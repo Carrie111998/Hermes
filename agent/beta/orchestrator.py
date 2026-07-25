@@ -37,6 +37,7 @@ class ExecutorConfirmation(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     operation_fingerprint: str
+    approval_nonce: str
     status: str
     evidence: str
 
@@ -126,6 +127,7 @@ def _recommended_operations(request: str, response: ConsolidatedResponse) -> tup
 def _parse_executor_confirmation(
     raw: Any,
     expected_operation_fingerprint: str,
+    expected_approval_nonce: str,
 ) -> tuple[str, str]:
     """Return a fail-closed execution status and normalized evidence."""
     if raw is None:
@@ -137,7 +139,10 @@ def _parse_executor_confirmation(
         if not text:
             return "failed", "executor returned no usable execution evidence"
         if not text.startswith("{"):
-            return "failed", "executor must return a structured confirmation with operation_fingerprint, status and evidence"
+            return "failed", (
+                "executor must return a structured confirmation with operation_fingerprint, "
+                "approval_nonce, status and evidence"
+            )
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
@@ -154,6 +159,8 @@ def _parse_executor_confirmation(
             )
         if confirmation.operation_fingerprint != expected_operation_fingerprint:
             return "failed", "executor confirmation does not match the approved operation"
+        if confirmation.approval_nonce != expected_approval_nonce:
+            return "failed", "executor confirmation does not match the approval receipt"
         status = confirmation.status.strip().lower()
         evidence = confirmation.evidence.strip()
         if not evidence:
@@ -180,9 +187,11 @@ def _execute_approved(
         receipt = receipts.get(operation.fingerprint)
         if not gate.authorized(operation, receipt):
             continue
+        assert receipt is not None
+        executor_operation = operation.model_copy(update={"approval_nonce": receipt.nonce})
         try:
             status, evidence = _parse_executor_confirmation(
-                executor(operation), operation.fingerprint
+                executor(executor_operation), operation.fingerprint, receipt.nonce
             )
             executed.append(ExecutedAction(
                 operation_fingerprint=operation.fingerprint,
@@ -213,9 +222,7 @@ def _reconcile_execution_response(
     failed = tuple(action for action in executed if action.status == "failed")
     executed_fingerprints = {action.operation_fingerprint for action in executed}
     pending = tuple(
-        operation
-        for operation in operations
-        if operation.fingerprint not in executed_fingerprints
+        operation for operation in operations if operation.fingerprint not in executed_fingerprints
     )
     all_operations_executed = not pending
 

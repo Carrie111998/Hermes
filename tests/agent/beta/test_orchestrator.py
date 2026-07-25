@@ -36,21 +36,17 @@ def _delegate_from(findings, calls):
         for index, task in enumerate(task_data):
             finding = findings[task["specialist_id"]]
             if finding.get("outer_status"):
-                results.append(
-                    {
-                        "task_index": index,
-                        "status": finding["outer_status"],
-                        "error": finding.get("error", "specialist failed"),
-                    }
-                )
+                results.append({
+                    "task_index": index,
+                    "status": finding["outer_status"],
+                    "error": finding.get("error", "specialist failed"),
+                })
             else:
-                results.append(
-                    {
-                        "task_index": index,
-                        "status": "completed",
-                        "summary": _specialist_payload(task, **finding),
-                    }
-                )
+                results.append({
+                    "task_index": index,
+                    "status": "completed",
+                    "summary": _specialist_payload(task, **finding),
+                })
         return json.dumps({"results": results})
 
     return fake_delegate
@@ -180,15 +176,10 @@ def test_hermes_delegate_handler_preserves_legacy_path(monkeypatch):
 def test_empty_executor_evidence_fails_closed():
     calls = []
     gate = ApprovalGate(requester=lambda _operation: {"approved": True})
-
     run = orchestrate_request(
-        REQUEST,
-        object(),
-        delegate=_delegate_from(_base_findings(), calls),
-        approval_gate=gate,
-        executor=lambda _operation: "   ",
+        REQUEST, object(), delegate=_delegate_from(_base_findings(), calls),
+        approval_gate=gate, executor=lambda _operation: "   ",
     )
-
     assert len(run.executed_actions) == 1
     assert run.executed_actions[0].status == "failed"
     assert "no usable execution evidence" in run.executed_actions[0].evidence
@@ -200,15 +191,11 @@ def test_empty_executor_evidence_fails_closed():
 def test_plain_text_executor_confirmation_fails_closed():
     calls = []
     gate = ApprovalGate(requester=lambda _operation: {"approved": True})
-
     run = orchestrate_request(
-        REQUEST,
-        object(),
-        delegate=_delegate_from(_base_findings(), calls),
+        REQUEST, object(), delegate=_delegate_from(_base_findings(), calls),
         approval_gate=gate,
         executor=lambda _operation: "service state changed; health check=ok",
     )
-
     assert len(run.executed_actions) == 1
     assert run.executed_actions[0].status == "failed"
     assert "structured confirmation" in run.executed_actions[0].evidence
@@ -219,19 +206,16 @@ def test_plain_text_executor_confirmation_fails_closed():
 def test_structured_executor_confirmation_is_preserved():
     calls = []
     gate = ApprovalGate(requester=lambda _operation: {"approved": True})
-
     run = orchestrate_request(
-        REQUEST,
-        object(),
-        delegate=_delegate_from(_base_findings(), calls),
+        REQUEST, object(), delegate=_delegate_from(_base_findings(), calls),
         approval_gate=gate,
         executor=lambda operation: {
             "operation_fingerprint": operation.fingerprint,
+            "approval_nonce": operation.approval_nonce,
             "status": "completed",
             "evidence": "  service state changed; health check=ok  ",
         },
     )
-
     assert len(run.executed_actions) == 1
     assert run.executed_actions[0].status == "completed"
     assert run.executed_actions[0].evidence == "service state changed; health check=ok"
@@ -241,18 +225,15 @@ def test_structured_executor_confirmation_is_preserved():
 def test_executor_confirmation_without_operation_fingerprint_fails_closed():
     calls = []
     gate = ApprovalGate(requester=lambda _operation: {"approved": True})
-
     run = orchestrate_request(
-        REQUEST,
-        object(),
-        delegate=_delegate_from(_base_findings(), calls),
+        REQUEST, object(), delegate=_delegate_from(_base_findings(), calls),
         approval_gate=gate,
-        executor=lambda _operation: {
+        executor=lambda operation: {
+            "approval_nonce": operation.approval_nonce,
             "status": "completed",
             "evidence": "service state changed; health check=ok",
         },
     )
-
     assert run.executed_actions[0].status == "failed"
     assert "operation_fingerprint" in run.executed_actions[0].evidence
     assert run.response.result == "Approved execution failed validation"
@@ -261,19 +242,51 @@ def test_executor_confirmation_without_operation_fingerprint_fails_closed():
 def test_executor_confirmation_for_different_operation_fails_closed():
     calls = []
     gate = ApprovalGate(requester=lambda _operation: {"approved": True})
-
     run = orchestrate_request(
-        REQUEST,
-        object(),
-        delegate=_delegate_from(_base_findings(), calls),
+        REQUEST, object(), delegate=_delegate_from(_base_findings(), calls),
         approval_gate=gate,
-        executor=lambda _operation: {
+        executor=lambda operation: {
             "operation_fingerprint": "different-operation",
+            "approval_nonce": operation.approval_nonce,
             "status": "completed",
             "evidence": "service state changed; health check=ok",
         },
     )
-
     assert run.executed_actions[0].status == "failed"
     assert "does not match the approved operation" in run.executed_actions[0].evidence
+    assert run.response.result == "Approved execution failed validation"
+
+
+def test_executor_confirmation_without_approval_nonce_fails_closed():
+    calls = []
+    gate = ApprovalGate(requester=lambda _operation: {"approved": True})
+    run = orchestrate_request(
+        REQUEST, object(), delegate=_delegate_from(_base_findings(), calls),
+        approval_gate=gate,
+        executor=lambda operation: {
+            "operation_fingerprint": operation.fingerprint,
+            "status": "completed",
+            "evidence": "service state changed; health check=ok",
+        },
+    )
+    assert run.executed_actions[0].status == "failed"
+    assert "approval_nonce" in run.executed_actions[0].evidence
+    assert run.response.result == "Approved execution failed validation"
+
+
+def test_executor_confirmation_from_another_receipt_fails_closed():
+    calls = []
+    gate = ApprovalGate(requester=lambda _operation: {"approved": True})
+    run = orchestrate_request(
+        REQUEST, object(), delegate=_delegate_from(_base_findings(), calls),
+        approval_gate=gate,
+        executor=lambda operation: {
+            "operation_fingerprint": operation.fingerprint,
+            "approval_nonce": "nonce-from-an-older-receipt",
+            "status": "completed",
+            "evidence": "service state changed; health check=ok",
+        },
+    )
+    assert run.executed_actions[0].status == "failed"
+    assert "does not match the approval receipt" in run.executed_actions[0].evidence
     assert run.response.result == "Approved execution failed validation"
