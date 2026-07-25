@@ -765,7 +765,7 @@ def test_reference_timeout_invalid_values_fall_back_to_default(value):
     assert resolve_moa_preset(_preset(reference_timeout=value), "p")["reference_timeout"] is None
 
 
-def test_reference_timeout_is_uncapped_and_unknown_policy_is_loud():
+def test_reference_timeout_is_uncapped_and_unknown_policy_is_graceful():
     preset = resolve_moa_preset(
         _preset(reference_timeout=9999, degraded_reference_policy="wat"), "p"
     )
@@ -773,4 +773,4 @@ def test_reference_timeout_is_uncapped_and_unknown_policy_is_loud():
     # Explicit per-preset values are honored as-is — long-thinking advisor
     # models legitimately run beyond any fixed cap.
     assert preset["reference_timeout"] == 9999.0
-    assert preset["degraded_reference_policy"] == "loud"
+    assert preset["degraded_reference_policy"] == "graceful"

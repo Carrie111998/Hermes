@@ -66,9 +66,9 @@ def _coerce_reference_timeout(value: Any) -> float | None:
 
 
 def _coerce_degraded_reference_policy(value: Any) -> str:
-    """Normalize failed-advisor disclosure policy; unknown values fail loud."""
-    policy = str(value or "loud").strip().lower()
-    return policy if policy in {"loud", "silent"} else "loud"
+    """Normalize failed-advisor disclosure policy; unknown values default to graceful."""
+    policy = str(value or "graceful").strip().lower()
+    return policy if policy in {"graceful", "loud", "silent"} else "graceful"
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -302,7 +302,7 @@ def _default_preset() -> dict[str, Any]:
         "reference_temperature": None,
         "aggregator_temperature": None,
         "reference_timeout": DEFAULT_MOA_REFERENCE_TIMEOUT,
-        "degraded_reference_policy": "loud",
+        "degraded_reference_policy": "graceful",
         "max_tokens": 4096,
         "reference_max_tokens": None,
         "fanout": "user_turn",

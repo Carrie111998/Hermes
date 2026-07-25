@@ -1347,7 +1347,7 @@ def run_conversation(
                         else None
                     ),
                     degraded_reference_policy=str(
-                        moa_config.get("degraded_reference_policy") or "loud"
+                        moa_config.get("degraded_reference_policy") or "graceful"
                     ),
                     agent=agent,
                 )

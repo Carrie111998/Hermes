@@ -1168,7 +1168,7 @@ def aggregate_moa_context(
     aggregator_temperature: float | None = None,
     reference_max_tokens: int | None = None,
     reference_timeout: float | None = None,
-    degraded_reference_policy: str = "loud",
+    degraded_reference_policy: str = "graceful",
     agent: Any = None,
 ) -> str:
     """Run configured reference models and synthesize their advice.
@@ -1686,7 +1686,7 @@ class MoAChatCompletions:
             float(raw_reference_timeout) if raw_reference_timeout else None
         )
         degraded_reference_policy = str(
-            preset.get("degraded_reference_policy") or "loud"
+            preset.get("degraded_reference_policy") or "graceful"
         )
         if aggregator_temperature is None and api_kwargs.get("temperature") is not None:
             # The acting agent's own configured temperature (if any) still

@@ -1394,7 +1394,7 @@ class _MoaReferenceControls(BaseModel):
     # None = no per-preset override; the fan-out inherits
     # auxiliary.moa_reference.timeout (900s default).
     reference_timeout: Optional[float] = None
-    degraded_reference_policy: Literal["loud", "silent"] = "loud"
+    degraded_reference_policy: Literal["graceful", "loud", "silent"] = "graceful"
 
     @field_validator("reference_timeout", mode="before")
     @classmethod
