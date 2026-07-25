@@ -82,6 +82,17 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_strict_index_mode_parses_core_deferral_and_word_limit(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "defer_core": True,
+            "summary_max_words": 10,
+        })
+
+        assert cfg.defer_core is True
+        assert cfg.summary_max_words == 10
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -238,6 +249,23 @@ class TestRetrieval:
 
 
 class TestAssembly:
+    def test_strict_index_mode_defers_core_tools(self):
+        from tools.tool_search import assemble_tool_defs, BRIDGE_TOOL_NAMES, ToolSearchConfig
+
+        defs = [_td("terminal", "Run shell commands"), _td("read_file", "Read files")]
+        result = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "defer_core": True,
+                "summary_max_words": 10,
+            }),
+        )
+
+        assert result.activated
+        assert {tool["function"]["name"] for tool in result.tool_defs} == BRIDGE_TOOL_NAMES
+
     def test_no_deferrable_returns_unchanged(self):
         """Pure-core toolset: pass-through, no bridge tools added."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
@@ -285,6 +313,21 @@ class TestAssembly:
 
 
 class TestBridgeDispatch:
+    def test_search_hit_summary_never_exceeds_configured_word_limit(self):
+        from tools.tool_search import CatalogEntry, _format_search_hit
+
+        entry = CatalogEntry(
+            name="terminal",
+            description="Run shell commands and return detailed output from the local machine safely",
+            schema=_td("terminal"),
+            source="core",
+            source_name="terminal",
+        )
+
+        hit = _format_search_hit(entry, max_words=10)
+
+        assert len(hit["description"].split()) <= 10
+
     def test_tool_search_requires_query(self):
         from tools.tool_search import dispatch_tool_search
         result = dispatch_tool_search({}, current_tool_defs=[])
@@ -535,4 +578,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-
