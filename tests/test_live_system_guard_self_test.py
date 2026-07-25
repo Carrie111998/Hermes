@@ -29,6 +29,16 @@ import pytest
 FOREIGN_PID = 1
 
 
+@pytest.fixture
+def harmless_systemctl(tmp_path):
+    """Executable named systemctl for cross-platform pass-through checks."""
+
+    executable = tmp_path / "systemctl"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    return str(executable)
+
+
 # ──────────────────── fail-closed self-protection ──────────────
 #
 # This file executes REAL kill primitives — os.kill(-1, SIGTERM), os.killpg,

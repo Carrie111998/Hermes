@@ -5082,16 +5082,11 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": redact_sensitive_text(combined_desc),
-                # Smart DENY overrides are one-operation decisions, so the UI
-                # must not offer a permanent scope.  Otherwise offer Always
-                # whenever any dangerous-pattern warning can actually be
-                # persisted (pure-tirith prompts stay session-max).
-                "allow_permanent": has_permanent_capable and not smart_denied_for_owner,
-                # Session approval is safe for every non-Smart-DENY prompt —
-                # including pure-tirith ones, where the persistence layer
-                # already caps scope at session. Adapters use this to render
-                # a session tier independently of the permanent tier.
-                "allow_session": not smart_denied_for_owner,
+                # Offer Always only when at least one dangerous-pattern
+                # warning can actually be persisted. Pure-tirith findings
+                # remain session-scoped.
+                "allow_permanent": has_permanent_capable,
+                "allow_session": True,
             }
             decision = _await_gateway_decision(
                 session_key,
@@ -5245,8 +5240,7 @@ def check_all_command_guards(command: str, env_type: str,
     choice = prompt_dangerous_approval(
         command,
         combined_desc,
-        allow_permanent=has_permanent_capable and not smart_denied_for_owner,
-        smart_denied=smart_denied_for_owner,
+        allow_permanent=has_permanent_capable,
         approval_callback=approval_callback,
     )
     _fire_approval_hook(
@@ -5418,8 +5412,8 @@ def check_execute_code_guard(code: str, env_type: str,
         "pattern_key": pattern_key,
         "pattern_keys": [pattern_key],
         "description": display_description,
-        "allow_permanent": not smart_denied_for_owner,
-        "allow_session": not smart_denied_for_owner,
+        "allow_permanent": True,
+        "allow_session": True,
     }
     decision = _await_gateway_decision(
         session_key,

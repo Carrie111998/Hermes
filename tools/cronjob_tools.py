@@ -941,6 +941,11 @@ def check_cronjob_requirements() -> bool:
     )
 
 
+# The decision above reads request-local gateway ContextVars and must never be
+# reused across sessions by the process-global check_fn/tool-definition caches.
+check_cronjob_requirements.__hermes_context_sensitive__ = True
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 

@@ -30,11 +30,9 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -45,32 +43,6 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
-DEFAULT_JUDGE_TIMEOUT = 30.0
-# Judge output budget. The freeform judge returns a one-line JSON verdict, but
-# reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
-# before emitting the visible JSON — and the first /goal turn's prompt is
-# larger than later turns, which pushes total reply length past tight caps.
-# 200 tokens (the original default) reliably truncated the JSON on reasoning
-# models, leaving '{"done": true, "reason": "The agent successfully' and
-# triggering the auto-pause. 4096 covers reasoning + verdict on every model
-# we've live-tested; override via auxiliary.goal_judge.max_tokens for
-# specifically constrained setups.
-DEFAULT_JUDGE_MAX_TOKENS = 4096
-# Cap how much of the last response + recent messages we send to the judge.
-_JUDGE_RESPONSE_SNIPPET_CHARS = 4000
-# After this many consecutive judge *parse* failures (empty output / non-JSON),
-# the loop auto-pauses and points the user at the goal_judge config. API /
-# transport errors do NOT count toward this — those are transient. This guards
-# against small models (e.g. deepseek-v4-flash) that cannot follow the strict
-# JSON reply contract; without it the loop runs until the turn budget is
-# exhausted with every reply shaped like `judge returned empty response` or
-# `judge reply was not JSON`.
-DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
-# Transport failures (API auth errors 401, timeouts, DNS, etc.) are also
-# tracked and auto-pause the loop after this many consecutive failures.
-# A broken/invalid API key returns 401 every call — the loop must not
-# run until the turn budget, wasting every turn on an unreachable judge.
-DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -320,11 +292,6 @@ class GoalState:
     pending_model_reason: Optional[str] = None
     pending_model_turn_id: Optional[str] = None
     pending_model_generation_id: Optional[str] = None
-    consecutive_parse_failures: int = 0       # judge-output parse failures in a row
-    # Transport failures are API/auth/network errors.  Broken API keys return
-    # 401 every call — track them separately so the loop auto-pauses instead
-    # of burning every turn budget slot on an unreachable judge.
-    consecutive_transport_failures: int = 0   # judge API/transport errors in a row
     # User-added criteria appended mid-loop via the /subgoal command.
     # The continuation prompt includes them so the primary model treats them
     # as additional completion criteria. Backwards-compatible: defaults to
@@ -393,8 +360,6 @@ class GoalState:
             pending_model_reason=data.get("pending_model_reason"),
             pending_model_turn_id=data.get("pending_model_turn_id"),
             pending_model_generation_id=data.get("pending_model_generation_id"),
-            consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
-            consecutive_transport_failures=int(data.get("consecutive_transport_failures", 0) or 0),
             subgoals=subgoals,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
@@ -693,404 +658,6 @@ def _session_waiting(session_id: str) -> bool:
         return bool(process_registry.is_session_waiting(session_id))
     except Exception:
         return False
-
-
-_JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
-
-
-def _goal_judge_max_tokens() -> int:
-    """Resolve auxiliary.goal_judge.max_tokens, falling back to the default.
-
-    ``load_config()`` is cached on the config file's (mtime, size), so calling
-    this once per judge turn is cheap. A non-positive or non-int value falls
-    back to the default rather than crashing the goal loop.
-    """
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        value = (
-            (cfg.get("auxiliary") or {})
-            .get("goal_judge", {})
-            .get("max_tokens", DEFAULT_JUDGE_MAX_TOKENS)
-        )
-        value = int(value)
-        if value > 0:
-            return value
-    except Exception:
-        pass
-    return DEFAULT_JUDGE_MAX_TOKENS
-
-
-def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
-    """Parse the judge's reply. Fail-open on unusable output.
-
-    Returns ``(verdict, reason, parse_failed, wait_directive)`` where:
-      - ``verdict`` is ``"done"``, ``"continue"``, or ``"wait"``.
-      - ``parse_failed`` is True when the judge returned output that couldn't
-        be interpreted as the expected JSON verdict (empty body, prose,
-        malformed JSON). Callers use it to auto-pause after N consecutive
-        parse failures so a weak judge model doesn't silently burn the budget.
-      - ``wait_directive`` is set only for ``verdict == "wait"``: a dict with
-        ``{"pid": int}`` or ``{"seconds": int}`` (whichever the judge supplied).
-        ``None`` otherwise. If a wait verdict carries neither a usable pid nor
-        seconds, it is downgraded to ``continue`` (can't park on nothing).
-
-    Accepts both the new ``{"verdict": ...}`` shape and the legacy
-    ``{"done": <bool>}`` shape.
-    """
-    if not raw:
-        return "continue", "judge returned empty response", True, None
-
-    text = raw.strip()
-
-    # Strip markdown code fences the model may wrap JSON in.
-    if text.startswith("```"):
-        text = text.strip("`")
-        # Peel off leading json/JSON/etc tag
-        nl = text.find("\n")
-        if nl != -1:
-            text = text[nl + 1:]
-
-    # First try: parse the whole blob.
-    data: Optional[Dict[str, Any]] = None
-    try:
-        data = json.loads(text)
-    except Exception:
-        # Second try: pull the first JSON object out.
-        match = _JSON_OBJECT_RE.search(text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except Exception:
-                data = None
-
-    if not isinstance(data, dict):
-        return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
-
-    reason = str(data.get("reason") or "").strip() or "no reason provided"
-
-    # Determine verdict — prefer the explicit "verdict" field, fall back to
-    # the legacy "done" boolean.
-    verdict_raw = data.get("verdict")
-    if isinstance(verdict_raw, str):
-        verdict = verdict_raw.strip().lower()
-    else:
-        done_val = data.get("done")
-        if isinstance(done_val, str):
-            done = done_val.strip().lower() in {"true", "yes", "1", "done"}
-        else:
-            done = bool(done_val)
-        verdict = "done" if done else "continue"
-
-    if verdict not in {"done", "continue", "wait"}:
-        verdict = "continue"
-
-    if verdict != "wait":
-        return verdict, reason, False, None
-
-    # Wait verdict: extract a concrete directive (pid or seconds). Accept a
-    # few key spellings the model might emit.
-    def _first_int(*keys: str) -> Optional[int]:
-        for k in keys:
-            v = data.get(k)
-            if v is None:
-                continue
-            try:
-                iv = int(v)
-                if iv > 0:
-                    return iv
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    # Prefer a session-id directive (releases on the process's own trigger —
-    # exit OR watch-pattern match), then pid (exit only), then seconds.
-    sess = data.get("wait_on_session") or data.get("session_id") or data.get("wait_session")
-    if isinstance(sess, str) and sess.strip():
-        return "wait", reason, False, {"session_id": sess.strip()}
-    pid = _first_int("wait_on_pid", "pid", "wait_pid")
-    if pid is not None:
-        return "wait", reason, False, {"pid": pid}
-    seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
-    if seconds is not None:
-        return "wait", reason, False, {"seconds": seconds}
-    # Wait with no usable target — can't park on nothing; treat as continue.
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
-
-
-def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
-    """Render the live background-process list for the judge prompt.
-
-    Each entry is a ``process_registry.list_sessions()`` dict. Only RUNNING
-    processes are worth showing (an exited one is nothing to wait on). Returns
-    an empty string when there's nothing running, so the judge prompt is
-    byte-identical to the no-background case (no behavior change for the
-    common path).
-    """
-    if not background_processes:
-        return ""
-    lines: List[str] = []
-    for p in background_processes:
-        if not isinstance(p, dict):
-            continue
-        if p.get("status") == "exited":
-            continue
-        pid = p.get("pid")
-        if not pid:
-            continue
-        cmd = _truncate(str(p.get("command") or "").replace("\n", " ").strip(), 120)
-        uptime = p.get("uptime_seconds")
-        tail = _truncate(str(p.get("output_preview") or "").replace("\n", " ").strip(), 120)
-        sid = p.get("session_id")
-        line = f"- pid {pid}"
-        if sid:
-            line += f" / session {sid}"
-        line += f": {cmd}"
-        if uptime is not None:
-            line += f" (running {uptime}s)"
-        # Surface the process's own trigger so the judge can wait on a
-        # mid-run signal (watch-pattern) or completion, not just exit.
-        wps = p.get("watch_patterns")
-        if wps:
-            hit = " [already matched]" if p.get("watch_hit") else ""
-            line += f" | watch_patterns={wps}{hit}"
-        elif p.get("notify_on_complete"):
-            line += " | notify_on_complete"
-        if tail:
-            line += f" | recent output: {tail}"
-        lines.append(line)
-    if not lines:
-        return ""
-    return JUDGE_BACKGROUND_BLOCK_TEMPLATE.format(background_lines="\n".join(lines))
-
-
-def judge_goal(
-    goal: str,
-    last_response: str,
-    *,
-    timeout: float = DEFAULT_JUDGE_TIMEOUT,
-    subgoals: Optional[List[str]] = None,
-    background_processes: Optional[List[Dict[str, Any]]] = None,
-    contract: Optional[GoalContract] = None,
-) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
-    """Ask the auxiliary model whether the goal is satisfied.
-
-    Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)`` where verdict
-    is ``"done"``, ``"continue"``, ``"wait"``, or ``"skipped"`` (when the
-    judge couldn't be reached). ``wait_directive`` is set only for ``"wait"``
-    (``{"pid": int}`` or ``{"seconds": int}``); ``None`` otherwise.
-
-    ``parse_failed`` is True only when the judge call succeeded but its output
-    was unusable (empty or non-JSON). API/transport errors return False — they
-    are transient and should fail-open silently.
-
-    ``transport_failed`` is True only when the judge couldn't reach the API at
-    all (auth 401, timeout, DNS, connection error).  Repeated transport
-    failures signal a permanent config problem (e.g. invalid API key).  Callers
-    use this flag to auto-pause after N consecutive transport failures (see
-    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``). Callers use this flag to
-    auto-pause after N consecutive parse failures (see
-    ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``).
-
-    ``subgoals`` is an optional list of user-added criteria (from
-    ``/subgoal``) factored into the verdict. ``background_processes`` is the
-    live ``process_registry.list_sessions()`` snapshot; when the agent is
-    waiting on one (a CI poller, build, etc.) the judge can return a ``wait``
-    verdict naming its pid, parking the loop instead of re-poking.
-    ``contract`` is an optional structured completion contract; when present
-    the judge decides DONE strictly against its Verification criterion and
-    refuses completion when a Constraint was violated. All three are additive
-    — a contract, subgoals, and a background-process list can coexist in one
-    judge prompt; when none are set, behavior is identical to the original
-    free-form judge.
-
-    This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
-    — the ``transport_failed=True`` flag lets callers track and auto-pause after
-    N consecutive transport failures (see
-    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``) so a permanently broken
-    judge doesn't burn the entire turn budget.
-    """
-    if not goal.strip():
-        return "skipped", "empty goal", False, None, False
-    if not last_response.strip():
-        # No substantive reply this turn — almost certainly not done yet.
-        return "continue", "empty response (nothing to evaluate)", False, None, False
-
-    try:
-        from agent.auxiliary_client import call_llm
-    except Exception as exc:
-        logger.debug("goal judge: auxiliary client import failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False, None, False
-
-    # Build the prompt. Priority: contract > subgoals > plain. When both a
-    # contract and subgoals exist, the subgoals are appended into the
-    # contract block as extra criteria so the judge sees a single source of
-    # truth.
-    clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
-    background_block = _render_background_block(background_processes)
-    current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-    if contract is not None and not contract.is_empty():
-        contract_block = contract.render_block()
-        if clean_subgoals:
-            extra = "\n".join(
-                f"- Extra criterion {i}: {text}"
-                for i, text in enumerate(clean_subgoals, start=1)
-            )
-            contract_block = f"{contract_block}\n{extra}"
-        prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            contract_block=_truncate(contract_block, 2500),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
-    elif clean_subgoals:
-        subgoals_block = "\n".join(
-            f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
-        )
-        prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            subgoals_block=_truncate(subgoals_block, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
-    else:
-        prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
-
-    try:
-        # Route through call_llm so auxiliary.goal_judge.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the direct-create path dropped extra_body (#35566).
-        resp = call_llm(
-            task="goal_judge",
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
-        )
-    except Exception as exc:
-        logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
-        return "continue", f"judge error: {type(exc).__name__}", False, None, True
-
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
-
-    verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
-    logger.info(
-        "goal judge: verdict=%s reason=%s%s",
-        verdict, _truncate(reason, 120),
-        f" wait={wait_directive}" if wait_directive else "",
-    )
-    return verdict, reason, parse_failed, wait_directive, False
-
-
-def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return the live background-process snapshot for the goal judge.
-
-    Thin, fail-safe wrapper over ``process_registry.list_sessions(task_id)``.
-    Returns only RUNNING processes (an exited one is nothing to wait on) and
-    never raises — any import/registry failure yields ``[]`` so the goal loop
-    degrades to its pre-wait-barrier behavior (judge just won't see processes).
-    The drivers (CLI + gateway) call this and pass the result into
-    ``GoalManager.evaluate_after_turn(background_processes=...)``.
-    """
-    try:
-        from tools.process_registry import process_registry
-
-        sessions = process_registry.list_sessions(task_id=task_id) or []
-    except Exception as exc:
-        logger.debug("gather_background_processes failed: %s", exc)
-        return []
-    return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
-
-
-def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
-    """Expand a plain-language objective into a structured completion contract.
-
-    Uses the ``goal_judge`` auxiliary task (main-model-first, cache-safe — it
-    is a side LLM call, not a conversation turn). Returns a populated
-    :class:`GoalContract` on success, or ``None`` when the auxiliary client is
-    unavailable or the model's reply can't be parsed. Callers fall back to a
-    bare free-form goal in that case, so a missing/weak aux model never blocks
-    setting a goal.
-    """
-    objective = (objective or "").strip()
-    if not objective:
-        return None
-
-    try:
-        from agent.auxiliary_client import call_llm
-    except Exception as exc:
-        logger.debug("goal draft: auxiliary client import failed: %s", exc)
-        return None
-
-    try:
-        # Route through call_llm — same #35566 fix as the judge call above.
-        resp = call_llm(
-            task="goal_judge",
-            messages=[
-                {"role": "system", "content": DRAFT_CONTRACT_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Objective:\n{_truncate(objective, 4000)}"},
-            ],
-            temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
-        )
-    except Exception as exc:
-        logger.info("goal draft: API call failed (%s)", exc)
-        return None
-
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
-
-    data = _extract_json_object(raw)
-    if not isinstance(data, dict):
-        logger.debug("goal draft: reply was not JSON: %r", _truncate(raw, 200))
-        return None
-    contract = GoalContract.from_dict(data)
-    return None if contract.is_empty() else contract
-
-
-def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
-    """Best-effort: pull the first JSON object out of a model reply.
-
-    Shares the fence-stripping + first-object fallback logic used by the
-    judge parser, but returns the dict (or None) rather than a verdict.
-    """
-    if not raw:
-        return None
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        nl = text.find("\n")
-        if nl != -1:
-            text = text[nl + 1:]
-    try:
-        data = json.loads(text)
-    except Exception:
-        match = _JSON_OBJECT_RE.search(text)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(0))
-        except Exception:
-            return None
-    return data if isinstance(data, dict) else None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1799,11 +1366,6 @@ class GoalManager:
             decision["continuation_prompt"] = self.next_continuation_prompt()
         return decision
 
-        decision = self._mutate_durable(_mutate)
-        if decision.get("should_continue"):
-            decision["continuation_prompt"] = self.next_continuation_prompt()
-        return decision
-
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
@@ -1948,32 +1510,12 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
-        # Still open — judge whether the latest response satisfies the card.
-        # The kanban worker loop has no wait-barrier concept (workers finish
-        # via kanban_complete / kanban_block, not by parking), so a WAIT
-        # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
-        if verdict == "wait":
-            verdict = "continue"
-        _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
-
-        if verdict == "done":
-            if nudged_to_finalize:
-                # Already asked once to call kanban_complete and it still
-                # didn't — block for review rather than spin.
-                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                try:
-                    block_fn(
-                        f"Goal-mode worker's output looked complete but it never "
-                        f"called kanban_complete after a finalize nudge ({reason})."
-                    )
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
-            prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
-            nudged_to_finalize = True
-        else:
-            prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
+        # Still open: only the primary worker can close or block its task via
+        # the structured lifecycle tools.  No auxiliary model interprets its
+        # prose or overrides its completion decision.
+        reason = "task remains open; call kanban_complete or kanban_block"
+        _log(f"kanban goal loop: turn {turns_used}/{max_turns} status={status}")
+        prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=reason)
 
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:

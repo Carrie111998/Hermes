@@ -2046,6 +2046,13 @@ class CredentialPool:
             count = 0
             new_entries = []
             for entry in self._entries:
+                # DEAD is a terminal quarantine, not a cooldown.  Only a
+                # successful write-side credential sync may revive it with
+                # fresh token material; a generic operator reset must never
+                # make an invalidated credential selectable again.
+                if entry.last_status == STATUS_DEAD:
+                    new_entries.append(entry)
+                    continue
                 if entry.last_status or entry.last_status_at or entry.last_error_code:
                     new_entries.append(
                         replace(

@@ -645,22 +645,13 @@ def test_complete_goal_mode_uses_primary_worker_lifecycle(monkeypatch, tmp_path)
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
 
-    # Mock the judge to reject the completion. The gate only runs when a
-    # judge is reachable, so force the availability probe True as well.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
-        # Match the real judge_goal contract:
-        # (verdict, reason, parse_failed, wait_directive, transport_failed)
-        return "continue", "missing verification evidence", False, None, False
-
-    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
-    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
-
-    # Attempt to complete should be rejected
+    # The primary worker's structured completion is authoritative. There is
+    # deliberately no auxiliary model call that can override this lifecycle.
     out = kt._handle_complete({"summary": "I did some stuff but not X"})
     d = json.loads(out)
     assert d.get("ok") is True
 
-    # Verify the task is NOT completed in the DB
+    # Verify the primary worker completed the task in the DB.
     conn2 = kb.connect()
     try:
         task = kb.get_task(conn2, goal_task_id)
@@ -2407,15 +2398,21 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
     from tools import kanban_tools as kt
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
+    from gateway.session_context import clear_session_vars, set_session_vars
 
-    out = kt._handle_create({
-        "title": "auto-sub gateway",
-        "assignee": "peer",
-    })
+    session_tokens = set_session_vars(
+        platform="telegram",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="user-9",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub gateway",
+            "assignee": "peer",
+        })
+    finally:
+        clear_session_vars(session_tokens)
     d = json.loads(out)
     assert d["ok"] is True
     new_tid = d["task_id"]

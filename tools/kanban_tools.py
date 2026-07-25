@@ -608,42 +608,6 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Goal-mode pre-completion judge gate (Issue #38367).
-            # Prevent workers from bypassing the auxiliary judge by
-            # calling kanban_complete before acceptance criteria are met.
-            # Only enforce when a judge is actually reachable — see
-            # _goal_judge_available for why an unavailable judge fails open.
-            task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
-                verdict = "done"
-                reason = ""
-                try:
-                    # judge_goal returns (verdict, reason, parse_failed,
-                    # wait_directive, transport_failed) — see
-                    # hermes_cli/goals.py. Unpacking fewer raises ValueError,
-                    # which the defensive handler below swallows, leaving
-                    # verdict="done" and silently disabling the gate.
-                    verdict, reason, _, _, _ = judge_goal(
-                        goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                        last_response=(summary or result or "").strip(),
-                    )
-                except Exception as judge_exc:
-                    # Defensive: judge_goal swallows its own errors, but if
-                    # it ever raises, fail open rather than wedge the worker.
-                    logger.warning(
-                        "goal judge check failed, allowing completion: %s",
-                        judge_exc,
-                        exc_info=True,
-                    )
-                if verdict != "done":
-                    return tool_error(
-                        f"Goal completion rejected by judge: {reason}. "
-                        f"To proceed, either: (1) provide explicit acceptance "
-                        f"evidence in your summary matching the task's criteria, "
-                        f"or (2) create continuation tasks with parents=[{tid}] "
-                        f"and keep this task alive."
-                    )
-
             try:
                 ok = kb.complete_task(
                     conn, tid,

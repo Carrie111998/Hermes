@@ -134,7 +134,12 @@ def _runner(session_id: str) -> tuple[object, _Adapter]:
         }
     )
     adapter = _Adapter()
-    runner.adapters = {Platform.DISCORD: adapter}
+    # Connector-authenticated Discord ingress is delivered by the relay
+    # transport while retaining Discord as its session/platform identity.
+    runner.adapters = {
+        Platform.DISCORD: adapter,
+        Platform.RELAY: adapter,
+    }
     runner._queued_events = {}
     runner._running_agents = {}
     runner._running_agents_ts = {}

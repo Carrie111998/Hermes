@@ -5273,8 +5273,12 @@ class TelegramAdapter(BasePlatformAdapter):
             ]
             if not smart_denied and allow_session:
                 buttons.append(
-                    InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
                 )
+                if allow_permanent:
+                    buttons.append(
+                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                    )
             buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
             keyboard = InlineKeyboardMarkup([buttons])
 

@@ -11249,6 +11249,56 @@ def _run_prompt_submit(
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        goal_turn_id = ""
+        goal_generation_id = ""
+        goal_turn_session_id = ""
+        goal_turn_handled = False
+        conversation_invoked = False
+
+        def _capture_goal_turn_authority(result_value=None) -> None:
+            nonlocal goal_turn_id, goal_generation_id, goal_turn_session_id
+            if not conversation_invoked:
+                return
+            agent_turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+            result_turn_id = (
+                str(result_value.get("turn_id", "") or "")
+                if isinstance(result_value, dict)
+                else ""
+            )
+            goal_turn_id = result_turn_id or agent_turn_id
+            goal_generation_id = (
+                str(getattr(agent, "_current_goal_generation_id", "") or "")
+                if goal_turn_id and goal_turn_id == agent_turn_id
+                else ""
+            )
+            goal_turn_session_id = str(
+                getattr(agent, "session_id", "")
+                or session.get("session_key")
+                or ""
+            )
+
+        def _abandon_goal_turn_if_needed() -> None:
+            nonlocal goal_turn_handled
+            if goal_turn_handled:
+                return
+            if not goal_turn_id or not goal_generation_id or not goal_turn_session_id:
+                return
+            try:
+                from hermes_cli.goals import GoalManager
+
+                GoalManager(goal_turn_session_id).abandon_model_turn(
+                    originating_turn_id=goal_turn_id,
+                    goal_generation_id=goal_generation_id,
+                )
+            except Exception as exc:
+                print(
+                    f"[tui_gateway] goal turn abandon failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            finally:
+                goal_turn_handled = True
+
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
@@ -11448,6 +11498,7 @@ def _run_prompt_submit(
                 pass
             conversation_invoked = True
             result = agent.run_conversation(run_message, **run_kwargs)
+            _capture_goal_turn_authority(result)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -11800,6 +11851,9 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            if not goal_turn_id:
+                _capture_goal_turn_authority()
+            _abandon_goal_turn_if_needed()
             if tts_queue is not None:
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
             if one_turn_restore:

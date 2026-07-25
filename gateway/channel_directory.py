@@ -9,6 +9,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -766,7 +767,12 @@ def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
+
+        # SessionDB's module default is captured at import time. Channel
+        # directory refreshes can run under a later profile/task-local home,
+        # so bind the database path at the call boundary instead of silently
+        # reading another profile's state.db.
+        db = SessionDB(get_hermes_home() / "state.db")
         try:
             lister = getattr(db, "list_gateway_sessions", None)
             if not callable(lister):

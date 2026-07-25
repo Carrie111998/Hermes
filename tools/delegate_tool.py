@@ -1377,6 +1377,10 @@ def _build_child_agent(
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
             iteration_budget=None,  # fresh budget per subagent
+            # Provider-call authority is aggregate across the whole
+            # delegation tree. Nested children receive this exact object
+            # again, so delegation cannot mint fresh execution authority.
+            execution_lease=getattr(parent_agent, "execution_lease", None),
             **child_optional_kwargs,
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)

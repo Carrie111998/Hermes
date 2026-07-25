@@ -7089,6 +7089,7 @@ class SessionDB:
     # SELECT can feed both the model-fed and display views.
     _CONVERSATION_ROW_COLUMNS = (
         "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+        "internal_provenance, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"

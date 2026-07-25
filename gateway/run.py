@@ -961,20 +961,7 @@ def _prepare_gateway_status_message(
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    text = _redact_gateway_user_facing_secrets(text)
-    if _TELEGRAM_NOISY_STATUS_RE.search(text):
-        # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
-        # compression progress statuses through to chat platforms. The
-        # membership check is derived from the #69550 template constants, so
-        # non-compression noise (aux failures, provider retry chatter, ...)
-        # stays suppressed even when the gate is open. Default False keeps
-        # the silent-by-design behavior byte-identical.
-        if not (
-            _gateway_compression_progress_notices_enabled()
-            and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
-        ):
-            return None
-    return text
+    return _redact_gateway_user_facing_secrets(text)
 
 
 def _final_mirror_statuses_to_deliver(
@@ -1415,6 +1402,16 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
+    from agent.message_provenance import (
+        MESSAGE_PROVENANCE_KEY,
+        normalize_message_provenance,
+    )
+
+    provenance = normalize_message_provenance(
+        msg.get(MESSAGE_PROVENANCE_KEY)
+    )
+    if provenance is not None:
+        entry[MESSAGE_PROVENANCE_KEY] = provenance
     # api_content sidecar (persist-what-you-send, prompt-cache stability):
     # forward the exact bytes previously sent to the API for this message so
     # the agent's api_messages build can substitute them and keep the request
@@ -4022,6 +4019,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_ephemeral_pin: Dict[str, tuple] = {}
     _session_vc_last: Dict[str, str] = {}
     _startup_restore_in_progress: bool = False
+    _isolated_runtime: bool = False
+    _require_production_model_sovereignty: bool = False
+    _require_capability_canary: bool = False
     # Loop-liveness heartbeat / watchdog handles (#66892, #69089). Class-level
     # defaults so partial construction in tests doesn't blow up on access; the
     # real values are set in __init__ / start() / stop().
@@ -15745,6 +15745,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        _real_user_message_present = bool(
+            (
+                persist_user_message
+                if persist_user_message is not None
+                else message_text
+            ).strip()
+            if isinstance(
+                persist_user_message
+                if persist_user_message is not None
+                else message_text,
+                str,
+            )
+            else (
+                persist_user_message
+                if persist_user_message is not None
+                else message_text
+            )
+        )
+
+        # Canonical route-back state changes over time. Put it in this
+        # replayable current user turn, not in ``context_prompt``: that value
+        # participates in the cached-agent signature and dynamic Brain state
+        # there would destroy prompt-cache continuity on every lifecycle
+        # update. Persist the exact snapshot the API sees so the next turn's
+        # cached history prefix stays byte-stable.
+        if _routeback_context_prompt and isinstance(message_text, str):
+            from gateway.canonical_brain_routeback_context import (
+                attach_routeback_context_to_user_turn,
+            )
+
+            message_text, persist_user_message = attach_routeback_context_to_user_turn(
+                message_text,
+                persist_user_message,
+                _routeback_context_prompt,
+            )
+
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
@@ -22803,7 +22839,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Failed to read persisted session model override", exc_info=True
             )
             return
-        if not persisted:
+        if not isinstance(persisted, Mapping) or not persisted:
             return
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
@@ -28130,19 +28166,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         first_response,
                         previewed=_previewed,
                     )
-                    # Apply the same predicate as the normal completed-turn path.
-                    # This direct queued-send branch predates intentional-silence
-                    # filtering, so without this check it leaks the literal marker.
+                    # Apply the same exact receipt predicate as the normal
+                    # completed-turn path.  The gateway must not infer silence
+                    # from authored prose, including legacy marker-shaped text.
                     try:
-                        from gateway.response_filters import is_intentional_silence_agent_result
-                        _intentional_silence = is_intentional_silence_agent_result(
-                            _delivery_result, first_response,
+                        from gateway.response_filters import should_suppress_delivery
+
+                        _suppress_first_delivery = should_suppress_delivery(
+                            _delivery_result
                         )
                     except Exception:
-                        _intentional_silence = False
-                    if _intentional_silence:
+                        _suppress_first_delivery = False
+                    if _suppress_first_delivery:
                         logger.info(
-                            "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                            "Queued follow-up for session %s: honoring structured suppress receipt before continuing.",
                             session_key or "?",
                         )
                     elif first_response and not _already_streamed:
@@ -29508,7 +29545,14 @@ async def start_gateway(
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(config)
+    runner = GatewayRunner(
+        config,
+        require_production_model_sovereignty=(
+            require_production_model_sovereignty
+        ),
+        require_capability_canary=require_capability_canary,
+    )
+    isolated_runtime = bool(getattr(runner, "_isolated_runtime", isolated_runtime))
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.

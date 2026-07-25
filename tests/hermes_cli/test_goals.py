@@ -44,185 +44,6 @@ def hermes_home(tmp_path, monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# _parse_judge_response
-# ──────────────────────────────────────────────────────────────────────
-
-
-class TestParseJudgeResponse:
-    def test_clean_json_done(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        verdict, reason, _pf, wait = _parse_judge_response('{"done": true, "reason": "all good"}')
-        assert verdict == "done"
-        assert reason == "all good"
-        assert wait is None
-
-    def test_clean_json_continue(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        verdict, reason, _pf, wait = _parse_judge_response('{"done": false, "reason": "more work needed"}')
-        assert verdict == "continue"
-        assert reason == "more work needed"
-        assert wait is None
-
-    def test_json_in_markdown_fence(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        raw = '```json\n{"done": true, "reason": "done"}\n```'
-        verdict, reason, _pf, _w = _parse_judge_response(raw)
-        assert verdict == "done"
-        assert "done" in reason
-
-    def test_json_embedded_in_prose(self):
-        """Some models prefix reasoning before emitting JSON — we extract it."""
-        from hermes_cli.goals import _parse_judge_response
-
-        raw = 'Looking at this... the agent says X. Verdict: {"done": false, "reason": "partial"}'
-        verdict, reason, _pf, _w = _parse_judge_response(raw)
-        assert verdict == "continue"
-        assert reason == "partial"
-
-    def test_string_done_values(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        for s in ("true", "yes", "done", "1"):
-            verdict, _, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
-            assert verdict == "done"
-        for s in ("false", "no", "not yet"):
-            verdict, _, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
-            assert verdict == "continue"
-
-    def test_new_verdict_shape(self):
-        """The explicit {"verdict": ...} shape is honored."""
-        from hermes_cli.goals import _parse_judge_response
-
-        v, _, _, _ = _parse_judge_response('{"verdict": "done", "reason": "r"}')
-        assert v == "done"
-        v, _, _, _ = _parse_judge_response('{"verdict": "continue", "reason": "r"}')
-        assert v == "continue"
-
-    def test_wait_verdict_with_pid(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        v, reason, pf, wait = _parse_judge_response(
-            '{"verdict": "wait", "wait_on_pid": 4242, "reason": "CI running"}'
-        )
-        assert v == "wait"
-        assert pf is False
-        assert wait == {"pid": 4242}
-        assert reason == "CI running"
-
-    def test_wait_verdict_with_seconds(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        v, _, _, wait = _parse_judge_response(
-            '{"verdict": "wait", "wait_for_seconds": 90, "reason": "rate limited"}'
-        )
-        assert v == "wait"
-        assert wait == {"seconds": 90}
-
-    def test_wait_verdict_without_target_downgrades_to_continue(self):
-        """A wait verdict with no pid/seconds can't park on anything → continue."""
-        from hermes_cli.goals import _parse_judge_response
-
-        v, _, pf, wait = _parse_judge_response('{"verdict": "wait", "reason": "vague"}')
-        assert v == "continue"
-        assert wait is None
-        assert pf is False
-
-    def test_unknown_verdict_falls_back_to_continue(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        v, _, _, _ = _parse_judge_response('{"verdict": "maybe", "reason": "r"}')
-        assert v == "continue"
-
-    def test_malformed_json_fails_open(self):
-        """Non-JSON → continue + parse_failed, with error-ish reason."""
-        from hermes_cli.goals import _parse_judge_response
-
-        verdict, reason, parse_failed, _w = _parse_judge_response("this is not json at all")
-        assert verdict == "continue"
-        assert parse_failed is True
-        assert reason  # non-empty
-
-    def test_empty_response(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        verdict, reason, parse_failed, _w = _parse_judge_response("")
-        assert verdict == "continue"
-        assert parse_failed is True
-        assert reason
-
-
-# ──────────────────────────────────────────────────────────────────────
-# judge_goal — fail-open semantics
-# ──────────────────────────────────────────────────────────────────────
-
-
-class TestJudgeGoal:
-    def test_empty_goal_skipped(self):
-        from hermes_cli.goals import judge_goal
-
-        verdict, _, _, _wd, _tf = judge_goal("", "some response")
-        assert verdict == "skipped"
-
-    def test_empty_response_continues(self):
-        from hermes_cli.goals import judge_goal
-
-        verdict, _, _, _wd, _tf = judge_goal("ship the thing", "")
-        assert verdict == "continue"
-
-    def test_no_aux_client_continues(self):
-        """Fail-open: if no aux client, we must return continue, not skipped/done."""
-        from hermes_cli import goals
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            side_effect=RuntimeError("No LLM provider configured"),
-        ):
-            verdict, _, _, _wd, _tf = goals.judge_goal("my goal", "my response")
-        assert verdict == "continue"
-
-    def test_api_error_continues(self):
-        """Judge exception → fail-open continue (don't wedge progress on judge bugs)."""
-        from hermes_cli import goals
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            side_effect=RuntimeError("boom"),
-        ):
-            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", "response")
-        assert verdict == "continue"
-        assert "judge error" in reason.lower()
-
-    def test_judge_says_done(self):
-        from hermes_cli import goals
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=MagicMock(
-                choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "achieved"}'))]
-            ),
-        ):
-            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", "agent response")
-        assert verdict == "done"
-        assert reason == "achieved"
-
-    def test_judge_says_continue(self):
-        from hermes_cli import goals
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=MagicMock(
-                choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "not yet"}'))]
-            ),
-        ):
-            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", "agent response")
-        assert verdict == "continue"
-        assert reason == "not yet"
-
-
-# ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
 # ──────────────────────────────────────────────────────────────────────
 
@@ -305,8 +126,9 @@ class TestGoalManager:
         mgr = GoalManager(session_id="eval-sid-1")
         mgr.set("ship it")
 
-        with patch.object(goals, "judge_goal", return_value=("done", "shipped", False, None, False)):
-            decision = mgr.evaluate_after_turn("I shipped the feature.")
+        authority = _begin_goal_turn(mgr)
+        mgr.record_model_outcome("complete", "shipped", **authority)
+        decision = mgr.evaluate_after_turn("I shipped the feature.", **authority)
 
         assert decision["verdict"] == "done"
         assert decision["should_continue"] is False
@@ -320,8 +142,9 @@ class TestGoalManager:
         mgr = GoalManager(session_id="eval-sid-2", default_max_turns=5)
         mgr.set("a long goal")
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
-            decision = mgr.evaluate_after_turn("made some progress")
+        authority = _begin_goal_turn(mgr)
+        mgr.record_model_outcome("continue", "more work", **authority)
+        decision = mgr.evaluate_after_turn("made some progress", **authority)
 
         assert decision["verdict"] == "continue"
         assert decision["should_continue"] is True
@@ -337,11 +160,12 @@ class TestGoalManager:
         mgr = GoalManager(session_id="eval-sid-3", default_max_turns=2)
         mgr.set("hard goal")
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "not yet", False, None, False)):
-            d1 = mgr.evaluate_after_turn("step 1")
-            assert d1["should_continue"] is True
-            assert mgr.state.turns_used == 1
-            assert mgr.state.status == "active"
+        authority = _begin_goal_turn(mgr, "turn-1")
+        mgr.record_model_outcome("continue", "first step remains", **authority)
+        d1 = mgr.evaluate_after_turn("step 1", **authority)
+        assert d1["should_continue"] is True
+        assert mgr.state.turns_used == 1
+        assert mgr.state.status == "active"
 
         authority = _begin_goal_turn(mgr, "turn-2")
         mgr.record_model_outcome("continue", "second step remains", **authority)
@@ -515,182 +339,6 @@ def test_goal_command_dispatches_in_cli_registry_helpers():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Auto-pause on consecutive judge parse failures
-# ──────────────────────────────────────────────────────────────────────
-
-
-class TestJudgeParseFailureAutoPause:
-    """Regression: weak judge models (e.g. deepseek-v4-flash) that return
-    empty strings or non-JSON prose must auto-pause the loop after N turns
-    instead of burning the whole turn budget."""
-
-    def test_parse_response_flags_empty_as_parse_failure(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        verdict, reason, parse_failed, _w = _parse_judge_response("")
-        assert verdict == "continue"
-        assert parse_failed is True
-        assert "empty" in reason.lower()
-
-    def test_parse_response_flags_non_json_as_parse_failure(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        verdict, reason, parse_failed, _w = _parse_judge_response(
-            "Let me analyze whether the goal is fully satisfied based on the agent's response..."
-        )
-        assert verdict == "continue"
-        assert parse_failed is True
-        assert "not json" in reason.lower()
-
-    def test_parse_response_clean_json_is_not_parse_failure(self):
-        from hermes_cli.goals import _parse_judge_response
-
-        verdict, _, parse_failed, _w = _parse_judge_response(
-            '{"done": false, "reason": "more work"}'
-        )
-        assert verdict == "continue"
-        assert parse_failed is False
-
-    def test_api_error_does_not_count_as_parse_failure(self):
-        """Transient network/API errors must not trip the auto-pause guard."""
-        from hermes_cli import goals
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            side_effect=RuntimeError("connection reset"),
-        ):
-            verdict, _, parse_failed, _wd, transport_failed = goals.judge_goal(
-                "goal", "response"
-            )
-        assert verdict == "continue"
-        assert parse_failed is False
-        assert transport_failed is True
-
-    def test_empty_judge_reply_flagged_as_parse_failure(self):
-        """End-to-end: judge returns empty content → parse_failed=True."""
-        from hermes_cli import goals
-
-        with patch(
-            "agent.auxiliary_client.call_llm",
-            return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=""))]),
-        ):
-            verdict, _, parse_failed, _wd, _tf = goals.judge_goal("goal", "response")
-        assert verdict == "continue"
-        assert parse_failed is True
-
-    def test_auto_pause_after_three_consecutive_parse_failures(self, hermes_home):
-        """N=3 consecutive parse failures → auto-pause with config pointer."""
-        from hermes_cli import goals
-        from hermes_cli.goals import GoalManager, DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
-
-        assert DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES == 3
-        mgr = GoalManager(session_id="parse-fail-sid-1", default_max_turns=20)
-        mgr.set("do a thing")
-
-        with patch.object(
-            goals, "judge_goal", return_value=("continue", "judge returned empty response", True, None, False)
-        ):
-            d1 = mgr.evaluate_after_turn("step 1")
-            assert d1["should_continue"] is True
-            assert mgr.state.consecutive_parse_failures == 1
-
-            d2 = mgr.evaluate_after_turn("step 2")
-            assert d2["should_continue"] is True
-            assert mgr.state.consecutive_parse_failures == 2
-
-            d3 = mgr.evaluate_after_turn("step 3")
-            assert d3["should_continue"] is False
-            assert d3["status"] == "paused"
-            assert mgr.state.consecutive_parse_failures == 3
-            # Message points at the config surface so the user can fix it.
-            assert "auxiliary" in d3["message"]
-            assert "goal_judge" in d3["message"]
-            assert "config.yaml" in d3["message"]
-
-    def test_parse_failure_counter_resets_on_good_reply(self, hermes_home):
-        """A single good judge reply resets the counter — transient flakes don't pause."""
-        from hermes_cli import goals
-        from hermes_cli.goals import GoalManager
-
-        mgr = GoalManager(session_id="parse-fail-sid-2", default_max_turns=20)
-        mgr.set("another goal")
-
-        # Two parse failures…
-        with patch.object(
-            goals, "judge_goal", return_value=("continue", "not json", True, None, False)
-        ):
-            mgr.evaluate_after_turn("step 1")
-            mgr.evaluate_after_turn("step 2")
-            assert mgr.state.consecutive_parse_failures == 2
-
-        # …then one clean reply resets the counter.
-        with patch.object(
-            goals, "judge_goal", return_value=("continue", "making progress", False, None, False)
-        ):
-            d = mgr.evaluate_after_turn("step 3")
-            assert d["should_continue"] is True
-            assert mgr.state.consecutive_parse_failures == 0
-
-    def test_transport_failures_do_not_increment_parse_counter(self, hermes_home):
-        """Transport failures use their own counter and a good reply resets both."""
-        from hermes_cli import goals
-        from hermes_cli.goals import GoalManager
-
-        mgr = GoalManager(session_id="parse-fail-sid-3", default_max_turns=20)
-        mgr.set("goal")
-        assert mgr.state is not None
-
-        with patch.object(
-            goals,
-            "judge_goal",
-            return_value=(
-                "continue",
-                "judge error: RuntimeError",
-                False,
-                None,
-                True,
-            ),
-        ):
-            for _ in range(2):
-                d = mgr.evaluate_after_turn("still going")
-                assert d["should_continue"] is True
-            assert mgr.state.consecutive_parse_failures == 0
-            assert mgr.state.consecutive_transport_failures == 2
-            assert mgr.state.status == "active"
-
-        with patch.object(
-            goals,
-            "judge_goal",
-            return_value=("continue", "making progress", False, None, False),
-        ):
-            d = mgr.evaluate_after_turn("recovered")
-
-        assert d["should_continue"] is True
-        assert mgr.state.consecutive_parse_failures == 0
-        assert mgr.state.consecutive_transport_failures == 0
-
-    def test_consecutive_parse_failures_persists_across_goalmanager_reloads(
-        self, hermes_home
-    ):
-        """The counter must be durable so cross-session resumes see it."""
-        from hermes_cli import goals
-        from hermes_cli.goals import GoalManager, load_goal
-
-        mgr = GoalManager(session_id="parse-fail-sid-4", default_max_turns=20)
-        mgr.set("persistent goal")
-
-        with patch.object(
-            goals, "judge_goal", return_value=("continue", "empty", True, None, False)
-        ):
-            mgr.evaluate_after_turn("r")
-            mgr.evaluate_after_turn("r")
-
-        reloaded = load_goal("parse-fail-sid-4")
-        assert reloaded is not None
-        assert reloaded.consecutive_parse_failures == 2
-
-
-# ──────────────────────────────────────────────────────────────────────
 # /subgoal — user-added criteria
 # ──────────────────────────────────────────────────────────────────────
 
@@ -853,69 +501,6 @@ class TestContinuationPromptWithSubgoals:
         assert "2. update docs" in prompt
 
 
-class TestJudgeGoalWithSubgoals:
-    def test_judge_uses_subgoals_template_when_provided(self, hermes_home):
-        """judge_goal switches templates when subgoals is non-empty.
-
-        We don't actually call the model — we patch the aux client to
-        capture the prompt that would be sent.
-        """
-        from unittest.mock import patch
-        from hermes_cli import goals
-
-        captured = {}
-
-        class _FakeMsg:
-            content = '{"done": true, "reason": "all done"}'
-        class _FakeChoice:
-            message = _FakeMsg()
-        class _FakeResp:
-            choices = [_FakeChoice()]
-        def _fake_call_llm(**kwargs):
-            captured.update(kwargs)
-            return _FakeResp()
-
-        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
-            verdict, reason, parse_failed, _wd, _tf = goals.judge_goal(
-                "ship the feature",
-                "ok shipped",
-                subgoals=["write tests", "update docs"],
-            )
-
-        # The aux client was called with a prompt that includes the subgoals.
-        sent_messages = captured.get("messages") or []
-        user_msg = next((m["content"] for m in sent_messages if m["role"] == "user"), "")
-        assert "Additional criteria" in user_msg
-        assert "1. write tests" in user_msg
-        assert "2. update docs" in user_msg
-        assert "every additional criterion" in user_msg
-        assert verdict == "done"
-
-    def test_judge_uses_original_template_when_no_subgoals(self, hermes_home):
-        from unittest.mock import patch
-        from hermes_cli import goals
-
-        captured = {}
-
-        class _FakeMsg:
-            content = '{"done": true, "reason": "ok"}'
-        class _FakeChoice:
-            message = _FakeMsg()
-        class _FakeResp:
-            choices = [_FakeChoice()]
-        def _fake_call_llm(**kwargs):
-            captured.update(kwargs)
-            return _FakeResp()
-
-        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
-            goals.judge_goal("ship it", "done", subgoals=None)
-
-        sent_messages = captured.get("messages") or []
-        user_msg = next((m["content"] for m in sent_messages if m["role"] == "user"), "")
-        assert "Additional criteria" not in user_msg
-        assert "ship it" in user_msg
-
-
 class TestStatusLineSubgoalCount:
     def test_status_line_no_subgoals(self, hermes_home):
         from hermes_cli.goals import GoalManager
@@ -979,10 +564,9 @@ class TestWaitBarrier:
             mgr.wait_on(proc.pid, reason="CI green")
             assert mgr.is_waiting() is True
 
-            # The judge must NOT be called while parked, and no turn is burned.
-            judge = MagicMock(return_value=("continue", "x", False, None, False))
-            with patch.object(goals, "judge_goal", judge):
-                decision = mgr.evaluate_after_turn("still waiting on CI")
+            # No turn is burned and response prose is not interpreted.
+            authority = _begin_goal_turn(mgr)
+            decision = mgr.evaluate_after_turn("still waiting on CI", **authority)
 
             assert decision["verdict"] == "waiting"
             assert decision["should_continue"] is False
@@ -1010,8 +594,11 @@ class TestWaitBarrier:
         assert mgr.is_waiting() is False  # lazy auto-clear
         assert mgr.state.waiting_on_pid is None
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "more", False, None, False)):
-            decision = mgr.evaluate_after_turn("process finished, here are results")
+        authority = _begin_goal_turn(mgr)
+        mgr.record_model_outcome("continue", "more", **authority)
+        decision = mgr.evaluate_after_turn(
+            "process finished, here are results", **authority
+        )
 
         assert decision["verdict"] == "continue"
         assert decision["should_continue"] is True
@@ -1026,8 +613,9 @@ class TestWaitBarrier:
         # is_waiting clears the stale barrier immediately.
         assert mgr.is_waiting() is False
 
-        with patch.object(goals, "judge_goal", return_value=("continue", "go", False, None, False)):
-            decision = mgr.evaluate_after_turn("response")
+        authority = _begin_goal_turn(mgr)
+        mgr.record_model_outcome("continue", "go", **authority)
+        decision = mgr.evaluate_after_turn("response", **authority)
         assert decision["should_continue"] is True
 
     def test_stop_waiting_clears_barrier(self, hermes_home):
@@ -1121,19 +709,12 @@ class TestMechanicalWait:
         try:
             mgr = GoalManager(session_id="jw-pid", default_max_turns=10)
             mgr.set("ship the PR")
-            # Judge sees the running process and says wait-on-pid.
-            with patch.object(
-                goals, "judge_goal",
-                return_value=("wait", "CI watcher still running", False, {"pid": proc.pid}, False),
-            ):
-                decision = mgr.evaluate_after_turn(
-                    "Pushed the PR, watching CI.",
-                    background_processes=[{
-                        "pid": proc.pid, "command": "wait_for_pr_green.sh",
-                        "status": "running", "uptime_seconds": 12,
-                    }],
-                )
-            assert decision["verdict"] == "wait"
+            mgr.wait_on(proc.pid, "CI watcher still running")
+            authority = _begin_goal_turn(mgr, "waiting-turn-1")
+            decision = mgr.evaluate_after_turn(
+                "Pushed the PR, watching CI.", **authority
+            )
+            assert decision["verdict"] == "waiting"
             assert decision["should_continue"] is False
             assert decision["continuation_prompt"] is None
             assert mgr.state.waiting_on_pid == proc.pid
@@ -1153,12 +734,10 @@ class TestMechanicalWait:
 
         mgr = GoalManager(session_id="jw-secs", default_max_turns=10)
         mgr.set("retry after backoff")
-        with patch.object(
-            goals, "judge_goal",
-            return_value=("wait", "rate limited", False, {"seconds": 120}, False),
-        ):
-            decision = mgr.evaluate_after_turn("Hit a 429, backing off.")
-        assert decision["verdict"] == "wait"
+        mgr.wait_for_seconds(120, "rate limited")
+        authority = _begin_goal_turn(mgr)
+        decision = mgr.evaluate_after_turn("Hit a 429, backing off.", **authority)
+        assert decision["verdict"] == "waiting"
         assert decision["should_continue"] is False
         assert mgr.state.waiting_until > 0
         assert mgr.state.waiting_on_pid is None
@@ -1182,14 +761,13 @@ class TestMechanicalWait:
 
         mgr = GoalManager(session_id="jw-cont", default_max_turns=10)
         mgr.set("do work")
-        with patch.object(
-            goals, "judge_goal",
-            return_value=("continue", "more to do", False, None, False),
-        ):
-            decision = mgr.evaluate_after_turn(
-                "made progress",
-                background_processes=[{"pid": 999999, "command": "x", "status": "running"}],
-            )
+        authority = _begin_goal_turn(mgr)
+        mgr.record_model_outcome("continue", "more to do", **authority)
+        decision = mgr.evaluate_after_turn(
+            "made progress",
+            **authority,
+            background_processes=[{"pid": 999999, "command": "x", "status": "running"}],
+        )
         assert decision["verdict"] == "continue"
         assert decision["should_continue"] is True
         assert mgr.state.waiting_on_pid is None
@@ -1249,19 +827,10 @@ class TestSessionTriggerBarrier:
         s, _reg = self._inject("proc_t4", watch_patterns=["BUILD SUCCESSFUL"])
         mgr = GoalManager(session_id="st-goal", default_max_turns=10)
         mgr.set("wait for the build to succeed")
-        with patch.object(
-            goals, "judge_goal",
-            return_value=("wait", "blocked on build", False, {"session_id": "proc_t4"}, False),
-        ):
-            decision = mgr.evaluate_after_turn(
-                "Started the build watcher.",
-                background_processes=[{
-                    "session_id": "proc_t4", "pid": 4242, "command": "watcher.sh",
-                    "status": "running", "watch_patterns": ["BUILD SUCCESSFUL"],
-                    "watch_hit": False,
-                }],
-            )
-        assert decision["verdict"] == "wait"
+        mgr.wait_on_session("proc_t4", "blocked on build")
+        authority = _begin_goal_turn(mgr, "session-wait-1")
+        decision = mgr.evaluate_after_turn("Started the build watcher.", **authority)
+        assert decision["verdict"] == "waiting"
         assert mgr.state.waiting_on_session == "proc_t4"
         assert mgr.is_waiting() is True
 
@@ -1275,10 +844,10 @@ class TestSessionTriggerBarrier:
         assert mgr.is_waiting() is False
         assert mgr.state.waiting_on_session is None
 
-        # Loop resumes with a real judge verdict.
-        with patch.object(goals, "judge_goal",
-                          return_value=("continue", "build done", False, None, False)):
-            d3 = mgr.evaluate_after_turn("build succeeded")
+        # Loop resumes with the primary model's structured outcome.
+        authority = _begin_goal_turn(mgr, "session-wait-3")
+        mgr.record_model_outcome("continue", "build done", **authority)
+        d3 = mgr.evaluate_after_turn("build succeeded", **authority)
         assert d3["should_continue"] is True
 
     def test_wait_on_session_validation(self, hermes_home):
@@ -1534,91 +1103,83 @@ class TestGoalTurnAuthority:
         old_authority = _begin_goal_turn(mgr, "old-turn")
         new_authority = _begin_goal_turn(mgr, "new-turn")
 
-    def test_draft_returns_none_on_bad_json(self, hermes_home):
-        from unittest.mock import patch
-        from hermes_cli import goals
-
-        class _FakeMsg:
-            content = "I cannot produce JSON, sorry"
-        class _FakeChoice:
-            message = _FakeMsg()
-        class _FakeResp:
-            choices = [_FakeChoice()]
-        with patch("agent.auxiliary_client.call_llm",
-                   return_value=_FakeResp()):
-            assert goals.draft_contract("anything") is None
-
-    def test_draft_returns_none_when_no_client(self, hermes_home):
-        from unittest.mock import patch
-        from hermes_cli import goals
-
-        with patch("agent.auxiliary_client.call_llm",
-                   side_effect=RuntimeError("No LLM provider configured")):
-            assert goals.draft_contract("anything") is None
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Compose: completion contract + wait barrier in one judge call
-# ──────────────────────────────────────────────────────────────────────
-
-
-class TestContractAndBackgroundCompose:
-    """A contract goal blocked on a background process must surface BOTH
-    the contract block and the background-process list to the judge, so it
-    can return either done (evidence met) or wait (parked on the poller)."""
-
-    def _capture_call_llm(self, captured, content='{"verdict": "wait", "wait_on_pid": 4242, "reason": "CI still running"}'):
-        """judge_goal routes through call_llm (#35566) — capture its kwargs."""
-        class _FakeMsg:
-            pass
-        _FakeMsg.content = content
-        class _FakeChoice:
-            message = _FakeMsg()
-        class _FakeResp:
-            choices = [_FakeChoice()]
-
-        def _fake(**kwargs):
-            captured.update(kwargs)
-            return _FakeResp()
-        return _fake
-
-    def test_judge_prompt_carries_contract_and_background(self, hermes_home):
-        from unittest.mock import patch
-        from hermes_cli import goals
-        from hermes_cli.goals import GoalContract
-
-        captured = {}
-        bg = [{
-            "session_id": "ci-watch", "pid": 4242, "status": "running",
-            "command": "wait_for_pr_green.sh 50501", "trigger": "exit",
-        }]
-        with patch("agent.auxiliary_client.call_llm",
-                   side_effect=self._capture_call_llm(captured)):
-            verdict, reason, parse_failed, wait_directive, _tf = goals.judge_goal(
-                "ship the PR",
-                "I pushed and started the CI watcher; waiting on it now.",
-                contract=GoalContract(verification="PR CI goes green"),
-                background_processes=bg,
-            )
-        user_msg = next(
-            (m["content"] for m in (captured.get("messages") or []) if m["role"] == "user"), ""
+        late = GoalManager("authority-late")
+        assert not late.record_model_outcome(
+            "complete", "late completion", **old_authority
+        )
+        assert not late.record_model_contract(
+            {"verification": "late proof"}, **old_authority
+        )
+        assert late.record_model_outcome(
+            "continue", "current turn", **new_authority
         )
 
     def test_abandon_revokes_pending_and_late_writes(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
-        captured = {}
-        bg = [{"session_id": "ci", "pid": 4242, "status": "running", "command": "ci", "trigger": "exit"}]
-        with patch("agent.auxiliary_client.call_llm",
-                   side_effect=self._capture_call_llm(
-                       captured,
-                       content='{"verdict": "done", "reason": "CI is green, evidence shown"}',
-                   )):
-            verdict, reason, parse_failed, wait_directive, _tf = goals.judge_goal(
-                "ship the PR",
-                "CI finished: 30 passed, 0 failed. Done.",
-                contract=GoalContract(verification="PR CI goes green"),
-                background_processes=bg,
+        mgr = GoalManager("authority-abandon")
+        mgr.set("do the work")
+        authority = _begin_goal_turn(mgr)
+        assert mgr.record_model_outcome("complete", "premature", **authority)
+
+        assert mgr.abandon_model_turn(**authority)
+        assert mgr.state.active_model_turn_id is None
+        assert mgr.state.pending_model_outcome is None
+        assert not GoalManager("authority-abandon").record_model_outcome(
+            "complete", "late", **authority
+        )
+        stale = mgr.evaluate_after_turn("ignored", **authority)
+        assert stale["verdict"] == "stale"
+        assert stale["should_continue"] is False
+
+    def test_resume_and_new_goal_rotate_generation(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager("authority-generation")
+        first = mgr.set("first")
+        first_authority = _begin_goal_turn(mgr, "first-turn")
+        mgr.pause()
+        resumed = mgr.resume()
+        assert resumed.generation_id != first.generation_id
+        assert not mgr.record_model_outcome(
+            "complete", "late first", **first_authority
+        )
+
+        resumed_generation = resumed.generation_id
+        replacement = mgr.set("replacement")
+        assert replacement.generation_id != resumed_generation
+
+    def test_migration_revokes_parent_turn_on_both_rows(self, hermes_home):
+        from hermes_cli.goals import GoalManager, migrate_goal_to_session
+
+        parent = GoalManager("authority-parent")
+        parent.set("survive compression")
+        authority = _begin_goal_turn(parent, "parent-turn")
+
+        assert migrate_goal_to_session("authority-parent", "authority-child")
+        child = GoalManager("authority-child")
+        assert child.state.generation_id != authority["goal_generation_id"]
+        assert child.state.active_model_turn_id is None
+        assert not parent.record_model_outcome("complete", "late", **authority)
+        assert not child.record_model_contract(
+            {"verification": "late"}, **authority
+        )
+
+    def test_concurrent_contract_and_outcome_do_not_lose_fields(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        owner = GoalManager("authority-race")
+        owner.set("race safely")
+        authority = _begin_goal_turn(owner)
+        barrier = threading.Barrier(3)
+        results = []
+
+        def _write_outcome():
+            barrier.wait()
+            results.append(
+                GoalManager("authority-race").record_model_outcome(
+                    "continue", "more work", **authority
+                )
             )
 
         def _write_contract():

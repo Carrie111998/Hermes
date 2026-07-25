@@ -5428,9 +5428,13 @@ class TestApiKeyStartupGuardFailsClosed:
     class _Stub:
         name = "api_server"
         _host = "0.0.0.0"
+        _api_bearer_verifier = None
 
         def __init__(self, key):
             self._api_key = key
+
+        def _api_auth_configured(self):
+            return bool(self._api_key)
 
     @staticmethod
     def _guard(key):

@@ -6391,10 +6391,17 @@ class SlackAdapter(BasePlatformAdapter):
             if not smart_denied and allow_session:
                 actions.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Always Allow"},
-                    "action_id": "hermes_approve_always",
+                    "text": {"type": "plain_text", "text": "Allow Session"},
+                    "action_id": "hermes_approve_session",
                     "value": session_key,
                 })
+                if allow_permanent:
+                    actions.append({
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Always Allow"},
+                        "action_id": "hermes_approve_always",
+                        "value": session_key,
+                    })
             actions.append({
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Deny"},

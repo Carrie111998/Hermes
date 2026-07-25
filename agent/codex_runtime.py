@@ -692,6 +692,11 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # Capture the Hermes turn identity before entering the runtime.  The
+    # app-server may fail before producing its own turn object, but the
+    # partial/error result must still be attributable to the inbound turn.
+    _hermes_turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -848,7 +853,6 @@ def run_codex_app_server_turn(
 
     from agent.delivery_outcome import get_delivery_outcome
 
-    _hermes_turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     return {
         "final_response": turn.final_text,
         "messages": messages,

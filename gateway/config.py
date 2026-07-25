@@ -920,7 +920,6 @@ class GatewayConfig:
     
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
-
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
@@ -1460,15 +1459,6 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["write_sessions_json"] = yaml_cfg["write_sessions_json"]
             elif isinstance(gateway_section, dict) and "write_sessions_json" in gateway_section:
                 gw_data["write_sessions_json"] = gateway_section["write_sessions_json"]
-
-            if "filter_silence_narration" in yaml_cfg:
-                gw_data["filter_silence_narration"] = yaml_cfg[
-                    "filter_silence_narration"
-                ]
-            elif isinstance(gateway_section, dict) and "filter_silence_narration" in gateway_section:
-                gw_data["filter_silence_narration"] = gateway_section[
-                    "filter_silence_narration"
-                ]
 
             if "unauthorized_dm_behavior" in yaml_cfg:
                 gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(

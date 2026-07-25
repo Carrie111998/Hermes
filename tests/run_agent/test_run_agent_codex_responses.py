@@ -1252,7 +1252,11 @@ def test_explicit_typed_moa_config_remains_authoritative(monkeypatch):
     assert len(auxiliary_calls) == 1
     assert auxiliary_calls[0]["user_prompt"] == "explicit prompt"
     assert auxiliary_calls[0]["reference_models"] == [
-        {"provider": "openai-codex", "model": "gpt-5.5"}
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "enabled": True,
+        }
     ]
     assert "trusted auxiliary synthesis" in repr(captured_request["input"])
 

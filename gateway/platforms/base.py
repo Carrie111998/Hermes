@@ -5396,6 +5396,14 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
+                    _text_thread_metadata = prepare_outbound_intent_metadata(
+                        _final_thread_metadata,
+                        source=event.source,
+                        session_key=session_key,
+                        inbound_message_id=_reply_anchor,
+                        intent_kind="assistant.final_response",
+                        content=text_content,
+                    )
                     result = await delivery_adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

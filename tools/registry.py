@@ -165,7 +165,22 @@ def _check_fn_cached(fn: Callable) -> bool:
     last-good True is returned and the failure is NOT cached, so the next call
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
+
+    Checks marked ``__hermes_context_sensitive__`` are evaluated directly.
+    Their result depends on request-local ContextVars, so a process-global TTL
+    entry could leak one session's availability decision into another.
     """
+    if getattr(fn, "__hermes_context_sensitive__", False):
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "context-sensitive check_fn %s raised; dependent tools will "
+                "be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+            )
+            return False
+
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)

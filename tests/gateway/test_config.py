@@ -1028,20 +1028,6 @@ class TestLoadGatewayConfig:
 
         assert config.always_log_local is False
 
-    def test_filter_silence_narration_from_nested_gateway_section(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(
-            "gateway:\n  filter_silence_narration: false\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        config = load_gateway_config()
-
-        assert config.filter_silence_narration is False
-
     def test_unauthorized_dm_behavior_from_nested_gateway_section(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

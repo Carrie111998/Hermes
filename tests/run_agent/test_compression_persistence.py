@@ -368,7 +368,17 @@ class TestFlushAfterCompression:
                 for i in range(12)
             ]
 
-            with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            summary_response = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="durable compacted summary")
+                    )
+                ]
+            )
+            with patch(
+                "agent.context_compressor.call_llm",
+                return_value=summary_response,
+            ):
                 compress_context(
                     agent, messages, approx_tokens=100_000, system_message="sys"
                 )

@@ -22,17 +22,38 @@ from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 # Helpers
 # =====================================================================
 
+@pytest.fixture(autouse=True)
+def _isolate_discord_channel_policy(monkeypatch):
+    """Keep earlier config-bridge tests from changing batching semantics."""
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+
+
 def _make_event(
     text: str,
     platform: Platform,
     chat_id: str = "12345",
     msg_type: MessageType = MessageType.TEXT,
 ) -> MessageEvent:
-    return MessageEvent(
+    event = MessageEvent(
         text=text,
         message_type=msg_type,
         source=SessionSource(platform=platform, chat_id=chat_id, chat_type="dm"),
     )
+    if platform == Platform.DISCORD:
+        # Delayed dispatch re-attests public visibility when the Canonical
+        # writer policy has been latched by an earlier test. Model a real
+        # public guild message rather than a metadata-free synthetic event.
+        default_role = object()
+        event.raw_message = SimpleNamespace(
+            channel=SimpleNamespace(
+                id=int(chat_id),
+                guild=SimpleNamespace(id=1, default_role=default_role),
+                permissions_for=lambda role: SimpleNamespace(
+                    view_channel=role is default_role
+                ),
+            )
+        )
+    return event
 
 
 # =====================================================================

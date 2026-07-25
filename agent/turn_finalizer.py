@@ -375,6 +375,26 @@ def finalize_turn(
                 # otherwise ``/resume`` reloads ``content=""`` and the bug
                 # resurfaces cross-session.
                 _tail.pop("_db_persisted", None)
+            if _runtime_boundary_receipt:
+                _receipt_message = messages[-1] if messages else None
+                if (
+                    isinstance(_receipt_message, dict)
+                    and _receipt_message.get("role") == "assistant"
+                    and _receipt_message.get("content") == final_response
+                ):
+                    from agent.message_provenance import (
+                        MESSAGE_PROVENANCE_KEY,
+                        RUNTIME_BOUNDARY_RECEIPT_KIND,
+                        bind_message_fragment,
+                    )
+
+                    _receipt_message[MESSAGE_PROVENANCE_KEY] = (
+                        bind_message_fragment(
+                            _receipt_message.get(MESSAGE_PROVENANCE_KEY),
+                            kind=RUNTIME_BOUNDARY_RECEIPT_KIND,
+                            exact_text=final_response,
+                        )
+                    )
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the

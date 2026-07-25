@@ -8,7 +8,6 @@ import sys
 import pytest
 
 from agent.prompt_builder import (
-    _scan_context_content,
     _truncate_content,
     _parse_skill_file,
     _skill_should_show,
@@ -83,17 +82,6 @@ class TestContextContentSovereignty:
         (tmp_path / "SOUL.md").write_text(content, encoding="utf-8")
 
         assert load_soul_md() == content
-
-    def test_leading_utf8_bom_stripped_not_blocked(self):
-        content = "\ufeffUse Python 3.12 with FastAPI for this project."
-        result = _scan_context_content(content, "SOUL.md")
-        assert "BLOCKED" not in result
-        assert result == "Use Python 3.12 with FastAPI for this project."
-
-    def test_bom_in_middle_still_blocked(self):
-        result = _scan_context_content("normal text\ufeffmore", "test.md")
-        assert "BLOCKED" in result
-
 
 # =========================================================================
 # Content truncation

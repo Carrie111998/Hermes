@@ -158,18 +158,18 @@ def test_all_chat_gateways_preserve_status_meaning(platform, message):
 @pytest.mark.parametrize(
     "message", ROUTINE_COMPRESSION_STATUS_SAMPLES, ids=lambda m: m[:32]
 )
-def test_all_routine_compression_statuses_suppressed_from_source_constants(
+def test_all_routine_compression_statuses_preserved_from_source_constants(
     platform, message
 ):
-    """Every ROUTINE compression status the agent actually emits is filtered.
+    """Every routine compression status keeps its authored meaning.
 
     Iterates the sample-formatted status strings built from the SAME
     constants the emission sites use (agent/conversation_compression.py's
     ROUTINE_COMPRESSION_STATUS_SAMPLES), so a reworded emit site that drifts
-    past the noise regex fails here without anyone remembering to re-copy
-    the literal into this file.
+    remains covered without anyone remembering to re-copy the literal into
+    this file. Delivery policy is structured; wording is never authority.
     """
-    assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+    assert _prepare_gateway_status_message(platform, "lifecycle", message) == message
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)

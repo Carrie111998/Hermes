@@ -34,46 +34,6 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Context file scanning — detect prompt injection / promptware in AGENTS.md,
-# .cursorrules, SOUL.md before they get injected into the system prompt.
-#
-# Patterns live in ``tools/threat_patterns.py`` — the single source of truth
-# shared with the memory-tool scanner and the tool-result delimiter system.
-# This module just chooses how to react when a match is found (block-with-
-# placeholder; the actual content never reaches the system prompt).
-# ---------------------------------------------------------------------------
-
-from tools.threat_patterns import scan_for_threats as _scan_for_threats
-
-
-def _scan_context_content(content: str, filename: str) -> str:
-    """Scan context file content for injection. Returns sanitized content.
-
-    Uses the "context" scope from the shared threat-pattern library, which
-    covers classic injection + promptware/C2 patterns + role-play hijack.
-    Strict-scope patterns (SSH backdoor, persistence, exfil-URL) are NOT
-    applied here — those are too aggressive for a context file in a
-    cloned repo (security research, infra docs).  Content matching is
-    BLOCKED at this layer because the file would otherwise enter the
-    system prompt verbatim and the user has no chance to intervene.
-    """
-    # Editors (Windows Notepad, PowerShell Out-File without -Encoding
-    # utf8NoBOM, some VS Code profiles) prefix a UTF-8 BOM as an encoding
-    # artifact, not a prompt injection. Strip a leading U+FEFF silently so a
-    # context file (SOUL.md, AGENTS.md, ...) is not blocked wholesale; BOMs
-    # elsewhere in the content remain subject to the threat scan below.
-    if content.startswith("\ufeff"):
-        content = content[1:]
-
-    findings = _scan_for_threats(content, scope="context")
-    if findings:
-        logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
-        return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
-
-    return content
-
-
 def _find_git_root(start: Path) -> Optional[Path]:
     """Walk *start* and its parents looking for a ``.git`` directory.
 

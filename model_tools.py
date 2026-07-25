@@ -285,6 +285,19 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _toolsets_have_context_sensitive_checks(
+    enabled_toolsets: Optional[List[str]],
+) -> bool:
+    """Return whether tool availability can vary between request contexts."""
+    if enabled_toolsets is None:
+        return True
+    return any(
+        "cronjob" in resolve_toolset(toolset_name)
+        for toolset_name in enabled_toolsets
+        if validate_toolset(toolset_name)
+    )
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -317,7 +330,11 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    if quiet_mode:
+    use_memoized_definitions = (
+        quiet_mode
+        and not _toolsets_have_context_sensitive_checks(enabled_toolsets)
+    )
+    if use_memoized_definitions:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -346,7 +363,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode:
+    if use_memoized_definitions:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a

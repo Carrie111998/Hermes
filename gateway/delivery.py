@@ -9,7 +9,6 @@ Routes messages to the appropriate destination based on:
 """
 
 import logging
-import re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -26,32 +25,6 @@ logger = logging.getLogger(__name__)
 # entirely — the adapter chunks in its own send() and the full output is
 # preserved.
 MAX_PLATFORM_OUTPUT = 4000
-
-# Matches strings that are *only* a "silence" narration with optional markdown
-# wrappers. Covers: *(silent)*, _silent_, `silent`, ~silent~, (silent), silent,
-# 🔇, a bare ".", "…", and the whitespace/marker-padded variants seen in the
-# wild. Anchored to start/end so substantive messages that merely *contain* the
-# word "silent" are never matched.
-_SILENCE_NARRATION = re.compile(
-    r'^[\s*_~`]*\(?\s*(silent|silence|no\s+response|no\s+reply)\s*\.?\)?[\s*_~`]*$'
-    r'|^[\s*_~`]*[\U0001F507\.\u2026]+[\s*_~`]*$',
-    re.IGNORECASE,
-)
-
-
-def _is_silence_narration(content: Optional[str]) -> bool:
-    """Return True when ``content`` is *only* a silence-narration token.
-
-    Length-guarded (real messages are longer) and anchored to the whole string
-    so legitimate prose like "The deployment ran silently" or "Silence is
-    golden — here is the plan..." is never flagged.
-    """
-    if not content:
-        return False
-    stripped = content.strip()
-    if not stripped or len(stripped) > 64:  # length guard
-        return False
-    return bool(_SILENCE_NARRATION.match(stripped))
 
 from .config import Platform, GatewayConfig, PlatformConfig
 from .session import SessionSource
@@ -606,5 +579,4 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
 

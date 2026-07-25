@@ -18,6 +18,8 @@ from gateway.channel_directory import (
     _build_discord,
     _build_from_sessions,
     _build_slack,
+    is_discord_public_target,
+    lookup_discord_public_target,
     _slack_directory_warning_last,
 )
 

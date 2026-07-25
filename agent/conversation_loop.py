@@ -1028,7 +1028,7 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while agent.iteration_budget.remaining > 0 or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1243,6 +1243,29 @@ def run_conversation(
             # event row enters the live history.
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+
+            # Give the one closing grace call a transient mechanical boundary
+            # receipt on the existing tool-result tail. It is never persisted
+            # and never masquerades as a user instruction.
+            if (
+                _budget_grace_iteration
+                and idx == len(messages) - 1
+                and msg.get("role") == "tool"
+            ):
+                _budget_receipt = (
+                    "\n\n[RUNTIME ITERATION SLICE RECEIPT]\n"
+                    "execution_slice_remaining=0\n"
+                    "additional_tool_execution_authorized=false\n"
+                    "transcript_and_canonical_checkpoint_preserved=true"
+                )
+                _content = api_msg.get("content", "")
+                if isinstance(_content, str):
+                    api_msg["content"] = _content + _budget_receipt
+                elif isinstance(_content, list):
+                    api_msg["content"] = [
+                        *_content,
+                        {"type": "text", "text": _budget_receipt},
+                    ]
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -6298,126 +6321,6 @@ def run_conversation(
                 ):
                     messages.pop()
 
-                try:
-                    from agent.verification_stop import (
-                        build_verify_on_stop_nudge,
-                        verify_on_stop_enabled,
-                    )
-
-                    if verify_on_stop_enabled():
-                        _verify_nudge = build_verify_on_stop_nudge(
-                            session_id=getattr(agent, "session_id", None),
-                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            attempts=getattr(agent, "_verification_stop_nudges", 0),
-                        )
-                    else:
-                        _verify_nudge = None
-                except Exception:
-                    logger.debug("verification stop-loop check failed", exc_info=True)
-                    _verify_nudge = None
-
-                if _verify_nudge:
-                    agent._verification_stop_nudges = (
-                        getattr(agent, "_verification_stop_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("verify-on-stop interim flush failed", exc_info=True)
-                    messages.append({
-                        "role": "user",
-                        "content": _verify_nudge,
-                        "_verification_stop_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    # Run the verification-stop loop silently — the nudge is an
-                    # internal turn that should not add noise to the user's
-                    # terminal. Keep a debug breadcrumb in agent.log for tracing.
-                    logger.debug("verification stop-loop nudge issued (attempt %d)",
-                                 agent._verification_stop_nudges)
-                    # Keep the attempted answer only as an explicit fallback for
-                    # continuation-budget exhaustion.  ``final_response`` itself
-                    # must be cleared so the finalizer can distinguish this gate
-                    # from unrelated error/recovery exits. (#61631)
-                    # Track whether this candidate was already streamed so the
-                    # finalizer can mark the turn previewed only if the
-                    # candidate is actually reused as the final response.
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
-
-                # User verification-loop gate: when the agent edited code this
-                # turn, let a registered `pre_verify` hook (plugin/shell) keep it
-                # going one more turn. The shipped guidance is folded into the
-                # evidence-based verify-on-stop nudge above, so this path has no
-                # default continuation cost.
-                _verify_nudge2 = None
-                _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
-                _attempt = getattr(agent, "_pre_verify_nudges", 0)
-                try:
-                    from agent.verify_hooks import max_verify_nudges
-                    from hermes_cli.plugins import get_pre_verify_continue_message, has_hook
-
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
-                        # Posture is fixed for the session — resolve once + cache.
-                        coding = getattr(agent, "_resolved_is_coding", None)
-                        if coding is None:
-                            from agent.coding_context import is_coding_context
-                            coding = bool(is_coding_context(platform=getattr(agent, "platform", "") or ""))
-                            agent._resolved_is_coding = coding
-                        _verify_nudge2 = get_pre_verify_continue_message(
-                            session_id=getattr(agent, "session_id", None) or "",
-                            platform=getattr(agent, "platform", "") or "",
-                            model=getattr(agent, "model", "") or "",
-                            coding=coding,
-                            attempt=_attempt,
-                            final_response=final_response,
-                            changed_paths=_edited,
-                        )
-                except Exception:
-                    logger.debug("pre_verify hook check failed", exc_info=True)
-                    _verify_nudge2 = None
-
-                if _verify_nudge2:
-                    agent._pre_verify_nudges = _attempt + 1
-                    final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("pre_verify interim flush failed", exc_info=True)
-                    messages.append({
-                        "role": "user",
-                        "content": _verify_nudge2,
-                        "_pre_verify_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    logger.debug("pre_verify nudge issued (attempt %d)",
-                                 agent._pre_verify_nudges)
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
-
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the
@@ -6563,8 +6466,9 @@ def run_conversation(
             # rather than retrying until the budget is exhausted.
             if (
                 _is_local_processing_error
-                or api_call_count >= agent.max_iterations - 1
+                or agent.iteration_budget.remaining <= 1
             ):
+                failed = True
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"

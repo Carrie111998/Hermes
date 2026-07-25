@@ -5919,19 +5919,32 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                **agent_overrides,
-                route=route,
-            ))
+            cleanup_ref = [None]
+            self._publish_api_authority_not_created(cleanup_ref, None)
+            try:
+                agent_task = asyncio.ensure_future(
+                    self._run_agent_from_reservation(
+                        reservation,
+                        user_message=user_message,
+                        conversation_history=history,
+                        ephemeral_system_prompt=system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_on_delta,
+                        tool_start_callback=_on_tool_start,
+                        tool_complete_callback=_on_tool_complete,
+                        agent_ref=agent_ref,
+                        cleanup_ref=cleanup_ref,
+                        gateway_session_key=gateway_session_key,
+                        **agent_overrides,
+                        route=route,
+                        clarify_notify_callback=_on_clarify,
+                        approval_event_callback=_on_approval,
+                    )
+                )
+            except Exception:
+                reservation.release()
+                raise
+            agent_task.add_done_callback(lambda _task: reservation.release())
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
@@ -7339,20 +7352,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 _stream_q.put((tag, payload))
 
             agent_ref = [None]
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
-                session_id=session_id,
-                stream_delta_callback=_on_delta,
-                tool_progress_callback=_on_tool_progress,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                **agent_overrides,
-                route=route,
-            ))
+            cleanup_ref = [None]
+            self._publish_api_authority_not_created(cleanup_ref, None)
+            try:
+                agent_task = asyncio.ensure_future(
+                    self._run_agent_from_reservation(
+                        reservation,
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        ephemeral_system_prompt=instructions,
+                        session_id=session_id,
+                        stream_delta_callback=_on_delta,
+                        tool_progress_callback=_on_tool_progress,
+                        tool_start_callback=_on_tool_start,
+                        tool_complete_callback=_on_tool_complete,
+                        agent_ref=agent_ref,
+                        cleanup_ref=cleanup_ref,
+                        gateway_session_key=gateway_session_key,
+                        **agent_overrides,
+                        route=route,
+                        clarify_notify_callback=_on_clarify,
+                        approval_event_callback=_on_approval,
+                    )
+                )
+            except Exception:
+                reservation.release()
+                raise
+            agent_task.add_done_callback(lambda _task: reservation.release())
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
@@ -8659,6 +8685,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        clarify_notify_callback=None,
+        approval_event_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -8669,16 +8697,6 @@ class APIServerAdapter(BasePlatformAdapter):
         *route* is an optional ``model_routes`` entry (resolved from the
         request's ``model`` field) that overrides the global model/provider
         for this specific request.
-
-        *session_model* is a raw model persisted on a native API session
-        row.  It is used only when the persisted value did not resolve to a
-        ``model_routes`` alias — see ``_create_agent`` for precedence.
-
-        *requested_runtime* / *route_source* / *confirmed_runtime_lock*
-        carry the Browser model-lock contract: when a confirmed lock is
-        active the completed agent's actual provider/model must match the
-        locked selection or the turn fails, and the response carries
-        sanitized ``runtime`` metadata reporting actual vs requested.
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -8699,162 +8717,367 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 cleanup_ref.append(pending_state)
         loop = asyncio.get_running_loop()
-        # Capture before hopping to the executor — ContextVars do not follow
-        # run_in_executor threads, so the profile scope must be re-entered
-        # inside _run() from this explicit value.
-        request_profile = _api_request_profile.get()
+        owned_agent_ref: list[Any] = [None]
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.approval import (
+                clear_session_local,
+                register_gateway_notify,
+                reset_current_session_key,
+                set_current_session_key,
+                unregister_gateway_notify,
+            )
 
-            with self._profile_scope(request_profile):
-                tokens = self._bind_api_server_session(
-                    chat_id=session_id or "",
-                    session_key=gateway_session_key or session_id or "",
-                    session_id=session_id or "",
-                )
+            # Cached agents carry mutable callbacks/transcript state.  Serialize
+            # exact-session turns from cache lookup through final cache fencing.
+            with self._api_agent_run_lock_for(session_id):
                 try:
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=stream_delta_callback,
-                        tool_progress_callback=tool_progress_callback,
-                        tool_start_callback=tool_start_callback,
-                        tool_complete_callback=tool_complete_callback,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=requested_model,
-                        requested_provider=requested_provider,
-                        model_options=model_options,
-                        route=route,
-                        session_model=session_model,
-                        confirmed_runtime_lock=confirmed_runtime_lock,
+                    # The long-term-memory key may span conversation rotations;
+                    # dangerous-action authority must be exact-conversation
+                    # scoped instead.
+                    bound_session_key = session_id or gateway_session_key or ""
+                    stable_memory_key = str(gateway_session_key or "")
+                    if (
+                        stable_memory_key
+                        and stable_memory_key != bound_session_key
+                    ):
+                        # Older API versions used the long-lived memory key as
+                        # their local approval namespace.  Fence any residual
+                        # process-local authority before the exact conversation
+                        # starts.  No durable authority envelope is issued for
+                        # this memory-only key in the new runtime.
+                        clear_session_local(stable_memory_key)
+                    approval_token = None
+                    approval_notify_registered = False
+                    try:
+                        tokens = self._bind_api_server_session(
+                            chat_id=session_id or "",
+                            session_key=bound_session_key,
+                            session_id=session_id or "",
+                        )
+                    except Exception:
+                        self._publish_api_authority_not_created(
+                            cleanup_ref,
+                            cleanup_state_callback,
+                        )
+                        raise
+                    bound_capability_epoch_sha256 = tokens.capability_epoch_sha256
+                    cleanup_handle = _APIServerCleanupHandle(
+                        bound_session_key,
+                        bound_capability_epoch_sha256,
+                        contextvars.copy_context(),
                     )
-                    if agent_ref is not None:
-                        agent_ref[0] = agent
-                    effective_task_id = session_id or str(uuid.uuid4())
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
+                    self._publish_api_cleanup_state(
+                        cleanup_handle,
+                        cleanup_ref,
+                        cleanup_state_callback,
                     )
+                    result: Any = None
                     usage = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
                     }
-                    # Include the effective session ID in the result so callers
-                    # (e.g. X-Hermes-Session-Id header) can track compression-
-                    # triggered session rotations. (#16938)
-                    _eff_sid = getattr(agent, "session_id", session_id)
-                    if isinstance(_eff_sid, str) and _eff_sid:
-                        result["session_id"] = _eff_sid
-                    # Signal whether context compression occurred during this turn
-                    # so _build_response_conversation_history can skip the
-                    # prior-concatenation path and store the compressed transcript
-                    # directly.  Rotation mode changes agent.session_id; in-place
-                    # mode sets _last_compaction_in_place (see #38763).
-                    _compacted_in_place = bool(getattr(agent, "_last_compaction_in_place", False))
-                    _session_rotated = (
-                        isinstance(_eff_sid, str) and isinstance(session_id, str)
-                        and _eff_sid != session_id
-                    )
-                    if _compacted_in_place or _session_rotated:
-                        result["_compressed"] = True
-                    include_runtime = bool(
-                        requested_runtime
-                        or route
-                        or confirmed_runtime_lock
-                        or (route_source and route_source != "global")
-                    )
-                    if include_runtime:
-                        runtime = dict(getattr(agent, "_hermes_api_runtime", {}) or {})
-                        raw_provider = getattr(agent, "provider", "")
-                        raw_model = getattr(agent, "model", "")
-                        actual_provider = (
-                            self._clean_runtime_id(raw_provider, max_len=80)
-                            if isinstance(raw_provider, str)
-                            else ""
-                        )
-                        actual_model = (
-                            self._clean_runtime_id(raw_model)
-                            if isinstance(raw_model, str)
-                            else ""
-                        )
-                        if actual_provider:
-                            runtime["provider"] = actual_provider
-                        else:
-                            runtime.setdefault("provider", "")
-                        if actual_model:
-                            runtime["model"] = actual_model
-                        else:
-                            runtime.setdefault("model", "")
-                        if confirmed_runtime_lock:
-                            expected_provider = self._clean_runtime_id(
-                                (route or {}).get("provider")
-                                or (requested_runtime or {}).get("provider"),
-                                max_len=80,
+                    execution_error: Optional[Exception] = None
+                    agent = None
+                    try:
+                        try:
+                            approval_token = set_current_session_key(
+                                bound_session_key
                             )
-                            expected_model = self._clean_runtime_id(
-                                (route or {}).get("model")
-                                or (requested_runtime or {}).get("model")
+                            model_release_receipt = self._admit_bound_api_server_run(
+                                session_id=str(session_id or ""),
+                                capability_epoch_sha256=(
+                                    bound_capability_epoch_sha256
+                                ),
                             )
-                            mismatched = (
-                                (expected_provider and actual_provider != expected_provider)
-                                or (expected_model and actual_model != expected_model)
-                            )
-                            if mismatched:
-                                raise RuntimeError(
-                                    "confirmed model lock runtime mismatch: "
-                                    f"expected provider={expected_provider or '<unspecified>'} "
-                                    f"model={expected_model or '<unspecified>'}; "
-                                    f"actual provider={actual_provider or '<unknown>'} "
-                                    f"model={actual_model or '<unknown>'}"
+                            if model_release_receipt is not None:
+                                cleanup_handle.model_release_receipt = dict(
+                                    model_release_receipt
                                 )
-                        if requested_runtime:
-                            runtime["requested"] = {
-                                "provider": self._clean_runtime_id((requested_runtime or {}).get("provider"), max_len=80),
-                                "model": self._clean_runtime_id((requested_runtime or {}).get("model")),
+                                self._publish_api_cleanup_state(
+                                    cleanup_handle,
+                                    cleanup_ref,
+                                    cleanup_state_callback,
+                                )
+                            approval_notify = self._make_api_approval_notify(
+                                session_id=str(session_id or ""),
+                                approval_session_key=bound_session_key,
+                                event_callback=approval_event_callback,
+                            )
+                            register_gateway_notify(
+                                bound_session_key,
+                                approval_notify,
+                            )
+                            approval_notify_registered = True
+                            agent = self._create_agent(
+                                ephemeral_system_prompt=ephemeral_system_prompt,
+                                session_id=session_id,
+                                stream_delta_callback=stream_delta_callback,
+                                tool_progress_callback=tool_progress_callback,
+                                tool_start_callback=tool_start_callback,
+                                tool_complete_callback=tool_complete_callback,
+                                gateway_session_key=gateway_session_key,
+                                requested_model=requested_model,
+                                requested_provider=requested_provider,
+                                model_options=model_options,
+                                route=route,
+                                session_model=session_model,
+                                confirmed_runtime_lock=confirmed_runtime_lock,
+                                clarify_notify_callback=clarify_notify_callback,
+                            )
+                            owned_agent_ref[0] = agent
+                            agent._api_approval_session_key = bound_session_key
+                            with self._api_agent_cache_lock:
+                                self._api_active_agents[id(agent)] = agent
+                            if agent_ref is not None:
+                                agent_ref[0] = agent
+                            effective_task_id = session_id or str(uuid.uuid4())
+                            self._attest_capability_agent_policy(agent)
+                            result = agent.run_conversation(
+                                user_message=user_message,
+                                conversation_history=conversation_history,
+                                task_id=effective_task_id,
+                            )
+                            if isinstance(result, Mapping) and not isinstance(result, dict):
+                                result = dict(result)
+                            usage = {
+                                "input_tokens": getattr(
+                                    agent, "session_prompt_tokens", 0
+                                )
+                                or 0,
+                                "output_tokens": getattr(
+                                    agent, "session_completion_tokens", 0
+                                )
+                                or 0,
+                                "total_tokens": getattr(
+                                    agent, "session_total_tokens", 0
+                                )
+                                or 0,
                             }
-                        runtime["route_source"] = route_source or runtime.get("route_source") or "global"
-                        runtime = self._sanitize_runtime_metadata(
-                            runtime=runtime,
-                            requested_runtime=requested_runtime,
-                            route_source=route_source or "global",
-                            model_lock=("confirmed" if confirmed_runtime_lock else ""),
-                        )
-                        if isinstance(result, dict):
-                            result["runtime"] = runtime
-                        usage["runtime"] = runtime
-                    return result, usage
-                except _ProviderAuthResolutionError as exc:
-                    # Only _ProviderAuthResolutionError — raised exclusively
-                    # where _resolve_runtime_agent_kwargs() is called inside
-                    # _create_agent() — means a provider auth/credential
-                    # failure.  Catching bare RuntimeError here would
-                    # mislabel unrelated RuntimeErrors from
-                    # run_conversation() (e.g. "Failed to recreate closed
-                    # OpenAI client") as auth failures.  Matches run.py's
-                    # response shape (final_response text, no HTTP error).
-                    # Previously this propagated unhandled:
-                    # /v1/chat/completions caught it as an undifferentiated
-                    # "Internal server error" 500, and
-                    # /api/sessions/{id}/chat[/stream] didn't catch it at
-                    # all (raw aiohttp 500, no JSON body).  Handling it
-                    # here, once, covers every _run_agent() caller;
-                    # /v1/runs has its own branch in its executor.
-                    logger.warning("Provider authentication failed for session=%s: %s",
-                                   session_id or "", exc)
-                    return (
-                        {
-                            "final_response": f"⚠️ Provider authentication failed: {exc}",
-                            "messages": [],
-                            "api_calls": 0,
-                            "tools": [],
-                        },
-                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                            # Include the effective session ID in the result so
+                            # callers can track compression-triggered rotations.
+                            _eff_sid = getattr(agent, "session_id", session_id)
+                            if (
+                                isinstance(result, dict)
+                                and isinstance(_eff_sid, str)
+                                and _eff_sid
+                            ):
+                                result["session_id"] = _eff_sid
+                            _compacted_in_place = bool(
+                                getattr(agent, "_last_compaction_in_place", False)
+                            )
+                            _session_rotated = (
+                                isinstance(_eff_sid, str)
+                                and isinstance(session_id, str)
+                                and _eff_sid != session_id
+                            )
+                            if (
+                                isinstance(result, dict)
+                                and (_compacted_in_place or _session_rotated)
+                            ):
+                                result["_compressed"] = True
+                            include_runtime = bool(
+                                requested_runtime
+                                or route
+                                or confirmed_runtime_lock
+                                or (route_source and route_source != "global")
+                            )
+                            if include_runtime:
+                                runtime = dict(
+                                    getattr(agent, "_hermes_api_runtime", {}) or {}
+                                )
+                                raw_provider = getattr(agent, "provider", "")
+                                raw_model = getattr(agent, "model", "")
+                                actual_provider = (
+                                    self._clean_runtime_id(
+                                        raw_provider, max_len=80
+                                    )
+                                    if isinstance(raw_provider, str)
+                                    else ""
+                                )
+                                actual_model = (
+                                    self._clean_runtime_id(raw_model)
+                                    if isinstance(raw_model, str)
+                                    else ""
+                                )
+                                runtime["provider"] = actual_provider
+                                runtime["model"] = actual_model
+                                if confirmed_runtime_lock:
+                                    expected_provider = self._clean_runtime_id(
+                                        (route or {}).get("provider")
+                                        or (requested_runtime or {}).get("provider"),
+                                        max_len=80,
+                                    )
+                                    expected_model = self._clean_runtime_id(
+                                        (route or {}).get("model")
+                                        or (requested_runtime or {}).get("model")
+                                    )
+                                    if (
+                                        (
+                                            expected_provider
+                                            and actual_provider
+                                            != expected_provider
+                                        )
+                                        or (
+                                            expected_model
+                                            and actual_model != expected_model
+                                        )
+                                    ):
+                                        raise RuntimeError(
+                                            "confirmed model lock runtime mismatch: "
+                                            f"expected provider={expected_provider or '<unspecified>'} "
+                                            f"model={expected_model or '<unspecified>'}; "
+                                            f"actual provider={actual_provider or '<unknown>'} "
+                                            f"model={actual_model or '<unknown>'}"
+                                        )
+                                if requested_runtime:
+                                    runtime["requested"] = {
+                                        "provider": self._clean_runtime_id(
+                                            requested_runtime.get("provider"),
+                                            max_len=80,
+                                        ),
+                                        "model": self._clean_runtime_id(
+                                            requested_runtime.get("model")
+                                        ),
+                                    }
+                                runtime["route_source"] = (
+                                    route_source
+                                    or runtime.get("route_source")
+                                    or "global"
+                                )
+                                runtime = self._sanitize_runtime_metadata(
+                                    runtime=runtime,
+                                    requested_runtime=requested_runtime,
+                                    route_source=route_source or "global",
+                                    model_lock=(
+                                        "confirmed"
+                                        if confirmed_runtime_lock
+                                        else ""
+                                    ),
+                                )
+                                if isinstance(result, dict):
+                                    result["runtime"] = runtime
+                                usage["runtime"] = runtime
+                        except _ProviderAuthResolutionError as exc:
+                            logger.warning(
+                                "Provider authentication failed for session=%s: %s",
+                                session_id or "",
+                                exc,
+                            )
+                            result = {
+                                "final_response": (
+                                    "⚠️ Provider authentication failed: "
+                                    f"{exc}"
+                                ),
+                                "messages": [],
+                                "api_calls": 0,
+                                "tools": [],
+                            }
+                            usage = {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0,
+                            }
+                        except Exception as exc:
+                            execution_error = exc
+                    finally:
+                        try:
+                            self._attempt_api_server_cleanup_once(
+                                cleanup_handle,
+                                use_copied_context=False,
+                                cleanup_ref=cleanup_ref,
+                                cleanup_state_callback=cleanup_state_callback,
+                            )
+                        finally:
+                            try:
+                                if approval_notify_registered:
+                                    unregister_gateway_notify(bound_session_key)
+                            finally:
+                                try:
+                                    if approval_token is not None:
+                                        reset_current_session_key(approval_token)
+                                finally:
+                                    self._clear_api_approval_scope(
+                                        session_id,
+                                        approval_session_key=bound_session_key,
+                                    )
+                                    try:
+                                        if (
+                                            stable_memory_key
+                                            and stable_memory_key
+                                            != bound_session_key
+                                        ):
+                                            # A legacy/internal caller must not
+                                            # be able to leave fresh authority
+                                            # under the memory scope during this
+                                            # exact-conversation turn.
+                                            clear_session_local(
+                                                stable_memory_key,
+                                                retire_capability_epoch_sha256=(
+                                                    bound_capability_epoch_sha256
+                                                ),
+                                            )
+                                    finally:
+                                        clear_session_vars(tokens)
+
+                    evicted_agent = self._finalize_api_agent_cache_after_turn(
+                        requested_session_id=session_id,
+                        agent=agent,
+                        result=result,
+                        execution_error=execution_error,
                     )
-                finally:
-                    clear_session_vars(tokens)
+                    return (
+                        result,
+                        usage,
+                        execution_error,
+                        cleanup_handle,
+                        evicted_agent,
+                    )
+                except Exception:
+                    # Binding/cleanup failures are terminal for cache purposes.
+                    # Fence the exact instance before the serialized lock opens.
+                    evicted = self._pop_cached_api_agent(
+                        session_id,
+                        expected_agent=owned_agent_ref[0],
+                    )
+                    if evicted is not None:
+                        self._release_api_cached_agent(evicted)
+                    raise
+
+        async def _own_execution_and_cleanup(executor_future):
+            evicted_agent = None
+            try:
+                (
+                    result,
+                    usage,
+                    execution_error,
+                    cleanup_handle,
+                    evicted_agent,
+                ) = await asyncio.shield(executor_future)
+                if cleanup_handle.status != "confirmed":
+                    retry_task = self._ensure_api_cleanup_retry(
+                        cleanup_handle,
+                        cleanup_ref=cleanup_ref,
+                        cleanup_state_callback=cleanup_state_callback,
+                    )
+                    await asyncio.shield(retry_task)
+                return result, usage, execution_error
+            finally:
+                agent = owned_agent_ref[0]
+                release_deferred = False
+                if agent is not None:
+                    with self._api_agent_cache_lock:
+                        self._api_active_agents.pop(id(agent), None)
+                        if id(agent) in self._api_deferred_agent_releases:
+                            self._api_deferred_agent_releases.discard(id(agent))
+                            release_deferred = True
+                if evicted_agent is not None:
+                    self._release_api_cached_agent(evicted_agent)
+                elif release_deferred:
+                    self._release_api_cached_agent(agent)
+                self._inflight_agent_runs -= 1
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1

@@ -863,7 +863,7 @@ class QueuedCommentaryAgent:
 
 
 class QueuedSilenceAgent:
-    """First turn is intentionally silent; queued follow-up still runs."""
+    """First turn has a structured suppress receipt; follow-up still runs."""
 
     calls = 0
 
@@ -872,11 +872,20 @@ class QueuedSilenceAgent:
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         type(self).calls += 1
-        return {
+        result = {
             "final_response": "NO_REPLY" if type(self).calls == 1 else "follow-up processed",
             "messages": [],
             "api_calls": 1,
+            "failed": False,
         }
+        if type(self).calls == 1:
+            result["turn_id"] = "queued-suppressed-turn"
+            result["delivery_outcome"] = {
+                "action": "suppress",
+                "reason": "queued follow-up owns the visible response",
+                "turn_id": "queued-suppressed-turn",
+            }
+        return result
 
 
 class QueuedFailedEmptyAgent:
@@ -1362,7 +1371,7 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
 async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_followup(
     monkeypatch, tmp_path,
 ):
-    """Regression: queued direct-send must not leak NO_REPLY to the channel."""
+    """Regression: queued direct-send must honor the structured suppress receipt."""
     QueuedSilenceAgent.calls = 0
     adapter, result = await _run_with_agent(
         monkeypatch,
