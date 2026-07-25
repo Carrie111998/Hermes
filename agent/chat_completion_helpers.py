@@ -827,11 +827,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # directly in the content rather than returning separate API fields).
     if not reasoning_text:
         content = assistant_message.content or ""
-        think_blocks = re.findall(
-            r'<(?:mm:think|think)>(.*?)</(?:mm:think|think)>',
-            content,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
+        think_matches = re.finditer(
+    r'<(?P<tag>mm:think|think)>(?P<body>.*?)</(?P=tag)>',
+    content,
+    flags=re.DOTALL | re.IGNORECASE,
+)
+think_blocks = [match.group("body") for match in think_matches]
         if think_blocks:
             combined = "\n\n".join(b.strip() for b in think_blocks if b.strip())
             reasoning_text = combined or None
@@ -1478,11 +1479,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if final_response:
             if re.search(r'<(?:mm:think|think)>', final_response, flags=re.IGNORECASE):
                 final_response = re.sub(
-                    r'<(?:mm:think|think)>.*?</(?:mm:think|think)>\s*',
-                    '',
-                    final_response,
-                    flags=re.DOTALL | re.IGNORECASE,
-                ).strip()
+                r'<(?P<tag>mm:think|think)>.*?</(?P=tag)>\s*',
+                '',
+                final_response,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
             if final_response:
                 messages.append({"role": "assistant", "content": final_response})
             else:
@@ -1525,12 +1526,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if final_response:
                 if re.search(r'<(?:mm:think|think)>', final_response, flags=re.IGNORECASE):
-                    final_response = re.sub(
-                        r'<(?:mm:think|think)>.*?</(?:mm:think|think)>\s*',
-                        '',
-                        final_response,
-                        flags=re.DOTALL | re.IGNORECASE,
-                    ).strip()
+                   final_response = re.sub(
+                    r'<(?P<tag>mm:think|think)>.*?</(?P=tag)>\s*',
+                    '',
+                    final_response,
+                    flags=re.DOTALL | re.IGNORECASE,
+                ).strip()
                 if final_response:
                     messages.append({"role": "assistant", "content": final_response})
                 else:
