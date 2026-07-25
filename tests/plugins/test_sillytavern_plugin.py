@@ -79,6 +79,11 @@ def test_register_exposes_sillytavern_to_agents():
         tool.get("check_fn") is None or callable(tool["check_fn"])
         for tool in context.tools
     )
+    slash_names = {args[0] for args, _ in context.commands}
+    assert slash_names == {"rp", "st-voice-roleplay"}
+    assert "sillytavern" in context.cli_commands
+    assert callable(context.cli_commands["sillytavern"]["setup_fn"])
+    assert callable(context.cli_commands["sillytavern"]["handler_fn"])
 
 
 def test_status_reports_install_state(monkeypatch, tmp_path):

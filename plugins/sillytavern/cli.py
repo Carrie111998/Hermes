@@ -25,10 +25,32 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     generate.add_argument("--temperature", type=float, default=None)
     generate.add_argument("--acknowledge-side-effects", action="store_true")
 
+    # Slash-equivalent quick ops (same handlers as /rp and /st-voice-roleplay).
+    rp = subs.add_parser("rp", help="ST-native roleplay quick ops (same as /rp)")
+    rp.add_argument("rp_args", nargs=argparse.REMAINDER, help="passthrough to /rp")
+
+    voice = subs.add_parser(
+        "voice-roleplay",
+        help="Voice roleplay quick ops (same as /st-voice-roleplay)",
+    )
+    voice.add_argument(
+        "voice_args", nargs=argparse.REMAINDER, help="passthrough to /st-voice-roleplay"
+    )
+
 
 def _print(payload: dict[str, object]) -> int:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if payload.get("success", True) else 1
+
+
+def _print_text(text: str) -> int:
+    print(text)
+    lowered = text.lstrip()
+    if lowered.startswith("{") and '"ok": false' in lowered.lower():
+        return 1
+    if lowered.startswith("{") and '"ok":false' in lowered.lower().replace(" ", ""):
+        return 1
+    return 0
 
 
 def sillytavern_command(args: argparse.Namespace) -> int:
@@ -59,5 +81,27 @@ def sillytavern_command(args: argparse.Namespace) -> int:
             "acknowledge_side_effects": args.acknowledge_side_effects,
         }
         return _print(core.generate(values))
-    print("usage: hermes sillytavern {status,capabilities,start,stop,generate}")
+    if command == "rp":
+        from .slash import handle_rp
+
+        raw = " ".join(getattr(args, "rp_args", []) or []).strip()
+        # argparse REMAINDER may keep a leading "--"
+        if raw.startswith("-- "):
+            raw = raw[3:].strip()
+        elif raw == "--":
+            raw = ""
+        return _print_text(handle_rp(raw))
+    if command == "voice-roleplay":
+        from .slash import handle_st_voice_roleplay
+
+        raw = " ".join(getattr(args, "voice_args", []) or []).strip()
+        if raw.startswith("-- "):
+            raw = raw[3:].strip()
+        elif raw == "--":
+            raw = ""
+        return _print_text(handle_st_voice_roleplay(raw))
+    print(
+        "usage: hermes sillytavern "
+        "{status,capabilities,start,stop,generate,rp,voice-roleplay}"
+    )
     return 2

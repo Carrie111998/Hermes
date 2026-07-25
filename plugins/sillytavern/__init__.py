@@ -1072,3 +1072,30 @@ def register(ctx):
         handler=sillytavern_audio_land,
         check_fn=_installed,
     )
+
+    # Slash + terminal CLI stay in the plugin (no core cli.py / COMMAND_REGISTRY).
+    from .cli import register_cli, sillytavern_command
+    from .slash import handle_rp, handle_st_voice_roleplay
+
+    ctx.register_command(
+        "rp",
+        handler=handle_rp,
+        description="ST-native roleplay quick ops (list/create/start/say/reply/summary/memory/lore).",
+        args_hint="[list|create|start|say|reply|summary|memory|lore|status|help]",
+    )
+    ctx.register_command(
+        "st-voice-roleplay",
+        handler=handle_st_voice_roleplay,
+        description="Voice roleplay turn helpers (STT → ST-native → TTS).",
+        args_hint="[start|complete|status] <session_id> [args...]",
+    )
+    ctx.register_cli_command(
+        name="sillytavern",
+        help="Manage local SillyTavern and ST-native roleplay helpers",
+        setup_fn=register_cli,
+        handler_fn=sillytavern_command,
+        description=(
+            "Start/stop/status for the pinned SillyTavern server, generate via its "
+            "API, and run ST-native / voice roleplay quick ops without core CLI wiring."
+        ),
+    )
