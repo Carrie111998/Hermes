@@ -2187,6 +2187,20 @@ def run_conversation(
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
 
+                    # Record the authoritative provider response in Plutus.
+                    # Use aggregator_usage rather than canonical_usage: MoA
+                    # advisor fan-out is already folded into session totals but
+                    # is not a second response from this provider call.
+                    try:
+                        from agent.plutus_metering import meter_normalized_usage
+                        meter_normalized_usage(
+                            aggregator_usage,
+                            provider=_agg_cost_provider,
+                            model=_agg_cost_model,
+                        )
+                    except Exception as _plutus_meter_exc:  # fail-open accounting
+                        logger.debug("Plutus provider metering unavailable: %s", _plutus_meter_exc)
+
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
                     # sessions (gateway, cron, delegated runs) cannot lose
