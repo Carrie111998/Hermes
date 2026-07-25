@@ -50,6 +50,13 @@ from .models import (
     SubmissionRequest,
 )
 from .policy import ExecutionPolicy
+from .performance_evaluation import (
+    PaperPerformanceEvaluation,
+    PaperPerformancePolicy,
+    PaperPerformanceRecommendation,
+    PaperTradeOutcome,
+    evaluate_paper_trading_performance,
+)
 from .session_lifecycle import (
     PaperTradingSession,
     PaperTradingSessionEvent,
@@ -122,4 +129,9 @@ __all__ = [
     "request_paper_trading_session_close",
     "resume_paper_trading_session",
     "start_paper_trading_session",
+    "PaperPerformanceEvaluation",
+    "PaperPerformancePolicy",
+    "PaperPerformanceRecommendation",
+    "PaperTradeOutcome",
+    "evaluate_paper_trading_performance",
 ]
