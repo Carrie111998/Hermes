@@ -475,13 +475,14 @@ def _spawn_supervisor_for_next_layer(state, state_path):
             return
 
         # Check if a supervisor is already running for this workflow
-        existing = subprocess.run(
-            ["pgrep", "-f", f"workflow_engine.*{workflow_name}.*{run_id}"],
-            capture_output=True, text=True
-        )
-        if existing.stdout.strip():
-            print(f"   ℹ  Supervisor already running for {workflow_name} (run {run_id}) — skipping spawn")
-            return
+        if run_id:
+            existing = subprocess.run(
+                ["pgrep", "-f", f"workflow_engine.*{workflow_name}.*{run_id}"],
+                capture_output=True, text=True
+            )
+            if existing.stdout.strip():
+                print(f"   ℹ  Supervisor already running for {workflow_name} (run {run_id}) — skipping spawn")
+                return
 
         # Spawn supervisor to create next layer's cards
         cmd = [
