@@ -21619,9 +21619,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
-            if session_key:
+            session_store = getattr(self, "session_store", None)
+            if session_key and session_store is not None:
                 # This block already runs in the agent worker thread.
-                self.session_store.set_session_metadata(
+                session_store.set_session_metadata(
                     session_key,
                     _CONTINUITY_CAPSULE_CAPABLE_METADATA,
                     turn_route["runtime"].get("api_mode") != "codex_app_server"
