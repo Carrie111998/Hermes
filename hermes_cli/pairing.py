@@ -18,7 +18,7 @@ def pairing_command(args):
     if action == "list":
         _cmd_list(store)
     elif action == "approve":
-        _cmd_approve(store, args.platform, args.code)
+        _cmd_approve(store, args.platform, args.code, getattr(args, "user_id_mode", False))
     elif action == "revoke":
         _cmd_revoke(store, args.platform, args.user_id)
     elif action == "clear-pending":
@@ -61,12 +61,15 @@ def _cmd_list(store):
     print()
 
 
-def _cmd_approve(store, platform: str, code: str):
-    """Approve a pairing code."""
+def _cmd_approve(store, platform: str, code: str, user_id_mode: bool = False):
+    """Approve a pairing code, or a pending request by user ID with --user-id."""
     platform = platform.lower().strip()
-    code = code.upper().strip()
 
-    result = store.approve_code(platform, code)
+    if user_id_mode:
+        result = store.approve_by_user_id(platform, code.strip())
+    else:
+        code = code.upper().strip()
+        result = store.approve_code(platform, code)
     if result:
         uid = result["user_id"]
         name = result.get("user_name") or ""

@@ -536,6 +536,53 @@ class PairingStore:
                 "user_name": matched_entry.get("user_name", ""),
             }
 
+    def approve_by_user_id(self, platform: str, user_id: str) -> Optional[dict]:
+        """
+        Approve a pending pairing request by user ID.
+
+        Alternative to ``approve_code`` for platforms where the pairing code
+        was never delivered to the operator (e.g. dropped DM, rate-limited
+        reply).  Looks up the pending entry by ``user_id`` instead of the
+        hashed code.
+
+        Returns ``{user_id, user_name}`` on success, ``None`` if no pending
+        entry matches the user ID or the platform is locked out.
+        """
+        with self._lock:
+            self._cleanup_expired(platform)
+            user_id = user_id.strip()
+
+            # Lockout check — same as approve_code to ensure consistency.
+            if self._is_locked_out(platform):
+                return None
+
+            pending = self._load_json(self._pending_path(platform))
+
+            matched_key = None
+            matched_entry = None
+            for entry_id, entry in pending.items():
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("user_id") == user_id:
+                    matched_key = entry_id
+                    matched_entry = entry
+                    break
+
+            if matched_key is None:
+                return None
+
+            del pending[matched_key]
+            self._save_json(self._pending_path(platform), pending)
+
+            # Add to approved list
+            self._approve_user(platform, matched_entry["user_id"],
+                               matched_entry.get("user_name", ""))
+
+            return {
+                "user_id": matched_entry["user_id"],
+                "user_name": matched_entry.get("user_name", ""),
+            }
+
     def list_pending(self, platform: str = None) -> list:
         """List pending pairing requests, optionally filtered by platform.
 

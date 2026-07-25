@@ -21,12 +21,16 @@ def build_pairing_parser(subparsers, *, cmd_pairing: Callable) -> None:
     pairing_sub.add_parser("list", help="Show pending + approved users")
 
     pairing_approve_parser = pairing_sub.add_parser(
-        "approve", help="Approve a pairing code"
+        "approve", help="Approve a pairing code or a pending request by user ID"
     )
     pairing_approve_parser.add_argument(
-        "platform", help="Platform name (telegram, discord, slack, whatsapp)"
+        "platform", help="Platform name (telegram, discord, slack, whatsapp, weixin)"
     )
-    pairing_approve_parser.add_argument("code", help="Pairing code to approve")
+    pairing_approve_parser.add_argument("code", help="Pairing code to approve (or user ID with --user-id)")
+    pairing_approve_parser.add_argument(
+        "--user-id", "-u", action="store_true", dest="user_id_mode",
+        help="Interpret the argument as a user ID (for when the pairing code was never delivered)"
+    )
 
     pairing_revoke_parser = pairing_sub.add_parser("revoke", help="Revoke user access")
     pairing_revoke_parser.add_argument("platform", help="Platform name")
