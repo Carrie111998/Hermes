@@ -82,6 +82,26 @@ def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
     return ["█" * max(1, int(v / peak * max_width)) if v > 0 else "" for v in values]
 
 
+
+def _safe_int(value: Any) -> int:
+    """Coerce a DB value to int, returning 0 for unparseable values (#71026)."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            return 0
+
+
 class InsightsEngine:
     """
     Analyzes session history and produces usage insights.
@@ -600,14 +620,14 @@ class InsightsEngine:
                 "input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_write_tokens", "reasoning_tokens", "api_call_count",
             ):
-                totals[key] += r[key] or 0
+                totals[key] += _safe_int(r[key])
             totals["estimated_cost_usd"] += r["estimated_cost_usd"] or 0.0
             totals["actual_cost_usd"] += r["actual_cost_usd"] or 0.0
             d = _accumulate(
                 r["model"], r["billing_provider"], r.get("billing_base_url"),
-                r["session_id"], r["input_tokens"] or 0, r["output_tokens"] or 0,
-                r["cache_read_tokens"] or 0, r["cache_write_tokens"] or 0,
-                r["reasoning_tokens"] or 0,
+                r["session_id"], _safe_int(r["input_tokens"]), _safe_int(r["output_tokens"]),
+                _safe_int(r["cache_read_tokens"]), _safe_int(r["cache_write_tokens"]),
+                _safe_int(r["reasoning_tokens"]),
                 stored_cost=(
                     r["estimated_cost_usd"]
                     if r.get("cost_status") or r.get("cost_source")
@@ -616,20 +636,20 @@ class InsightsEngine:
                 actual_cost=r["actual_cost_usd"],
                 cost_status=r.get("cost_status"),
             )
-            model_data[d]["api_calls"] += r["api_call_count"] or 0
+            model_data[d]["api_calls"] += _safe_int(r["api_call_count"])
 
         # Reconcile against the aggregate row. This covers legacy sessions,
         # interrupted migrations, and absolute cumulative updates without
         # double-counting already-attributed route deltas.
         for s in sessions:
             totals = usage_totals[s["id"]]
-            inp = max(0, (s.get("input_tokens") or 0) - totals["input_tokens"])
-            out = max(0, (s.get("output_tokens") or 0) - totals["output_tokens"])
+            inp = max(0, _safe_int(s.get("input_tokens")) - totals["input_tokens"])
+            out = max(0, _safe_int(s.get("output_tokens")) - totals["output_tokens"])
             cache_read = max(
-                0, (s.get("cache_read_tokens") or 0) - totals["cache_read_tokens"]
+                0, _safe_int(s.get("cache_read_tokens")) - totals["cache_read_tokens"]
             )
             cache_write = max(
-                0, (s.get("cache_write_tokens") or 0) - totals["cache_write_tokens"]
+                0, _safe_int(s.get("cache_write_tokens")) - totals["cache_write_tokens"]
             )
             residual_cost = max(
                 0.0, float(s.get("estimated_cost_usd") or 0.0)
@@ -640,7 +660,7 @@ class InsightsEngine:
                 - totals["actual_cost_usd"],
             )
             residual_calls = max(
-                0, (s.get("api_call_count") or 0) - totals["api_call_count"]
+                0, _safe_int(s.get("api_call_count")) - totals["api_call_count"]
             )
             if not (
                 inp or out or cache_read or cache_write or residual_cost
