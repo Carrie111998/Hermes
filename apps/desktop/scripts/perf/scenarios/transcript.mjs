@@ -3,7 +3,7 @@
 // mount→paint time plus any longtasks the mount blocks the main thread with.
 // This is the "open a long session" path — a first-impression latency.
 
-import { sleep } from '../lib/cdp.mjs'
+import { SELECTORS, sleep } from '../lib/cdp.mjs'
 
 const OBSERVE = `
   (() => {
@@ -27,24 +27,57 @@ export default {
     const turns = Number(opts.turns ?? 200)
 
     await cdp.send('Runtime.enable')
-    await cdp.eval(OBSERVE)
 
-    const mountMs = await cdp.eval(`window.__PERF_DRIVE__.loadTranscript(${turns})`)
+    let mountMs
+    let longtasks
+    let groupVisibility
 
-    // Let post-mount longtasks (content-visibility passes, virtualizer) settle.
-    await sleep(1500)
+    try {
+      await cdp.eval(OBSERVE)
+      mountMs = await cdp.eval(`window.__PERF_DRIVE__.loadTranscript(${turns})`)
 
-    const longtasks = await cdp.eval('window.__TM__.longtasks')
-    await cdp.eval('try { window.__TM__.po && window.__TM__.po.disconnect() } catch {}')
-    await cdp.eval('window.__PERF_DRIVE__.reset()')
+      // Let post-mount work settle before checking the rendered transcript.
+      await sleep(1500)
 
-    return {
-      metrics: {
-        transcript_mount_ms: Math.round(mountMs * 10) / 10,
-        transcript_longtask_ms: Math.round(longtasks.reduce((a, b) => a + b, 0) * 10) / 10,
-        transcript_longtask_max_ms: Math.round((longtasks.length ? Math.max(...longtasks) : 0) * 10) / 10
-      },
-      detail: { turns, messages: turns * 2, longtasks: longtasks.length }
+      longtasks = await cdp.eval('window.__TM__.longtasks')
+      groupVisibility = await cdp.eval(`(() => {
+        const groups = [...document.querySelectorAll(${JSON.stringify(SELECTORS.threadGroup)})]
+        return {
+          count: groups.length,
+          nonVisible: groups.filter(group => getComputedStyle(group).contentVisibility !== 'visible').length
+        }
+      })()`)
+
+      if (!groupVisibility.count) {
+        throw new Error('transcript scenario rendered no thread groups')
+      }
+
+      if (groupVisibility.nonVisible) {
+        throw new Error(
+          `transcript rendered ${groupVisibility.nonVisible}/${groupVisibility.count} groups without content-visibility:visible`
+        )
+      }
+
+      return {
+        metrics: {
+          transcript_mount_ms: Math.round(mountMs * 10) / 10,
+          transcript_longtask_ms: Math.round(longtasks.reduce((a, b) => a + b, 0) * 10) / 10,
+          transcript_longtask_max_ms: Math.round((longtasks.length ? Math.max(...longtasks) : 0) * 10) / 10
+        },
+        detail: {
+          turns,
+          messages: turns * 2,
+          longtasks: longtasks.length,
+          renderedGroups: groupVisibility.count,
+          contentVisibilityNonVisibleGroups: groupVisibility.nonVisible
+        }
+      }
+    } finally {
+      try {
+        await cdp.eval('try { window.__TM__?.po?.disconnect() } catch {}')
+      } finally {
+        await cdp.eval('window.__PERF_DRIVE__?.reset()')
+      }
     }
   }
 }
