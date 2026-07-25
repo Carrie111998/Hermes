@@ -910,6 +910,16 @@ class GatewaySlashCommandsMixin:
                 # apply there.
                 if caller_keys_on_alt and not (bool(row_chat) and bool(caller_chat)):
                     return False
+                if (not row_chat) and (not caller_chat):
+                    # Legacy NULL-chat DM row (created before the v23 schema
+                    # captured chat_id at session creation). It cannot prove the
+                    # caller's chat, but a DM keyed purely on the participant is
+                    # safe to resume on user_id equality alone — this restores
+                    # the pre-v23 resume behavior for single-user/single-chat
+                    # installs without weakening the guard for rows that DO
+                    # carry a chat_id. The caller_keys_on_alt gap above still
+                    # fails closed for multi-participant DMs. (CWE-639)
+                    return bool(row_uid) and row_uid == caller_uid
                 return (
                     bool(row_uid) and row_uid == caller_uid
                     and row_chat == caller_chat
