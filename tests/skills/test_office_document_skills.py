@@ -209,3 +209,30 @@ def test_check_bounding_boxes_reads_utf8_fields_json(tmp_path):
         f"script failed under non-UTF-8 locale:\n{result.stderr}"
     )
     assert "SUCCESS" in result.stdout
+
+
+# The extraction scripts write their JSON payload with json.dump, whose
+# default ensure_ascii=True keeps the bytes on disk pure ASCII — so these
+# writers are not broken today. They are pinned anyway: the codec is the
+# writer's contract, not a property of whatever the caller happens to dump,
+# and a later ensure_ascii=False would otherwise turn into silent mojibake
+# on any non-UTF-8 host.
+_ENCODING_SENSITIVE_WRITES = [
+    (
+        "pdf/scripts/extract_form_structure.py",
+        'with open(output_path, "w", encoding="utf-8") as f:',
+    ),
+    (
+        "pdf/scripts/extract_form_field_info.py",
+        'with open(json_output_path, "w", encoding="utf-8") as f:',
+    ),
+]
+
+
+@pytest.mark.parametrize("rel_path,expected", _ENCODING_SENSITIVE_WRITES)
+def test_document_writers_are_locale_independent(rel_path, expected):
+    """JSON payloads are written as UTF-8, never with the locale codec."""
+    source = (SKILLS / "productivity" / rel_path).read_text(encoding="utf-8")
+    assert expected in source, (
+        f"{rel_path}: locale-dependent write of a JSON payload"
+    )
