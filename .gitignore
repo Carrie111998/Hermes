@@ -225,3 +225,11 @@ nul
 # Local scratch / misgenerated Electron bundle (never publish)
 _tmp/
 /electron-main.mjs
+
+# Local-only: personal interview packs, ST DB lockfiles, unfinished ST Python package
+_interview_prep/
+interview_prep/
+sillytavern.db
+sillytavern_py/
+.stpy_verify.py
+fix_config2.py
