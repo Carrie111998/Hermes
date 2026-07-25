@@ -308,6 +308,33 @@ def test_docker_volumes_is_bridged_everywhere():
     assert "TERMINAL_DOCKER_VOLUMES" in _terminal_tool_env_var_names()
 
 
+def test_docker_runtime_is_bridged_everywhere():
+    """Regression pin for ``terminal.docker_runtime`` (opt-in gVisor/alternate
+    Docker runtime hardening).
+
+    Same four-site bridge invariant as docker_run_as_host_user /
+    docker_network — drift between any of the four sites means
+    ``terminal.docker_runtime: "runsc"`` in config.yaml silently does nothing
+    for that entry point, leaving the operator believing they have a
+    stronger kernel boundary than they actually do.
+    """
+    assert "docker_runtime" in _cli_env_map_keys()
+    assert "docker_runtime" in _gateway_env_map_keys()
+    assert "docker_runtime" in _save_config_env_sync_keys()
+    assert "TERMINAL_DOCKER_RUNTIME" in _terminal_tool_env_var_names()
+
+
+def test_docker_readonly_is_bridged_everywhere():
+    """Regression pin for ``terminal.docker_readonly`` (opt-in read-only
+    root filesystem hardening). Same four-site bridge invariant as
+    docker_runtime above.
+    """
+    assert "docker_readonly" in _cli_env_map_keys()
+    assert "docker_readonly" in _gateway_env_map_keys()
+    assert "docker_readonly" in _save_config_env_sync_keys()
+    assert "TERMINAL_DOCKER_READONLY" in _terminal_tool_env_var_names()
+
+
 def test_docker_forward_env_is_bridged_everywhere():
     """Regression pin for ``terminal.docker_forward_env`` — the sibling gap to
     docker_volumes.
