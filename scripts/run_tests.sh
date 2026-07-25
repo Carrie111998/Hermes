@@ -74,6 +74,21 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
 fi
 
 
+# ── Windows location variables (computed before we drop env) ───────────────
+# `env -i` forwards HOME, which is enough on POSIX. Native Windows CPython
+# resolves Path.home() from USERPROFILE (or HOMEDRIVE+HOMEPATH), and several
+# stdlib/platform paths come from LOCALAPPDATA/APPDATA. Dropping those makes
+# Path.home() fail during collection on native Windows. These are location
+# variables, not credentials, so forwarding them keeps the isolation intent
+# intact. Each is only forwarded when actually set, so POSIX runs are byte
+# for byte unchanged.
+WIN_ENV=()
+for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA; do
+  if [ -n "${!_win_var:-}" ]; then
+    WIN_ENV+=("$_win_var=${!_win_var}")
+  fi
+done
+
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
@@ -94,10 +109,12 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  PYTHONIOENCODING=utf-8 \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
