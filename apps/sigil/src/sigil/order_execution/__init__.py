@@ -59,6 +59,15 @@ from .live_certification import (
     effective_certification_status,
     revoke_live_trading_certification,
 )
+from .live_launch_control import (
+    LiveLaunchControl,
+    LiveLaunchControlPolicy,
+    LiveLaunchControlRequest,
+    LiveLaunchControlStatus,
+    arm_live_launch_control,
+    effective_live_launch_control_status,
+    suspend_live_launch_control,
+)
 from .live_eligibility import (
     LiveTradingEligibilityPolicy,
     LiveTradingEligibilityRequest,
@@ -172,4 +181,11 @@ __all__ = [
     "certify_live_trading",
     "effective_certification_status",
     "revoke_live_trading_certification",
+    "LiveLaunchControl",
+    "LiveLaunchControlPolicy",
+    "LiveLaunchControlRequest",
+    "LiveLaunchControlStatus",
+    "arm_live_launch_control",
+    "effective_live_launch_control_status",
+    "suspend_live_launch_control",
 ]
