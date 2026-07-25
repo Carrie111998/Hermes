@@ -1075,6 +1075,21 @@ def _get_db():
     return _db
 
 
+def _open_session_db(home: Path | None = None):
+    """Open a SessionDB bound to ``home`` (or the gateway launch home).
+
+    Used by resume / persist paths that must not inherit a stale process-global
+    ``_get_db()`` handle after ``_hermes_home`` is rebound (desktop launch-home
+    tests and app-global remote). Returns None when the store is unavailable.
+    """
+    from hermes_state import SessionDB
+
+    try:
+        return SessionDB(db_path=Path(home or _hermes_home) / "state.db")
+    except Exception:
+        return None
+
+
 def _db_for_profile(profile: str | None = None):
     """Return SessionDB for ``params.profile`` when it differs from launch.
 
@@ -2196,7 +2211,8 @@ def _ensure_session_db_row(session: dict) -> None:
     # Persist into the session's owning state.db. Profile sessions use their
     # profile home; default sessions use the gateway launch home explicitly so
     # they cannot inherit a stale global SessionDB handle.
-    db_home = Path(session.get("profile_home") or _hermes_home)
+    profile_home = session.get("profile_home")
+    db_home = Path(profile_home or _hermes_home)
     try:
         db = _open_session_db(db_home)
     except Exception:

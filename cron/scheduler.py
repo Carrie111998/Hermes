@@ -2325,8 +2325,22 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _scripts_dir_for_job(job: dict | None) -> Path:
+    """Resolve the scripts directory for a cron job.
+
+    A named profile selects its validated profile home, explicit ``default``
+    selects the canonical default root, and a missing profile follows the
+    scheduler's active home. Named resolution is derived from the immutable
+    job field rather than mutable process-global profile context.
+    """
+    scripts_dir = _execution_home_for_job(job) / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    return scripts_dir
+
+
 def _run_job_script(
     script_path: str,
+    job: dict | None = None,
     workdir: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
@@ -2498,7 +2512,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, job=job, workdir=workdir)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2529,10 +2543,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, job=job, workdir=workdir)
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, job=job, workdir=workdir)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
