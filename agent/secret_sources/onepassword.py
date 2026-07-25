@@ -172,6 +172,12 @@ def _validate_references(
             structured = None
         elif isinstance(ref, dict):
             ref_map = cast(Dict[str, object], ref)
+            non_string_fields = [key for key in ref_map if not isinstance(key, str)]
+            if non_string_fields:
+                warnings.append(
+                    f"Skipping {name!r}: structured mapping field names must be strings"
+                )
+                continue
             unknown = sorted(
                 set(ref_map)
                 - {"reference", "account", "service_account_token_env"}

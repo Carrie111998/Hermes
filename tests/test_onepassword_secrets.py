@@ -89,6 +89,20 @@ def test_validate_references_rejects_unknown_structured_keys():
     assert any("unknown field" in warning and "acount" in warning for warning in warnings)
 
 
+def test_validate_references_rejects_non_string_structured_keys():
+    valid, warnings = op._validate_references(
+        {
+            "WORK_KEY": {
+                "reference": "op://Work/Hermes/key",
+                1: "valid YAML key, invalid schema",
+            }
+        }
+    )
+
+    assert valid == {}
+    assert any("field names must be strings" in warning for warning in warnings)
+
+
 def test_structured_empty_routing_fields_override_profile_defaults():
     valid, warnings = op._validate_references(
         {

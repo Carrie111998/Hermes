@@ -175,7 +175,7 @@ Successful, complete pulls are cached in-process and on disk under `<hermes_home
 
 - stores only resolved secret **values** — never the service-account token or any raw auth material (auth is fingerprinted into the cache key);
 - is invalidated when any selected token, effective account, token-env routing, `OP_SESSION_*` identity, or reference mapping changes;
-- is bypassed for explicit desktop-auth routes because the desktop app's active identity has no stable environment fingerprint;
+- is bypassed whenever a route uses desktop authentication, including implicit fallback when a selected token variable is unset, because the desktop app's active identity has no stable environment fingerprint;
 - is **not** written when a pull had any per-reference error, so a transient auth failure isn't frozen in for the TTL;
 - is fully disabled — reads *and* writes — when `cache_ttl_seconds: 0`.
 

@@ -219,6 +219,31 @@ def test_status_checks_auth_readiness_per_effective_route(
     assert "skip 1Password" not in capsys.readouterr().out
 
 
+def test_status_normalizes_null_and_non_string_default_token_env(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(op_cli.op_src, "find_op", lambda binary_path="": None)
+    for raw_value, expected in (
+        (None, "OP_SERVICE_ACCOUNT_TOKEN"),
+        (123, "123"),
+    ):
+        monkeypatch.setattr(
+            op_cli,
+            "load_config",
+            lambda raw_value=raw_value: {
+                "secrets": {
+                    "onepassword": {
+                        "enabled": False,
+                        "service_account_token_env": raw_value,
+                    }
+                }
+            },
+        )
+
+        assert op_cli.cmd_status(argparse.Namespace()) == 0
+        assert expected in capsys.readouterr().out
+
+
 def test_status_marks_inherited_account_and_token_fields_independently(
     monkeypatch, capsys
 ):

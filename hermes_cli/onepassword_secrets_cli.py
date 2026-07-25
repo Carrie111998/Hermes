@@ -218,11 +218,16 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     enabled = bool(op_cfg.get("enabled"))
     account = str(op_cfg.get("account", "") or "").strip()
-    token_env = op_cfg.get("service_account_token_env", _DEFAULT_TOKEN_ENV)
+    raw_token_env = op_cfg.get("service_account_token_env", _DEFAULT_TOKEN_ENV)
+    token_env = (
+        _DEFAULT_TOKEN_ENV
+        if raw_token_env is None
+        else str(raw_token_env).strip()
+    )
     binary_path = str(op_cfg.get("binary_path", "") or "").strip()
     raw_references = op_cfg.get("env")
     references: dict = raw_references if isinstance(raw_references, dict) else {}
-    token_set = bool(os.environ.get(token_env))
+    token_set = bool(token_env and os.environ.get(token_env))
 
     binary = op_src.find_op(binary_path)
 
