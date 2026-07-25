@@ -86,6 +86,57 @@ describe('runtime message repository', () => {
     expect(appendedSource.map(item => item.id)).toEqual(['x', 'x', 'x:renderer-duplicate:2'])
   })
 
+  it('reserves historical renderer ids while their source occurrence is temporarily absent', async () => {
+    const initialSource = [message('x', 'user', 'one'), message('x', 'assistant', 'two')]
+    const { rerender } = render(<RuntimeHarness messages={initialSource} />)
+
+    await waitFor(() =>
+      expect(renderedMessages()).toEqual([
+        { id: 'x', text: 'one' },
+        { id: 'x:renderer-duplicate:2', text: 'two' }
+      ])
+    )
+
+    const withoutDuplicate = [
+      { ...initialSource[0] },
+      message('x:renderer-duplicate:2', 'assistant', 'legitimate suffix-shaped id')
+    ]
+
+    rerender(<RuntimeHarness messages={withoutDuplicate} />)
+
+    await waitFor(() =>
+      expect(renderedMessages()).toEqual([
+        { id: 'x', text: 'one' },
+        {
+          id: 'x:renderer-duplicate:2:renderer-duplicate:2',
+          text: 'legitimate suffix-shaped id'
+        }
+      ])
+    )
+
+    const restoredDuplicate = [
+      ...initialSource.map(item => ({ ...item })),
+      { ...withoutDuplicate[1] }
+    ]
+
+    rerender(<RuntimeHarness messages={restoredDuplicate} />)
+
+    await waitFor(() =>
+      expect(renderedMessages()).toEqual([
+        { id: 'x', text: 'one' },
+        { id: 'x:renderer-duplicate:2', text: 'two' },
+        {
+          id: 'x:renderer-duplicate:2:renderer-duplicate:2',
+          text: 'legitimate suffix-shaped id'
+        }
+      ])
+    )
+    expect(new Set(renderedMessages().map(item => item.id)).size).toBe(3)
+    expect(initialSource.map(item => item.id)).toEqual(['x', 'x'])
+    expect(withoutDuplicate.map(item => item.id)).toEqual(['x', 'x:renderer-duplicate:2'])
+    expect(restoredDuplicate.map(item => item.id)).toEqual(['x', 'x', 'x:renderer-duplicate:2'])
+  })
+
   it('preserves duplicate-id messages with deterministic renderer-only ids across updates', () => {
     const malformed = [
       message('reused-id', 'user', 'first visible message'),
