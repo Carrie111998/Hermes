@@ -88,6 +88,16 @@ class TestNormalizeMoaModel:
         assert _normalize_moa_model("moa:strategy") == ("moa", "strategy")
 
 
+    def test_bare_moa_maps_to_default_preset(self):
+        from cli import _normalize_moa_model
+
+        with patch("hermes_cli.config.load_config", return_value=_make_cli().config):
+            assert _normalize_moa_model("  MOA  ") == ("moa", "default")
+
+    def test_empty_moa_prefix_is_not_treated_as_virtual(self):
+        from cli import _normalize_moa_model
+        # No preset after the colon → leave untouched (no provider override).
+        assert _normalize_moa_model("moa:") == (None, "moa:")
 
 
     def test_none_model_unchanged(self):
@@ -113,3 +123,34 @@ class TestNormalizeMoaModel:
         assert requested_provider == "moa"
         assert model == "strategy"
 
+
+class TestBareMoaModelSwitch:
+    def test_bare_moa_reuses_default_preset_when_already_on_moa(self):
+        from hermes_cli.model_switch import switch_model
+
+        with (
+            patch("hermes_cli.config.load_config", return_value=_make_cli().config),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "moa-virtual-provider",
+                    "base_url": "moa://local",
+                    "api_mode": "chat_completions",
+                },
+            ),
+            patch("hermes_cli.model_switch.get_model_info", return_value=None),
+            patch("hermes_cli.model_switch.get_model_capabilities", return_value=None),
+        ):
+            result = switch_model(
+                "moa",
+                "moa",
+                "review",
+                current_base_url="moa://local",
+                current_api_key="moa-virtual-provider",
+                is_global=True,
+            )
+
+        assert result.success is True, result.error_message
+        assert result.target_provider == "moa"
+        assert result.new_model == "default"
+        assert result.is_global is True

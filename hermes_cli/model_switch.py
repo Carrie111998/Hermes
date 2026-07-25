@@ -1353,7 +1353,11 @@ def switch_model(
             from hermes_cli.moa_config import exact_moa_preset_name, normalize_moa_config
 
             _moa_cfg = normalize_moa_config(load_config().get("moa") or {})
-            _moa_match = exact_moa_preset_name(_moa_cfg, raw_input)
+            _moa_match = (
+                _moa_cfg["default_preset"]
+                if raw_input.strip().lower() == "moa"
+                else exact_moa_preset_name(_moa_cfg, raw_input)
+            )
             if _moa_match:
                 target_provider = "moa"
                 new_model = _moa_match
