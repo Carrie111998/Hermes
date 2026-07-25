@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import socket
+import threading
 import time
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -68,8 +69,13 @@ def _make_adapter(routes=None, **kwargs):
     return WebhookAdapter(config)
 
 
-def _delivery_key(route_name: str, delivery_id: str, profile: str = ""):
-    return (profile, route_name, delivery_id)
+def _delivery_key(
+    route_name: str,
+    delivery_id: str,
+    profile: str = "default",
+    provider: str = "x-github-delivery",
+):
+    return (profile, route_name, provider, delivery_id)
 
 
 def _create_app(adapter: WebhookAdapter) -> web.Application:
@@ -78,6 +84,9 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     app = web.Application(client_max_size=adapter._max_body_bytes)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    app.router.add_post(
+        "/p/{profile}/webhooks/{route_name}", adapter._handle_webhook
+    )
     return app
 
 
@@ -987,6 +996,117 @@ class TestPayloadFilters:
         adapter.handle_message.assert_not_called()
         assert _delivery_key("todoist", "script-nonzero-1") in adapter._seen_deliveries
 
+    @pytest.mark.asyncio
+    async def test_script_valid_non_object_output_is_consumed_once(
+        self, tmp_path, monkeypatch
+    ):
+        """A successful non-object transform is ignored but still deduplicated."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        counter = scripts / "runs.txt"
+        script = scripts / "array_transform.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            f"counter = Path({str(counter)!r})\n"
+            "runs = int(counter.read_text()) if counter.exists() else 0\n"
+            "counter.write_text(str(runs + 1))\n"
+            "print('[]')\n",
+            encoding="utf-8",
+        )
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": str(script),
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        headers = {"X-GitHub-Delivery": "non-object-once-1"}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/scripted", json={}, headers=headers)
+            retry = await cli.post("/webhooks/scripted", json={}, headers=headers)
+            first_data = await first.json()
+            retry_data = await retry.json()
+
+        assert first.status == 200
+        assert first_data["status"] == "ignored"
+        assert retry.status == 200
+        assert retry_data["status"] == "duplicate"
+        assert counter.read_text(encoding="utf-8") == "1"
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_script_empty_object_is_dispatched_as_empty_payload(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        script = scripts / "empty_object.py"
+        script.write_text("print('{}')\n", encoding="utf-8")
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Body: {body}",
+                "script": str(script),
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/scripted",
+                json={"body": "original"},
+                headers={"X-GitHub-Delivery": "empty-object-1"},
+            )
+
+        assert response.status == 202
+        await asyncio.sleep(0.05)
+        event = adapter.handle_message.call_args[0][0]
+        assert event.raw_message == {}
+        assert event.text == "Body: {body}"
+
+    @pytest.mark.asyncio
+    async def test_unexpected_transform_exception_releases_delivery_for_retry(
+        self, tmp_path
+    ):
+        script = tmp_path / "unused.py"
+        script.write_text("print('{}')\n", encoding="utf-8")
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": str(script),
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=[RuntimeError("transform crashed"), (False, None, True)]
+        )
+        headers = {"X-GitHub-Delivery": "transform-crash-1"}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            failed = await cli.post(
+                "/webhooks/scripted", json={}, headers=headers
+            )
+            retry = await cli.post(
+                "/webhooks/scripted", json={}, headers=headers
+            )
+            retry_data = await retry.json()
+
+        assert failed.status == 500
+        assert retry.status == 200
+        assert retry_data["status"] == "ignored"
+        assert adapter._route_processor.run_route_script.call_count == 2
+
 
 # ===================================================================
 # HTTP handling
@@ -1091,6 +1211,89 @@ class TestHTTPHandling:
 
 
 class TestIdempotency:
+
+    def test_delivery_identity_uses_canonical_header_precedence(self):
+        request = _mock_request(
+            headers={
+                "X-GitHub-Delivery": "github-id",
+                "svix-id": "svix-id",
+                "X-Request-ID": "request-id",
+            }
+        )
+
+        assert WebhookAdapter._delivery_identity(request) == (
+            "x-github-delivery",
+            "github-id",
+        )
+
+    @pytest.mark.asyncio
+    async def test_unprefixed_and_default_profile_alias_share_delivery_namespace(
+        self, monkeypatch
+    ):
+        """The two URL forms for agent:main must deduplicate one delivery."""
+        routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        runner = MagicMock()
+        runner.config.multiplex_profiles = True
+        adapter.gateway_runner = runner
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("default", None)],
+        )
+
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "profile-alias-1"}
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/idem", json={}, headers=headers)
+            retry = await cli.post(
+                "/p/default/webhooks/idem", json={}, headers=headers
+            )
+            retry_data = await retry.json()
+
+        assert first.status == 202
+        assert retry.status == 200
+        assert retry_data["status"] == "duplicate"
+        assert len(adapter._seen_deliveries) == 1
+
+    @pytest.mark.asyncio
+    async def test_equal_github_and_svix_ids_have_distinct_provider_namespaces(self):
+        """Provider-local IDs must not suppress a valid delivery from another provider."""
+        secret = "shared-provider-secret"
+        routes = {"idem": {"secret": secret, "prompt": "test"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        body = json.dumps({"event": "same-id"}).encode()
+        delivery_id = "provider-local-1"
+        timestamp = str(int(time.time()))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            github = await cli.post(
+                "/webhooks/idem",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GitHub-Delivery": delivery_id,
+                    "X-Hub-Signature-256": _github_signature(body, secret),
+                },
+            )
+            svix = await cli.post(
+                "/webhooks/idem",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "svix-id": delivery_id,
+                    "svix-timestamp": timestamp,
+                    "svix-signature": _svix_signature(
+                        body, secret, delivery_id, timestamp
+                    ),
+                },
+            )
+
+        assert github.status == 202
+        assert svix.status == 202
+        assert len(adapter._seen_deliveries) == 2
 
     @pytest.mark.asyncio
     async def test_request_id_duplicate_is_admitted_before_silent_route_script(
@@ -1236,7 +1439,10 @@ class TestIdempotency:
                 },
             )
             assert expired.status == 401
-            assert _delivery_key("scripted", delivery_id) not in adapter._seen_deliveries
+            assert (
+                _delivery_key("scripted", delivery_id, provider="x-request-id")
+                not in adapter._seen_deliveries
+            )
 
             accepted_body = json.dumps({"event_id": "accepted"}).encode()
             accepted_timestamp = str(int(time.time()))
@@ -1256,7 +1462,10 @@ class TestIdempotency:
             assert (await accepted.json())["reason"] == "script"
 
         assert counter.read_text(encoding="utf-8").splitlines() == ["accepted"]
-        assert _delivery_key("scripted", delivery_id) in adapter._seen_deliveries
+        assert (
+            _delivery_key("scripted", delivery_id, provider="x-request-id")
+            in adapter._seen_deliveries
+        )
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1353,7 +1562,9 @@ class TestIdempotency:
         assert first_data["status"] == "ignored"
         assert second_data["status"] == "ignored"
         assert (
-            _delivery_key("scripted", "retry-script-setup")
+            _delivery_key(
+                "scripted", "retry-script-setup", provider="x-request-id"
+            )
             not in adapter._seen_deliveries
         )
 
@@ -1379,10 +1590,16 @@ class TestIdempotency:
             )
             assert response.status == 202
 
-        session_chat_id = "webhook:idem:fresh-metadata-timestamp"
+        session_chat_id = (
+            "webhook:default:idem:x-request-id:fresh-metadata-timestamp"
+        )
         assert (
             adapter._seen_deliveries[
-                _delivery_key("idem", "fresh-metadata-timestamp")
+                _delivery_key(
+                    "idem",
+                    "fresh-metadata-timestamp",
+                    provider="x-request-id",
+                )
             ]
             == 200.0
         )
@@ -1447,6 +1664,99 @@ class TestIdempotency:
             data = await resp2.json()
             assert data["status"] == "duplicate"
             assert data["delivery_id"] == "msg_duplicate"
+
+    @pytest.mark.asyncio
+    async def test_stale_failure_cannot_release_newer_ttl_reservation(
+        self, monkeypatch, tmp_path
+    ):
+        """A's late release must not delete B's replacement reservation."""
+        script = tmp_path / "unused.py"
+        script.write_text("print('{}')\n", encoding="utf-8")
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "script": str(script),
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._idempotency_ttl = 1
+
+        clock = {"now": 0.0}
+        time_module = MagicMock()
+        time_module.time.side_effect = lambda: clock["now"]
+        monkeypatch.setattr("gateway.platforms.webhook.time", time_module)
+
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        third_started = threading.Event()
+        invocation_lock = threading.Lock()
+        invocations = 0
+
+        def _blocked_failure(script_path, payload):
+            nonlocal invocations
+            with invocation_lock:
+                invocations += 1
+                invocation = invocations
+            if invocation == 1:
+                first_started.set()
+                release_first.wait(timeout=2)
+            elif invocation == 2:
+                second_started.set()
+                release_second.wait(timeout=2)
+            else:
+                third_started.set()
+            return False, None, False
+
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=_blocked_failure
+        )
+        headers = {"X-GitHub-Delivery": "ttl-aba-1"}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first_request = asyncio.create_task(
+                cli.post("/webhooks/scripted", json={}, headers=headers)
+            )
+            assert await asyncio.to_thread(first_started.wait, 1)
+
+            clock["now"] = 2.0
+            second_request = asyncio.create_task(
+                cli.post("/webhooks/scripted", json={}, headers=headers)
+            )
+            assert await asyncio.to_thread(second_started.wait, 1)
+
+            clock["now"] = 2.5
+            release_first.set()
+            first_response = await first_request
+            retry = await cli.post("/webhooks/scripted", json={}, headers=headers)
+            retry_data = await retry.json()
+
+            release_second.set()
+            second_response = await second_request
+
+        assert first_response.status == 200
+        assert second_response.status == 200
+        assert retry.status == 200
+        assert retry_data["status"] == "duplicate"
+        assert third_started.is_set() is False
+
+    def test_expired_delivery_and_reservation_caches_prune_together(self):
+        adapter = _make_adapter()
+        adapter._idempotency_ttl = 60
+
+        for index in range(130):
+            assert adapter._record_delivery_id(
+                _delivery_key("route", f"expired-{index}"), 0.0
+            )
+
+        fresh = _delivery_key("route", "fresh")
+        assert adapter._record_delivery_id(fresh, 100.0)
+
+        assert adapter._seen_deliveries == {fresh: 100.0}
+        assert set(adapter._delivery_reservations) == {fresh}
 
 
 # ===================================================================
@@ -1649,6 +1959,102 @@ class TestSessionIsolation:
         assert len(captured_events) == 2
         ids = {ev.source.chat_id for ev in captured_events}
         assert len(ids) == 2, "Each delivery must have a unique session chat_id"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_profiles_have_independent_lanes_and_delivery_targets(
+        self, monkeypatch
+    ):
+        """Equal provider IDs in two profiles run and deliver independently."""
+        routes = {
+            "agent": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Profile event for {target}",
+                "deliver": "telegram",
+                "deliver_extra": {"chat_id": "{target}"},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.config.typing_indicator = False
+
+        class _Runner:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.multiplex_profiles = True
+                self.adapters = {}
+                self._profile_adapters = {}
+                self._session_db = None
+                self.session_store = None
+
+            def _profile_name_for_source(self, platform, adapter=None):
+                return None
+
+        runner = _Runner()
+        target = MagicMock()
+        delivered = []
+        both_delivered = asyncio.Event()
+
+        async def _deliver(chat_id, content, metadata=None):
+            delivered.append((chat_id, content))
+            if len(delivered) == 2:
+                both_delivered.set()
+            return SendResult(success=True)
+
+        target.send = AsyncMock(side_effect=_deliver)
+        runner.adapters[Platform.TELEGRAM] = target
+        adapter.gateway_runner = runner
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("alpha", None), ("beta", None)],
+        )
+
+        started_profiles = []
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _respond(event):
+            started_profiles.append(event.source.profile)
+            if len(started_profiles) == 2:
+                both_started.set()
+            await release.wait()
+            return f"response-{event.source.profile}"
+
+        adapter.set_message_handler(_respond)
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "shared-profile-id"}
+
+        async with TestClient(TestServer(app)) as cli:
+            alpha, beta = await asyncio.gather(
+                cli.post(
+                    "/p/alpha/webhooks/agent",
+                    json={"target": "chat-alpha"},
+                    headers=headers,
+                ),
+                cli.post(
+                    "/p/beta/webhooks/agent",
+                    json={"target": "chat-beta"},
+                    headers=headers,
+                ),
+            )
+            assert alpha.status == 202
+            assert beta.status == 202
+            try:
+                await asyncio.wait_for(both_started.wait(), timeout=1)
+            except TimeoutError:
+                release.set()
+                await asyncio.sleep(0.1)
+                pytest.fail("multiplexed profiles shared one active-session lane")
+            assert {key.split(":")[1] for key in adapter._active_sessions} == {
+                "alpha",
+                "beta",
+            }
+            release.set()
+            await asyncio.wait_for(both_delivered.wait(), timeout=1)
+
+        assert sorted(started_profiles) == ["alpha", "beta"]
+        assert sorted(delivered) == [
+            ("chat-alpha", "response-alpha"),
+            ("chat-beta", "response-beta"),
+        ]
 
 
 # ===================================================================

@@ -248,7 +248,7 @@ class TestCrossPlatformDelivery:
             assert resp.status == 202
 
         # The adapter should have stored delivery info
-        chat_id = "webhook:alerts:alert-001"
+        chat_id = "webhook:default:alerts:x-github-delivery:alert-001"
         assert chat_id in adapter._delivery_info
 
         # Now call send() as if the agent has finished
@@ -300,7 +300,7 @@ class TestGitHubCommentDelivery:
             )
             assert resp.status == 202
 
-        chat_id = "webhook:pr-bot:gh-comment-001"
+        chat_id = "webhook:default:pr-bot:x-github-delivery:gh-comment-001"
         assert chat_id in adapter._delivery_info
 
         # Verify deliver_extra was rendered with payload data

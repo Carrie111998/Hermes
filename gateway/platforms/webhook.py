@@ -189,8 +189,10 @@ class WebhookAdapter(BasePlatformAdapter):
         self.gateway_runner = None
 
         # Idempotency: TTL cache of recently processed delivery IDs, scoped by
-        # profile and route so unrelated providers cannot suppress each other.
-        self._seen_deliveries: Dict[tuple[str, str, str], float] = {}
+        # effective profile, route, and provider header. Provider-local IDs are
+        # not globally unique (for example, GitHub and Svix can both emit "1").
+        self._seen_deliveries: Dict[tuple[str, str, str, str], float] = {}
+        self._delivery_reservations: Dict[tuple[str, str, str, str], object] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -330,12 +332,13 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver the agent's response to the configured destination.
 
-        chat_id is ``webhook:{route}:{delivery_id}``.  The delivery info
-        stored during webhook receipt is read with ``.get()`` (not popped)
-        so that interim status messages emitted before the final response
-        — fallback-model notifications, context-pressure warnings, etc. —
-        do not consume the entry and silently downgrade the final response
-        to the ``log`` deliver type.  TTL cleanup happens on POST.
+        chat_id includes the effective profile, route, delivery-ID provider,
+        and provider-local ID. The delivery info stored during webhook receipt
+        is read with ``.get()`` (not popped) so that interim status messages
+        emitted before the final response — fallback-model notifications,
+        context-pressure warnings, etc. — do not consume the entry and silently
+        downgrade the final response to the ``log`` deliver type. TTL cleanup
+        happens on POST.
         """
         delivery = self._delivery_info.get(chat_id, {})
         deliver_type = delivery.get("deliver", "log")
@@ -396,6 +399,7 @@ class WebhookAdapter(BasePlatformAdapter):
         stale = [k for k, t in self._seen_deliveries.items() if t < cutoff]
         for k in stale:
             self._seen_deliveries.pop(k, None)
+            self._delivery_reservations.pop(k, None)
         self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
 
     def _record_rate_limit_hit(self, route_name: str, now: float) -> bool:
@@ -413,19 +417,56 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
         return True
 
-    def _record_delivery_id(
-        self, delivery_key: tuple[str, str, str], now: float
-    ) -> bool:
-        """Return True when this delivery should be processed."""
+    def _reserve_delivery_id(
+        self, delivery_key: tuple[str, str, str, str], now: float
+    ) -> Optional[object]:
+        """Reserve a delivery and return its generation token, or None."""
         seen_at = self._seen_deliveries.get(delivery_key)
         if seen_at is not None and now - seen_at < self._idempotency_ttl:
-            return False
+            return None
         if seen_at is not None:
             self._seen_deliveries.pop(delivery_key, None)
+            self._delivery_reservations.pop(delivery_key, None)
+        reservation = object()
         self._seen_deliveries[delivery_key] = now
+        self._delivery_reservations[delivery_key] = reservation
         if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
             self._prune_seen_deliveries(now)
-        return True
+        return reservation
+
+    def _record_delivery_id(
+        self, delivery_key: tuple[str, str, str, str], now: float
+    ) -> bool:
+        """Compatibility wrapper for tests and direct admission checks."""
+        return self._reserve_delivery_id(delivery_key, now) is not None
+
+    def _release_delivery_id(
+        self,
+        delivery_key: tuple[str, str, str, str],
+        reservation: object,
+    ) -> None:
+        """Release only when the caller still owns the current generation."""
+        if self._delivery_reservations.get(delivery_key) is not reservation:
+            return
+        self._delivery_reservations.pop(delivery_key, None)
+        self._seen_deliveries.pop(delivery_key, None)
+
+    @staticmethod
+    def _canonical_profile_namespace(profile: Any) -> str:
+        """Map both URL forms for the effective default profile to one key."""
+        profile_name = str(profile) if profile else "default"
+        if profile_name in {"default", "main"}:
+            return "default"
+        return profile_name
+
+    @staticmethod
+    def _delivery_identity(request: "web.Request") -> tuple[str, str]:
+        """Return the canonical provider header and its delivery-local ID."""
+        for header in ("X-GitHub-Delivery", "svix-id", "X-Request-ID"):
+            value = request.headers.get(header)
+            if value is not None:
+                return header.lower(), value
+        return "generated", uuid.uuid4().hex
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
@@ -668,16 +709,19 @@ class WebhookAdapter(BasePlatformAdapter):
         # before any route script.  Route scripts may perform side effects and
         # intentionally return empty stdout, so retries must be deduplicated
         # before the handler yields to script execution.
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", uuid.uuid4().hex),
-            ),
+        delivery_provider, delivery_id = self._delivery_identity(request)
+        profile_namespace = self._canonical_profile_namespace(profile)
+        delivery_cache_key = (
+            profile_namespace,
+            route_name,
+            delivery_provider,
+            delivery_id,
         )
-        delivery_cache_key = (profile or "", route_name, delivery_id)
         admitted_at = time.time()
-        if not self._record_delivery_id(delivery_cache_key, admitted_at):
+        delivery_reservation = self._reserve_delivery_id(
+            delivery_cache_key, admitted_at
+        )
+        if delivery_reservation is None:
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -689,14 +733,32 @@ class WebhookAdapter(BasePlatformAdapter):
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
-            should_continue, transformed_payload, consume_delivery = await asyncio.to_thread(
-                self._route_processor.run_route_script,
-                route_config.get("script"),
-                payload,
-            )
+            try:
+                should_continue, transformed_payload, consume_delivery = (
+                    await asyncio.to_thread(
+                        self._route_processor.run_route_script,
+                        route_config.get("script"),
+                        payload,
+                    )
+                )
+            except Exception:
+                self._release_delivery_id(
+                    delivery_cache_key, delivery_reservation
+                )
+                logger.exception(
+                    "[webhook] script transform crashed route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Transform failed"},
+                    status=500,
+                )
             if not should_continue:
                 if not consume_delivery:
-                    self._seen_deliveries.pop(delivery_cache_key, None)
+                    self._release_delivery_id(
+                        delivery_cache_key, delivery_reservation
+                    )
                 logger.info(
                     "[webhook] script ignored event=%s route=%s",
                     event_type,
@@ -709,7 +771,8 @@ class WebhookAdapter(BasePlatformAdapter):
                         "route": route_name,
                     }
                 )
-            payload = transformed_payload or payload
+            if transformed_payload is not None:
+                payload = transformed_payload
 
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
@@ -804,9 +867,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # Include every idempotency namespace component in the internal chat
+        # ID. Distinct profiles/providers may legitimately reuse a raw ID and
+        # must not share an active-session lane or delivery metadata.
+        session_chat_id = (
+            f"webhook:{profile_namespace}:{route_name}:"
+            f"{delivery_provider}:{delivery_id}"
+        )
         now = time.time()
 
         # Store delivery info for send().  Read by every send() invocation
