@@ -32,17 +32,30 @@ class WalletAction(str, enum.Enum):
 
 
 # Effort ordering, cheapest → most expensive. Downgrade steps one rung down.
-_EFFORT_ORDER = ["none", "low", "medium", "high", "max"]
+_EFFORT_ORDER = ["minimal", "none", "low", "medium", "high", "xhigh", "max"]
 
 
-def _downgrade_effort(effort: str, floor: str = "medium") -> str:
+def _downgrade_effort(effort: str, floor: str = "medium", provider: str = "") -> str:
     """One rung down, but never below ``floor`` and never below the request."""
+    try:
+        from gateway.fleet_safety.selector import get_effort_ladder
+        ladder = get_effort_ladder(provider)
+    except Exception:
+        ladder = ["none", "low", "medium", "high", "xhigh", "max"]
     e = (effort or "").lower()
-    if e not in _EFFORT_ORDER:
-        return floor
-    idx = _EFFORT_ORDER.index(e)
-    floor_idx = _EFFORT_ORDER.index(floor) if floor in _EFFORT_ORDER else 0
-    return _EFFORT_ORDER[max(floor_idx, idx - 1)]
+    if e in ladder:
+        idx = ladder.index(e)
+        floor_idx = ladder.index(floor) if floor in ladder else 0
+        return ladder[max(floor_idx, idx - 1)]
+    if e in _EFFORT_ORDER:
+        e_rank = _EFFORT_ORDER.index(e)
+        cheaper = [r for r in ladder if r in _EFFORT_ORDER and _EFFORT_ORDER.index(r) < e_rank]
+        if cheaper:
+            res = cheaper[-1]
+            floor_rank = _EFFORT_ORDER.index(floor) if floor in _EFFORT_ORDER else 0
+            if _EFFORT_ORDER.index(res) >= floor_rank:
+                return res
+    return floor
 
 
 @dataclass(frozen=True)
@@ -138,7 +151,7 @@ class WalletCap:
                 )
             return _mk(
                 WalletAction.DOWNGRADE_EFFORT,
-                _downgrade_effort(request.effort, c.downgrade_floor),
+                _downgrade_effort(request.effort, c.downgrade_floor, request.provider),
                 "usage unknown; downgrading effort by policy",
             )
 
@@ -149,7 +162,7 @@ class WalletCap:
                 f"no new heavy work — fall to next provider",
             )
         if used_percent >= c.downgrade_percent:
-            downgraded = _downgrade_effort(request.effort, c.downgrade_floor)
+            downgraded = _downgrade_effort(request.effort, c.downgrade_floor, request.provider)
             if downgraded != (request.effort or "").lower():
                 return _mk(
                     WalletAction.DOWNGRADE_EFFORT, downgraded,

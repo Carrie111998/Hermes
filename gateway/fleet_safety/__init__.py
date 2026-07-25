@@ -39,7 +39,15 @@ from gateway.fleet_safety.wallet_cap import (
     WalletCapConfig,
     WalletDecision,
 )
-from gateway.fleet_safety.usage_verify import VerifiedUsage, verify_usage
+from gateway.fleet_safety.usage_verify import VerifiedUsage, verify_usage, verified_usage_for
+from gateway.fleet_safety.selector import (
+    LaneConfig,
+    SelectedLane,
+    get_effort_ladder,
+    rank_fallback_chain,
+    resolve_effort_from_map,
+    select_best_lane,
+)
 from gateway.fleet_safety.report import format_kill_report
 from gateway.fleet_safety.enforcer import (
     EnforcementResult,
@@ -60,6 +68,13 @@ __all__ = [
     "WalletDecision",
     "VerifiedUsage",
     "verify_usage",
+    "verified_usage_for",
+    "LaneConfig",
+    "SelectedLane",
+    "get_effort_ladder",
+    "rank_fallback_chain",
+    "resolve_effort_from_map",
+    "select_best_lane",
     "format_kill_report",
     "EnforcementResult",
     "GuardEnforcer",

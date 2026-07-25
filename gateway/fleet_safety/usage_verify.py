@@ -28,10 +28,14 @@ wiring uses to produce those inputs.
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -217,3 +221,48 @@ def load_cached_percent(path: Path, provider: str) -> tuple:
         except ValueError:
             epoch = None
     return percent, epoch
+
+
+def _usage_cache_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / "usage-weekly.json"
+    except Exception:
+        return Path.home() / ".hermes" / "usage-weekly.json"
+
+
+def verified_usage_for(
+    provider: str,
+    *,
+    now: Optional[float] = None,
+    max_age_seconds: float = 900.0,
+    divergence_points: float = 15.0,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> VerifiedUsage:
+    """Reconcile the cached usage figure for ``provider`` against the live
+    authoritative source. Best-effort — never raises; returns an unknown/suspect
+    result if either side can't be read."""
+    if now is None:
+        now = time.time()
+
+    cached_percent, cached_ts = load_cached_percent(_usage_cache_path(), provider)
+
+    available, auth_percent, _auth_ts = False, None, None
+    try:
+        from agent.account_usage import fetch_account_usage
+        snapshot = fetch_account_usage(provider, base_url=base_url, api_key=api_key)
+        available, auth_percent, _auth_ts = extract_authoritative(snapshot)
+    except Exception as e:
+        logger.debug("authoritative usage fetch failed for %s: %s", provider, e)
+
+    return verify_usage(
+        provider,
+        cached_percent=cached_percent,
+        cached_fetched_at=cached_ts,
+        authoritative_percent=auth_percent,
+        authoritative_available=available,
+        now=now,
+        max_age_seconds=max_age_seconds,
+        divergence_points=divergence_points,
+    )
