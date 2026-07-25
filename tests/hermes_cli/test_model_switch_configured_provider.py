@@ -165,37 +165,31 @@ def test_explicit_provider_bypasses_configured_check():
 # ── Case B: proxy provider with base_url (litellm, etc.) ──────────────
 
 
-_LITELLM_LIVE = [
-    "deepseek-v4-pro", "deepseek-v4-flash",
-    "gemma4-unsloth", "moonshot/kimi-k2.6",
-]
-
-
-def _run_switch_on_litellm(raw_input: str, **extra):
-    """Call switch_model with litellm as the current provider, mocking a
-    proxy endpoint whose /v1/models returns models like deepseek-v4-pro."""
+def _run_switch_on_litellm(raw_input: str, with_base_url: bool = True, **extra):
+    """Call switch_model with litellm as current provider, mocking
+    list_provider_models to return [] (litellm is unknown to models.dev)
+    so _unknown_proxy = True → is_custom = True → Step e skipped."""
     defaults = dict(
         current_provider="litellm",
         current_model="deepseek-v4-flash",
         current_base_url="https://litellm-proxy.example.com/v1",
-        current_api_key="sk-litellm-key",
+        current_api_key="***",
         is_global=False,
         explicit_provider="",
     )
     defaults.update(extra)
 
     def fake_list_provider_models(provider: str):
-        if provider == "litellm":
-            return list(_LITELLM_LIVE)
-        return []
+        return []  # litellm unknown to models.dev
 
     fake_config = {
         "model": {
             "provider": "litellm",
-            "base_url": "https://litellm-proxy.example.com/v1",
             "default": "deepseek-v4-flash",
         }
     }
+    if with_base_url:
+        fake_config["model"]["base_url"] = "https://litellm-proxy.example.com/v1"
 
     with (
         patch(
@@ -210,60 +204,19 @@ def _run_switch_on_litellm(raw_input: str, **extra):
         return switch_model(raw_input=raw_input, **defaults)
 
 
-def test_proxy_provider_keeps_current_when_model_in_catalog():
-    """#71324: /model deepseek-v4-pro on litellm with base_url should
-    stay on litellm, not switch to native deepseek."""
-    result = _run_switch_on_litellm("deepseek-v4-pro")
+def test_proxy_provider_keeps_current_when_base_url_set():
+    """#71324: litellm with base_url → _unknown_proxy=True → is_custom=True
+    → Step e skipped → provider stays on litellm."""
+    result = _run_switch_on_litellm("deepseek-v4-pro", with_base_url=True)
     assert result.target_provider == "litellm", (
         f"Expected litellm, got {result.target_provider}. "
-        f"Proxy provider's live catalog was not checked."
+        f"Proxy with base_url was not treated as custom."
     )
     assert result.new_model == "deepseek-v4-pro"
 
 
-def test_proxy_provider_falls_through_when_model_not_in_catalog():
-    """When the proxy's catalog doesn't have the model, fall through to
-    static detection."""
-    result = _run_switch_on_litellm("claude-opus-4-5-20251101")
-    # Falls through to detect_provider_for_model
-    assert result.target_provider != "litellm"
-
-
-def test_proxy_provider_without_base_url_falls_through():
-    """When configured provider has no base_url, Case B is skipped."""
-    defaults = dict(
-        current_provider="litellm",
-        current_model="deepseek-v4-flash",
-        current_base_url="https://litellm-proxy.example.com/v1",
-        current_api_key="sk-litellm-key",
-        is_global=False,
-        explicit_provider="",
-    )
-
-    def fake_list_provider_models(provider: str):
-        if provider == "litellm":
-            return list(_LITELLM_LIVE)
-        return []
-
-    fake_config = {
-        "model": {
-            "provider": "litellm",
-            # no base_url — Case B not triggered
-            "default": "deepseek-v4-flash",
-        }
-    }
-
-    with (
-        patch(
-            "hermes_cli.model_switch.list_provider_models",
-            side_effect=fake_list_provider_models,
-        ),
-        patch(
-            "hermes_cli.config.load_config",
-            return_value=fake_config,
-        ),
-    ):
-        result = switch_model(raw_input="deepseek-v4-pro", **defaults)
-
-    # Falls through to static detection → native deepseek
+def test_proxy_provider_without_base_url_switches():
+    """litellm without base_url → _unknown_proxy=False → falls through
+    to detect_provider_for_model → native deepseek."""
+    result = _run_switch_on_litellm("deepseek-v4-pro", with_base_url=False)
     assert result.target_provider == "deepseek"
