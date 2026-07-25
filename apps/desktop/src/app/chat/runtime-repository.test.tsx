@@ -1,5 +1,5 @@
 import { AssistantRuntimeProvider, type ThreadMessage, useAuiState } from '@assistant-ui/react'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -58,6 +58,32 @@ describe('runtime message repository', () => {
 
     expect(renderedMessages().map(item => item.id)).toEqual(['user-id', 'assistant-id'])
     expect(unique.map(item => item.id)).toEqual(['user-id', 'assistant-id'])
+  })
+
+  it('keeps prior renderer ids stable when an appended source id collides with a generated suffix', async () => {
+    const initialSource = [message('x', 'user', 'one'), message('x', 'assistant', 'two')]
+    const { rerender } = render(<RuntimeHarness messages={initialSource} />)
+    const initialRendered = renderedMessages()
+
+    expect(initialRendered).toEqual([
+      { id: 'x', text: 'one' },
+      { id: 'x:renderer-duplicate:2', text: 'two' }
+    ])
+
+    const appendedSource = [
+      ...initialSource.map(item => ({ ...item })),
+      message('x:renderer-duplicate:2', 'user', 'three')
+    ]
+
+    rerender(<RuntimeHarness messages={appendedSource} />)
+
+    await waitFor(() => expect(renderedMessages().map(item => item.text)).toEqual(['one', 'two', 'three']))
+
+    const appendedRendered = renderedMessages()
+    expect(appendedRendered.slice(0, 2)).toEqual(initialRendered)
+    expect(new Set(appendedRendered.map(item => item.id)).size).toBe(3)
+    expect(initialSource.map(item => item.id)).toEqual(['x', 'x'])
+    expect(appendedSource.map(item => item.id)).toEqual(['x', 'x', 'x:renderer-duplicate:2'])
   })
 
   it('preserves duplicate-id messages with deterministic renderer-only ids across updates', () => {
