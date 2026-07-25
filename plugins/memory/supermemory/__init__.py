@@ -539,16 +539,18 @@ STORE_SCHEMA = {
 
 SEARCH_SCHEMA = {
     "name": "supermemory_search",
-    "description": "Search long-term memory by semantic similarity. Defaults suit most queries; tune the options below when a plain search is the wrong shape for the question.",
+    "description": (
+        "Search long-term memory by semantic similarity. Searches both extracted facts and "
+        "the contents of ingested documents. Write a specific, keyword-rich query rather than "
+        "echoing the user's phrasing verbatim — retrieval quality depends on it. Raise limit "
+        "instead of narrowing the query when a question is broad."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "What to search for."},
-            "limit": {"type": "integer", "description": "Maximum results to return, 1 to 20."},
-            "search_mode": {"type": "string", "enum": list(_VALID_SEARCH_MODES), "description": "Default hybrid (facts + document chunks). Use 'documents' when asking about the contents of an ingested file, transcript, podcast, or article. Use 'memories' for short personal facts and preferences only."},
-            "rerank": {"type": "boolean", "description": "Reorder results by relevance to the query. Use when the query is precise and result ordering matters. Cannot be combined with aggregate."},
-            "aggregate": {"type": "boolean", "description": "Synthesize an answer across multiple memories. Use for broad or summarizing questions ('what do we know about X'). Costs an extra LLM call, so skip it for simple lookups. Cannot be combined with rerank."},
-            "rewrite_query": {"type": "boolean", "description": "Rewrite a vague or conversational query into better search terms (+~400ms). Applied automatically on an empty result, so only set it upfront when the query is clearly loosely worded."},
+            "query": {"type": "string", "description": "Specific search terms. Prefer distinctive keywords and names over conversational phrasing."},
+            "limit": {"type": "integer", "description": "Maximum results to return, 1 to 20. Raise it for broad questions that need several sources."},
+            "aggregate": {"type": "boolean", "description": "Synthesize across multiple memories instead of returning them separately. Use for broad questions ('what do we know about X'). Costs an extra LLM call, so skip it for simple lookups."},
         },
         "required": ["query"],
     },
@@ -978,10 +980,9 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
         search_schema = SEARCH_SCHEMA
         if not self._allow_agent_search_overrides:
-            # Don't advertise knobs the agent isn't allowed to use.
+            # Don't advertise a knob the agent isn't allowed to use.
             search_schema = json.loads(json.dumps(SEARCH_SCHEMA))
-            for key in ("search_mode", "rerank", "aggregate", "rewrite_query"):
-                search_schema["parameters"]["properties"].pop(key, None)
+            search_schema["parameters"]["properties"].pop("aggregate", None)
 
         if not self._enable_custom_containers:
             return with_kebab_aliases([STORE_SCHEMA, search_schema, FORGET_SCHEMA, PROFILE_SCHEMA])
@@ -1033,17 +1034,14 @@ class SupermemoryMemoryProvider(MemoryProvider):
             limit = max(1, min(20, int(args.get("limit", 5) or 5)))
         except Exception:
             limit = 5
-        if self._allow_agent_search_overrides:
-            mode = str(args.get("search_mode") or "").strip().lower()
-            mode = mode if mode in _VALID_SEARCH_MODES else self._search_mode
-            rerank = _as_bool(args.get("rerank"), self._search_rerank)
-            aggregate = _as_bool(args.get("aggregate"), self._search_aggregate)
-            rewrite_query = _as_bool(args.get("rewrite_query"), self._search_rewrite_query)
-        else:
-            mode = self._search_mode
-            rerank = self._search_rerank
-            aggregate = self._search_aggregate
-            rewrite_query = self._search_rewrite_query
+        mode = self._search_mode
+        rerank = self._search_rerank
+        rewrite_query = self._search_rewrite_query
+        aggregate = (
+            _as_bool(args.get("aggregate"), self._search_aggregate)
+            if self._allow_agent_search_overrides
+            else self._search_aggregate
+        )
 
         def _run(mode_: str, rewrite_: bool) -> list:
             return self._client.search_memories(

@@ -61,7 +61,7 @@ Config file: `$HERMES_HOME/supermemory.json`
 | `search_rerank` | `false` | Rerank results by relevance to the query |
 | `search_aggregate` | `false` | Synthesize new memories by aggregating across multiple results. Mutually exclusive with `search_rerank` — the API rejects both with a 400, and aggregate does *not* rerank (server-side they are separate branches: aggregate synthesizes via LLM, rerank runs a cross-encoder). If both are set, aggregate wins and rerank is dropped. |
 | `search_rewrite_query` | `false` | Rewrite the query to improve matching (adds ~400ms latency). Applied automatically as a one-shot retry when a search returns nothing. |
-| `allow_agent_search_overrides` | `true` | Let the agent pass `search_mode` / `rerank` / `aggregate` / `rewrite_query` per call. Set `false` to pin behavior to this config and hide those options from the tool schema (useful for cost control, since `aggregate` costs an extra LLM call). |
+| `allow_agent_search_overrides` | `true` | Let the agent pass `aggregate` per call. Set `false` to pin it to this config and hide the option from the tool schema (useful for cost control, since `aggregate` costs an extra LLM call). All other search options are config-only. |
 | `entity_context` | built-in default | Extraction guidance passed to Supermemory |
 | `api_timeout` | `5.0` | Timeout for SDK and ingest requests |
 

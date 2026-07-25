@@ -309,16 +309,18 @@ def test_search_tool_forwards_config_defaults(provider):
     assert call["aggregate"] is False
 
 
-def test_search_tool_args_override_config(provider):
+def test_aggregate_is_the_only_agent_override(provider):
+    provider._client.search_results = [{"id": "m1", "memory": "hit", "similarity": 0.9}]
     provider.handle_tool_call("supermemory_search", {
-        "query": "podcast notes", "rerank": True, "aggregate": True,
-        "rewrite_query": True, "search_mode": "documents",
+        "query": "podcast notes", "aggregate": True,
+        # not agent-controllable — must not leak through
+        "rerank": True, "rewrite_query": True, "search_mode": "documents",
     })
-    call = provider._client.search_calls[-1]
-    assert call["search_mode"] == "documents"
-    assert call["rerank"] is True
+    call = provider._client.search_calls[0]
     assert call["aggregate"] is True
-    assert call["rewrite_query"] is True
+    assert call["search_mode"] == "hybrid"
+    assert call["rerank"] is False
+    assert call["rewrite_query"] is False
 
 
 def test_empty_result_retries_once_with_rewrite(provider):
@@ -347,24 +349,25 @@ def test_no_retry_when_first_search_hits(provider):
     assert len(provider._client.search_calls) == 1
 
 
-def test_overrides_ignored_when_disabled(provider):
+def test_aggregate_override_ignored_when_disabled(provider):
     provider._allow_agent_search_overrides = False
-    provider.handle_tool_call("supermemory_search", {
-        "query": "x", "aggregate": True, "search_mode": "documents"})
-    call = provider._client.search_calls[0]
-    assert call["aggregate"] is False
-    assert call["search_mode"] == "hybrid"
+    provider.handle_tool_call("supermemory_search", {"query": "x", "aggregate": True})
+    assert provider._client.search_calls[0]["aggregate"] is False
 
 
-def test_disabled_overrides_hides_knobs_from_schema(provider):
+def test_disabled_overrides_hides_aggregate_from_schema(provider):
     provider._allow_agent_search_overrides = False
     schema = next(s for s in provider.get_tool_schemas() if s["name"] == "supermemory_search")
     props = schema["parameters"]["properties"]
-    assert "query" in props
-    for knob in ("search_mode", "rerank", "aggregate", "rewrite_query"):
-        assert knob not in props
+    assert "query" in props and "limit" in props
+    assert "aggregate" not in props
     # global schema untouched
     assert "aggregate" in SEARCH_SCHEMA["parameters"]["properties"]
+
+
+def test_schema_exposes_only_query_limit_aggregate(provider):
+    schema = next(s for s in provider.get_tool_schemas() if s["name"] == "supermemory_search")
+    assert set(schema["parameters"]["properties"]) == {"query", "limit", "aggregate"}
 
 
 def _bare_client(captured):
