@@ -338,8 +338,8 @@ class TestMemorySync:
 
 
 class TestBackgroundReview:
-    def test_background_review_spawned_when_triggered(self):
-        """_spawn_background_review called when should_review_memory=True."""
+    def test_background_review_skipped_in_acp_mode(self):
+        """_spawn_background_review not called — ACP mode skips it to avoid session binding collision."""
         agent = _make_agent()
         turn = TurnResult(final_text="good answer", interrupted=False, error=None)
         _inject_session(agent, _mock_session(turn))
@@ -353,9 +353,7 @@ class TestBackgroundReview:
             should_review_memory=True,
         )
 
-        agent._spawn_background_review.assert_called_once()
-        call_kwargs = agent._spawn_background_review.call_args[1]
-        assert call_kwargs["review_memory"] is True
+        agent._spawn_background_review.assert_not_called()
 
     def test_background_review_skipped_when_no_final_text(self):
         """_spawn_background_review not called when final_text is empty."""
