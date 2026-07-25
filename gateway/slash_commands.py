@@ -337,7 +337,15 @@ class GatewaySlashCommandsMixin:
         # state (model/reasoning overrides, one-turn restores, model notes,
         # last-resolved cache, /queue overflow) + security state in one
         # funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="session_reset")
+        # SessionStore's old-epoch callback already cleared authority for an
+        # existing route; the cold-path branch above did so for a newly
+        # initialized route. Keep the single conversation-state funnel without
+        # clearing security authority a second time after publication.
+        self._clear_conversation_scope(
+            session_key,
+            reason="session_reset",
+            clear_security=False,
+        )
 
         # The old conversation's in-flight async delegations end WITH it
         # (#55578): after the reset rotates the session id, their completions
@@ -368,12 +376,6 @@ class GatewaySlashCommandsMixin:
             clear_credential_files()
         except Exception:
             pass
-
-        # Reset the session
-        new_entry = await self.async_session_store.reset_session(session_key)
-
-        # (Conversation-scoped overrides + security state were already
-        # cleared via _clear_conversation_scope above.)
 
         _old_sid = old_entry.session_id if old_entry else None
 
@@ -4283,7 +4285,14 @@ class GatewaySlashCommandsMixin:
         # notes, last-resolved cache #58403, /queue overflow) + security
         # state in one funnel call. See _CONVERSATION_SCOPED_STATE in
         # gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="resume")
+        # SessionStore already cleared the security boundary in its privileged
+        # pre-publication callback.  Only clear the remaining conversation
+        # state here; a second late security clear races with the new route.
+        self._clear_conversation_scope(
+            session_key,
+            reason="resume",
+            clear_security=False,
+        )
 
         # Evict any cached agent for this session so the next message
         # rebuilds with the correct session_id end-to-end — mirrors

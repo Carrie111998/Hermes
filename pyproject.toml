@@ -316,8 +316,6 @@ muncho-ops = "ops.muncho.runtime.operational_edge_cli:main"
 # Top-level single-file modules (not packages). Without this, uv2nix's
 # sealed venv is missing hermes_constants, run_agent, etc.
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
-cmdclass = {build_py = "scripts.canary.selective_build_py.SelectiveBuildPy"}
-
 [tool.setuptools.packages.find]
 # Operational top-level scripts such as the Canonical alias projector are
 # wheel-backed.  The custom build command excludes only the seven exact

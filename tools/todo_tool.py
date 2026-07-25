@@ -585,6 +585,11 @@ class TodoStore:
             return None
 
         lines = [TODO_INJECTION_HEADER]
+        if any(item["status"] == "blocked" for item in active_items):
+            lines.append(
+                "[Blocked items are preserved for later context; they are not "
+                "a runtime decision to continue the current loop.]"
+            )
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
             lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")

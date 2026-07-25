@@ -69,12 +69,20 @@ class FakeReaction:
 
 class FakeChannel:
     def __init__(self, channel_id=123, history_messages=None, parent_id=None):
+        default_role = object()
         self.id = channel_id
         self.parent_id = parent_id
         self.name = "wiki-inbox"
-        self.guild = SimpleNamespace(id=777, name="emo")
+        self.guild = SimpleNamespace(
+            id=777,
+            name="emo",
+            default_role=default_role,
+        )
         self.topic = None
         self._history_messages = list(history_messages or [])
+        self.permissions_for = lambda role: SimpleNamespace(
+            view_channel=role is default_role
+        )
 
     def history(self, **kwargs):
         async def _gen():

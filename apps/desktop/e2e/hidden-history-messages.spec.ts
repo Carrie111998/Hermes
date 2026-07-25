@@ -7,6 +7,7 @@
  */
 
 import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 
 import { expect, test } from './test'
@@ -18,14 +19,9 @@ import {
   launchDesktop,
   waitForAppReady,
   writeEnvFile,
-  writeMockProviderConfig,
+  writeMockProviderConfig
 } from './fixtures'
-import {
-  MOCK_REPLY,
-  startMockServer,
-  VERIFICATION_STOP_TEXT,
-  VERIFICATION_STOP_TRIGGER,
-} from './mock-server'
+import { MOCK_REPLY, startMockServer, VERIFICATION_STOP_TRIGGER } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
 
 const SESSION_TITLE = 'E2E Hidden History Messages'
@@ -37,20 +33,13 @@ async function setupSeededMockBackend(): Promise<MockBackendFixture> {
   const mock = await startMockServer()
   const sandbox = createSandbox('hidden-history')
   writeMockProviderConfig(sandbox.hermesHome, mock.url)
-  fs.appendFileSync(
-    path.join(sandbox.hermesHome, 'config.yaml'),
-    '\ncompression:\n  threshold_tokens: 1\n',
-    'utf8',
-  )
+  fs.appendFileSync(path.join(sandbox.hermesHome, 'config.yaml'), '\ncompression:\n  threshold_tokens: 1\n', 'utf8')
   writeEnvFile(sandbox.hermesHome)
   const builder = await RealSessionBuilder.start(sandbox.hermesHome)
   try {
     await builder.createSession({
       title: SESSION_TITLE,
-      turns: [
-        `${VISIBLE_USER_TEXT}${COMPACTION_TRIGGER_PADDING}`,
-        VISIBLE_POST_COMPACTION_TEXT,
-      ],
+      turns: [`${VISIBLE_USER_TEXT}${COMPACTION_TRIGGER_PADDING}`, VISIBLE_POST_COMPACTION_TEXT]
     })
   } finally {
     await builder.close()
@@ -68,7 +57,7 @@ async function setupSeededMockBackend(): Promise<MockBackendFixture> {
       await app.close().catch(() => undefined)
       await mock.close()
       sandbox.cleanup()
-    },
+    }
   }
 }
 
@@ -79,10 +68,7 @@ test('resume hides real context-compaction handoffs', async ({}, testInfo) => {
     const { page } = fixture
     await waitForAppReady(fixture, 120_000)
 
-    const sessionRow = page
-      .locator('[data-slot="sidebar"] button')
-      .filter({ hasText: SESSION_TITLE })
-      .first()
+    const sessionRow = page.locator('[data-slot="sidebar"] button').filter({ hasText: SESSION_TITLE }).first()
     await sessionRow.click()
 
     const transcript = page.locator('[data-slot="aui_thread-viewport"]')
@@ -96,15 +82,18 @@ test('resume hides real context-compaction handoffs', async ({}, testInfo) => {
   }
 })
 
-test('live verify-on-stop continuations stay out of the transcript', async ({}, testInfo) => {
+test('live model responses do not revive legacy verify-on-stop continuations', async ({}, testInfo) => {
   const sandbox = createSandbox('live-verification-nudge')
-  const projectRoot = path.join(sandbox.root, 'project')
+  // macOS resolves its default temp directory under /private/var, which the
+  // file tool correctly treats as a protected system path. Use an isolated
+  // user-owned directory so this E2E exercises the real write path on every
+  // supported runner.
+  const projectRoot = fs.mkdtempSync(path.join(os.homedir(), '.hermes-e2e-verification-'))
   const changedFile = path.join(projectRoot, 'e2e-verification-target.py')
-  fs.mkdirSync(projectRoot)
   fs.writeFileSync(
     path.join(projectRoot, 'pyproject.toml'),
     '[project]\nname = "e2e-verification-project"\nversion = "0.0.0"\n',
-    'utf8',
+    'utf8'
   )
 
   const mock = await startMockServer({ verificationWritePath: changedFile })
@@ -121,8 +110,9 @@ test('live verify-on-stop continuations stay out of the transcript', async ({}, 
     cleanup: async () => {
       await app.close().catch(() => undefined)
       await mock.close()
+      fs.rmSync(projectRoot, { force: true, recursive: true })
       sandbox.cleanup()
-    },
+    }
   }
 
   try {
@@ -133,11 +123,12 @@ test('live verify-on-stop continuations stay out of the transcript', async ({}, 
     await page.keyboard.press('Enter')
 
     const transcript = page.locator('[data-slot="aui_thread-viewport"]')
-    await expect(transcript).toContainText(VERIFICATION_STOP_TEXT, { timeout: 60_000 })
-    await expect.poll(
-      () => mock.receivedPrompts.some(prompt => prompt.includes('[System: You edited code in this turn')),
-      { timeout: 30_000 },
-    ).toBe(true)
+    await expect(transcript).toContainText('The code edit is complete.', { timeout: 60_000 })
+    await page.waitForTimeout(1_000)
+    expect(
+      mock.receivedPrompts.some(prompt => prompt.includes('[System: You edited code in this turn')),
+      'the fork keeps the model-authored final response instead of injecting a legacy continuation'
+    ).toBe(false)
     expect(fs.existsSync(changedFile), 'The scripted write_file call should edit only the sandbox project').toBe(true)
     await expect(transcript).not.toContainText('[System: You edited code in this turn')
     await page.screenshot({ path: testInfo.outputPath('live-verification-nudge.png') })

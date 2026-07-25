@@ -21,7 +21,7 @@ import {
   type Sandbox,
   waitForAppReady,
   writeEnvFile,
-  writeMockProviderConfig,
+  writeMockProviderConfig
 } from './fixtures'
 import { type MockServer, startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
@@ -29,7 +29,6 @@ import { type ElectronApplication, expect, type Page, test } from './test'
 
 // A seeded session has no generated title, so every label falls back to the
 // session preview — the first 60 characters of the first user message.
-const SESSION_TITLE = 'E2E attached image session'
 const CAPTION = 'E2E attached image must survive a relaunch'
 const IMAGE_DIR = 'Application Support/e2e shots'
 const IMAGE_NAME = 'e2e capture.png'
@@ -67,8 +66,8 @@ async function setupSeededDesktop(): Promise<SeededFixture> {
 
   try {
     await builder.createSession({
-      title: SESSION_TITLE,
-      turns: [{ images: [writeImage(sandbox)], text: CAPTION }],
+      title: '',
+      turns: [{ images: [writeImage(sandbox)], text: CAPTION }]
     })
   } finally {
     await builder.close()
@@ -85,7 +84,7 @@ async function setupSeededDesktop(): Promise<SeededFixture> {
       await app.close().catch(() => undefined)
       await mock.close()
       sandbox.cleanup()
-    },
+    }
   }
 }
 
@@ -100,7 +99,7 @@ async function openSeededSession(page: Page): Promise<void> {
   await page.waitForFunction(
     expected => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
     CAPTION,
-    { timeout: 30_000 },
+    { timeout: 30_000 }
   )
 }
 
@@ -109,7 +108,7 @@ async function openNewSession(page: Page): Promise<void> {
   await page.waitForFunction(
     expected => !(document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
     CAPTION,
-    { timeout: 15_000 },
+    { timeout: 15_000 }
   )
 }
 
@@ -167,6 +166,5 @@ test.describe('attached image resume', () => {
 
     await openSeededSession(fixture.page)
     await assertRendersThumbnail(fixture.page, 'cold reload')
-    await fixture.page.screenshot({ path: testInfo.outputPath('attachment-cold-reload.png') })
   })
 })

@@ -699,6 +699,16 @@ def build_session_context_prompt(
             "Voice-channel state, when relevant, appears in the current "
             "message as a `[Voice channel now: ...]` note."
         )
+        lines.append("")
+        lines.append(
+            "**Operational evidence note:** For source/code/runtime support work, "
+            "judge source-of-truth by evidence sufficiency, not keyword rules. "
+            "If a final answer depends on current/live source but the available "
+            "snapshot is stale, incomplete, or missing the requested files/symbols, "
+            "use an available bounded read-only worker/tool before finalizing. "
+            "If that evidence path is unavailable, say PARTIAL/BLOCKED, name the "
+            "missing evidence, and preserve the exact continuation context."
+        )
     elif context.source.platform == Platform.BLUEBUBBLES:
         lines.append("")
         lines.append(
@@ -2207,6 +2217,28 @@ class SessionStore:
             )
             return session_id
 
+    def _heal_compression_tip_locked(
+        self,
+        entry: "SessionEntry",
+        original_session_id: Optional[str],
+        canonical_session_id: Optional[str],
+    ) -> bool:
+        """Rewrite *entry* to the compression continuation if stale. Lock held."""
+        if (
+            not original_session_id
+            or not canonical_session_id
+            or entry.session_id != original_session_id
+            or canonical_session_id == original_session_id
+        ):
+            return False
+        logger.info(
+            "SessionStore healed compressed session mapping: %s -> %s",
+            entry.session_id,
+            canonical_session_id,
+        )
+        entry.session_id = canonical_session_id
+        return True
+
     def has_any_sessions(self) -> bool:
         """Check if any sessions have ever been created (across all platforms).
 
@@ -2909,14 +2941,78 @@ class SessionStore:
             for label, callback in callbacks:
                 if callback is None:
                     continue
-                # Never prune sessions with an active background process
-                # attached — the user may still be waiting on output.
-                # The callback is keyed by session_key (see process_registry.
-                # has_active_for_session); passing session_id here used to
-                # never match, so active sessions got pruned anyway.
-                if self._has_active_processes_safe(entry.session_key, context="prune"):
-                    continue
-                if entry.updated_at < cutoff:
+                try:
+                    if callback(entry.session_key):
+                        return True
+                except Exception as exc:
+                    # A maintenance sweep cannot prove inactivity when its
+                    # observer fails. Retain the entry rather than splitting a
+                    # live task from its authority epoch.
+                    logger.warning(
+                        "%s raised during prune for %s; retaining entry: %s",
+                        label,
+                        entry.session_key,
+                        exc,
+                    )
+                    return True
+            return False
+
+        for (
+            key,
+            entry,
+            observed_session_id,
+            observed_updated_at,
+            observed_epoch,
+        ) in candidates:
+            if _has_live_work(entry):
+                continue
+
+            # Revalidate immediately before the durable boundary. This avoids
+            # needless revocation when activity changed after the snapshot;
+            # the post-I/O CAS below still remains authoritative.
+            with self._lock:
+                current = self._entries.get(key)
+                candidate_still_current = bool(
+                    current is entry
+                    and current.session_id == observed_session_id
+                    and current.updated_at == observed_updated_at
+                    and current.capability_epoch == observed_epoch
+                    and not current.suspended
+                    and current.updated_at < cutoff
+                )
+            if not candidate_still_current or _has_live_work(entry):
+                continue
+
+            try:
+                self._before_capability_epoch_rotation(
+                    entry,
+                    "maintenance_prune",
+                )
+            except CapabilityEpochRotationBlocked:
+                logger.warning(
+                    "Deferring prune for %s because exact old-epoch "
+                    "revocation is unavailable",
+                    key,
+                )
+                continue
+
+            # A foreground turn may have started while writer I/O was in
+            # flight. Never remove it. Since the old epoch is already durably
+            # tombstoned, mark an exact same-epoch survivor for mandatory
+            # rotation on its next routing access.
+            live_after_revoke = _has_live_work(entry)
+            with self._lock:
+                current = self._entries.get(key)
+                cas_matches = bool(
+                    current is entry
+                    and current.session_id == observed_session_id
+                    and current.updated_at == observed_updated_at
+                    and current.capability_epoch == observed_epoch
+                    and not current.suspended
+                    and current.updated_at < cutoff
+                )
+                if cas_matches and not live_after_revoke:
+                    self._entries.pop(key, None)
                     removed_keys.append(key)
                 elif (
                     current is not None

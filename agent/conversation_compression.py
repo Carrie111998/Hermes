@@ -1157,6 +1157,15 @@ def _live_todo_hydration_receipt(todo_store: Any) -> Optional[dict[str, str]]:
 
     if todo_store is None:
         return None
+    # Only the concrete TodoStore carries the validated machine-state
+    # contract required for a synthetic assistant/tool hydration pair.
+    # Lightweight test/custom stores may expose only
+    # ``format_for_injection()``; that text is model context, not authority,
+    # and is attached to the preserved real user turn below.
+    from tools.todo_tool import TodoStore
+
+    if not isinstance(todo_store, TodoStore):
+        return None
     snapshot_reader = getattr(todo_store, "format_for_injection", None)
     binding_reader = getattr(todo_store, "canonical_binding_state", None)
     sync_reader = getattr(todo_store, "canonical_sync_blocked_state", None)
@@ -1617,6 +1626,12 @@ def compress_context(
         })
     except Exception:
         pass
+
+    # Compression can invoke an auxiliary model before the main turn. Recheck
+    # the sealed process projection at this exact model-call boundary.
+    from hermes_cli.config import attest_pinned_effective_config_projection
+
+    attest_pinned_effective_config_projection()
 
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking

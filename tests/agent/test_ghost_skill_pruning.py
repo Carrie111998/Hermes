@@ -21,6 +21,7 @@ Test patterns for the marker emit checks adapted from PR #32375
 from unittest.mock import MagicMock, patch
 
 from agent.context_compressor import (
+    COMPRESSED_SUMMARY_METADATA_KEY,
     SKILL_PRUNED_MARKER_PREFIX,
     SUMMARY_PREFIX,
     ContextCompressor,
@@ -340,7 +341,11 @@ class TestMarkerSurvivesRealCompress:
         )
         msgs = [
             {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": prior_handoff},
+            {
+                "role": "user",
+                "content": prior_handoff,
+                COMPRESSED_SUMMARY_METADATA_KEY: True,
+            },
         ] + [
             {"role": "assistant" if i % 2 == 0 else "user", "content": f"turn {i} " + "q" * 300}
             for i in range(8)

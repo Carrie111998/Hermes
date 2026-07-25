@@ -143,7 +143,7 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     _session_key_for_source; the adapter drain uses build_session_key on the
     event source. These must agree or the continuation is orphaned under a
     key nobody drains (the silent-stall shape from #47699)."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
     from datetime import datetime
     import uuid
 
@@ -176,17 +176,26 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     adapter = _DrainProbeAdapter()
     runner.adapters = {Platform.SLACK: adapter}
 
-    GoalManager(session_entry.session_id).set("ship it")
-    with patch(
-        "hermes_cli.goals.judge_goal",
-        return_value=("continue", "still needs work", False, None, False),
-    ):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="partial progress",
-        )
-        await asyncio.sleep(0.05)
+    manager = GoalManager(session_entry.session_id)
+    manager.set("ship it")
+    turn_id = f"turn-{uuid.uuid4().hex}"
+    generation_id = manager.begin_model_turn(turn_id)
+    assert generation_id
+    assert manager.record_model_outcome(
+        "continue",
+        "still needs work",
+        originating_turn_id=turn_id,
+        goal_generation_id=generation_id,
+    )
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry,
+        source=src,
+        final_response="partial progress",
+        goal_session_id=session_entry.session_id,
+        originating_turn_id=turn_id,
+        goal_generation_id=generation_id,
+    )
+    await asyncio.sleep(0.05)
 
     assert adapter_key in adapter._pending_messages, (
         "continuation enqueued under a different key than the adapter "

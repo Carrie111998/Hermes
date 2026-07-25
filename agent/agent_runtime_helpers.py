@@ -1141,7 +1141,17 @@ def recover_with_credential_pool(
                 None,
             )
         if current_entry is None:
-            current_entry = pool.current()
+            candidate = pool.current()
+            if not (_credential_id or _api_key_hint):
+                current_entry = candidate
+            elif candidate is not None:
+                candidate_id = getattr(candidate, "id", None)
+                candidate_key = getattr(candidate, "runtime_api_key", None)
+                if (
+                    (_credential_id and candidate_id == _credential_id)
+                    or (_api_key_hint and candidate_key == _api_key_hint)
+                ):
+                    current_entry = candidate
         current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
         if current_last_status == STATUS_EXHAUSTED:
             _ra().logger.info(
@@ -1241,6 +1251,13 @@ def recover_with_credential_pool(
                 agent.provider or "provider",
             )
             return False, has_retried_429
+        if _adopt_external_auth_pool_alternative(
+            agent,
+            pool,
+            status_code=status_code,
+            error_context=error_context,
+        ):
+            return True, False
         # Refresh the entry that supplied the failing key, not current():
         # the shared pointer can reference a different, healthy entry, and
         # refreshing it would consume that entry's single-use refresh token
@@ -1248,7 +1265,14 @@ def recover_with_credential_pool(
         refresh_kwargs = {"api_key_hint": _api_key_hint}
         if _credential_id:
             refresh_kwargs["credential_id"] = _credential_id
-        refreshed = pool.try_refresh_matching(**refresh_kwargs)
+        refresh_matching = getattr(pool, "try_refresh_matching", None)
+        if callable(refresh_matching):
+            refreshed = refresh_matching(**refresh_kwargs)
+        else:
+            # Compatibility for older/custom pool implementations. Their
+            # current-entry refresh is safe only when the exact failed key is
+            # still the sole/current identity represented by that pool.
+            refreshed = pool.try_refresh_current()
         if refreshed is not None:
             # ``try_refresh_matching()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry

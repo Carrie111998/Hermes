@@ -10,6 +10,7 @@ Covers the wrong-session-wake / silent-loss fixes:
 """
 
 import asyncio
+from unittest.mock import patch
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
@@ -61,7 +62,11 @@ async def _run_one_notifier_tick(monkeypatch, runner):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"kanban": {"dispatch_in_gateway": True}},
+    ):
+        await runner._kanban_notifier_watcher(interval=1)
 
 
 def _make_runner(adapters):

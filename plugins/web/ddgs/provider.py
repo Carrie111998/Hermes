@@ -76,6 +76,9 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     return results
 
 
+_ORIGINAL_RUN_DDGS_SEARCH = _run_ddgs_search
+
+
 # Optional test-only hook name forwarded to the child (see _search_worker.py).
 # Production search() never sets this.
 _test_hook: Optional[str] = None
@@ -320,7 +323,13 @@ class DDGSWebSearchProvider(WebSearchProvider):
         safe_limit = max(1, int(limit))
 
         try:
-            web_results = _run_ddgs_search_bounded(query, safe_limit)
+            # Preserve the documented in-process test seam. Production keeps
+            # the disposable-process boundary; only an explicitly replaced
+            # module helper is invoked directly.
+            if _run_ddgs_search is not _ORIGINAL_RUN_DDGS_SEARCH:
+                web_results = _run_ddgs_search(query, safe_limit)
+            else:
+                web_results = _run_ddgs_search_bounded(query, safe_limit)
         except TimeoutError:
             logger.warning(
                 "DDGS search timed out after %ds for query: %r",

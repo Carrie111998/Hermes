@@ -24,10 +24,41 @@ use ``build_editable``, which does NOT call ``bdist_wheel`` — it calls
 ``build_ext`` in editable mode. So the guard does not affect development.
 """
 
+import importlib.util
 import os
+from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.sdist import sdist
+
+
+def _load_selective_build_py():
+    """Load the source-tree build command without relying on package imports.
+
+    PEP 517 evaluates ``setup.py`` in an isolated build environment where the
+    repository root is not guaranteed to be importable.  Loading the command
+    by its source path keeps editable installs working while preserving the
+    single canonical implementation used by sealed builds.
+    """
+
+    module_path = (
+        Path(__file__).resolve().parent
+        / "scripts"
+        / "canary"
+        / "selective_build_py.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_hermes_selective_build_py",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load selective build command: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.SelectiveBuildPy
+
+
+SelectiveBuildPy = _load_selective_build_py()
 
 _IN_NIX_BUILD = os.environ.get("HERMES_NIX_BUILD") == "1"
 
@@ -51,7 +82,10 @@ class _GuardedSdist(sdist):
         return super().run(*args, **kwargs)
 
 
-cmdclass = {"sdist": _GuardedSdist}
+cmdclass = {
+    "build_py": SelectiveBuildPy,
+    "sdist": _GuardedSdist,
+}
 
 # bdist_wheel is only available when the `wheel` package is installed.
 # setuptools.build_meta.build_wheel() calls it internally, so the guard

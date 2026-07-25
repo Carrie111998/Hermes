@@ -1846,6 +1846,16 @@ class CredentialPool:
                 # Falling through to current()/_select_unlocked() would mark an
                 # innocent healthy key exhausted for the full cooldown TTL.
                 #
+                # OpenAI Codex pools are synchronized from the authoritative
+                # auth store before this method is called.  An exact key hint
+                # that is absent there means the failed credential was already
+                # removed or replaced; rotating the newly loaded pool would
+                # falsely report recovery against an unrelated account.
+                if self.provider == "openai-codex":
+                    self._unmatched_rotation_streak = 0
+                    self._current_id = None
+                    return None
+                #
                 # #70401: this branch must still be BOUNDED. With OAuth-token
                 # auth the upstream 401's key hint never matches any entry's
                 # ``runtime_api_key``, so every retry lands here, nothing is

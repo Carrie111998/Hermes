@@ -3227,6 +3227,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
+                if require_single_public_receipt:
+                    return SendResult(
+                        success=False,
+                        error=(
+                            "Discord forum parents are not supported for "
+                            "single-message receipt delivery"
+                        ),
+                    )
                 result = await self._send_to_forum(channel, content)
                 await asyncio.to_thread(
                     self._record_discord_response,
@@ -5461,6 +5469,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 import io
                 file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
+
+                public_target_error = _discord_policy_public_target_error(channel)
+                if public_target_error:
+                    return SendResult(success=False, error=public_target_error)
 
                 if self._is_forum_parent(channel):
                     return await self._forum_post_file(
@@ -9259,9 +9271,25 @@ def _define_discord_view_classes() -> None:
 
             self.resolved = True
 
-            # Unblock the waiting agent thread FIRST, then render the outcome.
-            # A click that lands after the approval wait timed out (count == 0)
-            # must not claim "Approved" — the command was already denied.
+            # Update the embed with the decision
+            embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            if embed:
+                embed.color = color
+                embed.set_footer(text=f"{label} by {interaction.user.display_name}")
+
+            # Disable all buttons
+            for child in self.children:
+                child.disabled = True
+
+            await interaction.response.edit_message(embed=embed, view=self)
+
+            # Editing is an external await boundary. Re-prove the target is
+            # still permitted before the irreversible approval mutation.
+            if _discord_policy_public_target_error(
+                getattr(interaction, "channel", None)
+            ):
+                return
+
             try:
                 from tools.approval import resolve_gateway_approval
                 count = resolve_gateway_approval(self.session_key, choice)
@@ -9273,22 +9301,27 @@ def _define_discord_view_classes() -> None:
                 logger.error("Failed to resolve gateway approval from button: %s", exc)
                 count = 0
 
-            if not count:
-                color = discord.Color.dark_grey()
-                label = "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)"
-
-            # Update the embed with the decision
-            embed = interaction.message.embeds[0] if interaction.message.embeds else None
-            if embed:
-                embed.color = color
-                footer = f"{label} by {interaction.user.display_name}" if count else label
-                embed.set_footer(text=footer)
-
-            # Disable all buttons
-            for child in self.children:
-                child.disabled = True
-
-            await interaction.response.edit_message(embed=embed, view=self)
+            # A click that lands after the approval wait timed out must not
+            # leave a false "Approved" receipt. Correct it only while the
+            # target remains permitted after the queue mutation.
+            if (
+                not count
+                and not _discord_policy_public_target_error(
+                    getattr(interaction, "channel", None)
+                )
+            ):
+                if embed:
+                    embed.color = discord.Color.dark_grey()
+                    embed.set_footer(
+                        text=(
+                            "⌛ Approval expired — command was not run "
+                            "(already timed out or resolved elsewhere)"
+                        )
+                    )
+                try:
+                    await interaction.edit_original_response(embed=embed, view=self)
+                except Exception:
+                    pass
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(

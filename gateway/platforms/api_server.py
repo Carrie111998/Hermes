@@ -44,6 +44,7 @@ import contextvars
 import errno
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 from contextlib import contextmanager, nullcontext
@@ -79,6 +80,13 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     if smart_denied:
         return ["once", "deny"]
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+
+
+async def _await_if_needed(value: Any) -> Any:
+    """Await production coroutines while preserving synchronous test seams."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 try:
@@ -2360,6 +2368,62 @@ class APIServerAdapter(BasePlatformAdapter):
             self._api_agent_cache.pop(cache_key, None)
             return agent
 
+    def _retire_api_session_agents(
+        self,
+        session_id: Optional[str],
+        *,
+        reason: str,
+    ) -> None:
+        """Interrupt and evict every process-local owner of one API session."""
+
+        normalized_session = str(session_id or "")
+        if not normalized_session:
+            return
+
+        cached_agent = self._pop_cached_api_agent(normalized_session)
+        with self._api_agent_cache_lock:
+            active_agents = [
+                agent
+                for agent in self._api_active_agents.values()
+                if str(getattr(agent, "session_id", "") or "")
+                == normalized_session
+            ]
+
+        owned_agents = {
+            id(agent): agent
+            for agent in [cached_agent, *active_agents]
+            if agent is not None
+        }
+        if not owned_agents:
+            self._clear_api_approval_scope(normalized_session)
+            self._clear_api_clarify_scope(
+                self._api_clarify_scope(normalized_session)
+            )
+            return
+
+        for agent in owned_agents.values():
+            try:
+                agent.interrupt(reason)
+            except Exception:
+                logger.debug(
+                    "Failed to interrupt retired API session agent",
+                    exc_info=True,
+                )
+            self._clear_api_clarify_scope(
+                str(
+                    getattr(agent, "_api_clarify_scope", "")
+                    or self._api_clarify_scope(normalized_session)
+                )
+            )
+            self._clear_api_approval_scope(
+                normalized_session,
+                approval_session_key=str(
+                    getattr(agent, "_api_approval_session_key", "") or ""
+                ),
+                cancel_core=True,
+            )
+            self._release_api_cached_agent(agent)
+
     def _prune_api_agent_cache_locked(self, now: float) -> List[Any]:
         """Prune idle/LRU agents while holding ``_api_agent_cache_lock``."""
 
@@ -2503,21 +2567,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 entry["last_used"] = time.monotonic()
                 self._api_agent_cache.move_to_end(requested_session_id)
         return None
-
-    def _port_is_available(self) -> bool:
-        """Return True when the configured listen port is free."""
-        try:
-            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
-                _s.settimeout(1)
-                _s.connect(('127.0.0.1', self._port))
-            logger.error(
-                "[%s] Port %d already in use. Set a different port in config.yaml: "
-                "platforms.api_server.port",
-                self.name, self._port,
-            )
-            return False
-        except (ConnectionRefusedError, OSError):
-            return True
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -2788,7 +2837,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # otherwise crash this handler (500) instead of returning a clean
             # 401. Encoding both sides keeps the timing-safe comparison and
             # matches web_server.py's dashboard-token check.
-            if hmac.compare_digest(token.encode(), self._api_key.encode()):
+            legacy_valid = bool(self._api_key) and hmac.compare_digest(
+                token.encode(),
+                self._api_key.encode(),
+            )
+            verifier_valid = (
+                self._api_bearer_verifier is not None
+                and api_bearer_matches(self._api_bearer_verifier, token)
+            )
+            if legacy_valid or verifier_valid:
                 return None  # Auth OK
 
         logger.warning(
@@ -5079,7 +5136,9 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        session, err = await _await_if_needed(
+            self._get_existing_session_or_404(request.match_info["session_id"])
+        )
         if err:
             return err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
@@ -5090,7 +5149,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await _await_if_needed(
+            self._get_existing_session_or_404(session_id)
+        )
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -5109,6 +5170,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+            self._retire_api_session_agents(
+                session_id,
+                reason="API session ended",
+            )
         session = await asyncio.to_thread(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
@@ -5118,11 +5183,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await _await_if_needed(
+            self._get_existing_session_or_404(session_id)
+        )
         if err:
             return err
         db = await self._ensure_session_db_async()
         deleted = await asyncio.to_thread(db.delete_session, session_id)
+        if deleted:
+            self._retire_api_session_agents(
+                session_id,
+                reason="API session deleted",
+            )
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
@@ -5131,7 +5203,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = await _await_if_needed(
+            self._get_existing_session_or_404(session_id)
+        )
         if err:
             return err
         db = await self._ensure_session_db_async()
@@ -5149,7 +5223,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
+        source, err = await _await_if_needed(
+            self._get_existing_session_or_404(source_id)
+        )
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -5197,7 +5273,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await _await_if_needed(
+            self._get_existing_session_or_404(session_id)
+        )
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -5260,7 +5338,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
-        history = await self._conversation_history_for_session(session_id)
+        history = await _await_if_needed(
+            self._conversation_history_for_session(session_id)
+        )
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -5285,6 +5365,11 @@ class APIServerAdapter(BasePlatformAdapter):
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
+        if outcome["incomplete"]:
+            headers["X-Hermes-Completed"] = "false"
+            headers["X-Hermes-Partial"] = (
+                "true" if outcome["partial"] else "false"
+            )
         runtime = {}
         if isinstance(result, dict):
             runtime = result.get("runtime") or {}
@@ -5302,6 +5387,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 else ""
             ),
         )
+        shared_outcome = {
+            "status": outcome["status"],
+            "completed": outcome["completed"],
+            "partial": outcome["partial"],
+            "interrupted": outcome["interrupted"],
+            "failed": outcome["failed"],
+            "incomplete": outcome["incomplete"],
+            "turn_exit_reason": outcome["turn_exit_reason"],
+        }
+        if not final_response and outcome["incomplete"]:
+            error_payload = _openai_error(
+                "Agent run did not produce a response.",
+                err_type="server_error",
+                code="agent_incomplete",
+            )
+            error_payload["error"]["hermes"] = shared_outcome
+            return web.json_response(error_payload, status=502, headers=headers)
         return web.json_response(
             {
                 "object": "hermes.session.chat.completion",
@@ -5309,6 +5411,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "message": {"role": "assistant", "content": final_response},
                 "usage": usage,
                 "runtime": runtime,
+                "outcome": shared_outcome,
             },
             headers=headers,
         )
@@ -5320,7 +5423,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await _await_if_needed(
+            self._get_existing_session_or_404(session_id)
+        )
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -5456,7 +5561,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "runtime": runtime_meta,
                 }))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = await self._conversation_history_for_session(session_id)
+                history = await _await_if_needed(
+                    self._conversation_history_for_session(session_id)
+                )
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -5648,7 +5755,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = await _await_if_needed(
+            self._get_existing_session_or_404(session_id)
+        )
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -6454,7 +6563,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "instructions": instructions,
                 "session_id": session_id_snapshot or session_id,
             })
-            if conversation and advance_conversation:
+            if conversation and response_env.get("status") == "completed":
                 self._response_store.set_conversation(conversation, response_id)
 
         def _persist_incomplete_if_needed() -> None:
@@ -9357,20 +9466,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     terminalized = True
                     return
-                with self._profile_scope(request_profile):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=agent_overrides.get("requested_model"),
-                        requested_provider=agent_overrides.get("requested_provider"),
-                        model_options=agent_overrides.get("model_options"),
-                        route=route,
-                    )
-                self._active_run_agents[run_id] = agent
-
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     approval_id = str(
                         (approval_data or {}).get("approval_id", "") or ""

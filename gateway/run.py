@@ -919,11 +919,15 @@ def _format_exec_approval_fallback(
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
     if not smart_denied and allow_session:
         choices.append(
-            f"`{command_prefix}approve always` to approve permanently"
+            f"`{command_prefix}approve session` to approve this pattern for the session"
         )
+        if allow_permanent:
+            choices.append(
+                f"`{command_prefix}approve always` to approve permanently"
+            )
     choices.append(f"`{command_prefix}deny` to cancel")
     return (
-        "⚠️ **Dangerous command requires approval:**\n"
+        f"{heading}\n"
         f"```\n{cmd_preview}\n```\nReason: {description}\n\n"
         + ", ".join(choices[:-1])
         + f", or {choices[-1]}."
@@ -23040,7 +23044,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
 
-    def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
+    def _clear_conversation_scope(
+        self,
+        session_key: str,
+        *,
+        reason: str,
+        clear_security: bool = True,
+    ) -> None:
         """Clear ALL conversation-scoped per-session state for ``session_key``.
 
         THE single conversation-boundary funnel. Call this — and nothing
@@ -23078,12 +23088,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             store = getattr(self, attr, None)
             if isinstance(store, dict):
                 store.pop(session_key, None)
-        self._clear_session_boundary_security_state(session_key)
+        if clear_security:
+            self._clear_session_boundary_security_state(session_key)
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason
         )
 
-    def _clear_session_boundary_security_state(self, session_key: str) -> None:
+    def _clear_session_boundary_security_state(
+        self,
+        session_key: str,
+        *,
+        strict: bool = False,
+        retire_capability_epoch_sha256: str = "",
+    ) -> None:
         """Clear per-session control state that must not survive a boundary switch."""
         if not session_key:
             return
@@ -26644,6 +26661,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if (
                     getattr(type(_status_adapter), "send_exec_approval", None)
                     is not None
+                    and approval_data.get("allow_session", True)
+                    and not approval_data.get("smart_denied", False)
                 ):
                     try:
                         _approval_fut = safe_schedule_threadsafe(
@@ -26654,8 +26673,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 description=desc,
                                 metadata=_status_thread_metadata,
                                 allow_permanent=approval_data.get("allow_permanent", True),
-                                allow_session=approval_data.get("allow_session", True),
-                                smart_denied=approval_data.get("smart_denied", False),
                             ),
                             _loop_for_step,
                             logger=logger,
@@ -26801,21 +26818,141 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _canonical_workspace_recovery_incomplete = False
             if _is_resume_pending:
                 _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
-                _persist_user_message_override = message
-                # The empty-message case is the auto-resume startup turn
-                # synthesized by _schedule_resume_pending_sessions — there is
-                # no NEW user message to address.  Guidance is adapter-aware:
-                # interactive platforms report the restore and ask what next;
-                # non-interactive event platforms (webhook, API server)
-                # continue the interrupted work instead, because nobody is
-                # present to answer and an acknowledgement would silently
-                # abandon the task (#57056).
                 _resume_adapter = self._adapter_for_source(source)
                 _interactive_resume = bool(
                     getattr(_resume_adapter, "interactive_resume", True)
                 )
-                message = build_resume_recovery_note(
-                    _reason, message, interactive=_interactive_resume,
+                if _persist_user_message_override is None:
+                    _persist_user_message_override = message
+
+                _task_workspace_resume: Dict[str, Any] = {
+                    "status": "none",
+                    "note": "",
+                }
+                if getattr(source, "platform", None) == Platform.DISCORD:
+                    try:
+                        from gateway.canonical_brain_task_workspace import (
+                            BOUNDARY_RESTART_RESUME,
+                            prepare_task_workspace_resume,
+                        )
+
+                        _task_workspace_resume = prepare_task_workspace_resume(
+                            thread_id=str(
+                                getattr(source, "thread_id", None)
+                                or getattr(source, "chat_id", None)
+                                or ""
+                            ),
+                            session_key=str(session_key or ""),
+                            todo_store=getattr(agent, "_todo_store", None),
+                            hydrate_local_state=not _has_real_user_message,
+                            boundary=BOUNDARY_RESTART_RESUME,
+                        )
+                    except Exception as _workspace_exc:
+                        logger.debug(
+                            "Canonical Task Workspace restart recovery failed soft: %s",
+                            _workspace_exc,
+                        )
+                        _task_workspace_resume = (
+                            _canonical_workspace_failure_result()
+                        )
+
+                _workspace_status = str(
+                    _task_workspace_resume.get("status") or "none"
+                )
+                _workspace_note = str(
+                    _task_workspace_resume.get("note") or ""
+                )
+                if _workspace_note:
+                    from agent.message_provenance import (
+                        CANONICAL_WORKSPACE_NOTE_KIND,
+                        bind_message_fragment,
+                    )
+
+                    _persist_user_provenance_override = bind_message_fragment(
+                        _persist_user_provenance_override,
+                        kind=CANONICAL_WORKSPACE_NOTE_KIND,
+                        exact_text=_workspace_note,
+                    )
+
+                if getattr(source, "platform", None) == Platform.DISCORD:
+                    _reason_phrase = (
+                        "a gateway restart"
+                        if _reason == "restart_timeout"
+                        else "a gateway shutdown"
+                        if _reason == "shutdown_timeout"
+                        else "a gateway interruption"
+                    )
+                    if _has_real_user_message:
+                        _resume_guidance = (
+                            "Address the user's NEW message below FIRST and focus "
+                            "on what the user is asking now. If an exact Canonical "
+                            "Task Workspace follows, GPT decides whether the new "
+                            "message changes, supersedes, or continues that plan."
+                        )
+                    elif _workspace_status == "exact":
+                        _resume_guidance = (
+                            "An exact active Canonical Task Workspace was recovered. "
+                            "Continue it from the next unverified step through its "
+                            "explicit completion or blocker contract."
+                        )
+                    elif _workspace_status == "blocked":
+                        _resume_guidance = (
+                            "An exact blocked Canonical Task Workspace was recovered. "
+                            "Do not assume its blocker cleared. Inspect its exact "
+                            "blocker contract and current evidence; GPT decides "
+                            "whether to author a new active revision and continue "
+                            "or report the still-current missing input or authority."
+                        )
+                    elif _workspace_status in {"ambiguous", "incomplete"}:
+                        _resume_guidance = (
+                            "Canonical Task Workspace recovery did not establish "
+                            "one complete, unambiguous active plan. GPT must inspect "
+                            "the structured state, retry exact reads when appropriate, "
+                            "report a concrete blocker, or ask a focused clarification "
+                            "only if ambiguity remains."
+                        )
+                    else:
+                        _resume_guidance = (
+                            "Report to the user that the session was restored "
+                            "successfully and ask what they would like to do next."
+                        )
+                    if _workspace_status in {
+                        "exact",
+                        "blocked",
+                        "ambiguous",
+                        "incomplete",
+                    }:
+                        _history_guidance = (
+                            "Do NOT blindly replay old tool calls. Use the durable "
+                            "structured workspace below, re-check live external state "
+                            "where needed, and continue only the remaining explicit work."
+                        )
+                    else:
+                        _history_guidance = (
+                            "Do NOT re-execute old tool calls — skip any unfinished "
+                            "work from the conversation history."
+                        )
+                    _auto_continue_note = (
+                        f"[System note: The previous turn was interrupted by "
+                        f"{_reason_phrase}; the gateway is now back online. "
+                        f"Any restart/shutdown command in the history has already "
+                        f"run — do NOT re-execute or verify it. {_resume_guidance} "
+                        f"{_history_guidance}]"
+                    )
+                else:
+                    # Event adapters may not have a user present to answer a
+                    # generic "what next?" prompt. Keep their adapter-aware
+                    # continuation behavior from the upstream recovery path.
+                    _auto_continue_note = build_resume_recovery_note(
+                        _reason,
+                        "",
+                        interactive=_interactive_resume,
+                    )
+
+                message = (
+                    _auto_continue_note
+                    + (f"\n\n{_workspace_note}" if _workspace_note else "")
+                    + (f"\n\n{message}" if message else "")
                 )
                 from agent.message_provenance import (
                     GATEWAY_AUTO_CONTINUE_NOTE_KIND,
@@ -26991,7 +27128,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
                 )
                 _sn_adapter = self._adapter_for_source(source)
-                message = build_resume_recovery_note(
+                _auto_continue_note = build_resume_recovery_note(
                     _sn_reason,
                     "",
                     interactive=bool(
@@ -29545,13 +29682,12 @@ async def start_gateway(
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(
-        config,
-        require_production_model_sovereignty=(
-            require_production_model_sovereignty
-        ),
-        require_capability_canary=require_capability_canary,
-    )
+    _runner_contract_kwargs: dict[str, bool] = {}
+    if require_production_model_sovereignty:
+        _runner_contract_kwargs["require_production_model_sovereignty"] = True
+    if require_capability_canary:
+        _runner_contract_kwargs["require_capability_canary"] = True
+    runner = GatewayRunner(config, **_runner_contract_kwargs)
     isolated_runtime = bool(getattr(runner, "_isolated_runtime", isolated_runtime))
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
@@ -29925,62 +30061,205 @@ async def start_gateway(
             raise SystemExit(runner.exit_code)
         return True
 
-    # Start the background cron scheduler via the resolved provider so
-    # scheduled jobs fire automatically. The built-in provider is the
-    # historical in-process 60s ticker; an external provider (e.g. chronos)
-    # may arm a schedule and return. Pass the event loop so cron delivery can
-    # use live adapters (E2EE support).
-    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+    # Production has two pieces of work that must be complete before systemd
+    # READY: durable session restoration and initialization of the exact
+    # built-in cron thread. The cron thread starts parked behind a one-shot
+    # activation gate, so no due job can run before readiness is published.
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
-
-    # Multiplex profiles: tell the built-in ticker which profile homes to
-    # tick so secondary-profile cron jobs actually fire (#69377).
-    # Without this, only the process-global HERMES_HOME (default profile)
-    # is iterated and every secondary profile's cron store is silently
-    # ignored — jobs show as "scheduled" with a valid next_run_at but
-    # never execute because no ticker owns that store.
-    if (
-        isinstance(cron_provider, InProcessCronScheduler)
-        and getattr(runner.config, "multiplex_profiles", False)
-    ):
+    cron_provider = None
+    cron_thread = None
+    production_cron_gate = None
+    if require_production_model_sovereignty:
         try:
-            from hermes_cli.profiles import profiles_to_serve
+            runner._schedule_resume_pending_sessions()
+            await runner._finish_startup_restore()
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if profile_homes:
-                cron_start_kwargs["profile_homes"] = profile_homes
-                logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
-                    len(profile_homes),
-                    [p[0] if isinstance(p, tuple) else p for p in profile_homes],
-                )
-        except Exception as exc:
-            logger.warning(
-                "Could not resolve profile homes for multiplex cron: %s",
-                exc,
+            from cron.scheduler_provider import resolve_cron_scheduler
+            from gateway.production_cron_startup import (
+                ProductionCronActivationGate,
             )
 
-    # External cron providers own their remote scheduling contract. Only the
-    # in-process ticker polls local due jobs, so only it receives the local
-    # external-drain dispatch gate.
-    if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
+            production_cron_gate = ProductionCronActivationGate(
+                provider=resolve_cron_scheduler(),
+                stop_event=cron_stop,
+                adapters=runner.adapters,
+                loop=asyncio.get_running_loop(),
+            )
+            await asyncio.to_thread(production_cron_gate.prepare, timeout=5.0)
+            cron_provider = production_cron_gate.provider
+            cron_thread = production_cron_gate.thread
+        except Exception:
+            logger.error(
+                "Production restore/cron initialization failed before READY.",
+                exc_info=True,
+            )
+            if production_cron_gate is not None:
+                production_cron_gate.stop()
+                await _await_thread_exit(production_cron_gate.thread, timeout=2.0)
+            await runner.stop()
+            _planned_stop_watcher_stop.set()
+            _planned_stop_watcher_thread.join(timeout=2)
+            remove_pid_file()
+            release_gateway_runtime_lock()
+            return False
+
+    if require_capability_canary:
+        try:
+            from gateway.canonical_capability_canary_runtime import (
+                attest_capability_execution_readiness,
+            )
+
+            if capability_plan is None:
+                raise RuntimeError("capability canary plan is unavailable")
+            # This is the final canary-specific execution gate before READY.
+            # Both probes cross the live authenticated worker/browser AF_UNIX
+            # boundaries; static service state cannot satisfy this contract.
+            attest_capability_execution_readiness(capability_plan)
+        except Exception:
+            logger.error(
+                "Capability canary execution readiness failed; gateway "
+                "remains offline.",
+                exc_info=True,
+            )
+            await runner.stop()
+            _planned_stop_watcher_stop.set()
+            _planned_stop_watcher_thread.join(timeout=2)
+            remove_pid_file()
+            release_gateway_runtime_lock()
+            return False
+
+    if canonical_writer_readiness_receipt is not None:
+        try:
+            from gateway.canonical_writer_readiness import (
+                attest_canonical_writer_startup_readiness,
+                notify_systemd_writer_readiness,
+            )
+
+            # Startup can load immutable platform/plugin modules. Re-attest
+            # from this exact MainPID so READY binds the final import closure.
+            canonical_writer_readiness_receipt = (
+                attest_canonical_writer_startup_readiness()
+            )
+            if canonical_writer_readiness_receipt is None:
+                raise RuntimeError(
+                    "Canonical writer boundary disappeared during startup"
+                )
+            if not notify_systemd_writer_readiness(
+                canonical_writer_readiness_receipt,
+                ready=True,
+            ):
+                raise RuntimeError(
+                    "enabled Canonical writer requires systemd Type=notify"
+                )
+        except Exception:
+            logger.error(
+                "Canonical writer systemd readiness publication failed.",
+                exc_info=True,
+            )
+            if production_cron_gate is not None:
+                production_cron_gate.stop()
+                await _await_thread_exit(production_cron_gate.thread, timeout=2.0)
+            await runner.stop()
+            _planned_stop_watcher_stop.set()
+            _planned_stop_watcher_thread.join(timeout=2)
+            if external_extension_runtime_allowed:
+                try:
+                    from tools.mcp_tool import shutdown_mcp_servers
+
+                    shutdown_mcp_servers()
+                except Exception:
+                    pass
+            remove_pid_file()
+            release_gateway_runtime_lock()
+            return False
+
+    if production_cron_gate is not None:
+        try:
+            await asyncio.to_thread(production_cron_gate.activate, timeout=5.0)
+        except Exception:
+            logger.error(
+                "Production cron activation failed after READY.",
+                exc_info=True,
+            )
+            production_cron_gate.stop()
+            await _await_thread_exit(production_cron_gate.thread, timeout=2.0)
+            await runner.stop()
+            _planned_stop_watcher_stop.set()
+            _planned_stop_watcher_thread.join(timeout=2)
+            remove_pid_file()
+            release_gateway_runtime_lock()
+            return False
+
+    # Generic/isolated runtimes retain upstream's resolved scheduler provider.
+    # Production already owns the exact parked instance above and must never
+    # resolve or start a second provider.
+    if (
+        production_cron_gate is None
+        and _gateway_cron_enabled_for_runtime(isolated_runtime)
+    ):
+        from cron.scheduler_provider import (
+            InProcessCronScheduler,
+            resolve_cron_scheduler,
         )
+
+        cron_provider = resolve_cron_scheduler()
+        cron_start_kwargs: Dict[str, Any] = {
+            "adapters": runner.adapters,
+            "loop": asyncio.get_running_loop(),
+        }
+
+        # Multiplex profiles: the built-in ticker owns every served profile's
+        # local store, while external providers keep their own contract.
+        if (
+            isinstance(cron_provider, InProcessCronScheduler)
+            and getattr(runner.config, "multiplex_profiles", False)
+        ):
+            try:
+                from hermes_cli.profiles import profiles_to_serve
+
+                profile_homes = list(profiles_to_serve(multiplex=True))
+                if profile_homes:
+                    cron_start_kwargs["profile_homes"] = profile_homes
+                    logger.info(
+                        "Cron scheduler will tick %d profile(s) under multiplex: %s",
+                        len(profile_homes),
+                        [
+                            p[0] if isinstance(p, tuple) else p
+                            for p in profile_homes
+                        ],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Could not resolve profile homes for multiplex cron: %s",
+                    exc,
+                )
+
+        if isinstance(cron_provider, InProcessCronScheduler):
+            cron_start_kwargs["can_dispatch"] = lambda: not (
+                runner._draining or runner._external_drain_active
+            )
+        cron_thread = threading.Thread(
+            target=cron_provider.start,
+            args=(cron_stop,),
+            kwargs=cron_start_kwargs,
+            daemon=True,
+            name="cron-scheduler",
+        )
+        cron_thread.start()
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
     # Shares cron_stop as the shutdown signal.
-    housekeeping_thread = threading.Thread(
-        target=_start_gateway_housekeeping,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="gateway-housekeeping",
-    )
-    housekeeping_thread.start()
+    housekeeping_thread = None
+    if not isolated_runtime:
+        housekeeping_thread = threading.Thread(
+            target=_start_gateway_housekeeping,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="gateway-housekeeping",
+        )
+        housekeeping_thread.start()
 
     # READY is emitted only after adapters, cron, and housekeeping have all
     # reached their running boundary. Missing config/systemd runtime state

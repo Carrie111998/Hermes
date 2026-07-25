@@ -3870,6 +3870,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             attest_pinned_effective_config_projection,
         )
 
+        attest_pinned_effective_config_projection()
+
         try:
             call_kwargs = {
                 "task": "compression",

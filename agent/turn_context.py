@@ -486,22 +486,28 @@ def build_turn_context(
         )
     if conversation_history:
         normalized_history: List[Dict[str, Any]] = []
+        history_changed = False
         from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
         from agent.message_provenance import MESSAGE_PROVENANCE_KEY
 
         for raw_message in conversation_history:
-            message = dict(raw_message)
-            if "content" in message:
-                provenance = message.get(MESSAGE_PROVENANCE_KEY)
-                message["content"] = _neutralize_reserved_runtime_markers(
-                    message.get("content"),
+            message = raw_message
+            if "content" in raw_message:
+                provenance = raw_message.get(MESSAGE_PROVENANCE_KEY)
+                normalized_content = _neutralize_reserved_runtime_markers(
+                    raw_message.get("content"),
                     provenance,
                     compressed_summary_metadata=bool(
-                        message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                        raw_message.get(COMPRESSED_SUMMARY_METADATA_KEY)
                     ),
                 )
+                if normalized_content != raw_message.get("content"):
+                    message = dict(raw_message)
+                    message["content"] = normalized_content
+                    history_changed = True
             normalized_history.append(message)
-        conversation_history = normalized_history
+        if history_changed:
+            conversation_history = normalized_history
 
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
@@ -1110,7 +1116,7 @@ def build_turn_context(
                 if messages is not _engine_input:
                     _preflight_compressed = True
                     conversation_history = conversation_history_after_compression(
-                        agent, messages
+                        agent, messages, conversation_history
                     )
                     agent._empty_content_retries = 0
                     agent._thinking_prefill_retries = 0
