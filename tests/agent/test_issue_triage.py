@@ -111,6 +111,58 @@ def test_reporter_is_operator_routes_to_slack_not_github():
     assert not any("comment" in c for c in calls)
 
 
+# --- ask-reporter idempotency (issue #3061 spam guard) ---------------------
+
+def _runner_with_comments(comments):
+    """A fake gh runner whose ``issue view ... --json comments`` returns the
+    given comments; every other call succeeds with empty stdout. Records calls."""
+    import json as _json
+    calls = []
+
+    def run(args, capture_output=True, text=True):
+        calls.append(args)
+        if "view" in args and "comments" in args:
+            return SimpleNamespace(returncode=0, stdout=_json.dumps({"comments": comments}), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    return run, calls
+
+
+def test_ask_reporter_skips_when_already_asked():
+    # A prior Mercury comment carries the hidden marker, so don't re-ask.
+    run, calls = _runner_with_comments([{"author": {"login": "mercury-bot"},
+                                         "body": "old ask\n\n" + t._ASK_MARKER}])
+    out = t.process_issue(_issue(author={"login": "other"}), "me", set(), dry_run=False,
+                          client=_FakeLLM(_NEEDS_INFO), model="m", run=run)
+    assert out.ask_target == "reporter"
+    assert not any("comment" in c for c in calls)  # no re-post
+    planned = next(a for a in out.auto_planned if a.action == "ask-reporter")
+    assert planned.executed is False and "skipped" in planned.note
+
+
+def test_ask_reporter_skips_when_reporter_replied():
+    # The reporter has commented since opening, so the ball is with the operator.
+    run, calls = _runner_with_comments([{"author": {"login": "other"}, "body": "here are my repro steps"}])
+    out = t.process_issue(_issue(author={"login": "other"}), "me", set(), dry_run=False,
+                          client=_FakeLLM(_NEEDS_INFO), model="m", run=run)
+    assert not any("comment" in c for c in calls)  # no re-post
+    planned = next(a for a in out.auto_planned if a.action == "ask-reporter")
+    assert planned.executed is False
+
+
+def test_ask_reporter_posts_first_time_with_marker():
+    # No prior engagement: post the clarification, and it carries the marker
+    # so the next sweep recognises it.
+    run, calls = _runner_with_comments([])
+    out = t.process_issue(_issue(author={"login": "other"}), "me", set(), dry_run=False,
+                          client=_FakeLLM(_NEEDS_INFO), model="m", run=run)
+    comment_calls = [c for c in calls if "comment" in c]
+    assert len(comment_calls) == 1
+    body = comment_calls[0][comment_calls[0].index("--body") + 1]
+    assert t._ASK_MARKER in body
+    planned = next(a for a in out.auto_planned if a.action == "ask-reporter")
+    assert planned.executed is True
+
+
 # --- gated actions never auto-run ------------------------------------------
 
 _CLOSE_VERDICT = (

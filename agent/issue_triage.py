@@ -215,7 +215,12 @@ def process_issue(issue: Dict[str, Any], operator_login: str, existing_labels: s
             else:
                 planned = PlannedAction("ask-reporter", {"questions": questions}, gated=False)
                 if questions and not dry_run:
-                    planned.executed = _post_questions(issue, questions, reporter, run=run)
+                    # Idempotency: don't re-ask when we already asked or the
+                    # reporter has since replied (issue #3061 spam guard).
+                    if _already_engaged(issue, reporter, run=run):
+                        planned.note = "skipped: already asked or reporter replied"
+                    else:
+                        planned.executed = _post_questions(issue, questions, reporter, run=run)
                 out.ask_target = "reporter"
                 out.auto_planned.append(planned)
         elif name == "ask-operator":
@@ -238,9 +243,16 @@ def _apply_labels(issue: Dict[str, Any], labels: List[str], *, run: Run) -> bool
     return ok
 
 
+# Hidden HTML-comment marker embedded in every Mercury clarification comment.
+# Lets a later sweep recognise its own prior ask (idempotency) without matching
+# on prose, which the LLM/operator can reword. Invisible in the rendered issue.
+_ASK_MARKER = "<!-- mercury:ask-reporter -->"
+
+
 def _post_questions(issue: Dict[str, Any], questions: List[str], reporter: str, *, run: Run) -> bool:
     lines = [f"Thanks for the report, @{reporter}! To move this forward, could you clarify:", ""]
     lines += [f"- {q}" for q in questions]
+    lines += ["", _ASK_MARKER]
     body = "\n".join(lines)
     proc = _run(run, ["issue", "comment", str(issue.get("number")), "-R", issue.get("repo", ""),
                       "--body", body])
@@ -249,3 +261,34 @@ def _post_questions(issue: Dict[str, Any], questions: List[str], reporter: str, 
         logger.warning("[triage] ask-reporter comment failed for %s: %s",
                        issue.get("number"), (proc.stderr or "")[:160])
     return ok
+
+
+def _already_engaged(issue: Dict[str, Any], reporter: str, *, run: Run) -> bool:
+    """True when Mercury should NOT (re-)ask the reporter on this issue.
+
+    The twice-daily --live sweep re-runs ``ask-reporter`` every time an issue
+    still reads as needs-info, so without this guard it re-posts the same
+    clarification each cycle (issue #3061 got 6). Skip the post when EITHER:
+
+    * Mercury already asked here (a prior comment carries ``_ASK_MARKER``): the
+      question stands, re-asking is noise; or
+    * the reporter has commented since opening the issue: they have responded,
+      so the ball is with the operator/triage to read it, not to ask again.
+
+    Fail OPEN (return False, allow the ask) if comments can't be fetched: a
+    transient gh error must not permanently silence first-ask clarification.
+    """
+    number = issue.get("number")
+    repo = issue.get("repo", "")
+    data = _gh_json(run, ["issue", "view", str(number), "-R", repo, "--json", "comments"])
+    if not isinstance(data, dict):
+        return False  # fail open: allow the ask
+    comments = data.get("comments") or []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        if _ASK_MARKER in (c.get("body") or ""):
+            return True  # we already asked
+        if ((c.get("author") or {}).get("login", "")) == reporter and reporter:
+            return True  # reporter has responded, don't re-ask
+    return False
