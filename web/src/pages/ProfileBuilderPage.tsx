@@ -416,20 +416,24 @@ export default function ProfileBuilderPage() {
                       setSkillFilter(e.target.value)
                     }
                   />
-                  {skills !== null && skills.length > 0 && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-muted-foreground">
-                        {keptSkills.size} of {filteredSkills.length} selected
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setKeptSkills(new Set())}
-                        className="text-xs text-muted-foreground underline hover:text-foreground"
-                      >
-                        Deselect all
-                      </button>
-                    </div>
-                  )}
+                  {skills !== null && skills.length > 0 && (() => {
+                    const activeKept = [...keptSkills].filter(n => skills.some(s => s.name === n)).length;
+                    return (
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">
+                          {activeKept} of {skills.length} selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setKeptSkills(new Set())}
+                          disabled={activeKept === 0}
+                          className="text-xs text-muted-foreground underline hover:text-foreground disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
+                        >
+                          Deselect all
+                        </button>
+                      </div>
+                    );
+                  })()}
                   {skills === null ? (
                     <p className="text-sm text-muted-foreground">
                       Loading skills…
