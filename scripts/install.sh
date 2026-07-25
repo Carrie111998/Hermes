@@ -605,21 +605,36 @@ install_uv() {
 check_python() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Checking Termux Python..."
-        if command -v python >/dev/null 2>&1; then
-            PYTHON_PATH="$(command -v python)"
-            if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
-                PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
-                log_success "Python found: $PYTHON_FOUND_VERSION"
-                return 0
+        # Prefer python3.11 if available — pyproject.toml requires >=3.11,<3.14
+        # and the default `python` may be 3.14+ which fails pip install. (#71331)
+        for _py_cmd in python3.11 python3.12 python3.13 python; do
+            if command -v "$_py_cmd" >/dev/null 2>&1; then
+                PYTHON_PATH="$(command -v "$_py_cmd")"
+                if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info < (3, 14) else 1)' 2>/dev/null; then
+                    PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
+                    log_success "Python found: $PYTHON_FOUND_VERSION"
+                    return 0
+                fi
             fi
-        fi
+        done
 
-        log_info "Installing Python via pkg..."
-        pkg install -y python >/dev/null
-        PYTHON_PATH="$(command -v python)"
-        PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
-        log_success "Python installed: $PYTHON_FOUND_VERSION"
-        return 0
+        # No suitable Python found — try installing python3.11 via pkg
+        log_info "Suitable Python (>=3.11,<3.14) not found, installing python3.11 via pkg..."
+        pkg install -y python3.11 >/dev/null 2>&1 || pkg install -y python >/dev/null
+        # Re-check: prefer python3.11, fall back to python
+        for _py_cmd in python3.11 python; do
+            if command -v "$_py_cmd" >/dev/null 2>&1; then
+                PYTHON_PATH="$(command -v "$_py_cmd")"
+                if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info < (3, 14) else 1)' 2>/dev/null; then
+                    PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
+                    log_success "Python installed: $PYTHON_FOUND_VERSION"
+                    return 0
+                fi
+            fi
+        done
+        log_error "Could not find or install Python >=3.11,<3.14 on Termux"
+        log_info "Try: pkg install python3.11"
+        exit 1
     fi
 
     log_info "Checking Python $PYTHON_VERSION..."
