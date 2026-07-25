@@ -23,6 +23,13 @@ const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_MODEL_SOURCE_KEY = 'hermes.desktop.composer.model-source'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
+// Sticky pre-session tool-preset pick for the NEXT new chat. Mirrors the model
+// pick: it follows across Cmd+N / restarts and rides on session.create as the
+// `tool_preset` param, overriding the profile's configured default_tool_preset.
+// Null = no draft pick → the backend falls back to default_tool_preset, then the
+// platform/coding posture. A live session's posture is per-chat and lives in
+// $currentToolPosture instead (this atom is draft-only).
+const COMPOSER_TOOL_PRESET_KEY = 'hermes.desktop.composer.tool-preset'
 
 // The last chat the user had open, so a relaunch lands back on it instead of an
 // empty new-chat. Stored (not runtime) id — the route is keyed by stored id.
@@ -311,6 +318,9 @@ export interface ToolPostureState {
   toolsEstTokens: number | null
 }
 export const $currentToolPosture = atom<ToolPostureState | null>(null)
+// Sticky draft-time tool-preset pick (see COMPOSER_TOOL_PRESET_KEY). Read by the
+// tool-posture pill in draft mode and shipped on the next session.create.
+export const $newChatToolPreset = atom<string | null>(storedString(COMPOSER_TOOL_PRESET_KEY) || null)
 export const $currentCwd = atom(getRememberedWorkspaceCwd())
 export const $newChatWorkspaceTarget = atom<NewChatWorkspaceTarget>(undefined)
 export const $newChatWorkspaceTargetGeneration = atom(0)
@@ -422,6 +432,11 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 
 export const setCurrentToolPosture = (next: Updater<ToolPostureState | null>) => updateAtom($currentToolPosture, next)
+
+export const setNewChatToolPreset = (next: Updater<string | null>) => {
+  updateAtom($newChatToolPreset, next)
+  persistString(COMPOSER_TOOL_PRESET_KEY, $newChatToolPreset.get() || null)
+}
 
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)

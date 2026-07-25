@@ -4,6 +4,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import type { HermesGateway } from '@/hermes'
 import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
@@ -39,6 +40,11 @@ interface Draft {
 }
 
 const RESERVED_NAMES = new Set(['Chat-only', 'Full'])
+
+// Radix Select forbids an empty-string item value (it's the placeholder
+// sentinel), so "no default" maps to this token in the control and back to
+// null on the wire.
+const NO_DEFAULT = '__none__'
 
 function formatTokens(n: number): string {
   if (n < 1000) {
@@ -234,6 +240,10 @@ export function ToolPresetsSettings() {
   const [saving, setSaving] = useState(false)
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
+  // Profile-scoped default preset every NEW chat starts with (null = none →
+  // platform/coding posture). Persisted via tools.default_preset_get/set.
+  const [defaultPreset, setDefaultPreset] = useState<string | null>(null)
+  const [savingDefault, setSavingDefault] = useState(false)
 
   const load = useCallback(async () => {
     const gateway = activeGateway()
@@ -247,16 +257,47 @@ export function ToolPresetsSettings() {
     setLoading(true)
 
     try {
-      const [cat, list] = await Promise.all([gateway.toolsCatalog(), gateway.toolsPresetsList()])
+      const [cat, list, def] = await Promise.all([
+        gateway.toolsCatalog(),
+        gateway.toolsPresetsList(),
+        gateway.toolsDefaultPresetGet()
+      ])
+
       setCatalog({
         ...cat,
         toolsets: cat.toolsets.filter(t => isDesktopToolsetVisible(t.name))
       })
       setPresets(list.presets)
+      setDefaultPreset(def.name)
     } catch (err) {
       notifyError(err, 'Could not load tool presets')
     } finally {
       setLoading(false)
+    }
+  }, [])
+
+  const changeDefaultPreset = useCallback(async (value: string) => {
+    const gateway = activeGateway()
+
+    if (!gateway) {
+      return
+    }
+
+    const name = value === NO_DEFAULT ? null : value
+    setSavingDefault(true)
+
+    try {
+      const result = await gateway.toolsDefaultPresetSet(name)
+      setDefaultPreset(result.name)
+      notify({
+        kind: 'success',
+        title: 'Default updated',
+        message: result.name ? `New chats start with "${result.name}"` : 'New chats use the platform default'
+      })
+    } catch (err) {
+      notifyError(err, 'Could not update default preset')
+    } finally {
+      setSavingDefault(false)
     }
   }, [])
 
@@ -419,7 +460,10 @@ export function ToolPresetsSettings() {
       return
     }
 
-    if (RESERVED_NAMES.has(payload.name)) {
+    // Editing a built-in in place is allowed — it persists an override (delete
+    // resets it). Only block a reserved name when it differs from the selected
+    // preset, i.e. renaming a user preset onto a reserved built-in's name.
+    if (RESERVED_NAMES.has(payload.name) && payload.name !== selected.name) {
       notifyError(new Error('reserved name'), `"${payload.name}" is a reserved built-in preset name`)
 
       return
@@ -501,6 +545,34 @@ export function ToolPresetsSettings() {
         Reusable tool / MCP / skill selections a chat can adopt. Trimming the surface shrinks the tool schemas, guidance,
         and skills index sent to the model — the token estimate updates as you toggle items.
       </p>
+
+      {/* Default preset for new chats — the profile-scoped starting posture every
+          new chat inherits (a draft-time pick in the composer overrides it). */}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg bg-background/55 px-3 py-2.5">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">Default preset for new chats</div>
+          <div className="text-[0.7rem] text-muted-foreground">
+            Every new chat starts with this preset. Pick one per chat from the composer to override it.
+          </div>
+        </div>
+        <Select
+          disabled={savingDefault}
+          onValueChange={value => void changeDefaultPreset(value)}
+          value={defaultPreset ?? NO_DEFAULT}
+        >
+          <SelectTrigger className="w-48 shrink-0">
+            <SelectValue placeholder="Platform default" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={NO_DEFAULT}>Platform default</SelectItem>
+            {presets.map(preset => (
+              <SelectItem key={preset.name} value={preset.name}>
+                {preset.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
       <div className="grid gap-4 @2xl:grid-cols-[15rem_minmax(0,1fr)]">
         {/* Preset list */}

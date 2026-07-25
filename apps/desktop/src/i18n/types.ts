@@ -1845,6 +1845,7 @@ export interface Translations {
       openContextUsage: string
       session: string
       runtimeSessionElapsed: string
+      openToolPresets: string
       yoloOn: string
       yoloOff: string
       modelNone: string

@@ -6,6 +6,7 @@ import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/stor
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
+import { ToolPostureStatus } from '@/app/shell/tool-posture-status'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
@@ -428,6 +429,14 @@ export function useStatusbarItems({
         ),
         title: copy.openContextUsage,
         variant: 'menu'
+      },
+      {
+        hidden: !chatOpen,
+        id: 'tool-posture',
+        // The tool-posture selector owns its slot: it renders the current
+        // preset + footprint AND opens the preset picker (the affordance that
+        // used to live as a composer pill inside the chat input).
+        render: () => <ToolPostureStatus />
       },
       {
         detail: <LiveDuration since={sessionStartedAt} />,

@@ -28,6 +28,11 @@ RESERVED_NAMES = {CHAT_ONLY, FULL}
 # The config.yaml key holding user presets.
 _CONFIG_KEY = "tool_presets"
 
+# The config.yaml key holding the profile's default preset for NEW chats.
+# ``None`` / absent = no default (new chats fall through to the platform/coding
+# posture). A stored value is the name of a built-in or user preset.
+_DEFAULT_KEY = "default_tool_preset"
+
 # Per-preset config fields (besides ``name``). All optional; absent == null.
 _PRESET_FIELDS = ("enabled_toolsets", "disabled_tools", "allowed_tools", "disabled_skills")
 
@@ -246,6 +251,41 @@ def save_preset(preset: Dict[str, Any]) -> List[Dict[str, Any]]:
     cfg[_CONFIG_KEY] = rows
     save_config(cfg)
     return list_presets()
+
+
+def get_default_preset(cfg: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Return the profile's default preset name for NEW chats, or ``None``.
+
+    ``None`` means no default is configured — a new chat falls through to the
+    platform / coding posture (which is effectively "Full"). This is the same
+    ``default_tool_preset`` value the desktop settings and ``session.create``
+    read, exposed here so the resolution logic has one home.
+    """
+    if cfg is None:
+        cfg = _load_cfg()
+    name = str(cfg.get(_DEFAULT_KEY) or "").strip()
+    return name or None
+
+
+def set_default_preset(name: Optional[str]) -> Optional[str]:
+    """Set (or clear) the profile's default preset for NEW chats.
+
+    ``name`` = a preset name (built-in or user) to make every new chat start
+    with it; falsy/``None`` clears the default so new chats fall through to the
+    platform/coding posture. Persists to ``config.yaml``. Returns the stored
+    value (``None`` when cleared). Does not validate the name — callers that
+    want to reject unknown presets should check against :func:`list_presets`.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    name = str(name or "").strip()
+    cfg = load_config()
+    if name:
+        cfg[_DEFAULT_KEY] = name
+    else:
+        cfg.pop(_DEFAULT_KEY, None)
+    save_config(cfg)
+    return get_default_preset(load_config())
 
 
 def delete_preset(name: str) -> List[Dict[str, Any]]:

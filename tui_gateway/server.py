@@ -1627,6 +1627,22 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                    # Tool preset the desktop draft (or the configured default)
+                    # picked for this brand-new chat, resolved at create-time.
+                    # Splat the resolved axes as the existing *_override kwargs so
+                    # they build into the agent AND persist to model_config (round-
+                    # tripping on later resume). Every axis is passed explicitly —
+                    # including [] (chat-only) and None (Full) — so _make_agent's
+                    # _UNSET discipline keeps those meaningful values distinct from
+                    # "no override".
+                    resolved_preset = current.get("create_tool_preset")
+                    if isinstance(resolved_preset, dict):
+                        kw["enabled_toolsets_override"] = resolved_preset.get("enabled_toolsets")
+                        kw["disabled_toolsets_override"] = resolved_preset.get("disabled_toolsets")
+                        kw["allowed_tool_names_override"] = resolved_preset.get("allowed_tool_names")
+                        kw["denied_tool_names_override"] = resolved_preset.get("denied_tool_names")
+                        kw["disabled_skills_override"] = resolved_preset.get("disabled_skills")
+                        kw["tool_preset_override"] = resolved_preset.get("tool_preset")
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2011,6 +2027,27 @@ def _ensure_session_db_row(session: dict) -> None:
         # service_tier value to the provider. Persist a durable marker so resume
         # can distinguish that choice from an omitted/inherited tier.
         model_config["service_tier"] = create_service_tier_override or "normal"
+    # Per-chat tool preset resolved at create-time (draft pick or the profile's
+    # default_tool_preset). Persist the resolved snapshot into this FIRST
+    # model_config write — the agent isn't built yet at first prompt.submit — so
+    # a resume restores the same surface even before the agent's own live-persist
+    # runs. Explicit ``is not None`` keeps [] (chat-only) from being dropped and
+    # re-expanded to full tools; matches _runtime_model_config's serialization.
+    resolved_preset = session.get("create_tool_preset")
+    if isinstance(resolved_preset, dict):
+        for _preset_key in (
+            "enabled_toolsets",
+            "disabled_toolsets",
+            "allowed_tool_names",
+            "denied_tool_names",
+            "disabled_skills",
+        ):
+            _preset_val = resolved_preset.get(_preset_key)
+            if _preset_val is not None:
+                model_config[_preset_key] = list(_preset_val)
+        _preset_label = resolved_preset.get("tool_preset")
+        if _preset_label is not None:
+            model_config["tool_preset"] = _preset_label
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -5960,6 +5997,26 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    # Per-chat tool preset for a BRAND-NEW chat. Precedence (highest first):
+    #   draft-picked `tool_preset` param  >  configured `default_tool_preset`.
+    # Resolve to the runtime override lists HERE (create-time), never inside
+    # _make_agent, so RESUMED sessions — which restore their own stored posture
+    # from model_config — are never retroactively changed by the default. None
+    # (no param, no configured default, or an unknown name) means "no preset":
+    # the build falls through to the platform/coding posture (_load_enabled_toolsets)
+    # then profile config. resolve_preset preserves [] (chat-only) vs None (Full).
+    create_tool_preset = None
+    try:
+        import tool_presets
+
+        _preset_name = str(params.get("tool_preset") or "").strip()
+        if not _preset_name:
+            _preset_name = str(_load_cfg().get("default_tool_preset") or "").strip()
+        if _preset_name:
+            create_tool_preset = tool_presets.resolve_preset(_preset_name)
+    except Exception:
+        logger.debug("create-time tool preset resolution failed", exc_info=True)
+
     ready = threading.Event()
     now = time.time()
     lease, limit_message = _claim_active_session_slot(
@@ -5990,6 +6047,7 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "create_tool_preset": create_tool_preset,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
@@ -15843,7 +15901,8 @@ def _(rid, params: dict) -> dict:
 
 @method("tools.preset_save")
 def _(rid, params: dict) -> dict:
-    """Upsert a user preset by name. Rejects reserved names. Persists presets."""
+    """Upsert a preset by name. Reserved built-in names persist as overrides
+    (delete resets them to default). Persists presets."""
     try:
         import tool_presets
 
@@ -15871,6 +15930,39 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"presets": presets})
     except Exception as e:
         return _err(rid, 5040, str(e))
+
+
+@method("tools.default_preset_get")
+def _(rid, params: dict) -> dict:
+    """Return the profile's configured default tool preset for NEW chats.
+
+    ``name`` is the stored ``default_tool_preset`` (or null when unset — a new
+    chat then falls through to the platform/coding posture). Empty/unknown names
+    normalize to null so the UI can render "no default" cleanly.
+    """
+    try:
+        import tool_presets
+
+        return _ok(rid, {"name": tool_presets.get_default_preset()})
+    except Exception as e:
+        return _err(rid, 5041, str(e))
+
+
+@method("tools.default_preset_set")
+def _(rid, params: dict) -> dict:
+    """Set (or clear) the profile's default tool preset for NEW chats.
+
+    ``name`` = a known preset name (built-in or user) to make every new chat
+    start with it; null/empty clears the default (new chats fall through to the
+    platform/coding posture). Persists to ``config.yaml`` via load/save.
+    """
+    try:
+        import tool_presets
+
+        name = str(params.get("name") or "").strip()
+        return _ok(rid, {"name": tool_presets.set_default_preset(name or None)})
+    except Exception as e:
+        return _err(rid, 5042, str(e))
 
 
 @method("toolsets.list")

@@ -105,7 +105,12 @@ def manage_presets_tool(args: Dict[str, Any]) -> str:
     action = str((args or {}).get("action") or "").strip().lower()
 
     if action == "list":
-        return json.dumps({"presets": tp.list_presets()}, ensure_ascii=False)
+        # Surface the configured default so the model understands which preset a
+        # NEW chat starts with (null = no default → platform/coding posture).
+        return json.dumps(
+            {"presets": tp.list_presets(), "default": tp.get_default_preset()},
+            ensure_ascii=False,
+        )
 
     if action == "catalog":
         try:
@@ -149,6 +154,24 @@ def manage_presets_tool(args: Dict[str, Any]) -> str:
             ensure_ascii=False,
         )
 
+    if action == "set_default":
+        # Empty/omitted name clears the default (new chats fall through to the
+        # platform/coding posture). A provided name must be a real preset so the
+        # model can't silently persist a typo.
+        name = str(args.get("name") or "").strip()
+        if name:
+            known = {p.get("name") for p in tp.list_presets()}
+            if name not in known:
+                return tool_error(
+                    f"'{name}' is not a known preset. Use action='list' to see "
+                    "available presets, or omit 'name' to clear the default."
+                )
+        default = tp.set_default_preset(name or None)
+        return json.dumps(
+            {"ok": True, "default": default, "presets": tp.list_presets()},
+            ensure_ascii=False,
+        )
+
     if action == "delete":
         name = str(args.get("name") or "").strip()
         if not name:
@@ -162,7 +185,8 @@ def manage_presets_tool(args: Dict[str, Any]) -> str:
         )
 
     return tool_error(
-        f"unknown action '{action}'. Use one of: list, catalog, save, delete"
+        f"unknown action '{action}'. Use one of: list, catalog, save, "
+        "set_default, delete"
     )
 
 
@@ -182,8 +206,13 @@ MANAGE_PRESETS_SCHEMA = {
         "- action='catalog': list every selectable toolset, MCP server, tool, "
         "and skill with approximate token costs. Call this FIRST when creating "
         "a preset so you use real names and understand the token trade-offs.\n"
-        "- action='list': show existing presets and their current selections.\n"
+        "- action='list': show existing presets and their current selections, "
+        "plus 'default' — the preset every NEW chat starts with (null = no "
+        "default, new chats use the profile/platform posture).\n"
         "- action='save': create or update a preset by name.\n"
+        "- action='set_default': set which preset new chats start with. Pass "
+        "'name' to make it the default; omit 'name' to clear it. This does NOT "
+        "change existing chats — only ones created afterward.\n"
         "- action='delete': delete a user preset (or reset a built-in to default).\n\n"
         "Preset fields (for save):\n"
         "- enabled_toolsets: toolset names to enable. Omit or null = profile "
@@ -196,19 +225,23 @@ MANAGE_PRESETS_SCHEMA = {
         "- disabled_skills: skill names to hide from the skills index.\n\n"
         "'Chat-only' and 'Full' are reserved built-ins; you may customize them "
         "(delete resets them). Saving a preset does not change the current "
-        "chat — the user applies it from the tool-posture picker."
+        "chat — the user applies it from the tool-posture picker. To control "
+        "what NEW chats start with, use action='set_default'."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "catalog", "save", "delete"],
+                "enum": ["list", "catalog", "save", "set_default", "delete"],
                 "description": "The operation to perform.",
             },
             "name": {
                 "type": "string",
-                "description": "Preset name (required for save/delete).",
+                "description": (
+                    "Preset name. Required for save/delete. For set_default, the "
+                    "preset to make the default for new chats; omit to clear it."
+                ),
             },
             "enabled_toolsets": {
                 "type": ["array", "null"],

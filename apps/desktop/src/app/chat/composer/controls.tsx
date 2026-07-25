@@ -10,7 +10,6 @@ import { cn } from '@/lib/utils'
 
 import type { ConversationStatus } from './hooks/use-voice-conversation'
 import { ModelPill } from './model-pill'
-import { ToolPosturePill } from './tool-posture-pill'
 import type { ChatBarState, VoiceStatus } from './types'
 
 export const ICON_BTN = 'size-(--composer-control-size) shrink-0 rounded-md'
@@ -90,9 +89,8 @@ export function ComposerControls({
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
-      {/* Per-chat tool posture — hidden on the compact/floating composer to keep
-          that row to the essentials, mirroring how the model pill collapses. */}
-      {!compactModelPill && <ToolPosturePill disabled={disabled} />}
+      {/* The per-chat tool-posture selector now lives in the bottom status bar
+          (next to context usage), not here in the composer. */}
       <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
       {/* While the agent runs and the user is typing, steer takes over the mic's
           slot rather than crowding the row with an extra button. */}

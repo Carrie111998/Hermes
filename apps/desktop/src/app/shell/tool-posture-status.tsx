@@ -1,11 +1,10 @@
 import type { ToolPreset } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { SETTINGS_ROUTE } from '@/app/routes'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
+import { STATUSBAR_ACTION_CLASS } from '@/app/shell/statusbar-controls'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -16,23 +15,26 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
-import { Tip } from '@/components/ui/tooltip'
-import { ChevronDown, Wrench } from '@/lib/icons'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { useI18n } from '@/i18n'
+import { Wrench } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeSessionId, $currentToolPosture, setCurrentToolPosture, type ToolPostureState } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentToolPosture,
+  $newChatToolPreset,
+  setCurrentToolPosture,
+  setNewChatToolPreset,
+  type ToolPostureState
+} from '@/store/session'
 
-// The two reserved virtual presets always exist even without user presets
-// (contract §core-semantics-5). Shown first, ahead of any config presets.
+// The two reserved virtual presets always exist even without user presets. Shown
+// first, ahead of any config presets.
 const CHAT_ONLY = 'Chat-only'
 const FULL = 'Full'
 const CUSTOM = 'Custom'
-
-const PILL = cn(
-  'h-(--composer-control-size) max-w-52 shrink-0 gap-1 rounded-md px-2 text-xs font-normal',
-  'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
-)
 
 /**
  * Derive the display label from a live posture. Prefer the backend-stamped
@@ -52,28 +54,16 @@ function postureLabel(posture: ToolPostureState | null): string {
   return posture.enabledToolsets.length === 0 ? CHAT_ONLY : CUSTOM
 }
 
-/** "7 tools · ~5.4k tok" — a glanceable read on the posture's token footprint. */
-function postureBadge(posture: ToolPostureState | null): string {
-  if (!posture) {
-    return ''
+/** "19 · ~10.1k" — the live tool-schema footprint, or null when unknown. */
+function postureFootprint(posture: ToolPostureState | null): string | null {
+  if (!posture || typeof posture.toolsEstTokens !== 'number') {
+    return null
   }
 
-  const parts: string[] = []
+  const tokens =
+    posture.toolsEstTokens >= 1000 ? `~${(posture.toolsEstTokens / 1000).toFixed(1)}k` : `~${posture.toolsEstTokens}`
 
-  if (typeof posture.toolCount === 'number') {
-    parts.push(`${posture.toolCount} ${posture.toolCount === 1 ? 'tool' : 'tools'}`)
-  }
-
-  if (typeof posture.toolsEstTokens === 'number') {
-    const tok =
-      posture.toolsEstTokens >= 1000
-        ? `~${(posture.toolsEstTokens / 1000).toFixed(1)}k tok`
-        : `~${posture.toolsEstTokens} tok`
-
-    parts.push(tok)
-  }
-
-  return parts.join(' · ')
+  return typeof posture.toolCount === 'number' ? `${posture.toolCount} · ${tokens}` : tokens
 }
 
 function toPosture(session: Record<string, unknown> | undefined): ToolPostureState | null {
@@ -90,21 +80,65 @@ function toPosture(session: Record<string, unknown> | undefined): ToolPostureSta
 }
 
 /**
- * Per-chat tool-posture selector — a compact composer pill (sibling of the
- * model pill) that shows the live session's tool surface and its token cost, and
- * lets the user swap presets mid-chat. Selecting a preset calls
- * `tools.session_configure`, which is turn-boundary gated: while the session is
- * generating the backend answers `{ok:false, reason:"busy"}`, surfaced here as a
- * non-blocking notice. Only rendered once a session is live (posture is per-chat
- * and has no meaning for a fresh draft).
+ * Per-chat tool-posture selector, living in the bottom status bar next to the
+ * context-usage / session-timer / approval-mode readouts. Shows the active
+ * chat's preset + its tool-schema footprint and, on click, opens the preset
+ * picker (the affordance that used to be a composer pill).
+ *
+ * Two modes, mirroring the old pill:
+ *   - **Live session:** shows the session's tool surface + token cost. Selecting
+ *     a preset calls `tools.session_configure`, turn-boundary gated (a `busy`
+ *     answer surfaces as a non-blocking notice).
+ *   - **Draft (no live session):** shows the pick the NEXT new chat starts with
+ *     (sticky draft pick → configured default → Full). Selecting stores the
+ *     sticky pre-session pick that rides on the next `session.create`.
  */
-export function ToolPosturePill({ disabled }: { disabled: boolean }) {
+export function ToolPostureStatus() {
+  const { t } = useI18n()
+  const title = t.shell.statusbar.openToolPresets
   const posture = useStore($currentToolPosture)
   const activeSessionId = useStore($activeSessionId)
+  const draftPreset = useStore($newChatToolPreset)
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const [presets, setPresets] = useState<ToolPreset[] | null>(null)
   const [pending, setPending] = useState(false)
+  const [defaultPreset, setDefaultPreset] = useState<string | null>(null)
+
+  const isDraft = !activeSessionId
+
+  // In draft mode the label follows the configured default when no sticky draft
+  // pick exists, so fetch it up front to render the right "starts as" preset.
+  useEffect(() => {
+    if (!isDraft) {
+      return
+    }
+
+    const gateway = activeGateway()
+
+    if (!gateway) {
+      return
+    }
+
+    let cancelled = false
+
+    gateway
+      .toolsDefaultPresetGet()
+      .then(result => {
+        if (!cancelled) {
+          setDefaultPreset(result.name)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDefaultPreset(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [isDraft])
 
   const loadPresets = useCallback(() => {
     const gateway = activeGateway()
@@ -121,18 +155,27 @@ export function ToolPosturePill({ disabled }: { disabled: boolean }) {
 
   const applyPreset = useCallback(
     async (preset: string) => {
-      const gateway = activeGateway()
-
-      if (!gateway || !activeSessionId || pending) {
-        return
-      }
-
-      // "Custom…" isn't a preset the backend resolves — it's an affordance that
-      // points at the full editor the settings preset manager owns.
+      // "Custom…" isn't a preset the backend resolves — it points at the full
+      // editor the settings preset manager owns.
       if (preset === CUSTOM) {
         setOpen(false)
         navigate(`${SETTINGS_ROUTE}?tab=tool-presets`)
 
+        return
+      }
+
+      // Draft mode: store the sticky pre-session pick. It rides on the next
+      // session.create (as `tool_preset`) and overrides the configured default.
+      if (isDraft) {
+        setNewChatToolPreset(preset)
+        setOpen(false)
+
+        return
+      }
+
+      const gateway = activeGateway()
+
+      if (!gateway || !activeSessionId || pending) {
         return
       }
 
@@ -169,21 +212,17 @@ export function ToolPosturePill({ disabled }: { disabled: boolean }) {
         setPending(false)
       }
     },
-    [activeSessionId, navigate, pending]
+    [activeSessionId, isDraft, navigate, pending]
   )
 
-  // Per-chat posture has no meaning before a session exists — mirror how the
-  // model pill is the pickable control for a draft, but tools are not.
-  if (!activeSessionId) {
-    return null
-  }
-
-  const label = postureLabel(posture)
-  const badge = postureBadge(posture)
+  // Draft: the label reflects what the next chat starts with (sticky pick →
+  // configured default → Full). Live: derive from the session's posture; the
+  // footprint detail only has meaning for a live surface.
+  const label = isDraft ? (draftPreset ?? defaultPreset ?? FULL) : postureLabel(posture)
+  const detail = isDraft ? null : postureFootprint(posture)
 
   const builtins = presets?.filter(preset => preset.builtin) ?? [{ name: CHAT_ONLY }, { name: FULL }]
   const userPresets = presets?.filter(preset => !preset.builtin) ?? []
-  const title = `Tools: ${label}${badge ? ` (${badge})` : ''}`
 
   return (
     <DropdownMenu
@@ -196,20 +235,20 @@ export function ToolPosturePill({ disabled }: { disabled: boolean }) {
       }}
       open={open}
     >
-      <Tip label={title} side="top">
-        <DropdownMenuTrigger asChild>
-          <Button aria-label={title} className={PILL} disabled={disabled || pending} type="button" variant="ghost">
-            <Wrench className="size-3 shrink-0 opacity-70" />
-            <span className="truncate">{label}</span>
-            {badge && (
-              <Badge className="font-normal" size="xs" variant="muted">
-                {badge}
-              </Badge>
-            )}
-            <ChevronDown className="size-2.5 shrink-0 opacity-50" />
-          </Button>
-        </DropdownMenuTrigger>
-      </Tip>
+      <TooltipProvider delayDuration={0}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <button className={cn(STATUSBAR_ACTION_CLASS)} disabled={pending} type="button">
+                <Wrench className="size-3" />
+                <span className="truncate">{label}</span>
+                {detail && <span className="truncate text-muted-foreground/80">{detail}</span>}
+              </button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>{title}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
       <DropdownMenuContent align="end" className="w-56" side="top" sideOffset={8}>
         <DropdownMenuLabel>Tool preset</DropdownMenuLabel>
         <DropdownMenuRadioGroup onValueChange={value => void applyPreset(value)} value={label}>

@@ -160,6 +160,15 @@ export interface ToolPresetsResult {
   presets: ToolPreset[]
 }
 
+/**
+ * Return shape of `tools.default_preset_get` / `tools.default_preset_set`. The
+ * profile-scoped default preset every NEW chat starts with; `null` when unset
+ * (a new chat then falls through to the platform/coding posture).
+ */
+export interface ToolDefaultPresetResult {
+  name: string | null
+}
+
 const ANY = '*'
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 // A reconnect after sleep/wake must not hang forever in 'connecting' (which
@@ -455,6 +464,16 @@ export class JsonRpcGatewayClient {
   /** Delete a user preset by name. */
   toolsPresetDelete(name: string): Promise<ToolPresetsResult> {
     return this.request<ToolPresetsResult>('tools.preset_delete', { name })
+  }
+
+  /** Get the profile's default tool preset for new chats (null = unset). */
+  toolsDefaultPresetGet(): Promise<ToolDefaultPresetResult> {
+    return this.request<ToolDefaultPresetResult>('tools.default_preset_get', {})
+  }
+
+  /** Set (or clear, with null) the profile's default tool preset for new chats. */
+  toolsDefaultPresetSet(name: string | null): Promise<ToolDefaultPresetResult> {
+    return this.request<ToolDefaultPresetResult>('tools.default_preset_set', { name })
   }
 
   private handleMessage(raw: unknown): void {

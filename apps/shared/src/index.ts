@@ -49,6 +49,7 @@ export type {
   ToolCatalogMcpServer,
   ToolCatalogSkill,
   ToolCatalogToolset,
+  ToolDefaultPresetResult,
   ToolPreset,
   ToolPresetsResult,
   ToolsSessionConfigureParams,

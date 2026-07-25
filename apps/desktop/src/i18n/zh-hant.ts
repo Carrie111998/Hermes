@@ -2076,6 +2076,7 @@ export const zhHant = defineLocale({
       openContextUsage: '開啟上下文使用量明細',
       session: '工作階段',
       runtimeSessionElapsed: '執行時工作階段已用時間',
+      openToolPresets: '本次對話傳送給模型的工具結構 — 點擊編輯預設',
       yoloOn: 'YOLO 已開啟 — 自動核准危險指令。點擊關閉。Shift+點擊可全域切換。',
       yoloOff: 'YOLO 已關閉 — 點擊自動核准危險指令。Shift+點擊可全域切換。',
       modelNone: '無',
