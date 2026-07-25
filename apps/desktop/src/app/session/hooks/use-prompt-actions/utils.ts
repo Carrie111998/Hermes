@@ -248,7 +248,9 @@ export function renderRpcResult(response: unknown, name: string): string {
 
   // process.stop — { killed: number }
   if ('killed' in r && typeof r.killed === 'number') {
-    return r.killed > 0 ? `Stopped ${r.killed} background process${r.killed === 1 ? '' : 'es'}.` : 'No background processes to stop.'
+    return r.killed > 0
+      ? `Stopped ${r.killed} background process${r.killed === 1 ? '' : 'es'}.`
+      : 'No background processes to stop.'
   }
 
   // session.save — { file }
@@ -357,6 +359,14 @@ export function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targ
 
 export interface SubmitTextOptions {
   attachments?: ComposerAttachment[]
+  /** The composer scope key that was actually loaded when this text was
+   *  submitted (see use-composer-draft's activeQueueSessionKeyRef). Compared
+   *  against the resolved submit target in sessionContextDrift — a mismatch
+   *  means the composer and the session-side refs disagreed about which
+   *  session this send belongs to (#59305). Omit for non-composer submits
+   *  (queue drain, steer, external submit requests): the check is a no-op
+   *  without it. */
+  composerScope?: string | null
   fromQueue?: boolean
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground
