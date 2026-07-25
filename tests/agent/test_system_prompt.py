@@ -183,6 +183,52 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 
     assert prompt == expected
     assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+class TestFleetWorkerGuard:
+    def test_subagent_executes_directly_without_fleet_readmission(self):
+        agent = _make_agent(platform="subagent")
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={"fleet": {"enabled": True}}):
+            stable = _stable_prompt(agent)
+
+        assert "already admitted and pinned" in stable
+        assert "Do not load the fleet-balanced-router skill" in stable
+        assert "Fleet default workflow is enabled" not in stable
+
+    def test_primary_session_keeps_default_fleet_admission(self):
+        agent = _make_agent(platform="cli")
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={"fleet": {"enabled": True}}):
+            stable = _stable_prompt(agent)
+
+        assert "Fleet default workflow is enabled" in stable
+        assert (
+            "Desktop Fleet Auto may admit and pin this parent before agent "
+            "construction" in stable
+        )
+        assert "No active session migrates" in stable
+        assert (
+            "Do not call `hermes fleet run` to readmit or replace this parent"
+            in stable
+        )
+        assert "separate child only" not in stable
+        assert "already admitted and pinned" not in stable
+
+    def test_primary_fleet_instruction_is_byte_stable_for_agent_lifetime(self):
+        agent = _make_agent(platform="desktop")
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={
+                "fleet": {
+                    "enabled": True,
+                    "parent_desktop_enabled": True,
+                }
+            },
+        ):
+            first = _stable_prompt(agent)
+            second = _stable_prompt(agent)
+
+        assert first == second
 
 
 class TestTelegramRichMessagesHint:

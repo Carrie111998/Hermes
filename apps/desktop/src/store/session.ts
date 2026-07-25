@@ -9,7 +9,7 @@ import { persistBoolean, persistString, storedBoolean, storedString } from '@/li
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
 type Updater<T> = T | ((current: T) => T)
-export type ComposerModelSource = '' | 'default' | 'manual'
+export type ComposerModelSource = '' | 'default' | 'fleet_auto' | 'manual'
 
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 
@@ -21,6 +21,7 @@ const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 const COMPOSER_MODEL_KEY = 'hermes.desktop.composer.model'
 const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_MODEL_SOURCE_KEY = 'hermes.desktop.composer.model-source'
+const COMPOSER_PRE_FLEET_MODEL_SOURCE_KEY = 'hermes.desktop.composer.pre-fleet-model-source'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
 
@@ -346,6 +347,9 @@ export const $resumeFailedSessionId = atom<string | null>(null)
 export const $resumeExhaustedSessionId = atom<string | null>(null)
 export const $currentModel = atom(storedString(COMPOSER_MODEL_KEY) ?? '')
 export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
+export const $currentModelDisplayLabel = atom('')
+export const $currentFleetAdapterKind = atom('')
+export const $currentFleetLaneId = atom('')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
@@ -420,10 +424,17 @@ export const setCurrentProvider = (next: Updater<string>) => {
   persistString(COMPOSER_PROVIDER_KEY, $currentProvider.get() || null)
 }
 
+export const setCurrentModelDisplayLabel = (next: Updater<string>) =>
+  updateAtom($currentModelDisplayLabel, next)
+export const setCurrentFleetAdapterKind = (next: Updater<string>) =>
+  updateAtom($currentFleetAdapterKind, next)
+export const setCurrentFleetLaneId = (next: Updater<string>) =>
+  updateAtom($currentFleetLaneId, next)
+
 export const getCurrentModelSource = (): ComposerModelSource => {
   const source = storedString(COMPOSER_MODEL_SOURCE_KEY)
 
-  return source === 'default' || source === 'manual' ? source : ''
+  return source === 'default' || source === 'fleet_auto' || source === 'manual' ? source : ''
 }
 
 // Reactive mirror of the persisted source so UI (the composer pill's
@@ -434,6 +445,29 @@ export const $currentModelSource = atom<ComposerModelSource>(getCurrentModelSour
 export const setCurrentModelSource = (source: ComposerModelSource) => {
   persistString(COMPOSER_MODEL_SOURCE_KEY, source || null)
   $currentModelSource.set(source)
+}
+
+export const setFleetAutoComposerEnabled = (enabled: boolean) => {
+  const current = getCurrentModelSource()
+
+  if (enabled) {
+    if (current !== 'fleet_auto') {
+      persistString(
+        COMPOSER_PRE_FLEET_MODEL_SOURCE_KEY,
+        current === 'manual' || current === 'default' ? current : 'default'
+      )
+    }
+
+    setCurrentModelSource('fleet_auto')
+
+    return
+  }
+
+  if (current === 'fleet_auto') {
+    const previous = storedString(COMPOSER_PRE_FLEET_MODEL_SOURCE_KEY)
+    setCurrentModelSource(previous === 'manual' ? 'manual' : 'default')
+    persistString(COMPOSER_PRE_FLEET_MODEL_SOURCE_KEY, null)
+  }
 }
 
 // Monotonic intent token for async default refreshes. A profile/config request

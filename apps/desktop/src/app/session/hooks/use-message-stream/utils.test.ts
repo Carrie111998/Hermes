@@ -38,6 +38,24 @@ describe('sessionInfoStatePatch / hasSessionInfoStatePatch', () => {
     expect(hasSessionInfoStatePatch(patch)).toBe(true)
     expect(hasSessionInfoStatePatch(sessionInfoStatePatch(payload({})))).toBe(false)
   })
+
+  it('projects authoritative Fleet route identity into per-session state', () => {
+    const patch = sessionInfoStatePatch(
+      payload({
+        display_label: 'Grok · Fleet',
+        fleet_adapter_kind: 'native_provider',
+        fleet_lane_id: 'grok',
+        model_source: 'fleet_auto'
+      })
+    )
+
+    expect(patch).toMatchObject({
+      fleetAdapterKind: 'native_provider',
+      fleetLaneId: 'grok',
+      modelDisplayLabel: 'Grok · Fleet',
+      modelSource: 'fleet_auto'
+    })
+  })
 })
 
 describe('delegateTaskPayloads', () => {

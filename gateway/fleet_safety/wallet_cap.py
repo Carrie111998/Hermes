@@ -111,6 +111,8 @@ class WalletDecision:
     effort: str                 # the effort to actually use (possibly downgraded)
     reason: str
     used_percent: Optional[float]
+    fallback_provider: Optional[str] = None
+    fallback_model: Optional[str] = None
 
     @property
     def allowed(self) -> bool:

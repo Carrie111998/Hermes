@@ -627,3 +627,35 @@ describe('appendLiveSessionProjection', () => {
     expect(appendLiveSessionProjection(stored, { session_id: 'runtime-1' })).toBe(stored)
   })
 })
+
+describe('applyRuntimeInfo fleet parent authority', () => {
+  it('repaints authoritative backend fleet route over stale Sonnet composer state', async () => {
+    const sessionStore = await import('@/store/session')
+    sessionStore.setCurrentModel('claude-sonnet-4-6')
+    sessionStore.setCurrentProvider('anthropic')
+    sessionStore.setCurrentModelSource('manual')
+    sessionStore.setCurrentModelDisplayLabel('')
+
+    const patch = applyRuntimeInfo({
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      model_source: 'fleet_auto',
+      display_label: 'Codex · Fleet',
+      fleet_lane_id: 'chatgpt_codex',
+      fleet_adapter_kind: 'native_provider'
+    })
+
+    expect(patch).toMatchObject({
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      modelSource: 'fleet_auto',
+      modelDisplayLabel: 'Codex · Fleet',
+      fleetLaneId: 'chatgpt_codex',
+      fleetAdapterKind: 'native_provider'
+    })
+    expect(sessionStore.$currentModel.get()).toBe('gpt-5.6-sol')
+    expect(sessionStore.$currentProvider.get()).toBe('openai-codex')
+    expect(sessionStore.getCurrentModelSource()).toBe('fleet_auto')
+    expect(sessionStore.$currentModelDisplayLabel.get()).toBe('Codex · Fleet')
+  })
+})

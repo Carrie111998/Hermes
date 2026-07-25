@@ -40,7 +40,12 @@ from gateway.fleet_safety.usage_verify import (
     VerifiedUsage,
     extract_authoritative,
     load_cached_percent,
+    verified_usage_for,
     verify_usage,
+)
+from gateway.fleet_safety.selector import (
+    SelectedLane,
+    select_best_lane,
 )
 
 logger = logging.getLogger(__name__)
@@ -296,49 +301,15 @@ def run_guard_tick(runner: Any, loop: Any = None, now: Optional[float] = None) -
 # --------------------------------------------------------------------------
 
 
-def _usage_cache_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()) / "usage-weekly.json"
-    except Exception:
-        return Path.home() / ".hermes" / "usage-weekly.json"
-
-
-def verified_usage_for(
-    provider: str,
+def select_best_lane_for(
+    current_provider: str = "",
     *,
+    is_heavy: bool = True,
     now: Optional[float] = None,
-    max_age_seconds: float = 900.0,
-    divergence_points: float = 15.0,
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> VerifiedUsage:
-    """Reconcile the cached usage figure for ``provider`` against the live
-    authoritative source. Best-effort — never raises; returns an unknown/suspect
-    result if either side can't be read."""
-    if now is None:
-        now = time.time()
-
-    cached_percent, cached_ts = load_cached_percent(_usage_cache_path(), provider)
-
-    available, auth_percent, _auth_ts = False, None, None
-    try:
-        from agent.account_usage import fetch_account_usage
-        snapshot = fetch_account_usage(provider, base_url=base_url, api_key=api_key)
-        available, auth_percent, _auth_ts = extract_authoritative(snapshot)
-    except Exception as e:
-        logger.debug("authoritative usage fetch failed for %s: %s", provider, e)
-
-    return verify_usage(
-        provider,
-        cached_percent=cached_percent,
-        cached_fetched_at=cached_ts,
-        authoritative_percent=auth_percent,
-        authoritative_available=available,
-        now=now,
-        max_age_seconds=max_age_seconds,
-        divergence_points=divergence_points,
-    )
+) -> SelectedLane:
+    """Select the best fallback routing lane using usage-headroom rules."""
+    cfg = _load_fleet_safety_config()
+    return select_best_lane(cfg, current_provider=current_provider, is_heavy=is_heavy, now=now)
 
 
 def decide_routing(
@@ -365,7 +336,17 @@ def decide_routing(
         divergence_points=float(verify_cfg.get("divergence_points", 15.0) or 15.0),
     )
     cap = WalletCap(wallet_cfg)
-    return cap.decide(
+    decision = cap.decide(
         RoutingRequest(provider=provider, effort=effort, is_heavy=is_heavy),
         verified.used_percent,
     )
+    if decision.action == WalletAction.FALLBACK_PROVIDER:
+        from dataclasses import replace
+        best = select_best_lane(cfg, current_provider=provider, is_heavy=is_heavy, now=now)
+        decision = replace(
+            decision,
+            fallback_provider=best.provider,
+            fallback_model=best.model,
+            reason=f"{decision.reason} -> fallback to {best.lane} ({best.provider}/{best.model})",
+        )
+    return decision

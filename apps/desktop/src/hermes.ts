@@ -22,6 +22,7 @@ import type {
   DebugShareResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
+  FleetStatusResponse,
   HermesConfig,
   HermesConfigRecord,
   LogsResponse,
@@ -641,6 +642,13 @@ export function getStatus(): Promise<StatusResponse> {
   })
 }
 
+export function getFleetStatus(profile?: null | string): Promise<FleetStatusResponse> {
+  return window.hermesDesktop.api<FleetStatusResponse>({
+    ...profileScoped(profile),
+    path: '/api/fleet/status'
+  })
+}
+
 export function getLogs(params: {
   component?: string
   file?: string
@@ -693,6 +701,13 @@ export function getHermesConfigRecord(): Promise<HermesConfigRecord> {
   })
 }
 
+export function getHermesConfigRecordForProfile(profile: string): Promise<HermesConfigRecord> {
+  return window.hermesDesktop.api<HermesConfigRecord>({
+    ...profileScoped(profile),
+    path: '/api/config'
+  })
+}
+
 export function getHermesConfigDefaults(): Promise<HermesConfigRecord> {
   return window.hermesDesktop.api<HermesConfigRecord>({
     ...profileScoped(),
@@ -711,6 +726,18 @@ export function getHermesConfigSchema(): Promise<ConfigSchemaResponse> {
 export function saveHermesConfig(config: HermesConfigRecord): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...profileScoped(),
+    path: '/api/config',
+    method: 'PUT',
+    body: { config }
+  })
+}
+
+export function saveHermesConfigForProfile(
+  config: HermesConfigRecord,
+  profile: string
+): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(profile),
     path: '/api/config',
     method: 'PUT',
     body: { config }

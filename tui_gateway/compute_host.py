@@ -452,6 +452,8 @@ class ComputeHost:
                 service_tier_override=frame.get("service_tier_override"),
                 platform_override=frame.get("source"),
                 session_db=session_db,
+                exact_route=frame.get("fleet_parent_route"),
+                cwd_override=str(frame.get("cwd") or ""),
             )
         finally:
             if home_token is not None:
@@ -502,6 +504,12 @@ class ComputeHost:
                 "edit_snapshots": {},
                 "tool_started_at": {},
                 "model_override": frame.get("model_override"),
+                "model_source": (
+                    "fleet_auto"
+                    if frame.get("fleet_parent_route") is not None
+                    else "default"
+                ),
+                "fleet_parent_route": frame.get("fleet_parent_route"),
                 "source": server._sanitize_client_source(frame.get("source")),
                 "transport": self._transport,
             }
@@ -512,6 +520,9 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if frame.get("fleet_parent_route") is not None:
+            session["model_source"] = "fleet_auto"
+            session["fleet_parent_route"] = frame.get("fleet_parent_route")
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

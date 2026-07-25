@@ -39,8 +39,10 @@ Antigravity has two layers — keep them distinct or the guidance will be wrong:
 
 ## Prerequisites
 
-- The `agy` binary on PATH. Verify through the `terminal` tool:
-  `command -v agy && agy --version`.
+- The `agy` binary either on PATH or at a verified absolute path. Verify through
+  the `terminal` tool. On the current native Windows package layout, use
+  `C:\Users\<user>\AppData\Local\agy\bin\agy.exe` when `command -v agy`
+  is empty; never infer the username from the hostname.
 - No env vars or API keys required by this skill — Antigravity manages its own
   auth via the OS keyring / browser sign-in (see Authentication below).
 
@@ -72,13 +74,18 @@ fixes, reviews, second opinions) to Antigravity rather than just smoke-testing.
 ### One-shot (preferred for scripted prompts and second opinions)
 
 ```
-terminal(command="agy -p 'Review this diff for bugs and security issues' --model 'Gemini 3.1 Pro (High)'", workdir="/path/to/repo", timeout=300)
+terminal(command="agy -p 'Review this diff for bugs and security issues' --model 'Gemini 3.1 Pro (High)' --log-file /path/to/evidence/agy.log", workdir="/path/to/repo", timeout=300)
 ```
 
 `-p` is non-interactive: it runs the prompt and exits. Pick the engine with
-`--model` (run `agy models` for the exact display strings, e.g.
-`'Gemini 3.1 Pro (High)'`, `'Claude Opus 4.6 (Thinking)'`). Add extra context
-roots with repeatable `--add-dir`.
+`--model`. On `agy` 1.1.5, use the exact display label (for example,
+`'Gemini 3.1 Pro (High)'` or `'Claude Opus 4.6 (Thinking)'`) and verify the
+wrapper log's `Propagating selected model override` label. Although `agy
+models` prints slug-like names, the slug `gemini-3.1-pro-high` was observed to
+fall back to `Gemini 3.6 Flash (High)`; a successful response alone is not
+route proof. Add extra context roots with repeatable `--add-dir`. Set the
+primary workspace with the terminal tool's `workdir`; `agy` 1.1.5 has no
+`--workspace` or `--no-project` flag.
 
 ### Long / bounded runs (tests, builds, multi-file changes)
 
@@ -127,8 +134,10 @@ another agent's plan or diff.
 
 - Binary / entrypoint: `agy`
 - App data dir: `~/.gemini/antigravity-cli/`
-- Settings file: `~/.gemini/antigravity-cli/settings.json`
-- Keybindings file: `~/.gemini/antigravity-cli/keybindings.json`
+- Shared CLI config: `~/.gemini/config/config.json`
+- Project config: `~/.gemini/config/projects/`
+- Version-dependent optional files: `~/.gemini/antigravity-cli/settings.json`
+  and `~/.gemini/antigravity-cli/keybindings.json` (absence is valid)
 - Logs: `~/.gemini/antigravity-cli/log/cli-*.log`
 - Conversations: `~/.gemini/antigravity-cli/conversations/`
 - Brain artifacts: `~/.gemini/antigravity-cli/brain/`
@@ -231,7 +240,7 @@ files with `read_file`):
 2. `terminal(command="agy --version")`
 3. `terminal(command="agy help")`
 4. `terminal(command="agy plugin list")`
-5. `read_file` on `~/.gemini/antigravity-cli/settings.json`
+5. `read_file` on `~/.gemini/config/config.json` when present
 6. `read_file` on the latest `~/.gemini/antigravity-cli/log/cli-*.log`
 7. If needed, `read_file` on `~/.gemini/antigravity-cli/keybindings.json`
 

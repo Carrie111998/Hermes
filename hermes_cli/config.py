@@ -944,6 +944,39 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Subscription-aware fleet routing is opt-in. Parent Desktop admission is
+    # separately gated and happens only before a new agent is constructed.
+    # bridge_usage_file blank → {HERMES_HOME}/fleet/usage-weekly.json.
+    "fleet": {
+        "enabled": False,
+        "parent_desktop_enabled": False,
+        "bridge_usage_file": "",
+        "switch_delta_pct": 20.0,
+        "minimum_confidence": "high",
+        "rotation_without_fresh_capacity": False,
+        "lease_ttl_seconds": 1800,
+        "execution_timeout_seconds": 1800,
+        "default_reservation_pct": 5.0,
+        "lanes": {
+            "chatgpt_codex": {
+                "enabled": True,
+                "max_concurrency": 1,
+                "reserve_floor_pct": 10.0,
+            },
+            "claude_code": {
+                "enabled": False,
+                "max_concurrency": 1,
+                "reserve_floor_pct": 10.0,
+            },
+            "grok": {
+                "enabled": False,
+                "max_concurrency": 1,
+                "reserve_floor_pct": 10.0,
+            },
+            "antigravity": {"enabled": False},
+            "kimi": {"enabled": False},
+        },
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).
