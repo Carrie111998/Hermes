@@ -127,8 +127,8 @@ description: "Hermes 内置工具权威参考，按工具集分组"
 | `kanban_block` | 因需向用户提问而阻塞当前任务——调度器暂停、呈现问题，并在人工回复后恢复。 | `HERMES_KANBAN_TASK` 或 `kanban` 工具集 |
 | `kanban_heartbeat` | 在长时间运行的操作期间发送进度心跳，让调度器知道 worker 仍在运行。 | `HERMES_KANBAN_TASK` 或 `kanban` 工具集 |
 | `kanban_comment` | 在不改变任务状态的情况下向任务线程添加评论——适用于呈现中间发现。 | `HERMES_KANBAN_TASK` 或 `kanban` 工具集 |
-| `kanban_create` | 从当前任务派生子任务。由编排器和生成后续任务的 worker 使用。 | `HERMES_KANBAN_TASK` 或 `kanban` 工具集 |
-| `kanban_link` | 用父 → 子依赖边链接任务。 | `HERMES_KANBAN_TASK` 或 `kanban` 工具集 |
+| `kanban_create` | 创建已提交的审查/后续工作。仅限启用 Loop 的前台会话或编排器 profile；任务 worker 不会收到此工具。 | 启用 Loop 的前台会话或含 `kanban` 工具集的 profile |
+| `kanban_link` | 用父 → 子依赖边链接任务。仅限前台/编排器；任务 worker 不会收到此工具。 | 含 `kanban` 工具集的 profile |
 | `kanban_unblock` | 将被阻塞的任务恢复为 `ready` 状态。仅限编排器；对调度器生成的任务 worker 隐藏。 | 含 `kanban` 工具集的 profile |
 
 ## `memory` 工具集

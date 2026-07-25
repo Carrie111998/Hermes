@@ -27,7 +27,6 @@ orchestrator profiles that route work through the board.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -151,18 +150,6 @@ def _check_kanban_orchestrator_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
-
-
-def _check_kanban_create_mode() -> bool:
-    """Expose create to orchestrators and dispatcher-authenticated workers."""
-    if _is_delegated_child_context():
-        return False
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return bool(
-            os.environ.get("HERMES_KANBAN_RUN_ID")
-            and os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-        )
-    return _check_kanban_orchestrator_mode()
 
 
 def _check_kanban_graph_control_mode() -> bool:
@@ -1285,11 +1272,6 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
-    delegated_err = _reject_delegated_child_mutation("kanban_create")
-    if delegated_err:
-        return delegated_err
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return _handle_worker_create(args)
     guard = _require_orchestrator_tool("kanban_create")
     if guard:
         return guard
@@ -1557,146 +1539,6 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
     except Exception as e:
         logger.exception("kanban_create failed")
-        return tool_error(f"kanban_create: {e}")
-
-
-def _handle_worker_create(args: dict) -> str:
-    """Persist a scoped child card from a live dispatcher worker attempt."""
-
-    title = str(args.get("title") or "").strip()
-    if not title:
-        return tool_error("title is required")
-    allowed = {"title", "body", "assignee", "parents", "idempotency_key"}
-    unsupported = sorted(set(args) - allowed)
-    if unsupported:
-        return tool_error(
-            "kanban_create: workers may only set title, body, assignee, "
-            f"parents, and idempotency_key; unsupported: {', '.join(unsupported)}"
-        )
-
-    creator_task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    creator_claim_lock = str(
-        os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or ""
-    ).strip()
-    try:
-        creator_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
-    except ValueError:
-        creator_run_id = 0
-    worker_board = str(os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
-    worker_profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
-    if not all((
-        creator_task_id,
-        creator_run_id > 0,
-        creator_claim_lock,
-        worker_board,
-        worker_profile,
-    )):
-        return tool_error(
-            "kanban_create: worker creation requires dispatcher task, run, "
-            "claim, board, and profile provenance"
-        )
-
-    assignee = str(args.get("assignee") or "").strip() or None
-    body = args.get("body")
-    parents = args.get("parents") or []
-    if isinstance(parents, str):
-        parents = [parents]
-    if not isinstance(parents, (list, tuple)):
-        return tool_error(
-            f"parents must be a list of task ids, got {type(parents).__name__}"
-        )
-    parents = tuple(
-        dict.fromkeys(
-            [creator_task_id]
-            + [
-                str(parent).strip()
-                for parent in parents
-                if parent is not None and str(parent).strip()
-            ]
-        )
-    )
-
-    try:
-        from hermes_cli.profiles import normalize_profile_name
-
-        kb, conn = _connect(board=worker_board)
-        try:
-            creator = kb.get_task(conn, creator_task_id)
-            if (
-                creator is None
-                or normalize_profile_name(worker_profile) != creator.assignee
-            ):
-                return tool_error(
-                    "kanban_create: worker task/run provenance is not an "
-                    "active dispatcher claim"
-                )
-
-            needs_specification = not (
-                assignee and isinstance(body, str) and bool(body.strip())
-            )
-            caller_key = str(args.get("idempotency_key") or "").strip()
-            fingerprint = (
-                {"key": caller_key}
-                if caller_key
-                else {
-                    "title": title,
-                    "body": body,
-                    "assignee": assignee,
-                    "parents": sorted(parents),
-                }
-            )
-            digest = hashlib.sha256(
-                json.dumps(
-                    fingerprint,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest()
-            idempotency_key = (
-                f"worker-create:{creator_task_id}:{digest}"
-            )
-
-            with kb.scoped_current_board(worker_board):
-                new_tid = kb.create_task(
-                    conn,
-                    title=title,
-                    body=body,
-                    assignee=assignee,
-                    parents=parents,
-                    tenant=creator.tenant,
-                    workspace_kind="scratch",
-                    project_id=creator.project_id,
-                    project_source_task_id=creator.id,
-                    idempotency_key=idempotency_key,
-                    created_by=worker_profile,
-                    session_id=creator.session_id,
-                    workflow_id=creator.workflow_id,
-                    board=worker_board,
-                    needs_specification=needs_specification,
-                    reject_blocked_parents=True,
-                    creator_task_id=creator_task_id,
-                    creator_run_id=creator_run_id,
-                    creator_claim_lock=creator_claim_lock,
-                )
-            new_task = kb.get_task(conn, new_tid)
-            return _ok(
-                task_id=new_tid,
-                status=new_task.status if new_task else None,
-                workspace_kind=new_task.workspace_kind if new_task else None,
-                workspace_path=new_task.workspace_path if new_task else None,
-                project_id=new_task.project_id if new_task else None,
-                workflow_id=new_task.workflow_id if new_task else None,
-                creator_task_id=creator_task_id,
-                creator_run_id=creator_run_id,
-                subscribed=False,
-            )
-        finally:
-            conn.close()
-    except ValueError as e:
-        return tool_error(f"kanban_create: {e}")
-    except Exception as e:
-        logger.exception("kanban_create worker path failed")
         return tool_error(f"kanban_create: {e}")
 
 
@@ -2221,13 +2063,13 @@ KANBAN_ATTACHMENTS_SCHEMA = {
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
-        "Create committed workflow work. Orchestrators get the full task "
-        "surface. Dispatcher workers may set only title, body, assignee, "
-        "parents, and idempotency_key; the child inherits their workflow identity "
-        "and scope, and gets a fresh workspace. Pass completed source tasks in "
-        "``parents``. "
+        "Foreground/orchestrator-only committed workflow mutation. Create a "
+        "review or follow-up task after reading a worker boundary and its "
+        "comments. Pass a completed source task in ``parents`` so dependency "
+        "order, workspace, tenant, session, and workflow identity are inherited. "
         "Never pass a blocked task as a parent; create runnable resolution work "
-        "without that blocked parent and reference it in the body."
+        "without parents and reference the blocked task in the body. "
+        "A worker suggestion is not committed work until this call succeeds."
     ),
     "parameters": {
         "type": "object",
@@ -2531,7 +2373,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_create_mode,
+    check_fn=_check_kanban_orchestrator_mode,
     emoji="➕",
 )
 

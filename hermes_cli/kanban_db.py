@@ -3604,9 +3604,6 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     needs_specification: bool = False,
     reject_blocked_parents: bool = False,
-    creator_task_id: Optional[str] = None,
-    creator_run_id: Optional[int] = None,
-    creator_claim_lock: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3642,13 +3639,15 @@ def create_task(
     config — passed to the worker as ``-m <model> [--provider <name>]``.
     ``provider_override`` requires ``model_override``.
 
-    ``project_source_task_id`` is an internal cross-profile fallback for a
-    worker-created child. When the active profile cannot resolve ``project_id``
-    in its own projects.db, a matching canonical project-linked task in this
-    board can supply the repo and branch convention. Its literal worktree is
-    never reused; the new task still gets its own task-id-keyed path.
-
-    Worker creator proof is all-or-nothing and is revalidated with the insert.
+    ``project_source_task_id`` is a legacy internal cross-profile fallback for
+    historical provenance verification. When the active profile cannot resolve
+    ``project_id`` in its own projects.db, a matching canonical project-linked
+    task in this board can supply the repo and branch convention. Its literal
+    worktree is never reused; the new task still gets its own task-id-keyed
+    path. This retained path does not grant current dispatcher-spawned leaf
+    workers topology authority: they cannot create, link, assign, or
+    review-route follow-up tasks; those graph mutations belong to foreground
+    control-plane orchestration.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3693,12 +3692,13 @@ def create_task(
         except Exception:
             project_obj = None
         if project_obj is None and project_source_task_id:
-            # Worker profiles have their own projects.db, while the Kanban DB is
-            # intentionally shared. Recover routing only from a canonical
-            # project-linked source task in this same board. This carries the
-            # repo + project branch convention forward without copying or
-            # opening the creator profile's project store, and without reusing
-            # the source task's literal worktree path.
+            # The active profile may have its own projects.db, while the Kanban
+            # DB is intentionally shared. For this legacy provenance fallback,
+            # recover routing only from a canonical project-linked source task
+            # in this same board. This carries the repo + project branch
+            # convention forward without copying or opening another profile's
+            # project store, and without reusing the source task's literal
+            # worktree path.
             source_task = get_task(conn, str(project_source_task_id))
             if (
                 source_task is not None
@@ -3768,17 +3768,6 @@ def create_task(
         )
     )
     workflow_id = str(workflow_id or "").strip() or None
-    creator_task_id = str(creator_task_id or "").strip() or None
-    creator_claim_lock = str(creator_claim_lock or "").strip() or None
-    if creator_run_id is not None:
-        creator_run_id = int(creator_run_id)
-    creator_parts = (creator_task_id, creator_run_id, creator_claim_lock)
-    if 0 < sum(value is not None for value in creator_parts) < 3:
-        raise ValueError(
-            "creator task, run, and claim provenance must be supplied together"
-        )
-    if creator_task_id and creator_task_id not in parents:
-        raise ValueError("worker-created task must depend on its creator task")
 
     # Resolve lineage before the idempotency fast path so a retried create
     # cannot accidentally return a task from a different workflow.
@@ -3871,11 +3860,10 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Keep the common replay fast path, but worker-created cards always enter
-    # the write transaction so their live run capability is revalidated.
-    # Every create path repeats this lookup under BEGIN IMMEDIATE below; that
-    # authoritative check prevents concurrent duplicate inserts.
-    if idempotency_key and creator_task_id is None:
+    # Idempotency check — return the existing task instead of creating a
+    # duplicate. The lookup is repeated under BEGIN IMMEDIATE below so two
+    # concurrent creators with the same key cannot both insert.
+    if idempotency_key:
         row = conn.execute(
             "SELECT id, workflow_id FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
@@ -3914,78 +3902,27 @@ def create_task(
             workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
-    def _scope(*values: Any) -> tuple[Optional[str], ...]:
-        return tuple(str(value or "").strip() or None for value in values)
-
     for attempt in range(2):
         task_id = _new_task_id()
         try:
             with write_txn(conn):
-                creator_row = None
-                if creator_task_id is not None:
-                    creator_row = conn.execute(
-                        """
-                        SELECT
-                            t.status AS task_status,
-                            t.current_run_id,
-                            t.claim_lock AS task_claim_lock,
-                            t.assignee,
-                            t.workflow_id,
-                            t.project_id,
-                            t.tenant,
-                            t.session_id,
-                            r.task_id AS run_task_id,
-                            r.profile AS run_profile,
-                            r.status AS run_status,
-                            r.claim_lock AS run_claim_lock,
-                            r.ended_at AS run_ended_at
-                        FROM tasks t
-                        JOIN task_runs r ON r.id = ?
-                        WHERE t.id = ?
-                        """,
-                        (creator_run_id, creator_task_id),
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id, workflow_id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1",
+                        (idempotency_key,),
                     ).fetchone()
-                    if (
-                        creator_row is None
-                        or creator_row["task_status"] != "running"
-                        or creator_row["current_run_id"] != creator_run_id
-                        or creator_row["task_claim_lock"] != creator_claim_lock
-                        or creator_row["run_task_id"] != creator_task_id
-                        or creator_row["run_status"] != "running"
-                        or creator_row["run_ended_at"] is not None
-                        or creator_row["run_claim_lock"] != creator_claim_lock
-                        or creator_row["run_profile"] != creator_row["assignee"]
-                    ):
-                        raise ValueError(
-                            "creator task/run provenance is not an active "
-                            "dispatcher claim"
+                    if row:
+                        existing_workflow_id = (
+                            str(row["workflow_id"] or "").strip() or None
                         )
-
-                    creator_scope = _scope(
-                        creator_row["workflow_id"],
-                        creator_row["project_id"],
-                        creator_row["tenant"],
-                        creator_row["session_id"],
-                    )
-                    if _scope(workflow_id, project_id, tenant, session_id) != creator_scope:
-                        raise ValueError(
-                            "worker-created task must inherit creator scope"
-                        )
-                    if creator_row["project_id"] is None:
-                        if workspace_kind != "scratch" or workspace_path is not None:
+                        if workflow_id and existing_workflow_id != workflow_id:
                             raise ValueError(
-                                "worker-created task requires a fresh scratch "
-                                "workspace"
+                                f"idempotent task {row['id']} belongs to workflow "
+                                f"{existing_workflow_id or '<none>'}, not {workflow_id}"
                             )
-                    elif (
-                        project_obj is None
-                        or workspace_kind != "worktree"
-                        or workspace_path is not None
-                    ):
-                        raise ValueError(
-                            "worker-created project task requires a fresh "
-                            "per-task project worktree"
-                        )
+                        return row["id"]
 
                 # Repeat lineage checks under the write lock. A previously
                 # ungrouped parent is allowed to acquire its one immutable
@@ -3994,8 +3931,7 @@ def create_task(
                 if parents:
                     placeholders = ",".join("?" for _ in parents)
                     rows = conn.execute(
-                        f"SELECT id, workflow_id, project_id, tenant, "
-                        f"session_id, status FROM tasks "
+                        f"SELECT id, workflow_id, status FROM tasks "
                         f"WHERE id IN ({placeholders})",
                         parents,
                     ).fetchall()
@@ -4036,60 +3972,6 @@ def create_task(
                                 f"workflow {locked_workflow_id}"
                             )
                         workflow_id = locked_workflow_id
-                    if creator_row is not None:
-                        for row in rows:
-                            if _scope(
-                                row["workflow_id"],
-                                row["project_id"],
-                                row["tenant"],
-                                row["session_id"],
-                            ) != creator_scope:
-                                raise ValueError(
-                                    f"parent {row['id']} is outside the creator "
-                                    "task scope"
-                                )
-
-                if idempotency_key:
-                    row = conn.execute(
-                        "SELECT id, workflow_id, project_id, tenant, session_id "
-                        "FROM tasks WHERE idempotency_key = ? "
-                        "AND status != 'archived' "
-                        "ORDER BY created_at DESC, id DESC LIMIT 1",
-                        (idempotency_key,),
-                    ).fetchone()
-                    if row:
-                        if creator_row is not None:
-                            if _scope(
-                                row["workflow_id"],
-                                row["project_id"],
-                                row["tenant"],
-                                row["session_id"],
-                            ) != creator_scope:
-                                raise ValueError(
-                                    "worker idempotency key resolved outside "
-                                    "the creator scope"
-                                )
-                            linked = conn.execute(
-                                "SELECT 1 FROM task_links "
-                                "WHERE parent_id = ? AND child_id = ?",
-                                (creator_task_id, row["id"]),
-                            ).fetchone()
-                            if linked is None:
-                                raise ValueError(
-                                    "worker idempotency key resolved to a task "
-                                    "without creator lineage"
-                                )
-                        else:
-                            existing_workflow_id = (
-                                str(row["workflow_id"] or "").strip() or None
-                            )
-                            if workflow_id and existing_workflow_id != workflow_id:
-                                raise ValueError(
-                                    f"idempotent task {row['id']} belongs to "
-                                    f"workflow {existing_workflow_id or '<none>'}, "
-                                    f"not {workflow_id}"
-                                )
-                        return row["id"]
                 if workflow_id:
                     locked_workflow = conn.execute(
                         "SELECT status FROM workflows WHERE id = ?",
@@ -4218,14 +4100,6 @@ def create_task(
                         "needs_specification": bool(needs_specification) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
-                        **(
-                            {
-                                "creator_task_id": creator_task_id,
-                                "creator_run_id": creator_run_id,
-                            }
-                            if creator_task_id is not None
-                            else {}
-                        ),
                     },
                 )
             return task_id
@@ -7051,22 +6925,22 @@ def _verify_created_cards(
     """Partition ``claimed_ids`` into (verified, phantom).
 
     A card is "verified" iff a row exists in ``tasks`` AND at least one
-    of the following holds:
+    of the following legacy/historical provenance checks holds:
 
     * ``created_by`` matches the completing task's ``assignee`` profile
-      (the common case: worker A spawns a card via ``kanban_create``,
-      which stamps ``created_by=A``).
+      (compatibility with historical creator-profile provenance).
     * ``created_by`` matches the completing task's id (edge case where
-      a worker passed its own task id as the ``created_by`` value).
+      an older caller passed its own task id as the ``created_by`` value).
     * The card is linked as a ``task_links.child`` of the completing
-      task — i.e. the worker explicitly called ``kanban_create`` with
-      ``parents=[<current_task>]``. This accepts cards created through
+      task (historical lineage evidence). This accepts cards created through
       the dashboard/CLI by a different principal but then attached to
-      the completing task by the worker.
+      the completing task.
 
     ``phantom`` returns ids that either don't exist at all, or exist
     but don't satisfy any of the three trust conditions. The caller
-    decides what to do with each bucket; this helper never mutates.
+    decides what to do with each bucket; this helper never mutates. The checks
+    preserve historical completion handoffs; current dispatcher-spawned leaf
+    workers cannot create, link, assign, or review-route follow-up topology.
     """
     claimed = [str(x).strip() for x in (claimed_ids or []) if str(x).strip()]
     if not claimed:
@@ -7159,7 +7033,7 @@ def _scan_prose_for_phantom_ids(
 
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
-    that don't exist or weren't created by the completing worker.
+    that don't exist or fail the retained historical provenance checks.
 
     The phantom list is attached as ``.phantom`` for callers that want
     structured access. Kept as ``ValueError`` subclass so existing
@@ -7171,7 +7045,7 @@ class HallucinatedCardsError(ValueError):
         self.completing_task_id = completing_task_id
         super().__init__(
             f"completion blocked: claimed created_cards that do not exist "
-            f"or were not created by this worker: {', '.join(phantom)}"
+            f"or lack verified historical provenance: {', '.join(phantom)}"
         )
 
 
@@ -7204,14 +7078,16 @@ def complete_task(
     (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
     are encouraged to use it for structured handoff facts.
 
-    ``created_cards`` is an optional list of task ids the completing
-    worker claims to have created. Each id is verified against
-    ``tasks.created_by``. If any id is phantom (does not exist or was
-    not created by this worker's assignee profile), completion is blocked
+    ``created_cards`` is an optional list of task ids supplied by a completing
+    caller for legacy/historical provenance verification. Each id is checked
+    against ``tasks.created_by`` and historical child-link evidence. If any id
+    is phantom (does not exist or fails those checks), completion is blocked
     with a ``HallucinatedCardsError`` and a
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
-    ``completed`` event payload.
+    ``completed`` event payload. This compatibility field does not authorize
+    current dispatcher-spawned leaf workers to create, link, assign, or
+    review-route follow-up topology.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
