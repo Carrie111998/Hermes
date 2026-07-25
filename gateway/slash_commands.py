@@ -1093,14 +1093,14 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
-        await self._notify_gateway_session_cancel(
-            session_key,
-            source,
-            reason="stop",
-        )
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
+            await self._notify_gateway_session_cancel(
+                session_key,
+                source,
+                reason="stop",
+            )
             # Force-clean the sentinel so the session is unlocked.
             await self._interrupt_and_clear_session(
                 session_key,
@@ -1111,6 +1111,11 @@ class GatewaySlashCommandsMixin:
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:
+            await self._notify_gateway_session_cancel(
+                session_key,
+                source,
+                reason="stop",
+            )
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             await self._interrupt_and_clear_session(
@@ -1129,12 +1134,24 @@ class GatewaySlashCommandsMixin:
         # agent(s) that share this thread, gated on authorization.
         sibling_keys = self._sibling_thread_run_keys(source, session_key)
         if sibling_keys and self._is_user_authorized(source):
-            for sibling_key in sibling_keys:
-                await self._notify_gateway_session_cancel(
+            cancel_routes = [(session_key, source)] + [
+                (
                     sibling_key,
-                    source,
-                    reason="stop",
+                    self._source_for_session_cancel(sibling_key, source),
                 )
+                for sibling_key in sibling_keys
+            ]
+            await asyncio.gather(
+                *(
+                    self._notify_gateway_session_cancel(
+                        key,
+                        route_source,
+                        reason="stop",
+                    )
+                    for key, route_source in cancel_routes
+                )
+            )
+            for sibling_key in sibling_keys:
                 await self._interrupt_and_clear_session(
                     sibling_key,
                     source,
@@ -1148,6 +1165,12 @@ class GatewaySlashCommandsMixin:
                 ", ".join(sibling_keys),
             )
             return EphemeralReply(t("gateway.stop.stopped"))
+
+        await self._notify_gateway_session_cancel(
+            session_key,
+            source,
+            reason="stop",
+        )
 
         # No running agent anywhere for this scope. A platform status
         # indicator can still be stuck — e.g. Slack's persistent

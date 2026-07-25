@@ -323,7 +323,11 @@ async def test_route_delivery_binds_relay_to_ingress_logical_platform(monkeypatc
         Platform.DISCORD,
         "channel-1",
         "relay reply",
-        metadata={"thread_id": "thread-1"},
+        metadata={
+            "thread_id": "thread-1",
+            "scope_id": "guild-1",
+            "user_id": "user-1",
+        },
     )
     relay.send.assert_not_awaited()
 
@@ -388,6 +392,21 @@ async def test_terminal_hook_runs_on_active_session_before_busy_queue(monkeypatc
     assert await runner._handle_message(_event()) is None
     runner._queue_or_replace_pending_event.assert_not_called()
     running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_active_session_drain_gate_prevents_hook_side_effects(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    session_key = build_session_key(_source())
+    runner._running_agents[session_key] = MagicMock()
+    runner._draining = True
+    hook = AsyncMock(return_value=[])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    result = await runner._handle_message(_event())
+
+    hook.assert_not_awaited()
+    assert "not accepting" in str(result).lower()
 
 
 @pytest.mark.asyncio

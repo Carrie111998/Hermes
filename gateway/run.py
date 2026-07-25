@@ -11447,7 +11447,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             # Ordinary user messages reach the plugin seam only after access
-            # checks and every active-session control intercept above.
+            # checks and every active-session control intercept above. During
+            # shutdown draining, no participant hook may create side effects.
+            if self._draining:
+                if self._queue_during_drain_enabled():
+                    self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    if self._queue_during_drain_enabled()
+                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                )
             if (
                 not is_internal
                 and not event.is_command()
@@ -11510,14 +11519,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         merge_text=True,
                     )
                 return None
-            if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-                )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -12886,6 +12887,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _source_for_session_cancel(
+        self,
+        session_key: str,
+        fallback: SessionSource,
+    ) -> SessionSource:
+        """Recover the target route identity for a session cancellation."""
+        cached = self._get_cached_session_source(session_key)
+        if cached is not None:
+            return cached
+        thread_id = str(fallback.thread_id or "")
+        marker = f":{thread_id}:" if thread_id else ""
+        if marker and marker in session_key:
+            target_user = session_key.rsplit(marker, 1)[-1]
+            if target_user and ":" not in target_user:
+                return dataclasses.replace(
+                    fallback,
+                    user_id=target_user,
+                    user_id_alt=None,
+                )
+        return fallback
+
     async def _run_gateway_message_hook(
         self,
         event: MessageEvent,
@@ -12908,6 +12930,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         delivery_via_relay = (
             getattr(source, "delivered_via_upstream_relay", False) is True
         )
+        if delivery_via_relay:
+            delivery_metadata = dict(delivery_metadata or {})
+            if source.scope_id:
+                delivery_metadata["scope_id"] = str(source.scope_id)
+            if source.user_id:
+                delivery_metadata["user_id"] = str(source.user_id)
 
         async def _send_to_source(content: str):
             if adapter is None:

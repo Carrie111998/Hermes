@@ -8,8 +8,10 @@ nothing and reply "no active task to stop".  Authorized users should be able to
 stop any run in the same thread.
 """
 
+import asyncio
+
 import pytest
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
 from gateway.session import SessionSource, build_session_key
@@ -131,12 +133,42 @@ async def test_stop_interrupts_sibling_thread_run_when_authorized(monkeypatch):
     result = await runner._handle_stop_command(event)
 
     assert interrupted == [(key_b, _INTERRUPT_REASON_STOP, "stop_command_thread_sibling")]
-    assert runner._notify_gateway_session_cancel.await_args_list == [
-        call(key_a, event.source, reason="stop"),
-        call(key_b, event.source, reason="stop"),
-    ]
+    cancel_calls = runner._notify_gateway_session_cancel.await_args_list
+    assert [item.args[0] for item in cancel_calls] == [key_a, key_b]
+    assert cancel_calls[0].args[1].user_id == "userA"
+    assert cancel_calls[1].args[1].user_id == "userB"
     # EphemeralReply or str — both carry the "stopped" message, not "no_active".
     assert "no active" not in str(getattr(result, "text", result)).lower()
+
+
+@pytest.mark.asyncio
+async def test_sibling_stop_notifies_all_routes_concurrently(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    key_a = _per_user_key("userA")
+    key_b = _per_user_key("userB")
+    key_c = _per_user_key("userC")
+    runner._running_agents = {key_b: _FakeAgent(), key_c: _FakeAgent()}
+    runner.session_store = _FakeStore(key_a)
+    runner._is_user_authorized = lambda source: True
+    runner._interrupt_and_clear_session = AsyncMock()
+
+    entered = []
+    all_entered = asyncio.Event()
+
+    async def notify(session_key, _source, *, reason):
+        entered.append(session_key)
+        if len(entered) == 3:
+            all_entered.set()
+        await all_entered.wait()
+
+    runner._notify_gateway_session_cancel = notify
+    event = MessageEvent(
+        text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
+    )
+
+    await asyncio.wait_for(runner._handle_stop_command(event), timeout=0.2)
+
+    assert set(entered) == {key_a, key_b, key_c}
 
 
 @pytest.mark.asyncio
