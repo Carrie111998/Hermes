@@ -6070,13 +6070,15 @@ def _desktop_macos_relaunchable_fixup(desktop_dir: Path) -> None:
     bundle also inherits the com.apple.quarantine flag from the downloaded
     installer process chain. Both make the relaunch fail.
 
-    Clearing the quarantine xattrs and re-applying clean ad-hoc signatures
-    (omitting the hardened-runtime flag, which is meaningless without a real
-    Developer ID) lets the rebuilt app relaunch. Preserve the electron-builder
-    entitlements on the main bundle and Helper apps when their plists are
-    available; otherwise retain the legacy deep-sign fallback. No-op when a real
-    signing identity is configured (CSC_LINK / APPLE_SIGNING_IDENTITY) so a
-    properly signed/notarized build is never clobbered. Best-effort: never raises.
+    Clearing the quarantine xattrs and re-applying clean ad-hoc signatures with
+    ``--options runtime`` lets the rebuilt app relaunch. Hardened Runtime
+    exception entitlements (allow-jit, etc.) only take effect when CS_RUNTIME
+    is set; ad-hoc + runtime does not require a Developer ID and matches the
+    release signature flags. Preserve the electron-builder entitlements on the
+    main bundle and Helper apps when their plists are available; otherwise
+    retain the legacy deep-sign fallback. No-op when a real signing identity is
+    configured (CSC_LINK / APPLE_SIGNING_IDENTITY) so a properly
+    signed/notarized build is never clobbered. Best-effort: never raises.
     """
     if sys.platform != "darwin":
         return
@@ -6101,18 +6103,19 @@ def _desktop_macos_relaunchable_fixup(desktop_dir: Path) -> None:
             for helper_app in sorted(frameworks_dir.glob("Hermes Helper*.app")):
                 if helper_app.is_dir():
                     subprocess.run(
-                        [codesign, "--force", "--sign", "-", "--entitlements",
-                         str(helper_entitlements), str(helper_app)],
+                        [codesign, "--force", "--options", "runtime", "--sign", "-",
+                         "--entitlements", str(helper_entitlements), str(helper_app)],
                         check=False,
                     )
             subprocess.run(
-                [codesign, "--force", "--sign", "-", "--entitlements",
-                 str(main_entitlements), str(app)],
+                [codesign, "--force", "--options", "runtime", "--sign", "-",
+                 "--entitlements", str(main_entitlements), str(app)],
                 check=False,
             )
         else:
             subprocess.run(
-                [codesign, "--force", "--deep", "--sign", "-", str(app)],
+                [codesign, "--force", "--deep", "--options", "runtime", "--sign", "-",
+                 str(app)],
                 check=False,
             )
     except Exception as exc:

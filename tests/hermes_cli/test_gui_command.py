@@ -1052,12 +1052,12 @@ def test_desktop_macos_relaunchable_fixup_preserves_packaged_entitlements(
     ]
     assert codesign_commands == [
         [
-            "/usr/bin/codesign", "--force", "--sign", "-", "--entitlements",
-            str(helper_entitlements), str(helper_app),
+            "/usr/bin/codesign", "--force", "--options", "runtime", "--sign", "-",
+            "--entitlements", str(helper_entitlements), str(helper_app),
         ],
         [
-            "/usr/bin/codesign", "--force", "--sign", "-", "--entitlements",
-            str(main_entitlements), str(app),
+            "/usr/bin/codesign", "--force", "--options", "runtime", "--sign", "-",
+            "--entitlements", str(main_entitlements), str(app),
         ],
     ]
 
@@ -1082,7 +1082,8 @@ def test_desktop_macos_relaunchable_fixup_deep_signs_without_entitlement_plists(
     ]
     assert codesign_commands == [
         [
-            "/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app),
+            "/usr/bin/codesign", "--force", "--deep", "--options", "runtime",
+            "--sign", "-", str(app),
         ],
     ]
 
@@ -1122,10 +1123,27 @@ def _display_codesign_entitlements(app: Path) -> dict:
             "--xml",
             str(app),
         ],
-        check=True,
+        check=False,
         capture_output=True,
     )
-    return plistlib.loads(result.stdout) if result.stdout else {}
+    if result.returncode != 0 or not result.stdout:
+        return {}
+    return plistlib.loads(result.stdout)
+
+
+def _display_codesign_flags(app: Path) -> str:
+    result = subprocess.run(
+        ["/usr/bin/codesign", "--display", "--verbose=2", str(app)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    # codesign prints details on stderr
+    text = (result.stderr or "") + (result.stdout or "")
+    for line in text.splitlines():
+        if line.strip().startswith("flags="):
+            return line.strip()
+    return text
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS codesign")
@@ -1159,6 +1177,8 @@ def test_desktop_macos_relaunchable_fixup_embeds_entitlements_in_real_bundles(
     expected = {"com.apple.security.device.audio-input": True}
     assert _display_codesign_entitlements(app) == expected
     assert _display_codesign_entitlements(helper_app) == expected
+    assert "runtime" in _display_codesign_flags(app)
+    assert "runtime" in _display_codesign_flags(helper_app)
     subprocess.run(
         ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
         check=True,
@@ -1194,6 +1214,7 @@ def test_desktop_macos_relaunchable_fixup_missing_plists_uses_valid_deep_fallbac
 
     assert _display_codesign_entitlements(app) == {}
     assert _display_codesign_entitlements(helper_app) == {}
+    assert "runtime" in _display_codesign_flags(app)
     subprocess.run(
         ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
         check=True,
@@ -1243,6 +1264,8 @@ def test_installer_macos_resign_embeds_entitlements_in_real_bundles(tmp_path):
     expected = {"com.apple.security.device.audio-input": True}
     assert _display_codesign_entitlements(app) == expected
     assert _display_codesign_entitlements(helper_app) == expected
+    assert "runtime" in _display_codesign_flags(app)
+    assert "runtime" in _display_codesign_flags(helper_app)
     subprocess.run(
         ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
         check=True,
@@ -1268,6 +1291,7 @@ def test_installer_macos_resign_missing_plists_uses_valid_deep_fallback(tmp_path
 
     assert _display_codesign_entitlements(app) == {}
     assert _display_codesign_entitlements(helper_app) == {}
+    assert "runtime" in _display_codesign_flags(app)
     subprocess.run(
         ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
         check=True,

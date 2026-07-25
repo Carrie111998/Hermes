@@ -2738,12 +2738,15 @@ _desktop_macos_adhoc_resign() {
 
     xattr -cr "$app" 2>/dev/null || true
     if [ -f "$main_entitlements" ] && [ -f "$helper_entitlements" ]; then
+        # Hardened Runtime exception entitlements (allow-jit, etc.) only take
+        # effect when CS_RUNTIME is set. Ad-hoc + --options runtime is valid
+        # without a Developer ID and matches the release signature flags.
         while IFS= read -r -d '' helper_app; do
-            codesign --force --sign - --entitlements "$helper_entitlements" "$helper_app" >/dev/null 2>&1 || true
+            codesign --force --options runtime --sign - --entitlements "$helper_entitlements" "$helper_app" >/dev/null 2>&1 || true
         done < <(find "$app/Contents/Frameworks" -maxdepth 1 -name 'Hermes Helper*.app' -type d -print0 2>/dev/null)
-        codesign --force --sign - --entitlements "$main_entitlements" "$app" >/dev/null 2>&1 || true
+        codesign --force --options runtime --sign - --entitlements "$main_entitlements" "$app" >/dev/null 2>&1 || true
     else
-        codesign --force --deep --sign - "$app" >/dev/null 2>&1 || true
+        codesign --force --deep --options runtime --sign - "$app" >/dev/null 2>&1 || true
     fi
 }
 
