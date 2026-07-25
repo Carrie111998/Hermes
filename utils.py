@@ -88,6 +88,28 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
+def _raise_if_owner_write_protected(target: Union[str, Path]) -> None:
+    """Refuse an atomic replacement when the target has an owner sentinel.
+
+    A sibling named ``.<filename>.write-protected`` is an explicit ownership
+    contract used by managed deployments.  Profiles and ordinary installs are
+    unchanged unless an operator deliberately creates the sentinel.
+    """
+
+    target_path = Path(target)
+    sentinel = target_path.parent / f".{target_path.name}.write-protected"
+    try:
+        sentinel_mode = sentinel.lstat().st_mode
+    except OSError:
+        return
+    if not stat.S_ISREG(sentinel_mode):
+        return
+    raise PermissionError(
+        f"{target_path} is owner-managed and write-protected by {sentinel}; "
+        "reconcile it through its owner source instead of a runtime config writer"
+    )
+
+
 def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
@@ -108,8 +130,11 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     Returns the resolved real path used for the replace, so callers that
     need to re-apply permissions can target it instead of the symlink.
     """
+    _raise_if_owner_write_protected(target)
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
+    if real_path != target_str:
+        _raise_if_owner_write_protected(real_path)
     tmp_str = str(tmp_path)
     try:
         os.replace(tmp_str, real_path)
@@ -327,6 +352,43 @@ def atomic_yaml_write(
     except BaseException:
         # Match atomic_json_write: cleanup must also happen for process-level
         # interruptions before we re-raise them.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_roundtrip_yaml_write(path: Union[str, Path], data: Any) -> None:
+    """Atomically write ruamel round-trip YAML while preserving file metadata."""
+
+    from ruamel.yaml import YAML
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        _restore_file_mode(real_path_obj, original_mode)
+    except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:

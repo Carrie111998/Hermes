@@ -126,6 +126,56 @@ def test_atomic_yaml_write_preserves_symlink(tmp_path: Path) -> None:
     assert data == {"model": {"provider": "openrouter"}}
 
 
+def test_atomic_yaml_write_refuses_explicitly_protected_config(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    sentinel = tmp_path / ".config.yaml.write-protected"
+    original = b"owner: canonical\n"
+    config.write_bytes(original)
+    sentinel.write_text("owner-managed\n", encoding="utf-8")
+
+    with pytest.raises(PermissionError, match="owner-managed and write-protected"):
+        atomic_yaml_write(config, {"owner": "rewritten"})
+
+    assert config.read_bytes() == original
+
+
+def test_atomic_yaml_write_remains_mutable_without_protection_sentinel(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "profiles" / "reviewer"
+    profile.mkdir(parents=True)
+    config = profile / "config.yaml"
+    config.write_text("owner: profile\n", encoding="utf-8")
+
+    atomic_yaml_write(config, {"owner": "profile-updated"})
+
+    assert yaml.safe_load(config.read_text(encoding="utf-8")) == {
+        "owner": "profile-updated"
+    }
+
+
+def test_atomic_yaml_write_refuses_symlink_to_protected_real_config(
+    tmp_path: Path,
+) -> None:
+    owner = tmp_path / "owner"
+    profile = tmp_path / "profile"
+    owner.mkdir()
+    profile.mkdir()
+    real = owner / "config.yaml"
+    real.write_text("owner: canonical\n", encoding="utf-8")
+    (owner / ".config.yaml.write-protected").write_text(
+        "owner-managed\n", encoding="utf-8"
+    )
+    link = profile / "config.yaml"
+    link.symlink_to(real)
+
+    with pytest.raises(PermissionError, match="owner-managed and write-protected"):
+        atomic_yaml_write(link, {"owner": "rewritten-through-profile"})
+
+    assert link.is_symlink()
+    assert real.read_text(encoding="utf-8") == "owner: canonical\n"
+
+
 def test_atomic_json_write_preserves_symlink_permissions(tmp_path: Path) -> None:
     """Symlinked targets keep the real file's permission bits."""
     if os.name != "posix":

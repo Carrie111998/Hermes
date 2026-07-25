@@ -141,10 +141,11 @@ class HolographicMemoryProvider(MemoryProvider):
                     existing = yaml.safe_load(f) or {}
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-memory-store"] = values
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(existing, f, default_flow_style=False)
-        except Exception:
-            pass
+            from utils import atomic_yaml_write
+
+            atomic_yaml_write(config_path, existing)
+        except Exception as exc:
+            logger.warning("Failed to save holographic memory config: %s", exc)
 
     def get_config_schema(self):
         from hermes_constants import display_hermes_home
