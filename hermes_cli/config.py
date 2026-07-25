@@ -1819,6 +1819,48 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Document/corpus processing — read-only auxiliary side tasks used by
+        # `hermes documents`. These must remain proposal/analysis routes: source
+        # extraction, rights/privacy gates, deterministic checks, and final file
+        # writes are handled outside the model call. Override these if the goal
+        # is reducing main-chat token usage; leaving them on auto may use the
+        # main route depending on available providers.
+        "document_summarization": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 180,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
+        "document_merge_draft": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 300,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
+        "document_integrity_check": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 300,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
+        "document_corpus_planner": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
         # Monitor — urgency/importance classifier used by the important-mail
         # monitor catalog automation (cron/scripts/classify_items.py). Scores
         # candidate items 0-10 against the user's criteria so only above-

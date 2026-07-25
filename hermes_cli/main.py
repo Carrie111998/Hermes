@@ -3456,6 +3456,10 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("kanban_decomposer", "Kanban decomposer", "task decomposition"),
     ("profile_describer", "Profile describer", "auto profile descriptions"),
     ("curator", "Curator", "skill-usage review pass"),
+    ("document_summarization", "Document summarization", "read-only corpus summaries"),
+    ("document_merge_draft", "Document merge draft", "proposal-only document merges"),
+    ("document_integrity_check", "Document integrity check", "source-anchor verification"),
+    ("document_corpus_planner", "Document corpus planner", "source registry planning"),
 ]
 
 
@@ -14485,14 +14489,14 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "docs", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
-        "send", "sessions", "setup",
+        "send", "sessions", "setup", "documents",
         "skin", "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
@@ -15081,6 +15085,13 @@ def main():
         help="Remove all fallback entries",
     )
     fallback_parser.set_defaults(func=cmd_fallback)
+
+    # =========================================================================
+    # documents command — read-only corpus/document processing pilot
+    # =========================================================================
+    from hermes_cli.document_processing import register_documents_parser
+
+    register_documents_parser(subparsers)
 
     # =========================================================================
     # secrets command — external secret managers (Bitwarden, 1Password)
