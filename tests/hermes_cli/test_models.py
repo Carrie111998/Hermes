@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from hermes_cli.nous_account import NousPortalAccountInfo
 from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
@@ -327,6 +329,12 @@ class TestDetectProviderForModel:
     def test_bare_custom_provider_not_overridden_by_static_catalog(self):
         """Same protection for the bare 'custom' provider."""
         assert detect_provider_for_model("gpt-5.4", "custom") is None
+
+    @pytest.mark.parametrize("provider", ["custom", "custom:myproxy", "local"])
+    def test_explicit_custom_or_local_provider_not_overridden_by_openrouter_catalog(self, provider):
+        """Vendor-prefixed models may be served by an explicit custom/local endpoint."""
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
+            assert detect_provider_for_model("anthropic/claude-opus-4.6", provider) is None
 
     def test_non_custom_provider_detection_unaffected(self):
         """The custom-provider guard must NOT change detection for non-custom

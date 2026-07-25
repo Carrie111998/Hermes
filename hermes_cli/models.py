@@ -2097,6 +2097,16 @@ def _provider_catalog_names(provider: str) -> tuple[str, ...]:
     return active + retired
 
 
+def _is_explicit_custom_or_local_provider(provider: str) -> bool:
+    """Return whether provider selection must outrank catalog auto-detection."""
+    keys = _provider_keys(provider)
+    return (
+        "custom" in keys
+        or "local" in keys
+        or any(key.startswith("custom:") for key in keys)
+    )
+
+
 def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
     return any(
         name_lower == model.lower()
@@ -2239,14 +2249,11 @@ def detect_static_provider_for_model(
         return None
 
     # --- Step 1: check static provider catalogs for a direct match ---
-    # If the current provider is a custom endpoint (custom or custom:*), never
+    # If the current provider is an explicit custom/local endpoint, never
     # auto-switch away from it based on a static catalog match — the user
     # explicitly configured their own endpoint and the same model name may be
     # served there (#48305).
-    _is_custom_current = (
-        current_provider == "custom"
-        or current_provider.startswith("custom:")
-    )
+    _is_custom_current = _is_explicit_custom_or_local_provider(current_provider)
     for pid in _PROVIDER_MODELS:
         if (
             pid in current_keys
@@ -2287,6 +2294,9 @@ def detect_provider_for_model(
     """
     name = (model_name or "").strip()
     if not name:
+        return None
+
+    if _is_explicit_custom_or_local_provider(current_provider):
         return None
 
     static_match = detect_static_provider_for_model(name, current_provider)

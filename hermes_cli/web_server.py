@@ -7220,10 +7220,14 @@ def _infer_provider_on_model_change(model_val: str, prev_provider: str) -> tuple
     try:
         from hermes_cli.models import (
             _AGGREGATOR_PROVIDERS,
+            _is_explicit_custom_or_local_provider,
             detect_provider_for_model,
             normalize_provider,
         )
     except Exception:
+        return "", name
+
+    if _is_explicit_custom_or_local_provider(prev_provider):
         return "", name
 
     try:
