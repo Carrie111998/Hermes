@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from contextlib import contextmanager
 import threading
 import time
@@ -71,6 +72,25 @@ def test_same_key_is_exclusive_across_two_board_databases(kanban_home):
         assert conflict.resource_key == "control-plane:cto"
         assert conflict.holder_board == "default"
         assert conflict.holder_task_id == first
+
+
+def test_repeated_resource_conflicts_do_not_spam_durable_events(kanban_home):
+    holder = _create("default", "holder", ["gpu:0"])
+    blocked = _create("other", "blocked", ["gpu:0"])
+    with kb.connect_closing(board="default") as conn:
+        assert kb.claim_task(conn, holder, board="default") is not None
+
+    with kb.connect_closing(board="other") as conn:
+        before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (blocked,)
+        ).fetchone()[0]
+        for _ in range(5):
+            assert kb.claim_task(conn, blocked, board="other") is None
+        after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (blocked,)
+        ).fetchone()[0]
+        assert after == before
+        assert kb.get_resource_conflict(conn, blocked, board="other") is not None
 
 
 def test_concurrent_cross_board_claim_race_has_one_winner(kanban_home):
@@ -332,6 +352,25 @@ def test_cli_create_and_update_resource_keys_round_trip(kanban_home):
         ]
 
 
+def test_cli_resource_errors_are_friendly(kanban_home, capsys):
+    from hermes_cli import kanban as cli
+
+    task_id = _create("default", "leased")
+    root = argparse.ArgumentParser()
+    subparsers = root.add_subparsers(dest="command")
+    cli.build_parser(subparsers)
+
+    invalid = root.parse_args(["kanban", "resources", task_id, "INVALID!"])
+    assert cli.kanban_command(invalid) == 2
+    assert "invalid resource key" in capsys.readouterr().err
+
+    with kb.connect_closing() as conn:
+        assert kb.claim_task(conn, task_id) is not None
+    running = root.parse_args(["kanban", "resources", task_id, "gpu:0"])
+    assert cli.kanban_command(running) == 2
+    assert "running" in capsys.readouterr().err
+
+
 def test_kanban_create_tool_schema_and_handler_round_trip(kanban_home, monkeypatch):
     from tools import kanban_tools as kt
 
@@ -368,6 +407,27 @@ def test_expired_registry_ttl_cannot_override_live_authoritative_claim(kanban_ho
         assert kb.claim_task(conn, contender, board="other") is None
         assert kb.get_task(conn, contender).status == "ready"
     assert kb.list_resource_leases()[0].holder_task_id == holder
+
+
+def test_unassisted_cross_board_recovery_steals_expired_lease(kanban_home):
+    holder = _create("default", "holder", ["gpu:0"])
+    successor = _create("other", "successor", ["gpu:0"])
+    with kb.connect_closing(board="default") as conn:
+        claimed = kb.claim_task(conn, holder, board="default", ttl_seconds=1)
+        assert claimed is not None
+        # Simulate a dead board daemon. Deliberately do not call
+        # release_stale_claims: the competing board must inspect the holder DB.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, worker_pid = NULL WHERE id = ?",
+                (int(time.time()) - 1, holder),
+            )
+
+    with kb.connect_closing(board="other") as conn:
+        stolen = kb.claim_task(conn, successor, board="other")
+        assert stolen is not None
+        assert stolen.status == "running"
+    assert kb.list_resource_leases()[0].holder_task_id == successor
 
 
 def test_live_pid_claim_extension_renews_resource_lease_under_same_lock(kanban_home):

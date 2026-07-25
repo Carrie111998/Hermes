@@ -1452,8 +1452,10 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
 
 
 @contextlib.contextmanager
-def _cross_process_init_lock(path: Path):
-    """Serialize first-connect WAL/schema/integrity setup across processes.
+def _cross_process_init_lock(
+    path: Path, *, purpose: str = "database initialization"
+):
+    """Serialize bounded host-wide operations across processes.
 
     ``_INIT_LOCK`` only protects threads inside one Python process. During a
     dispatcher burst, many worker processes can all hit a fresh/legacy board at
@@ -1510,11 +1512,12 @@ def _cross_process_init_lock(path: Path):
                     time.sleep(_INIT_LOCK_POLL_SECONDS)
         if not acquired:
             _log.warning(
-                "kanban init lock for %s not acquired within %.0fs — proceeding "
-                "without the cross-process lock (in-process lock + idempotent "
-                "init are the correctness backstop). A stuck holder is no longer "
-                "able to block this connect indefinitely (#36644).",
-                lock_path, _INIT_LOCK_TIMEOUT_SECONDS,
+                "kanban cross-process lock for %s not acquired within %.0fs "
+                "(purpose=%s); yielding without ownership so the caller can "
+                "apply its bounded safe fallback (#36644).",
+                lock_path,
+                _INIT_LOCK_TIMEOUT_SECONDS,
+                purpose,
             )
         yield acquired
     finally:
@@ -4133,14 +4136,15 @@ def _lease_holder_is_active(lease: ResourceLease, now: int) -> bool:
         # empty SQLite file at a stale path or allowing overlapping work.
         return lease.claim_expires >= now
     try:
-        holder = sqlite3.connect(lease.holder_db_path, timeout=1.0)
-        holder.row_factory = sqlite3.Row
-        row = holder.execute(
-            "SELECT status, claim_lock, current_run_id, claim_expires, worker_pid "
-            "FROM tasks WHERE id = ?",
-            (lease.holder_task_id,),
-        ).fetchone()
-        holder.close()
+        with contextlib.closing(
+            sqlite3.connect(lease.holder_db_path, timeout=1.0)
+        ) as holder:
+            holder.row_factory = sqlite3.Row
+            row = holder.execute(
+                "SELECT status, claim_lock, current_run_id, claim_expires, worker_pid "
+                "FROM tasks WHERE id = ?",
+                (lease.holder_task_id,),
+            ).fetchone()
     except (OSError, sqlite3.Error):
         # Fail closed only for the bounded lease while a holder DB is
         # temporarily unreadable.
@@ -4429,7 +4433,9 @@ def claim_task(
     board_slug = _board_for_db_path(db_path, board)
     # The host-wide lock covers the short lease-acquire + board-CAS boundary.
     # Workers run outside it, so independent resources retain full parallelism.
-    with _cross_process_init_lock(_resource_leases_path()) as held:
+    with _cross_process_init_lock(
+        _resource_leases_path(), purpose="resource lease coordination"
+    ) as held:
         if not held:
             return None
         conflict = _acquire_resource_leases(
@@ -4441,17 +4447,10 @@ def claim_task(
             claim_expires=expires,
         )
         if conflict is not None:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "resource_conflict",
-                    {
-                        "resource_key": conflict.resource_key,
-                        "holder_board": conflict.holder_board,
-                        "holder_task_id": conflict.holder_task_id,
-                        "holder_run_id": conflict.run_id,
-                        "claim_expires": conflict.claim_expires,
-                    },
-                )
+            # A ready task is retried every dispatcher tick. Persisting an event
+            # here would create hundreds of identical rows per hour. The
+            # conflict remains observable through DispatchResult and the
+            # authoritative resource-leases registry.
             return None
         claimed = _claim_task_without_resources(
             conn, task_id, ttl_seconds=ttl_seconds, claimer=owner_token,
@@ -4695,7 +4694,9 @@ def claim_review_task(
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     board_db_path = _connection_db_path(conn)
     board_slug = _board_for_db_path(board_db_path, board)
-    with _cross_process_init_lock(_resource_leases_path()) as held:
+    with _cross_process_init_lock(
+        _resource_leases_path(), purpose="resource lease coordination"
+    ) as held:
         if not held:
             return None
         conflict = _acquire_resource_leases(
@@ -4707,17 +4708,10 @@ def claim_review_task(
             claim_expires=expires,
         )
         if conflict is not None:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "resource_conflict",
-                    {
-                        "resource_key": conflict.resource_key,
-                        "holder_board": conflict.holder_board,
-                        "holder_task_id": conflict.holder_task_id,
-                        "holder_run_id": conflict.run_id,
-                        "claim_expires": conflict.claim_expires,
-                    },
-                )
+            # A ready task is retried every dispatcher tick. Persisting an event
+            # here would create hundreds of identical rows per hour. The
+            # conflict remains observable through DispatchResult and the
+            # authoritative resource-leases registry.
             return None
         claimed = _claim_review_task_without_resources(
             conn, task_id, ttl_seconds=ttl_seconds, claimer=owner_token,
@@ -4758,7 +4752,9 @@ def heartbeat_claim(
     # leased tasks need the host-wide lock that closes the registry/board
     # expiry race; making every task wait on it would couple unrelated work.
     lease_lock = (
-        _cross_process_init_lock(_resource_leases_path())
+        _cross_process_init_lock(
+            _resource_leases_path(), purpose="resource lease coordination"
+        )
         if owned_task.resource_keys
         else contextlib.nullcontext(True)
     )
@@ -4846,7 +4842,9 @@ def release_stale_claims(
             if owned_task is None:
                 continue
             lease_lock = (
-                _cross_process_init_lock(_resource_leases_path())
+                _cross_process_init_lock(
+                    _resource_leases_path(), purpose="resource lease coordination"
+                )
                 if owned_task.resource_keys
                 else contextlib.nullcontext(True)
             )
@@ -7489,7 +7487,9 @@ def _defer_reclaim_for_live_worker(
     if owned_task is None or owned_task.claim_lock != claim_lock:
         return
     lease_lock = (
-        _cross_process_init_lock(_resource_leases_path())
+        _cross_process_init_lock(
+            _resource_leases_path(), purpose="resource lease coordination"
+        )
         if owned_task.resource_keys
         else contextlib.nullcontext(True)
     )
