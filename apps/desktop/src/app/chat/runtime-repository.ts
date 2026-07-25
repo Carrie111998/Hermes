@@ -13,36 +13,58 @@ import { coalesceToolOnlyAssistants, createToolMergeCache, toRuntimeMessage } fr
 export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMessageRepository {
   const cacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
   const toolMergeCacheRef = useRef(createToolMergeCache())
+  // Source-id occurrence slots survive clone-based rerenders. Once a slot has a
+  // renderer id, it keeps it so a later source id cannot steal that identity.
+  const repositoryIdsBySourceRef = useRef(new Map<string, string[]>())
 
   return useMemo(() => {
     const items: { message: ThreadMessage; parentId: string | null }[] = []
     const branchParentByGroup = new Map<string, string | null>()
     const mergedMessages = coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)
-    // assistant-ui's internal MessageRepository rejects duplicate ids even though
-    // fromBranchableArray accepts them. Reserve every source id so valid ids stay
-    // byte-for-byte intact, then remap only later colliding occurrences in this
-    // renderer-only repository projection.
     const sourceIds = new Set(mergedMessages.map(message => message.id))
-    const repositoryIds = new Set<string>()
-    const collisionCounts = new Map<string, number>()
+    const occurrenceBySource = new Map<string, number>()
+
+    const slots = mergedMessages.map(message => {
+      const occurrence = occurrenceBySource.get(message.id) ?? 0
+      occurrenceBySource.set(message.id, occurrence + 1)
+
+      return {
+        occurrence,
+        previousRepositoryId: repositoryIdsBySourceRef.current.get(message.id)?.[occurrence]
+      }
+    })
+
+    // Existing projected identities win. New slots avoid every current source id
+    // on initial construction and every renderer id already assigned this render.
+    const repositoryIds = new Set(
+      slots
+        .map(slot => slot.previousRepositoryId)
+        .filter((id): id is string => id !== undefined)
+    )
+
     let visibleParentId: string | null = null
     let headId: string | null = null
 
-    for (const message of mergedMessages) {
-      let repositoryId = message.id
+    for (const [index, message] of mergedMessages.entries()) {
+      const slot = slots[index]
+      let repositoryId = slot?.previousRepositoryId ?? message.id
 
-      if (repositoryIds.has(repositoryId)) {
-        let collision = (collisionCounts.get(message.id) ?? 1) + 1
+      if (!slot?.previousRepositoryId && repositoryIds.has(repositoryId)) {
+        let collision = 2
 
         do {
           repositoryId = `${message.id}:renderer-duplicate:${collision}`
           collision += 1
         } while (sourceIds.has(repositoryId) || repositoryIds.has(repositoryId))
-
-        collisionCounts.set(message.id, collision - 1)
       }
 
       repositoryIds.add(repositoryId)
+
+      if (!slot?.previousRepositoryId) {
+        const assignments = repositoryIdsBySourceRef.current.get(message.id) ?? []
+        assignments[slot?.occurrence ?? 0] = repositoryId
+        repositoryIdsBySourceRef.current.set(message.id, assignments)
+      }
 
       let parentId = visibleParentId
 
