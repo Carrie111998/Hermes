@@ -679,6 +679,190 @@ def st_memory_to_lore(args, **kwargs) -> str:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
+# ── Voice Roleplay: STT → ST-native → TTS → Memory ──────────────────
+
+def st_voice_roleplay(args, **kwargs) -> str:
+    """
+    Voice roleplay turn (phase 1):
+    1. Record audio from microphone (duration_seconds)
+    2. STT transcribe (faster-whisper local)
+    3. ST-native: add user message, build prompt with lore
+    4. Return prompt for the agent to complete via LLM
+    """
+    try:
+        n = _native()
+        session_id = args.get("session_id")
+        duration = int(args.get("duration_seconds", 10))
+        lore_book = args.get("lore_book")
+        history_limit = int(args.get("history_limit", 20))
+        tts_voice = args.get("tts_voice", "hakua")
+        tts_model = args.get("tts_model", "irodori-tts")
+        tts_speed = float(args.get("tts_speed", 1.0))
+        stt_model = args.get("stt_model", "base")
+        auto_memory = bool(args.get("auto_memory", True))
+
+        # Step 1: Record audio using AudioRecorder
+        from tools.voice_mode import create_audio_recorder
+        recorder = create_audio_recorder()
+        recorder.start()
+        import time
+        time.sleep(duration)
+        wav_path = recorder.stop()
+        if not wav_path:
+            return json.dumps({"ok": False, "error": "Failed to record audio or recording too short/quiet"})
+
+        # Step 2: STT transcribe
+        from tools.voice_mode import transcribe_recording
+        stt_result = transcribe_recording(wav_path, model=stt_model)
+        if not stt_result.get("success"):
+            return json.dumps({"ok": False, "error": f"STT failed: {stt_result.get('error')}"})
+        transcript = stt_result.get("transcript", "").strip()
+        if not transcript:
+            return json.dumps({"ok": False, "error": "No speech detected"})
+
+        # Step 3: Add user message and build ST-native prompt
+        n.add_message(session_id, "user", transcript, name="User")
+        prompt = n.build_prompt(
+            session_id, transcript, lore_book=lore_book, history_limit=history_limit
+        )
+
+        # Return the prompt for the agent to complete via LLM
+        return json.dumps({
+            "ok": True,
+            "stage": "prompt_ready",
+            "transcript": transcript,
+            "prompt": prompt,
+            "tts_voice": tts_voice,
+            "tts_model": tts_model,
+            "tts_speed": tts_speed,
+            "auto_memory": auto_memory,
+        }, ensure_ascii=False)
+
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_voice_roleplay_complete(args, **kwargs) -> str:
+    """
+    Voice roleplay turn (phase 2) - complete after LLM generates reply:
+    1. Record assistant reply into session
+    2. TTS synthesize with irodori (hakua voice)
+    3. Play audio
+    4. If auto_memory: emit session to ebbinghaus memory
+    """
+    try:
+        n = _native()
+        session_id = args.get("session_id")
+        reply_content = args.get("reply_content", "")
+        tts_voice = args.get("tts_voice", "hakua")
+        tts_model = args.get("tts_model", "irodori-tts")
+        tts_speed = float(args.get("tts_speed", 1.0))
+        auto_memory = bool(args.get("auto_memory", True))
+
+        # Record the assistant's reply
+        n.add_message(session_id, "assistant", reply_content, name="Character")
+
+        # Step 2: TTS with irodori (hakua voice)
+        # Use the text_to_speech_tool which routes to irodori provider
+        from tools.tts_tool import text_to_speech_tool
+        # Let text_to_speech_tool handle output path (it manages temp dir)
+        tts_result = text_to_speech_tool(text=reply_content)
+
+        # Step 3: Play audio
+        from tools.voice_mode import play_audio_file
+        tts_file = tts_result.get("file_path") if isinstance(tts_result, dict) else None
+        if tts_file and os.path.isfile(tts_file) and os.path.getsize(tts_file) > 0:
+            play_audio_file(tts_file)
+
+        # Step 4: Memory bridge
+        memory_records = None
+        if auto_memory:
+            memory_records = n.session_to_memory_records(session_id)
+            # Note: actual ebbinghaus ingestion is done by agent via memory tool
+
+        return json.dumps({
+            "ok": True,
+            "tts_file": tts_file,
+            "memory_records": memory_records if auto_memory else None,
+        }, ensure_ascii=False)
+
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+# ── Audio landing: copy audio files into SillyTavern uploads ──────────
+
+def _st_uploads_dir() -> str:
+    """Return the SillyTavern uploads directory path."""
+    st_dir = _get_dir()
+    return os.path.join(st_dir, "data", "_uploads")
+
+
+def sillytavern_audio_land(args: dict | None = None, **kwargs) -> str:
+    """Copy the latest audio file or zip into SillyTavern's data/_uploads/ directory."""
+    try:
+        source_path = (args or kwargs).get("source_path", "")
+        target_name = (args or kwargs).get("target_name", "")
+        uploads = _st_uploads_dir()
+        os.makedirs(uploads, exist_ok=True)
+
+        if not source_path:
+            # Auto-detect: find the latest zip or wav in the irodori buffer
+            try:
+                from plugins.irodori_tts.audio_buffer import (
+                    _buffer_dir_from_config,
+                    buffer_status as _buffer_status,
+                )
+
+                buf_dir = _buffer_dir_from_config()
+                candidates = []
+                for ext in (".zip", "*.wav"):
+                    if ext.endswith(".wav"):
+                        candidates += sorted(
+                            Path(buf_dir).glob("*.wav"),
+                            key=lambda p: p.stat().st_mtime,
+                            reverse=True,
+                        )
+                    elif ext.endswith(".zip"):
+                        candidates += sorted(
+                            Path(buf_dir).glob("audio-*.zip"),
+                            key=lambda p: p.stat().st_mtime,
+                            reverse=True,
+                        )
+                if not candidates:
+                    return json.dumps(
+                        {"ok": False, "error": "No audio files or zips found in irodori buffer."}
+                    )
+                source_path = str(candidates[0])
+            except Exception as exc:
+                return json.dumps(
+                    {"ok": False, "error": f"Could not auto-detect source: {exc}"}
+                )
+
+        src = Path(source_path)
+        if not src.exists():
+            return json.dumps(
+                {"ok": False, "error": f"Source file not found: {source_path}"}
+            )
+
+        dest_name = target_name or src.name
+        dest = Path(uploads) / dest_name
+        import shutil
+        shutil.copy2(src, dest)
+        return json.dumps(
+            {
+                "ok": True,
+                "source": str(src),
+                "dest": str(dest),
+                "uploads_dir": uploads,
+                "st_url": f"{_base_url()}/uploads/{dest_name}",
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
 # ── Register ────────────────────────────────────────────────────────
 
 def register(ctx):
@@ -837,4 +1021,54 @@ def register(ctx):
             "records": {"type": "array", "items": {"type": "object"}},
         }, "required": ["book", "records"]},
         handler=st_memory_to_lore,
+    )
+    # Voice Roleplay: STT -> ST-native -> TTS -> Memory
+    ctx.register_tool(
+        name="st_voice_roleplay",
+        description="Voice roleplay turn (phase 1): record audio -> STT -> ST-native prompt assembly. Returns prompt for LLM completion.",
+        schema={"type": "object", "properties": {
+            "session_id": {"type": "integer"},
+            "duration_seconds": {"type": "integer", "default": 10},
+            "lore_book": {"type": "string"},
+            "history_limit": {"type": "integer", "default": 20},
+            "tts_voice": {"type": "string", "default": "hakua"},
+            "tts_model": {"type": "string", "default": "irodori-tts"},
+            "tts_speed": {"type": "number", "default": 1.0},
+            "stt_model": {"type": "string", "default": "base"},
+            "auto_memory": {"type": "boolean", "default": True},
+        }, "required": ["session_id"]},
+        handler=st_voice_roleplay,
+    )
+    ctx.register_tool(
+        name="st_voice_roleplay_complete",
+        description="Voice roleplay turn (phase 2): record assistant reply -> TTS (irodori/hakua) -> play -> memory bridge.",
+        schema={"type": "object", "properties": {
+            "session_id": {"type": "integer"},
+            "reply_content": {"type": "string"},
+            "tts_voice": {"type": "string", "default": "hakua"},
+            "tts_model": {"type": "string", "default": "irodori-tts"},
+            "tts_speed": {"type": "number", "default": 1.0},
+            "auto_memory": {"type": "boolean", "default": True},
+        }, "required": ["session_id", "reply_content"]},
+        handler=st_voice_roleplay_complete,
+    )
+    # ── Audio landing: copy audio/zip from irodori buffer into ST uploads ──
+    ctx.register_tool(
+        name="st_audio_land",
+        description="Copy the latest audio file or zip from the irodori audio buffer into SillyTavern's data/_uploads/ directory.",
+        schema={
+            "type": "object",
+            "properties": {
+                "source_path": {
+                    "type": "string",
+                    "description": "Optional absolute path to an audio file or zip. Omit to use the latest from the irodori buffer.",
+                },
+                "target_name": {
+                    "type": "string",
+                    "description": "Optional filename under _uploads/. Defaults to the source basename.",
+                },
+            },
+        },
+        handler=sillytavern_audio_land,
+        check_fn=_installed,
     )

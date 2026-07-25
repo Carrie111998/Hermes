@@ -2478,8 +2478,28 @@ def synthesize_speech(values: dict[str, Any]) -> dict[str, Any]:
             "provider": provider,
             "error": "No local TTS backend was found.",
         }
-    # Push to WebSocket audio clients (best-effort, silent)
+    buffer_info: dict[str, Any] = {}
     if result.get("ok") and result.get("file_path"):
+        try:
+            from plugins.irodori_tts.audio_buffer import _buffer_dir_from_config
+            from plugins.irodori_tts.audio_buffer import add_audio as buffer_add
+            from plugins.irodori_tts.audio_buffer import maybe_zip as buffer_maybe_zip
+
+            buf_dir = _buffer_dir_from_config()
+            buffer_add(Path(result["file_path"]))
+            zip_result = buffer_maybe_zip(buf_dir)
+            buffer_info["buffer"] = zip_result
+            if zip_result.get("zipped"):
+                try:
+                    dest = _audio_dir() / Path(zip_result.get("zip_path") or "").name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(zip_result["zip_path"], dest)
+                    buffer_info["aituber_audio"] = str(dest)
+                except Exception as exc:
+                    buffer_info["sync_error"] = str(exc)
+        except Exception as exc:
+            buffer_info["buffer_error"] = str(exc)
+        result["buffer"] = buffer_info
         result["audio_ws"] = audio_ws_push_wav(result["file_path"])
     return result
 

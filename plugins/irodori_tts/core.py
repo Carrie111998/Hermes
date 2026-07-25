@@ -131,6 +131,21 @@ def settings(tts_config: dict[str, Any] | None = None) -> IrodoriSettings:
     )
 
 
+def _auto_buffer(file_path: str, result: dict) -> None:
+    """Add synthesized file to audio buffer and trigger zip if threshold reached.
+    Best-effort: failures are silently logged into result['buffer']."""
+    try:
+        from .audio_buffer import add_audio, maybe_zip
+
+        buf = add_audio(file_path)
+        result["buffer"] = {"buffered": bool(buf), "path": str(buf) if buf else None}
+        zip_r = maybe_zip()
+        if zip_r.get("zipped"):
+            result["buffer"]["zip"] = zip_r
+    except Exception as exc:
+        result["buffer"] = {"buffered": False, "error": str(exc)}
+
+
 def _float_value(value: Any, default: float) -> float:
     try:
         return float(value)
@@ -344,7 +359,7 @@ def synthesize_text(
     if not destination.exists() or destination.stat().st_size <= 0:
         raise RuntimeError(f"Irodori TTS script did not create audio: {destination}")
 
-    return {
+    result = {
         "ok": True,
         "provider": "irodori",
         "file_path": str(destination),
@@ -354,6 +369,11 @@ def synthesize_text(
         "speed": speed_value,
         "media_tag": f"MEDIA:{destination}",
     }
+
+    # Auto-buffer: add to audio buffer, then trigger zip if threshold reached
+    _auto_buffer(str(destination), result)
+
+    return result
 
 
 class IrodoriScriptTTSProvider(TTSProvider):

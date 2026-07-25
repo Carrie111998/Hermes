@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
+from .audio_buffer import _buffer_dir_from_config
+from .audio_buffer import add_audio as _add_audio
+from .audio_buffer import buffer_status as _buffer_status
+from .audio_buffer import maybe_zip as _maybe_zip
 from .core import IrodoriScriptTTSProvider, synthesize_text, status_payload
 
 
@@ -27,7 +32,36 @@ def _synthesize_handler(
         output_format=format,
         speed=speed,
     )
+    if result.get("ok") and result.get("file_path"):
+        try:
+            buf_dir = _buffer_dir_from_config()
+            _add_audio(Path(result["file_path"]))
+            result["buffer"] = _maybe_zip(buf_dir)
+        except Exception as exc:
+            result["buffer_error"] = str(exc)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _buffer_zip_handler(_: Any = None, **__: Any) -> str:
+    return json.dumps(_maybe_zip(_buffer_dir_from_config()), ensure_ascii=False, indent=2)
+
+
+def _buffer_status_handler(_: Any = None, **__: Any) -> str:
+    return json.dumps(_buffer_status(_buffer_dir_from_config()), ensure_ascii=False, indent=2)
+
+
+def add_audio(path: str | Any = None) -> dict[str, Any]:
+    if not path:
+        return {"ok": False, "error": "path is required."}
+    try:
+        result = _add_audio(path)
+        if isinstance(result, dict):
+            return result
+        if result is None:
+            return {"ok": False, "error": "add_audio returned None"}
+        return {"ok": True, "path": str(result)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def register(ctx) -> None:
@@ -82,6 +116,45 @@ def register(ctx) -> None:
         handler=_synthesize_handler,
         check_fn=lambda: status_payload()["available"],
         description="Synthesize speech with local Irodori TTS through the Windows script harness.",
+    )
+
+    ctx.register_tool(
+        name="irodori_tts_buffer_zip",
+        toolset="tts",
+        schema={
+            "type": "object",
+            "properties": {},
+        },
+        handler=_buffer_zip_handler,
+        check_fn=lambda: status_payload()["available"],
+        description="Zip buffered TTS wav files when the threshold is reached. Does not push to audio_ws.",
+    )
+
+    ctx.register_tool(
+        name="irodori_tts_buffer_status",
+        toolset="tts",
+        schema={
+            "type": "object",
+            "properties": {},
+        },
+        handler=_buffer_status_handler,
+        check_fn=lambda: status_payload()["available"],
+        description="Show current irodori audio buffer backlog: files and bytes.",
+    )
+
+    ctx.register_tool(
+        name="irodori_tts_buffer_add",
+        toolset="tts",
+        schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Audio file to buffer."}
+            },
+            "required": ["path"],
+        },
+        handler=add_audio,
+        check_fn=lambda: status_payload()["available"],
+        description="Add an existing local audio file to the irodori TTS buffer.",
     )
 
     from .cli import register_cli

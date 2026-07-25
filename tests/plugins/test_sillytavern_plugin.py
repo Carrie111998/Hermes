@@ -60,6 +60,19 @@ def test_register_exposes_sillytavern_to_agents():
         "sillytavern_proxy_start",
         "sillytavern_proxy_stop",
         "sillytavern_proxy_status",
+        "st_audio_land",
+        "st_character_create",
+        "st_character_list",
+        "st_lore_add",
+        "st_memory_to_lore",
+        "st_persona_create",
+        "st_session_reply",
+        "st_session_say",
+        "st_session_start",
+        "st_session_summary",
+        "st_session_to_memory",
+        "st_voice_roleplay",
+        "st_voice_roleplay_complete",
     }
     assert all(callable(tool["handler"]) for tool in context.tools)
     assert all(
