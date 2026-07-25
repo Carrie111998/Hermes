@@ -19,9 +19,28 @@ def test_install_hook_review_is_routed_through_the_consolidated_label_gate():
     assert "SETUP_HITS=$(git diff --diff-filter=d --name-only" in supply_chain
     assert "CI_REVIEWED" in supply_chain
     assert "Install-hook file added or modified" in supply_chain
+    assert "install-hook-reviewed" not in supply_chain
 
     assert "inputs.supply_chain" in review_labels
     assert "grep -Fxq 'ci-reviewed'" in review_labels
+
+
+def test_critical_pattern_scan_has_balanced_shell_conditionals():
+    text = _workflow_text(SUPPLY_CHAIN_WORKFLOW)
+    scan_start = text.index("      - name: Scan diff for critical patterns")
+    scan_end = text.index("      - name: Emit review_status", scan_start)
+    scan_script = text[scan_start:scan_end]
+
+    depth = 0
+    for raw_line in scan_script.splitlines():
+        line = raw_line.strip()
+        if line.startswith("if "):
+            depth += 1
+        elif line == "fi":
+            depth -= 1
+            assert depth >= 0, "scan script closes a conditional that was never opened"
+
+    assert depth == 0, "scan script leaves an unterminated conditional"
 
 
 def test_consolidated_label_does_not_bypass_other_critical_patterns():

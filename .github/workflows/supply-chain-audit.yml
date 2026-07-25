@@ -148,11 +148,7 @@ jobs:
           \`\`\`
           ${SETUP_HITS}
           \`\`\`
-
-          If a maintainer has reviewed and approved these install-hook changes,
-          add the \`install-hook-reviewed\` label and rerun this check.
           "
-            fi
           fi
 
           if [ -n "$FINDINGS" ]; then
