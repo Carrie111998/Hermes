@@ -148,4 +148,7 @@ def intercept_telegram_approval(
 
 
 def register(context: Any) -> None:
+    # Run additive state migrations at plugin load, before the first live
+    # approval event reaches the worker.
+    StateStore(load_config().state_db)
     context.register_hook("pre_gateway_dispatch", intercept_telegram_approval)
