@@ -557,10 +557,10 @@ class TestHTTP413Compression:
 class TestPreflightCompression:
     """Preflight compression should compress history before the first API call."""
 
-    def test_compress_context_emits_lifecycle_status_before_work(self, agent):
-        """Direct context compression should tell gateway users why the turn paused."""
+    def test_compress_context_emits_typed_progress_before_work(self, agent):
+        """Automatic compression identifies routine progress structurally."""
         # This test calls _compress_context directly and asserts the FIRST
-        # status event is the lifecycle "Compacting context" message. With
+        # status event is the typed "Compacting context" message. With
         # compaction enabled the lazy feasibility probe would emit an
         # aux-provider warning first (no aux key in the hermetic test env),
         # displacing events[0]. The flag value is irrelevant to what this
@@ -601,7 +601,7 @@ class TestPreflightCompression:
         assert new_system_prompt == "You are helpful."
         build_prompt.assert_not_called()
         assert events == [
-            ("lifecycle", COMPACTION_STATUS),
+            ("compression_progress", COMPACTION_STATUS),
             ("compress", "started"),
             ("compacted", COMPACTION_DONE_STATUS),
         ]
@@ -952,7 +952,7 @@ class TestPreflightCompression:
         assert result["completed"] is True
         assert mock_compress.call_count >= 1
         assert any(
-            ev == "lifecycle" and "Pre-API compression" in msg
+            ev == "compression_progress" and "Pre-API compression" in msg
             for ev, msg in status_messages
         )
 
@@ -1004,7 +1004,7 @@ class TestPreflightCompression:
         assert result["completed"] is True
         assert result["final_response"] == "After preflight"
         assert any(
-            ev == "lifecycle" and "Preflight compression" in msg
+            ev == "compression_progress" and "Preflight compression" in msg
             for ev, msg in status_messages
         )
 
@@ -1048,7 +1048,7 @@ class TestPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
         assert not any(
-            ev == "lifecycle" and "Preflight compression" in msg
+            ev == "compression_progress" and "Preflight compression" in msg
             for ev, msg in status_messages
         )
 
@@ -1098,9 +1098,11 @@ class TestPreflightCompression:
 
         mock_compress.assert_called_once()
         assert result["completed"] is True
-        lifecycle_messages = [msg for ev, msg in status_messages if ev == "lifecycle"]
-        assert "🔧 LCM context maintenance: preparing compacted context." in lifecycle_messages
-        assert not any("Preflight compression" in msg for msg in lifecycle_messages)
+        progress_messages = [
+            msg for ev, msg in status_messages if ev == "compression_progress"
+        ]
+        assert "🔧 LCM context maintenance: preparing compacted context." in progress_messages
+        assert not any("Preflight compression" in msg for msg in progress_messages)
 
     def test_preflight_defers_when_recent_real_usage_fit(self, agent):
         """A noisy rough estimate should not re-compact a recently fitting request."""
@@ -1139,7 +1141,7 @@ class TestPreflightCompression:
         assert result["completed"] is True
         assert result["final_response"] == "Used real fit"
         assert not any(
-            ev == "lifecycle" and "Preflight compression" in msg
+            ev == "compression_progress" and "Preflight compression" in msg
             for ev, msg in status_messages
         )
 

@@ -158,7 +158,8 @@ def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
 
     agent.context_compressor.compress.assert_called_once()
     assert any(
-        ev == "lifecycle" and "Resumed after" in str(msg) for ev, msg in events
+        ev == "compression_progress" and "Resumed after" in str(msg)
+        for ev, msg in events
     ), f"expected idle status line, got: {events}"
 
 

@@ -1747,7 +1747,10 @@ def compress_context(
         )
     _compaction_status_emitted = bool(_compaction_status)
     if _compaction_status:
-        emit_routine_compression_progress(agent, _compaction_status)
+        if force:
+            agent._emit_status(_compaction_status)
+        else:
+            emit_routine_compression_progress(agent, _compaction_status)
     _compaction_done_emitted = False
 
     def _complete_compaction_lifecycle() -> None:
@@ -2696,7 +2699,10 @@ def _compress_context_via_codex_app_server(
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
     try:
-        emit_routine_compression_progress(agent, COMPACTION_STATUS)
+        if force:
+            agent._emit_status(COMPACTION_STATUS)
+        else:
+            emit_routine_compression_progress(agent, COMPACTION_STATUS)
     except Exception:
         pass
 
