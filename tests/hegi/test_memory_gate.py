@@ -53,6 +53,10 @@ def test_approval_parser_recognizes_supported_phrases():
     assert parse_approval_command('@헤기 “기억해”라고 하지 않았어') is None
     assert parse_approval_command("@헤기 승인하지 않음") is None
     assert parse_approval_command("@다른봇 기억해") is None
+    assert (
+        parse_approval_command("@헤기 승인 대기 중인 드래프트 2건 기억해")
+        == "approve"
+    )
     assert parse_approval_command("@헤기 기억하지 마") == "reject"
     assert parse_approval_command("@헤기 승인하지 마") == "reject"
     assert parse_approval_command("그냥 확인") is None

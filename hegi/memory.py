@@ -241,6 +241,15 @@ def parse_approval_command(
         normalized,
         flags=re.IGNORECASE,
     ).strip()
+    pending_drafts = re.fullmatch(
+        r"(?:승인 대기 중인\s+)?(?:드래프트|draft)"
+        r"(?:\s+\d+\s*건)?\s+"
+        r"(?:기억해|기억 승인해|승인하고 저장해)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if pending_drafts:
+        return "approve"
     phrases = dict(_COMMANDS)
     if isinstance(commands, dict):
         configured_groups = {
