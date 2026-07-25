@@ -5983,6 +5983,58 @@ class SessionDB:
                 return content
         return content
 
+    @staticmethod
+    def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
+        """Serialize ``display_metadata`` for its TEXT column without double-encoding.
+
+        Import/replace paths can hand us an already-serialized JSON string (the
+        same hazard ``tool_calls`` guards against above). ``json.dumps`` on that
+        string would store a quoted JSON string, and the single ``json.loads``
+        on read then yields a ``str`` instead of a dict.
+        """
+        if not display_metadata:
+            return None
+        if isinstance(display_metadata, str):
+            try:
+                parsed = json.loads(display_metadata)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Ignoring non-JSON display metadata on write")
+                return None
+            if not isinstance(parsed, dict):
+                logger.warning("Ignoring non-object display metadata on write")
+                return None
+            return json.dumps(parsed)
+        if isinstance(display_metadata, dict):
+            return json.dumps(display_metadata)
+        logger.warning(
+            "Ignoring unexpected display metadata type on write: %s",
+            type(display_metadata).__name__,
+        )
+        return None
+
+    @staticmethod
+    def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
+        """Decode a ``display_metadata`` column into the dict every reader expects.
+
+        Every message read path must go through this. Returning the raw TEXT
+        instead reaches the desktop as a string, where ``'task_count' in meta``
+        throws and fails the whole resume. Rows written before the encode guard
+        landed are double-encoded, so unwrap a second layer when we find one.
+        """
+        if raw is None:
+            return None
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Ignoring invalid display metadata on message row")
+            return None
+        if not isinstance(meta, dict):
+            logger.warning("Ignoring non-object display metadata on message row")
+            return None
+        return meta
+
     def append_message(
         self,
         session_id: str,
@@ -6029,7 +6081,7 @@ class SessionDB:
         """
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
-        display_metadata_json = json.dumps(display_metadata) if display_metadata else None
+        display_metadata_json = self._encode_display_metadata(display_metadata)
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
             json.dumps(reasoning_details)
@@ -6168,7 +6220,7 @@ class SessionDB:
                 "UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
                 (
                     _scrub_surrogates(display_kind),
-                    json.dumps(display_metadata) if display_metadata else None,
+                    self._encode_display_metadata(display_metadata),
                     row[0],
                 ),
             )
@@ -6262,7 +6314,7 @@ class SessionDB:
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
-                    json.dumps(msg["display_metadata"]) if msg.get("display_metadata") else None,
+                    self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
             inserted += 1
@@ -6476,6 +6528,8 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
                     msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
         return result
 
@@ -6545,6 +6599,8 @@ class SessionDB:
                         "Failed to deserialize tool_calls in get_messages_around, falling back to []"
                     )
                     msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
 
         # before_rows includes the anchor itself; subtract 1 for the count of
@@ -6667,6 +6723,8 @@ class SessionDB:
                         "Failed to deserialize tool_calls in get_anchored_view, falling back to []"
                     )
                     msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             return msg
 
         return {
@@ -6865,10 +6923,9 @@ class SessionDB:
             if row["display_kind"]:
                 msg["display_kind"] = row["display_kind"]
             if row["display_metadata"]:
-                try:
-                    msg["display_metadata"] = json.loads(row["display_metadata"])
-                except (TypeError, json.JSONDecodeError):
-                    logger.warning("Ignoring invalid display metadata on message row")
+                decoded = self._decode_display_metadata(row["display_metadata"])
+                if decoded is not None:
+                    msg["display_metadata"] = decoded
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:
@@ -8902,10 +8959,28 @@ class SessionDB:
         except OSError:
             pass
 
+    def get_session_delete_targets(self, session_id: str) -> List[str]:
+        """Return every session row that :meth:`delete_session` would remove.
+
+        The requested session is first, followed by its recursively discovered
+        delegate/subagent children. Branch and compression children are not
+        included because deletion preserves them by orphaning their parent
+        reference.
+        """
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+            if not exists:
+                return []
+            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
+        return [session_id, *sorted(delegate_ids)]
+
     def delete_session(
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        expected_delete_ids: Optional[List[str]] = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -8915,9 +8990,18 @@ class SessionDB:
         (``parent_session_id → NULL``) so they remain accessible independently.
         When *sessions_dir* is provided, also removes on-disk transcript
         files (``.json`` / ``.jsonl`` / ``request_dump_*``) for every deleted
-        session. Returns True if the session was found and deleted.
+        session. When *expected_delete_ids* is provided, deletion proceeds only
+        if the parent plus delegate cascade still matches that exact set. This
+        lets export-before-delete callers fail closed if a new delegate appears
+        after they materialize their archive. The delegate tree is re-walked
+        inside the write transaction on purpose (TOCTOU guard); the cost is
+        accepted for correctness. Returns True if the session was found and
+        deleted.
         """
         removed_delegate_ids: List[str] = []
+        expected_ids = (
+            set(expected_delete_ids) if expected_delete_ids is not None else None
+        )
 
         def _do(conn):
             cursor = conn.execute(
@@ -8925,6 +9009,13 @@ class SessionDB:
             )
             if cursor.fetchone()[0] == 0:
                 return False
+            if expected_ids is not None:
+                actual_ids = {
+                    session_id,
+                    *_collect_delegate_child_ids(conn, [session_id]),
+                }
+                if actual_ids != expected_ids:
+                    return False
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(

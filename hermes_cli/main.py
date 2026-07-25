@@ -639,7 +639,7 @@ def _apply_profile_override() -> None:
 
             active_path = get_default_hermes_root() / "active_profile"
             if active_path.exists():
-                name = active_path.read_text().strip()
+                name = active_path.read_text(encoding="utf-8").strip()
                 if name and name != "default":
                     profile_name = name
                     consume = 0  # don't strip anything from argv
@@ -1021,7 +1021,7 @@ def _has_any_provider_configured() -> bool:
         try:
             import json
 
-            auth = json.loads(auth_file.read_text())
+            auth = json.loads(auth_file.read_text(encoding="utf-8"))
             active = auth.get("active_provider")
             if active:
                 status = get_auth_status(active)
@@ -3975,13 +3975,17 @@ def _custom_provider_base_url_config_value(provider_info, resolved_base_url=""):
 
 
 def _save_custom_provider(
-    base_url, api_key="", model="", context_length=None, name=None, api_mode=None
+    base_url, api_key="", model="", context_length=None, name=None, api_mode=None,
+    key_env=""
 ):
     """Save a custom endpoint to custom_providers in config.yaml.
 
     Deduplicates by base_url — if the URL already exists, updates the
     model name, context_length, and api_mode but doesn't add a duplicate entry.
     Uses *name* when provided, otherwise auto-generates from the URL.
+
+    When *key_env* is set the caller has already written the key to ``.env``,
+    so the entry references it instead of inlining the secret (#69449).
     """
     from hermes_cli.config import load_config, save_config
 
@@ -4013,6 +4017,10 @@ def _save_custom_provider(
             elif "api_mode" in entry:
                 entry.pop("api_mode", None)
                 changed = True
+            if key_env and (entry.get("key_env") != key_env or entry.get("api_key")):
+                entry["key_env"] = key_env
+                entry.pop("api_key", None)
+                changed = True
             if changed:
                 cfg["custom_providers"] = providers
                 save_config(cfg)
@@ -4023,7 +4031,9 @@ def _save_custom_provider(
         name = _auto_provider_name(base_url)
 
     entry = {"name": name, "base_url": base_url}
-    if api_key:
+    if key_env:
+        entry["key_env"] = key_env
+    elif api_key:
         entry["api_key"] = api_key
     if model:
         entry["model"] = model
@@ -4806,7 +4816,7 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
         "id": str(_uuid.uuid4()),
     }
     tmp = prompt_path.with_suffix(".tmp")
-    tmp.write_text(_json.dumps(payload))
+    tmp.write_text(_json.dumps(payload), encoding="utf-8")
     tmp.replace(prompt_path)
 
     # Poll for response
@@ -4814,7 +4824,7 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
     while _time.monotonic() < deadline:
         if response_path.exists():
             try:
-                answer = response_path.read_text().strip()
+                answer = response_path.read_text(encoding="utf-8").strip()
                 response_path.unlink(missing_ok=True)
                 prompt_path.unlink(missing_ok=True)
                 return answer if answer else default
@@ -5507,7 +5517,225 @@ def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     existing = [p for p in candidates if p.exists()]
     if not existing:
         return None
+    if sys.platform == "win32" and len(existing) > 1:
+        # Multiple unpacked trees can coexist (e.g. a stale win-arm64-unpacked
+        # left behind by a cross-arch experiment next to the real win-unpacked).
+        # Picking purely by mtime can then hand a wrong-architecture Hermes.exe
+        # to the launcher, which Windows rejects with "This app can't run on
+        # your computer" (#69179). Prefer candidates whose PE machine field
+        # matches the host; fall back to mtime when none can be parsed.
+        expected = _expected_windows_pe_machines()
+        matching = [p for p in existing if _pe_machine_or_none(p) in expected]
+        if matching:
+            existing = matching
     return max(existing, key=lambda p: p.stat().st_mtime)
+
+
+# ─── Desktop exe integrity gate (#69179) ────────────────────────────────────
+#
+# The desktop self-update chain (Desktop → hermes-setup --update →
+# `hermes update` → `hermes desktop --build-only` → relaunch) rebuilds
+# Hermes.exe on the end user's machine and used to verify only that the file
+# EXISTS before declaring success. A corrupt cached Electron zip whose
+# extraction produced a truncated electron.exe, an interrupted rcedit resource
+# rewrite, a disk-full pack, or a wrong-arch unpacked tree therefore shipped a
+# broken binary that Windows refuses to load ("This app can't run on your
+# computer" / 此应用无法在你的电脑上运行). These helpers parse the PE header —
+# no signature infrastructure required — so a structurally broken or
+# wrong-architecture Hermes.exe is caught BEFORE the updater replaces the
+# working app, and the previous build can be restored from the .bak tree that
+# apps/desktop/scripts/before-pack.mjs now preserves.
+
+_PE_MACHINE_I386 = 0x014C
+_PE_MACHINE_AMD64 = 0x8664
+_PE_MACHINE_ARM64 = 0xAA64
+
+_PE_MACHINE_NAMES = {
+    _PE_MACHINE_I386: "x86 (32-bit)",
+    _PE_MACHINE_AMD64: "x64 (AMD64)",
+    _PE_MACHINE_ARM64: "ARM64",
+}
+
+
+def _expected_windows_pe_machines() -> set:
+    """PE machine values the current Windows host can natively load.
+
+    AMD64 hosts run x64 and (via WOW64) x86. ARM64 hosts run ARM64 and
+    (Windows 11 emulation) x64. 32-bit x86 hosts run only x86. Unknown
+    machines return the permissive full set so the integrity gate can never
+    brick launch on exotic hosts.
+    """
+    import platform as _platform
+
+    machine = (_platform.machine() or "").upper()
+    if machine in ("AMD64", "X86_64", "X64"):
+        return {_PE_MACHINE_AMD64, _PE_MACHINE_I386}
+    if machine in ("ARM64", "AARCH64"):
+        return {_PE_MACHINE_ARM64, _PE_MACHINE_AMD64}
+    if machine in ("X86", "I386", "I486", "I586", "I686"):
+        return {_PE_MACHINE_I386}
+    return {_PE_MACHINE_AMD64, _PE_MACHINE_ARM64, _PE_MACHINE_I386}
+
+
+def _parse_pe_machine(path: Path) -> int:
+    """Parse ``path`` as a PE executable and return its COFF machine field.
+
+    Raises ``ValueError`` with a human-readable reason when the file is not a
+    structurally complete PE: missing MZ/PE magic (an HTML error page or JSON
+    body saved as .exe), header truncation, or raw section data extending past
+    the end of the file (the truncated-download / interrupted-extraction
+    shape). Purely a header walk — cheap even on a 200 MB Electron exe.
+    """
+    import struct
+
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"unreadable: {exc}")
+    if file_size < 512:
+        raise ValueError(
+            f"file is only {file_size} bytes — far too small to be a Windows executable"
+        )
+    with path.open("rb") as fh:
+        head = fh.read(64)
+        if len(head) < 64 or head[:2] != b"MZ":
+            raise ValueError(
+                "missing MZ header — not a Windows executable "
+                "(a truncated or non-binary file saved as .exe?)"
+            )
+        e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
+        if e_lfanew <= 0 or e_lfanew + 24 > file_size:
+            raise ValueError("corrupt DOS header: PE header offset points past end of file")
+        fh.seek(e_lfanew)
+        pe_head = fh.read(24)
+        if len(pe_head) < 24 or pe_head[:4] != b"PE\x00\x00":
+            raise ValueError("missing PE signature — corrupt executable header")
+        machine, n_sections = struct.unpack_from("<HH", pe_head, 4)
+        size_of_optional = struct.unpack_from("<H", pe_head, 20)[0]
+        fh.seek(e_lfanew + 24 + size_of_optional)
+        max_section_end = 0
+        for _ in range(n_sections):
+            section = fh.read(40)
+            if len(section) < 40:
+                raise ValueError("truncated PE section table")
+            size_of_raw, pointer_to_raw = struct.unpack_from("<II", section, 16)
+            max_section_end = max(max_section_end, pointer_to_raw + size_of_raw)
+        if file_size < max_section_end:
+            raise ValueError(
+                f"truncated executable: file is {file_size} bytes but its PE "
+                f"sections extend to {max_section_end} bytes"
+            )
+    return machine
+
+
+def _pe_machine_or_none(path: Path) -> Optional[int]:
+    try:
+        return _parse_pe_machine(path)
+    except ValueError:
+        return None
+
+
+def _desktop_exe_integrity_error(path: Path) -> Optional[str]:
+    """Return a human-readable reason ``path`` cannot run on this Windows host,
+    or ``None`` when the exe parses as a complete PE of a loadable architecture.
+    """
+    try:
+        machine = _parse_pe_machine(path)
+    except ValueError as exc:
+        return str(exc)
+    expected = _expected_windows_pe_machines()
+    if machine not in expected:
+        import platform as _platform
+
+        got = _PE_MACHINE_NAMES.get(machine, f"unknown machine 0x{machine:04X}")
+        return (
+            f"architecture mismatch: built a {got} executable but this is a "
+            f"{_platform.machine()} Windows host"
+        )
+    return None
+
+
+def _desktop_backup_unpacked_dir(packaged_executable: Path) -> Path:
+    """The rollback tree before-pack.mjs preserves: ``<unpacked-dir>.bak``."""
+    unpacked = packaged_executable.parent
+    return unpacked.parent / (unpacked.name + ".bak")
+
+
+def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:
+    """Restore the previous unpacked desktop app from its ``.bak`` tree.
+
+    Returns the restored executable path, or ``None`` when no usable backup
+    exists (missing, or its exe fails the same integrity probe). The corrupt
+    tree is kept alongside as ``<unpacked-dir>.corrupt`` for diagnostics.
+    Best-effort: never raises.
+    """
+    unpacked = packaged_executable.parent
+    backup_dir = _desktop_backup_unpacked_dir(packaged_executable)
+    backup_exe = backup_dir / packaged_executable.name
+    if not backup_exe.exists():
+        return None
+    if _desktop_exe_integrity_error(backup_exe) is not None:
+        return None
+    corrupt_dir = unpacked.parent / (unpacked.name + ".corrupt")
+    try:
+        shutil.rmtree(corrupt_dir, ignore_errors=True)
+        try:
+            unpacked.rename(corrupt_dir)
+        except OSError:
+            shutil.rmtree(unpacked, ignore_errors=True)
+        backup_dir.rename(unpacked)
+    except OSError:
+        return None
+    restored = unpacked / packaged_executable.name
+    return restored if restored.exists() else None
+
+
+def _ensure_desktop_exe_launchable(
+    desktop_dir: Path, packaged_executable: Optional[Path]
+) -> tuple:
+    """Windows post-build integrity gate for the self-update rebuild (#69179).
+
+    Returns ``(verified_exe_or_None, rolled_back)``:
+
+    - exe passed the probe → ``(exe, False)``
+    - exe corrupt/wrong-arch, previous build restored → ``(old_exe, True)``
+    - exe corrupt and nothing restorable → ``(None, False)``
+
+    On any integrity failure the corrupt cached Electron zip is purged and the
+    desktop build stamp invalidated, so the updater's retry-once rebuild pulls
+    a fresh, SHASUM-verified Electron download instead of re-staging the same
+    corrupt bytes. No-op off Windows and when there is no executable to check.
+    """
+    if packaged_executable is None or sys.platform != "win32":
+        return packaged_executable, False
+
+    error = _desktop_exe_integrity_error(packaged_executable)
+    if error is None:
+        return packaged_executable, False
+
+    print(f"✗ The built Hermes.exe failed its integrity check: {error}")
+    print(f"    at: {packaged_executable}")
+
+    # Self-heal setup for the retry: drop the (likely corrupt) cached Electron
+    # zip and the content stamp so the next rebuild is a genuine re-download +
+    # re-stage rather than a replay of the same broken extraction.
+    _purge_electron_build_cache(desktop_dir)
+    try:
+        _desktop_stamp_path().unlink()
+    except OSError:
+        pass
+
+    restored = _rollback_desktop_from_backup(packaged_executable)
+    if restored is not None:
+        print("  ↩ Update aborted — restored the previous working Hermes.exe from backup.")
+        print("    Your existing version was kept and still works. Run `hermes desktop`")
+        print("    (or the in-app update) again to retry with a fresh Electron download.")
+        return restored, True
+
+    print("  ✗ No usable backup was found to restore.")
+    print("    Run `hermes desktop --force-build` to rebuild, or re-run the Hermes")
+    print("    installer to repair the install.")
+    return None, False
 
 
 def _electron_download_cache_dirs() -> list[Path]:
@@ -6150,6 +6378,22 @@ def cmd_gui(args: argparse.Namespace):
                 # an in-place self-update (otherwise macOS reports "Hermes is
                 # damaged"). No-op on non-macOS and on real-identity builds.
                 _desktop_macos_relaunchable_fixup(desktop_dir)
+
+                # Windows integrity gate (#69179): never declare the rebuild a
+                # success on a Hermes.exe Windows cannot load (truncated PE from
+                # a corrupt cached Electron zip, wrong-arch tree, interrupted
+                # rcedit rewrite). Roll back to the .bak tree preserved by
+                # before-pack.mjs when possible, then fail loudly so the
+                # updater's retry-once rebuilds from a fresh Electron download
+                # instead of silently shipping the broken exe.
+                verified_executable, rolled_back = _ensure_desktop_exe_launchable(
+                    desktop_dir, packaged_executable
+                )
+                if packaged_executable is not None and (
+                    rolled_back or verified_executable is None
+                ):
+                    sys.exit(1)
+                packaged_executable = verified_executable
 
             # Build succeeded — write the stamp so next run can skip
             _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
@@ -9959,7 +10203,7 @@ def _ensure_fhs_path_guard() -> None:
         if not cfg.is_file():
             continue
         try:
-            existing = cfg.read_text(errors="replace")
+            existing = cfg.read_text(errors="replace", encoding="utf-8")
         except OSError:
             continue
         # Idempotency: skip if any uncommented PATH= line already references
@@ -11905,7 +12149,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if gateway_mode:
             _exit_code_path = get_hermes_home() / ".update_exit_code"
             try:
-                _exit_code_path.write_text("0")
+                _exit_code_path.write_text("0", encoding="utf-8")
             except OSError:
                 pass
 
@@ -12535,7 +12779,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if gateway_mode:
                     _exit_code_path = get_hermes_home() / ".update_exit_code"
                     try:
-                        _exit_code_path.write_text("1")
+                        _exit_code_path.write_text("1", encoding="utf-8")
                     except OSError:
                         pass
             _warn_incomplete_gateway_fleet_restart(failed_or_stale_units)
@@ -13357,7 +13601,11 @@ def _render_distribution_plan(plan) -> None:
                 env_path = plan.target_dir / ".env"
                 if env_path.is_file():
                     try:
-                        for raw in env_path.read_text().splitlines():
+                        # .env is written as UTF-8 everywhere in the codebase,
+                        # but a Notepad-edited file can carry a BOM — read as
+                        # utf-8-sig so the first key isn't hidden behind
+                        # U+FEFF (#62617).
+                        for raw in env_path.read_text(encoding="utf-8-sig").splitlines():
                             line = raw.strip()
                             if not line or line.startswith("#"):
                                 continue
@@ -13365,7 +13613,10 @@ def _render_distribution_plan(plan) -> None:
                             if key == er.name:
                                 already = True
                                 break
-                    except OSError:
+                    except (OSError, UnicodeDecodeError):
+                        # UnicodeDecodeError is a ValueError, not an OSError, so
+                        # the old guard let a mis-encoded .env abort the whole
+                        # install preview. Skip the pre-check instead.
                         pass
             status = "✓ set" if already else ("needs setting" if er.required else "—")
             line = f"    • {er.name} ({tag}, {status})"
@@ -16089,10 +16340,10 @@ def main():
                 return
             output_dir = Path(args.output).expanduser() if args.output else get_hermes_home() / "session-exports"
 
-            def _export_one(session_id: str):
+            def _export_one(session_id: str, *, include_lineage: bool = False):
                 data = (
                     db.export_session_lineage(session_id)
-                    if getattr(args, "lineage", "single") == "logical"
+                    if include_lineage
                     else db.export_session(session_id)
                 )
                 if not data:
@@ -16116,36 +16367,93 @@ def main():
                 db.close()
                 return
 
+            lineage_is_logical = getattr(args, "lineage", "single") == "logical"
+
             if args.session_id:
                 resolved_session_id = db.resolve_session_id(args.session_id)
                 if not resolved_session_id:
                     print(f"Session '{args.session_id}' not found.")
                     db.close()
                     return
-                try:
-                    data, exported_path = _export_one(resolved_session_id)
-                except FileExistsError as e:
-                    print(f"Export already exists: {e}. Pass --force to overwrite.")
-                    db.close()
-                    return
-                if not data or not exported_path:
-                    print(f"Session '{args.session_id}' not found.")
-                    db.close()
-                    return
-                message_count = len(data.get("messages") or [])
-                suffix = "" if message_count == 1 else "s"
-                print(f"Exported 1 session ({message_count} message{suffix}) to {exported_path}")
+                delete_target_ids = [resolved_session_id]
                 if args.delete_after_verified:
-                    ok, reason = verify_export_file(exported_path, data)
-                    if not ok:
-                        print(f"Export verification failed; not deleting: {reason}")
+                    delete_target_ids = db.get_session_delete_targets(
+                        resolved_session_id
+                    )
+
+                exported_items = []
+                for target_id in delete_target_ids:
+                    try:
+                        data, exported_path = _export_one(
+                            target_id,
+                            include_lineage=(
+                                target_id == resolved_session_id
+                                and lineage_is_logical
+                            ),
+                        )
+                    except FileExistsError as e:
+                        print(
+                            f"Export already exists: {e}. "
+                            "Pass --force to overwrite."
+                        )
                         db.close()
                         return
+                    if not data or not exported_path:
+                        print(
+                            f"Session '{target_id}' disappeared during export; "
+                            "nothing was deleted."
+                        )
+                        db.close()
+                        return
+                    exported_items.append((data, exported_path))
+
+                message_count = sum(
+                    len(data.get("messages") or [])
+                    for data, _path in exported_items
+                )
+                suffix = "" if message_count == 1 else "s"
+                if len(exported_items) == 1:
+                    print(
+                        f"Exported 1 session ({message_count} message{suffix}) "
+                        f"to {exported_items[0][1]}"
+                    )
+                else:
+                    print(
+                        f"Exported {len(exported_items)} sessions "
+                        f"({message_count} message{suffix}) to {output_dir}"
+                    )
+                if args.delete_after_verified:
+                    for data, exported_path in exported_items:
+                        ok, reason = verify_export_file(exported_path, data)
+                        if not ok:
+                            print(
+                                "Export verification failed; not deleting "
+                                f"session '{data.get('id')}': {reason}"
+                            )
+                            db.close()
+                            return
                     sessions_dir = get_hermes_home() / "sessions"
-                    if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
-                        print(f"Deleted exported session '{resolved_session_id}'.")
+                    if db.delete_session(
+                        resolved_session_id,
+                        sessions_dir=sessions_dir,
+                        expected_delete_ids=delete_target_ids,
+                    ):
+                        delegate_count = len(delete_target_ids) - 1
+                        delegate_suffix = (
+                            ""
+                            if not delegate_count
+                            else f" and {delegate_count} delegate session"
+                            f"{'' if delegate_count == 1 else 's'}"
+                        )
+                        print(
+                            f"Deleted exported session '{resolved_session_id}'"
+                            f"{delegate_suffix}."
+                        )
                     else:
-                        print(f"Exported, but session '{resolved_session_id}' was not deleted because it was not found.")
+                        print(
+                            f"Exported, but session '{resolved_session_id}' was "
+                            "not deleted because its delegate set changed."
+                        )
                 db.close()
                 return
 
@@ -16171,7 +16479,10 @@ def main():
             exported = 0
             for row in candidates:
                 try:
-                    data, exported_path = _export_one(row["id"])
+                    data, exported_path = _export_one(
+                        row["id"],
+                        include_lineage=lineage_is_logical,
+                    )
                 except FileExistsError as e:
                     print(f"Skipping existing export: {e}. Pass --force to overwrite.")
                     continue
