@@ -2203,6 +2203,10 @@ class WorkflowEngine:
                 # substitution when creating downstream cards.
                 if context is None and "context" in saved:
                     context = saved["context"]
+                # Restore _session_info from saved session_info so
+                # completion notifications work in the supervisor subprocess.
+                if context and "session_info" in saved:
+                    context.setdefault("_session_info", saved["session_info"])
                 # Restore attachments from saved state so the supervisor
                 # subprocess can attach files to first-layer cards.
                 if not attachments and "attachments" in saved:
