@@ -41,7 +41,7 @@ export const zh: Translations = {
     set: '设置',
     skip: '跳过',
     update: '更新',
-    tryHint: term => `试试“${term}”`,
+    tryHint: term => `试试"${term}"`,
     on: '开',
     off: '关'
   },
@@ -96,7 +96,7 @@ export const zh: Translations = {
       remoteSignInHint: signInLabel =>
         `先退出已保存的远程浏览器会话，然后打开${signInLabel}。也可以使用本地网关切换到随应用提供的后端。`,
       signOutAndSignIn: '退出并重新登录',
-      remoteFailureHint: '在“网关设置”中检查网关 URL 和登录，或切换到本地网关。',
+      remoteFailureHint: '在"网关设置"中检查网关 URL 和登录，或切换到本地网关。',
       hideRecentLogs: '隐藏最近日志',
       showRecentLogs: '显示最近日志',
       signedInTitle: '已登录',
@@ -226,7 +226,7 @@ export const zh: Translations = {
     resetAll: '全部重置',
     pressKey: '请按下按键…',
     set: '设置',
-    conflictWith: label => `已绑定到“${label}”`,
+    conflictWith: label => `已绑定到"${label}"`,
     categories: {
       composer: '输入框',
       profiles: '配置',
@@ -677,7 +677,7 @@ export const zh: Translations = {
         showReasoning: '当后端提供推理内容时予以显示。'
       },
       desktop: {
-        repoScanEnabled: '扫描本地文件夹，并在“项目”中显示 Git 代码仓库。',
+        repoScanEnabled: '扫描本地文件夹，并在"项目"中显示 Git 代码仓库。',
         repoScanRoots: '要扫描的文件夹。留空时扫描主目录。',
         repoScanExcludePaths: '发现代码仓库时跳过这些文件夹及其子目录。'
       },
@@ -819,7 +819,7 @@ export const zh: Translations = {
       appliesTo: '应用于',
       allProfiles: '所有 profile',
       defaultConnection: '默认连接会用于所有没有自定义覆盖的 profile。',
-      profileConnection: profile => `仅当“${profile}”是当前 profile 时使用此连接。设为本地即可继承默认连接。`,
+      profileConnection: profile => `仅当"${profile}"是当前 profile 时使用此连接。设为本地即可继承默认连接。`,
       envOverrideTitle: '环境变量正在控制此桌面会话。',
       envOverrideDesc: '取消设置 HERMES_DESKTOP_REMOTE_URL 和 HERMES_DESKTOP_REMOTE_TOKEN 后才会使用下面保存的设置。',
       modeTitle: '连接模式',
@@ -925,7 +925,7 @@ export const zh: Translations = {
       sshHermesPathPlaceholder: '自动检测',
       sshTestConnection: '测试 SSH',
       sshConnect: '连接',
-      sshButtonsHint: '“保存”将在下次启动时生效，“连接”则立即重新连接。',
+      sshButtonsHint: '"保存"将在下次启动时生效，"连接"则立即重新连接。',
       sshReachable: (host, platform) => `可连接：${host}（${platform}）——已找到 Hermes`,
       sshIncompleteHost: '连接前请输入 SSH 主机。',
       sshErrUnreachable: '无法通过 SSH 连接到该主机。请检查主机、端口和网络。',
@@ -1163,7 +1163,7 @@ export const zh: Translations = {
       oauthHint: name => `${name} 通过浏览器登录 — Hermes 会为你完成整个流程。`,
       moa: {
         title: '混合智能体 (MOA)',
-        description: '配置以模型形式出现在“混合智能体”提供方下的命名预设。聚合模型是实际应答的模型。',
+        description: '配置以模型形式出现在"混合智能体"提供方下的命名预设。聚合模型是实际应答的模型。',
         presetPlaceholder: '预设',
         enabled: '启用',
         setDefault: '设为默认',
@@ -1292,7 +1292,7 @@ export const zh: Translations = {
       deletePermanently: '永久删除',
       messages: count => `${count} 条消息`,
       restored: '已恢复',
-      deleteConfirm: title => `永久删除“${title}”？此操作无法撤销。`,
+      deleteConfirm: title => `永久删除"${title}"？此操作无法撤销。`,
       autoArchiveTitle: '自动归档闲置会话',
       autoArchiveDesc:
         '自动归档你一段时间未使用的会话。已置顶的会话永远不会被归档，也不会删除任何内容——归档的会话会移动到这里。',
@@ -1628,7 +1628,7 @@ export const zh: Translations = {
       hub: '技能中心'
     },
     emptyNoneFound: noun => `未找到${noun}`,
-    emptyNothingMatches: query => `没有匹配“${query}”的内容。`,
+    emptyNothingMatches: query => `没有匹配"${query}"的内容。`,
     emptyNoneAvailable: noun => `暂无可用的${noun}。`,
     changesApplyNewSessions: '更改将应用于新会话。',
     skillUpdated: '技能已更新',
@@ -2327,8 +2327,8 @@ export const zh: Translations = {
       'Webhook 是独立的网关平台。在此启用以接受传入的 HTTP 事件；仅当订阅投递到 Telegram、Discord、Slack 或其他渠道时才需要聊天渠道。',
     enable: '启用 Webhook',
     enabling: '正在启用…',
-    enabled: (name: string) => `已启用：“${name}”`,
-    disabled: (name: string) => `已禁用：“${name}”`,
+    enabled: (name: string) => `已启用："${name}"`,
+    disabled: (name: string) => `已禁用："${name}"`,
     enableRow: '启用',
     disableRow: '禁用',
     delete: '删除',
@@ -2337,8 +2337,8 @@ export const zh: Translations = {
     deleteTitle: '删除 Webhook',
     deleteDescPrefix: '这将永久移除 ',
     deleteDescSuffix: '。此操作无法撤销。',
-    deleteFailed: (name: string) => `删除“${name}”失败`,
-    toggleFailed: (name: string) => `更新“${name}”失败`,
+    deleteFailed: (name: string) => `删除"${name}"失败`,
+    toggleFailed: (name: string) => `更新"${name}"失败`,
     newSubscription: '新建订阅',
     restarting: '网关正在重启…',
     restartNeeded: 'Webhook 已启用，但网关仍需重启后接收器才能上线。',
@@ -2764,7 +2764,7 @@ export const zh: Translations = {
   },
 
   // 与 intro-copy.jsonl 逐条对应的中文池；专业名词（git、diff、PR、terminal、
-  // stack trace 等）按惯例保留英文。每个人格 5 条，保持“每次启动随机”的行为。
+  // stack trace 等）按惯例保留英文。每个人格 5 条，保持"每次启动随机"的行为。
   intro: {
     bodies: {
       helpful: [
@@ -3252,7 +3252,7 @@ export const zh: Translations = {
     autoBrowser: provider => `已在浏览器中打开 ${provider}。请在那里授权 Hermes，连接会自动完成，无需复制或粘贴。`,
     reopenSignInPage: '重新打开登录页面',
     waitingAuthorize: '等待你授权...',
-    externalPending: provider => `${provider} 通过自己的 CLI 登录。请在终端运行此命令，然后回来选择“我已登录”：`,
+    externalPending: provider => `${provider} 通过自己的 CLI 登录。请在终端运行此命令，然后回来选择"我已登录"：`,
     signedIn: '我已登录',
     deviceCodeOpened: provider => `已在浏览器中打开 ${provider}。请在那里输入此代码：`,
     reopenVerification: '重新打开验证页面',
@@ -3417,7 +3417,7 @@ export const zh: Translations = {
       noModel: '无模型',
       switchModel: '切换模型',
       openModelPicker: '打开模型选择器',
-      modelPinned: '已由你固定；新对话将使用此模型而非“设置”中的默认模型',
+      modelPinned: '已由你固定;新对话将使用此模型而非"设置"中的默认模型',
       modelTitle: (provider, model) => `模型 · ${provider}: ${model}`,
       providerModelTitle: (provider, model) => `${provider} · ${model}`
     }
@@ -3570,7 +3570,7 @@ export const zh: Translations = {
     dirDown: '下',
     dirLeft: '左',
     dirRight: '右',
-    pluginDisabled: pluginId => `插件“${pluginId}”已禁用`,
+    pluginDisabled: pluginId => `插件"${pluginId}"已禁用`,
     pluginDisabledBody: '在 设置 → 插件 中重新启用即可恢复面板。',
     missingPane: paneId => `缺少面板：${paneId}`,
     editTitle: '布局',
@@ -3644,7 +3644,7 @@ export const zh: Translations = {
       reject: '拒绝',
       alwaysTitle: '始终允许此命令？',
       alwaysDescription: pattern =>
-        `这会将“${pattern}”模式加入永久允许列表 (~/.hermes/config.yaml)。Hermes 对类似命令将不再询问，包括当前会话和未来会话。`,
+        `这会将"${pattern}"模式加入永久允许列表 (~/.hermes/config.yaml)。Hermes 对类似命令将不再询问，包括当前会话和未来会话。`,
       alwaysAllow: '始终允许'
     },
     clarify: {
@@ -3703,7 +3703,7 @@ export const zh: Translations = {
       },
       titleTemplates: {
         actionCommand: (action, command) => `${action} ${command}`,
-        actionQuoted: (action, value) => `${action}“${value}”`,
+        actionQuoted: (action, value) => `${action}"${value}"`,
         actionTarget: (action, target) => `${action} ${target}`,
         prefixedDone: (prefix, action) => `${prefix}${action}`,
         runningPrefixedTool: (prefix, action) => `正在运行${prefix}${action}`,
@@ -3764,9 +3764,9 @@ export const zh: Translations = {
     yoloSystem: active => `此会话 YOLO ${active ? '已开启' : '已关闭'}`,
     yoloTitle: 'YOLO',
     yoloToggleFailed: '无法切换 YOLO',
-    profileStatus: current => `配置档案：${current}。使用 /profile <name> 或“新建会话”选择器在其他配置档案中开始对话。`,
+    profileStatus: current => `配置档案：${current}。使用 /profile <name> 或"新建会话"选择器在其他配置档案中开始对话。`,
     unknownProfile: '未知配置档案',
-    noProfileNamed: (target, available) => `没有名为“${target}”的配置档案。可用：${available}`,
+    noProfileNamed: (target, available) => `没有名为"${target}"的配置档案。可用：${available}`,
     newChatsProfile: name => `新对话将使用配置档案 ${name}。`,
     setProfileFailed: '设置配置档案失败',
     sttDisabled: '设置中已禁用语音转文字。',
