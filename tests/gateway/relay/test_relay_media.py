@@ -167,6 +167,33 @@ async def test_inbound_without_client_keeps_public_drops_rehost():
 # ── RelayMediaClient unit surface ────────────────────────────────────────
 
 
+def test_media_base_url_derivation():
+    assert media_base_url("wss://conn.example/relay") == "https://conn.example"
+    assert media_base_url("ws://localhost:8080/relay") == "http://localhost:8080"
+    assert media_base_url("https://conn.example") == "https://conn.example"
+
+
+def test_client_enabled_requires_full_credentials():
+    assert RelayMediaClient("https://c.example", "gw1", "sec").enabled is True
+    assert RelayMediaClient("https://c.example", None, "sec").enabled is False
+    assert RelayMediaClient("https://c.example", "gw1", None).enabled is False
+    assert RelayMediaClient("", "gw1", "sec").enabled is False
+
+
+def test_client_recognizes_rehost_urls():
+    c = RelayMediaClient("https://c.example", "gw1", "sec")
+    assert c.is_relay_media_url("https://c.example/relay/media/abc") is True
+    assert c.is_relay_media_url("https://evil.example/relay/media/abc") is False
+    assert c.is_relay_media_url("https://cdn.example/files/relay/media/photo.png") is False
+    assert c.is_relay_media_url("https://cdn.discordapp.com/a/b.png") is False
+
+
+def test_client_recognizes_rehost_urls_under_connector_base_path():
+    c = RelayMediaClient("https://c.example/team-a", "gw1", "sec")
+    assert c.is_relay_media_url("https://c.example/team-a/relay/media/abc") is True
+    assert c.is_relay_media_url("https://c.example/relay/media/abc") is False
+
+
 @pytest.mark.asyncio
 async def test_client_upload_rejects_oversize_and_missing(tmp_path: Path):
     c = RelayMediaClient("https://c.example", "gw1", "sec")
