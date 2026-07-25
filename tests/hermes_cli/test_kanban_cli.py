@@ -167,6 +167,70 @@ def test_run_slash_json_output(kanban_home):
     assert payload["status"] == "ready"
 
 
+def test_run_slash_review_and_ingest_pr_json_lifecycle(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="dev")
+        assert kb.claim_task(conn, task_id) is not None
+    assert "Submitted" in kc.run_slash(
+        f"review {task_id} --assignee reviewer --summary ready --metadata '{{\"commit\": \"abc\"}}'"
+    )
+    ingested = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 88 --head-sha deadbeef "
+        "--title 'ship it' --assignee reviewer --checks-passed true --json"
+    ))
+    assert ingested["status"] == "review"
+    archived = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 88 --head-sha deadbeef "
+        "--title closed --action merged --json"
+    ))
+    assert archived["status"] == "archived"
+
+
+def test_run_slash_ingest_pr_reopened_same_head_reactivates_card(kanban_home):
+    initial = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title initial --assignee reviewer --checks-passed true --json"
+    ))
+    archived = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title closed --action closed --json"
+    ))
+    reopened = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title reopened --assignee reviewer --checks-passed false --action reopened --json"
+    ))
+    duplicate = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title reopened --assignee reviewer --checks-passed false --action reopened --json"
+    ))
+    assert archived["id"] == initial["id"]
+    assert reopened["id"] == initial["id"] == duplicate["id"]
+    assert reopened["status"] == duplicate["status"] == "blocked"
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+            ("github-pr:acme/widget:90:deadbeef",),
+        ).fetchall()
+    assert [row["id"] for row in rows] == [initial["id"]]
+
+
+def test_run_slash_review_and_ingest_pr_reject_bad_metadata(kanban_home):
+    assert "must be a JSON object" in kc.run_slash(
+        "ingest-pr --repository acme/widget --number 1 --head-sha abc --title x --metadata '[]'"
+    )
+    assert "--metadata" in kc.run_slash(
+        "ingest-pr --repository acme/widget --number 1 --head-sha abc --title x --metadata '{'"
+    )
+
+
+def test_run_slash_ingest_pr_unseen_terminal_json_is_noop(kanban_home):
+    payload = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 89 --head-sha missing "
+        "--title closed --action closed --json"
+    ))
+    assert payload == {"task_id": None, "status": "no-op"}
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

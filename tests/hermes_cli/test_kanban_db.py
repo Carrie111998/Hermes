@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -3908,10 +3909,10 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, t).status == "review"
 
 
-def test_dispatch_review_spawns_with_correct_skills(
+def test_dispatch_review_spawns_with_default_review_skill(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review tasks get sdlc-review skill set before spawning."""
+    """Review tasks get a resolvable built-in review skill before spawning."""
     spawned_tasks = []
 
     def capture_spawn(task, workspace, board=None):
@@ -3924,7 +3925,276 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills == ["github-code-review"]
+
+
+def test_dispatch_review_resolves_target_profile_skills_or_blocks(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+    reviewer = kanban_home / "profiles" / "reviewer"
+    skill = reviewer / "skills" / "github-code-review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: github-code-review\n---\n", encoding="utf-8")
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "reviewer")
+    spawned = []
+    with kb.connect() as conn:
+        good = kb.create_task(conn, title="good", assignee="reviewer")
+        _set_task_status(conn, good, "review")
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: spawned.append(task) or 1)
+        assert result.spawned and spawned[0].skills == ["github-code-review"]
+        bad = kb.create_task(conn, title="bad", assignee="reviewer", skills=["missing-skill"])
+        _set_task_status(conn, bad, "review")
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 1)
+        assert bad in result.auto_blocked
+        assert kb.get_task(conn, bad).status == "blocked"
+
+
+def test_submit_review_preserves_implementer_and_routes_reviewer(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="dev")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="PR https://example.test/1",
+            metadata={"commit": "abc"}, expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "review"
+        assert task.assignee == "reviewer"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_submitted'",
+            (task_id,),
+        ).fetchone()
+    payload = json.loads(event["payload"])
+    assert payload["original_assignee"] == "dev"
+    assert payload["reviewer"] == "reviewer"
+
+
+def test_review_changes_creates_ready_remediation_without_running_write(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="dev")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        remediation_id = kb.request_review_changes(
+            conn, task_id, summary="fix failing test", expected_run_id=review.current_run_id,
+        )
+        remediation = kb.get_task(conn, remediation_id)
+        review_task = kb.get_task(conn, task_id)
+    assert remediation is not None
+    assert remediation.assignee == "dev"
+    assert remediation.status == "ready"
+    assert review_task.status == "done"
+
+
+def test_ingest_pull_request_is_idempotent_and_routes_external_states(kanban_home):
+    with kb.connect() as conn:
+        first = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=7, head_sha="deadbeef",
+            title="External change", reviewer="reviewer", checks_passed=True,
+        )
+        second = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=7, head_sha="deadbeef",
+            title="External change", reviewer="reviewer", checks_passed=True,
+        )
+        blocked = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=8, head_sha="badc0de",
+            title="Broken checks", reviewer="reviewer", checks_passed=False,
+        )
+        draft = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=9, head_sha="cafebabe",
+            title="Draft", reviewer="reviewer", draft=True,
+        )
+        assert kb.get_task(conn, first).status == "review"
+        assert kb.get_task(conn, blocked).status == "blocked"
+        assert kb.get_task(conn, draft).status == "triage"
+    assert first == second
+
+
+def test_ingest_pull_request_upserts_state_and_supersedes_old_head(kanban_home):
+    with kb.connect() as conn:
+        first = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="old",
+            title="draft", reviewer="reviewer", draft=True,
+        )
+        assert kb.get_task(conn, first).status == "triage"
+        same = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="old",
+            title="ready", reviewer="new-reviewer", url="https://example.test/10",
+            checks_passed=True, metadata={"revision": 2},
+        )
+        updated = kb.get_task(conn, same)
+        assert same == first
+        assert updated.status == "review"
+        assert updated.assignee == "new-reviewer"
+        assert "UNTRUSTED GITHUB PR DATA" in updated.body
+        newest = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="new",
+            title="new head", reviewer="reviewer", checks_passed=True,
+            action="synchronize",
+        )
+        assert kb.get_task(conn, first).status == "archived"
+        assert kb.get_task(conn, newest).status == "review"
+        closed = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="new",
+            title="closed", reviewer="reviewer", action="merged",
+        )
+        assert closed == newest
+        assert kb.get_task(conn, newest).status == "archived"
+
+
+def test_ingest_pull_request_same_head_preserves_active_reviewer_claim(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=11, head_sha="deadbeef",
+            title="initial", reviewer="reviewer", checks_passed=True,
+        )
+        claimed = kb.claim_review_task(conn, task_id, claimer="reviewer:123")
+        assert claimed is not None
+        before = kb.get_task(conn, task_id)
+        assert before is not None
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+
+        duplicate = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=11, head_sha="deadbeef",
+            title="initial", reviewer="reviewer", checks_passed=True,
+        )
+        updated = kb.get_task(conn, task_id)
+        assert updated is not None
+        assert duplicate == task_id
+        assert updated.status == "running"
+        assert updated.claim_lock == before.claim_lock
+        assert updated.current_run_id == before.current_run_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)
+        ).fetchone()[0] == event_count
+
+        kb.ingest_pull_request(
+            conn, repository="acme/widget", number=11, head_sha="deadbeef",
+            title="edited title", reviewer="replacement", checks_passed=False,
+            metadata={"revision": 2},
+        )
+        safe_update = kb.get_task(conn, task_id)
+        assert safe_update is not None
+    assert safe_update.status == "running"
+    assert safe_update.assignee == "reviewer"
+    assert safe_update.claim_lock == before.claim_lock
+    assert safe_update.current_run_id == before.current_run_id
+    assert "edited title" in safe_update.body
+
+
+def test_ingest_pull_request_keeps_canonical_event_fields_and_repository_identity(kanban_home):
+    with kb.connect() as conn:
+        first = kb.ingest_pull_request(
+            conn, repository="acme/repo_x", number=12, head_sha="same",
+            title="first", reviewer="reviewer", checks_passed=True,
+            metadata={"repository": "attacker/repo", "head_sha": "forged", "action": "merged"},
+        )
+        second = kb.ingest_pull_request(
+            conn, repository="acme/repoax", number=12, head_sha="same",
+            title="second", reviewer="reviewer", checks_passed=True,
+        )
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'github_pr_ingested'",
+            (first,),
+        ).fetchone()
+    payload = json.loads(event["payload"])
+    assert first != second
+    assert payload["repository"] == "acme/repo_x"
+    assert payload["head_sha"] == "same"
+    assert payload["action"] == "open"
+    assert payload["metadata"]["repository"] == "attacker/repo"
+    assert payload["metadata"]["action"] == "merged"
+
+
+def test_ingest_pull_request_unseen_terminal_event_is_noop(kanban_home):
+    with kb.connect() as conn:
+        assert kb.ingest_pull_request(
+            conn, repository="acme/widget", number=13, head_sha="missing",
+            title="closed elsewhere", action="closed",
+        ) is None
+        assert kb.list_tasks(conn, limit=100) == []
+
+
+def test_ingest_pull_request_same_head_unclaimed_blocked_promotes_to_review(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=14, head_sha="same",
+            title="checks pending", reviewer="reviewer", checks_passed=False,
+        )
+        blocked_task = kb.get_task(conn, task_id)
+        assert blocked_task is not None
+        assert blocked_task.status == "blocked"
+        updated = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=14, head_sha="same",
+            title="checks passed", reviewer="reviewer", checks_passed=True,
+        )
+        task = kb.get_task(conn, updated)
+    assert task is not None
+    assert task.status == "review"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+
+
+def test_ingest_pull_request_reopened_same_head_reactivates_canonical_card(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="initial", reviewer="reviewer", checks_passed=True,
+        )
+        assert task_id is not None
+        assert kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="closed", action="closed",
+        ) == task_id
+        assert kb.get_task(conn, task_id).status == "archived"
+
+        reopened = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="reopened", reviewer="replacement", checks_passed=False,
+            action="reopened",
+        )
+        duplicate = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="reopened", reviewer="replacement", checks_passed=False,
+            action="reopened",
+        )
+        task = kb.get_task(conn, reopened)
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ?",
+            ("github-pr:acme/widget:15:same",),
+        ).fetchall()
+        reopened_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'github_pr_reopened'",
+            (task_id,),
+        ).fetchone()[0]
+    assert reopened == task_id == duplicate
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.assignee == "replacement"
+    assert [(row["id"], row["status"]) for row in rows] == [(task_id, "blocked")]
+    assert reopened_events == 1
+
+
+def test_review_changes_cas_failure_creates_no_remediation(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="dev")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.submit_for_review(conn, task_id, reviewer="reviewer", summary="ready")
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        assert kb.request_review_changes(
+            conn, task_id, summary="fix", expected_run_id=review.current_run_id + 1,
+        ) is None
+        assert len(kb.list_tasks(conn, limit=100)) == 1
+        assert kb.get_task(conn, task_id).status == "running"
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
