@@ -81,8 +81,8 @@ def get_current_state(config: dict) -> str:
     Returns 'acp_client' when active, 'auto' otherwise.
 
     A runtime is considered active when ``model.provider`` is either the
-    canonical ``acp-client`` or a registered ACP runtime / delegation
-    provider whose resolver produces ``api_mode = "acp_client"``.
+    canonical ``acp-client`` or a registered ACP runtime provider whose
+    resolver produces ``api_mode = "acp_client"``.
     Additionally, when ``model.acp_command`` is set and a backup snapshot
     exists (set by ``enable_runtime``), the runtime is considered active
     even if the display provider name is not directly resolvable.
@@ -280,9 +280,8 @@ def _try_registry_resolve(
     ``None`` and the caller falls through to the built-in PATH-based path.
 
     **Runtime registry only.**  This function backs ``/acp-client-runtime``,
-    which manages the main agent's ACP runtime.  The delegation provider
-    registry has a separate contract (subagent delegation) and is NOT
-    consulted here — mixing them caused config-propagation ambiguity.
+    which manages the main agent's ACP runtime.  Only the ACP runtime
+    provider registry is consulted here.
     """
     try:
         from hermes_cli.acp_runtime_provider_registry import (
@@ -323,7 +322,7 @@ def apply(
 
     Returns: ACPRuntimeStatus describing the outcome.
 
-    When *acp_command* matches a plugin-registered delegation provider key
+    When *acp_command* matches a plugin-registered ACP runtime provider key
     (e.g. ``claude-agent-acp`` → resolver key ``claude-code-acp``), the
     resolver produces the real ``command``/``args``/``model``/display
     ``provider``.  The PATH check is skipped for registry-resolved providers
@@ -388,7 +387,7 @@ def apply(
             )
 
         # --- Registry-resolved provider path (e.g. claude-agent-acp) ---------
-        # When the command string matches a registered delegation provider key,
+        # When the command string matches a registered ACP runtime provider key,
         # the plugin resolver produces the real binary, args, model, and display
         # provider.  We skip the PATH check (resolver is trusted; binary may be
         # ``npx`` which is always present) and write all resolved fields.

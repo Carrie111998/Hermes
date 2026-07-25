@@ -3427,45 +3427,6 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "max_output_tokens": None,
         }
 
-    # Plugin-registered delegation providers take priority.  When a provider
-    # key is registered via ``PluginContext.register_delegation_provider()``
-    # (e.g. ``claude-code-acp``), the plugin's resolver produces a generic
-    # descriptor dict.  No vendor name is hardcoded in core — the registry is
-    # generic.  Falls through to the built-in path if no resolver matches.
-    try:
-        from hermes_cli.delegation_provider_registry import (
-            resolve_via_registry,
-        )
-
-        descriptor = resolve_via_registry(
-            configured_provider, configured_model, cfg,
-        )
-        if descriptor is not None:
-            # Normalise: ensure all keys the caller expects are present.
-            return {
-                "model": descriptor.get("model") or configured_model or None,
-                "provider": descriptor.get("provider") or configured_provider,
-                "base_url": descriptor.get("base_url"),
-                "api_key": descriptor.get("api_key", ""),
-                "api_mode": descriptor.get("api_mode"),
-                "request_overrides": dict(
-                    descriptor.get("request_overrides") or {}
-                ),
-                "max_output_tokens": descriptor.get("max_output_tokens"),
-                "command": descriptor.get("command"),
-                "args": list(descriptor.get("args") or []),
-                "metadata": descriptor.get("metadata"),
-            }
-    except Exception as exc:
-        # If the resolver itself raised, propagate as ValueError (the caller
-        # wraps it in a tool_error).  An import failure means the registry
-        # module isn't available — fall through to the built-in path.
-        if not isinstance(exc, (ImportError, ModuleNotFoundError, AttributeError)):
-            raise ValueError(
-                f"Delegation provider '{configured_provider}' resolver "
-                f"failed: {exc}"
-            ) from exc
-
     # Provider is configured — resolve full credentials via built-in path
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider

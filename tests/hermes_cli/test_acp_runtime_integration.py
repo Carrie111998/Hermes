@@ -46,14 +46,11 @@ model:
 
 @pytest.fixture(autouse=True)
 def _clean_registries():
-    """Clear both registries before and after each test."""
+    """Clear the runtime registry before and after each test."""
     from hermes_cli.acp_runtime_provider_registry import _clear_for_testing as _clear_rt
-    from hermes_cli.delegation_provider_registry import _clear_for_testing as _clear_del
     _clear_rt()
-    _clear_del()
     yield
     _clear_rt()
-    _clear_del()
 
 
 # ---------------------------------------------------------------------------
@@ -99,29 +96,6 @@ class TestPluginRegisterPopulatesRegistry:
         assert "test-agent-acp" in list_acp_runtime_providers()
         assert get_acp_runtime_provider("test-agent-acp") is _fake_runtime_resolver
 
-    def test_runtime_registry_separate_from_delegation(self):
-        """A key registered only in the runtime registry should NOT appear
-        in the delegation registry, and vice versa."""
-        from hermes_cli.acp_runtime_provider_registry import (
-            register_acp_runtime_provider,
-            get_acp_runtime_provider,
-        )
-        from hermes_cli.delegation_provider_registry import (
-            register_delegation_provider,
-            get_delegation_provider,
-        )
-
-        register_acp_runtime_provider("rt-only", _fake_runtime_resolver)
-        register_delegation_provider("del-only", _fake_runtime_resolver)
-
-        # rt-only is in runtime registry, not delegation
-        assert get_acp_runtime_provider("rt-only") is not None
-        assert get_delegation_provider("rt-only") is None
-
-        # del-only is in delegation registry, not runtime
-        assert get_acp_runtime_provider("del-only") is None
-        assert get_delegation_provider("del-only") is not None
-
 
 # ---------------------------------------------------------------------------
 # Test 2: acp_runtime_switch apply with registry-resolved provider
@@ -147,24 +121,6 @@ class TestSwitchApplyWithRegistry:
         assert cfg["model"]["default"] == "opus[1m]"
         assert cfg["model"]["acp_command"] == "fake-agent-binary"
         assert cfg["model"]["acp_args"] == ["--flag", "value"]
-
-    def test_apply_does_not_consult_delegation_registry(self):
-        """The switch should NOT fall back to the delegation registry.
-        A key registered only in delegation should trigger PATH check."""
-        from hermes_cli.delegation_provider_registry import (
-            register_delegation_provider,
-        )
-        from hermes_cli import acp_runtime_switch as ars
-
-        register_delegation_provider("del-only-key", _fake_runtime_resolver)
-
-        cfg = {}
-        with patch.object(ars, "check_acp_command_ok",
-                          return_value=(False, "not found")):
-            r = ars.apply(cfg, "acp_client", acp_command="del-only-key")
-        # Should fail because it falls through to PATH check
-        assert r.success is False
-        assert "Cannot enable" in r.message
 
 
 # ---------------------------------------------------------------------------
@@ -338,15 +294,3 @@ class TestGetCurrentStateWithRegistry:
         register_acp_runtime_provider("my-acp", _fake_runtime_resolver)
         cfg = {"model": {"provider": "my-acp", "default": "opus[1m]"}}
         assert ars.get_current_state(cfg) == "acp_client"
-
-    def test_does_not_check_delegation_registry(self):
-        """get_current_state should NOT consult the delegation registry.
-        A provider registered only in delegation should be 'auto'."""
-        from hermes_cli.delegation_provider_registry import (
-            register_delegation_provider,
-        )
-        from hermes_cli import acp_runtime_switch as ars
-
-        register_delegation_provider("del-only", _fake_runtime_resolver)
-        cfg = {"model": {"provider": "del-only", "default": "opus[1m]"}}
-        assert ars.get_current_state(cfg) == "auto"

@@ -926,52 +926,6 @@ class PluginContext:
             self.manifest.name, provider.name,
         )
 
-    # -- delegation provider registration ------------------------------------
-
-    def register_delegation_provider(
-        self, key: str, resolver: Callable,
-    ) -> None:
-        """Register a custom delegation provider for ``delegate_task``.
-
-        Plugins use this to declare a provider that ``delegation.provider``
-        in config.yaml can target.  When a delegation request names a provider
-        the built-in ``resolve_runtime_provider`` does not know, the registry
-        is consulted first — if a resolver is registered for that key, it
-        produces a generic descriptor dict that ``_resolve_delegation_credentials``
-        consumes.
-
-        The resolver callable receives ``(requested_model, cfg)``:
-
-        * ``requested_model``: the ``delegation.model`` value (``str | None``).
-        * ``cfg``: the full ``delegation`` config block from config.yaml.
-
-        It must return a ``dict`` with any subset of the recognised keys:
-        ``provider``, ``model``, ``api_mode``, ``base_url``, ``api_key``,
-        ``command``, ``args``, ``request_overrides``, ``max_output_tokens``,
-        ``metadata``.
-
-        Security: the provider key is trusted (plugin/config-controlled, never
-        model-controlled).  ``acp_command`` / ``acp_args`` remain hidden from
-        the model tool schema (``_MODEL_HIDDEN_TASK_FIELDS``).
-
-        Args:
-            key: provider key (e.g. ``"my-plugin-provider"``).  Must be non-empty.
-            resolver: callable ``(requested_model, cfg) -> descriptor_dict``.
-
-        Raises:
-            TypeError: if *resolver* is not callable.
-            ValueError: if *key* is empty.
-        """
-        from hermes_cli.delegation_provider_registry import (
-            register_delegation_provider as _register,
-        )
-
-        _register(key, resolver)
-        logger.info(
-            "Plugin '%s' registered delegation provider: %s",
-            self.manifest.name, key,
-        )
-
     # -- ACP runtime provider registration -----------------------------------
 
     def register_acp_runtime_provider(

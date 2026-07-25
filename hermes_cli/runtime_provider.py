@@ -1849,8 +1849,8 @@ def resolve_runtime_provider(
     )
 
     # When the resolved provider is already the canonical acp_client (set
-    # directly in config as ``acp-client``), the delegation registry is not
-    # consulted — the generic ``acp_client`` block below handles it.
+    # directly in config as ``acp-client``), the generic ``acp_client`` block
+    # below handles it.
 
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,

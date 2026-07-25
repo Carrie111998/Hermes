@@ -625,13 +625,13 @@ def init_agent(
     )
     # Also check plugin-registered ACP runtime providers: a display provider
     # like ``claude-code-acp`` resolves to ``api_mode = "acp_client"`` via the
-    # runtime registry or delegation registry.  This lets /acp-client-runtime
-    # write the logical provider name into config without the core knowing any
-    # vendor-specific names.
+    # runtime registry.  This lets /acp-client-runtime write the logical
+    # provider name into config without the core knowing any vendor-specific
+    # names.
     if not _is_acp and provider_name:
         # Get actual model config + requested model for the resolver
         _init_model = model or ""
-        # Try ACP runtime provider registry first
+        # Consult the ACP runtime provider registry
         try:
             from hermes_cli.acp_runtime_provider_registry import (
                 resolve_acp_runtime_provider,
@@ -645,17 +645,6 @@ def init_agent(
                     _is_acp = True
         except Exception:
             pass
-        # Fall back to delegation provider registry
-        if not _is_acp:
-            try:
-                from hermes_cli.delegation_provider_registry import resolve_via_registry
-                from hermes_cli.config import load_config as _load_config
-                _cfg_for_resolver = _load_config() if not _init_model else {"model": {"default": _init_model}}
-                _desc = resolve_via_registry(provider_name, _init_model or None, _cfg_for_resolver)
-                if _desc and _desc.get("api_mode") == "acp_client":
-                    _is_acp = True
-            except Exception:
-                pass
     if _is_acp:
         try:
             from tools.mcp_tool import _load_mcp_config
@@ -680,8 +669,8 @@ def init_agent(
         agent.api_mode = "acp_client"
     elif _is_acp:
         # Plugin-registered display provider (e.g. ``claude-code-acp``) that
-        # resolves to acp_client transport via the runtime / delegation
-        # registry.  No vendor-specific names in core.
+        # resolves to acp_client transport via the runtime registry.
+        # No vendor-specific names in core.
         agent.api_mode = "acp_client"
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"

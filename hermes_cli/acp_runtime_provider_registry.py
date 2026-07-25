@@ -6,16 +6,10 @@ for the ``/acp-client-runtime`` slash command.  A plugin registers a resolver
 callable under a runtime key; when the switch encounters the key as the
 command argument, it resolves the descriptor and writes config generically.
 
-This registry is intentionally separate from ``delegation_provider_registry``
-because the contracts differ:
-
-  * **Delegation providers** resolve credentials for ``delegate_task``
-    subagent delegation — they receive ``(requested_model, delegation_cfg)``
-    and return a descriptor consumed by ``_resolve_delegation_credentials``.
-  * **Runtime providers** resolve descriptors for the main agent's ACP
-    runtime — they receive ``(requested_model, operator_cfg)`` and return
-    a descriptor consumed by ``acp_runtime_switch.apply()`` and
-    ``agent_init.py``.
+This registry resolves descriptors for the main agent's ACP runtime —
+resolvers receive ``(requested_model, operator_cfg)`` and return a
+descriptor consumed by ``acp_runtime_switch.apply()`` and
+``agent_init.py``.
 
 The descriptor returned by a resolver is a plain ``dict`` — **no
 vendor-specific fields in the registry itself**.  Recognised keys:
