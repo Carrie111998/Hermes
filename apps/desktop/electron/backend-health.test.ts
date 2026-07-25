@@ -52,6 +52,34 @@ test('falls back to /api/status only for old backends without /api/health', asyn
   ])
 })
 
+test('falls back to /api/status when gated 0.19 backends 401 /api/health', async () => {
+  const calls: string[][] = []
+
+  await waitForHermesReady('http://192.168.1.132:9119', {
+    token: null,
+    fetchPublicJson: async url => {
+      calls.push(['public', url])
+
+      throw new Error(
+        '401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}'
+      )
+    },
+    fetchJson: async (url, token) => {
+      calls.push(['token', url, token == null ? 'null' : token])
+
+      return { version: '0.19.0', auth_required: true }
+    },
+    sleep: async () => {},
+    timeoutMs: 100,
+    pollMs: 1
+  })
+
+  assert.deepEqual(calls, [
+    ['public', 'http://192.168.1.132:9119/api/health'],
+    ['token', 'http://192.168.1.132:9119/api/status', 'null']
+  ])
+})
+
 test('does not fall back to heavyweight /api/status for transient health failures', async () => {
   const calls: string[][] = []
   let currentTime = 0
@@ -75,6 +103,35 @@ test('does not fall back to heavyweight /api/status for transient health failure
       pollMs: 1
     }),
     /Timed out connecting/
+  )
+
+  assert.ok(calls.length > 0)
+  assert.ok(calls.every(call => call[0] === 'public' && call[1].endsWith('/api/health')))
+})
+
+test('does not fall back on generic 401 without the gated no_cookie shape', async () => {
+  const calls: string[][] = []
+  let currentTime = 0
+
+  await assert.rejects(
+    waitForHermesReady('http://127.0.0.1:9000', {
+      fetchPublicJson: async url => {
+        calls.push(['public', url])
+        throw new Error('401: {"detail":"Unauthorized"}')
+      },
+      fetchJson: async url => {
+        calls.push(['token', url])
+      },
+      sleep: async () => {},
+      now: () => {
+        currentTime += 20
+
+        return currentTime
+      },
+      timeoutMs: 50,
+      pollMs: 1
+    }),
+    /401: \{"detail":"Unauthorized"\}/
   )
 
   assert.ok(calls.length > 0)
@@ -123,7 +180,7 @@ test('aborts as superseded when the bootstrap signal fires', async () => {
   )
 })
 
-test('recognizes missing-route shapes only', () => {
+test('recognizes missing-route and gated-health shapes', () => {
   assert.equal(isMissingHealthEndpointError(new Error('404: {"detail":"Not Found"}')), true)
   assert.equal(
     isMissingHealthEndpointError(
@@ -131,6 +188,13 @@ test('recognizes missing-route shapes only', () => {
     ),
     true
   )
+  assert.equal(
+    isMissingHealthEndpointError(
+      new Error('401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}')
+    ),
+    true
+  )
+  assert.equal(isMissingHealthEndpointError(new Error('401: {"detail":"Unauthorized"}')), false)
   assert.equal(isMissingHealthEndpointError(new Error('Timed out connecting to Hermes backend after 15000ms')), false)
   assert.equal(isMissingHealthEndpointError(new Error('500: boom')), false)
 })
