@@ -252,6 +252,35 @@ class TestManifestParsing:
         assert cfg["url"] == "https://example.com/mcp"
         assert "headers" not in cfg
 
+    @pytest.mark.parametrize("env_var", ["not-valid", 42])
+    def test_auth_env_var_must_be_a_valid_env_var_name(self, catalog_dir, env_var):
+        body = _basic_manifest(
+            auth={
+                "type": "api_key",
+                "env_var": env_var,
+                "env": [{"name": "DEMO_TOKEN", "prompt": "Token"}],
+            }
+        )
+        _write_manifest(catalog_dir, "demo", body)
+        from hermes_cli.mcp_catalog import CatalogError, _parse_manifest
+
+        with pytest.raises(CatalogError, match="invalid auth.env_var"):
+            _parse_manifest(catalog_dir / "demo" / "manifest.yaml")
+
+    def test_auth_env_var_must_reference_declared_auth_env(self, catalog_dir):
+        body = _basic_manifest(
+            auth={
+                "type": "api_key",
+                "env_var": "UNPROMPTED_TOKEN",
+                "env": [{"name": "DEMO_TOKEN", "prompt": "Token"}],
+            }
+        )
+        _write_manifest(catalog_dir, "demo", body)
+        from hermes_cli.mcp_catalog import CatalogError, _parse_manifest
+
+        with pytest.raises(CatalogError, match="must name an auth.env entry"):
+            _parse_manifest(catalog_dir / "demo" / "manifest.yaml")
+
     def test_transport_env_bad_shape_rejected(self, catalog_dir):
         body = _basic_manifest()
         body["transport"]["env"] = ["DISABLE_TELEMETRY=true"]  # list, not mapping
@@ -353,6 +382,34 @@ class TestInstall:
 
         assert get_env_value("DEMO_KEY") == "secret-val"
         assert "demo" in load_config()["mcp_servers"]
+
+    def test_install_http_bearer_prompts_token_and_keeps_it_out_of_config(
+        self, catalog_dir, monkeypatch
+    ):
+        body = _basic_manifest(
+            transport={"type": "http", "url": "https://vault.example.com/message"},
+            auth={
+                "type": "api_key",
+                "env_var": "DEMO_VAULT_TOKEN",
+                "env": [{"name": "DEMO_VAULT_TOKEN", "prompt": "Token", "secret": True}],
+            },
+        )
+        _write_manifest(catalog_dir, "demo", body)
+
+        from hermes_cli import mcp_catalog
+        from hermes_cli.config import get_env_path, read_raw_config
+        from hermes_cli.mcp_catalog import install_entry
+
+        token = "not-in-config"
+        monkeypatch.setattr(mcp_catalog, "_prompt_input", lambda *a, **kw: token)
+        install_entry(_entry("demo"), enable=True)
+
+        raw_config = (get_env_path().parent / "config.yaml").read_text()
+        raw_env = get_env_path().read_text()
+        server = read_raw_config()["mcp_servers"]["demo"]
+        assert server["headers"] == {"Authorization": "Bearer ${DEMO_VAULT_TOKEN}"}
+        assert token not in raw_config
+        assert f"DEMO_VAULT_TOKEN={token}" in raw_env
 
     def test_install_http_oauth_writes_auth_marker(self, catalog_dir):
         body = _basic_manifest(
