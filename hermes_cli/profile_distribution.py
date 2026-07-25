@@ -61,6 +61,7 @@ Update semantics:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -637,6 +638,24 @@ def install_distribution(
             plan.manifest,
             preserve_config=False,
         )
+
+        # Seed an empty per-profile .env sentinel (same as create_profile).
+        # Distributions deliberately exclude credentials from the payload, so
+        # without this file `hermes update`'s backfill_profile_envs would
+        # treat a brand-new install as a pre-#44792 legacy profile and copy
+        # the default profile's API keys into it.
+        env_path = plan.target_dir / ".env"
+        if not env_path.exists():
+            try:
+                env_path.write_text(
+                    "# Per-profile secrets for this Hermes profile.\n"
+                    "# API keys and tokens set here override the shell environment.\n"
+                    "# Behavioral settings belong in config.yaml, not here.\n",
+                    encoding="utf-8",
+                )
+                os.chmod(str(env_path), 0o600)
+            except OSError:
+                pass  # best-effort — save_env_value creates the file on demand
 
         if create_alias:
             collision = check_alias_collision(plan.manifest.name)
