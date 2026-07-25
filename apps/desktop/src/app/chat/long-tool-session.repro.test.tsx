@@ -469,6 +469,99 @@ describe('representative long tool-heavy session contract (#68467)', () => {
     expect(view.container.querySelectorAll('[data-slot="aui_turn-pair"]')).toHaveLength(20)
   })
 
+  it('reconciles a retained preview when rewind removes only a non-preview tail', async () => {
+    clearPreviewArtifacts('runtime-fixture')
+    const messages = makeMinimalTurns(2)
+    messages[1].parts = [
+      {
+        type: 'tool-call',
+        toolCallId: 'retained-preview',
+        toolName: 'write_file',
+        args: { path: '/workspace/retained.html' },
+        argsText: JSON.stringify({ path: '/workspace/retained.html' }),
+        result: { output: 'created' },
+        isError: false
+      }
+    ]
+    const view = render(<Harness messages={messages} onSubmit={() => true} />)
+
+    await waitFor(() =>
+      expect($previewStatusBySession.get()['runtime-fixture']?.map(item => item.target)).toEqual([
+        '/workspace/retained.html'
+      ])
+    )
+
+    act(() => clearPreviewArtifacts('runtime-fixture'))
+    view.rerender(<Harness messages={messages.slice(0, -2)} onSubmit={() => true} />)
+
+    await waitFor(() =>
+      expect($previewStatusBySession.get()['runtime-fixture']?.map(item => item.target)).toEqual([
+        '/workspace/retained.html'
+      ])
+    )
+  })
+
+  it('restores a failed rewind tail once without replay churn', async () => {
+    clearPreviewArtifacts('runtime-fixture')
+    const messages = makeMinimalTurns(2)
+    messages[1].parts = [
+      {
+        type: 'tool-call',
+        toolCallId: 'rollback-retained-preview',
+        toolName: 'write_file',
+        args: { path: '/workspace/rollback-retained.html' },
+        argsText: JSON.stringify({ path: '/workspace/rollback-retained.html' }),
+        result: { output: 'created' },
+        isError: false
+      }
+    ]
+    messages[3].parts = [
+      {
+        type: 'tool-call',
+        toolCallId: 'rollback-tail-preview',
+        toolName: 'write_file',
+        args: { path: '/workspace/rollback-tail.html' },
+        argsText: JSON.stringify({ path: '/workspace/rollback-tail.html' }),
+        result: { output: 'created' },
+        isError: false
+      }
+    ]
+    const view = render(<Harness messages={messages} onSubmit={() => true} />)
+
+    await waitFor(() => expect($previewStatusBySession.get()['runtime-fixture']).toHaveLength(2))
+
+    let emissions = 0
+
+    const unsubscribe = $previewStatusBySession.subscribe(() => {
+      emissions += 1
+    })
+
+    act(() => clearPreviewArtifacts('runtime-fixture'))
+    view.rerender(<Harness messages={messages.slice(0, -2)} onSubmit={() => true} />)
+
+    await waitFor(() =>
+      expect($previewStatusBySession.get()['runtime-fixture']?.map(item => item.target)).toEqual([
+        '/workspace/rollback-retained.html'
+      ])
+    )
+    expect(emissions).toBe(3)
+
+    view.rerender(<Harness messages={messages} onSubmit={() => true} />)
+
+    await waitFor(() =>
+      expect($previewStatusBySession.get()['runtime-fixture']?.map(item => item.target)).toEqual([
+        '/workspace/rollback-retained.html',
+        '/workspace/rollback-tail.html'
+      ])
+    )
+    expect(emissions).toBe(4)
+
+    view.rerender(<Harness messages={structuredClone(messages)} onSubmit={() => true} />)
+    await waitFor(() => expect(screen.getByText('Question 1')).toBeTruthy())
+    expect(emissions).toBe(4)
+    unsubscribe()
+  })
+
   it('re-registers the same preview target after a restored timeline produces it again', async () => {
     clearPreviewArtifacts('runtime-fixture')
     const withPreview = makeMinimalTurns(25)

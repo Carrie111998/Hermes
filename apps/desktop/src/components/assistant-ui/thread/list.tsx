@@ -1,4 +1,5 @@
 import { ThreadPrimitive, useAuiEvent, useAuiState } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import {
   type ComponentProps,
   type CSSProperties,
@@ -16,7 +17,7 @@ import { useStickToBottom } from 'use-stick-to-bottom'
 
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import { getPreviewClearGeneration, recordPreviewArtifacts } from '@/store/preview-status'
+import { $previewClearGenerationBySession, recordPreviewArtifacts } from '@/store/preview-status'
 import {
   onScrollToBottomRequest,
   onThreadEditClose,
@@ -167,8 +168,41 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
   const targetCacheRef = useRef(new WeakMap<object, { args: unknown; result: unknown; target: string }>())
 
   const registrationBySessionRef = useRef(
-    new Map<string, { clearGeneration: number; occurrenceKeys: Set<string> }>()
+    new Map<
+      string,
+      {
+        clearGeneration: number
+        occurrenceKeys: Set<string>
+        targetsSignature: string
+        timelineSignature: string
+      }
+    >()
   )
+
+  const timelinePartIdsRef = useRef(new WeakMap<object, number>())
+  const nextTimelinePartIdRef = useRef(0)
+
+  const timelineSignature = useAuiState(s =>
+    s.thread.messages
+      .map(message => {
+        const partIds = message.content.map(part => {
+          let id = timelinePartIdsRef.current.get(part)
+
+          if (id === undefined) {
+            id = nextTimelinePartIdRef.current++
+            timelinePartIdsRef.current.set(part, id)
+          }
+
+          return id
+        })
+
+        return `${message.id}:${partIds.join(',')}`
+      })
+      .join('|')
+  )
+
+  const clearGenerationBySession = useStore($previewClearGenerationBySession)
+  const clearGeneration = sessionId ? (clearGenerationBySession[sessionId] ?? 0) : 0
 
   const targetsSignature = useAuiState(s =>
     JSON.stringify(
@@ -206,15 +240,42 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
       return
     }
 
-    const entries = JSON.parse(targetsSignature) as Array<{ key: string; target: string }>
-    const clearGeneration = getPreviewClearGeneration(sessionId)
     const previous = registrationBySessionRef.current.get(sessionId)
+    const timelineChanged = previous?.timelineSignature !== timelineSignature
+
+    // A clear invalidates the abandoned timeline, but must not immediately
+    // replay that same timeline before restore/edit publishes its optimistic
+    // rewind. Keep the old generation until an authoritative timeline change
+    // arrives; that change may leave the preview inventory itself unchanged.
+    if (previous && previous.clearGeneration !== clearGeneration && !timelineChanged) {
+      return
+    }
+
+    // Ordinary non-preview streaming/tail updates do not need inventory work.
+    // Remember the latest timeline identity so a later clear can distinguish
+    // the actual rewind from the generation-only notification.
+    if (
+      previous &&
+      previous.clearGeneration === clearGeneration &&
+      previous.targetsSignature === targetsSignature
+    ) {
+      previous.timelineSignature = timelineSignature
+
+      return
+    }
+
+    const entries = JSON.parse(targetsSignature) as Array<{ key: string; target: string }>
     const occurrenceKeys = new Set(entries.map(entry => entry.key))
     const priorKeys = previous?.clearGeneration === clearGeneration ? previous.occurrenceKeys : new Set<string>()
     const newTargets = entries.filter(entry => !priorKeys.has(entry.key)).map(entry => entry.target)
 
     registrationBySessionRef.current.delete(sessionId)
-    registrationBySessionRef.current.set(sessionId, { clearGeneration, occurrenceKeys })
+    registrationBySessionRef.current.set(sessionId, {
+      clearGeneration,
+      occurrenceKeys,
+      targetsSignature,
+      timelineSignature
+    })
 
     while (registrationBySessionRef.current.size > MAX_TRACKED_PREVIEW_SESSIONS) {
       const oldestSession = registrationBySessionRef.current.keys().next().value
@@ -227,7 +288,7 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
     }
 
     recordPreviewArtifacts(sessionId, newTargets, cwd || '')
-  }, [cwd, sessionId, targetsSignature])
+  }, [clearGeneration, cwd, sessionId, targetsSignature, timelineSignature])
 
   return null
 }

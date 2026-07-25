@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
+  $previewClearGenerationBySession,
   $previewStatusBySession,
   clearPreviewArtifacts,
   dismissPreviewArtifact,
@@ -9,7 +10,10 @@ import {
   recordPreviewArtifacts
 } from './preview-status'
 
-beforeEach(() => $previewStatusBySession.set({}))
+beforeEach(() => {
+  $previewClearGenerationBySession.set({})
+  $previewStatusBySession.set({})
+})
 
 describe('recordPreviewArtifact', () => {
   it('appends new targets newest-last and is idempotent', () => {
@@ -84,5 +88,6 @@ describe('recordPreviewArtifact', () => {
     expect(getPreviewClearGeneration('s1')).toBe(before)
     clearPreviewArtifacts('s1')
     expect(getPreviewClearGeneration('s1')).toBe(before + 1)
+    expect($previewClearGenerationBySession.get().s1).toBe(before + 1)
   })
 })

@@ -22,9 +22,9 @@ export interface PreviewArtifact {
 }
 
 const MAX_PER_SESSION = 4
-const clearGenerationBySession = new Map<string, number>()
 
 export const $previewStatusBySession = atom<Record<string, PreviewArtifact[]>>({})
+export const $previewClearGenerationBySession = atom<Record<string, number>>({})
 
 const writePreviews = (sid: string, items: PreviewArtifact[]) => {
   const current = $previewStatusBySession.get()
@@ -91,10 +91,12 @@ export function dismissPreviewArtifact(sid: string, id: string) {
 }
 
 export function clearPreviewArtifacts(sid: string) {
-  clearGenerationBySession.set(sid, (clearGenerationBySession.get(sid) ?? 0) + 1)
+  const generations = $previewClearGenerationBySession.get()
+
+  $previewClearGenerationBySession.set({ ...generations, [sid]: (generations[sid] ?? 0) + 1 })
   writePreviews(sid, [])
 }
 
 export function getPreviewClearGeneration(sid: string): number {
-  return clearGenerationBySession.get(sid) ?? 0
+  return $previewClearGenerationBySession.get()[sid] ?? 0
 }
