@@ -59,6 +59,13 @@ from .live_certification import (
     effective_certification_status,
     revoke_live_trading_certification,
 )
+from .live_order_admission import (
+    LiveOrderAdmission,
+    LiveOrderAdmissionPolicy,
+    LiveOrderAdmissionRequest,
+    LiveOrderAdmissionStatus,
+    evaluate_live_order_admission,
+)
 from .live_launch_control import (
     LiveLaunchControl,
     LiveLaunchControlPolicy,
@@ -188,4 +195,9 @@ __all__ = [
     "arm_live_launch_control",
     "effective_live_launch_control_status",
     "suspend_live_launch_control",
+    "LiveOrderAdmission",
+    "LiveOrderAdmissionPolicy",
+    "LiveOrderAdmissionRequest",
+    "LiveOrderAdmissionStatus",
+    "evaluate_live_order_admission",
 ]
