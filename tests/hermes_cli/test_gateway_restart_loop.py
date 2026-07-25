@@ -677,16 +677,20 @@ class TestLifecycleGuardModule:
 
         assert contains_gateway_lifecycle_invocation(command, cwd=tmp_path)
 
-    def test_shell_suffix_mentioned_as_data_is_not_scanned(self, tmp_path):
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo helper.sh",
+            "echo bash -c './helper.sh'",
+            "printf '%s\\n' \"bash -c './helper.sh'\"",
+        ],
+    )
+    def test_shell_helper_mentioned_as_data_is_not_scanned(self, tmp_path, command):
         from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
 
-        (tmp_path / "helper.sh").write_text(
-            "#!/bin/sh\nhermes gateway restart\n"
-        )
+        (tmp_path / "helper.sh").write_text("#!/bin/sh\nhermes gateway restart\n")
 
-        assert not contains_gateway_lifecycle_invocation(
-            "echo helper.sh", cwd=tmp_path
-        )
+        assert not contains_gateway_lifecycle_invocation(command, cwd=tmp_path)
 
     def test_literal_nested_helpers_are_scanned_recursively(self, tmp_path):
         from cron.lifecycle_guard import contains_gateway_lifecycle_invocation

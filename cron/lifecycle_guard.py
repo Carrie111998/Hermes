@@ -131,7 +131,10 @@ _SHELL_SOURCE_REF_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _SHELL_COMMAND_STRING_PATTERN = re.compile(
-    r"\b(?:bash|sh|zsh|dash|ksh)\s+"
+    _SHELL_COMMAND_START
+    + _SHELL_CONTROL_PREFIX
+    + _SHELL_LAUNCH_PREFIX
+    + r"(?:bash|sh|zsh|dash|ksh)\s+"
     r"(?:-\S+\s+)*?-[A-Za-z]*c[A-Za-z]*\s+"
     r"(?P<quote>[\"'])(?P<body>.*?)(?P=quote)",
     re.IGNORECASE | re.DOTALL,
