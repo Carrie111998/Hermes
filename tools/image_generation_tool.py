@@ -1787,5 +1787,10 @@ registry.register(
     toolset="image_gen",
     schema=IMAGE_GENERATE_SCHEMA,
     handler=_handle_image_generate,
+    check_fn=check_image_generation_requirements,
+    requires_env=[],
+    is_async=False,
+    emoji="🎨",
+    dynamic_schema_overrides=_build_dynamic_image_schema,
     override=True,
 )
