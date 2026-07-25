@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { $selectedStoredSessionId, setSelectedStoredSessionId } from './session'
+import { setSelectedStoredSessionId } from './session'
 import { $sessionTiles, focusOpenSession } from './session-states'
 
 const SESSION_A = 'session-a'

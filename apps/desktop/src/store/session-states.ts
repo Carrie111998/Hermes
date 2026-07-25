@@ -18,6 +18,7 @@
 
 import { atom, computed } from 'nanostores'
 
+import { routeSessionId } from '@/app/routes'
 import type { ClientSessionState } from '@/app/types'
 import { findGroup, findGroupOfPane, type LayoutNode } from '@/components/pane-shell/tree/model'
 import {
@@ -38,7 +39,6 @@ import {
   setActiveSessionStoredIdRotation
 } from './session'
 import { isSecondaryWindow } from './windows'
-import { routeSessionId } from '@/app/routes'
 
 // ---------------------------------------------------------------------------
 // Reactive per-runtime session state (view mirror of the wiring cache).
@@ -601,8 +601,10 @@ export function focusOpenSession(storedSessionId: string): boolean {
     if (routeSessionId(window.location.pathname)) {
       revealTreePane('workspace')
       noteActiveTreeGroup(null)
+
       return true
     }
+
     return false
   }
 
