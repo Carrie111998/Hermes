@@ -3183,6 +3183,96 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
     assert tokens.get("refresh_token") == "old-refresh-token"
 
 
+def test_codex_terminal_refresh_marks_manual_device_code_entry_dead(tmp_path, monkeypatch):
+    """Regression (live 2026-07-25): terminal refresh must persist DEAD on manual entries.
+
+    The quarantine branch only removes ``source == "device_code"`` entries, so a
+    ``manual:device_code`` entry survived it and returned early — never reaching
+    ``_mark_exhausted``.  Its ``last_status`` stayed ``"ok"`` with
+    ``last_status_at=None`` forever, so it kept being selected (rewriting the
+    ``.codex_refresh_failed`` sentinel every few minutes) and the 24h
+    ``DEAD_MANUAL_PRUNE_TTL_SECONDS`` prune could never fire.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "9666c0",
+                        "label": "stale-manual",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "expired-access",
+                        "refresh_token": "reused-refresh",
+                        # The live shape: a past success left ok/None behind and
+                        # every terminal failure since has left it untouched.
+                        "last_status": "ok",
+                        "last_status_at": None,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import (
+        DEAD_MANUAL_PRUNE_TTL_SECONDS,
+        STATUS_DEAD,
+        load_pool,
+    )
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    pool = load_pool("openai-codex")
+    assert pool.select() is not None
+
+    def _reused(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh token already used",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _reused)
+
+    assert pool.try_refresh_current() is None
+
+    # The manual entry is retained (not removed like a singleton) but must now
+    # carry the terminal status plus a timestamp for the prune to key off.
+    dead = next(entry for entry in pool.entries() if entry.id == "9666c0")
+    assert dead.last_status == STATUS_DEAD
+    assert dead.last_status_at is not None
+    assert dead.last_error_reason == "refresh_token_reused"
+
+    # DEAD must be persisted, not just held in memory.
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["id"] == "9666c0"
+    assert persisted["last_status"] == STATUS_DEAD
+    assert persisted["last_status_at"]
+
+    # DEAD entries leave rotation immediately, so nothing re-drives the refresh
+    # (this is what stopped the every-4.5-minute sentinel rewrite).
+    assert pool.select() is None
+
+    # ...and after the 24h quiet window the existing prune finally reclaims it.
+    aged = load_pool("openai-codex")
+    entry = next(item for item in aged.entries() if item.id == "9666c0")
+    monkeypatch.setattr(
+        "agent.credential_pool.time.time",
+        lambda: (entry.last_status_at or 0) + DEAD_MANUAL_PRUNE_TTL_SECONDS + 60,
+    )
+    assert aged.select() is None
+    assert [item.id for item in aged.entries()] == []
+
+
 def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     """Regression for #19566: stale rotation writes keep concurrent entries."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

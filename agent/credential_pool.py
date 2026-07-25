@@ -678,6 +678,44 @@ class CredentialPool:
         self._persist()
         return updated
 
+    def _mark_dead_from_terminal_refresh(
+        self,
+        entry: PooledCredential,
+        exc: Exception,
+    ) -> None:
+        """Persist STATUS_DEAD on a retained entry whose refresh token is dead.
+
+        The provider quarantine branches in ``_refresh_entry`` drop
+        singleton-seeded (``device_code``) entries outright, but ``manual:*``
+        entries are deliberately retained so the audit trail survives until
+        ``DEAD_MANUAL_PRUNE_TTL_SECONDS`` reclaims them.  Retaining them is only
+        safe if the terminal status is actually written: those branches return
+        early, so without this the entry never reaches ``_mark_exhausted`` and
+        keeps whatever status its last success left behind (``ok`` /
+        ``last_status_at=None``).  It then stays in rotation, re-drives a doomed
+        refresh on every selection — rewriting the ``.codex_refresh_failed``
+        sentinel each time — while the 24h prune, which requires DEAD *and* a
+        non-zero ``last_status_at``, can never fire.
+
+        Does not persist; callers fold this into their own ``_persist`` so the
+        quarantine is a single write.  A no-op when the entry was removed.
+        """
+        current = next((item for item in self._entries if item.id == entry.id), None)
+        if current is None:
+            return
+        reason = getattr(exc, "code", None)
+        self._replace_entry(
+            current,
+            replace(
+                current,
+                last_status=STATUS_DEAD,
+                last_status_at=time.time(),
+                last_error_reason=reason if isinstance(reason, str) and reason else None,
+                last_error_message=str(exc),
+                last_error_reset_at=None,
+            ),
+        )
+
     def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
         """Sync a claude_code pool entry from ~/.claude/.credentials.json if tokens differ.
 
@@ -1399,6 +1437,11 @@ class CredentialPool:
                         item for item in self._entries
                         if item.source != "device_code"
                     ]
+                    # A ``manual:device_code`` entry does not match the
+                    # ``device_code`` removal filter above, so it survives the
+                    # quarantine with its dead refresh token intact.  Mark it
+                    # DEAD here — this branch returns before ``_mark_exhausted``.
+                    self._mark_dead_from_terminal_refresh(entry, exc)
                     if self._current_id == entry.id:
                         self._current_id = None
                     self._persist(removed_ids=removed_ids)
