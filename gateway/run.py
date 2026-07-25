@@ -11186,6 +11186,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # _interrupt_requested.  Force-clean _running_agents so the session
             # is unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
+                await self._notify_gateway_session_cancel(
+                    _quick_key,
+                    source,
+                    reason="stop",
+                )
                 await self._interrupt_and_clear_session(
                     _quick_key,
                     source,
@@ -11412,6 +11417,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
+
+            # Ordinary user messages reach the plugin seam only after access
+            # checks and every active-session control intercept above.
+            if (
+                not is_internal
+                and not event.is_command()
+                and await self._run_gateway_message_hook(event, source, _quick_key)
+            ):
+                return None
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -12209,6 +12223,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
+        # This is the cold-session counterpart to the active-session seam. All
+        # gateway controls and slash capabilities have already had first refusal.
+        if (
+            not is_internal
+            and not event.is_command()
+            and await self._run_gateway_message_hook(event, source, _quick_key)
+        ):
+            return None
+
         if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.
@@ -12834,6 +12857,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
         return source
+
+    async def _run_gateway_message_hook(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> bool:
+        """Return True when an ordinary user-message hook suppresses dispatch."""
+        from gateway.message_hooks import (
+            GatewayDelivery,
+            GatewayMessageEvent,
+            GatewayMessageRoute,
+        )
+        from gateway.platforms.base import SendResult
+        from hermes_cli.plugins import invoke_hook_async
+
+        adapter = self._adapter_for_source(source)
+        metadata = self._thread_metadata_for_source(source, event.message_id)
+
+        async def _send_to_source(content: str):
+            if adapter is None:
+                return SendResult(success=False, error="No adapter for current route")
+            return await adapter.send(
+                str(source.chat_id),
+                content,
+                metadata=metadata,
+            )
+
+        try:
+            results = await invoke_hook_async(
+                "gateway_message",
+                event=GatewayMessageEvent.from_event(event),
+                route=GatewayMessageRoute.from_source(
+                    source,
+                    session_key=session_key,
+                ),
+                delivery=GatewayDelivery(_send_to_source),
+                raise_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "gateway_message hook failed; suppressing normal dispatch (%s)",
+                type(exc).__name__,
+            )
+            return True
+
+        for result in results:
+            if not isinstance(result, dict):
+                logger.warning(
+                    "gateway_message hook returned invalid terminal result type %s; "
+                    "suppressing normal dispatch",
+                    type(result).__name__,
+                )
+                return True
+            decision = str(result.get("decision", "")).strip().lower()
+            if decision in {"handled", "suppress"}:
+                return True
+            if decision in {"continue", "pass"}:
+                continue
+            logger.warning(
+                "gateway_message hook returned an invalid decision; "
+                "suppressing normal dispatch"
+            )
+            return True
+        return False
+
+    async def _notify_gateway_session_cancel(
+        self,
+        session_key: str,
+        source: SessionSource,
+        *,
+        reason: str,
+    ) -> None:
+        """Best-effort async notification for an explicit session boundary."""
+        from gateway.message_hooks import GatewayMessageRoute
+        from hermes_cli.plugins import invoke_hook_async
+
+        try:
+            await invoke_hook_async(
+                "gateway_session_cancel",
+                route=GatewayMessageRoute.from_source(
+                    source,
+                    session_key=session_key,
+                ),
+                reason=str(reason),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "gateway_session_cancel hook failed for %s (%s)",
+                session_key,
+                type(exc).__name__,
+            )
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""

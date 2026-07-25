@@ -179,6 +179,23 @@ async def test_hook_error_does_not_break_reset(mock_invoke_hook):
 
 
 @pytest.mark.asyncio
+async def test_reset_notifies_gateway_session_cancel_hook():
+    """The confirmed reset path must notify async plugin-owned work."""
+    runner = _make_runner()
+    runner._notify_gateway_session_cancel = AsyncMock()
+    event = _make_event("/new")
+    session_key = build_session_key(event.source)
+
+    await runner._handle_reset_command(event)
+
+    runner._notify_gateway_session_cancel.assert_awaited_once_with(
+        session_key,
+        event.source,
+        reason="reset",
+    )
+
+
+@pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
 async def test_idle_expiry_fires_finalize_hook(mock_invoke_hook):
     """Regression test for #14981.

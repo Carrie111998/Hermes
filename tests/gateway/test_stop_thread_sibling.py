@@ -9,6 +9,7 @@ stop any run in the same thread.
 """
 
 import pytest
+from unittest.mock import AsyncMock
 
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
 from gateway.session import SessionSource, build_session_key
@@ -161,6 +162,28 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 # ---------------------------------------------------------------------------
 # /stop with no active agent still clears a stuck platform status (#32295)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_notifies_gateway_session_cancel_hook():
+    runner = object.__new__(GatewayRunner)
+    key = _per_user_key("userA")
+    runner._running_agents = {}
+    runner.session_store = _FakeStore(key)
+    runner._is_user_authorized = lambda source: True
+    runner.adapters = {}
+    runner._notify_gateway_session_cancel = AsyncMock()
+    event = MessageEvent(
+        text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
+    )
+
+    await runner._handle_stop_command(event)
+
+    runner._notify_gateway_session_cancel.assert_awaited_once_with(
+        key,
+        event.source,
+        reason="stop",
+    )
 
 
 class _FakeStatusAdapter:

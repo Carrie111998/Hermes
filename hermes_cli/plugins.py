@@ -171,6 +171,14 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Ordinary user-message interception after user access and gateway control
+    # handling, before either cold or busy-session agent behavior. Callbacks
+    # receive only immutable normalized event/route snapshots plus a route-bound
+    # delivery capability. Decisions: handled/suppress or continue/pass.
+    "gateway_message",
+    # Best-effort notification when a user explicitly cancels or resets a
+    # gateway session. Async plugin-owned work can stop at the same boundary.
+    "gateway_session_cancel",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -1926,6 +1934,41 @@ class PluginManager:
                 )
         return results
 
+    async def invoke_hook_async(
+        self,
+        hook_name: str,
+        *,
+        raise_exceptions: bool = False,
+        **kwargs: Any,
+    ) -> List[Any]:
+        """Await sync or async callbacks registered for *hook_name*.
+
+        Callback failures are isolated by default, matching :meth:`invoke_hook`.
+        Decision-style callers may request fail-fast behavior with
+        ``raise_exceptions=True``. Task cancellation always propagates.
+        """
+        callbacks = self._hooks.get(hook_name, [])
+        results: List[Any] = []
+        for cb in callbacks:
+            try:
+                ret = cb(**kwargs)
+                if inspect.isawaitable(ret):
+                    ret = await ret
+                if ret is not None:
+                    results.append(ret)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Async hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+                if raise_exceptions:
+                    raise
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2052,6 +2095,20 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def invoke_hook_async(
+    hook_name: str,
+    *,
+    raise_exceptions: bool = False,
+    **kwargs: Any,
+) -> List[Any]:
+    """Invoke sync or async lifecycle-hook callbacks and await completion."""
+    return await get_plugin_manager().invoke_hook_async(
+        hook_name,
+        raise_exceptions=raise_exceptions,
+        **kwargs,
+    )
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
