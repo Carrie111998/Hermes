@@ -121,9 +121,23 @@ function buildDesktopBackendEnv({
   }
 }
 
+function buildDesktopParentEnv({ pid = process.pid, nonce }: any = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) {
+    throw new Error('Desktop parent PID must be a positive process identifier')
+  }
+  if (!/^[A-Za-z0-9_-]{32,128}$/.test(String(nonce || ''))) {
+    throw new Error('Desktop parent nonce must be 32-128 URL-safe characters')
+  }
+  return {
+    HERMES_DESKTOP_PARENT_PID: String(pid),
+    HERMES_DESKTOP_PARENT_NONCE: String(nonce)
+  }
+}
+
 export {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
+  buildDesktopParentEnv,
   buildDesktopBackendPath,
   delimiterForPlatform,
   normalizeHermesHomeRoot,

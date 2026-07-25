@@ -399,6 +399,9 @@ class PluginContext:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
+        risk_class=None,
+        connector_id: str = "",
+        target_resolver: Callable | None = None,
         override: bool = False,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
@@ -437,6 +440,9 @@ class PluginContext:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            risk_class=risk_class,
+            connector_id=connector_id,
+            target_resolver=target_resolver,
             override=override,
         )
         self._manager._plugin_tool_names.add(name)
@@ -2263,6 +2269,7 @@ def resolve_pre_tool_block(
                 tool_name,
                 details.message or "",
                 rule_key=details.rule_key or tool_name,
+                args=args or {},
             )
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than

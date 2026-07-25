@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from tools.governance import RiskClass, infer_risk_class
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,11 +93,14 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "risk_class", "risk_source", "connector_id", "target_resolver",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 risk_class=RiskClass.READ, risk_source="inferred",
+                 connector_id="", target_resolver=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -114,6 +119,10 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.risk_class = RiskClass.parse(risk_class)
+        self.risk_source = risk_source
+        self.connector_id = connector_id
+        self.target_resolver = target_resolver
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +384,9 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        risk_class: RiskClass | str | None = None,
+        connector_id: str = "",
+        target_resolver: Optional[Callable] = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -385,6 +397,47 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        resolved_risk = (
+            RiskClass.parse(risk_class)
+            if risk_class is not None
+            else infer_risk_class(name, toolset)
+        )
+        risk_source = "explicit" if risk_class is not None else "inferred"
+        resolved_connector = connector_id
+        if not resolved_connector and (
+            toolset.startswith("mcp-")
+            or toolset
+            in {
+                "browser",
+                "browser-cdp",
+                "cloudflare",
+                "computer_use",
+                "discord",
+                "discord_admin",
+                "feishu_doc",
+                "feishu_drive",
+                "github",
+                "hermes-yuanbao",
+                "homeassistant",
+                "image_gen",
+                "messaging",
+                "spotify",
+                "tts",
+                "video",
+                "video_gen",
+                "vision",
+                "web",
+                "x_search",
+            }
+        ):
+            connector_aliases = {
+                "browser-cdp": "browser",
+                "discord_admin": "discord",
+                "feishu_doc": "feishu",
+                "feishu_drive": "feishu",
+            }
+            resolved_connector = connector_aliases.get(toolset, toolset)
+
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -445,6 +498,10 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                risk_class=resolved_risk,
+                risk_source=risk_source,
+                connector_id=resolved_connector,
+                target_resolver=target_resolver,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -575,6 +632,37 @@ class ToolRegistry:
                     )
             result.append({"type": "function", "function": schema_with_name})
         return result
+
+    def get_connector_report(self) -> List[dict]:
+        """Return a live, secret-free inventory for connector management UIs."""
+        grouped: Dict[str, List[ToolEntry]] = {}
+        for entry in self._snapshot_entries():
+            if entry.connector_id:
+                grouped.setdefault(entry.connector_id, []).append(entry)
+
+        report = []
+        for connector_id in sorted(grouped):
+            entries = grouped[connector_id]
+            available = [
+                entry
+                for entry in entries
+                if entry.check_fn is None or _check_fn_cached(entry.check_fn)
+            ]
+            risks = sorted(
+                {entry.risk_class for entry in entries},
+                key=lambda risk: risk.level,
+            )
+            report.append({
+                "connector_id": connector_id,
+                "toolsets": sorted({entry.toolset for entry in entries}),
+                "tool_count": len(entries),
+                "available_tool_count": len(available),
+                "healthy": len(available) == len(entries),
+                "risk_classes": [risk.value for risk in risks],
+                "max_risk_class": risks[-1].value if risks else RiskClass.READ.value,
+                "tools": sorted(entry.name for entry in entries),
+            })
+        return report
 
     # ------------------------------------------------------------------
     # Dispatch

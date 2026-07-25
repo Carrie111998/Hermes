@@ -915,13 +915,18 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     @mcp.tool()
     def permissions_list_open() -> str:
-        """List pending approval requests observed during this bridge session.
+        """List durable and live pending approval requests.
 
-        Returns exec and plugin approval requests that the bridge has seen
-        since it started. Approvals are live-session only — older approvals
-        from before the bridge connected are not included.
+        Durable requests survive bridge, gateway, and desktop restarts.  Live
+        bridge-only requests are merged for backwards compatibility.
         """
-        approvals = bridge.list_pending_approvals()
+        from tools.approval_store import ApprovalStore
+
+        durable = ApprovalStore().list_requests(status="pending")
+        by_id = {item["id"]: item for item in durable}
+        for item in bridge.list_pending_approvals():
+            by_id.setdefault(item.get("id", ""), item)
+        approvals = sorted(by_id.values(), key=lambda item: item.get("created_at", 0))
         return json.dumps({
             "count": len(approvals),
             "approvals": approvals,
@@ -934,11 +939,11 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         id: str,
         decision: str,
     ) -> str:
-        """Respond to a pending approval request.
+        """Resolve a durable or live approval request.
 
-        Args:
-            id: The approval ID from permissions_list_open
-            decision: One of "allow-once", "allow-always", or "deny"
+        ``allow-always`` creates a standing rule bound to the request's exact
+        tool, target, and risk ceiling.  Targetless requests cannot become
+        standing rules because that would amount to a blanket tool approval.
         """
         if decision not in {"allow-once", "allow-always", "deny"}:
             return json.dumps({
@@ -946,8 +951,102 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
                          f"Must be allow-once, allow-always, or deny"
             })
 
+        from tools.approval_store import ApprovalStore
+
+        store = ApprovalStore()
+        durable = store.get_request(id)
+        if durable is not None:
+            try:
+                if decision == "allow-always":
+                    resolved, rule = store.resolve_request_with_standing_rule(
+                        id,
+                        expires_at=time.time() + (30 * 24 * 60 * 60),
+                        max_uses=100,
+                        decided_by="mcp",
+                        note=f"Bounded rule created from approval {id}",
+                    )
+                else:
+                    rule = None
+                    resolved = store.resolve_request(
+                        id,
+                        "denied" if decision == "deny" else "approved",
+                        decided_by="mcp",
+                    )
+                return json.dumps({
+                    "resolved": True,
+                    "approval_id": id,
+                    "decision": decision,
+                    "status": resolved["status"],
+                    "standing_rule_id": rule["id"] if rule else None,
+                }, indent=2)
+            except (KeyError, ValueError) as exc:
+                return json.dumps({"error": str(exc)})
+
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
+
+    # -- permissions standing rules ----------------------------------------
+
+    @mcp.tool()
+    def permissions_rules_list(active_only: bool = True) -> str:
+        """List target-scoped standing approval rules."""
+        from tools.approval_store import ApprovalStore
+
+        rules = ApprovalStore().list_standing_rules(active_only=active_only)
+        return json.dumps({"count": len(rules), "rules": rules}, indent=2)
+
+    @mcp.tool()
+    def permissions_rules_create(
+        tool_name: str,
+        target_pattern: str,
+        risk_ceiling: str,
+        operation: str = "",
+        profile: str = "",
+        workspace: str = "",
+        job_id: str = "",
+        expires_at: float | None = None,
+        max_uses: int | None = None,
+        note: str = "",
+    ) -> str:
+        """Create a bounded standing approval for one tool and target pattern."""
+        from tools.approval_store import ApprovalStore
+
+        try:
+            rule = ApprovalStore().add_standing_rule(
+                tool_name=tool_name,
+                target_pattern=target_pattern,
+                risk_ceiling=risk_ceiling,
+                match_mode="exact",
+                operation=operation,
+                profile=profile,
+                workspace=workspace,
+                job_id=job_id,
+                expires_at=expires_at,
+                max_uses=max_uses,
+                note=note,
+            )
+            return json.dumps({"created": True, "rule": rule}, indent=2)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+
+    @mcp.tool()
+    def permissions_rules_revoke(id: str) -> str:
+        """Revoke a standing approval rule."""
+        from tools.approval_store import ApprovalStore
+
+        revoked = ApprovalStore().revoke_standing_rule(id)
+        return json.dumps({"revoked": revoked, "id": id}, indent=2)
+
+    # -- connector inventory ------------------------------------------------
+
+    @mcp.tool()
+    def connectors_list() -> str:
+        """Return connector health, exposed tools, and declared risk classes."""
+        from tools.registry import discover_builtin_tools, registry
+
+        discover_builtin_tools()
+        connectors = registry.get_connector_report()
+        return json.dumps({"count": len(connectors), "connectors": connectors}, indent=2)
 
     return mcp
 

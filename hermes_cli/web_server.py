@@ -15639,6 +15639,179 @@ async def update_skill_content(body: SkillContentUpdate):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Governance — durable approvals, bounded standing rules, connector inventory
+# ---------------------------------------------------------------------------
+
+
+class GovernanceDecision(BaseModel):
+    decision: str
+    reason: str = ""
+
+
+class GovernanceRuleCreate(BaseModel):
+    tool_name: str
+    target_pattern: str
+    match_mode: Literal["exact"] = "exact"
+    risk_ceiling: str
+    operation: str = ""
+    profile: str = ""
+    workspace: str = ""
+    job_id: str = ""
+    expires_at: Optional[float] = None
+    max_uses: Optional[int] = None
+    note: str = ""
+
+
+def _governance_store(profile: Optional[str]):
+    from tools.approval_store import ApprovalStore
+
+    with _profile_scope(profile):
+        return ApprovalStore()
+
+
+@app.get("/api/governance/approvals")
+async def governance_list_approvals(
+    status: str = "pending",
+    session_key: Optional[str] = None,
+    profile: Optional[str] = None,
+):
+    """List durable approval requests without exposing raw tool arguments."""
+    allowed = {"pending", "approved", "denied", "expired", "consumed"}
+    if status not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid approval status")
+    approvals = _governance_store(profile).list_requests(
+        status=status, session_key=session_key
+    )
+    return {"count": len(approvals), "approvals": approvals}
+
+
+@app.post("/api/governance/approvals/{approval_id}/decision")
+async def governance_decide_approval(
+    approval_id: str,
+    body: GovernanceDecision,
+    profile: Optional[str] = None,
+):
+    """Resolve one immutable approval envelope or create its exact standing rule."""
+    store = _governance_store(profile)
+    request = store.get_request(approval_id)
+    if request is None:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    if body.decision not in {"allow-once", "allow-always", "deny"}:
+        raise HTTPException(status_code=400, detail="Invalid decision")
+
+    standing_rule = None
+    try:
+        if body.decision == "allow-always":
+            resolved, standing_rule = store.resolve_request_with_standing_rule(
+                approval_id,
+                expires_at=time.time() + (30 * 24 * 60 * 60),
+                max_uses=100,
+                decision_reason=body.reason,
+                decided_by="desktop",
+                note=f"Bounded rule created from approval {approval_id}",
+            )
+        else:
+            resolved = store.resolve_request(
+                approval_id,
+                "denied" if body.decision == "deny" else "approved",
+                decision_reason=body.reason,
+                decided_by="desktop",
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "resolved": True,
+        "approval_id": approval_id,
+        "decision": body.decision,
+        "status": resolved["status"],
+        "standing_rule_id": standing_rule["id"] if standing_rule else None,
+    }
+
+
+@app.get("/api/governance/rules")
+async def governance_list_rules(active_only: bool = True, profile: Optional[str] = None):
+    rules = _governance_store(profile).list_standing_rules(active_only=active_only)
+    return {"count": len(rules), "rules": rules}
+
+
+@app.post("/api/governance/rules")
+async def governance_create_rule(
+    body: GovernanceRuleCreate,
+    profile: Optional[str] = None,
+):
+    try:
+        rule = _governance_store(profile).add_standing_rule(
+            tool_name=body.tool_name,
+            target_pattern=body.target_pattern,
+            match_mode=body.match_mode,
+            risk_ceiling=body.risk_ceiling,
+            operation=body.operation,
+            profile=body.profile,
+            workspace=body.workspace,
+            job_id=body.job_id,
+            expires_at=body.expires_at,
+            max_uses=body.max_uses,
+            note=body.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"created": True, "rule": rule}
+
+
+@app.delete("/api/governance/rules/{rule_id}")
+async def governance_revoke_rule(rule_id: str, profile: Optional[str] = None):
+    return {
+        "revoked": _governance_store(profile).revoke_standing_rule(rule_id),
+        "id": rule_id,
+    }
+
+
+@app.get("/api/governance/connectors")
+async def governance_connector_inventory(profile: Optional[str] = None):
+    """Return live connector/tool health without configuration secrets."""
+    from tools.registry import discover_builtin_tools, registry
+
+    discover_builtin_tools()
+    connectors = registry.get_connector_report()
+    by_id = {
+        row["connector_id"]: {
+            "id": row["connector_id"],
+            "enabled": True,
+            "health": "healthy" if row["healthy"] else "degraded",
+            "tool_count": row["tool_count"],
+            "available_tool_count": row["available_tool_count"],
+            "tools": row["tools"],
+            "risk_classes": row["risk_classes"],
+            "highest_risk": row["max_risk_class"],
+        }
+        for row in connectors
+    }
+
+    # Configured MCP servers may not have registered tools in the web process.
+    # Include their enablement state without returning commands, headers, or env.
+    with _profile_scope(profile):
+        cfg = load_config()
+    for name, server in (cfg.get("mcp_servers", {}) or {}).items():
+        connector_id = f"mcp-{name}"
+        if connector_id in by_id:
+            continue
+        enabled = bool(server.get("enabled", True)) if isinstance(server, dict) else True
+        by_id[connector_id] = {
+            "id": connector_id,
+            "enabled": enabled,
+            "health": "configured" if enabled else "disabled",
+            "tool_count": 0,
+            "tools": [],
+            "risk_classes": [],
+            "highest_risk": None,
+        }
+
+    rows = sorted(by_id.values(), key=lambda row: row["id"])
+    return {"count": len(rows), "connectors": rows}
+
+
 @app.get("/api/tools/toolsets")
 async def get_toolsets(profile: Optional[str] = None):
     from hermes_cli.tools_config import (
@@ -20097,6 +20270,12 @@ def start_server(
         ws_ping_timeout=None if _is_loopback else 20.0,
     )
     server = uvicorn.Server(config)
+    from hermes_cli.desktop_parent_monitor import (
+        monitor_desktop_parent,
+        parse_desktop_parent_contract,
+    )
+
+    desktop_parent = parse_desktop_parent_contract()
 
     async def _serve():
         # Split startup from main_loop so we can read the bound port
@@ -20168,7 +20347,19 @@ def start_server(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
 
-            await server.main_loop()
+            parent_monitor_task = None
+            if desktop_parent is not None:
+                parent_monitor_task = asyncio.create_task(
+                    monitor_desktop_parent(server, desktop_parent),
+                    name="desktop-parent-monitor",
+                )
+            try:
+                await server.main_loop()
+            finally:
+                if parent_monitor_task is not None:
+                    parent_monitor_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await parent_monitor_task
             if server.started:
                 await server.shutdown()
 
