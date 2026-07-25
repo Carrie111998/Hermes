@@ -41,6 +41,23 @@ def cron_env(tmp_path, monkeypatch):
     return hermes_home
 
 
+def _successful_popen(captured, stdout="ok\n", stderr=""):
+    class FakeProcess:
+        returncode = 0
+        pid = 4242
+
+        def communicate(self, timeout=None):
+            captured["communicate_timeout"] = timeout
+            return stdout, stderr
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    return fake_popen
+
+
 class TestJobScriptField:
     """Test that the script field is stored and retrieved correctly."""
 
@@ -194,22 +211,23 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
-        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            sched_mod,
+            "windows_detach_flags_without_breakaway",
+            lambda: 0x08000200,
+        )
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", _successful_popen(captured)
+        )
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000000
+        assert captured["kwargs"]["creationflags"] == 0x08000200
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
@@ -231,15 +249,16 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(pythonw))
-        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            sched_mod,
+            "windows_detach_flags_without_breakaway",
+            lambda: 0x08000200,
+        )
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", _successful_popen(captured)
+        )
 
         success, output = _run_job_script("probe.py")
 
@@ -258,13 +277,10 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", _successful_popen(captured)
+        )
 
         success, output = _run_job_script("probe.py")
 
