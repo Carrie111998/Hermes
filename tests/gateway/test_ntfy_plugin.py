@@ -788,6 +788,67 @@ class TestEnvEnablement:
         assert seed["home_channel"]["name"] == "alerts"
 
 
+class TestHomeChannelConfigPath:
+    """End-to-end through the production configuration layer.
+
+    The env seed above is only half the path. ``gateway/config.py``'s
+    plugin-platform enable pass (inside ``_apply_env_overrides``) wires
+    ``seed["home_channel"]`` into a :class:`HomeChannel` dataclass with
+    ``name=str(home.get("name") or "Home")``. A blank seed name is falsy
+    there, so *without* the adapter fix the user-visible channel name is the
+    generic ``"Home"`` rather than the channel id — which is exactly the
+    normalization these tests have to disprove.
+    """
+
+    @staticmethod
+    def _resolve_home_channel(monkeypatch, name_value):
+        """Drive the real config loader and return the resulting HomeChannel."""
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+
+        monkeypatch.setenv("NTFY_TOPIC", "hermes-in")
+        monkeypatch.setenv("NTFY_HOME_CHANNEL", "alerts")
+        if name_value is None:
+            monkeypatch.delenv("NTFY_HOME_CHANNEL_NAME", raising=False)
+        else:
+            monkeypatch.setenv("NTFY_HOME_CHANNEL_NAME", name_value)
+
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        platform_config = config.platforms.get(Platform("ntfy"))
+        assert platform_config is not None, "ntfy plugin was not enabled from env"
+        return platform_config.home_channel
+
+    def test_empty_name_resolves_to_channel_id_not_home(self, monkeypatch):
+        home_channel = self._resolve_home_channel(monkeypatch, "")
+        assert home_channel is not None
+        assert home_channel.chat_id == "alerts"
+        # The assertion teknium1 asked for: user-visible name is the channel
+        # id, NOT the "Home" default that `or "Home"` yields for a blank seed.
+        assert home_channel.name == "alerts"
+        assert home_channel.name != "Home"
+
+    @pytest.mark.parametrize("blank", [" ", "   ", "\t", "\n", " \t\n "])
+    def test_whitespace_name_resolves_to_channel_id_not_home(self, monkeypatch, blank):
+        home_channel = self._resolve_home_channel(monkeypatch, blank)
+        assert home_channel is not None
+        assert home_channel.chat_id == "alerts"
+        assert home_channel.name == "alerts"
+        assert home_channel.name != "Home"
+
+    def test_unset_name_resolves_to_channel_id(self, monkeypatch):
+        home_channel = self._resolve_home_channel(monkeypatch, None)
+        assert home_channel is not None
+        assert home_channel.name == "alerts"
+
+    def test_explicit_name_is_preserved(self, monkeypatch):
+        """Anchor: a real name must survive the config layer untouched."""
+        home_channel = self._resolve_home_channel(monkeypatch, "Alerts Channel")
+        assert home_channel is not None
+        assert home_channel.chat_id == "alerts"
+        assert home_channel.name == "Alerts Channel"
+
+
 # ---------------------------------------------------------------------------
 # 10. _standalone_send() — out-of-process cron delivery
 # ---------------------------------------------------------------------------
