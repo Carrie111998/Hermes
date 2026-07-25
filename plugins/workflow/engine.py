@@ -440,7 +440,7 @@ class WorkflowEngine:
 
     def _fire_completion_notification(self, workflow_name, workflow, states, layers, layer_idx, context=None):
         """Fire completion notification after all layers complete."""
-        print(f"   🔔 _fire_completion_notification called: context_has_session={bool((context or {}).get("_session_info"))}")
+        print(f"   🔔 _fire_completion_notification called: context_has_session={bool((context or {}).get('_session_info'))}")
         try:
             from plugins.workflow import _notify_workflow_complete
             _notif_state = {
