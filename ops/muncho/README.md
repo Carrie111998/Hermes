@@ -16,6 +16,16 @@ the core:
   timer waits at least 30 minutes after activation and packaging never starts
   the job.  It creates fork branches/PRs only; auto-merge/deploy remains a
   separate gate and the public upstream is read-only.
+- `upstream_sync_job_rail.py` is the reviewed successor for the standing
+  three-hour Cloud schedule. It has exactly two code-owned jobs: the existing
+  Muncho fork sync and the canonical SkyAI source-branch sync. Both create or
+  update fork-only candidate PRs and fail closed on unknown conflicts; neither
+  may merge or deploy. The sync service receives only the dedicated GitHub
+  credential and publishes a sanitized public result. A separate daily
+  `upstream_sync_discord_reporter.py` service reads only that public result and
+  reuses `hermes send`; it has no GitHub credential. This separation keeps
+  model/provider, Muncho brain, SkyAI customer data, and Discord credentials
+  outside the mechanical sync service.
 - `planned_gateway_restart.sh` writes the existing Hermes planned-stop marker
   before an external service manager restarts the gateway.
 - `production_config_model_sovereignty.py` plans, applies, and rolls back the
