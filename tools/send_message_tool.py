@@ -1297,6 +1297,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_chunks = BasePlatformAdapter.truncate_message(
                 formatted, 4096, len_fn=utf16_len
             )
+            if len(text_chunks) > 1 and send_parse_mode == ParseMode.MARKDOWN_V2:
+                # truncate_message appends a raw " (1/2)" indicator *after*
+                # MarkdownV2 escaping has run, so the parentheses arrive bare
+                # and Telegram rejects the whole chunk ("character '(' is
+                # reserved"). The gateway adapter already compensates; this
+                # standalone path (cron/tool sends) did not, which is why only
+                # messages long enough to chunk lost their formatting.
+                import re as _re
+                from plugins.platforms.telegram.adapter import (
+                    _separate_chunk_indicator_from_fence,
+                )
+                text_chunks = [
+                    _separate_chunk_indicator_from_fence(
+                        _re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                    )
+                    for chunk in text_chunks
+                ]
             for chunk in text_chunks:
                 try:
                     last_msg = await _send_telegram_message_with_retry(
