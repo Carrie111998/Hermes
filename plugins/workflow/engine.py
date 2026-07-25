@@ -2316,14 +2316,21 @@ class WorkflowEngine:
                                       current_layer=len(layers) - 1)
 
                 # Fire completion notification for simple (no-loop) workflows
-                # The notification code at the end of execute() is only reached
-                # by the supervisor's monitoring loop. For simple workflows that
-                # return here, we must fire the notification explicitly.
                 try:
                     from plugins.workflow import _notify_workflow_complete
+                    # Build a minimal state dict for the notification
+                    _notif_state = {
+                        "workflow_name": workflow_name,
+                        "kanban_board": self.kanban_board,
+                        "run_id": workflow.run_id,
+                        "session_info": _session_info or {},
+                        "states": {nid: {"status": s.status, "kanban_card_id": s.kanban_card_id} for nid, s in states.items()},
+                        "layers": layers,
+                        "current_layer": len(layers) - 1,
+                    }
                     for nid in reversed(list(states.keys())):
                         if states[nid].status == "done" and states[nid].kanban_card_id:
-                            _notify_workflow_complete(states[nid].kanban_card_id, state=None)
+                            _notify_workflow_complete(states[nid].kanban_card_id, state=_notif_state)
                             break
                 except Exception as _notify_exc:
                     print(f"   ⚠  Completion notification failed: {_notify_exc}")
