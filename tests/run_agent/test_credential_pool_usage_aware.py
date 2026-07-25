@@ -131,11 +131,11 @@ def test_no_proactive_refresh_on_auth_401():
 
 def test_usage_env_helpers():
     import os as _os
-    from agent.credential_pool import _usage_env_float, _usage_env_int
+    from agent.credential_pool import _usage_env_float, _usage_config_value
     _os.environ["X_TTL_TEST"] = "300"
     try:
         assert _usage_env_float("X_TTL_TEST", 180.0) == 300.0
-        assert _usage_env_int("X_MISSING_TEST", 2) == 2
+        assert _usage_config_value("missing", "X_MISSING_TEST", 2, int) == 2
         _os.environ["X_BAD_TEST"] = "notanumber"
         assert _usage_env_float("X_BAD_TEST", 9.0) == 9.0
     finally:
