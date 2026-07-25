@@ -21,6 +21,8 @@ on the real OS.
 import os
 from unittest.mock import patch
 
+import pytest
+
 from tools.environments.base import BaseEnvironment
 from tools.environments import local as local_mod
 from tools.environments.local import (
@@ -510,3 +512,57 @@ class TestWrapCommandWindowsNativeCwd:
         script = captured["script"]
         assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-deadbeef.sh" in script
         assert r"C:\Users\Alexander\AppData" not in script
+
+
+class TestWindowsLoginSnapshotPreservesInheritedPath:
+    @pytest.mark.parametrize(
+        ("is_windows", "bash", "cwd", "init_files", "expected"),
+        [
+            (
+                True,
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Users\Alice\.buzz",
+                ["/c/Users/Alice/.bashrc"],
+                [
+                    r"C:\Program Files\Git\bin\bash.exe",
+                    "-c",
+                    "set +e\n"
+                    "[ -r '/c/Users/Alice/.bashrc' ] && . "
+                    "'/c/Users/Alice/.bashrc' 2>/dev/null || true\n"
+                    "command -v buzz",
+                ],
+            ),
+            (
+                False,
+                "/bin/bash",
+                "/tmp",
+                [],
+                ["/bin/bash", "-l", "-c", "command -v buzz"],
+            ),
+        ],
+    )
+    def test_snapshot_shell_mode(
+        self, monkeypatch, is_windows, bash, cwd, init_files, expected
+    ):
+        """Windows preserves host PATH; POSIX retains login-shell behavior."""
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", is_windows)
+        monkeypatch.setattr(local_mod, "_find_bash", lambda: bash)
+        monkeypatch.setattr(local_mod, "_resolve_shell_init_files", lambda: init_files)
+
+        captured = {}
+
+        class FakeProc:
+            pid = 123
+
+        def fake_popen(args, **kwargs):
+            captured["args"] = args
+            return FakeProc()
+
+        monkeypatch.setattr(local_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(local_mod.os, "getpgid", lambda _pid: 1, raising=False)
+        with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
+            env = LocalEnvironment(cwd=cwd, timeout=10)
+
+        env._run_bash("command -v buzz", login=True)
+
+        assert captured["args"] == expected

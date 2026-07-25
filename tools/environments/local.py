@@ -1369,7 +1369,14 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        # Git for Windows' /etc/profile replaces the native parent PATH. That
+        # drops directories injected by desktop hosts (for example, a bundled
+        # collaboration CLI beside the app executable) before the snapshot is
+        # captured. Configured init files are already sourced explicitly above,
+        # so keep the Windows snapshot non-login while preserving POSIX login
+        # behaviour.
+        use_login_shell = login and not _IS_WINDOWS
+        args = [bash, "-l", "-c", cmd_string] if use_login_shell else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
