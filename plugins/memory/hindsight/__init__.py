@@ -1814,7 +1814,13 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._prefer_observations = False
                     self._recall_min_scores = None
             except Exception:
-                pass  # packaging/version not available — proceed
+                logger.warning(
+                    "Could not determine hindsight-client version; disabling "
+                    "prefer_observations / min_scores params defensively — "
+                    "recall will proceed without them.",
+                )
+                self._prefer_observations = False
+                self._recall_min_scores = None
 
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
