@@ -1,5 +1,6 @@
 """Tests for the /voice command and auto voice reply in the gateway."""
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -353,6 +354,13 @@ class TestAutoVoiceReply:
         """voice_only + text input: neither fires."""
         assert self._call(runner, "voice_only", MessageType.TEXT) is False
 
+    def test_realtime_voice_marker_preserves_voice_only_semantics(self, runner):
+        runner._voice_mode["telegram:123"] = "voice_only"
+        event = _make_event(message_type=MessageType.TEXT)
+        event.raw_message = SimpleNamespace(codex_realtime_voice=True)
+
+        assert runner._should_send_voice_reply(event, "Hello!", []) is True
+
     # -- Mode off: nothing fires -------------------------------------------
 
     def test_off_mode_voice(self, runner):
@@ -436,6 +444,106 @@ class TestSendVoiceReply:
         assert mock_tts.call_args.kwargs["output_path"].endswith(".ogg")
         call_args = mock_adapter.send_voice.call_args
         assert call_args.kwargs.get("chat_id") == "123"
+
+    @pytest.mark.asyncio
+    async def test_discord_realtime_session_speaks_through_codex_without_local_tts(self, runner):
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = True
+        manager.append_speech = AsyncMock(return_value=True)
+        runner._codex_realtime_voice = manager
+
+        with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_awaited_once_with(adapter, 111, "Hoi Maikel")
+        local_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_realtime_speech_failure_stays_silent_when_classic_fallback_is_disabled(
+        self, runner
+    ):
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = False
+        manager.append_speech = AsyncMock(side_effect=RuntimeError("speech failed"))
+        runner._codex_realtime_voice = manager
+
+        with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_awaited_once_with(adapter, 111, "Hoi Maikel")
+        local_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_removed_no_fallback_realtime_session_does_not_leak_local_tts(
+        self, runner
+    ):
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(
+            guild_id=111,
+            guild=None,
+            codex_realtime_voice=True,
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = False
+        manager.configured_fallback_enabled.return_value = False
+        manager.append_speech = AsyncMock()
+        runner._codex_realtime_voice = manager
+
+        with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_not_awaited()
+        local_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discord_realtime_does_not_speak_reply_from_unlinked_text_channel(self, runner):
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter._voice_text_channels = {111: 999}
+        adapter.send_voice = AsyncMock()
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.append_speech = AsyncMock(return_value=True)
+        runner._codex_realtime_voice = manager
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.mp3"})
+
+        with patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value=tts_result,
+        ) as local_tts, patch("os.path.isfile", return_value=False):
+            await runner._send_voice_reply(event, "Niet voor de VC")
+
+        manager.append_speech.assert_not_awaited()
+        local_tts.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_non_telegram_auto_voice_reply_uses_mp3(self, runner):
@@ -624,7 +732,7 @@ class TestVoiceInHelp:
 class TestVoiceReceiver:
     """Test VoiceReceiver silence detection, SSRC mapping, and lifecycle."""
 
-    def _make_receiver(self):
+    def _make_receiver(self, pcm_callback=None):
         from plugins.platforms.discord.adapter import VoiceReceiver
         mock_vc = MagicMock()
         mock_vc._connection.secret_key = [0] * 32
@@ -633,7 +741,7 @@ class TestVoiceReceiver:
         mock_vc._connection.add_socket_listener = MagicMock()
         mock_vc._connection.remove_socket_listener = MagicMock()
         mock_vc._connection.hook = None
-        receiver = VoiceReceiver(mock_vc)
+        receiver = VoiceReceiver(mock_vc, pcm_callback=pcm_callback)
         return receiver
 
     def test_initial_state(self):
@@ -670,6 +778,38 @@ class TestVoiceReceiver:
         receiver.map_ssrc(100, 42)
         receiver.map_ssrc(100, 99)
         assert receiver._ssrc_to_user[100] == 99
+
+    def test_realtime_pcm_callback_can_consume_frame_before_classic_stt_buffer(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True
+        )
+        receiver.map_ssrc(100, 42)
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert consumed == [(42, b"pcm")]
+        assert receiver._buffers[100] == bytearray()
+
+    def test_realtime_pcm_callback_can_consume_unmapped_early_frame(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True
+        )
+
+        receiver.handle_decoded_pcm(100, b"early")
+
+        assert consumed == [(0, b"early")]
+        assert receiver._buffers[100] == bytearray()
+
+    def test_unconsumed_pcm_falls_back_to_classic_stt_buffer(self):
+        receiver = self._make_receiver(pcm_callback=lambda _user_id, _pcm: False)
+        receiver.map_ssrc(100, 42)
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert receiver._buffers[100] == bytearray(b"pcm")
+        assert 100 in receiver._last_packet_time
 
     def test_pause_resume(self):
         receiver = self._make_receiver()
@@ -847,6 +987,99 @@ class TestVoiceChannelCommands:
         assert mock_adapter._voice_sources[111]["chat_type"] == "group"
 
     @pytest.mark.asyncio
+    async def test_join_starts_opt_in_realtime_after_binding_and_wires_pcm_before_connect(self, runner):
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        mock_adapter._voice_text_channels = {}
+        mock_adapter._voice_sources = {}
+        mock_adapter._voice_input_callback = None
+        mock_adapter._voice_pcm_callback = None
+
+        manager = MagicMock()
+        manager.push_discord_pcm.return_value = True
+        manager.start_for_voice_channel = AsyncMock(
+            return_value=SimpleNamespace(
+                enabled=True,
+                active=True,
+                fallback_to_classic=True,
+                reason=None,
+                capabilities=SimpleNamespace(protocol_version="v1"),
+            )
+        )
+        runner._codex_realtime_voice = manager
+        runner._handle_voice_channel_input = AsyncMock()
+
+        async def _join(_channel):
+            assert callable(mock_adapter._voice_pcm_callback)
+            assert mock_adapter._voice_pcm_callback(111, 42, b"pcm") is True
+            return True
+
+        mock_adapter.join_voice_channel = AsyncMock(side_effect=_join)
+        event = self._make_discord_event(user_id="42")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "codex live" in result.lower()
+        manager.start_for_voice_channel.assert_awaited_once()
+        kwargs = manager.start_for_voice_channel.await_args.kwargs
+        assert kwargs["adapter"] is mock_adapter
+        assert kwargs["guild_id"] == 111
+        assert kwargs["user_id"] == 42
+        assert callable(kwargs["on_transcript"])
+        assert callable(kwargs["on_runtime_failure"])
+        await kwargs["on_runtime_failure"]("temporary failure", True)
+        assert runner._voice_mode["discord:123"] == "all"
+        await mock_adapter._voice_input_callback(111, 42, "classic fallback")
+        runner._handle_voice_channel_input.assert_awaited_with(
+            111,
+            42,
+            "classic fallback",
+            adapter=mock_adapter,
+        )
+
+    @pytest.mark.asyncio
+    async def test_join_without_classic_fallback_clears_state_when_leave_fails(self, runner):
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        mock_adapter.join_voice_channel = AsyncMock(return_value=True)
+        mock_adapter.leave_voice_channel = AsyncMock(
+            side_effect=RuntimeError("Discord disconnect failed")
+        )
+        mock_adapter._voice_text_channels = {}
+        mock_adapter._voice_sources = {}
+        mock_adapter._voice_input_callback = None
+        mock_adapter._voice_pcm_callback = None
+
+        manager = MagicMock()
+        manager.push_discord_pcm.return_value = False
+        manager.start_for_voice_channel = AsyncMock(
+            return_value=SimpleNamespace(
+                enabled=True,
+                active=False,
+                fallback_to_classic=False,
+                reason="not entitled",
+                capabilities=None,
+            )
+        )
+        runner._codex_realtime_voice = manager
+        event = self._make_discord_event(user_id="42")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "fallback is disabled" in result
+        assert "not entitled" in result
+        mock_adapter.leave_voice_channel.assert_awaited_once_with(111)
+        assert runner._voice_mode["discord:123"] == "off"
+        assert mock_adapter._voice_input_callback is None
+        assert mock_adapter._voice_pcm_callback is None
+
+    @pytest.mark.asyncio
     async def test_join_failure(self, runner):
         """Failed join returns permissions error."""
         mock_channel = MagicMock()
@@ -865,12 +1098,16 @@ class TestVoiceChannelCommands:
         mock_channel = MagicMock()
         mock_channel.name = "General"
         mock_adapter = AsyncMock()
+        mock_adapter._voice_input_callback = None
+        mock_adapter._voice_pcm_callback = None
         mock_adapter.join_voice_channel = AsyncMock(side_effect=RuntimeError("No permission"))
         mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
         event = self._make_discord_event()
         runner.adapters[event.source.platform] = mock_adapter
         result = await runner._handle_voice_channel_join(event)
         assert "failed" in result.lower()
+        assert mock_adapter._voice_input_callback is None
+        assert mock_adapter._voice_pcm_callback is None
 
     @pytest.mark.asyncio
     async def test_join_missing_voice_dependencies(self, runner):
@@ -926,6 +1163,24 @@ class TestVoiceChannelCommands:
         assert runner._voice_mode["discord:123"] == "off"
         mock_adapter.leave_voice_channel.assert_called_once_with(111)
 
+    @pytest.mark.asyncio
+    async def test_leave_still_disconnects_when_realtime_cleanup_fails(self, runner):
+        mock_adapter = AsyncMock()
+        mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
+        mock_adapter.leave_voice_channel = AsyncMock()
+        manager = MagicMock()
+        manager.stop_for_voice_channel = AsyncMock(
+            side_effect=RuntimeError("provider teardown failed")
+        )
+        runner._codex_realtime_voice = manager
+        event = self._make_discord_event("/voice leave")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_leave(event)
+
+        assert "left" in result.lower()
+        mock_adapter.leave_voice_channel.assert_awaited_once_with(111)
+
     # -- _handle_voice_channel_input --
 
     @pytest.mark.asyncio
@@ -963,6 +1218,33 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+
+    @pytest.mark.asyncio
+    async def test_realtime_transcript_uses_bound_adapter_text_pipeline(self, runner):
+        from gateway.config import Platform
+
+        primary_adapter = AsyncMock()
+        primary_adapter.handle_message = AsyncMock()
+        bound_adapter = AsyncMock()
+        bound_adapter._voice_text_channels = {111: 123}
+        bound_adapter._voice_sources = {}
+        bound_adapter._client = MagicMock()
+        bound_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        bound_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = primary_adapter
+
+        await runner._handle_voice_channel_input(
+            111,
+            42,
+            "Realtime transcript",
+            realtime=True,
+            adapter=bound_adapter,
+        )
+
+        event = bound_adapter.handle_message.call_args.args[0]
+        assert event.message_type == MessageType.TEXT
+        assert event.raw_message.guild_id == 111
+        primary_adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):
@@ -1351,22 +1633,35 @@ class TestVoiceReceiverThreadSafety:
             "check_silence must hold self._lock while iterating buffers"
         )
 
-    def test_on_packet_buffer_write_holds_lock(self):
-        """_on_packet must hold lock when writing to buffers."""
-        import ast, inspect, textwrap
-        from plugins.platforms.discord.adapter import VoiceReceiver
-        source = textwrap.dedent(inspect.getsource(VoiceReceiver._on_packet))
-        tree = ast.parse(source)
-        # Find 'with self._lock:' that contains buffer extend
-        found_lock_with_extend = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.With):
-                src_fragment = ast.dump(node)
-                if "lock" in src_fragment and "extend" in src_fragment:
-                    found_lock_with_extend = True
-        assert found_lock_with_extend, (
-            "_on_packet must hold self._lock when extending buffers"
-        )
+    def test_decoded_pcm_fallback_writes_buffer_under_lock(self):
+        """Decoded PCM fallback must hold the lock while extending buffers."""
+        receiver = self._make_receiver()
+
+        class RecordingLock:
+            def __init__(self):
+                self.depth = 0
+
+            def __enter__(self):
+                self.depth += 1
+                return self
+
+            def __exit__(self, *_args):
+                self.depth -= 1
+
+        lock = RecordingLock()
+
+        class GuardedBuffer(bytearray):
+            def extend(self, data):
+                assert lock.depth > 0, "buffer write happened outside receiver lock"
+                super().extend(data)
+
+        setattr(receiver, "_lock", lock)
+        receiver._ssrc_to_user[100] = 42
+        receiver._buffers[100] = GuardedBuffer()
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert receiver._buffers[100] == bytearray(b"pcm")
 
     def test_concurrent_buffer_access_safe(self):
         """Simulate concurrent buffer writes and reads under lock."""
@@ -1963,6 +2258,20 @@ class TestVoiceTimeoutCleansRunnerState:
 
         assert runner._voice_mode["discord:999"] == "off", \
             "voice_mode must persist explicit off state after timeout cleanup"
+
+    @pytest.mark.asyncio
+    async def test_runner_timeout_cleanup_stops_realtime_for_bound_guild(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 999}
+        manager = MagicMock()
+        manager.stop_for_voice_channel = AsyncMock()
+        runner._codex_realtime_voice = manager
+
+        runner._handle_voice_timeout_cleanup("999", adapter=adapter)
+        await asyncio.sleep(0)
+
+        manager.stop_for_voice_channel.assert_awaited_once_with(adapter, 111)
 
     @pytest.mark.asyncio
     async def test_timeout_without_callback_does_not_crash(self, adapter):

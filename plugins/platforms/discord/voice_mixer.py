@@ -145,6 +145,78 @@ class MixerChild:
         return samples
 
 
+class StreamingMixerChild:
+    """Incremental PCM child for low-latency WebRTC speech.
+
+    WebRTC supplies small PCM chunks over time instead of one complete clip.
+    A short underflow grace keeps the child alive across normal network jitter
+    without permanently ducking the ambient bed after a turn ends.
+    """
+
+    __slots__ = (
+        "name", "gain", "is_speech", "_buffer", "_closing",
+        "_finished", "_empty_reads", "_max_empty_reads",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        gain: float = 1.0,
+        underflow_grace_ms: int = 200,
+    ) -> None:
+        self.name = name
+        self.gain = float(gain)
+        self.is_speech = True
+        self._buffer = bytearray()
+        self._closing = False
+        self._finished = False
+        self._empty_reads = 0
+        self._max_empty_reads = max(1, underflow_grace_ms // FRAME_LENGTH_MS)
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def push(self, pcm: bytes) -> None:
+        if not pcm or self._finished or self._closing:
+            return
+        self._buffer.extend(pcm)
+        self._empty_reads = 0
+
+    def close(self) -> None:
+        self._closing = True
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        if self._finished:
+            return None
+        if len(self._buffer) >= FRAME_SIZE:
+            chunk = bytes(self._buffer[:FRAME_SIZE])
+            del self._buffer[:FRAME_SIZE]
+            self._empty_reads = 0
+        elif self._closing:
+            if not self._buffer:
+                self._finished = True
+                return None
+            chunk = bytes(self._buffer) + b"\x00" * (FRAME_SIZE - len(self._buffer))
+            self._buffer.clear()
+        else:
+            self._empty_reads += 1
+            if self._empty_reads > self._max_empty_reads:
+                self._finished = True
+                return None
+            np = _require_numpy()
+            return np.zeros(
+                SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32
+            )
+
+        np = _require_numpy()
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        if self.gain != 1.0:
+            samples *= self.gain
+        return samples
+
+
 class VoiceMixer:
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
@@ -168,7 +240,7 @@ class VoiceMixer:
     ):
         self._lock = threading.Lock()
         self._ambient: Optional[MixerChild] = None
-        self._speech: List[MixerChild] = []
+        self._speech: List[MixerChild | StreamingMixerChild] = []
         self._ambient_gain = float(ambient_gain)
         self._duck_gain = float(duck_gain)
         self._speech_gain = float(speech_gain)
@@ -222,6 +294,48 @@ class VoiceMixer:
             if self._ambient is not None:
                 self._ambient.gain = self._duck_gain
 
+    def push_speech_stream(
+        self,
+        name: str,
+        pcm: bytes,
+        *,
+        gain: Optional[float] = None,
+    ) -> bool:
+        """Append PCM and return whether a new low-latency stream started."""
+        if not pcm:
+            return False
+        with self._lock:
+            child = next(
+                (
+                    item
+                    for item in self._speech
+                    if isinstance(item, StreamingMixerChild)
+                    and item.name == name
+                    and not item.finished
+                ),
+                None,
+            )
+            created = child is None
+            if child is None:
+                child = StreamingMixerChild(
+                    name,
+                    gain=self._speech_gain if gain is None else float(gain),
+                )
+                self._speech.append(child)
+            child.push(pcm)
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+            return created
+
+    def end_speech_stream(self, name: str) -> None:
+        """Close a named stream after its buffered PCM has drained."""
+        with self._lock:
+            for child in self._speech:
+                if isinstance(child, StreamingMixerChild) and child.name == name:
+                    child.close()
+
     @property
     def speech_active(self) -> bool:
         with self._lock:
@@ -257,7 +371,7 @@ class VoiceMixer:
 
             # Speech children (drop exhausted ones; release duck when last ends)
             if self._speech:
-                still_live: List[MixerChild] = []
+                still_live: List[MixerChild | StreamingMixerChild] = []
                 for child in self._speech:
                     frame = child.read_frame()
                     if frame is None:

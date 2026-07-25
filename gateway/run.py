@@ -3725,6 +3725,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
         self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
+        # Experimental Codex GPT-Live route. Constructed lazily on the first
+        # Discord VC join; WebRTC dependencies remain opt-in after that.
+        self._codex_realtime_voice = None
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -9907,6 +9910,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _agent, context="shutdown idle-cache"
                     )
 
+            realtime_voice = getattr(self, "_codex_realtime_voice", None)
+            if realtime_voice is not None:
+                try:
+                    await realtime_voice.close()
+                except Exception:
+                    logger.debug("Codex realtime voice shutdown failed", exc_info=True)
+
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 
@@ -15482,6 +15492,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
 
+    def _get_codex_realtime_voice_manager(self):
+        manager = getattr(self, "_codex_realtime_voice", None)
+        if manager is None:
+            from gateway.codex_realtime_voice import CodexRealtimeVoiceManager
+
+            manager = CodexRealtimeVoiceManager()
+            self._codex_realtime_voice = manager
+        return manager
+
+    async def _handle_codex_realtime_runtime_failure(
+        self,
+        adapter,
+        guild_id: int,
+        source: SessionSource,
+        reason: str,
+        fallback_to_classic: bool,
+    ) -> None:
+        if fallback_to_classic:
+            return
+        logger.warning(
+            "Codex realtime voice stopped without classic fallback: %s",
+            reason,
+        )
+        try:
+            await adapter.leave_voice_channel(guild_id)
+        except Exception:
+            logger.warning(
+                "Discord leave failed after Codex realtime failure",
+                exc_info=True,
+            )
+        finally:
+            self._voice_mode[
+                self._voice_key(source.platform, source.chat_id)
+            ] = "off"
+            self._save_voice_modes()
+            self._set_adapter_auto_tts_disabled(
+                adapter,
+                source.chat_id,
+                disabled=True,
+            )
+            if hasattr(adapter, "_voice_input_callback"):
+                setattr(adapter, "_voice_input_callback", None)
+            if hasattr(adapter, "_voice_pcm_callback"):
+                setattr(adapter, "_voice_pcm_callback", None)
+
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
         adapter = self._adapter_for_source(event.source)
@@ -15501,9 +15556,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+            adapter._voice_input_callback = (
+                lambda callback_guild_id, callback_user_id, transcript: (
+                    self._handle_voice_channel_input(
+                        callback_guild_id,
+                        callback_user_id,
+                        transcript,
+                        adapter=adapter,
+                    )
+                )
+            )
+        realtime_manager = self._get_codex_realtime_voice_manager()
+        if hasattr(adapter, "_voice_pcm_callback"):
+            setattr(
+                adapter,
+                "_voice_pcm_callback",
+                lambda callback_guild_id, callback_user_id, pcm: (
+                    realtime_manager.push_discord_pcm(
+                        adapter,
+                        callback_guild_id,
+                        callback_user_id,
+                        pcm,
+                    )
+                ),
+            )
         if hasattr(adapter, "_on_voice_disconnect"):
-            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+            adapter._on_voice_disconnect = lambda chat_id: self._handle_voice_timeout_cleanup(
+                chat_id, adapter=adapter
+            )
         # Let the adapter's inactivity timer see the live voice-reply mode so it
         # doesn't disconnect a deliberately text-only (/voice off) session.
         if hasattr(adapter, "_voice_mode_getter"):
@@ -15516,6 +15596,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Failed to join voice channel: %s", e)
             adapter._voice_input_callback = None
+            if hasattr(adapter, "_voice_pcm_callback"):
+                setattr(adapter, "_voice_pcm_callback", None)
             err_lower = str(e).lower()
             if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
                 return (
@@ -15531,12 +15613,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+
+            try:
+                realtime_user_id = int(event.source.user_id or "0")
+            except (TypeError, ValueError):
+                realtime_user_id = 0
+            realtime_result = await realtime_manager.start_for_voice_channel(
+                adapter=adapter,
+                guild_id=guild_id,
+                user_id=realtime_user_id,
+                on_transcript=lambda transcript_user_id, text: (
+                    self._handle_voice_channel_input(
+                        guild_id,
+                        transcript_user_id,
+                        text,
+                        realtime=True,
+                        adapter=adapter,
+                    )
+                ),
+                on_runtime_failure=lambda reason, fallback_to_classic: (
+                    self._handle_codex_realtime_runtime_failure(
+                        adapter,
+                        guild_id,
+                        event.source,
+                        reason,
+                        fallback_to_classic,
+                    )
+                ),
+            )
+            if realtime_result.enabled and not realtime_result.active:
+                realtime_reason = str(
+                    realtime_result.reason or "Codex realtime startup failed"
+                )
+                if not realtime_result.fallback_to_classic:
+                    await self._handle_codex_realtime_runtime_failure(
+                        adapter,
+                        guild_id,
+                        event.source,
+                        realtime_reason,
+                        False,
+                    )
+                    return (
+                        f"Codex Live could not start ({realtime_reason}) and "
+                        "classic fallback is disabled."
+                    )
+                realtime_line = (
+                    f"\nCodex Live unavailable ({realtime_reason}); "
+                    "using classic STT/TTS voice."
+                )
+            elif realtime_result.active:
+                realtime_line = "\nCodex Live realtime voice is active (experimental)."
+            else:
+                realtime_line = ""
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
-                f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
+                "I'll speak my replies and listen to you. Use /voice leave to disconnect."
+                f"{realtime_line}"
             )
-        # Join failed — clear callback
+        # Join failed — clear callbacks
         adapter._voice_input_callback = None
+        if hasattr(adapter, "_voice_pcm_callback"):
+            setattr(adapter, "_voice_pcm_callback", None)
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
@@ -15551,26 +15688,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "Not in a voice channel."
 
         try:
+            await self._get_codex_realtime_voice_manager().stop_for_voice_channel(
+                adapter, guild_id
+            )
+        except Exception:
+            logger.warning(
+                "Codex realtime voice cleanup failed before Discord leave",
+                exc_info=True,
+            )
+        try:
             await adapter.leave_voice_channel(guild_id)
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
-        # Always clean up state even if leave raised an exception
-        self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
+        # Always clean up runner state even if Discord teardown raised.
+        self._voice_mode[
+            self._voice_key(event.source.platform, event.source.chat_id)
+        ] = "off"
         self._save_voice_modes()
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
+        if hasattr(adapter, "_voice_pcm_callback"):
+            setattr(adapter, "_voice_pcm_callback", None)
         return "Left voice channel."
 
-    def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
-        """Called by the adapter when a voice channel times out.
+    def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
+        """Clean runner/provider state after Discord voice inactivity timeout."""
+        if adapter is not None:
+            guild_ids = [
+                guild_id
+                for guild_id, linked_chat_id in getattr(
+                    adapter, "_voice_text_channels", {}
+                ).items()
+                if str(linked_chat_id) == str(chat_id)
+            ]
+            manager = self._get_codex_realtime_voice_manager()
 
-        Cleans up runner-side voice_mode state that the adapter cannot reach.
-        """
+            async def _stop_realtime_voice(guild_id: int) -> None:
+                try:
+                    await manager.stop_for_voice_channel(adapter, guild_id)
+                except Exception:
+                    logger.warning(
+                        "Codex realtime voice timeout cleanup failed",
+                        exc_info=True,
+                    )
+
+            for guild_id in guild_ids:
+                task = asyncio.create_task(_stop_realtime_voice(guild_id))
+                background_tasks = getattr(self, "_background_tasks", None)
+                if isinstance(background_tasks, set):
+                    background_tasks.add(task)
+                    task.add_done_callback(background_tasks.discard)
+
         self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
         self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
-        self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        resolved_adapter = adapter or self.adapters.get(Platform.DISCORD)
+        self._set_adapter_auto_tts_disabled(
+            resolved_adapter, chat_id, disabled=True
+        )
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -15614,14 +15789,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        realtime: bool = False,
+        adapter=None,
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
-        adapter's full message pipeline (session, typing, agent, TTS reply).
+        adapter's full message pipeline. Realtime transcripts use a TEXT event
+        so the classic base-adapter TTS path cannot speak a duplicate reply;
+        the runner routes the final text back through Codex appendSpeech.
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = adapter or self.adapters.get(Platform.DISCORD)
         if not adapter:
             return
 
@@ -15675,8 +15858,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event = MessageEvent(
             source=source,
             text=transcript,
-            message_type=MessageType.VOICE,
-            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            message_type=MessageType.TEXT if realtime else MessageType.VOICE,
+            raw_message=SimpleNamespace(
+                guild_id=guild_id,
+                guild=None,
+                codex_realtime_voice=realtime,
+            ),
         )
 
         await adapter.handle_message(event)
@@ -15704,7 +15891,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
-        is_voice_input = (event.message_type == MessageType.VOICE)
+        is_realtime_voice_input = bool(
+            getattr(event.raw_message, "codex_realtime_voice", False)
+        )
+        is_voice_input = (
+            event.message_type == MessageType.VOICE or is_realtime_voice_input
+        )
 
         should = (
             (voice_mode == "all")
@@ -15730,7 +15922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When streaming already delivered the text (already_sent=True),
         # the base adapter will receive None and can't run auto-TTS,
         # so the runner must take over.
-        if is_voice_input and not already_sent:
+        if is_voice_input and not is_realtime_voice_input and not already_sent:
             return False
 
         return True
@@ -15741,6 +15933,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
+        if event.source.platform == Platform.DISCORD:
+            guild_id = self._get_guild_id(event)
+            adapter = self._adapter_for_source(event.source)
+            realtime_manager = self._get_codex_realtime_voice_manager()
+            voice_text_channels = getattr(adapter, "_voice_text_channels", {})
+            linked_chat_id = (
+                voice_text_channels.get(guild_id)
+                if isinstance(voice_text_channels, dict) and guild_id
+                else None
+            )
+            is_realtime_voice_input = bool(
+                getattr(event.raw_message, "codex_realtime_voice", False)
+            )
+            linked_voice_session = (
+                guild_id
+                and adapter is not None
+                and str(linked_chat_id) == str(event.source.chat_id)
+            )
+            if (
+                linked_voice_session
+                and realtime_manager.is_active(adapter, guild_id)
+            ):
+                fallback_to_classic = realtime_manager.classic_fallback_enabled(
+                    adapter, guild_id
+                )
+                try:
+                    if await realtime_manager.append_speech(
+                        adapter, guild_id, text[:4000]
+                    ):
+                        return
+                except Exception:
+                    logger.warning(
+                        "Codex realtime speech failed (%s)",
+                        (
+                            "using classic TTS fallback"
+                            if fallback_to_classic
+                            else "classic TTS fallback disabled"
+                        ),
+                        exc_info=True,
+                    )
+                if not fallback_to_classic:
+                    return
+            elif (
+                linked_voice_session
+                and is_realtime_voice_input
+                and not realtime_manager.configured_fallback_enabled(adapter)
+            ):
+                # A no-fallback realtime route may fail while Hermes is still
+                # processing its last transcript. Do not leak that reply into
+                # local TTS after the failed session has already been removed.
+                return
+
         import uuid as _uuid
         audio_path = None
         actual_path = None

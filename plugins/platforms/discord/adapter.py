@@ -433,9 +433,15 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(
+        self,
+        voice_client,
+        allowed_user_ids: Optional[set] = None,
+        pcm_callback: Optional[Callable[[int, bytes], bool]] = None,
+    ):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        self._pcm_callback = pcm_callback
         self._running = False
 
         # Decryption
@@ -503,6 +509,23 @@ class VoiceReceiver:
     def map_ssrc(self, ssrc: int, user_id: int):
         with self._lock:
             self._ssrc_to_user[ssrc] = user_id
+
+    def handle_decoded_pcm(self, ssrc: int, pcm: bytes) -> None:
+        """Offer one decoded frame to realtime, else buffer for classic STT."""
+        with self._lock:
+            user_id = self._ssrc_to_user.get(ssrc, 0)
+        if self._pcm_callback is not None:
+            try:
+                # user_id may still be 0 before Discord's SPEAKING mapping
+                # arrives. Realtime routes can consume/drop those early frames
+                # so they never leak into a parallel classic-STT utterance.
+                if self._pcm_callback(user_id, pcm):
+                    return
+            except Exception:
+                logger.debug("Realtime PCM callback failed; using classic STT", exc_info=True)
+        with self._lock:
+            self._buffers[ssrc].extend(pcm)
+            self._last_packet_time[ssrc] = time.monotonic()
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5).
@@ -668,9 +691,7 @@ class VoiceReceiver:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
-            with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+            self.handle_decoded_pcm(ssrc, pcm)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -903,6 +924,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
+        # Sync callback from VoiceReceiver's socket thread. Returning True
+        # means realtime consumed the PCM frame and classic utterance STT must
+        # not buffer it as a duplicate input path.
+        self._voice_pcm_callback: Optional[Callable[[int, int, bytes], bool]] = None
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
         # linked text-channel id; set by run.py. Lets the inactivity timer leave
@@ -3729,7 +3754,13 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ambient_pcm_cache = pcm
         return pcm
 
-    async def _install_voice_mixer(self, guild_id: int, vc) -> None:
+    async def _install_voice_mixer(
+        self,
+        guild_id: int,
+        vc,
+        *,
+        include_ambient: bool = True,
+    ) -> None:
         """Create a VoiceMixer, start the ambient bed, and play it on the VC.
 
         The mixer runs continuously for the life of the connection: one
@@ -3745,7 +3776,11 @@ class DiscordAdapter(BasePlatformAdapter):
             duck_gain=float(self._voice_fx_cfg.get("duck_gain", 0.06)),
             speech_gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)),
         )
-        ambient = await asyncio.to_thread(self._get_ambient_pcm)
+        ambient = (
+            await asyncio.to_thread(self._get_ambient_pcm)
+            if include_ambient
+            else None
+        )
         if ambient:
             mixer.set_ambient(ambient)
 
@@ -3820,6 +3855,39 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    async def ensure_realtime_voice_output(self, guild_id: int) -> bool:
+        """Ensure Discord has one continuous mixer for realtime PCM output."""
+        if self.voice_mixer_active(guild_id):
+            return True
+        vc = self._voice_clients.get(guild_id)
+        if vc is None or not vc.is_connected():
+            return False
+        try:
+            await self._install_voice_mixer(
+                guild_id,
+                vc,
+                include_ambient=bool(self._voice_fx_cfg.get("enabled")),
+            )
+        except Exception:
+            logger.warning("Realtime voice mixer failed to start", exc_info=True)
+            return False
+        return self.voice_mixer_active(guild_id)
+
+    def push_realtime_voice_pcm(self, guild_id: int, pcm: bytes) -> bool:
+        """Append Discord-native PCM to the live WebRTC speech stream."""
+        mixer = self._voice_mixers.get(guild_id)
+        if mixer is None or not pcm:
+            return False
+        if mixer.push_speech_stream("codex-realtime", pcm):
+            # Reset once per speech burst, not once per 20 ms WebRTC packet.
+            self._reset_voice_timeout(guild_id)
+        return True
+
+    def end_realtime_voice_output(self, guild_id: int) -> None:
+        mixer = self._voice_mixers.get(guild_id)
+        if mixer is not None:
+            mixer.end_speech_stream("codex-realtime")
+
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
         if not self._client or not DISCORD_AVAILABLE:
@@ -3843,7 +3911,17 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Start voice receiver (Phase 2: listen to users)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                pcm_callback = None
+                voice_pcm_callback = self._voice_pcm_callback
+                if voice_pcm_callback is not None:
+                    pcm_callback = lambda user_id, pcm: bool(
+                        voice_pcm_callback(guild_id, user_id, pcm)
+                    )
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    pcm_callback=pcm_callback,
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -4012,13 +4090,14 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
             except Exception:
                 pass
-        await self.leave_voice_channel(guild_id)
-        # Notify the runner so it can clean up voice_mode state
+        # Notify the runner while the guild-to-text mapping still exists so it
+        # can stop any provider session before Discord teardown removes it.
         if self._on_voice_disconnect and text_ch_id:
             try:
                 self._on_voice_disconnect(str(text_ch_id))
             except Exception:
                 pass
+        await self.leave_voice_channel(guild_id)
         if text_ch_id and self._client:
             ch = self._client.get_channel(text_ch_id)
             if ch:
@@ -9472,6 +9551,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     seeded_extra = {}
+    realtime_voice_cfg = discord_cfg.get("codex_realtime_voice")
+    if isinstance(realtime_voice_cfg, dict):
+        seeded_extra["codex_realtime_voice"] = dict(realtime_voice_cfg)
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)

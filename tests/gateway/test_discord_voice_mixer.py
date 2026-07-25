@@ -99,6 +99,33 @@ class TestVoiceMixerCore:
         mx.read()
         assert not mx.speech_active
 
+    def test_streamed_speech_accepts_incremental_pcm_without_restarting(self):
+        mx = vm.VoiceMixer()
+        first = (np.ones(vm.SAMPLES_PER_FRAME * 2) * 1000).astype(np.int16).tobytes()
+        second = (np.ones(vm.SAMPLES_PER_FRAME * 2) * 2000).astype(np.int16).tobytes()
+
+        assert mx.push_speech_stream("codex-live", first) is True
+        assert np.frombuffer(mx.read(), dtype=np.int16)[0] == 1000
+        assert mx.push_speech_stream("codex-live", second) is False
+        assert np.frombuffer(mx.read(), dtype=np.int16)[0] == 2000
+        assert mx.speech_active
+
+        mx.end_speech_stream("codex-live")
+        mx.read()
+        assert not mx.speech_active
+
+    def test_streamed_speech_survives_short_network_underflow(self):
+        mx = vm.VoiceMixer()
+        frame = (np.ones(vm.SAMPLES_PER_FRAME * 2) * 500).astype(np.int16).tobytes()
+        mx.push_speech_stream("codex-live", frame)
+        mx.read()
+        # A handful of empty 20 ms mixer reads must not destroy the stream;
+        # the next WebRTC packet should continue in the same child.
+        for _ in range(4):
+            assert mx.read() == vm.SILENCE_FRAME
+        mx.push_speech_stream("codex-live", frame)
+        assert np.frombuffer(mx.read(), dtype=np.int16)[0] == 500
+
     def test_set_ambient_none_clears(self):
         mx = vm.VoiceMixer()
         mx.set_ambient(vm.synth_ambient_pcm(seconds=0.5))
@@ -164,6 +191,30 @@ class TestVoiceMixerActive:
         adapter = _make_adapter()
         adapter._voice_mixers[111] = object()
         assert adapter.voice_mixer_active(111) is True
+
+    @pytest.mark.asyncio
+    async def test_realtime_output_installs_mixer_without_ambient_when_fx_disabled(self):
+        adapter = _make_adapter({
+            "enabled": False,
+            "ambient_enabled": True,
+            "ambient_gain": 0.18,
+            "duck_gain": 0.06,
+            "speech_gain": 1.0,
+        })
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        adapter._voice_clients[111] = vc
+
+        assert await adapter.ensure_realtime_voice_output(111) is True
+        assert adapter.voice_mixer_active(111) is True
+        mixer = adapter._voice_mixers[111]
+        assert mixer._ambient is None
+
+        frame = b"\x00" * vm.FRAME_SIZE
+        assert adapter.push_realtime_voice_pcm(111, frame) is True
+        assert mixer.speech_active is True
+        adapter.end_realtime_voice_output(111)
 
     def test_false_when_attr_missing(self):
         # Defensive getattr path (object.__new__ helper that forgot the attr).
