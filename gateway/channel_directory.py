@@ -265,8 +265,9 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     Uses ``users.conversations`` against each workspace's web client. Pulls
     public + private channels the bot is a member of, then merges in DMs
     discovered from session history (IMs aren't useful to enumerate
-    proactively). If the Slack app lacks channels:read, fall back to session
-    history quietly instead of logging a recurring warning every refresh.
+    proactively). If the Slack app lacks private-channel scopes, retries with
+    public channels only. If public-channel scopes are also absent, falls back
+    to session history quietly instead of logging on every refresh.
     """
     team_clients = getattr(adapter, "_team_clients", None) or {}
     if not team_clients:
@@ -276,49 +277,75 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     seen_ids: set = set()
 
     for team_id, client in team_clients.items():
-        try:
-            cursor: Optional[str] = None
-            for _page in range(20):  # safety cap on pagination
+        cursor: Optional[str] = None
+        conversation_types = "public_channel,private_channel"
+        tried_public_only = False
+        page = 0
+
+        while page < 20:  # safety cap on successful pagination
+            try:
                 response = await client.users_conversations(
-                    types="public_channel,private_channel",
+                    types=conversation_types,
                     exclude_archived=True,
                     limit=200,
                     cursor=cursor,
                 )
-                if not response.get("ok"):
-                    error_code = response.get("error", "unknown")
-                    if error_code == "missing_scope":
-                        logger.debug(
-                            "Channel directory: Slack team %s lacks channels:read; using session history only",
-                            team_id,
-                        )
-                    else:
-                        detail = f"users.conversations not ok: {error_code}"
-                        _warn_slack_directory(team_id, detail)
-                    break
-                for ch in response.get("channels", []):
-                    cid = ch.get("id")
-                    name = ch.get("name")
-                    if not cid or not name or cid in seen_ids:
-                        continue
-                    seen_ids.add(cid)
-                    channels.append({
-                        "id": cid,
-                        "name": name,
-                        "type": "private" if ch.get("is_private") else "channel",
-                    })
-                cursor = (response.get("response_metadata") or {}).get("next_cursor")
-                if not cursor:
-                    break
-        except Exception as e:
-            if _slack_api_error_code(e) == "missing_scope":
-                logger.debug(
-                    "Channel directory: Slack team %s lacks channels:read; using session history only",
-                    team_id,
-                )
-            else:
-                _warn_slack_directory(team_id, str(e))
-            continue
+            except Exception as e:
+                error_code = _slack_api_error_code(e)
+                if error_code == "missing_scope" and not tried_public_only:
+                    conversation_types = "public_channel"
+                    tried_public_only = True
+                    cursor = None
+                    logger.debug(
+                        "Channel directory: Slack team %s lacks private-channel scope; retrying public channels",
+                        team_id,
+                    )
+                    continue
+                if error_code == "missing_scope":
+                    logger.debug(
+                        "Channel directory: Slack team %s lacks channel read scopes; using session history only",
+                        team_id,
+                    )
+                else:
+                    _warn_slack_directory(team_id, str(e))
+                break
+
+            if not response.get("ok"):
+                error_code = response.get("error", "unknown")
+                if error_code == "missing_scope" and not tried_public_only:
+                    conversation_types = "public_channel"
+                    tried_public_only = True
+                    cursor = None
+                    logger.debug(
+                        "Channel directory: Slack team %s lacks private-channel scope; retrying public channels",
+                        team_id,
+                    )
+                    continue
+                if error_code == "missing_scope":
+                    logger.debug(
+                        "Channel directory: Slack team %s lacks channel read scopes; using session history only",
+                        team_id,
+                    )
+                else:
+                    detail = f"users.conversations not ok: {error_code}"
+                    _warn_slack_directory(team_id, detail)
+                break
+
+            page += 1
+            for ch in response.get("channels", []):
+                cid = ch.get("id")
+                name = ch.get("name")
+                if not cid or not name or cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                channels.append({
+                    "id": cid,
+                    "name": name,
+                    "type": "private" if ch.get("is_private") else "channel",
+                })
+            cursor = (response.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
 
     # Merge in DM/group entries discovered from session history.
     # Build a lookup from API-discovered channels so we can enrich session entries.
