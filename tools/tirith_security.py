@@ -740,6 +740,7 @@ def check_command_security(command: str) -> dict:
     global _crash_count, _circuit_open
 
     cfg = _load_security_config()
+    fail_open = cfg["tirith_fail_open"]
 
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
@@ -748,9 +749,13 @@ def check_command_security(command: str) -> dict:
     # stop trying for the rest of the process.  Without this, a corrupted
     # or missing binary causes every tool call to hit the same spawn failure
     # → fail-open → agent retry loop, hanging the user for 20+ minutes
-    # (issue #41400).
+    # (issue #41400).  Honor fail_open here: when fail-closed, block instead
+    # of silently allowing, so a broken tirith can't bypass security
+    # (issue #71350).
     if _circuit_open:
-        return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        if fail_open:
+            return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        return {"action": "block", "findings": [], "summary": "tirith disabled (circuit breaker; fail-closed)"}
 
     # Unsupported platform (Windows etc.) — tirith has no binary here and
     # never will. Skip the resolver entirely so we don't even try to spawn.
@@ -760,7 +765,6 @@ def check_command_security(command: str) -> dict:
 
     tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     timeout = cfg["tirith_timeout"]
-    fail_open = cfg["tirith_fail_open"]
 
     if tirith_path is None:
         _warn_once(
@@ -812,8 +816,14 @@ def check_command_security(command: str) -> dict:
         _crash_count = 0
     elif exit_code == 1:
         action = "block"
+        # Documented verdict (block), not a crash — reset breaker so a run
+        # of legitimate block verdicts can't open it (issue #71350).
+        _crash_count = 0
     elif exit_code == 2:
         action = "warn"
+        # Documented verdict (warn), not a crash — reset breaker for the
+        # same reason as exit code 1 (issue #71350).
+        _crash_count = 0
     else:
         # Unknown exit code (includes signal-killed processes like -11/SIGSEGV)
         # — respect fail_open

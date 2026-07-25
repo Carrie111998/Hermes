@@ -1325,6 +1325,134 @@ class TestSpawnWarningDedup:
 
 
 # ---------------------------------------------------------------------------
+# Circuit breaker + fail_open interaction (issue #71350)
+#
+# When the circuit breaker is open (_circuit_open=True), the short-circuit
+# return must honor tirith_fail_open: fail_open=true allows (fail-open),
+# fail_open=false blocks (fail-closed). Previously the breaker returned
+# allow unconditionally, ignoring fail_open. Additionally, _crash_count
+# must reset on documented verdict exit codes (0/1/2), not just 0, so a
+# run of legitimate block/warn verdicts can't open the breaker.
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreakerFailOpenHonored:
+    """The circuit breaker short-circuit must respect fail_open (#71350)."""
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_breaker_fail_open_true_allows(self, mock_cfg):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._circuit_open = True
+        try:
+            result = check_command_security("echo hi")
+            assert result["action"] == "allow"
+            assert "circuit breaker" in result["summary"]
+            assert "fail-closed" not in result["summary"]
+        finally:
+            _tirith_mod._circuit_open = False
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_breaker_fail_open_false_blocks(self, mock_cfg):
+        """Regression for #71350: fail_open=false must block when breaker open."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": False}
+        _tirith_mod._circuit_open = True
+        try:
+            result = check_command_security("echo hi")
+            assert result["action"] == "block"
+            assert "circuit breaker" in result["summary"]
+            assert "fail-closed" in result["summary"]
+            assert result["findings"] == []
+        finally:
+            _tirith_mod._circuit_open = False
+
+
+class TestCircuitBreakerCrashCountResetOnVerdicts:
+    """_crash_count must reset on documented verdict exits (0/1/2), not just 0
+    (#71350).  Exit codes 1 (block) and 2 (warn) are documented tirith
+    verdict outcomes, not crashes — a run of them must not open the breaker."""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    @patch("tools.tirith_security.is_platform_supported", return_value=True)
+    def test_block_verdict_resets_crash_count(self, _mock_plat, mock_cfg, mock_run):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._resolved_path = "tirith"
+        _tirith_mod._crash_count = _tirith_mod._CRASH_LIMIT - 1
+        mock_run.return_value = _mock_run(1, _json_stdout(
+            [{"rule_id": "homograph_url"}], "blocked"))
+        try:
+            result = check_command_security("bad cmd")
+            assert result["action"] == "block"
+            # Exit code 1 is a verdict, not a crash — counter resets.
+            assert _tirith_mod._crash_count == 0
+            assert _tirith_mod._circuit_open is False
+        finally:
+            _tirith_mod._crash_count = 0
+            _tirith_mod._circuit_open = False
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    @patch("tools.tirith_security.is_platform_supported", return_value=True)
+    def test_warn_verdict_resets_crash_count(self, _mock_plat, mock_cfg, mock_run):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._resolved_path = "tirith"
+        _tirith_mod._crash_count = _tirith_mod._CRASH_LIMIT - 1
+        mock_run.return_value = _mock_run(2, _json_stdout(
+            [{"rule_id": "shortened_url"}], "warned"))
+        try:
+            result = check_command_security("suspicious cmd")
+            assert result["action"] == "warn"
+            # Exit code 2 is a verdict, not a crash — counter resets.
+            assert _tirith_mod._crash_count == 0
+            assert _tirith_mod._circuit_open is False
+        finally:
+            _tirith_mod._crash_count = 0
+            _tirith_mod._circuit_open = False
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    @patch("tools.tirith_security.is_platform_supported", return_value=True)
+    def test_repeated_block_verdicts_do_not_open_breaker(self, _mock_plat, mock_cfg, mock_run):
+        """A run of legitimate block verdicts must never trip the breaker."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._resolved_path = "tirith"
+        mock_run.return_value = _mock_run(1, _json_stdout(
+            [{"rule_id": "homograph_url"}], "blocked"))
+        try:
+            for _ in range(_tirith_mod._CRASH_LIMIT * 3):
+                result = check_command_security("bad cmd")
+                assert result["action"] == "block"
+            # Breaker must remain closed despite many block verdicts.
+            assert _tirith_mod._circuit_open is False
+            assert _tirith_mod._crash_count == 0
+        finally:
+            _tirith_mod._crash_count = 0
+            _tirith_mod._circuit_open = False
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    @patch("tools.tirith_security.is_platform_supported", return_value=True)
+    def test_unknown_exit_code_still_increments_crash_count(self, _mock_plat, mock_cfg, mock_run):
+        """Unknown exit codes (99, signals) are real crashes and must still
+        count toward the breaker, unlike documented verdicts 0/1/2."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._resolved_path = "tirith"
+        mock_run.return_value = _mock_run(99, "")
+        try:
+            result = check_command_security("cmd")
+            assert result["action"] == "allow"
+            assert _tirith_mod._crash_count == 1
+        finally:
+            _tirith_mod._crash_count = 0
+            _tirith_mod._circuit_open = False
+
+
+# ---------------------------------------------------------------------------
 # .app TLD suppression (issue #24461)
 # ---------------------------------------------------------------------------
 
