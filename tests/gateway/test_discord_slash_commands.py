@@ -202,9 +202,19 @@ async def test_auto_registers_missing_gateway_commands(adapter):
 
     # These commands are gateway-available but were not in the original
     # hardcoded registration list — they should be auto-registered.
-    expected_auto = {"debug", "yolo", "profile"}
+    # `clear` is a gateway-only alias of `new` and must surface natively.
+    expected_auto = {"clear", "debug", "yolo", "profile"}
     for name in expected_auto:
         assert name in tree_names, f"/{name} should be auto-registered on Discord"
+
+    # Regular aliases stay typed-only: the auto-loop must NOT turn them into
+    # native slashes, matching Telegram/Slack canonical-only menus and the
+    # internal-alias hiding in gateway_help_lines(). Only gateway_aliases
+    # (e.g. clear) surface. `bg` (alias of background) and the internal
+    # underscore variant `reload_mcp` are not hardcoded native commands, so
+    # their absence proves the auto-loop stays scoped to gateway_aliases.
+    assert "bg" not in tree_names, "/bg is a regular alias — must stay typed-only"
+    assert "reload_mcp" not in tree_names, "internal underscore alias must not surface"
 
 
 @pytest.mark.asyncio
@@ -219,6 +229,11 @@ async def test_auto_registered_command_dispatches_correctly(adapter):
     adapter._run_simple_slash.reset_mock()
     await debug_cmd.callback(interaction)
     adapter._run_simple_slash.assert_awaited_once_with(interaction, "/debug")
+
+    clear_cmd = adapter._client.tree.commands["clear"]
+    adapter._run_simple_slash.reset_mock()
+    await clear_cmd.callback(interaction, args="next")
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/clear next")
 
 
 @pytest.mark.asyncio
