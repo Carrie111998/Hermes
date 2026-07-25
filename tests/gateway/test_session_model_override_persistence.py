@@ -223,6 +223,35 @@ def test_runner_rehydrate_survives_credential_resolution_failure(store_factory):
     assert override.get("api_key") is None
 
 
+def test_rehydrate_forwards_target_model_to_provider_resolution(store_factory):
+    """Regression: rehydration must pass the model name through so that
+    aggregator providers (e.g. opencode-zen/go) resolve the correct
+    per-model api_mode.  Refs #70153."""
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    store.set_model_override(session_key, OVERRIDE)
+
+    runner = _make_runner(store_factory())
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "api_key": "sk-fresh",
+            "api_mode": "chat_completions",  # correct for this model
+            "base_url": "https://api.opencode.example/v1",
+            "provider": "opencode-go",
+        },
+    ) as mock_resolve:
+        runner._rehydrate_session_model_override(session_key)
+
+    # The model name must be forwarded as target_model so the provider
+    # resolver can select the right transport.
+    mock_resolve.assert_called_once_with("openai", target_model="gpt-5o")
+
+    override = runner._session_model_overrides[session_key]
+    assert override["api_mode"] == "chat_completions"
+
+
 def test_sanitize_model_override():
     assert sanitize_model_override(None) is None
     assert sanitize_model_override({}) is None
