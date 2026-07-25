@@ -3639,11 +3639,15 @@ def create_task(
     config — passed to the worker as ``-m <model> [--provider <name>]``.
     ``provider_override`` requires ``model_override``.
 
-    ``project_source_task_id`` is an internal cross-profile fallback for a
-    worker-created child. When the active profile cannot resolve ``project_id``
-    in its own projects.db, a matching canonical project-linked task in this
-    board can supply the repo and branch convention. Its literal worktree is
-    never reused; the new task still gets its own task-id-keyed path.
+    ``project_source_task_id`` is a legacy internal cross-profile fallback for
+    historical provenance verification. When the active profile cannot resolve
+    ``project_id`` in its own projects.db, a matching canonical project-linked
+    task in this board can supply the repo and branch convention. Its literal
+    worktree is never reused; the new task still gets its own task-id-keyed
+    path. This retained path does not grant current dispatcher-spawned leaf
+    workers topology authority: they cannot create, link, assign, or
+    review-route follow-up tasks; those graph mutations belong to foreground
+    control-plane orchestration.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3688,12 +3692,13 @@ def create_task(
         except Exception:
             project_obj = None
         if project_obj is None and project_source_task_id:
-            # Worker profiles have their own projects.db, while the Kanban DB is
-            # intentionally shared. Recover routing only from a canonical
-            # project-linked source task in this same board. This carries the
-            # repo + project branch convention forward without copying or
-            # opening the creator profile's project store, and without reusing
-            # the source task's literal worktree path.
+            # The active profile may have its own projects.db, while the Kanban
+            # DB is intentionally shared. For this legacy provenance fallback,
+            # recover routing only from a canonical project-linked source task
+            # in this same board. This carries the repo + project branch
+            # convention forward without copying or opening another profile's
+            # project store, and without reusing the source task's literal
+            # worktree path.
             source_task = get_task(conn, str(project_source_task_id))
             if (
                 source_task is not None
@@ -6920,22 +6925,22 @@ def _verify_created_cards(
     """Partition ``claimed_ids`` into (verified, phantom).
 
     A card is "verified" iff a row exists in ``tasks`` AND at least one
-    of the following holds:
+    of the following legacy/historical provenance checks holds:
 
     * ``created_by`` matches the completing task's ``assignee`` profile
-      (the common case: worker A spawns a card via ``kanban_create``,
-      which stamps ``created_by=A``).
+      (compatibility with historical creator-profile provenance).
     * ``created_by`` matches the completing task's id (edge case where
-      a worker passed its own task id as the ``created_by`` value).
+      an older caller passed its own task id as the ``created_by`` value).
     * The card is linked as a ``task_links.child`` of the completing
-      task — i.e. the worker explicitly called ``kanban_create`` with
-      ``parents=[<current_task>]``. This accepts cards created through
+      task (historical lineage evidence). This accepts cards created through
       the dashboard/CLI by a different principal but then attached to
-      the completing task by the worker.
+      the completing task.
 
     ``phantom`` returns ids that either don't exist at all, or exist
     but don't satisfy any of the three trust conditions. The caller
-    decides what to do with each bucket; this helper never mutates.
+    decides what to do with each bucket; this helper never mutates. The checks
+    preserve historical completion handoffs; current dispatcher-spawned leaf
+    workers cannot create, link, assign, or review-route follow-up topology.
     """
     claimed = [str(x).strip() for x in (claimed_ids or []) if str(x).strip()]
     if not claimed:
@@ -7028,7 +7033,7 @@ def _scan_prose_for_phantom_ids(
 
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
-    that don't exist or weren't created by the completing worker.
+    that don't exist or fail the retained historical provenance checks.
 
     The phantom list is attached as ``.phantom`` for callers that want
     structured access. Kept as ``ValueError`` subclass so existing
@@ -7040,7 +7045,7 @@ class HallucinatedCardsError(ValueError):
         self.completing_task_id = completing_task_id
         super().__init__(
             f"completion blocked: claimed created_cards that do not exist "
-            f"or were not created by this worker: {', '.join(phantom)}"
+            f"or lack verified historical provenance: {', '.join(phantom)}"
         )
 
 
@@ -7073,14 +7078,16 @@ def complete_task(
     (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
     are encouraged to use it for structured handoff facts.
 
-    ``created_cards`` is an optional list of task ids the completing
-    worker claims to have created. Each id is verified against
-    ``tasks.created_by``. If any id is phantom (does not exist or was
-    not created by this worker's assignee profile), completion is blocked
+    ``created_cards`` is an optional list of task ids supplied by a completing
+    caller for legacy/historical provenance verification. Each id is checked
+    against ``tasks.created_by`` and historical child-link evidence. If any id
+    is phantom (does not exist or fails those checks), completion is blocked
     with a ``HallucinatedCardsError`` and a
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
-    ``completed`` event payload.
+    ``completed`` event payload. This compatibility field does not authorize
+    current dispatcher-spawned leaf workers to create, link, assign, or
+    review-route follow-up topology.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
