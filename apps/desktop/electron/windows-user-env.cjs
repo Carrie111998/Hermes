@@ -57,7 +57,8 @@ function readWindowsUserEnvVar(
     stdout = exec('reg', ['query', 'HKCU\\Environment', '/v', name], {
       encoding: 'utf8',
       windowsHide: true,
-      timeout: 5000
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore']
     })
   } catch {
     // `reg` missing, or value absent (reg exits 1) — caller falls back.

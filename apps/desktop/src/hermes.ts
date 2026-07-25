@@ -268,7 +268,8 @@ export function renameSession(
 export function getGlobalModelInfo(): Promise<ModelInfoResponse> {
   return window.hermesDesktop.api<ModelInfoResponse>({
     ...profileScoped(),
-    path: '/api/model/info'
+    path: '/api/model/info',
+    timeoutMs: 45_000
   })
 }
 
@@ -330,14 +331,16 @@ export function getHermesConfigRecord(): Promise<HermesConfigRecord> {
 export function getHermesConfigDefaults(): Promise<HermesConfigRecord> {
   return window.hermesDesktop.api<HermesConfigRecord>({
     ...profileScoped(),
-    path: '/api/config/defaults'
+    path: '/api/config/defaults',
+    timeoutMs: 45_000
   })
 }
 
 export function getHermesConfigSchema(): Promise<ConfigSchemaResponse> {
   return window.hermesDesktop.api<ConfigSchemaResponse>({
     ...profileScoped(),
-    path: '/api/config/schema'
+    path: '/api/config/schema',
+    timeoutMs: 45_000
   })
 }
 
@@ -370,7 +373,8 @@ export function saveMemoryProviderConfig(
 export function getEnvVars(): Promise<Record<string, EnvVarInfo>> {
   return window.hermesDesktop.api<Record<string, EnvVarInfo>>({
     ...profileScoped(),
-    path: '/api/env'
+    path: '/api/env',
+    timeoutMs: 45_000
   })
 }
 

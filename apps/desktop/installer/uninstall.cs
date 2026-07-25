@@ -113,6 +113,34 @@ class Uninstaller
         }
         catch { Console.WriteLine(" 跳过"); }
 
+        // 6. Clean up QIJI_HOME data directory (%LOCALAPPDATA%\qiji)
+        Console.Write("  清理数据目录...");
+        try
+        {
+            string qijiHome = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "qiji");
+            if (Directory.Exists(qijiHome))
+                Directory.Delete(qijiHome, true);
+            Console.WriteLine(" 完成");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(" 部分失败");
+            Console.WriteLine("    " + ex.Message);
+        }
+
+        // 7. Remove QIJI_HOME env var from registry
+        Console.Write("  清理环境变量...");
+        try
+        {
+            Registry.CurrentUser.DeleteSubKey(
+                @"Environment\QIJI_HOME", false);
+            // Also try the typed API (more reliable on some Windows versions)
+            Environment.SetEnvironmentVariable("QIJI_HOME", null, EnvironmentVariableTarget.User);
+            Console.WriteLine(" 完成");
+        }
+        catch { Console.WriteLine(" 跳过"); }
+
         Console.WriteLine();
         Console.WriteLine("  ============================================");
         Console.WriteLine("            卸载完成！");

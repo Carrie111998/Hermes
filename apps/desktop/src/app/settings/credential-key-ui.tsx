@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { translateNow, useI18n } from '@/i18n'
 import { ChevronDown, ExternalLink, Loader2, Save } from '@/lib/icons'
+import { providerDisplayName } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
 import type { EnvVarInfo } from '@/types/hermes'
 
@@ -269,7 +270,7 @@ export function ProviderKeyRows({ expanded, group, onExpand, onToggle, rowProps 
           />
 
           <span className="min-w-0 truncate text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
-            {group.name}
+            {providerDisplayName(group.name)}
           </span>
 
           {expandable && (
@@ -293,7 +294,7 @@ export function ProviderKeyRows({ expanded, group, onExpand, onToggle, rowProps 
         >
           <KeyField
             info={group.primary[1]}
-            placeholder={t.settings.credentials.pasteLabelKey(group.name)}
+            placeholder={t.settings.credentials.pasteLabelKey(providerDisplayName(group.name))}
             rowProps={rowProps}
             varKey={group.primary[0]}
           />

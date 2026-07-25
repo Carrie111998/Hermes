@@ -70,10 +70,10 @@ DEFAULT_CATALOG_URL = (
 # stale and new model releases never reach the picker. The raw GitHub URL
 # is the same manifest published from the same repo and is not bot-gated,
 # so we fall through to it whenever the primary URL fails.
-DEFAULT_CATALOG_FALLBACK_URLS: tuple[str, ...] = (
-    "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/static/api/model-catalog.json",
-)
-DEFAULT_TTL_HOURS = 1
+# Qiji white-label: no raw.githubusercontent.com fallback — it's GFW-blocked
+# in China and the 30-60s TCP connect timeout stalls the event loop.
+DEFAULT_CATALOG_FALLBACK_URLS: tuple[str, ...] = ()
+DEFAULT_TTL_HOURS = 24
 DEFAULT_FETCH_TIMEOUT = 8.0
 SUPPORTED_SCHEMA_VERSION = 1
 

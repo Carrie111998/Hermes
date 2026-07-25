@@ -191,7 +191,19 @@ class Launcher
         Console.WriteLine("首次启动需要初始化后端环境，请耐心等待 1-2 分钟。");
         Console.WriteLine();
         Console.WriteLine("正在启动奇计...");
-        Process.Start(appExe);
+        // UseShellExecute=true launches Qiji.exe as a detached process via the
+        // Windows shell. This prevents the installer's console window from
+        // staying open as a parent of the Qiji process.
+        var launchPsi = new ProcessStartInfo
+        {
+            FileName = appExe,
+            WorkingDirectory = appDir,
+            UseShellExecute = true
+        };
+        Process.Start(launchPsi);
+
+        // Brief pause so the user sees "启动成功" before the window closes.
+        System.Threading.Thread.Sleep(2000);
     }
 
     static void CreateShortcut(string shortcutPath, string targetPath, string workingDir)

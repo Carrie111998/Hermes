@@ -23,8 +23,8 @@ param(
     # exact ref.  Precedence: Commit > Tag > Branch.
     [string]$Commit = "",
     [string]$Tag = "",
-    [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }),
-    [string]$InstallDir = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\hermes\hermes-agent" }),
+    [string]$HermesHome = $(if ($env:QIJI_HOME) { $env:QIJI_HOME } elseif ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\qiji" }),
+    [string]$InstallDir = $(if ($env:QIJI_HOME) { "$env:QIJI_HOME\hermes-agent" } elseif ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\qiji\hermes-agent" }),
 
     # --- Stage protocol (additive; default invocation behaves as before) ----
     # See the "Stage protocol" section near the bottom of the file for the
@@ -2427,14 +2427,16 @@ function Set-PathVariable {
     }
     
     # Set HERMES_HOME so the Python code finds config/data in the right place.
-    # Only needed on Windows where we install to %LOCALAPPDATA%\hermes instead
-    # of the Unix default ~/.hermes
-    $currentHermesHome = [Environment]::GetEnvironmentVariable("HERMES_HOME", "User")
-    if (-not $currentHermesHome -or $currentHermesHome -ne $HermesHome) {
-        [Environment]::SetEnvironmentVariable("HERMES_HOME", $HermesHome, "User")
-        Write-Success "Set HERMES_HOME=$HermesHome"
+    # Only needed on Windows where we install to %LOCALAPPDATA%\qiji instead
+    # of the Unix default ~/.qiji
+    $currentQijiHome = [Environment]::GetEnvironmentVariable("QIJI_HOME", "User")
+    if (-not $currentQijiHome -or $currentQijiHome -ne $HermesHome) {
+        [Environment]::SetEnvironmentVariable("QIJI_HOME", $HermesHome, "User")
+        Write-Success "Set QIJI_HOME=$HermesHome"
     }
+    # Also set HERMES_HOME for backwards compat (hermes CLI still reads it)
     $env:HERMES_HOME = $HermesHome
+    $env:QIJI_HOME = $HermesHome
     
     # Update current session
     $env:Path = "$hermesBin;$env:Path"

@@ -546,7 +546,7 @@ export function Picker({ ctx }: { ctx: OnboardingContext }) {
 // this form lets them paste it immediately without hunting for where to go.
 function RelayInlineForm({ ctx }: { ctx: OnboardingContext }) {
   const { t } = useI18n()
-  const [baseUrl, setBaseUrl] = useState('https://www.aicps.vip')
+  const [baseUrl, setBaseUrl] = useState('https://www.aicps.vip/v1')
   const [apiKey, setApiKey] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<null | string>(null)
@@ -557,7 +557,7 @@ function RelayInlineForm({ ctx }: { ctx: OnboardingContext }) {
     if (!canSave || saving) return
     setSaving(true)
     setError(null)
-    const url = baseUrl.trim() || 'https://www.aicps.vip'
+    const url = baseUrl.trim() || 'https://www.aicps.vip/v1'
     const result = await saveOnboardingApiKey('OPENAI_BASE_URL', url, '奇计中转站', ctx, apiKey.trim())
     if (!result.ok) {
       setError(result.message ?? '配置失败')
@@ -576,7 +576,7 @@ function RelayInlineForm({ ctx }: { ctx: OnboardingContext }) {
         className="font-mono"
         onChange={e => setBaseUrl(e.target.value)}
         onKeyDown={e => e.key === 'Enter' && void submit()}
-        placeholder="https://www.aicps.vip"
+        placeholder="https://www.aicps.vip/v1"
         type="text"
         value={baseUrl}
       />
@@ -789,7 +789,7 @@ export function ApiKeyForm({
   // slot for the base URL so the existing isLocal-style two-field rendering
   // kicks in.
   const showsBaseUrl = isLocal || isQijiRelay
-  const [relayBaseUrl, setRelayBaseUrl] = useState('https://www.aicps.vip')
+  const [relayBaseUrl, setRelayBaseUrl] = useState('https://www.aicps.vip/v1')
   const alreadySet = isSet?.(option.envKey) ?? false
   // When set, surface the backend's redacted value (e.g. "sk-12…wxyz") as the
   // placeholder so users can eyeball that the right key is in place.
@@ -811,7 +811,7 @@ export function ApiKeyForm({
     // We write OPENAI_BASE_URL with the URL, and pass the API key as the
     // optional `apiKey` arg so onSave can also persist OPENAI_API_KEY.
     if (isQijiRelay) {
-      const baseUrl = relayBaseUrl.trim() || 'https://www.aicps.vip'
+      const baseUrl = relayBaseUrl.trim() || 'https://www.aicps.vip/v1'
       const result = await onSave('OPENAI_BASE_URL', baseUrl, option.name, value)
       if (!result.ok) {
         setError(result.message ?? '配置失败')
@@ -886,7 +886,7 @@ export function ApiKeyForm({
           onKeyDown={e => e.key === 'Enter' && void submit()}
           placeholder={
             isQijiRelay
-              ? 'https://www.aicps.vip'
+              ? 'https://www.aicps.vip/v1'
               : currentRedacted ??
                 (alreadySet ? t.onboarding.replaceCurrent : option.placeholder || t.onboarding.pasteApiKey)
           }

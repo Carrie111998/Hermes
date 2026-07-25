@@ -3318,6 +3318,9 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
 
     Also surfaces ``model_context_length`` as a top-level field so the web UI can
     display and edit it.  A value of 0 means "auto-detect".
+
+    Similarly surfaces ``model_provider`` and ``model_base_url`` so the frontend
+    can detect a configured custom/relay endpoint without reading raw YAML.
     """
     config = dict(config)  # shallow copy
     model_val = config.get("model")
@@ -3326,6 +3329,8 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
         ctx_len = model_val.get("context_length", 0)
         config["model"] = model_val.get("default", model_val.get("name", ""))
         config["model_context_length"] = ctx_len if isinstance(ctx_len, int) else 0
+        config["model_provider"] = model_val.get("provider", "")
+        config["model_base_url"] = model_val.get("base_url", "")
     else:
         config["model_context_length"] = 0
     return config

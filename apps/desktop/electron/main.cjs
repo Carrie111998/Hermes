@@ -2,9 +2,10 @@
 // CP936 on Chinese locale). Node writes UTF-8, so Chinese strings in error
 // messages and log output appear as mojibake (锟斤拷). Switch the console to
 // UTF-8 (CP65001) as early as possible. This is a no-op on macOS/Linux.
+// Avoid shell:true (DEP0190 + leaks cmd.exe output to inherited console).
 if (process.platform === 'win32') {
   try {
-    require('node:child_process').execFileSync('chcp', ['65001'], { stdio: 'ignore', shell: true })
+    require('node:child_process').execFileSync('chcp.com', ['65001'], { stdio: 'ignore' })
   } catch { /* non-fatal — console may not exist in some contexts */ }
 }
 
@@ -253,43 +254,36 @@ if (INSTALL_STAMP) {
   )
 }
 
-// HERMES_HOME — the user-facing root for everything Hermes-related. Mirrors
-// scripts/install.ps1's $HermesHome and scripts/install.sh's $HERMES_HOME.
+// QIJI_HOME — the user-facing root for everything Qiji-related.
+// Isolated from upstream Hermes (%LOCALAPPDATA%\hermes) so the two products
+// don't share a Python venv, repo checkout, config, or sessions.
 //
-// Defaults:
-//   Windows: %LOCALAPPDATA%\hermes (matches install.ps1)
-//   macOS / Linux: ~/.hermes (matches install.sh)
-//
-// Special case for Windows: if the user has a legacy ~/.hermes directory
-// (e.g., from a prior pip install or a manual setup) AND no
-// %LOCALAPPDATA%\hermes yet, prefer the legacy path so we don't orphan their
-// existing config / sessions / .env. New installs go to %LOCALAPPDATA%.
+// Resolution order:
+//   1. QIJI_HOME env var (explicit override)
+//   2. HERMES_HOME env var (backwards compat with existing deployments)
+//   3. Registry HKCU\Environment\QIJI_HOME (survives Explorer's stale env)
+//   4. %LOCALAPPDATA%\qiji (Windows) / ~/.qiji (macOS/Linux)
 //
 // HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
-// HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
-// touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
+// beneath the throwaway userData dir so a fresh-install run never touches the
+// user's real data.
 function resolveHermesHome() {
+  if (process.env.QIJI_HOME) return normalizeHermesHomeRoot(process.env.QIJI_HOME)
   if (process.env.HERMES_HOME) return normalizeHermesHomeRoot(process.env.HERMES_HOME)
   if (USER_DATA_OVERRIDE) return path.join(path.resolve(USER_DATA_OVERRIDE), 'hermes-home')
   if (IS_WINDOWS) {
     // A GUI app launched from Explorer inherits the environment block captured
-    // at login, so a HERMES_HOME set via `setx` AFTER login is invisible in
-    // process.env even though the CLI (a fresh shell) sees it. Without this the
-    // backend silently falls back to %LOCALAPPDATA%\hermes and reports "No
-    // inference provider configured" despite a valid configured home (#45471).
-    // Consult the live User-scoped registry value before the default below.
-    const fromRegistry = readWindowsUserEnvVar('HERMES_HOME')
-    if (fromRegistry) return normalizeHermesHomeRoot(fromRegistry)
+    // at login, so an env var set via `setx` AFTER login is invisible in
+    // process.env. Consult the live User-scoped registry value.
+    const fromRegistryQiji = readWindowsUserEnvVar('QIJI_HOME')
+    if (fromRegistryQiji) return normalizeHermesHomeRoot(fromRegistryQiji)
+    const fromRegistryHermes = readWindowsUserEnvVar('HERMES_HOME')
+    if (fromRegistryHermes) return normalizeHermesHomeRoot(fromRegistryHermes)
   }
   if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
-    const legacy = path.join(app.getPath('home'), '.hermes')
-    // Migrate transparently to LOCALAPPDATA, but honour an existing legacy
-    // ~/.hermes setup (no LOCALAPPDATA install yet) so users don't lose state.
-    if (!directoryExists(localappdata) && directoryExists(legacy)) return legacy
-    return localappdata
+    return path.join(process.env.LOCALAPPDATA, 'qiji')
   }
-  return path.join(app.getPath('home'), '.hermes')
+  return path.join(app.getPath('home'), '.qiji')
 }
 
 const HERMES_HOME = resolveHermesHome()
@@ -1447,15 +1441,13 @@ function findGitBash() {
     return findOnPath('bash')
   }
 
-  // install.ps1 drops PortableGit at %LOCALAPPDATA%\hermes\git\... — checked
+  // install.ps1 drops PortableGit at HERMES_HOME\git\... — checked
   // first so users who installed via install.ps1 are detected before we
   // start probing system-wide locations.
   const localAppData = process.env.LOCALAPPDATA || ''
   const candidates = []
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'bin', 'bash.exe'))
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'usr', 'bin', 'bash.exe'))
-  }
+  candidates.push(path.join(HERMES_HOME, 'git', 'bin', 'bash.exe'))
+  candidates.push(path.join(HERMES_HOME, 'git', 'usr', 'bin', 'bash.exe'))
 
   // Standard Git for Windows install locations.
   candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'))
@@ -1479,7 +1471,7 @@ function getVenvPython(venvRoot) {
 }
 
 // resolveGitBinary — locate git.exe on Windows. A fresh installer-driven
-// install only has PortableGit under %LOCALAPPDATA%\hermes\git (never on
+// install only has PortableGit under HERMES_HOME\git (never on
 // PATH), so a bare spawn('git') ENOENTs and self-update checks fail with
 // "Couldn't check for updates". Mirror findGitBash: PortableGit first, then
 // standard Git-for-Windows locations, then PATH. Cached after first probe.
@@ -1493,10 +1485,8 @@ function resolveGitBinary() {
 
   const localAppData = process.env.LOCALAPPDATA || ''
   const candidates = []
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'cmd', 'git.exe'))
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'bin', 'git.exe'))
-  }
+  candidates.push(path.join(HERMES_HOME, 'git', 'cmd', 'git.exe'))
+  candidates.push(path.join(HERMES_HOME, 'git', 'bin', 'git.exe'))
   candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'cmd', 'git.exe'))
   candidates.push(path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'cmd', 'git.exe'))
   if (localAppData) {
@@ -5223,6 +5213,7 @@ async function spawnPoolBackend(profile, entry) {
       env: {
         ...process.env,
         HERMES_HOME,
+        QIJI_HOME: HERMES_HOME,
         ...backend.env,
         // Pin the gateway's tool/terminal cwd to the same directory we chose for
         // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
@@ -7012,7 +7003,7 @@ async function getUninstallSummary() {
         ['-m', 'hermes_cli.main', 'uninstall', '--gui-summary'],
         hiddenWindowsChildOptions({
           cwd: agentRoot,
-          env: { ...process.env, HERMES_HOME, NO_COLOR: '1' },
+          env: { ...process.env, HERMES_HOME, QIJI_HOME: HERMES_HOME, NO_COLOR: '1' },
           stdio: ['ignore', 'pipe', 'ignore']
         })
       )

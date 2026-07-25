@@ -428,7 +428,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             <SelectContent>
               {providerOptions.map(provider => (
                 <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
-                  {providerDisplayName(provider.name)}
+                  {providerDisplayName(provider.slug || provider.name)}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -460,7 +460,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
               </>
             ) : (
               <Button onClick={startProviderSetup} size="sm" variant="textStrong">
-                {m.setUp(selectedProviderRow?.name ?? 'provider')}
+                {m.setUp(providerDisplayName(selectedProviderRow?.slug ?? selectedProviderRow?.name ?? 'provider'))}
               </Button>
             )
           ) : (
@@ -491,8 +491,8 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         {needsSetup && !setupIsApiKey && (
           <p className="mt-2 text-xs text-muted-foreground">
             {selectedProviderRow?.auth_type === 'api_key'
-              ? m.needsApiKey(selectedProviderRow?.name ?? '')
-              : m.signInBrowser(selectedProviderRow?.name ?? '')}
+              ? m.needsApiKey(providerDisplayName(selectedProviderRow?.slug ?? selectedProviderRow?.name ?? ''))
+              : m.signInBrowser(providerDisplayName(selectedProviderRow?.slug ?? selectedProviderRow?.name ?? ''))}
           </p>
         )}
         {config && mainModel && (reasoningSupported || fastSupported) && (
@@ -609,7 +609,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                         <SelectContent>
                           {providerOptions.map(provider => (
                             <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
-                              {provider.name}
+                              {providerDisplayName(provider.slug || provider.name)}
                             </SelectItem>
                           ))}
                         </SelectContent>

@@ -319,8 +319,19 @@ function spawnPowerShell(scriptPath, args, { emit, stageName, abortSignal, herme
     // as GBK and get mojibake'd by the 'utf8' stream decoder below.
     // Using -Command with proper quoting instead of -File so we can set
     // [Console]::OutputEncoding before the script runs.
+    //
+    // CRITICAL: In -Command mode with the & call operator, args starting with
+    // '-' (e.g. -Manifest, -VendorDir, -Commit) MUST NOT be single-quoted.
+    // PowerShell treats '-VendorDir' (quoted) as a positional string value,
+    // not a named parameter.  Only quote VALUES (paths, hashes, etc.).
     const quotedScript = "'" + scriptPath.replace(/'/g, "''") + "'"
-    const quotedArgs = args.map(a => "'" + String(a).replace(/'/g, "''") + "'").join(' ')
+    const quotedArgs = args.map(a => {
+      const s = String(a)
+      // Named parameters (start with -) must stay unquoted so PowerShell
+      // binds them as parameter names, not positional string values.
+      if (s.startsWith('-') && !s.includes(' ')) return s
+      return "'" + s.replace(/'/g, "''") + "'"
+    }).join(' ')
     const fullArgs = [
       '-NoProfile', '-ExecutionPolicy', 'Bypass',
       '-Command',
@@ -331,9 +342,10 @@ function spawnPowerShell(scriptPath, args, { emit, stageName, abortSignal, herme
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        // Pass HERMES_HOME through so install.ps1 respects the caller's
+        // Pass home dir through so install.ps1 respects the caller's
         // choice rather than re-computing the default.
-        HERMES_HOME: hermesHome || process.env.HERMES_HOME || ''
+        HERMES_HOME: hermesHome || process.env.HERMES_HOME || '',
+        QIJI_HOME: hermesHome || process.env.QIJI_HOME || ''
       }
     }))
 
@@ -406,7 +418,8 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        HERMES_HOME: hermesHome || process.env.HERMES_HOME || ''
+        HERMES_HOME: hermesHome || process.env.HERMES_HOME || '',
+        QIJI_HOME: hermesHome || process.env.QIJI_HOME || ''
       }
     })
 
@@ -500,11 +513,12 @@ function buildPosixPinArgs({ installStamp, activeRoot, hermesHome }) {
   return args
 }
 
-async function fetchManifest({ scriptPath, installerKind, emit, hermesHome, activeRoot, installStamp }) {
+async function fetchManifest({ scriptPath, installerKind, emit, hermesHome, activeRoot, installStamp, vendorDir }) {
   const isPosix = installerKind === 'posix'
+  const vendorArgs = (!isPosix && vendorDir) ? ['-VendorDir', vendorDir] : []
   const args = isPosix
     ? ['--manifest', ...buildPosixPinArgs({ installStamp, activeRoot, hermesHome })]
-    : ['-Manifest', ...buildPinArgs(installStamp)]
+    : ['-Manifest', ...vendorArgs, ...buildPinArgs(installStamp)]
   const result = await (isPosix ? spawnBash : spawnPowerShell)(scriptPath, args, {
     emit,
     stageName: '__manifest__',
@@ -701,7 +715,8 @@ async function runBootstrap(opts) {
       emit,
       hermesHome,
       activeRoot,
-      installStamp
+      installStamp,
+      vendorDir
     })
     emit({
       type: 'manifest',

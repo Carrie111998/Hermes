@@ -138,3 +138,5 @@ RELEASE_v*.md
 # walkthroughs). Throwaway artifacts, never part of the app.
 apps/desktop/demo/
 .history/
+-Commit/
+.build/

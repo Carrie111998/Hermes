@@ -325,11 +325,25 @@ function CustomEndpointCard() {
 
         try {
           const cfg = await getHermesConfigRecord()
-          const modelCfg = (cfg as Record<string, unknown>)?.model
 
-          if (modelCfg && typeof modelCfg === 'object') {
-            baseUrl = String((modelCfg as Record<string, unknown>).base_url ?? '') || null
+          // /api/config flattens model dict into top-level fields:
+          // model_provider, model_base_url. Read those first.
+          baseUrl = String((cfg as Record<string, unknown>)?.model_base_url ?? '') || null
+
+          // If model_base_url is empty, the provider may be a named custom
+          // provider (e.g. providers.aicps) whose base_url lives under the
+          // top-level providers: block.
+          if (!baseUrl) {
+            const providerSlug = String((cfg as Record<string, unknown>)?.model_provider ?? '').trim()
+            if (providerSlug) {
+              const providersCfg = (cfg as Record<string, unknown>)?.providers as Record<string, unknown> | undefined
+              const providerCfg = providersCfg?.[providerSlug] as Record<string, unknown> | undefined
+              if (providerCfg && typeof providerCfg === 'object') {
+                baseUrl = String(providerCfg.base_url ?? '') || null
+              }
+            }
           }
+          /* config read is best-effort */
         } catch {
           /* config read is best-effort */
         }

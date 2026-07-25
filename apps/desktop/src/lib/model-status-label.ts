@@ -83,49 +83,92 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
 }
 
 // Chinese-friendly provider names (maps backend slug/name → display name).
-const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+// Keyed by EXACT slug match first, then falls back to prefix/contains matching.
+// Multi-entry providers (e.g. minimax / minimax-oauth / minimax-cn) use
+// distinguishable suffixes so users don't see 3 identical "MiniMax" entries.
+const PROVIDER_SLUG_MAP: Record<string, string> = {
   'openai': 'OpenAI',
+  'openai-api': 'OpenAI API',
+  'openai-codex': 'OpenAI Codex',
   'anthropic': 'Anthropic',
-  'google': '谷歌',
   'gemini': '谷歌 Gemini',
+  'google': '谷歌',
   'deepseek': 'DeepSeek',
+  'alibaba': '通义千问',
   'qwen': '通义千问',
+  'qwen-oauth': '通义千问 (OAuth)',
   'zhipu': '智谱',
   'glm': '智谱',
+  'zai': '智谱 Z.AI',
   'moonshot': '月之暗面',
   'kimi': '月之暗面',
+  'kimi-coding': '月之暗面 (编码计划)',
+  'kimi-coding-cn': '月之暗面 (国内)',
   'baichuan': '百川',
   'spark': '讯飞星火',
   'hunyuan': '腾讯混元',
+  'tencent-tokenhub': '腾讯混元 (TokenHub)',
   'doubao': '字节豆包',
   'minimax': 'MiniMax',
+  'minimax-oauth': 'MiniMax (OAuth)',
+  'minimax-cn': 'MiniMax (国内)',
   'mistral': 'Mistral',
   'cohere': 'Cohere',
   'meta': 'Meta',
   'llama': 'Meta Llama',
   'nous': 'Nous Research',
   'openrouter': 'OpenRouter',
+  'novita': 'NovitaAI',
+  'lmstudio': 'LM Studio',
   'groq': 'Groq',
   'together': 'Together AI',
   'fireworks': 'Fireworks AI',
   'perplexity': 'Perplexity',
-  'x-ai': 'xAI',
   'xai': 'xAI',
+  'xai-oauth': 'xAI Grok (OAuth)',
+  'xiaomi': '小米 MiMo',
+  'nvidia': 'NVIDIA NIM',
+  'copilot': 'GitHub Copilot',
+  'copilot-acp': 'GitHub Copilot ACP',
+  'huggingface': 'Hugging Face',
+  'bedrock': 'AWS Bedrock',
+  'azure-foundry': 'Azure Foundry',
+  'stepfun': '阶跃星辰 StepFun',
+  'arcee': 'Arcee AI',
+  'gmi': 'GMI Cloud',
+  'kilocode': 'Kilo Code',
+  'opencode-zen': 'OpenCode Zen',
+  'opencode-go': 'OpenCode Go',
+  'ollama-cloud': 'Ollama Cloud',
+  'ollama': 'Ollama',
   'custom': '自定义端点',
   'local': '本地',
-  'zai': '智谱'
+  'provider': '提供方'
+}
+
+// Fallback: if no exact slug match, try fuzzy prefix matching against the
+// BASE provider names (without suffix variants).
+const PROVIDER_PREFIX_MAP: Record<string, string> = {
+  'qwen': '通义千问',
+  'zhipu': '智谱',
+  'glm': '智谱',
+  'moonshot': '月之暗面',
+  'baichuan': '百川',
+  'spark': '讯飞星火',
+  'hunyuan': '腾讯混元',
+  'doubao': '字节豆包'
 }
 
 export function providerDisplayName(slugOrName: string): string {
   const lower = (slugOrName || '').trim().toLowerCase()
 
-  if (PROVIDER_DISPLAY_NAMES[lower]) {
-    return PROVIDER_DISPLAY_NAMES[lower]
+  if (PROVIDER_SLUG_MAP[lower]) {
+    return PROVIDER_SLUG_MAP[lower]
   }
 
-  for (const key of Object.keys(PROVIDER_DISPLAY_NAMES)) {
-    if (lower.startsWith(key) || lower.includes(key)) {
-      return PROVIDER_DISPLAY_NAMES[key]
+  for (const key of Object.keys(PROVIDER_PREFIX_MAP)) {
+    if (lower.includes(key)) {
+      return PROVIDER_PREFIX_MAP[key]
     }
   }
 
