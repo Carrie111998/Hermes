@@ -575,3 +575,58 @@ async def test_gateway_requires_reply_and_accepts_telemetry_kwargs(
     assert decision == {"action": "skip", "reason": "hegi-approval-queued"}
     adapter.send.assert_awaited()
     assert processed == ["-1001"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_accepts_report_command_with_explicit_meeting_id(
+    tmp_path, monkeypatch
+):
+    config, state = _config(tmp_path, monkeypatch)
+    processed = []
+    monkeypatch.setattr(
+        "hegi.gateway_plugin._process_pending_background",
+        lambda cfg: processed.append(cfg.chat_id),
+    )
+    adapter = SimpleNamespace(send=AsyncMock(return_value={"message_id": "ack"}))
+    gateway = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    event = SimpleNamespace(
+        text="기억해 meeting_id: meeting-1",
+        message_id="913",
+        reply_to_message_id=None,
+        source=SimpleNamespace(
+            platform=SimpleNamespace(value="telegram"),
+            chat_id="-1001",
+            user_id="42",
+        ),
+    )
+
+    decision = intercept_telegram_approval(event=event, gateway=gateway)
+    await asyncio.sleep(0.05)
+
+    assert decision == {"action": "skip", "reason": "hegi-approval-queued"}
+    assert processed == ["-1001"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_reply_and_explicit_meeting_id_conflict(
+    tmp_path, monkeypatch
+):
+    _config(tmp_path, monkeypatch)
+    adapter = SimpleNamespace(send=AsyncMock(return_value={"message_id": "ack"}))
+    gateway = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    event = SimpleNamespace(
+        text="기억해 meeting_id: different-meeting",
+        message_id="914",
+        reply_to_message_id="400",
+        source=SimpleNamespace(
+            platform=SimpleNamespace(value="telegram"),
+            chat_id="-1001",
+            user_id="42",
+        ),
+    )
+
+    decision = intercept_telegram_approval(event=event, gateway=gateway)
+    await asyncio.sleep(0.05)
+
+    assert decision == {"action": "skip", "reason": "hegi-approval-denied"}
+    assert "서로 다릅니다" in adapter.send.await_args.args[1]

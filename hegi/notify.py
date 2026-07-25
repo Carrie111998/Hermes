@@ -78,8 +78,12 @@ def telegram_parts(minutes: MeetingMinutes) -> list[str]:
         f"이견\n{_bullets(minutes.disagreements)}\n\n"
         f"Action Items\n{_bullets(actions)}",
         f"4/4 Memory Evaluation · {meeting}\n\n{memory_text}\n\n"
-        "아래 명령은 반드시 이 메시지에 Telegram 답장으로 보내세요.\n"
-        "@헤기 기억해\n@헤기 초안 만들어\n@헤기 기존 기억에 합쳐\n@헤기 기억하지 마\n\n"
+        "아래 명령줄 중 하나를 그대로 보내세요. Telegram 답장 여부와 무관하게 "
+        "Meeting ID로 안전하게 연결됩니다.\n"
+        f"@헤기 기억해 meeting_id: {meeting}\n"
+        f"@헤기 초안 만들어 meeting_id: {meeting}\n"
+        f"@헤기 기존 기억에 합쳐 meeting_id: {meeting}\n"
+        f"@헤기 기억하지 마 meeting_id: {meeting}\n\n"
         "approve/commit은 교수님의 인증된 명시적 승인 명령이 있을 때만 수행합니다.",
     ]
 

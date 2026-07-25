@@ -88,7 +88,7 @@ def test_telegram_resume_skips_already_sent_parts(tmp_path):
     assert state.delivered_parts("meeting") == {1, 2, 3, 4}
 
 
-def test_memory_approval_prompt_requires_reply_to_report():
+def test_memory_approval_prompt_embeds_meeting_id():
     final_part = telegram_parts(_minutes())[-1]
-    assert "반드시 이 메시지에 Telegram 답장으로" in final_part
-    assert "@헤기 기억해" in final_part
+    assert "Telegram 답장 여부와 무관하게" in final_part
+    assert "@헤기 기억해 meeting_id: meeting" in final_part

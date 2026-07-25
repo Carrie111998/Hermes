@@ -109,18 +109,26 @@ def _schedule_reply(gateway: Any, event: Any, text: str) -> None:
 
 
 def _meeting_id(state: StateStore, event: Any) -> str | None:
+    reply_meeting: str | None = None
     reply_id = getattr(event, "reply_to_message_id", None)
     if reply_id:
-        matched = state.meeting_for_report_message(str(reply_id))
-        if matched:
-            return matched
+        reply_meeting = state.meeting_for_report_message(str(reply_id))
     text = str(getattr(event, "text", "") or "")
     explicit = re.search(
         r"\bmeeting[_\s-]*id\s*[:=]\s*([A-Za-z0-9._:-]+)",
         text,
         flags=re.IGNORECASE,
     )
-    return explicit.group(1) if explicit else None
+    explicit_meeting = explicit.group(1) if explicit else None
+    if (
+        reply_meeting
+        and explicit_meeting
+        and reply_meeting != explicit_meeting
+    ):
+        raise ValueError(
+            "답장한 회의록과 명령의 Meeting ID가 서로 다릅니다."
+        )
+    return reply_meeting or explicit_meeting
 
 
 def _process_pending_background(config: Any) -> None:
@@ -152,9 +160,19 @@ def intercept_telegram_approval(
     command = parse_approval_command(text, memory.get("commands"))
     if command is None:
         return None
-    meeting_id = _meeting_id(state, event)
+    try:
+        meeting_id = _meeting_id(state, event)
+    except ValueError as exc:
+        _schedule_reply(gateway, event, f"HEGI 승인 거부: {exc}")
+        return {"action": "skip", "reason": "hegi-approval-denied"}
     if not meeting_id:
-        _schedule_reply(gateway, event, "처리할 HEGI 회의록을 찾지 못했습니다.")
+        _schedule_reply(
+            gateway,
+            event,
+            "처리할 HEGI 회의록을 찾지 못했습니다.\n"
+            "회의록 보고의 명령줄에는 Meeting ID가 포함됩니다. "
+            "그 명령줄을 그대로 보내거나 보고 메시지에 답장해 주세요.",
+        )
         return {"action": "skip", "reason": "hegi-no-meeting"}
     backend = MCPMemoryBackend(
         read_server=str(memory.get("read_server", "memory-forest-read")),
