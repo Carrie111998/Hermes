@@ -33,11 +33,7 @@ import {
   stripHighlightMarkers,
   type SearchField as SearchMatchField
 } from '@/lib/search-match'
-import { rankSession, sessionMatchesSearch } from '@/lib/session-search'
-import {
-  SessionSearchMetaContext,
-  type SessionSearchMeta
-} from './search-meta-context'
+import { rankSession } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
 import { $cronJobs } from '@/store/cron'
@@ -152,6 +148,10 @@ import {
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
 
+import {
+  SessionSearchMetaContext,
+  type SessionSearchMeta
+} from './search-meta-context'
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
