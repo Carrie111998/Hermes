@@ -135,6 +135,39 @@ class TestHermesTokenStorage:
 
         assert storage.has_cached_tokens()
 
+    def test_cleanup_stale_cache_when_auth_type_not_oauth(self, tmp_path, monkeypatch):
+        """When auth type changes from oauth to non-oauth, stale cache is cleaned."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("cloudflare")
+
+        # Simulate previous OAuth usage: create client.json and tokens
+        d = tmp_path / "mcp-tokens"
+        d.mkdir(parents=True)
+        (d / "cloudflare.json").write_text('{"access_token": "old", "token_type": "Bearer"}')
+        (d / "cloudflare.client.json").write_text('{"client_id": "some-id"}')
+        (d / "cloudflare.meta.json").write_text('{"token_endpoint": "https://example.com/token"}')
+
+        assert storage.has_cached_tokens()
+        assert storage._client_info_path().exists()
+
+        # This simulates the cleanup path in MCPServerTask._connect()
+        # when _auth_type != "oauth": check for stale client.json, then remove all
+        storage.remove()
+
+        # All three OAuth cache files should be gone
+        assert not (d / "cloudflare.json").exists()
+        assert not (d / "cloudflare.client.json").exists()
+        assert not (d / "cloudflare.meta.json").exists()
+
+    def test_cleanup_stale_cache_noop_when_no_files(self, tmp_path, monkeypatch):
+        """Cleanup is a no-op when no stale cache files exist."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("new-server")
+
+        # No files exist — remove() should not raise
+        assert not storage._client_info_path().exists()
+        storage.remove()  # Should not raise
+
     def test_corrupt_tokens_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("bad-server")
