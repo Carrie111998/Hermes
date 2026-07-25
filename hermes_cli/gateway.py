@@ -1312,6 +1312,8 @@ def _probe_launchd_gateway_supervisor(
             ["launchctl", "list"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
