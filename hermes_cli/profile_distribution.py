@@ -653,9 +653,20 @@ def install_distribution(
                     "# Behavioral settings belong in config.yaml, not here.\n",
                     encoding="utf-8",
                 )
+            except OSError as e:
+                # Fresh installs must not leave a profiles/<name>/ tree without
+                # the sentinel — backfill would copy default credentials into it.
+                if not plan.existing:
+                    shutil.rmtree(plan.target_dir, ignore_errors=True)
+                raise DistributionError(
+                    f"Failed to seed per-profile .env at {env_path}: {e}. "
+                    "Refusing to leave the profile without a .env sentinel "
+                    "(hermes update would backfill default credentials)."
+                ) from e
+            try:
                 os.chmod(str(env_path), 0o600)
             except OSError:
-                pass  # best-effort — save_env_value creates the file on demand
+                pass  # mode bits are best-effort on some platforms
 
         if create_alias:
             collision = check_alias_collision(plan.manifest.name)

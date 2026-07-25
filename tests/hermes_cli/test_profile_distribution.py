@@ -352,8 +352,11 @@ class TestInstall:
             line.startswith("#") or not line.strip()
             for line in content.splitlines()
         )
-        assert "API_KEY" not in content
-        assert "TOKEN" not in content
+        assert not any(
+            (not line.startswith("#")) and ("=" in line)
+            for line in content.splitlines()
+            if line.strip()
+        )
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
     def test_install_env_seed_blocks_default_secret_backfill(self, profile_env):
@@ -387,6 +390,20 @@ class TestInstall:
         assert (plan.target_dir / ".env").read_text(encoding="utf-8") == (
             "OPENAI_API_KEY=sk-user\n"
         )
+
+    def test_install_raises_if_env_seed_write_fails(self, profile_env, monkeypatch):
+        staged = _make_staging_dir(profile_env, "src")
+        real_write = Path.write_text
+
+        def boom(self, *args, **kwargs):
+            if self.name == ".env":
+                raise OSError("disk full")
+            return real_write(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", boom)
+        with pytest.raises(DistributionError, match=r"seed per-profile \.env"):
+            install_distribution(str(staged), name="noseed")
+        assert not (profile_env / ".hermes" / "profiles" / "noseed").exists()
 
     def test_install_enforces_hermes_requires(self, profile_env, monkeypatch):
         # Pin current Hermes version to something well below the requirement
