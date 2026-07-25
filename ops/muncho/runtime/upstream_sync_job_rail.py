@@ -896,6 +896,30 @@ def load_json(path: Path) -> Mapping[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def cleanup_managed_worktrees(root: Path, *, prefix: str) -> dict[str, int]:
+    """Remove only rail-owned worktrees so one job cannot starve the next."""
+
+    result = {"removed": 0, "failed": 0}
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return {**result, "failed": 1}
+    for child in children:
+        if (
+            not child.name.startswith(prefix)
+            or child.is_symlink()
+            or not child.is_dir()
+        ):
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            result["failed"] += 1
+        else:
+            result["removed"] += 1
+    return result
+
+
 def run_child(
     *,
     job_id: str,
@@ -1156,6 +1180,10 @@ def run_all(args: argparse.Namespace) -> int:
             environment=muncho_env,
             report_path=muncho_state / "auto-sync-pr-latest.json",
         )
+        inter_job_cleanup = cleanup_managed_worktrees(
+            STATE_ROOT / "muncho-worktrees",
+            prefix="codex-upstream-sync-auto-",
+        )
         skyai_result = run_child(
             job_id=SKYAI_JOB_ID,
             routine=paths["skyai_routine"],
@@ -1214,6 +1242,7 @@ def run_all(args: argparse.Namespace) -> int:
             "release_root": str(release),
             "status": public["status"],
             "children": children,
+            "inter_job_cleanup": inter_job_cleanup,
             "public_report_sha256": public_sha,
             "provider_or_model_invoked": False,
             "discord_delivery_attempted": False,

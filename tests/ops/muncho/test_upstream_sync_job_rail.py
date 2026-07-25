@@ -176,6 +176,34 @@ def test_package_hashes_final_sender_interpreter_target(
     ).hexdigest()
 
 
+def test_cleanup_managed_worktrees_removes_only_owned_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "worktrees"
+    managed = root / "codex-upstream-sync-auto-20260725-0100"
+    unrelated = root / "operator-investigation"
+    outside = tmp_path / "outside"
+    managed.mkdir(parents=True)
+    unrelated.mkdir()
+    outside.mkdir()
+    (managed / "tracked.txt").write_text("managed", encoding="utf-8")
+    (root / "codex-upstream-sync-auto-symlink").symlink_to(
+        outside,
+        target_is_directory=True,
+    )
+
+    result = rail.cleanup_managed_worktrees(
+        root,
+        prefix="codex-upstream-sync-auto-",
+    )
+
+    assert result == {"removed": 1, "failed": 0}
+    assert not managed.exists()
+    assert unrelated.is_dir()
+    assert outside.is_dir()
+    assert (root / "codex-upstream-sync-auto-symlink").is_symlink()
+
+
 def test_run_all_executes_both_jobs_and_publishes_only_sanitized_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -255,6 +283,7 @@ def test_run_all_executes_both_jobs_and_publishes_only_sanitized_fields(
     assert public_report["discord_delivery_attempted"] is False
     receipt = json.loads((state / "latest.json").read_text())
     assert receipt["secret_material_recorded"] is False
+    assert receipt["inter_job_cleanup"] == {"removed": 0, "failed": 0}
     assert all(item["content_recorded"] is False for item in receipt["children"])
 
 
