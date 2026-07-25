@@ -304,6 +304,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
+        monkeypatch.setattr(tt, "get_session_cwd", lambda key=None: None)
         monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
@@ -363,6 +364,42 @@ class TestTerminalToolGatewayLifecycleGuard:
         result = json.loads(tt.terminal_tool(
             command="sleep 75; ./delayed_restart.sh"
         ))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    @pytest.mark.parametrize("background", [False, True])
+    def test_revalidates_helper_after_approval_before_execution(
+        self, monkeypatch, tmp_path, background
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "delayed_restart.sh"
+        script.write_text("#!/bin/sh\nprintf safe\\n\n")
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "cwd": str(tmp_path),
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+
+        def _approve_after_mutation(*args, **kwargs):
+            script.write_text("#!/bin/sh\nhermes gateway restart\n")
+            return {"approved": True}
+
+        monkeypatch.setattr(tt, "_check_all_guards", _approve_after_mutation)
+
+        result = json.loads(
+            tt.terminal_tool(
+                command="./delayed_restart.sh",
+                background=background,
+            )
+        )
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
@@ -439,7 +476,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
-    def test_nonlocal_background_guard_and_spawn_share_effective_cwd(
+    def test_nonlocal_background_helper_fails_closed_without_backend_inspection(
         self, monkeypatch, tmp_path
     ):
         from types import SimpleNamespace
@@ -493,9 +530,9 @@ class TestTerminalToolGatewayLifecycleGuard:
             )
         )
 
-        assert result["exit_code"] == 0
-        assert len(spawn_calls) == 1
-        assert spawn_calls[0]["cwd"] == str(execution)
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+        assert spawn_calls == []
 
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
@@ -618,6 +655,14 @@ class TestLifecycleGuardModule:
             ". helper",
             "exec ./helper",
             "command bash helper",
+            "DELAY=1 ./helper",
+            "sudo ./helper",
+            "sudo -u root ./helper",
+            "sudo -n bash helper",
+            "sudo -n env DELAY=1 ./helper",
+            "bash -c './helper'",
+            "bash -c 'sudo -u root ./helper'",
+            'bash -c "source helper"',
             "if ./helper; then printf safe; fi",
             "while ./helper; do :; done",
             "! ./helper",
@@ -631,6 +676,17 @@ class TestLifecycleGuardModule:
         (tmp_path / "helper").write_text("#!/bin/sh\nhermes gateway restart\n")
 
         assert contains_gateway_lifecycle_invocation(command, cwd=tmp_path)
+
+    def test_shell_suffix_mentioned_as_data_is_not_scanned(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        (tmp_path / "helper.sh").write_text(
+            "#!/bin/sh\nhermes gateway restart\n"
+        )
+
+        assert not contains_gateway_lifecycle_invocation(
+            "echo helper.sh", cwd=tmp_path
+        )
 
     def test_literal_nested_helpers_are_scanned_recursively(self, tmp_path):
         from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
@@ -719,6 +775,119 @@ class TestCreateJobBlocksLifecycleCommands:
                          schedule="30m")
         assert job["id"]
 
+    def test_create_job_blocks_nested_script_helper(self, tmp_path, monkeypatch):
+        from cron.jobs import create_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts = tmp_path / ".hermes" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "outer.sh").write_text("#!/bin/sh\n./helper\n")
+        (scripts / "helper").write_text(
+            "#!/bin/sh\nhermes gateway restart\n"
+        )
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            create_job(
+                prompt="collect status",
+                schedule="30m",
+                script="outer.sh",
+            )
+
+    def test_create_job_scans_helpers_from_configured_workdir(
+        self, tmp_path, monkeypatch
+    ):
+        from cron.jobs import create_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts = tmp_path / ".hermes" / "scripts"
+        scripts.mkdir(parents=True)
+        workdir = tmp_path / "job-workdir"
+        workdir.mkdir()
+        (scripts / "outer.sh").write_text("#!/bin/sh\n./helper\n")
+        (workdir / "helper").write_text(
+            "#!/bin/sh\nhermes gateway restart\n"
+        )
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            create_job(
+                prompt="collect status",
+                schedule="30m",
+                script="outer.sh",
+                workdir=str(workdir),
+            )
+
+    def test_update_job_blocks_unsafe_effective_prompt_and_preserves_job(self):
+        from cron.jobs import create_job, get_job, update_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        job = create_job(prompt="collect status", schedule="30m")
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            update_job(
+                job["id"],
+                {"prompt": "then run hermes gateway restart"},
+            )
+
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["prompt"] == "collect status"
+
+    def test_update_job_revalidates_active_script_after_helper_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        from cron.jobs import create_job, get_job, update_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts = tmp_path / ".hermes" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "outer.sh").write_text("#!/bin/sh\n./helper\n")
+        helper = scripts / "helper"
+        helper.write_text("#!/bin/sh\nprintf safe\\n\n")
+        job = create_job(
+            prompt="collect status",
+            schedule="30m",
+            script="outer.sh",
+        )
+        assert job is not None
+        helper.write_text("#!/bin/sh\nhermes gateway restart\n")
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            update_job(job["id"], {"name": "still active"})
+
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["name"] == job["name"]
+
+    def test_update_job_can_pause_an_unsafe_legacy_job(
+        self, tmp_path, monkeypatch
+    ):
+        from cron.jobs import create_job, update_job
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts = tmp_path / ".hermes" / "scripts"
+        scripts.mkdir(parents=True)
+        script = scripts / "legacy.sh"
+        script.write_text("#!/bin/sh\nprintf safe\\n\n")
+        job = create_job(
+            prompt="collect status",
+            schedule="30m",
+            script="legacy.sh",
+        )
+        assert job is not None
+        script.write_text("#!/bin/sh\nhermes gateway restart\n")
+
+        paused = update_job(
+            job["id"],
+            {"enabled": False, "state": "paused"},
+        )
+
+        assert paused is not None
+        assert paused["enabled"] is False
+        assert paused["state"] == "paused"
+
     def test_cronjob_tool_surfaces_block_as_error(self, tmp_path, monkeypatch):
         """End-to-end through the model tool: the block comes back as
         result['error'] with the #30719 hint, not an unhandled exception."""
@@ -731,6 +900,115 @@ class TestCreateJobBlocksLifecycleCommands:
         ))
         assert result.get("success") is False
         assert "#30719" in result.get("error", "")
+
+
+class TestSchedulerLifecycleRevalidation:
+    """Persisted or changed scripts must fail closed immediately before run."""
+
+    def test_run_job_script_blocks_nested_helper_without_subprocess(
+        self, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts = tmp_path / ".hermes" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "outer.sh").write_text("#!/bin/sh\n./helper\n")
+        (scripts / "helper").write_text(
+            "#!/bin/sh\nhermes gateway restart\n"
+        )
+        calls = []
+
+        def _must_not_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("subprocess.run must not be reached")
+
+        monkeypatch.setattr(scheduler.subprocess, "run", _must_not_run)
+
+        ok, output = scheduler._run_job_script("outer.sh")
+
+        assert ok is False
+        assert "#30719" in output
+        assert calls == []
+
+    def test_run_job_script_scans_configured_workdir_before_subprocess(
+        self, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts = tmp_path / ".hermes" / "scripts"
+        scripts.mkdir(parents=True)
+        workdir = tmp_path / "job-workdir"
+        workdir.mkdir()
+        (scripts / "outer.sh").write_text("#!/bin/sh\n./helper\n")
+        (scripts / "helper").write_text("#!/bin/sh\nprintf safe\\n\n")
+        (workdir / "helper").write_text(
+            "#!/bin/sh\nhermes gateway restart\n"
+        )
+        calls = []
+
+        def _must_not_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("subprocess.run must not be reached")
+
+        monkeypatch.setattr(scheduler.subprocess, "run", _must_not_run)
+
+        ok, output = scheduler._run_job_script(
+            "outer.sh",
+            workdir=str(workdir),
+        )
+
+        assert ok is False
+        assert "#30719" in output
+        assert calls == []
+
+    def test_run_job_script_revalidates_after_environment_setup(
+        self, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+        from tools.environments import local
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        scripts = tmp_path / ".hermes" / "scripts"
+        scripts.mkdir(parents=True)
+        script = scripts / "mutable.sh"
+        script.write_text("#!/bin/sh\nprintf safe\\n\n")
+        calls = []
+
+        def _mutating_sanitizer(env):
+            script.write_text("#!/bin/sh\nhermes gateway restart\n")
+            return env
+
+        def _must_not_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("subprocess.run must not be reached")
+
+        monkeypatch.setattr(local, "_sanitize_subprocess_env", _mutating_sanitizer)
+        monkeypatch.setattr(scheduler.subprocess, "run", _must_not_run)
+
+        ok, output = scheduler._run_job_script("mutable.sh")
+
+        assert ok is False
+        assert "#30719" in output
+        assert calls == []
+
+    def test_run_job_blocks_hand_edited_prompt_before_agent_setup(self):
+        from cron import scheduler
+
+        success, _doc, _response, error = scheduler.run_job(
+            {
+                "id": "legacy-unsafe",
+                "name": "legacy unsafe",
+                "prompt": "run hermes gateway restart",
+                "script": None,
+                "no_agent": False,
+            }
+        )
+
+        assert success is False
+        assert error is not None
+        assert "#30719" in error
 
 
 # ---------------------------------------------------------------------------

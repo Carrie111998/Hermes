@@ -2385,24 +2385,36 @@ def terminal_tool(
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
+        def _gateway_lifecycle_block_response() -> Optional[str]:
+            """Revalidate lifecycle safety against the execution-time backend/cwd."""
+            if os.environ.get("_HERMES_GATEWAY") != "1":
+                return None
+
             from hermes_cli.cron import _contains_gateway_lifecycle_invocation
-            if _contains_gateway_lifecycle_invocation(
+
+            if not _contains_gateway_lifecycle_invocation(
                 command,
                 cwd=effective_command_cwd,
+                inspect_helpers=env_type == "local",
             ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: cannot restart or stop the gateway from inside the "
-                        "gateway process. The gateway would kill this command before "
-                        "it could complete (SIGTERM propagates to child processes). "
-                        "Run `hermes gateway restart` from a separate shell outside "
-                        "the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
+                return None
+
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    "Blocked: cannot restart or stop the gateway from inside the "
+                    "gateway process. The gateway would kill this command before "
+                    "it could complete (SIGTERM propagates to child processes). "
+                    "Run `hermes gateway restart` from a separate shell outside "
+                    "the running gateway."
+                ),
+                "status": "error",
+            }, ensure_ascii=False)
+
+        blocked_response = _gateway_lifecycle_block_response()
+        if blocked_response is not None:
+            return blocked_response
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
@@ -2472,6 +2484,9 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             effective_cwd = effective_command_cwd
+            blocked_response = _gateway_lifecycle_block_response()
+            if blocked_response is not None:
+                return blocked_response
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2738,6 +2753,9 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
+                    blocked_response = _gateway_lifecycle_block_response()
+                    if blocked_response is not None:
+                        return blocked_response
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
