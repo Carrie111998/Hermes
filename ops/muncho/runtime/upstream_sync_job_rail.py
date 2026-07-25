@@ -48,6 +48,9 @@ LOGS_DIRECTORY_NAME = "muncho-dual-upstream-sync"
 STATE_ROOT = Path("/var/lib") / STATE_DIRECTORY_NAME
 REPORT_STATE_ROOT = Path("/var/lib") / REPORT_STATE_DIRECTORY_NAME
 PUBLIC_REPORT_ROOT = Path("/var/log") / LOGS_DIRECTORY_NAME
+PRIVATE_PUBLIC_REPORT_ROOT = Path("/var/log/private") / LOGS_DIRECTORY_NAME
+REPORT_VIEW_DIRECTORY_NAME = "muncho-dual-upstream-sync-report-view"
+REPORT_VIEW_ROOT = Path("/run") / REPORT_VIEW_DIRECTORY_NAME
 RUNTIME_ROOT = Path("/run") / STATE_DIRECTORY_NAME
 PACKAGE_ROOT = Path(
     "/var/lib/muncho-production-legacy-cutover/staged/dual-upstream-sync-rail"
@@ -411,7 +414,7 @@ def render_report_service(
         f"AssertPathExists={interpreter}",
         f"AssertPathExists={reporter}",
         f"AssertPathExists={sender_python}",
-        f"AssertPathExists={PUBLIC_REPORT_ROOT}",
+        f"AssertPathExists={PRIVATE_PUBLIC_REPORT_ROOT}",
         f"AssertPathExists={SYSTEMD_STUB_RESOLV_CONF}",
         "",
         "[Service]",
@@ -421,6 +424,8 @@ def render_report_service(
         f"WorkingDirectory={sender_release}",
         f"StateDirectory={REPORT_STATE_DIRECTORY_NAME}",
         "StateDirectoryMode=0700",
+        f"RuntimeDirectory={REPORT_VIEW_DIRECTORY_NAME}",
+        "RuntimeDirectoryMode=0700",
         f"Environment=HOME={HERMES_HOME}",
         f"Environment=HERMES_HOME={HERMES_HOME}",
         "Environment=LANG=C.UTF-8",
@@ -429,7 +434,7 @@ def render_report_service(
         "Environment=TZ=Europe/Sofia",
         (
             f"ExecStart={interpreter} -I -B {reporter} "
-            f"--public-report-dir {PUBLIC_REPORT_ROOT} "
+            f"--public-report-dir {REPORT_VIEW_ROOT} "
             f"--state-dir {REPORT_STATE_ROOT} "
             f"--channel-id {DISCORD_CHANNEL_ID} "
             f"--sender-python {sender_python} "
@@ -467,10 +472,14 @@ def render_report_service(
             f"BindReadOnlyPaths={SYSTEMD_STUB_RESOLV_CONF}:"
             f"{SYSTEMD_UPLINK_RESOLV_CONF}"
         ),
+        (
+            f"BindReadOnlyPaths={PRIVATE_PUBLIC_REPORT_ROOT}:"
+            f"{REPORT_VIEW_ROOT}"
+        ),
         f"ReadOnlyPaths={release}",
         f"ReadOnlyPaths={sender_release}",
         f"ReadOnlyPaths={HERMES_HOME}",
-        f"ReadOnlyPaths={PUBLIC_REPORT_ROOT}",
+        f"ReadOnlyPaths={REPORT_VIEW_ROOT}",
         f"ReadWritePaths={REPORT_STATE_ROOT}",
         f"InaccessiblePaths=-{STATE_ROOT}",
         f"InaccessiblePaths=-{CREDENTIAL_SOURCE.parent}",
@@ -572,7 +581,9 @@ def validate_report_service(
         f"User={REPORT_USER}\n",
         f"WorkingDirectory={sender_release}\n",
         f"StateDirectory={REPORT_STATE_DIRECTORY_NAME}\n",
-        f"ReadOnlyPaths={PUBLIC_REPORT_ROOT}\n",
+        f"RuntimeDirectory={REPORT_VIEW_DIRECTORY_NAME}\n",
+        f"ReadOnlyPaths={REPORT_VIEW_ROOT}\n",
+        f"--public-report-dir {REPORT_VIEW_ROOT} ",
         f"InaccessiblePaths=-{STATE_ROOT}\n",
         f"--channel-id {DISCORD_CHANNEL_ID} ",
         f"--sender-python {sender_release / '.venv/bin/python'} ",
@@ -582,6 +593,10 @@ def validate_report_service(
         (
             f"BindReadOnlyPaths={SYSTEMD_STUB_RESOLV_CONF}:"
             f"{SYSTEMD_UPLINK_RESOLV_CONF}\n"
+        ),
+        (
+            f"BindReadOnlyPaths={PRIVATE_PUBLIC_REPORT_ROOT}:"
+            f"{REPORT_VIEW_ROOT}\n"
         ),
     )
     forbidden = (
