@@ -2970,6 +2970,98 @@ def test_xai_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypatch
     assert tokens.get("refresh_token") == "old-refresh-token"
 
 
+def test_xai_terminal_refresh_marks_manual_device_code_entry_dead(tmp_path, monkeypatch):
+    """Carry-over of the Codex fix (315c819fd) to the identical xAI branch.
+
+    The xAI quarantine branch only removes ``source == "device_code"`` entries,
+    so a ``manual:device_code`` entry survives it and the branch returns early —
+    never reaching ``_mark_exhausted``.  Its ``last_status`` would stay ``"ok"``
+    with ``last_status_at=None`` forever, keeping a credential with a dead
+    refresh token in rotation and making the 24h
+    ``DEAD_MANUAL_PRUNE_TTL_SECONDS`` prune (which needs DEAD *and* a non-zero
+    ``last_status_at``) unable to ever fire.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_OAUTH_ACCESS_TOKEN", raising=False)
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "7b31ae",
+                        "label": "stale-manual",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "expired-access",
+                        "refresh_token": "reused-refresh",
+                        # The live Codex shape: a past success left ok/None
+                        # behind and every terminal failure since has left it
+                        # untouched.
+                        "last_status": "ok",
+                        "last_status_at": None,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import (
+        DEAD_MANUAL_PRUNE_TTL_SECONDS,
+        STATUS_DEAD,
+        load_pool,
+    )
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    pool = load_pool("xai-oauth")
+    assert pool.select() is not None
+
+    def _revoked(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="xai-oauth",
+            code="xai_refresh_failed",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_xai_oauth_pure", _revoked)
+
+    assert pool.try_refresh_current() is None
+
+    # The manual entry is retained (not removed like a singleton) but must now
+    # carry the terminal status plus a timestamp for the prune to key off.
+    dead = next(entry for entry in pool.entries() if entry.id == "7b31ae")
+    assert dead.last_status == STATUS_DEAD
+    assert dead.last_status_at is not None
+    assert dead.last_error_reason == "xai_refresh_failed"
+
+    # DEAD must be persisted, not just held in memory.
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["xai-oauth"][0]
+    assert persisted["id"] == "7b31ae"
+    assert persisted["last_status"] == STATUS_DEAD
+    assert persisted["last_status_at"]
+
+    # DEAD entries leave rotation immediately, so nothing re-drives the doomed
+    # refresh on every subsequent pool selection.
+    assert pool.select() is None
+
+    # ...and after the 24h quiet window the existing prune finally reclaims it.
+    aged = load_pool("xai-oauth")
+    entry = next(item for item in aged.entries() if item.id == "7b31ae")
+    monkeypatch.setattr(
+        "agent.credential_pool.time.time",
+        lambda: (entry.last_status_at or 0) + DEAD_MANUAL_PRUNE_TTL_SECONDS + 60,
+    )
+    assert aged.select() is None
+    assert [item.id for item in aged.entries()] == []
+
+
 def test_xai_oauth_concurrent_pool_instances_refresh_single_use_token_once(
     tmp_path, monkeypatch
 ):

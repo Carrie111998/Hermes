@@ -1367,6 +1367,11 @@ class CredentialPool:
                         item for item in self._entries
                         if item.source != "device_code"
                     ]
+                    # A ``manual:device_code`` entry does not match the
+                    # ``device_code`` removal filter above, so it survives the
+                    # quarantine with its dead refresh token intact.  Mark it
+                    # DEAD here — this branch returns before ``_mark_exhausted``.
+                    self._mark_dead_from_terminal_refresh(entry, exc)
                     if self._current_id == entry.id:
                         self._current_id = None
                     self._persist(removed_ids=removed_ids)
