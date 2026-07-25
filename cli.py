@@ -16414,7 +16414,7 @@ def main(
             # re-enter, and nothing here drains the completion queue. Left
             # unset, async_delivery_supported() defaults True, delegate_task is
             # forced background, and every subagent result is discarded. The
-            # oneshot path already does this (herses_cli/oneshot.py:231);
+            # oneshot path already does this (hermes_cli/oneshot.py:231);
             # single-query chat was missed. See declare_stateless_channel().
             from gateway.session_context import declare_stateless_channel
             declare_stateless_channel()
