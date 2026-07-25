@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, field
+import weakref
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Optional
 
 from gateway.platforms.base import MessageEvent, SendResult
@@ -107,19 +108,23 @@ class GatewayMessageRoute:
         )
 
 
-@dataclass(frozen=True, slots=True)
 class GatewayDelivery:
     """Capability that can send only to the route captured by its host callback."""
 
-    _send_callback: Callable[[str], Awaitable[Any] | Any] = field(
-        repr=False,
-        compare=False,
-    )
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, send_callback: Callable[[str], Awaitable[Any] | Any]) -> None:
+        if not callable(send_callback):
+            raise TypeError("send_callback must be callable")
+        _DELIVERY_SEND_CALLBACKS[self] = send_callback
 
     async def send(self, content: str) -> GatewayDeliveryReceipt:
         """Send text to the bound source and normalize the native acknowledgement."""
         try:
-            native_result = self._send_callback(str(content))
+            send_callback = _DELIVERY_SEND_CALLBACKS.get(self)
+            if send_callback is None:
+                return GatewayDeliveryReceipt(status="failed")
+            native_result = send_callback(str(content))
             if inspect.isawaitable(native_result):
                 native_result = await native_result
         except Exception:
@@ -133,6 +138,12 @@ class GatewayDelivery:
         if native_result.success is True and message_id:
             return GatewayDeliveryReceipt(status="sent", message_id=message_id)
         return GatewayDeliveryReceipt(status="unknown")
+
+
+_DELIVERY_SEND_CALLBACKS: weakref.WeakKeyDictionary[
+    GatewayDelivery,
+    Callable[[str], Awaitable[Any] | Any],
+] = weakref.WeakKeyDictionary()
 
 
 def _optional_text(value: Any) -> Optional[str]:

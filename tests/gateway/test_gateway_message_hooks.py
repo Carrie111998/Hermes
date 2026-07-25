@@ -1,5 +1,6 @@
 """Public contract tests for the generic gateway user-message hook."""
 
+import asyncio
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -124,6 +125,8 @@ async def test_route_delivery_returns_truthful_normalized_receipts(native_result
     assert not hasattr(delivery, "gateway")
     assert not hasattr(delivery, "credentials")
     assert not hasattr(delivery, "event")
+    assert not hasattr(delivery, "_send_callback")
+
 
 @pytest.mark.asyncio
 async def test_route_delivery_reports_raised_send_as_failed_without_native_details():
@@ -135,6 +138,16 @@ async def test_route_delivery_reports_raised_send_as_failed_without_native_detai
     assert receipt.status == "failed"
     assert receipt.message_id is None
     assert not hasattr(receipt, "error")
+
+
+def test_route_delivery_does_not_expose_native_send_callback():
+    async def send_native(_content: str):
+        return SendResult(success=True, message_id="out-1")
+
+    delivery = GatewayDelivery(send_native)
+
+    assert not hasattr(delivery, "_send_callback")
+    assert not hasattr(delivery, "__dict__")
 
 
 def _runner_for_dispatch():
@@ -223,6 +236,86 @@ async def test_continue_hook_decisions_reach_cold_agent_dispatch(monkeypatch, de
     await runner._handle_message(_event())
 
     runner._handle_message_with_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_awaited_cold_hook_cannot_start_duplicate_agents(monkeypatch):
+    runner, adapter = _runner_for_dispatch()
+    first_hook_entered = asyncio.Event()
+    release_first_hook = asyncio.Event()
+    hook_calls = 0
+    active_agent_calls = 0
+    max_concurrent_agent_calls = 0
+
+    async def hook(_name, **_kwargs):
+        nonlocal hook_calls
+        hook_calls += 1
+        if hook_calls == 1:
+            first_hook_entered.set()
+            await release_first_hook.wait()
+        return [{"decision": "pass"}]
+
+    async def run_agent(*_args, **_kwargs):
+        nonlocal active_agent_calls, max_concurrent_agent_calls
+        active_agent_calls += 1
+        max_concurrent_agent_calls = max(
+            max_concurrent_agent_calls,
+            active_agent_calls,
+        )
+        await asyncio.sleep(0)
+        active_agent_calls -= 1
+        return ""
+
+    runner._handle_message_with_agent = run_agent
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    first = asyncio.create_task(runner._handle_message(_event()))
+    await first_hook_entered.wait()
+    second = asyncio.create_task(runner._handle_message(_event()))
+    for _ in range(100):
+        if hook_calls == 2:
+            break
+        await asyncio.sleep(0)
+    release_first_hook.set()
+    await asyncio.gather(first, second)
+
+    assert hook_calls == 2
+    assert max_concurrent_agent_calls == 1
+    assert build_session_key(_source()) in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_route_delivery_binds_relay_to_ingress_logical_platform(monkeypatch):
+    runner, _native_adapter = _runner_for_dispatch()
+    relay = SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="wrong-route")),
+        send_for_platform=AsyncMock(
+            return_value=SendResult(success=True, message_id="relay-out")
+        ),
+        _pending_messages={},
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    event = _event()
+    event.source.delivered_via_upstream_relay = True
+
+    async def hook(_name, **kwargs):
+        receipt = await kwargs["delivery"].send("relay reply")
+        assert receipt == GatewayDeliveryReceipt(status="sent", message_id="relay-out")
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    await runner._handle_message(event)
+
+    relay.send_for_platform.assert_awaited_once_with(
+        Platform.DISCORD,
+        "channel-1",
+        "relay reply",
+        metadata={"thread_id": "thread-1"},
+    )
+    relay.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

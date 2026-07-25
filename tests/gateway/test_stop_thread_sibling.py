@@ -9,7 +9,7 @@ stop any run in the same thread.
 """
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
 from gateway.session import SessionSource, build_session_key
@@ -123,6 +123,7 @@ async def test_stop_interrupts_sibling_thread_run_when_authorized(monkeypatch):
 
     runner._interrupt_and_clear_session = _fake_interrupt
     runner._is_user_authorized = lambda source: True
+    runner._notify_gateway_session_cancel = AsyncMock()
 
     event = MessageEvent(
         text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
@@ -130,6 +131,10 @@ async def test_stop_interrupts_sibling_thread_run_when_authorized(monkeypatch):
     result = await runner._handle_stop_command(event)
 
     assert interrupted == [(key_b, _INTERRUPT_REASON_STOP, "stop_command_thread_sibling")]
+    assert runner._notify_gateway_session_cancel.await_args_list == [
+        call(key_a, event.source, reason="stop"),
+        call(key_b, event.source, reason="stop"),
+    ]
     # EphemeralReply or str — both carry the "stopped" message, not "no_active".
     assert "no active" not in str(getattr(result, "text", result)).lower()
 

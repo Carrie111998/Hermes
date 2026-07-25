@@ -1124,6 +1124,11 @@ class GatewaySlashCommandsMixin:
         sibling_keys = self._sibling_thread_run_keys(source, session_key)
         if sibling_keys and self._is_user_authorized(source):
             for sibling_key in sibling_keys:
+                await self._notify_gateway_session_cancel(
+                    sibling_key,
+                    source,
+                    reason="stop",
+                )
                 await self._interrupt_and_clear_session(
                     sibling_key,
                     source,

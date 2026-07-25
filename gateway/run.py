@@ -12223,15 +12223,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        # This is the cold-session counterpart to the active-session seam. All
-        # gateway controls and slash capabilities have already had first refusal.
-        if (
-            not is_internal
-            and not event.is_command()
-            and await self._run_gateway_message_hook(event, source, _quick_key)
-        ):
-            return None
-
         if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.
@@ -12287,6 +12278,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            # This is the cold-session counterpart to the active-session seam.
+            # Claim before awaiting a plugin so a pass-through hook cannot
+            # reopen the duplicate-agent race protected by the sentinel.
+            if (
+                not is_internal
+                and not event.is_command()
+                and await self._run_gateway_message_hook(event, source, _quick_key)
+            ):
+                return None
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -12874,13 +12874,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.plugins import invoke_hook_async
 
         adapter = self._adapter_for_source(source)
-        metadata = self._thread_metadata_for_source(source, event.message_id)
+        delivery_platform = source.platform
+        delivery_chat_id = str(source.chat_id)
+        delivery_metadata = self._thread_metadata_for_source(source, event.message_id)
+        delivery_via_relay = (
+            getattr(source, "delivered_via_upstream_relay", False) is True
+        )
 
         async def _send_to_source(content: str):
             if adapter is None:
-                return SendResult(success=False, error="No adapter for current route")
+                return SendResult(success=False)
+            metadata = dict(delivery_metadata) if delivery_metadata else None
+            if delivery_via_relay:
+                send_for_platform: Any = getattr(adapter, "send_for_platform", None)
+                if not callable(send_for_platform):
+                    return SendResult(success=False)
+                return await send_for_platform(
+                    delivery_platform,
+                    delivery_chat_id,
+                    content,
+                    metadata=metadata,
+                )
             return await adapter.send(
-                str(source.chat_id),
+                delivery_chat_id,
                 content,
                 metadata=metadata,
             )
