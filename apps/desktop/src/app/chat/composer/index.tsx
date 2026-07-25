@@ -1022,7 +1022,17 @@ export function ChatBar({
                       </Button>
                       <Button
                         className="h-6 rounded-md px-2 text-[0.68rem]"
-                        onClick={() => exitQueuedEdit('save')}
+                        onClick={() => {
+                          const editor = editorRef.current
+                          if (editor) {
+                            const domText = composerPlainText(editor)
+                            if (domText !== draftRef.current) {
+                              draftRef.current = domText
+                              setComposerText(domText)
+                            }
+                          }
+                          exitQueuedEdit('save')
+                        }}
                         type="button"
                       >
                         {t.common.save}
