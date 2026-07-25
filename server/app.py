@@ -23,7 +23,7 @@ from .storage import create_storage
 from .agent_service import AgentRunService, StubRunExecutor
 from .chat_bridge import ChatBridge
 from .lead_research import LeadResearchService
-from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, research_campaigns, sales_intelligence, unsubscribe
+from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, oauth, research_campaigns, sales_intelligence, unsubscribe
 
 
 def create_app(settings: Settings | None = None, db: Database | None = None,
@@ -109,6 +109,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.include_router(integrations.router, prefix=api_prefix)
     app.include_router(outreach.router, prefix=api_prefix)
     app.include_router(operations.router, prefix=api_prefix)
+    app.include_router(oauth.router, prefix=api_prefix)
     app.include_router(unsubscribe.router, prefix=api_prefix)
     if chat_service:
         app.include_router(chat.router)

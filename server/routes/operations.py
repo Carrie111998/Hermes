@@ -381,7 +381,15 @@ def admin_integrations(request: Request, _: Principal = Depends(require_admin)):
 
 @router.get("/admin/analytics/costs")
 def admin_costs(request: Request, _: Principal = Depends(require_admin)):
-    return [dict(row) for row in request.app.state.db.all(
+    """Per-tenant model spend.
+
+    `agent_runs.cost` is never written today: the run executor shells out to the
+    hermes CLI and does not parse token accounting back out of it. Every total
+    is therefore structurally 0. `metering_enabled` says so explicitly, because
+    a bare 0.0 reads as "this tenant cost nothing" rather than "not measured".
+    Populate it in AgentRunService before flipping the flag.
+    """
+    return [{**dict(row), "metering_enabled": False} for row in request.app.state.db.all(
         "SELECT company_id,SUM(cost) AS total_cost FROM agent_runs GROUP BY company_id")]
 
 

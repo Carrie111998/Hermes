@@ -49,6 +49,13 @@ class Settings:
     chat_toolset: str = "none"
     auth_max_attempts: int = 8
     auth_window_seconds: int = 300
+    # One OAuth app per provider, shared by every tenant — the standard SaaS
+    # shape. Tenants authorize against it; they never supply client secrets.
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    microsoft_oauth_client_id: str = ""
+    microsoft_oauth_client_secret: str = ""
+    microsoft_oauth_tenant: str = "common"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -85,4 +92,9 @@ class Settings:
             chat_toolset=str(cfg.get("chat_toolset") or "none").lower(),
             auth_max_attempts=max(1, int(cfg.get("auth_max_attempts", 8))),
             auth_window_seconds=max(30, int(cfg.get("auth_window_seconds", 300))),
+            google_oauth_client_id=os.environ.get("GOOGLE_OAUTH_CLIENT_ID", ""),
+            google_oauth_client_secret=os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", ""),
+            microsoft_oauth_client_id=os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", ""),
+            microsoft_oauth_client_secret=os.environ.get("MICROSOFT_OAUTH_CLIENT_SECRET", ""),
+            microsoft_oauth_tenant=os.environ.get("MICROSOFT_OAUTH_TENANT", "common"),
         )
