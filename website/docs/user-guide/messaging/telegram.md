@@ -194,6 +194,40 @@ hermes gateway
 
 The bot should come online within seconds. Send it a message on Telegram to verify.
 
+### Attach a static location pin to the next message (Optional)
+
+By default, a Telegram location pin is handled as its own conversational
+message. To treat a deliberate, one-time pin as context for the text message
+you are about to send, enable `stage_next`:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        location_pin_mode: stage_next
+        location_pin_ttl_seconds: 300
+```
+
+With this opt-in mode:
+
+1. Hermes validates the static pin and sender with the gateway's normal
+   authorization rules.
+2. Hermes replies `Location will be attached to your next message.` without
+   invoking the agent for the pin itself. The pin is held in memory only after
+   that acknowledgement succeeds.
+3. The next normally accepted text message from the same sender, chat, and
+   forum topic receives the location context.
+4. The pin is consumed once, or discarded after the configured lifetime.
+
+The lifetime defaults to 300 seconds and is clamped to 1–3600 seconds. Static
+pins can be staged in DMs and authorized groups without an `@mention`, but the
+following text request must still pass the group's normal trigger rules. Pins
+without a stable Telegram sender identity (for example, anonymous sender-chat
+posts) are not staged and continue through normal message gating. Live
+location updates and edited location messages keep their existing behavior;
+this option only changes deliberate one-time pins and venues.
+
 ## Sending Generated Files from Docker-backed Terminals
 
 If your terminal backend is `docker`, keep in mind that Telegram attachments are
