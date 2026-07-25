@@ -149,15 +149,19 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
 
     Resolution order:
     1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
+       - exact tool name key wins
+       - ``"*"`` wildcard applies to all tools not named explicitly
+       - empty string is a valid override (suppresses emoji — used by ``clean``)
     2. Tool registry's per-tool ``emoji`` field
     3. *default* fallback
     """
-    # 1. Skin override
+    # 1. Skin override (allow empty string to mean "no emoji")
     skin = _get_skin()
     if skin and skin.tool_emojis:
-        override = skin.tool_emojis.get(tool_name)
-        if override:
-            return override
+        if tool_name in skin.tool_emojis:
+            return skin.tool_emojis[tool_name]
+        if "*" in skin.tool_emojis:
+            return skin.tool_emojis["*"]
     # 2. Registry default
     try:
         from tools.registry import registry
@@ -168,6 +172,14 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
         pass
     # 3. Hardcoded fallback
     return default
+
+
+def _format_tool_emoji(tool_name: str, default: str = "⚡") -> str:
+    """Return emoji plus trailing space, or empty string when suppressed."""
+    emoji = get_tool_emoji(tool_name, default)
+    if not emoji:
+        return ""
+    return f"{emoji} "
 
 
 # =========================================================================
@@ -1352,59 +1364,59 @@ def _get_cute_tool_message(
         return f"{line}{failure_suffix}"
 
     if tool_name == "web_search":
-        return _wrap(f"┊ 🔍 search    {_trunc(args.get('query', ''), 42)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('web_search', '🔍')}search    {_trunc(args.get('query', ''), 42)}  {dur}")
     if tool_name == "web_extract":
         urls = args.get("urls", [])
         if urls:
             url = _display_url(urls[0] if isinstance(urls, list) else urls)
             if not url:
-                return _wrap(f"┊ 📄 fetch     pages  {dur}")
+                return _wrap(f"┊ {_format_tool_emoji('web_extract', '📄')}fetch     pages  {dur}")
             domain = url.replace("https://", "").replace("http://", "").split("/")[0]
             extra = f" +{len(urls)-1}" if isinstance(urls, list) and len(urls) > 1 else ""
-            return _wrap(f"┊ 📄 fetch     {_trunc(domain, 35)}{extra}  {dur}")
-        return _wrap(f"┊ 📄 fetch     pages  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('web_extract', '📄')}fetch     {_trunc(domain, 35)}{extra}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('web_extract', '📄')}fetch     pages  {dur}")
     if tool_name == "terminal":
-        return _wrap(f"┊ 💻 $         {_trunc(build_tool_preview(tool_name, args) or args.get('command', ''), 42)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('terminal', '💻')}$         {_trunc(build_tool_preview(tool_name, args) or args.get('command', ''), 42)}  {dur}")
     if tool_name == "process":
         action = args.get("action", "?")
         sid = args.get("session_id", "")[:12]
         labels = {"list": "ls processes", "poll": f"poll {sid}", "log": f"log {sid}",
                   "wait": f"wait {sid}", "kill": f"kill {sid}", "write": f"write {sid}", "submit": f"submit {sid}"}
-        return _wrap(f"┊ ⚙️  proc      {labels.get(action, f'{action} {sid}')}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('process', '⚙️ ')}proc      {labels.get(action, f'{action} {sid}')}  {dur}")
     if tool_name == "read_file":
-        return _wrap(f"┊ 📖 read      {_trunc(build_tool_preview(tool_name, args) or args.get('path', ''), 42)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('read_file', '📖')}read      {_trunc(build_tool_preview(tool_name, args) or args.get('path', ''), 42)}  {dur}")
     if tool_name == "write_file":
-        return _wrap(f"┊ ✍️  write     {_path(args.get('path', ''))}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('write_file', '✍️ ')}write     {_path(args.get('path', ''))}  {dur}")
     if tool_name == "patch":
-        return _wrap(f"┊ 🔧 patch     {_path(args.get('path', ''))}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('patch', '🔧')}patch     {_path(args.get('path', ''))}  {dur}")
     if tool_name == "search_files":
         pattern = _trunc(args.get("pattern", ""), 35)
         target = args.get("target", "content")
         verb = "find" if target == "files" else "grep"
-        return _wrap(f"┊ 🔎 {verb:9} {pattern}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('search_files', '🔎')}{verb:9} {pattern}  {dur}")
     if tool_name == "browser_navigate":
         url = args.get("url", "")
         domain = url.replace("https://", "").replace("http://", "").split("/")[0]
-        return _wrap(f"┊ 🌐 navigate  {_trunc(domain, 35)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_navigate', '🌐')}navigate  {_trunc(domain, 35)}  {dur}")
     if tool_name == "browser_snapshot":
         mode = "full" if args.get("full") else "compact"
-        return _wrap(f"┊ 📸 snapshot  {mode}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_snapshot', '📸')}snapshot  {mode}  {dur}")
     if tool_name == "browser_click":
-        return _wrap(f"┊ 👆 click     {args.get('ref', '?')}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_click', '👆')}click     {args.get('ref', '?')}  {dur}")
     if tool_name == "browser_type":
-        return _wrap(f"┊ ⌨️  type      \"{_trunc(args.get('text', ''), 30)}\"  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_type', '⌨️ ')}type      \"{_trunc(args.get('text', ''), 30)}\"  {dur}")
     if tool_name == "browser_scroll":
         d = args.get("direction", "down")
         arrow = {"down": "↓", "up": "↑", "right": "→", "left": "←"}.get(d, "↓")
-        return _wrap(f"┊ {arrow}  scroll    {d}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_scroll', arrow)}scroll    {d}  {dur}")
     if tool_name == "browser_back":
-        return _wrap(f"┊ ◀️  back      {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_back', '◀️ ')}back      {dur}")
     if tool_name == "browser_press":
-        return _wrap(f"┊ ⌨️  press     {args.get('key', '?')}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_press', '⌨️ ')}press     {args.get('key', '?')}  {dur}")
     if tool_name == "browser_get_images":
-        return _wrap(f"┊ 🖼️  images    extracting  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_get_images', '🖼️ ')}images    extracting  {dur}")
     if tool_name == "browser_vision":
-        return _wrap(f"┊ 👁️  vision    analyzing page  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('browser_vision', '👁️ ')}vision    analyzing page  {dur}")
     if tool_name == "todo":
         todos_arg = args.get("todos")
         merge = args.get("merge", False)
@@ -1422,72 +1434,72 @@ def _get_cute_tool_message(
                 pass
         if todos_arg is None:
             if total > 0:
-                return _wrap(f"┊ 📋 plan      {done}/{total} task(s)  {dur}")
-            return _wrap(f"┊ 📋 plan      reading tasks  {dur}")
+                return _wrap(f"┊ {_format_tool_emoji('todo', '📋')}plan      {done}/{total} task(s)  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('todo', '📋')}plan      reading tasks  {dur}")
         elif merge:
             if total > 0 and done > 0:
-                return _wrap(f"┊ 📋 plan      update {done}/{total} ✓  {dur}")
-            return _wrap(f"┊ 📋 plan      update {len(todos_arg)} task(s)  {dur}")
+                return _wrap(f"┊ {_format_tool_emoji('todo', '📋')}plan      update {done}/{total} ✓  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('todo', '📋')}plan      update {len(todos_arg)} task(s)  {dur}")
         else:
             if total > 0 and done > 0:
-                return _wrap(f"┊ 📋 plan      {done}/{total} task(s)  {dur}")
-            return _wrap(f"┊ 📋 plan      {len(todos_arg)} task(s)  {dur}")
+                return _wrap(f"┊ {_format_tool_emoji('todo', '📋')}plan      {done}/{total} task(s)  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('todo', '📋')}plan      {len(todos_arg)} task(s)  {dur}")
     if tool_name == "session_search":
-        return _wrap(f"┊ 🔍 recall    \"{_trunc(args.get('query', ''), 35)}\"  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('session_search', '🔍')}recall    \"{_trunc(args.get('query', ''), 35)}\"  {dur}")
     if tool_name == "memory":
         action = args.get("action", "?")
         target = args.get("target", "")
         if action == "add":
-            return _wrap(f"┊ 🧠 memory    +{target}: \"{_trunc(args.get('content', ''), 30)}\"  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('memory', '🧠')}memory    +{target}: \"{_trunc(args.get('content', ''), 30)}\"  {dur}")
         elif action == "replace":
             old = args.get("old_text") or ""
             old = old if old else "<missing old_text>"
-            return _wrap(f"┊ 🧠 memory    ~{target}: \"{_trunc(old, 20)}\"  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('memory', '🧠')}memory    ~{target}: \"{_trunc(old, 20)}\"  {dur}")
         elif action == "remove":
             old = args.get("old_text") or ""
             old = old if old else "<missing old_text>"
-            return _wrap(f"┊ 🧠 memory    -{target}: \"{_trunc(old, 20)}\"  {dur}")
-        return _wrap(f"┊ 🧠 memory    {action}  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('memory', '🧠')}memory    -{target}: \"{_trunc(old, 20)}\"  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('memory', '🧠')}memory    {action}  {dur}")
     if tool_name == "skills_list":
-        return _wrap(f"┊ 📚 skills    list {args.get('category', 'all')}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('skills_list', '📚')}skills    list {args.get('category', 'all')}  {dur}")
     if tool_name == "skill_view":
         label = args.get("name", "")
         file_path = args.get("file_path")
         if file_path:
             label = f"{label} → {file_path}" if label else str(file_path)
-        return _wrap(f"┊ 📚 skill     {_trunc(label, 44)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('skill_view', '📚')}skill     {_trunc(label, 44)}  {dur}")
     if tool_name == "image_generate":
-        return _wrap(f"┊ 🎨 create    {_trunc(args.get('prompt', ''), 35)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('image_generate', '🎨')}create    {_trunc(args.get('prompt', ''), 35)}  {dur}")
     if tool_name == "text_to_speech":
-        return _wrap(f"┊ 🔊 speak     {_trunc(args.get('text', ''), 30)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('text_to_speech', '🔊')}speak     {_trunc(args.get('text', ''), 30)}  {dur}")
     if tool_name == "vision_analyze":
-        return _wrap(f"┊ 👁️  vision    {_trunc(args.get('question', ''), 30)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('vision_analyze', '👁️ ')}vision    {_trunc(args.get('question', ''), 30)}  {dur}")
     if tool_name == "send_message":
-        return _wrap(f"┊ 📨 send      {args.get('target', '?')}: \"{_trunc(args.get('message', ''), 25)}\"  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('send_message', '📨')}send      {args.get('target', '?')}: \"{_trunc(args.get('message', ''), 25)}\"  {dur}")
     if tool_name == "cronjob":
         action = args.get("action", "?")
         if action == "create":
             skills = args.get("skills") or ([] if not args.get("skill") else [args.get("skill")])
             label = args.get("name") or (skills[0] if skills else None) or args.get("prompt", "task")
-            return _wrap(f"┊ ⏰ cron      create {_trunc(label, 24)}  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('cronjob', '⏰')}cron      create {_trunc(label, 24)}  {dur}")
         if action == "list":
-            return _wrap(f"┊ ⏰ cron      listing  {dur}")
-        return _wrap(f"┊ ⏰ cron      {action} {args.get('job_id', '')}  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('cronjob', '⏰')}cron      listing  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('cronjob', '⏰')}cron      {action} {args.get('job_id', '')}  {dur}")
     if tool_name == "execute_code":
         code = args.get("code", "")
         first_line = code.strip().split("\n")[0] if code.strip() else ""
-        return _wrap(f"┊ 🐍 exec      {_trunc(first_line, 35)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('execute_code', '🐍')}exec      {_trunc(first_line, 35)}  {dur}")
     if tool_name == "delegate_task":
         tasks = args.get("tasks")
         if tasks and isinstance(tasks, list):
             task_count, goals = _delegate_task_goal_parts(tasks, per_goal_len=30)
             detail = " | ".join(goals) if goals else "parallel"
             count_label = task_count or len(tasks)
-            return _wrap(f"┊ 🔀 delegate  {count_label}x: {_trunc(detail, 35)}  {dur}")
-        return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
+            return _wrap(f"┊ {_format_tool_emoji('delegate_task', '🔀')}delegate  {count_label}x: {_trunc(detail, 35)}  {dur}")
+        return _wrap(f"┊ {_format_tool_emoji('delegate_task', '🔀')}delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
 
     preview = build_tool_preview(tool_name, args) or ""
-    return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
+    return _wrap(f"┊ {_format_tool_emoji(tool_name, '⚡')}{tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
 
 
 def get_cute_tool_message(
@@ -1500,7 +1512,7 @@ def get_cute_tool_message(
         logger.debug("Tool completion label failed for %s: %s", tool_name, exc)
         safe_name = tool_name[:9] if isinstance(tool_name, str) and tool_name else "tool"
         safe_duration = f"{duration:.1f}s" if isinstance(duration, (int, float)) else "done"
-        return f"┊ ⚡ {safe_name:9} completed  {safe_duration}"
+        return f"┊ {_format_tool_emoji(safe_name, '⚡')}{safe_name:9} completed  {safe_duration}"
 
 
 # =========================================================================

@@ -73,6 +73,16 @@ class TestBuiltinSkins:
         assert skin.name == "mono"
         assert skin.get_color("banner_title") == "#e6edf3"
 
+
+    def test_clean_skin_loads(self):
+        from hermes_cli.skin_engine import load_skin
+        skin = load_skin("clean")
+        assert skin.name == "clean"
+        assert skin.tool_prefix == "|"
+        assert skin.tool_emojis.get("*") == ""
+        assert skin.get_branding("response_label").strip() == "Hermes"
+        assert skin.get_branding("response_box_style") == "simple"
+
     def test_slate_skin_loads(self):
         from hermes_cli.skin_engine import load_skin
         skin = load_skin("slate")
@@ -148,6 +158,7 @@ class TestSkinManagement:
         assert "default" in names
         assert "ares" in names
         assert "mono" in names
+        assert "clean" in names
         assert "slate" in names
         assert "daylight" in names
         assert "warm-lightmode" in names

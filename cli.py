@@ -888,6 +888,26 @@ except Exception:
     pass
 
 from rich import box as rich_box
+
+def _response_box_style():
+    """Pick Rich box style from active skin branding (default: HORIZONTALS)."""
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        import rich.box as rich_box
+        style = (get_active_skin().get_branding("response_box_style", "horizontals") or "horizontals").strip().lower()
+        if style in {"simple", "ascii", "clean"}:
+            return rich_box.SIMPLE
+        if style in {"minimal", "min"}:
+            return rich_box.MINIMAL
+        if style in {"square"}:
+            return rich_box.SQUARE
+        if style in {"rounded"}:
+            return rich_box.ROUNDED
+        return rich_box.HORIZONTALS
+    except Exception:
+        import rich.box as rich_box
+        return rich_box.HORIZONTALS
+
 from rich.console import Console
 from rich.markup import escape as _escape
 from rich.panel import Panel
@@ -12914,7 +12934,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         title_align="left",
                         border_style=_resp_color,
                         style=_resp_text,
-                        box=rich_box.HORIZONTALS,
+                        box=_response_box_style(),
                         padding=(1, 4),
                         width=self._scrollback_box_width(),
                     ))
@@ -12947,7 +12967,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             title="[#CD7F32 bold]⚡ Out of credits[/]",
                             title_align="left",
                             border_style="#CD7F32",
-                            box=rich_box.HORIZONTALS,
+                            box=_response_box_style(),
                             padding=(1, 4),
                             width=self._scrollback_box_width(),
                         ))
