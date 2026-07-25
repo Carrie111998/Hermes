@@ -2479,7 +2479,7 @@ class WorkflowEngine:
                     # the card before the worker picks it up.
                     try:
                         with kanban_db.connect_closing(board=self.kanban_board) as _conn:
-                            _kanban_db.heartbeat_worker(_conn, card_id)
+                            kanban_db.heartbeat_worker(_conn, card_id)
                     except Exception:
                         pass  # Non-fatal: heartbeat sweep has created_at fallback
                     print(f"   ✓ {nid} → card {card_id}")
@@ -2709,9 +2709,8 @@ class WorkflowEngine:
             # Sweep stale heartbeats once per poll tick.  Idempotent
             # and cheap (single SELECT + conditional UPDATEs).
             try:
-                from hermes_cli import kanban_db as _kb
-                with _kanban_db.connect_closing(board=self.kanban_board) as _conn:
-                    _kanban_db.sweep_stale_heartbeats(_conn)
+                with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                    kanban_db.sweep_stale_heartbeats(_conn)
             except Exception:
                 pass  # Non-fatal: heartbeat sweep is a safety net
 
