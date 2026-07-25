@@ -1492,6 +1492,7 @@ class ProcessRegistry:
             and output snapshot.
         """
         from tools.ansi_strip import strip_ansi
+        from tools.environments.base import touch_activity_if_due
         from tools.interrupt import is_interrupted as _is_interrupted
 
         try:
@@ -1515,7 +1516,9 @@ class ProcessRegistry:
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
-        deadline = time.monotonic() + effective_timeout
+        now = time.monotonic()
+        deadline = now + effective_timeout
+        activity_state = {"last_touch": now, "start": now}
 
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
@@ -1553,6 +1556,7 @@ class ProcessRegistry:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            touch_activity_if_due(activity_state, "background process wait")
             session._completion_event.wait(timeout=min(1.0, remaining))
 
         result = {

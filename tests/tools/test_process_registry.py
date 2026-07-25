@@ -254,6 +254,33 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
 
 
 # =========================================================================
+# Blocking wait activity
+# =========================================================================
+
+
+def test_wait_reports_activity_while_process_is_running(registry, monkeypatch):
+    """A blocking process wait must keep the agent/kanban heartbeat alive."""
+    session = _make_session(sid="proc_wait_activity")
+    registry._running[session.id] = session
+    touches = []
+
+    def record_touch(state, label):
+        touches.append((state, label))
+
+    monkeypatch.setattr(
+        "tools.environments.base.touch_activity_if_due",
+        record_touch,
+    )
+
+    result = registry.wait(session.id, timeout=0.05)
+
+    assert result["status"] == "timeout"
+    assert touches
+    assert {label for _, label in touches} == {"background process wait"}
+    assert all("start" in state and "last_touch" in state for state, _ in touches)
+
+
+# =========================================================================
 # Orphaned-pipe reconciliation (issue #17327)
 # =========================================================================
 
