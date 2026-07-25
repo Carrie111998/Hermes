@@ -4630,6 +4630,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("[Gateway] reaction hook emit failed", exc_info=True)
 
+    def _build_env_fallback_platform_config(
+        self, platform: "Platform"
+    ) -> "Optional[PlatformConfig]":
+        """Build a minimal PlatformConfig from env vars for a platform that
+        was enabled via .env (e.g. TELEGRAM_BOT_TOKEN) rather than via
+        config.yaml's gateway.platforms block.
+
+        Without this, a retryable fatal error on such a platform never gets
+        queued into _failed_platforms (platform_config is None), so the
+        background reconnect watcher never tries to recover it — the gateway
+        stays alive but deaf until manual restart.
+        """
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES, PlatformConfig
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES.get(platform)
+        if not env_name:
+            return None
+        token = os.environ.get(env_name)
+        if not token:
+            return None
+        home_channel = os.environ.get(f"{platform.value.upper()}_HOME_CHANNEL")
+        return PlatformConfig(
+            token=token,
+            home_channel=home_channel or "",
+            enabled=True,
+        )
+
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
@@ -4750,6 +4777,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
             platform_config = self.config.platforms.get(adapter.platform)
+            # Fallback: platforms enabled via .env (e.g. TELEGRAM_BOT_TOKEN)
+            # are not in config.yaml's gateway.platforms dict, so
+            # platform_config would be None and the adapter would never be
+            # queued for background reconnection — causing the gateway to
+            # silently stay alive but deaf until manual restart.
+            # Build a minimal PlatformConfig from env vars so the reconnect
+            # watcher can recover it.
+            if platform_config is None:
+                platform_config = self._build_env_fallback_platform_config(
+                    adapter.platform
+                )
             if platform_config and adapter.platform not in self._failed_platforms:
                 self._failed_platforms[adapter.platform] = {
                     "config": platform_config,
@@ -4764,6 +4802,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # exhausting its restart budget), respawn it so queued platforms
                 # are not permanently stranded (#70344).
                 self._ensure_reconnect_watcher_running()
+            elif platform_config is None:
+                logger.warning(
+                    "%s has retryable fatal error but no platform config "
+                    "found in config.yaml or env; cannot queue for reconnect",
+                    adapter.platform.value,
+                )
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
