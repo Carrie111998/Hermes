@@ -8592,6 +8592,7 @@ def _messaging_platform_payload(
     env_on_disk: dict[str, str],
     runtime: dict | None,
     scoped: bool = False,
+    scoped_home: Path | None = None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     runtime_platforms = runtime.get("platforms") if runtime else {}
@@ -8600,8 +8601,9 @@ def _messaging_platform_payload(
         if isinstance(runtime_platforms, dict)
         else {}
     )
+    pid_path = scoped_home / "gateway.pid" if scoped_home else None
     gateway_running = (
-        get_running_pid() is not None
+        get_running_pid(pid_path=pid_path) is not None
         or get_runtime_status_running_pid(runtime) is not None
     )
     env_vars = []
@@ -9609,13 +9611,16 @@ async def get_messaging_platforms(profile: Optional[str] = None):
     # all resolve against the requested profile's HERMES_HOME.
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
-        runtime = read_runtime_status()
+        runtime = read_runtime_status(
+            path=scoped_dir / "gateway_state.json" if scoped_dir else None
+        )
         return {
             "env_path": str(get_env_path()),
             "gateway_start_command": _gateway_display_command(profile, "start"),
             "platforms": [
                 _messaging_platform_payload(
-                    entry, env_on_disk, runtime, scoped=scoped_dir is not None
+                    entry, env_on_disk, runtime, scoped=scoped_dir is not None,
+                    scoped_home=scoped_dir,
                 )
                 for entry in _messaging_platform_catalog()
             ]
@@ -9751,7 +9756,9 @@ async def test_messaging_platform(platform_id: str, profile: Optional[str] = Non
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
         payload = _messaging_platform_payload(
-            entry, env_on_disk, read_runtime_status(), scoped=scoped_dir is not None
+            entry, env_on_disk, read_runtime_status(
+                path=scoped_dir / "gateway_state.json" if scoped_dir else None
+            ), scoped=scoped_dir is not None, scoped_home=scoped_dir,
         )
     if not payload["enabled"]:
         message = f"{entry['name']} is disabled. Enable it, then restart the gateway."

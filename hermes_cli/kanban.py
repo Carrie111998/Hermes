@@ -134,7 +134,9 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
-def _check_dispatcher_presence() -> tuple[bool, str]:
+def _check_dispatcher_presence(
+    hermes_home: Optional[Path] = None,
+) -> tuple[bool, str]:
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
@@ -155,7 +157,9 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     except Exception:
         return (True, "")  # can't probe — silent
     try:
-        pid = get_running_pid()
+        pid = get_running_pid(
+            pid_path=hermes_home / "gateway.pid" if hermes_home else None
+        )
     except Exception:
         return (True, "")  # probe errored — silent
 
