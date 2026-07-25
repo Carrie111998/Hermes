@@ -755,6 +755,37 @@ def _build_anthropic_client_with_bearer_hook(
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
+def _resolve_bedrock_mantle_workspace_id(base_url: Optional[str]) -> str:
+    """Resolve the optional Bedrock Mantle workspace for Anthropic requests.
+
+    The Anthropic Messages endpoint accepts ``anthropic-workspace-id``.
+    ``anthropic-workspace`` is not equivalent and is silently ignored.
+    """
+    if not _is_bedrock_mantle_endpoint(base_url):
+        return ""
+
+    workspace_id = os.environ.get("BEDROCK_MANTLE_WORKSPACE_ID", "").strip()
+    if not workspace_id:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+            bedrock = config.get("bedrock") or {}
+            workspace_id = str(bedrock.get("mantle_workspace_id") or "").strip()
+        except Exception:
+            workspace_id = ""
+
+    if workspace_id and (
+        not workspace_id.startswith("proj_")
+        or not workspace_id.removeprefix("proj_").isalnum()
+    ):
+        raise ValueError(
+            "Invalid Bedrock Mantle workspace ID. "
+            "Expected a project ID beginning with 'proj_'."
+        )
+    return workspace_id
+
+
 def build_anthropic_client(
     api_key,
     base_url: str = None,
@@ -880,6 +911,12 @@ def build_anthropic_client(
         kwargs["api_key"] = api_key
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+
+    workspace_id = _resolve_bedrock_mantle_workspace_id(normalized_base_url)
+    if workspace_id:
+        headers = dict(kwargs.get("default_headers") or {})
+        headers["anthropic-workspace-id"] = workspace_id
+        kwargs["default_headers"] = headers
 
     return _anthropic_sdk.Anthropic(**kwargs)
 

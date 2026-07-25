@@ -147,6 +147,42 @@ class TestBuildAnthropicClient:
             "http://bedrock-mantle.ap-northeast-1.api.aws/anthropic"
         ) is False
 
+    def test_bedrock_mantle_adds_workspace_header(self, monkeypatch):
+        monkeypatch.setenv("BEDROCK_MANTLE_WORKSPACE_ID", "proj_test123")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "bedrock-key",
+                base_url="https://bedrock-mantle.us-east-1.api.aws/anthropic",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert (
+                kwargs["default_headers"]["anthropic-workspace-id"]
+                == "proj_test123"
+            )
+            assert "anthropic-workspace" not in kwargs["default_headers"]
+
+    def test_workspace_header_is_not_added_outside_bedrock_mantle(self, monkeypatch):
+        monkeypatch.setenv("BEDROCK_MANTLE_WORKSPACE_ID", "proj_test123")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "anthropic-key",
+                base_url="https://api.anthropic.com",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert "anthropic-workspace-id" not in kwargs.get("default_headers", {})
+
+    def test_invalid_bedrock_mantle_workspace_id_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("BEDROCK_MANTLE_WORKSPACE_ID", "workspace-test")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            with pytest.raises(
+                ValueError, match="Invalid Bedrock Mantle workspace ID"
+            ):
+                build_anthropic_client(
+                    "bedrock-key",
+                    base_url="https://bedrock-mantle.us-east-1.api.aws/anthropic",
+                )
+            mock_sdk.Anthropic.assert_not_called()
+
     def test_azure_anthropic_endpoint_keeps_context_1m_beta(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client(
