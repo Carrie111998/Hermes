@@ -239,6 +239,62 @@ kanban:
   dispatch_interval_seconds: 60    # default
 ```
 
+### Explicit Ultra foreground routing
+
+Foreground sessions can opt into a durable Loop planning boundary by keeping
+the canonical reasoning effort at `ultra` (the provider adapter may still
+clamp the wire-level effort to the provider's supported value). The default
+profile configuration is:
+
+```yaml
+# ~/.hermes/config.yaml (or the active profile's config.yaml)
+loop:
+  enabled: true
+  foreground_routing: ultra
+```
+
+With this setting, a substantive actionable request in an eligible foreground
+session has a single required first model round: the model must plan the work
+and call `delegate_task(mode: "loop")` with a goal/tasks packet plus context
+that states boundaries and acceptance criteria. The existing Loop service and
+dispatcher then own durable graph specification, dependency routing, and
+worker execution. `auxiliary.kanban_decomposer` only normalizes and routes the
+foreground-authored skeleton; it does not replace the foreground plan or
+review its evidence.
+
+When `codex_app_server` is selected, the same boundary is enforced by a
+model-agnostic Hermes `delegate_task(mode: "loop")` preflight before the Codex
+subprocess receives the turn. If that preflight cannot safely dispatch a
+workflow, Hermes fails closed and does not silently downgrade or bypass the
+selected Codex runtime.
+
+The policy is intentionally bypassed for greetings and deterministic
+single-step requests, real clarification/input dependencies, an active Loop
+workflow, dispatcher workers, delegated children, internal completion/boundary
+wakes, unavailable Loop tools, and an explicit request opt-out. To preserve
+ordinary foreground behavior, set the policy off in the active profile:
+
+```yaml
+loop:
+  foreground_routing: off
+```
+
+The setting is profile-scoped; it is read from the active `HERMES_HOME` and
+does not affect other profiles. It also does not rebuild or mutate the cached
+system prompt. Completed Loop work returns through the existing exact-origin
+workflow wake, where the originating foreground can review evidence, create a
+follow-up, unblock a dependency, or close the workflow.
+
+Verification commands:
+
+```bash
+# Inspect the active profile's merged settings.
+hermes config get loop.foreground_routing
+
+# Run the focused policy and Loop tests (the wrapper preserves CI parity).
+scripts/run_tests.sh tests/agent/test_loop_foreground.py tests/tools/test_delegate_loop_mode.py
+```
+
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
 start` directly, or wire the gateway up as a systemd user unit (see the

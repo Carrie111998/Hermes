@@ -86,6 +86,47 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_canonical_ultra_codex_turn_enforces_loop_before_app_server(
+        self, fake_session, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        agent = _make_codex_agent()
+        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+        calls = []
+
+        def delegate(**kwargs):
+            calls.append(kwargs)
+            return '{"status":"dispatched","mode":"loop","workflow_id":"wf-codex"}'
+
+        monkeypatch.setattr("tools.delegate_tool.delegate_task", delegate)
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("Implement the migration and verify the rollout.")
+
+        assert len(calls) == 1
+        assert calls[0]["mode"] == "loop"
+        assert calls[0]["parent_agent"] is agent
+        assert result["completed"] is True
+        assert result["codex_thread_id"] == "thread-stub-1"
+
+    def test_canonical_ultra_codex_turn_fails_closed_if_loop_cannot_be_enforced(
+        self, fake_session, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        agent = _make_codex_agent()
+        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+        monkeypatch.setattr(
+            "tools.delegate_tool.delegate_task",
+            lambda **kwargs: '{"error":"planning unavailable"}',
+        )
+        with patch.object(agent, "_run_codex_app_server_turn") as app_server:
+            result = agent.run_conversation("Implement the migration and verify the rollout.")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 0
+        assert "rejected" in result["error"]
+        app_server.assert_not_called()
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

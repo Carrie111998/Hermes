@@ -2343,6 +2343,12 @@ DEFAULT_CONFIG = {
     # Live Loop graph construction.  This is a durable graph bound, separate
     # from delegation.max_concurrent_children (which limits ephemeral agents).
     "loop": {
+        "enabled": True,
+        # Route substantive foreground turns whose canonical reasoning intent
+        # is ``ultra`` through one explicit Loop planning call.  This is read
+        # before provider adapters clamp effort for the wire protocol.  Set to
+        # ``off`` to preserve ordinary foreground behavior.
+        "foreground_routing": "ultra",
         "max_graph_nodes": 32,
         # Durable JIT-specification retry/lease windows. The lease prevents two
         # watchers compiling the same skeleton; failures back off before retry.
