@@ -1622,12 +1622,26 @@ async function checkUpdates() {
   // This probe runs BEFORE the .git existence check because install.ps1's
   // vendor init (git init) also silently fails when git.exe is broken, leaving
   // no .git directory at all.  We still want the HTTP fallback to run.
-  const probe = await runGit(['--version'], { cwd: updateRoot })
+  //
+  // Also catches spawn ENOENT: resolveGitBinary() falls back to bare 'git'
+  // when no candidate path exists, and if 'git' is not on PATH, spawn throws
+  // synchronously (caught here) and we use HTTP fallback.
+  let probe
+  try {
+    probe = await runGit(['--version'], { cwd: updateRoot })
+  } catch (e) {
+    rememberLog(`[updates] git.exe spawn failed (${e?.message}), using HTTP API fallback`)
+    return checkUpdatesViaHttp(updateRoot, branch, OFFICIAL_REPO_HTTPS_URL)
+  }
   if (probe.code !== 0) {
     rememberLog(`[updates] git.exe unavailable (exit ${probe.code}), using HTTP API fallback`)
     return checkUpdatesViaHttp(updateRoot, branch, OFFICIAL_REPO_HTTPS_URL)
   }
 
+  // From here on, every runGit() call can ENOENT if git.exe is missing.
+  // Wrap the entire git-dependent section: if ANY git command throws,
+  // fall back to the HTTP API instead of surfacing a raw ENOENT to the user.
+  try {
   const gitDir = path.join(updateRoot, '.git')
   if (!directoryExists(gitDir)) {
     return {
@@ -1651,6 +1665,11 @@ async function checkUpdates() {
     ])
     const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
     if (target.code !== 0 || !targetSha) {
+      // ls-remote failed — try HTTP API fallback before giving up.
+      const httpResult = await checkUpdatesViaHttp(updateRoot, branch, OFFICIAL_REPO_HTTPS_URL)
+      if (httpResult && !httpResult.error) {
+        return httpResult
+      }
       return {
         supported: true,
         branch,
@@ -1676,6 +1695,13 @@ async function checkUpdates() {
 
   const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
   if (fetched.code !== 0) {
+    // git fetch failed (SSL, network, auth). Fall back to HTTP API so the
+    // user still sees whether an update is available instead of a dead-end
+    // "can't reach update server" error.
+    const httpResult = await checkUpdatesViaHttp(updateRoot, branch, OFFICIAL_REPO_HTTPS_URL)
+    if (httpResult && !httpResult.error) {
+      return httpResult
+    }
     return {
       supported: true,
       branch,
@@ -1709,6 +1735,11 @@ async function checkUpdates() {
     dirty: dirtyStr.length > 0,
     hermesRoot: updateRoot,
     fetchedAt: Date.now()
+  }
+  } catch (e) {
+    // Any git command threw (ENOENT, timeout, etc). Fall back to HTTP API.
+    rememberLog(`[updates] git error in checkUpdates (${e?.message}), using HTTP API fallback`)
+    return checkUpdatesViaHttp(updateRoot, branch, OFFICIAL_REPO_HTTPS_URL)
   }
 }
 

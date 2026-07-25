@@ -8,9 +8,21 @@ using Microsoft.Win32;
 
 class Launcher
 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AllocConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool FreeConsole();
+
     [STAThread]
     static void Main()
     {
+        // Allocate a console for install progress output.
+        // The exe is compiled as /target:winexe (GUI subsystem) so it has no
+        // console by default. We create one here, then free it before launching
+        // Qiji so the console window closes cleanly.
+        AllocConsole();
+
         string exePath = Assembly.GetExecutingAssembly().Location;
 
         // ---- Extract embedded 7zr.exe to temp ----
@@ -55,16 +67,13 @@ class Launcher
         Directory.CreateDirectory(installDir);
 
         // ---- Add Windows Defender exclusion for install dir ----
-        // -NonInteractive + RedirectStandardInput prevents Add-MpPreference
-        // from blocking on an interactive confirmation prompt (which would
-        // hang the installer until the user presses a key in the console).
         Console.WriteLine("配置 Windows Defender 排除项（跳过实时扫描）...");
         try
         {
             var dpsi = new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = "-NoProfile -NonInteractive -Command \"Add-MpPreference -ExclusionPath '\" + installDir + \"' -ErrorAction SilentlyContinue\"",
+                Arguments = "-NoProfile -NonInteractive -Command \"Add-MpPreference -ExclusionPath '" + installDir + "' -ErrorAction SilentlyContinue\"",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true
@@ -81,7 +90,7 @@ class Launcher
             var dpsi2 = new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = "-NoProfile -NonInteractive -Command \"Add-MpPreference -ExclusionPath '\" + tempDir + \"' -ErrorAction SilentlyContinue\"",
+                Arguments = "-NoProfile -NonInteractive -Command \"Add-MpPreference -ExclusionPath '" + tempDir + "' -ErrorAction SilentlyContinue\"",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true
@@ -183,17 +192,16 @@ class Launcher
         Console.WriteLine("          安装完成！");
         Console.WriteLine("============================================");
         Console.WriteLine();
-        Console.WriteLine("安装路径:  " + appDir);
-        Console.WriteLine("桌面快捷方式: 奇计");
-        Console.WriteLine("开始菜单: 奇计");
-        Console.WriteLine("卸载: 控制面板 或 运行 uninstall.exe");
-        Console.WriteLine();
-        Console.WriteLine("首次启动需要初始化后端环境，请耐心等待 1-2 分钟。");
-        Console.WriteLine();
         Console.WriteLine("正在启动奇计...");
-        // UseShellExecute=true launches Qiji.exe as a detached process via the
-        // Windows shell. This prevents the installer's console window from
-        // staying open as a parent of the Qiji process.
+        Console.WriteLine();
+
+        // ---- Launch Qiji and close console immediately ----
+        // FreeConsole detaches us (and the console window) from any child processes.
+        // UseShellExecute=true launches Qiji as a fully independent process.
+        // Environment.Exit(0) terminates the launcher immediately so the console
+        // window disappears the moment Qiji starts.
+        FreeConsole();
+
         var launchPsi = new ProcessStartInfo
         {
             FileName = appExe,
@@ -202,8 +210,7 @@ class Launcher
         };
         Process.Start(launchPsi);
 
-        // Brief pause so the user sees "启动成功" before the window closes.
-        System.Threading.Thread.Sleep(2000);
+        Environment.Exit(0);
     }
 
     static void CreateShortcut(string shortcutPath, string targetPath, string workingDir)

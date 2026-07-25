@@ -80,9 +80,13 @@ const uninstallSize = (fs.statSync(uninstallExe).size / 1024).toFixed(1)
 console.log(`  uninstall.exe: ${uninstallSize} KB`)
 
 // ---- Compile launcher3.exe ----
+// /target:winexe = GUI subsystem (no console window by default).
+// launcher3.cs calls AllocConsole() at startup to show install progress,
+// then FreeConsole() + Environment.Exit(0) before launching Qiji so the
+// console window closes immediately instead of lingering as a parent of Qiji.
 step(4, 'Compiling launcher3.exe (admin manifest + embedded 7zr.exe + uninstall.exe) ...')
 if (fs.existsSync(launcherExe)) fs.unlinkSync(launcherExe)
-execSync(`"${CSC}" /nologo /optimize /target:exe /win32manifest:"${manifest}" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /resource:"${sevenZip}" /resource:"${uninstallExe}" /out:"${launcherExe}" "${launcherSrc}"`, { stdio: 'inherit' })
+execSync(`"${CSC}" /nologo /optimize /target:winexe /win32manifest:"${manifest}" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /resource:"${sevenZip}" /resource:"${uninstallExe}" /out:"${launcherExe}" "${launcherSrc}"`, { stdio: 'inherit' })
 const launcherSize = (fs.statSync(launcherExe).size / 1024).toFixed(1)
 console.log(`  launcher3.exe: ${launcherSize} KB`)
 
