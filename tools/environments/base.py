@@ -402,6 +402,18 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
 )
 
+# Awk state-machine that skips both the ``declare -x`` line AND any continuation
+# lines of excluded vars.  ``export -p`` emits multi-line values as raw
+# continuation lines (no ``declare -x`` prefix); a naive ``grep -vE`` only
+# removes the first line, allowing the continuation lines to survive the filter
+# and execute as shell commands on the next ``source``.  See #71296.
+_SNAPSHOT_EXCLUDED_AWK = (
+    "awk '"
+    "/^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)/ {skip=1; next} "
+    "/^declare -x / {skip=0} "
+    "!skip {print}'"
+)
+
 
 def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
@@ -409,9 +421,11 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
 
     ``export -p`` emits one ``declare -x NAME="value"`` line per exported var.
     We drop the HERMES_SESSION_* / UI / CRON_AUTO_DELIVER lines so they never
-    persist across sessions in the shared snapshot. ``grep -vE`` returns exit 1
-    when it filters everything, so ``|| true`` keeps the pipeline's success
-    contract intact for the callers that chain on it.
+    persist across sessions in the shared snapshot.  An awk state-machine is
+    used instead of ``grep -vE`` because ``export -p`` can emit multi-line
+    values as raw continuation lines; a line-based grep only removes the first
+    ``declare -x`` line, allowing continuation lines to survive and execute as
+    shell commands on the next ``source`` (#71296).
 
     The pipeline MUST be wrapped in a brace group with the redirection applied
     to the group, not to the last pipeline segment. *tmp_path* typically embeds
@@ -424,7 +438,7 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     expanded in the current shell, keeping both expansions consistent.
     """
     return (
-        f"{{ export -p | grep -vE '{_SNAPSHOT_EXCLUDED_ENV_REGEX}' || true; }} "
+        f"{{ export -p | {_SNAPSHOT_EXCLUDED_AWK} || true; }} "
         f"> {tmp_path}"
     )
 

