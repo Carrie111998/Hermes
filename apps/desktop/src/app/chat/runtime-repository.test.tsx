@@ -152,6 +152,7 @@ describe('runtime message repository', () => {
       { ...transcriptA[0] },
       message('a:renderer-duplicate:2', 'assistant', 'same-lineage legitimate id')
     ]
+
     rerender(<RuntimeHarness messages={sameLineageWithoutDuplicate} scopeKey="lineage-a" />)
 
     await waitFor(() =>
@@ -168,6 +169,7 @@ describe('runtime message repository', () => {
       ...transcriptA.map(item => ({ ...item })),
       { ...sameLineageWithoutDuplicate[1] }
     ]
+
     rerender(<RuntimeHarness messages={sameLineageRestored} scopeKey="lineage-a" />)
 
     await waitFor(() =>
