@@ -19,25 +19,23 @@ import { describe, expect, it, vi } from 'vitest'
 // bundle) keeps every import on the same module instance.
 vi.mock('@hermes/ink', async () => import('../../packages/hermes-ink/src/entry-exports.js'))
 
-import Ink from '../../packages/hermes-ink/src/ink/ink.js'
 import StdinContext from '../../packages/hermes-ink/src/ink/components/StdinContext.js'
 import { EventEmitter } from '../../packages/hermes-ink/src/ink/events/emitter.js'
 import { InputEvent } from '../../packages/hermes-ink/src/ink/events/input-event.js'
-import { stripAnsi } from '../lib/text.js'
-
+import Ink from '../../packages/hermes-ink/src/ink/ink.js'
 import { SkillsHub } from '../components/skillsHub.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import type { Theme } from '../theme.js'
+import { stripAnsi } from '../lib/text.js'
+import { DEFAULT_THEME } from '../theme.js'
 
-const fakeTheme = {
-  color: {
-    accent: 'cyan',
-    dim: 'gray',
-    label: 'red',
-    muted: 'gray',
-    text: 'white'
-  }
-} as unknown as Theme
+// The overlay's selected-row styling (chipRowProps -> listRowStyle ->
+// liftForContrast -> parseColor) reads theme fields beyond the handful of
+// colors this test renders text with, and parseColor() throws on an
+// undefined channel. A hand-rolled partial Theme stub therefore crashes the
+// mount as soon as upstream adds a field, which unmounts the tree, drops the
+// useInput listener, and silently turns both cases below into no-ops. Use the
+// real theme so the test keeps exercising the install path.
+const theme = DEFAULT_THEME
 
 // Builds a minimal ParsedKey (see packages/hermes-ink/src/ink/parse-keypress.ts)
 // for the handful of keys this test needs to send. `parseKeypress` itself
@@ -153,7 +151,7 @@ describe('SkillsHub install', () => {
       })
     } as unknown as GatewayClient
 
-    const harness = mountInteractive(<SkillsHub gw={gw} onClose={onClose} t={fakeTheme} />)
+    const harness = mountInteractive(<SkillsHub gw={gw} onClose={onClose} t={theme} />)
     await harness.settle() // let the initial `skills.manage` list request resolve
 
     await harness.send(RETURN_KEY) // category -> skill
@@ -198,7 +196,7 @@ describe('SkillsHub install', () => {
       })
     } as unknown as GatewayClient
 
-    const harness = mountInteractive(<SkillsHub gw={gw} onClose={onClose} t={fakeTheme} />)
+    const harness = mountInteractive(<SkillsHub gw={gw} onClose={onClose} t={theme} />)
     await harness.settle()
 
     await harness.send(RETURN_KEY)
