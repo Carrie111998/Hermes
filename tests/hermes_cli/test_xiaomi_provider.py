@@ -1,23 +1,13 @@
 """Tests for Xiaomi MiMo provider support."""
 
-import os
-import sys
-import types
 
 import pytest
-
-# Ensure dotenv doesn't interfere
-if "dotenv" not in sys.modules:
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    sys.modules["dotenv"] = fake_dotenv
 
 from hermes_cli.auth import (
     PROVIDER_REGISTRY,
     resolve_provider,
     get_api_key_provider_status,
     resolve_api_key_provider_credentials,
-    AuthError,
 )
 
 
@@ -90,9 +80,10 @@ class TestXiaomiAutoDetection:
         for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
                      "DEEPSEEK_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
                      "DASHSCOPE_API_KEY", "XAI_API_KEY", "KIMI_API_KEY",
-                     "MINIMAX_API_KEY", "AI_GATEWAY_API_KEY", "KILOCODE_API_KEY",
+                     "MINIMAX_API_KEY", "KILOCODE_API_KEY",
                      "HF_TOKEN", "GLM_API_KEY", "COPILOT_GITHUB_TOKEN",
-                     "GH_TOKEN", "GITHUB_TOKEN", "MINIMAX_CN_API_KEY"):
+                     "GH_TOKEN", "GITHUB_TOKEN", "MINIMAX_CN_API_KEY",
+                     "TOKENHUB_API_KEY", "ARCEEAI_API_KEY"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("XIAOMI_API_KEY", "sk-xiaomi-test-12345678")
         provider = resolve_provider("auto")
@@ -130,6 +121,83 @@ class TestXiaomiCredentials:
         creds = resolve_api_key_provider_credentials("xiaomi")
         assert creds["base_url"] == "https://custom.xiaomi.example/v1"
 
+    def test_resolve_credentials_reads_home_external_secret_scope(
+        self, tmp_path, monkeypatch
+    ):
+        """BWS-injected keys belong in the profile scope that loaded them."""
+        from agent import secret_scope as ss
+        from hermes_cli import config as config_module
+        from hermes_cli import env_loader
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / ".env").write_text("", encoding="utf-8")
+        monkeypatch.setattr(config_module, "get_env_path", lambda: home / ".env")
+        config_module.invalidate_env_cache()
+
+        monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
+            str(home.resolve()),
+            {"XIAOMI_API_KEY": "sk-bws-xiaomi-12345678"},
+        )
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope(ss.build_profile_secret_scope(home))
+        try:
+            creds = resolve_api_key_provider_credentials("xiaomi")
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        assert creds["api_key"] == "sk-bws-xiaomi-12345678"
+        assert creds["source"] == "XIAOMI_API_KEY"
+
+    def test_scoped_missing_key_does_not_fall_through_to_raw_env(
+        self, tmp_path, monkeypatch
+    ):
+        from agent import secret_scope as ss
+        from hermes_cli import config as config_module
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / ".env").write_text("", encoding="utf-8")
+        monkeypatch.setattr(config_module, "get_env_path", lambda: home / ".env")
+        config_module.invalidate_env_cache()
+
+        monkeypatch.setenv("XIAOMI_API_KEY", "sk-other-profile-12345678")
+        monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            creds = resolve_api_key_provider_credentials("xiaomi")
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        assert creds["api_key"] == ""
+
+    def test_unscoped_multiplex_read_fails_closed(self, tmp_path, monkeypatch):
+        from agent import secret_scope as ss
+        from hermes_cli import config as config_module
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / ".env").write_text("", encoding="utf-8")
+        monkeypatch.setattr(config_module, "get_env_path", lambda: home / ".env")
+        config_module.invalidate_env_cache()
+
+        monkeypatch.setenv("XIAOMI_API_KEY", "sk-global-leak-12345678")
+        monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
+
+        ss.set_multiplex_active(True)
+        try:
+            with pytest.raises(ss.UnscopedSecretError):
+                resolve_api_key_provider_credentials("xiaomi")
+        finally:
+            ss.set_multiplex_active(False)
+
 
 # =============================================================================
 # Model catalog (dynamic — no static list)
@@ -144,13 +212,15 @@ class TestXiaomiModelCatalog:
         assert PROVIDER_TO_MODELS_DEV["xiaomi"] == "xiaomi"
 
     def test_static_model_list_fallback(self):
-        """Static _PROVIDER_MODELS fallback must exist for model picker."""
+        """Static _PROVIDER_MODELS fallback must exist for model picker.
+
+        We only assert the provider key is present — the specific model
+        names are data that changes with upstream releases and doesn't
+        belong in tests.
+        """
         from hermes_cli.models import _PROVIDER_MODELS
         assert "xiaomi" in _PROVIDER_MODELS
-        models = _PROVIDER_MODELS["xiaomi"]
-        assert "mimo-v2-pro" in models
-        assert "mimo-v2-omni" in models
-        assert "mimo-v2-flash" in models
+        assert len(_PROVIDER_MODELS["xiaomi"]) >= 1
 
     def test_list_agentic_models_mock(self, monkeypatch):
         """When models.dev returns Xiaomi data, list_agentic_models should return models."""
@@ -201,6 +271,26 @@ class TestXiaomiNormalization:
         from hermes_cli.model_normalize import _MATCHING_PREFIX_STRIP_PROVIDERS
         assert "xiaomi" in _MATCHING_PREFIX_STRIP_PROVIDERS
 
+    def test_lowercase_model_provider(self):
+        """Xiaomi must be in _LOWERCASE_MODEL_PROVIDERS."""
+        from hermes_cli.model_normalize import _LOWERCASE_MODEL_PROVIDERS
+        assert "xiaomi" in _LOWERCASE_MODEL_PROVIDERS
+
+    def test_lowercase_subset_of_matching_prefix(self):
+        """_LOWERCASE_MODEL_PROVIDERS must be a subset of _MATCHING_PREFIX_STRIP_PROVIDERS.
+
+        Otherwise the .lower() code path is unreachable dead code — the
+        provider check at line 422 gates entry to the block.
+        """
+        from hermes_cli.model_normalize import (
+            _LOWERCASE_MODEL_PROVIDERS,
+            _MATCHING_PREFIX_STRIP_PROVIDERS,
+        )
+        assert _LOWERCASE_MODEL_PROVIDERS.issubset(_MATCHING_PREFIX_STRIP_PROVIDERS), (
+            f"_LOWERCASE_MODEL_PROVIDERS has entries not in _MATCHING_PREFIX_STRIP_PROVIDERS: "
+            f"{_LOWERCASE_MODEL_PROVIDERS - _MATCHING_PREFIX_STRIP_PROVIDERS}"
+        )
+
     def test_normalize_strips_provider_prefix(self):
         from hermes_cli.model_normalize import normalize_model_for_provider
         result = normalize_model_for_provider("xiaomi/mimo-v2-pro", "xiaomi")
@@ -210,6 +300,40 @@ class TestXiaomiNormalization:
         from hermes_cli.model_normalize import normalize_model_for_provider
         result = normalize_model_for_provider("mimo-v2-pro", "xiaomi")
         assert result == "mimo-v2-pro"
+
+    @pytest.mark.parametrize("empty_input", ["", None, "   "])
+    def test_normalize_empty_and_none(self, empty_input):
+        """None, empty, and whitespace-only inputs return empty string."""
+        from hermes_cli.model_normalize import normalize_model_for_provider
+        result = normalize_model_for_provider(empty_input, "xiaomi")
+        assert result == ""
+
+    @pytest.mark.parametrize("input_name,expected", [
+        ("MiMo-V2.5-Pro", "mimo-v2.5-pro"),
+        ("MIMO-V2.5-PRO", "mimo-v2.5-pro"),
+        ("MiMo-v2.5-pro", "mimo-v2.5-pro"),
+        ("mimo-v2.5-pro", "mimo-v2.5-pro"),     # already lowercase
+        ("MiMo-V2-Pro", "mimo-v2-pro"),
+        ("MiMo-V2-Omni", "mimo-v2-omni"),
+        ("MiMo-V2-Flash", "mimo-v2-flash"),
+        ("MiMo-V2.5", "mimo-v2.5"),
+    ])
+    def test_normalize_lowercases_mixed_case(self, input_name, expected):
+        """Xiaomi's API requires lowercase model IDs — mixed case from docs must be lowered."""
+        from hermes_cli.model_normalize import normalize_model_for_provider
+        result = normalize_model_for_provider(input_name, "xiaomi")
+        assert result == expected
+
+    @pytest.mark.parametrize("input_name,expected", [
+        ("xiaomi/MiMo-V2.5-Pro", "mimo-v2.5-pro"),
+        ("xiaomi/MIMO-V2.5-PRO", "mimo-v2.5-pro"),
+        ("xiaomi/mimo-v2.5-pro", "mimo-v2.5-pro"),
+    ])
+    def test_normalize_strips_prefix_and_lowercases(self, input_name, expected):
+        """Provider prefix stripping AND lowercasing must both work together."""
+        from hermes_cli.model_normalize import normalize_model_for_provider
+        result = normalize_model_for_provider(input_name, "xiaomi")
+        assert result == expected
 
 
 # =============================================================================
@@ -293,10 +417,10 @@ class TestXiaomiAuxiliary:
         assert "xiaomi" not in _API_KEY_PROVIDER_AUX_MODELS
 
     def test_vision_model_override(self):
-        """Xiaomi vision tasks should use mimo-v2-omni (multimodal), not the main model."""
+        """Xiaomi vision tasks should use mimo-v2.5 (multimodal), not the main model."""
         from agent.auxiliary_client import _PROVIDER_VISION_MODELS
         assert "xiaomi" in _PROVIDER_VISION_MODELS
-        assert _PROVIDER_VISION_MODELS["xiaomi"] == "mimo-v2-omni"
+        assert _PROVIDER_VISION_MODELS["xiaomi"] == "mimo-v2.5"
 
 
 # =============================================================================
