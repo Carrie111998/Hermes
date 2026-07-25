@@ -1,0 +1,354 @@
+From c33cc4dd182fa4274a290787930815bfd3aeaa30 Mon Sep 17 00:00:00 2001
+From: Yong Wook Lee <icerain@jj.ac.kr>
+Date: Sat, 25 Jul 2026 18:17:17 +0900
+Subject: [PATCH] fix(hegi): supervise quiet-meeting approval pipeline
+
+The prior fix depended on a standalone daemon that could die while leaving stale readiness files. Run the quiet-meeting detector and approval recovery inside the enabled plugin, sharing daemon.lock so standalone and gateway workers cannot duplicate reports. Regression tests cover startup, lock exclusion, and reply-only approval guidance.
+---
+ hegi/README.md                          |   7 ++
+ hegi/gateway_plugin.py                  |  92 ++++++++++++++++--
+ hegi/notify.py                          |   1 +
+ tests/hegi/test_approval_integration.py | 121 +++++++++++++++++++++++-
+ tests/hegi/test_archive_notify.py       |   8 +-
+ 5 files changed, 218 insertions(+), 11 deletions(-)
+
+diff --git a/hegi/README.md b/hegi/README.md
+index 3b496aa76..b2b6f9c2c 100644
+--- a/hegi/README.md
++++ b/hegi/README.md
+@@ -32,6 +32,13 @@ python -m hegi status
+ pre-dispatch plugin이 일반 Memory Curator 응답보다 먼저 메시지를 처리한다. 승인
+ 작업은 SQLite에 단계별로 영속화된다. `초안 만들어`는 pending Draft에서 멈추고,
+ `기억해`는 fresh search부터 validate/audit/index/backup까지 한 번에 완료한다.
++승인은 반드시 HEGI가 보고한 회의록 메시지에 대한 reply이거나 명시적
++`meeting_id`를 포함해야 한다.
++
++Memory Curator gateway는 공진방 메시지를 처음 수신할 때 HEGI pipeline worker를
++함께 기동한다. worker는 10분 무대화 감지와 중단된 승인 작업 복구를 주기적으로
++수행하며, standalone `hegi daemon --send`와 같은 `daemon.lock`을 사용하므로 두
++실행 경로가 동일 회의를 중복 처리하지 않는다.
+ 
+ 설치와 운영은 [operations.md](docs/operations.md), 안전 경계는
+ [memory_policy.md](docs/memory_policy.md)를 참고한다.
+diff --git a/hegi/gateway_plugin.py b/hegi/gateway_plugin.py
+index 2f4536eaa..90eee6789 100644
+--- a/hegi/gateway_plugin.py
++++ b/hegi/gateway_plugin.py
+@@ -3,8 +3,9 @@
+ from __future__ import annotations
+ 
+ import asyncio
+-from concurrent.futures import ThreadPoolExecutor
++import logging
+ import re
++import threading
+ from typing import Any
+ 
+ from .approval import process_pending_approvals
+@@ -13,9 +14,77 @@ from .memory import DraftGate, MCPMemoryBackend, parse_approval_command
+ from .state import StateStore
+ 
+ 
+-_APPROVAL_EXECUTOR = ThreadPoolExecutor(
+-    max_workers=1, thread_name_prefix="hegi-approval-worker"
+-)
++_PIPELINE_LOCK = threading.Lock()
++_PIPELINE_THREAD: threading.Thread | None = None
++_PIPELINE_WAKE = threading.Event()
++_LOGGER = logging.getLogger(__name__)
++
++try:
++    import fcntl
++except ImportError:  # pragma: no cover - Windows uses standalone recovery
++    fcntl = None  # type: ignore[assignment]
++
++
++def _pipeline_loop(config: Any) -> None:
++    from .pipeline import HegiPipeline
++
++    pipeline = HegiPipeline(config)
++    poll_seconds = max(
++        1, int(config.section("daemon").get("poll_seconds", 60))
++    )
++    while True:
++        _run_pipeline_cycle(config, pipeline)
++        _PIPELINE_WAKE.wait(poll_seconds)
++        _PIPELINE_WAKE.clear()
++
++
++def _run_pipeline_cycle(config: Any, pipeline: Any) -> bool:
++    """Run one cycle only while owning the standalone daemon's lock."""
++    if fcntl is None:
++        return False
++    lock_path = config.state_db.parent / "daemon.lock"
++    lock_path.parent.mkdir(parents=True, exist_ok=True)
++    with lock_path.open("a+", encoding="ascii") as lock_stream:
++        try:
++            fcntl.flock(
++                lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
++            )
++        except BlockingIOError:
++            return False
++        try:
++            try:
++                pipeline.run_once(dry_run=False)
++            except Exception as exc:
++                _LOGGER.exception("embedded HEGI pipeline cycle failed")
++                pipeline.state.add_dead_letter(
++                    "gateway_pipeline", {}, str(exc)
++                )
++            try:
++                process_pending_approvals(config)
++            except Exception as exc:
++                _LOGGER.exception("embedded HEGI approval cycle failed")
++                pipeline.state.add_dead_letter(
++                    "gateway_approval", {}, str(exc)
++                )
++        finally:
++            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
++    return True
++
++
++def _ensure_pipeline_worker(config: Any) -> None:
++    global _PIPELINE_THREAD
++    if fcntl is None:
++        return
++    with _PIPELINE_LOCK:
++        if _PIPELINE_THREAD is not None and _PIPELINE_THREAD.is_alive():
++            return
++        _PIPELINE_THREAD = threading.Thread(
++            target=_pipeline_loop,
++            args=(config,),
++            name="hegi-gateway-pipeline",
++            daemon=True,
++        )
++        _PIPELINE_THREAD.start()
+ 
+ 
+ def _platform_name(event: Any) -> str:
+@@ -55,7 +124,8 @@ def _meeting_id(state: StateStore, event: Any) -> str | None:
+ 
+ 
+ def _process_pending_background(config: Any) -> None:
+-    _APPROVAL_EXECUTOR.submit(process_pending_approvals, config)
++    _ensure_pipeline_worker(config)
++    _PIPELINE_WAKE.set()
+ 
+ 
+ def intercept_telegram_approval(
+@@ -70,9 +140,6 @@ def intercept_telegram_approval(
+     except Exception:
+         return None
+     memory = config.section("memory")
+-    command = parse_approval_command(text, memory.get("commands"))
+-    if command is None:
+-        return None
+     source = getattr(event, "source", None)
+     if (
+         not config.enabled
+@@ -80,7 +147,11 @@ def intercept_telegram_approval(
+         or str(getattr(source, "chat_id", "")) != config.chat_id
+     ):
+         return None
++    _ensure_pipeline_worker(config)
+     state = StateStore(config.state_db)
++    command = parse_approval_command(text, memory.get("commands"))
++    if command is None:
++        return None
+     meeting_id = _meeting_id(state, event)
+     if not meeting_id:
+         _schedule_reply(gateway, event, "처리할 HEGI 회의록을 찾지 못했습니다.")
+@@ -150,5 +221,8 @@ def intercept_telegram_approval(
+ def register(context: Any) -> None:
+     # Run additive state migrations at plugin load, before the first live
+     # approval event reaches the worker.
+-    StateStore(load_config().state_db)
++    config = load_config()
++    StateStore(config.state_db)
++    _ensure_pipeline_worker(config)
++    _PIPELINE_WAKE.set()
+     context.register_hook("pre_gateway_dispatch", intercept_telegram_approval)
+diff --git a/hegi/notify.py b/hegi/notify.py
+index 80a20ee80..a2a0a8d8e 100644
+--- a/hegi/notify.py
++++ b/hegi/notify.py
+@@ -78,6 +78,7 @@ def telegram_parts(minutes: MeetingMinutes) -> list[str]:
+         f"이견\n{_bullets(minutes.disagreements)}\n\n"
+         f"Action Items\n{_bullets(actions)}",
+         f"4/4 Memory Evaluation · {meeting}\n\n{memory_text}\n\n"
++        "아래 명령은 반드시 이 메시지에 Telegram 답장으로 보내세요.\n"
+         "@헤기 기억해\n@헤기 초안 만들어\n@헤기 기존 기억에 합쳐\n@헤기 기억하지 마\n\n"
+         "approve/commit은 교수님의 인증된 명시적 승인 명령이 있을 때만 수행합니다.",
+     ]
+diff --git a/tests/hegi/test_approval_integration.py b/tests/hegi/test_approval_integration.py
+index 3321e190f..f92c9b6f3 100644
+--- a/tests/hegi/test_approval_integration.py
++++ b/tests/hegi/test_approval_integration.py
+@@ -136,6 +136,10 @@ memory:
+         encoding="utf-8",
+     )
+     monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(
++        "hegi.gateway_plugin._ensure_pipeline_worker",
++        lambda _config: None,
++    )
+     config = load_config(config_path)
+     state = StateStore(config.state_db)
+     state.save_episode(
+@@ -226,6 +230,121 @@ def test_draft_only_stops_pending(tmp_path, monkeypatch):
+     assert approval.commits == 0
+ 
+ 
++def test_gateway_starts_embedded_pipeline_worker_once(monkeypatch):
++    import hegi.gateway_plugin as plugin
++
++    started = []
++
++    class FakeThread:
++        def __init__(self, **kwargs):
++            self.kwargs = kwargs
++            self.alive = False
++
++        def start(self):
++            self.alive = True
++            started.append(self.kwargs)
++
++        def is_alive(self):
++            return self.alive
++
++    monkeypatch.setattr(plugin.threading, "Thread", FakeThread)
++    monkeypatch.setattr(plugin, "_PIPELINE_THREAD", None)
++    config = SimpleNamespace(section=lambda _name: {"poll_seconds": 60})
++
++    plugin._ensure_pipeline_worker(config)
++    plugin._ensure_pipeline_worker(config)
++
++    assert len(started) == 1
++    assert started[0]["daemon"] is True
++    assert started[0]["name"] == "hegi-gateway-pipeline"
++
++
++def test_embedded_pipeline_shares_standalone_daemon_lock(tmp_path, monkeypatch):
++    import hegi.gateway_plugin as plugin
++
++    if plugin.fcntl is None:
++        pytest.skip("POSIX daemon lock is unavailable")
++    state_db = tmp_path / "hegi" / "state.db"
++    config = SimpleNamespace(state_db=state_db)
++    calls = []
++    pipeline = SimpleNamespace(
++        run_once=lambda **kwargs: calls.append(("pipeline", kwargs)),
++        state=SimpleNamespace(add_dead_letter=lambda *_args: None),
++    )
++    monkeypatch.setattr(
++        plugin,
++        "process_pending_approvals",
++        lambda _config: calls.append(("approval", {})),
++    )
++    lock_path = state_db.parent / "daemon.lock"
++    lock_path.parent.mkdir(parents=True)
++    with lock_path.open("a+", encoding="ascii") as standalone_lock:
++        plugin.fcntl.flock(
++            standalone_lock.fileno(),
++            plugin.fcntl.LOCK_EX | plugin.fcntl.LOCK_NB,
++        )
++        assert plugin._run_pipeline_cycle(config, pipeline) is False
++        assert calls == []
++        plugin.fcntl.flock(standalone_lock.fileno(), plugin.fcntl.LOCK_UN)
++
++    assert plugin._run_pipeline_cycle(config, pipeline) is True
++    assert calls == [
++        ("pipeline", {"dry_run": False}),
++        ("approval", {}),
++    ]
++
++
++def test_gateway_starts_embedded_pipeline_for_plain_discussion(
++    tmp_path, monkeypatch
++):
++    _config(tmp_path, monkeypatch)
++    started = []
++    monkeypatch.setattr(
++        "hegi.gateway_plugin._ensure_pipeline_worker",
++        lambda config: started.append(config.chat_id),
++    )
++    adapter = SimpleNamespace(send=AsyncMock(return_value={"message_id": "ack"}))
++    gateway = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
++    source = SimpleNamespace(
++        platform=SimpleNamespace(value="telegram"),
++        chat_id="-1001",
++        user_id="42",
++    )
++    event = SimpleNamespace(
++        text="마찰의 투명성을 논의합시다.",
++        message_id="discussion",
++        reply_to_message_id=None,
++        source=source,
++    )
++
++    assert intercept_telegram_approval(
++        event=event, gateway=gateway, session_store=None
++    ) is None
++    assert started == ["-1001"]
++
++
++def test_plugin_registration_starts_worker_in_gateway_process(
++    tmp_path, monkeypatch
++):
++    _config(tmp_path, monkeypatch)
++    started = []
++    registered = []
++    monkeypatch.setattr(
++        "hegi.gateway_plugin._ensure_pipeline_worker",
++        lambda config: started.append(config.chat_id),
++    )
++    context = SimpleNamespace(
++        register_hook=lambda name, callback: registered.append((name, callback))
++    )
++
++    from hegi.gateway_plugin import register
++
++    register(context)
++
++    assert started == ["-1001"]
++    assert registered[0][0] == "pre_gateway_dispatch"
++
++
+ def test_unauthorized_user_cannot_create_draft_or_job(tmp_path, monkeypatch):
+     _config(tmp_path, monkeypatch)
+     state = StateStore(tmp_path / "runtime" / "hegi" / "state.db")
+@@ -429,7 +548,7 @@ async def test_gateway_requires_reply_and_accepts_telemetry_kwargs(
+     _config(tmp_path, monkeypatch)
+     processed = []
+     monkeypatch.setattr(
+-        "hegi.gateway_plugin.process_pending_approvals",
++        "hegi.gateway_plugin._process_pending_background",
+         lambda config: processed.append(config.chat_id),
+     )
+     adapter = SimpleNamespace(send=AsyncMock(return_value={"message_id": "ack"}))
+diff --git a/tests/hegi/test_archive_notify.py b/tests/hegi/test_archive_notify.py
+index eb1de031f..480819eed 100644
+--- a/tests/hegi/test_archive_notify.py
++++ b/tests/hegi/test_archive_notify.py
+@@ -6,7 +6,7 @@ import pytest
+ 
+ from hegi.archive import ArchiveManager
+ from hegi.models import MeetingEpisode, MeetingMinutes, MemoryEvaluation
+-from hegi.notify import TelegramReporter
++from hegi.notify import TelegramReporter, telegram_parts
+ from hegi.state import StateStore
+ 
+ 
+@@ -86,3 +86,9 @@ def test_telegram_resume_skips_already_sent_parts(tmp_path):
+     assert len(resumed_calls) == 3
+     assert all(not content.startswith("1/4") for content in resumed_calls)
+     assert state.delivered_parts("meeting") == {1, 2, 3, 4}
++
++
++def test_memory_approval_prompt_requires_reply_to_report():
++    final_part = telegram_parts(_minutes())[-1]
++    assert "반드시 이 메시지에 Telegram 답장으로" in final_part
++    assert "@헤기 기억해" in final_part
+-- 
+2.43.0
+
