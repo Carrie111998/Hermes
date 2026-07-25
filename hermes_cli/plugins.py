@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -579,6 +580,70 @@ class PluginContext:
             "args_hint": (args_hint or "").strip(),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
+
+    # -- inline-button callback prefix registration ---------------------------
+
+    # Callback prefixes consumed by the platform adapters' built-in button
+    # flows. A plugin prefix may not shadow (or be shadowed by) any of these.
+    _RESERVED_CALLBACK_PREFIXES = (
+        "mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:",
+        "cp:", "gt:", "ea:", "sc:", "cl:", "update_prompt:",
+    )
+    _CALLBACK_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,14}:$")
+
+    def register_callback_prefix(
+        self,
+        prefix: str,
+        handler: Callable,
+        description: str = "",
+    ) -> None:
+        """Register an inline-button callback prefix (e.g. ``"em:"``).
+
+        Platform adapters route button presses whose ``callback_data`` starts
+        with *prefix* to *handler* — only after the presser passes the same
+        authorization check as the built-in approval buttons. The handler
+        signature is ``fn(data: str) -> str | None`` (sync or async): ``data``
+        is the full callback payload including the prefix, and the return
+        value (truncated by the adapter) becomes the callback answer.
+
+        Handlers own their payload grammar and must validate it fail-closed:
+        refuse anything malformed rather than guessing. Prefixes are lowercase
+        ``[a-z0-9_-]``, 2-16 chars, ending in ``:``; built-in prefixes and
+        prefixes claimed by another plugin are rejected with a warning.
+        """
+        clean = (prefix or "").strip()
+        if not self._CALLBACK_PREFIX_RE.match(clean):
+            logger.warning(
+                "Plugin '%s' tried to register invalid callback prefix %r. Skipping.",
+                self.manifest.name, prefix,
+            )
+            return
+        if any(
+            clean.startswith(reserved) or reserved.startswith(clean)
+            for reserved in self._RESERVED_CALLBACK_PREFIXES
+        ):
+            logger.warning(
+                "Plugin '%s' tried to register callback prefix %r which conflicts "
+                "with a built-in prefix. Skipping.",
+                self.manifest.name, prefix,
+            )
+            return
+        existing = self._manager._callback_prefixes.get(clean)
+        if existing is not None and existing.get("plugin") != self.manifest.name:
+            logger.warning(
+                "Plugin '%s' tried to register callback prefix %r already claimed "
+                "by plugin '%s'. Skipping.",
+                self.manifest.name, prefix, existing.get("plugin"),
+            )
+            return
+        self._manager._callback_prefixes[clean] = {
+            "handler": handler,
+            "description": (description or "").strip(),
+            "plugin": self.manifest.name,
+        }
+        logger.debug(
+            "Plugin %s registered callback prefix: %s", self.manifest.name, clean
+        )
 
     # -- tool dispatch -------------------------------------------------------
 
@@ -1257,6 +1322,7 @@ class PluginManager:
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
+        self._callback_prefixes: Dict[str, dict] = {}  # Inline-button callback prefixes registered by plugins
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
@@ -1297,6 +1363,7 @@ class PluginManager:
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
             self._plugin_commands.clear()
+            self._callback_prefixes.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
@@ -2346,6 +2413,22 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def get_plugin_callback_prefix(data: str) -> Optional[tuple]:
+    """Return ``(prefix, entry)`` for the plugin callback prefix matching *data*.
+
+    ``entry`` is the registration dict (``handler`` / ``plugin`` /
+    ``description``) stored by ``PluginContext.register_callback_prefix``.
+    Registered prefixes are colon-terminated and cannot shadow each other or
+    any built-in prefix, so at most one entry matches. Returns ``None`` when
+    nothing matches.
+    """
+    registry = _ensure_plugins_discovered()._callback_prefixes
+    for prefix, entry in registry.items():
+        if data.startswith(prefix):
+            return prefix, entry
+    return None
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
