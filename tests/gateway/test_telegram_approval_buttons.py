@@ -372,7 +372,7 @@ class TestTelegramApprovalCallback:
         update = MagicMock()
         update.callback_query = query
         context = MagicMock()
-        query.from_user.id = "12345"
+        query.from_user.id = "99"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
@@ -404,7 +404,7 @@ class TestTelegramApprovalCallback:
         query.message.chat_id = 12345
         query.from_user = MagicMock()
         query.from_user.first_name = "Norbert"
-        query.from_user.id = "12345"
+        query.from_user.id = "99"
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -432,7 +432,7 @@ class TestTelegramApprovalCallback:
         query.message.chat_id = 12345
         query.from_user = MagicMock()
         query.from_user.first_name = "Norbert"
-        query.from_user.id = "12345"
+        query.from_user.id = "99"
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -461,7 +461,7 @@ class TestTelegramApprovalCallback:
         query.message.chat_id = 12345
         query.from_user = MagicMock()
         query.from_user.first_name = "Teknium"
-        query.from_user.id = "12345"
+        query.from_user.id = "99"
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -496,7 +496,7 @@ class TestTelegramApprovalCallback:
         update = MagicMock()
         update.callback_query = query
         context = MagicMock()
-        query.from_user.id = "12345"
+        query.from_user.id = "99"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             with patch("tools.approval.resolve_gateway_approval", return_value=1):
@@ -524,7 +524,7 @@ class TestTelegramApprovalCallback:
         update = MagicMock()
         update.callback_query = query
         context = MagicMock()
-        query.from_user.id = "12345"
+        query.from_user.id = "99"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
@@ -585,7 +585,7 @@ class TestTelegramApprovalCallback:
         update = MagicMock()
         update.callback_query = query
         context = MagicMock()
-        query.from_user.id = "12345"
+        query.from_user.id = "99"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
@@ -736,3 +736,97 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+
+# ===========================================================================
+# Approval taps are bound to the session that raised them
+# ===========================================================================
+
+class TestApprovalTapOwnership:
+    """A group member who may talk to the bot still may not answer someone
+    else's approval prompt (mirrors qqbot's per-session interaction check)."""
+
+    def _query(self, *, caller_id, approval_id, chat_id=12345, thread_id=None):
+        query = AsyncMock()
+        query.data = f"ea:always:{approval_id}"
+        query.message = MagicMock()
+        query.message.chat_id = chat_id
+        query.message.message_thread_id = thread_id
+        query.from_user = MagicMock()
+        query.from_user.id = caller_id
+        query.from_user.first_name = "Bystander"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        return query
+
+    @pytest.mark.asyncio
+    async def test_bystander_cannot_answer_another_users_approval(self):
+        """The whole point: an allowlisted bystander taps "Allow Always" on a
+        command they did not trigger. Before the fix this ran the command and
+        wrote it into the permanent allowlist."""
+        adapter = _make_adapter()
+        adapter._approval_state[10] = "agent:main:telegram:group:12345:99"
+
+        query = self._query(caller_id="777", approval_id=10)
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        mock_resolve.assert_not_called()
+        assert "only the user who triggered" in query.answer.call_args[1]["text"].lower()
+        query.edit_message_text.assert_not_called()
+        # The prompt must survive for its owner rather than being consumed.
+        assert adapter._approval_state[10] == "agent:main:telegram:group:12345:99"
+
+    @pytest.mark.asyncio
+    async def test_owner_can_answer_their_own_approval(self):
+        adapter = _make_adapter()
+        adapter._approval_state[11] = "agent:main:telegram:group:12345:99"
+
+        query = self._query(caller_id="99", approval_id=11)
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        mock_resolve.assert_called_once_with("agent:main:telegram:group:12345:99", "always")
+        assert 11 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_shared_thread_session_stays_answerable_by_any_member(self):
+        """Forum topics with thread_sessions_per_user off are shared by design:
+        the key ends in the thread id, so there is no single owner to enforce."""
+        adapter = _make_adapter()
+        adapter._approval_state[12] = "agent:main:telegram:group:12345:777"
+
+        query = self._query(caller_id="42", approval_id=12, thread_id=777)
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        mock_resolve.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dm_session_is_not_treated_as_owned_by_a_stranger(self):
+        """A DM key ends in the chat id, which is the peer themselves — the
+        owner check must not misread it as a foreign participant id."""
+        adapter = _make_adapter()
+        adapter._approval_state[13] = "agent:main:telegram:dm:12345"
+
+        query = self._query(caller_id="12345", approval_id=13)
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        mock_resolve.assert_called_once()
