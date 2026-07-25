@@ -50,16 +50,21 @@ python evals/runners/run_suite.py \
 You should see a summary table with ✅/❌ per scenario and a pass rate. The
 report JSON is written to `evals/reports/orchestration.json`.
 
-### Run all Tier 1 suites at once (CI-style)
+### Run all Tier 1 suites at once
 
 ```bash
-python scripts/ci/run_evals.py --tier 1
+for s in orchestration cost_cache subagent_verify memory_recall windows_reliability; do
+  python evals/runners/run_suite.py --suite "$s" --deterministic-only --quiet
+done
 ```
 
-This runs `orchestration`, `cost_cache`, `subagent_verify`, and
-`memory_recall` in deterministic mode, evaluates hard gates, compares
-against baselines, and writes an aggregate report to
-`evals/reports/latest.json`.
+Each Tier-1 suite first runs its hermetic `runtime_probe` against real
+production modules (in a temporary `HERMES_HOME`/workspace, zero API calls),
+then grades its `_mock_*` rubric fixtures. A failed probe makes that suite's
+run exit non-zero. These suites are covered by the repository's existing
+Python test lane via `tests/evals/test_run_suite.py`, so the standard CI
+orchestrator discovers them automatically — there is no separate eval workflow
+or aggregator script.
 
 ### Run a live suite (needs an API key)
 
@@ -253,10 +258,11 @@ no rubric module exists)
 
 If `evals/rubrics/<suite_name>.py` is missing, the runner evaluates
 `pass_conditions` with its built-in evaluators (`delegate_call_count`,
-`no_cache_break`, `response_contains`, `no_tool_error`). Unknown
-condition types pass by default. **Do not rely on this for production
-suites** — write a rubric module. The fallback exists for rapid
-prototyping only.
+`no_cache_break`, `response_contains`, `no_tool_error`). Unknown or
+unsupported condition types **fail closed** (the scenario is marked failed
+with an `unsupported_conditions` detail), so a typo in a condition name can
+never be silently counted as a pass. **Prefer a rubric module for production
+suites** — the fallback exists for rapid prototyping only.
 
 ### 2.4 Checklist for a new suite
 
@@ -268,15 +274,14 @@ prototyping only.
 - [ ] `skip_memory: true` and `skip_context_files: true` unless the suite
       specifically tests those features
 - [ ] `config_overrides.agent.max_iterations` set to a reasonable cap (8–15)
-- [ ] If deterministic: `_mock_messages` embedded for rubric self-test, or
-      conditions that work with empty/structural-only result dicts
+- [ ] If Tier 1: a registered `runtime_probe` in `evals/runtime_probes.py`
+      exercises the protected production path (zero API calls, isolated
+      `HERMES_HOME`), while `_mock_messages` cover rubric parsing only
 - [ ] If live: suite YAML header comments note the required API key
 - [ ] Baseline JSON created at `evals/baselines/<name>_baseline.json` (copy
       the first successful report)
-- [ ] Suite added to the appropriate tier list in `scripts/ci/run_evals.py`
-      (`_TIER1_SUITES` or `_TIER2_SUITES`)
-- [ ] If the suite emits a hard-gate metric, added to `HARD_GATES` in
-      `scripts/ci/run_evals.py` and `metric_to_suites` mapping
+- [ ] Suite and probe are covered by `tests/evals/test_run_suite.py`, which the
+      existing Python CI lane discovers without a new workflow
 
 ---
 
@@ -284,10 +289,13 @@ prototyping only.
 
 ### 3.1 Deterministic mode (Tier 1)
 
-Deterministic mode skips all live API calls. The runner produces a
-result dict with empty `final_response` and `messages` (or the
-`_mock_messages` from the YAML), then grades it with the rubric. This
-tests the rubric logic and the suite structure — not the model.
+Deterministic mode makes no live model/API calls. For a suite that declares a
+`runtime_probe`, the runner first executes that probe against real production
+modules inside a temporary `HERMES_HOME`/workspace (persistence, config
+propagation, prompt/tool byte-stability, summary spill/read-back, file I/O),
+then grades the `_mock_messages` fixtures with the rubric. The probe tests real
+deterministic invariants; the fixtures test rubric parsing. Neither is a
+model-quality measurement, and a failed probe fails the run closed.
 
 ```bash
 python evals/runners/run_suite.py \
@@ -383,18 +391,25 @@ API calls or YAML loading.
 | Quick rubric logic check | `python evals/rubrics/<suite>.py` |
 | Full deterministic suite | `python evals/runners/run_suite.py --suite <name> --deterministic-only` |
 | Full live suite | `python evals/runners/run_suite.py --suite <name> --provider openrouter --model <model>` |
-| All Tier 1 suites (CI-style) | `python scripts/ci/run_evals.py --tier 1` |
-| Single suite via CI runner | `python scripts/ci/run_evals.py --tier 1 --suite orchestration` |
+| All Tier 1 suites | `for s in orchestration cost_cache subagent_verify memory_recall windows_reliability; do python evals/runners/run_suite.py --suite "$s" --deterministic-only; done` |
 | Compare to baseline | add `--baseline evals/baselines/<name>_baseline.json` |
 
 ---
 
-## 4. CI Integration — Tier 1 / 2 / 3 Gates
+## 4. CI Integration
 
-The CI eval pipeline is defined in `.github/workflows/evals.yml` and
-orchestrated by `scripts/ci/run_evals.py`. It uses a three-tier system
-that separates fast, free, deterministic checks from slow, expensive,
-live-model checks.
+This PR does **not** add a dedicated eval workflow or an aggregator script.
+Tier-1 suites and their runtime probes are exercised through the repository's
+existing Python test lane: `tests/evals/test_run_suite.py` imports the runner,
+asserts every shipped Tier-1 suite declares a real `runtime_probe`, and runs
+each probe against production modules. The standard `python` CI lane already
+triggers on changes under `agent/**`, `tools/**`, `hermes_cli/**`,
+`model_tools.py`, and `evals/**`, so a production regression that breaks a probe
+fails an ordinary required check — no CI-sensitive workflow file is introduced.
+
+The tier vocabulary below is retained as a conceptual guide for how the suites
+are intended to be used (deterministic vs live); it no longer maps to a
+standalone `evals.yml` pipeline.
 
 ### 4.1 Tier architecture
 
@@ -436,42 +451,23 @@ produce warnings but never fail the build:
 - Otherwise, status is `"stable"`.
 - Missing baseline → status `"no_baseline"` (informational).
 
-### 4.3 CI workflow anatomy
+### 4.3 How CI actually runs these
 
-The `evals.yml` workflow has four jobs:
+There is no dedicated `evals.yml` workflow in this PR. The suites are validated
+by the repository's normal `python` test lane through
+`tests/evals/test_run_suite.py`, which:
 
-```
-tier1-deterministic    → runs on every PR/push, ubuntu-latest
-windows-reliability    → runs on every PR/push, windows-latest
-tier2-live             → runs on push to main/master only
-tier3-nightly          → runs on schedule (cron)
-```
+- imports the runner and asserts the runner contract (fixture handling,
+  fail-closed on unknown/missing conditions, deterministic skips, exit codes);
+- asserts every shipped Tier-1 suite declares a real `runtime_probe`;
+- runs each probe against production modules with zero API calls.
 
-**Triggers:**
-```yaml
-on:
-  pull_request:
-    paths:
-      - 'agent/**'
-      - 'tools/**'
-      - 'hermes_cli/**'
-      - 'run_agent.py'
-      - 'toolsets.py'
-      - 'evals/**'
-      - 'scripts/ci/**'
-  push:
-    branches: [main, master]
-  schedule:
-    - cron: '0 4 * * *'
-```
-
-The `paths` filter ensures Tier 1 only runs when files that could affect
-agent behavior or the eval harness itself are changed. Docs-only PRs
-skip evals entirely.
-
-**Tier 2 uses `continue-on-error: true`** so live-model failures don't
-block the merge — they're informational and tracked via the aggregate
-report artifact.
+The existing change classifier already routes the `python` lane on edits under
+`agent/**`, `tools/**`, `hermes_cli/**`, `model_tools.py`, and `evals/**`, so a
+production regression that breaks a probe fails an ordinary required check. Live
+(Tier 2/3) runs remain a manual/opt-in activity via `run_suite.py --provider`;
+they are intentionally not wired into required CI because they cost money and
+depend on external providers.
 
 ### 4.4 Adding a suite to CI
 
@@ -480,36 +476,32 @@ report artifact.
    Tier 2. The `windows_reliability` suite is special — it runs on a
    Windows runner and is triggered alongside Tier 1.
 
-2. **Add to the tier list** in `scripts/ci/run_evals.py`:
+2. **Declare a `runtime_probe`** (Tier-1 suites): register a probe in
+   `evals/runtime_probes.py::_PROBES` keyed by the suite name, set
+   `runtime_probe: <suite_name>` in the suite YAML, and add the suite name to
+   the Tier-1 set asserted by `tests/evals/test_run_suite.py`:
    ```python
-   _TIER1_SUITES = [
-       "orchestration",
-       "cost_cache",
-       "subagent_verify",
-       "memory_recall",
-       "my_new_suite",       # ← add here
-   ]
+   # evals/runtime_probes.py
+   _PROBES = {
+       "orchestration": _probe_orchestration,
+       "cost_cache": _probe_cost_cache,
+       "subagent_verify": _probe_subagent_verify,
+       "memory_recall": _probe_memory_recall,
+       "windows_reliability": _probe_windows_reliability,
+       "my_new_suite": _probe_my_new_suite,   # ← add here
+   }
    ```
 
-3. **Add a workflow step** in `.github/workflows/evals.yml`:
-   ```yaml
-   - name: Run my_new_suite suite (deterministic)
-     run: |
-       python evals/runners/run_suite.py \
-         --suite my_new_suite \
-         --deterministic-only \
-         --output evals/reports/my_new_suite.json \
-         --quiet
+3. **Add a self-test** to `tests/evals/test_run_suite.py` so the existing
+   Python CI lane exercises the suite and its probe:
+   ```python
+   # extend the tier1 set and probe parametrization
+   assert suite.get("runtime_probe") == "my_new_suite"
    ```
 
-4. **If the suite emits a hard-gate metric**, register it:
-   ```python
-   HARD_GATES["my_metric"] = (">=", 0.75, "description of the metric")
-   ```
-   And add it to the `metric_to_suites` mapping:
-   ```python
-   metric_to_suites["my_metric"] = ["my_new_suite"]
-   ```
+4. **Emit gate metrics inside the suite's rubric** so the runner's per-suite
+   `pass_rate` reflects them. The runner exits non-zero when the suite errors
+   (including a failed runtime probe) or when `pass_rate < 0.5`.
 
 5. **Create the baseline** by running the suite once and copying the
    report to `evals/baselines/my_new_suite_baseline.json`.
@@ -518,14 +510,13 @@ report artifact.
 
 | Code | Meaning |
 |---|---|
-| `0` | All suites ran, all hard gates passed (soft-gate warnings are OK) |
-| `1` | A hard gate failed, a suite errored, or a required secret was missing |
+| `0` | Suite ran, runtime probe passed, no scenario failed or errored |
+| `1` | The runtime probe failed, a scenario failed/errored, `pass_rate < 0.5`, or a baseline regression was detected |
 | `2` | Invalid arguments (argparse error) |
 
-The per-suite runner (`run_suite.py`) exits `1` if `pass_rate < 0.5` or if
-a baseline regression is detected. The CI runner (`run_evals.py`) exits
-`1` if any hard gate fails or any suite produced an error without
-scenarios.
+The per-suite runner (`run_suite.py`) exits `1` if the suite's runtime probe
+fails, if any scenario fails or errors, if `pass_rate < 0.5`, or if a baseline
+regression is detected.
 
 ---
 
@@ -841,34 +832,26 @@ Located at `evals/suites/windows_reliability.yaml` with rubric
 | `W3_home_spaces` | HERMES_HOME with spaces in path | Common on Windows (`C:\Users\First Last\`) — shell quoting bugs surface here |
 | `W4_unicode_arg` | Emoji and RTL text in user goal | MSYS2 bash may mangle Unicode arguments passed to subprocesses |
 
-### 7.2 Windows CI job
+### 7.2 Windows coverage
 
-The `windows-reliability` job in `evals.yml` runs on `windows-latest`:
+There is no dedicated Windows eval workflow in this PR. Windows behavior is
+covered two ways:
 
-```yaml
-windows-reliability:
-  runs-on: windows-latest
-  if: github.event_name == 'pull_request' || github.event_name == 'push'
-  steps:
-    - uses: actions/checkout@v4
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    - name: Install deps
-      run: pip install pyyaml
-    - name: Run Windows reliability suite
-      run: |
-        python evals/runners/run_suite.py `
-          --suite windows_reliability `
-          --deterministic-only `
-          --output evals/reports/windows_reliability.json `
-          --quiet
-      shell: pwsh
-```
+- The `windows_reliability` suite's `runtime_probe` exercises the real
+  `tools.file_tools` write/read path with a Unicode filename, a
+  spaces-in-path workspace, and a >200-character deep path. This runs under
+  the normal `python` test lane (`tests/evals/test_run_suite.py`) on whatever
+  runner CI uses, and additionally on a developer's Windows machine.
+- On a Windows dev box you can run the suite directly:
 
-Note the PowerShell-style line continuation (backtick) and `shell: pwsh`.
-This is the only job that uses PowerShell — all others use bash.
+  ```pwsh
+  python evals/runners/run_suite.py `
+    --suite windows_reliability `
+    --deterministic-only `
+    --quiet
+  ```
+
+  Note the PowerShell-style line continuation (backtick).
 
 ### 7.3 Mojibake detection
 
@@ -923,12 +906,13 @@ on Windows are correctness issues, not quality issues.
    on Linux CI but not on Windows. If a suite needs to run on both,
    use a relative path or a temp directory that works cross-platform.
 
-7. **The `windows_reliability` suite does NOT need a baseline.** In
-   deterministic mode, the scenarios pass by default (no live model
-   calls). The baseline exists at
+7. **The `windows_reliability` suite does NOT need a baseline.** Its
+   deterministic run exercises the real file-tool path via the suite's
+   `runtime_probe` (Unicode, spaces, deep paths) and grades rubric fixtures;
+   it makes no live model calls. The baseline exists at
    `evals/baselines/windows_reliability_baseline.json` for consistency,
-   but the real value of this suite is in live mode on a Windows
-   developer machine, not in CI.
+   but the fullest value of this suite is in live mode on a Windows
+   developer machine.
 
 ---
 
@@ -961,10 +945,10 @@ cost per call depends on:
 
 ### 8.2 Sampling strategies
 
-1. **Run Tier 2 only on merge to main, not on every PR.** The
-   `evals.yml` workflow gates Tier 2 with
-   `if: github.event_name == 'push' && (github.ref == 'refs/heads/main' ...)`.
-   This limits live-model cost to once per merge, not once per PR commit.
+1. **Run Tier 2 only on merge to main, not on every PR.** Live suites are
+   opt-in (`run_suite.py --provider ...`) and are not wired into required PR
+   CI, so they don't run per PR commit. Trigger them on merge or on demand to
+   limit live-model cost.
 
 2. **Use `continue-on-error: true` for Tier 2/3.** A live suite failure
    should not block the merge — it's informational. Blocking on live
@@ -1036,18 +1020,17 @@ evals/baselines/code_task_baseline_sonnet.json     # sonnet (release gate)
    it may be spending too long on a scenario. Consider splitting the
    suite or reducing `max_iterations`.
 
-### 8.5 CI budget controls
+### 8.5 Budget controls
 
-The `evals.yml` workflow includes several implicit budget controls:
+Because live suites are opt-in rather than wired into required CI, budget
+control is mostly a matter of when you invoke them:
 
-- **Path filtering:** Tier 1 only runs when `agent/**`, `tools/**`,
-  `run_agent.py`, `toolsets.py`, or `evals/**` files change. Docs-only
-  PRs skip evals entirely.
-- **Tier 2 gating:** Only runs on push to main/master, not on PRs.
-- **`continue-on-error`** on Tier 2/3: prevents retry loops from
-  burning budget on flaky suites.
-- **Per-suite timeout:** 30 minutes per suite, enforced by
-  `subprocess.run(timeout=1800)` in the CI runner.
+- **Deterministic Tier-1 runs cost nothing** — probes and fixtures make zero
+  API calls, so per-PR validation is free.
+- **Run live (Tier 2/3) suites on merge or on demand**, not per PR commit.
+- **Pick the cheapest capable model** with `--provider`/`--model`.
+- **Cap iterations** with `config_overrides.agent.max_iterations` so a runaway
+  live scenario can't loop indefinitely.
 
 If you need tighter budget control, consider:
 - Adding a monthly API spending cap at the provider level
@@ -1103,19 +1086,17 @@ evals/
 # Run a single suite
 python evals/runners/run_suite.py --suite orchestration --deterministic-only --quiet
 
-# Run all Tier 1 suites (CI-style)
-python scripts/ci/run_evals.py --tier 1
-
-# Run a single suite via CI runner
-python scripts/ci/run_evals.py --tier 1 --suite cost_cache
+# Run all Tier 1 suites
+for s in orchestration cost_cache subagent_verify memory_recall windows_reliability; do
+  python evals/runners/run_suite.py --suite "$s" --deterministic-only --quiet
+done
 
 # --- Tier 2 (live, needs API key) ---
 export OPENROUTER_API_KEY=sk-or-...
 python evals/runners/run_suite.py --suite code_task --provider openrouter --model anthropic/claude-haiku-4.5
-python scripts/ci/run_evals.py --tier 2
 
-# --- Tier 3 (nightly comprehensive) ---
-python scripts/ci/run_evals.py --tier 3
+# --- Tier 3 (nightly comprehensive: run each live suite with a provider) ---
+python evals/runners/run_suite.py --suite research_citation --provider openrouter --model anthropic/claude-haiku-4.5
 
 # --- Rubric self-test ---
 python evals/rubrics/orchestration.py

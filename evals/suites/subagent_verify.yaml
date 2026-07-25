@@ -26,6 +26,7 @@
 # the actual agent and measures its verification behavior.
 
 name: subagent_verify
+runtime_probe: subagent_verify
 description: >
   Tests that the parent agent verifies subagent outputs via independent tool
   calls (read_file, search_files, terminal) rather than blindly trusting

@@ -421,3 +421,101 @@ def test_suite_rubrics_fail_closed_on_unknown_conditions(suite_name, scenario_id
 
     assert grade["pass"] is False
     assert "unsupported_conditions" in grade["details"]
+
+
+def test_required_runtime_probe_failure_fails_suite_closed(tmp_path):
+    suite = _write_suite(
+        tmp_path,
+        "runtime_probe_contract",
+        [
+            {
+                "id": "RP1",
+                "description": "rubric fixture passes but runtime probe must gate it",
+                "user_message": "hello",
+                "pass_conditions": [{"type": "response_contains", "value": "done"}],
+                "_mock_final_response": "done",
+            }
+        ],
+    )
+    data = yaml.safe_load(suite.read_text(encoding="utf-8"))
+    data["runtime_probe"] = "does_not_exist"
+    suite.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    report = runner.run_suite(suite, deterministic_only=True, quiet=True)
+
+    assert report["passed"] == 1  # fixture grading remains visible
+    assert report["runtime_probe"]["pass"] is False
+    assert report["errored"] == 1
+
+
+def test_shipped_tier1_suites_require_real_runtime_probes():
+    tier1 = {
+        "orchestration",
+        "cost_cache",
+        "subagent_verify",
+        "memory_recall",
+        "windows_reliability",
+    }
+    for suite_name in tier1:
+        suite = yaml.safe_load(
+            (runner._EVALS_DIR / "suites" / f"{suite_name}.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert suite.get("runtime_probe") == suite_name
+
+
+@pytest.mark.parametrize(
+    "probe_name",
+    [
+        "orchestration",
+        "cost_cache",
+        "subagent_verify",
+        "memory_recall",
+        "windows_reliability",
+    ],
+)
+def test_runtime_probes_exercise_production_paths_without_api_calls(probe_name):
+    from evals.runtime_probes import run_runtime_probe
+
+    result = run_runtime_probe(probe_name)
+
+    assert result["pass"] is True, result
+    assert result["api_calls"] == 0
+    assert result["production_modules"]
+    assert all(
+        name.startswith(("agent.", "tools.", "hermes_cli.", "model_tools"))
+        for name in result["production_modules"]
+    )
+
+
+def test_unknown_runtime_probe_fails_closed_without_raising():
+    from evals.runtime_probes import run_runtime_probe
+
+    result = run_runtime_probe("does_not_exist")
+
+    assert result["pass"] is False
+    assert result["api_calls"] == 0
+    assert "unknown runtime probe" in result["details"]["error"]
+
+
+def test_runtime_probes_do_not_leak_global_state():
+    """Probes mutate process globals (HERMES_HOME override, tool-defs cache);
+    they must restore them so running a probe can't corrupt a live process or
+    a shared test session."""
+    import model_tools
+    from hermes_constants import get_hermes_home
+    from evals.runtime_probes import run_runtime_probe
+
+    home_before = get_hermes_home()
+    model_tools._clear_tool_defs_cache()
+
+    result = run_runtime_probe("cost_cache")
+    assert result["pass"] is True, result
+
+    # HERMES_HOME override was reset back to its original value.
+    assert get_hermes_home() == home_before
+    # The tool-defs cache the probe populated was cleared on exit, so the next
+    # caller repopulates it under its own settings rather than inheriting
+    # the probe's ["file"]-only toolset snapshot.
+    assert model_tools._tool_defs_cache == {}

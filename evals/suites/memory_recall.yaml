@@ -1,4 +1,5 @@
 name: memory_recall
+runtime_probe: memory_recall
 description: 'Cross-session memory retrieval quality: fact recall, distractor resistance, stale-override
   resolution, and clean-state honesty.  Measures recall@3 ≥ 0.85.
 

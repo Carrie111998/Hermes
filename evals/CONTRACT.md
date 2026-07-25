@@ -4,6 +4,9 @@
 ```yaml
 name: suite_name
 description: What this suite tests
+# Optional. Tier-1 suites declare a hermetic production-path probe that runs
+# before rubric fixtures in --deterministic-only mode (see "Runtime probes").
+runtime_probe: suite_name
 scenarios:
   - id: S1_unique_id
     description: Human-readable
@@ -49,6 +52,30 @@ run with `--deterministic-only` must either provide `_mock_*` fixture data or
 declare `deterministic_skip`; otherwise it is reported as an error rather than
 being graded against an empty transcript.
 
+## Runtime probes (production-path evidence)
+
+`_mock_*` transcripts are **rubric unit coverage**, not evidence that Hermes
+production paths work. A Tier-1 suite therefore declares a `runtime_probe`
+that runs first, before any fixture grading, whenever the suite executes in
+`--deterministic-only` mode.
+
+A runtime probe:
+
+- imports and calls **real production modules** (e.g. `tools.memory_tool`,
+  `tools.delegate_tool`, `agent.system_prompt`, `model_tools`,
+  `hermes_cli.config`, `tools.file_tools`);
+- creates an isolated `HERMES_HOME` and workspace via
+  `set_hermes_home_override`, and removes them on exit;
+- makes **zero** model/API calls (`api_calls == 0`);
+- **fails closed** — an unknown probe name, an assertion failure, or any raised
+  exception yields `{"pass": false}` with a captured `details.error`.
+
+Probes are registered in `evals/runtime_probes.py::_PROBES` and invoked by the
+runner. When a suite declares a probe that does not pass, the runner records a
+`runtime_probe` block in the report and increments `errored`, so the CLI exits
+non-zero even when every rubric fixture grades green. This closes the gap where
+a production regression could not change a fixture-only result.
+
 ## Runner Output Format
 ```json
 {
@@ -57,7 +84,15 @@ being graded against an empty transcript.
   "total": 5,
   "passed": 4,
   "failed": 1,
+  "errored": 0,
+  "skipped": 0,
   "pass_rate": 0.80,
+  "runtime_probe": {
+    "pass": true,
+    "api_calls": 0,
+    "production_modules": ["tools.delegate_tool", "hermes_cli.config"],
+    "details": {"max_concurrent_children": 7}
+  },
   "scenarios": [
     {
       "id": "S1",
@@ -71,11 +106,21 @@ being graded against an empty transcript.
 }
 ```
 
-## AIAgent API (from livetest pattern)
+`runtime_probe` is present only for suites that declare one. `errored` is
+non-zero when the probe fails or when a deterministic scenario has neither
+fixture data nor an explicit skip.
+
+## AIAgent API (live mode only)
+
+Live mode is the only runner mode that measures model behavior. Tier-1 runtime
+probes measure deterministic production invariants (persistence, config
+propagation, prompt/tool byte-stability, summary spill/read-back, and file
+I/O); embedded transcripts measure rubric parsing only.
+
 ```python
 from run_agent import AIAgent
 agent = AIAgent(
-    provider="openrouter",  # or fake for deterministic
+    provider="openrouter",
     model="...",
     enabled_toolsets=["terminal", "file"],
     quiet_mode=True,

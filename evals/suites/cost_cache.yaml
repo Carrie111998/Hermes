@@ -1,4 +1,5 @@
 name: cost_cache
+runtime_probe: cost_cache
 description: >
   Prompt-cache preservation and cache-break detection for Hermes Agent.
   Verifies that the per-conversation prompt-cache prefix is byte-stable across

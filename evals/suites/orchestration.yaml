@@ -23,6 +23,7 @@
 #   plan_score             – 0-1 decomposition quality heuristic
 
 name: orchestration
+runtime_probe: orchestration
 description: >
   Agent decomposition, delegation choices, concurrency caps, depth limits,
   and cascade rejection.  5 scenarios (O1-O5) with deterministic pass

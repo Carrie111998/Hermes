@@ -1,4 +1,5 @@
 name: windows_reliability
+runtime_probe: windows_reliability
 description: Tests Hermes Agent reliability on Windows 10/11 with MSYS2 git-bash shell
 scenarios:
 - id: W1_encoding

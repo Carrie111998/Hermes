@@ -360,6 +360,19 @@ def run_suite(
     errored = 0
     skipped = 0
 
+    # Tier-1 fixture transcripts exercise rubric parsing only.  A suite that
+    # declares ``runtime_probe`` must also pass a hermetic production-path
+    # probe; otherwise a production regression could leave every YAML fixture
+    # green.  Probes make no API calls and isolate HERMES_HOME/workspace state.
+    runtime_probe = None
+    runtime_probe_name = suite.get("runtime_probe")
+    if runtime_probe_name:
+        from evals.runtime_probes import run_runtime_probe
+
+        runtime_probe = run_runtime_probe(str(runtime_probe_name))
+        if not runtime_probe.get("pass"):
+            errored += 1
+
     for i, scenario in enumerate(scenarios):
         sid = scenario.get("id", f"S{i}")
         if not quiet:
@@ -421,8 +434,10 @@ def run_suite(
                     "duration_s": round(time.time() - t0, 2),
                 })
                 continue
-            # Deterministic mode: grade structural invariants against embedded
-            # mock transcripts (_mock_messages). No live API call.
+            # Fixture mode: grade rubric invariants against embedded transcripts.
+            # The suite-level runtime_probe above is the production-path evidence;
+            # these _mock_* values are intentionally only rubric unit coverage,
+            # not proof that Hermes production paths work. No live API call.
             messages = scenario.get("_mock_messages", []) or []
             final_response = scenario.get("_mock_final_response")
             if final_response is None:
@@ -491,6 +506,8 @@ def run_suite(
         "pass_rate": round(pass_rate, 4),
         "scenarios": results,
     }
+    if runtime_probe is not None:
+        report["runtime_probe"] = runtime_probe
 
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -553,6 +570,16 @@ def print_summary(report: dict) -> None:
     print(f"Rate:    {report['pass_rate']:.1%}")
     print(f"{'='*60}")
 
+    runtime_probe = report.get("runtime_probe")
+    if runtime_probe is not None:
+        status = "PASS" if runtime_probe.get("pass") else "FAIL"
+        modules = ", ".join(runtime_probe.get("production_modules", []))
+        print(f"Runtime probe: {status}  api_calls={runtime_probe.get('api_calls', 0)}")
+        if modules:
+            print(f"  production modules: {modules}")
+        if not runtime_probe.get("pass"):
+            print(f"  details: {runtime_probe.get('details', {})}")
+
     for s in report.get("scenarios", []):
         if s.get("skipped"):
             status = "↷"
@@ -580,7 +607,14 @@ def main():
     parser.add_argument("--model", default="anthropic/claude-haiku-4.5", help="Model name")
     parser.add_argument("--output", help="Output JSON path (default: evals/reports/<suite>.json)")
     parser.add_argument("--baseline", help="Baseline JSON path for comparison")
-    parser.add_argument("--deterministic-only", action="store_true", help="Skip live API calls, structural checks only")
+    parser.add_argument(
+        "--deterministic-only",
+        action="store_true",
+        help=(
+            "Run the suite's hermetic production-path probe (when declared) "
+            "plus rubric fixtures; make no live model/API calls"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="Suppress per-scenario output")
     args = parser.parse_args()
 
