@@ -110,7 +110,13 @@ def test_package_has_exact_two_jobs_and_split_credentials(
     assert "LoadCredential=" not in report_service
     assert "GH_TOKEN" not in report_service
     assert str(rail.CREDENTIAL_SOURCE) not in report_service
-    assert f"ReadOnlyPaths={rail.PUBLIC_REPORT_ROOT}" in report_service
+    assert f"ReadOnlyPaths={rail.REPORT_VIEW_ROOT}" in report_service
+    assert (
+        f"BindReadOnlyPaths={rail.PRIVATE_PUBLIC_REPORT_ROOT}:"
+        f"{rail.REPORT_VIEW_ROOT}"
+        in report_service
+    )
+    assert f"--public-report-dir {rail.REPORT_VIEW_ROOT}" in report_service
     assert f"InaccessiblePaths=-{rail.STATE_ROOT}" in report_service
     assert str(release / rail.REPORTER_RELATIVE) in report_service
     assert (
