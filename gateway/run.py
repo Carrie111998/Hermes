@@ -17380,11 +17380,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     result = await transport.adapter.send(str(home.chat_id), message)
                 if result is not None and getattr(result, "success", True) is False:
+                    error = getattr(result, "error", "send returned success=False")
+                    if error == "send_path_degraded":
+                        try:
+                            # Telegram polling deliberately marks the live PTB
+                            # send path degraded until the first getUpdates
+                            # response proves polling health.  At cold startup
+                            # that can be a normal timing window, while the
+                            # standalone Bot API sender is the established
+                            # fallback used by cron for exactly this degraded
+                            # live-adapter state.
+                            from tools.send_message_tool import _send_to_platform
+
+                            fallback = await _send_to_platform(
+                                platform,
+                                platform_cfg,
+                                str(home.chat_id),
+                                message,
+                                thread_id=str(home.thread_id) if home.thread_id else None,
+                            )
+                            if not (isinstance(fallback, dict) and fallback.get("error")):
+                                delivered.add(target)
+                                logger.info(
+                                    "Sent home-channel startup notification to %s:%s via standalone fallback after degraded live send path",
+                                    platform.value,
+                                    home.chat_id,
+                                )
+                                continue
+                            error = f"{error}; standalone fallback failed: {fallback.get('error')}"
+                        except Exception as fallback_exc:
+                            error = f"{error}; standalone fallback failed: {fallback_exc}"
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
                         platform.value,
                         home.chat_id,
-                        getattr(result, "error", "send returned success=False"),
+                        error,
                     )
                     continue
 
