@@ -2059,6 +2059,11 @@ def _api_key_for_custom_model_catalog(base_url: str, model_cfg: dict[str, Any]) 
         openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
         if openrouter_key:
             return openrouter_key
+        # Parity with runtime_provider openrouter context (#289):
+        # OpenRouter accepts OPENAI_API_KEY when OPENROUTER_API_KEY is unset.
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if openai_key:
+            return openai_key
 
     return ""
 
