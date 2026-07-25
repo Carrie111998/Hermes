@@ -1335,6 +1335,86 @@ def switch_model(
                     if isinstance(user_providers, dict) and target_provider in user_providers:
                         explicit_provider = target_provider
 
+        # --- Step d2: Configured provider catalog check ---
+        # When the user's config.yaml specifies a default provider (e.g.
+        # ``model.provider: opencode-go``) and the current session is on a
+        # different provider, the configured provider's live catalog may
+        # contain the bare model name.  Check it before falling to static
+        # catalog detection, which would pick the native provider instead.
+        # See #48731.
+        #
+        # Also checks the current provider's own live catalog when it has
+        # a ``base_url`` (proxy/custom endpoint like litellm), so a model
+        # served by the proxy isn't hijacked by static native-provider
+        # catalogs.  See #71324.
+        if (
+            not resolved_in_current_catalog
+            and not resolved_alias
+            and target_provider == current_provider
+        ):
+            try:
+                from hermes_cli.config import load_config as _load_cfg
+                _cfg = _load_cfg()
+                _model_cfg = _cfg.get("model")
+                _configured_prov = (
+                    _model_cfg.get("provider", "")
+                    if isinstance(_model_cfg, dict)
+                    else ""
+                )
+
+                # Case A: configured provider differs from current and is
+                # an aggregator — switch to it if it has the model.
+                if (
+                    _configured_prov
+                    and _configured_prov != current_provider
+                    and is_aggregator(_configured_prov)
+                ):
+                    _cat = list_provider_models(_configured_prov)
+                    if _cat:
+                        _nl = new_model.lower()
+                        for _mid in _cat:
+                            if _mid.lower() == _nl:
+                                new_model = _mid
+                                target_provider = _configured_prov
+                                resolved_in_current_catalog = True
+                                break
+                        if not resolved_in_current_catalog:
+                            for _mid in _cat:
+                                if "/" in _mid:
+                                    _, _bare = _mid.split("/", 1)
+                                    if _bare.lower() == _nl:
+                                        new_model = _mid
+                                        target_provider = _configured_prov
+                                        resolved_in_current_catalog = True
+                                        break
+
+                # Case B: current provider has a custom base_url (proxy
+                # like litellm) — check its own live /v1/models catalog
+                # before falling through to static detection.
+                if (
+                    not resolved_in_current_catalog
+                    and isinstance(_model_cfg, dict)
+                    and _model_cfg.get("base_url", "")
+                ):
+                    _cat = list_provider_models(current_provider)
+                    if _cat:
+                        _nl = new_model.lower()
+                        for _mid in _cat:
+                            if _mid.lower() == _nl:
+                                new_model = _mid
+                                resolved_in_current_catalog = True
+                                break
+                        if not resolved_in_current_catalog:
+                            for _mid in _cat:
+                                if "/" in _mid:
+                                    _, _bare = _mid.split("/", 1)
+                                    if _bare.lower() == _nl:
+                                        new_model = _mid
+                                        resolved_in_current_catalog = True
+                                        break
+            except Exception:
+                pass  # config unavailable — fall through to static detection
+
         # --- Step e: detect_provider_for_model() as last resort ---
         _base = current_base_url or ""
         is_custom = (
