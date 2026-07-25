@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 from scripts import skyai_v2_upstream_sync_scheduler as scheduler
 
@@ -42,6 +43,21 @@ def test_format_sync_report_is_bounded_and_factual() -> None:
     assert "https://github.com/lomliev/hermes-agent/pull/178" in message
     assert "без auto-merge, deploy и runtime промени" in message
     assert len(message) <= scheduler.MAX_MESSAGE_LENGTH
+
+
+def test_scheduler_script_starts_outside_repo(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(Path(scheduler.__file__).resolve()), "--help"],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0
+    assert "--job" in completed.stdout
 
 
 def test_deliver_once_uses_existing_hermes_transport_once(tmp_path: Path) -> None:
