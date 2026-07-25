@@ -47,7 +47,7 @@ import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
