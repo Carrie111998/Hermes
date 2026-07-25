@@ -3799,3 +3799,42 @@ def test_assignment_preflight_never_retries_known_broken_credential_twice(tmp_pa
 
     assert calls.count("broken") == 2  # initial ping + exactly one post-reload retry
     assert selected is not None and selected.id == "healthy"
+
+
+def test_assignment_preflight_does_not_hold_pool_lock_during_network_ping(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_codex_preflight_pool(
+        tmp_path,
+        [_codex_preflight_entry("healthy", "healthy-token", 0)],
+    )
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    ping_started = threading.Event()
+    release_ping = threading.Event()
+    selection_done = threading.Event()
+
+    def probe(_entry):
+        ping_started.set()
+        assert release_ping.wait(timeout=2.0)
+        return 200
+
+    def select_worker():
+        pool.select_health_checked(probe)
+        selection_done.set()
+
+    worker = threading.Thread(target=select_worker, daemon=True)
+    worker.start()
+    assert ping_started.wait(timeout=2.0)
+
+    # A reader must remain responsive while the assignment health endpoint is
+    # blocked; otherwise N slow pings serialize every pool consumer for N×10s.
+    read_done = threading.Event()
+    reader = threading.Thread(target=lambda: (pool.entries(), read_done.set()), daemon=True)
+    reader.start()
+    assert read_done.wait(timeout=0.5)
+
+    release_ping.set()
+    assert selection_done.wait(timeout=2.0)

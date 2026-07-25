@@ -4143,14 +4143,13 @@ def probe_codex_credential_health(
     """
     token = str(access_token or "").strip()
     if not token or not _decode_jwt_claims(token):
-        return None
+        return {"status_code": 401, "reason": "invalid_token"}
     cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
     now = time.monotonic()
     with _codex_quota_probe_lock:
         cached = _codex_credential_health_cache.get(cache_key)
         if cached is not None and (now - cached[0]) < min_interval_seconds:
             return dict(cached[1]) if isinstance(cached[1], dict) else None
-        _codex_credential_health_cache[cache_key] = (now, None)
 
     result: Optional[Dict[str, Any]] = None
     try:

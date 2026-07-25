@@ -1739,7 +1739,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
             resolved_route = dict(fb)
             resolved_pool = load_pool(fb_provider)
-            resolved_entry = resolved_pool.current() or resolved_pool.peek()
+            resolved_entry = (
+                resolved_pool.current()
+                or resolved_pool.peek()
+                or resolved_pool.select()
+            )
             if resolved_entry is not None:
                 resolved_route["auth_type"] = resolved_entry.auth_type
                 resolved_route["source"] = resolved_entry.source

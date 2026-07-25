@@ -140,6 +140,44 @@ class TestAuthFailoverActivation:
         assert agent.model == "claude-opus-4-8"
         assert agent.api_mode == "anthropic_messages"
 
+    def test_cold_claude_pool_is_selected_then_verified_before_fallback(self):
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "anthropic", "model": "claude-opus-4-8"},
+            ]
+        )
+        config = {
+            "orchestrator": {
+                "enabled": True,
+                "billing_policy": "subscription_only",
+            }
+        }
+        oauth_entry = SimpleNamespace(
+            auth_type="oauth",
+            source="env:ANTHROPIC_TOKEN",
+        )
+        cold_pool = MagicMock()
+        cold_pool.current.return_value = None
+        cold_pool.peek.return_value = None
+        cold_pool.select.return_value = oauth_entry
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client("https://api.anthropic.com", "subscription-oauth"),
+                    "claude-opus-4-8",
+                ),
+            ),
+            patch("agent.credential_pool.load_pool", return_value=cold_pool),
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+        ):
+            advanced = agent._try_activate_fallback(reason=FailoverReason.auth)
+
+        assert advanced is True
+        assert agent.provider == "anthropic"
+        cold_pool.select.assert_called_once_with()
+
     def test_no_failover_without_chain(self):
         """A user with no fallback configured (the common case for the
         original incident) does NOT failover — falls through to the

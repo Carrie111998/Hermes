@@ -203,6 +203,15 @@ def test_assignment_health_probe_is_cached_per_token(monkeypatch):
     assert len(calls) == 1
 
 
+def test_assignment_health_probe_classifies_corrupt_token_as_401(monkeypatch):
+    calls = _patch_httpx(monkeypatch, _StubResponse(200, _usage_payload(1.0, 2.0)))
+
+    result = probe_codex_credential_health("not-a-jwt")
+
+    assert result == {"status_code": 401, "reason": "invalid_token"}
+    assert calls == []
+
+
 def test_probe_sends_chatgpt_account_id_from_jwt(monkeypatch):
     calls = _patch_httpx(monkeypatch, _StubResponse(200, _usage_payload(0.0, 0.0)))
     token = _jwt(
