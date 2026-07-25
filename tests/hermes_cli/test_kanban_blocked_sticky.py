@@ -272,6 +272,30 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Create-time blocked rows are also sticky
+# ---------------------------------------------------------------------------
+
+
+def test_create_time_blocked_task_survives_recompute_ready(kanban_home: Path) -> None:
+    """A task deliberately created as blocked must remain an inert human gate."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="parked owner decision",
+            initial_status="blocked",
+        )
+
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+        assert [row["kind"] for row in events] == ["created", "blocked"]
+        assert kb._has_sticky_block(conn, tid) is True
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
 # Schema-init recovery on legacy DBs is covered by
 # tests/hermes_cli/test_kanban_db.py::test_connect_migrates_legacy_db_before_optional_column_indexes
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test

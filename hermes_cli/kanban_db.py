@@ -3172,6 +3172,21 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # ``recompute_ready`` treats explicit blocked events as
+                    # sticky operator gates. Creation-time blocks need the
+                    # same durable marker or the next dispatcher tick can
+                    # silently promote them.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status=blocked",
+                            "kind": None,
+                            "recurrences": 1,
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
