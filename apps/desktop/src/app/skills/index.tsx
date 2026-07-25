@@ -105,22 +105,41 @@ const usageOf = (skill: SkillInfo): number => (typeof skill.usage === 'number' ?
 
 const categoryFor = (skill: SkillInfo): string => asText(skill.category) || 'general'
 
+type SkillOrigin = NonNullable<SkillInfo['origin']>
+
+function skillOrigin(skill: SkillInfo): SkillOrigin {
+  if (skill.origin) {
+    return skill.origin
+  }
+
+  if (skill.provenance === 'hub' || skill.provenance === 'bundled') {
+    return skill.provenance
+  }
+
+  return 'local'
+}
+
 // Row subtitle: category, with non-default origins badged.
-function skillSubtitle(skill: SkillInfo): React.ReactNode {
+function skillSubtitle(skill: SkillInfo, labels: Record<SkillOrigin, string>): React.ReactNode {
   const category = prettyName(categoryFor(skill))
-  const provenance = skill.provenance
+  const origin = skillOrigin(skill)
 
   return (
     <>
       <span className="truncate">{category}</span>
-      {provenance === 'agent' && (
+      {origin === 'background_review' && (
         <Badge className="shrink-0 normal-case" variant="default">
-          learned
+          {labels[origin]}
         </Badge>
       )}
-      {provenance === 'hub' && (
+      {origin === 'local' && (
         <Badge className="shrink-0 normal-case" variant="muted">
-          hub
+          {labels[origin]}
+        </Badge>
+      )}
+      {origin === 'hub' && (
+        <Badge className="shrink-0 normal-case" variant="muted">
+          {labels[origin]}
         </Badge>
       )}
     </>
@@ -603,7 +622,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                   meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
                   onSelect={() => setSelectedSkill(skill.name)}
                   onToggle={enabled => void handleToggleSkill(skill, enabled)}
-                  subtitle={skillSubtitle(skill)}
+                  subtitle={skillSubtitle(skill, t.skills.provenance)}
                   title={skill.name}
                   toggleLabel={skill.name}
                 />
@@ -718,9 +737,11 @@ function DetailHeader({
 
 function SkillDetail({ onArchive, onEdit, skill }: { onArchive: () => void; onEdit: () => void; skill: SkillInfo }) {
   const { t } = useI18n()
-  // Only learned/local skills are the user's to rewrite or archive — bundled
-  // and hub skills are managed by their sources.
-  const editable = skill.provenance === 'agent'
+  const origin = skillOrigin(skill)
+
+  // Local and background-created skills are user-owned. Bundled and Hub skills
+  // remain source-managed. Legacy backends classify local ownership as agent.
+  const editable = skill.provenance === 'agent' || origin === 'local' || origin === 'background_review'
 
   return (
     <>
@@ -729,9 +750,9 @@ function SkillDetail({ onArchive, onEdit, skill }: { onArchive: () => void; onEd
         pills={
           <>
             <PanelPill>{prettyName(categoryFor(skill))}</PanelPill>
-            {skill.provenance && skill.provenance !== 'bundled' && (
-              <PanelPill tone={skill.provenance === 'agent' ? 'good' : 'muted'}>
-                {t.skills.provenance[skill.provenance]}
+            {origin !== 'bundled' && (
+              <PanelPill tone={origin === 'background_review' ? 'good' : 'muted'}>
+                {t.skills.provenance[origin]}
               </PanelPill>
             )}
           </>

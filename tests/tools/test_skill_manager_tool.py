@@ -626,6 +626,7 @@ class TestSkillManageDispatcher:
         # entirely (telemetry best-effort) or present with created_by unset.
         rec = usage.get("test-skill") or {}
         assert rec.get("created_by") in {None, "", False}
+        assert rec.get("origin") in {None, ""}
 
     def test_create_from_background_review_marks_agent_created(self, tmp_path):
         """Background-review fork creates ARE marked as agent-created."""
@@ -644,6 +645,7 @@ class TestSkillManageDispatcher:
         result = json.loads(raw)
         assert result["success"] is True
         assert usage["review-sediment"]["created_by"] == "agent"
+        assert usage["review-sediment"]["origin"] == "background_review"
 
     def test_delete_via_dispatcher_threads_absorbed_into(self, tmp_path):
         # Dispatcher must plumb absorbed_into through to _delete_skill so the

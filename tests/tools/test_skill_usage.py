@@ -788,27 +788,33 @@ def test_usage_report_covers_all_provenance(skills_home):
     """usage_report() surfaces every skill with provenance, unlike the
     curator-scoped agent_created_report()."""
     from tools.skill_usage import (
-        bump_use, usage_report, mark_agent_created,
+        bump_use, usage_report, mark_background_review_created,
     )
     skills_dir = skills_home / "skills"
     _write_skill(skills_dir, "bundled-one")
     _write_skill(skills_dir, "hub-one")
     _write_skill(skills_dir, "mine")
+    _write_skill(skills_dir, "manual")
     (skills_dir / ".bundled_manifest").write_text("bundled-one:abc\n", encoding="utf-8")
     hub = skills_dir / ".hub"
     hub.mkdir()
     (hub / "lock.json").write_text(
         json.dumps({"installed": {"hub-one": {}}}), encoding="utf-8",
     )
-    mark_agent_created("mine")
-    for n in ("bundled-one", "hub-one", "mine"):
+    mark_background_review_created("mine")
+    for n in ("bundled-one", "hub-one", "mine", "manual"):
         bump_use(n)
 
     rows = {r["name"]: r for r in usage_report()}
-    assert set(rows) == {"bundled-one", "hub-one", "mine"}
+    assert set(rows) == {"bundled-one", "hub-one", "mine", "manual"}
     assert rows["bundled-one"]["provenance"] == "bundled"
     assert rows["hub-one"]["provenance"] == "hub"
     assert rows["mine"]["provenance"] == "agent"
+    assert rows["manual"]["provenance"] == "agent"
+    assert rows["bundled-one"]["origin"] == "bundled"
+    assert rows["hub-one"]["origin"] == "hub"
+    assert rows["mine"]["origin"] == "background_review"
+    assert rows["manual"]["origin"] == "local"
     # All carry real usage now.
     for n in rows:
         assert rows[n]["use_count"] == 1

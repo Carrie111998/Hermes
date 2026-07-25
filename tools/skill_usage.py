@@ -492,6 +492,7 @@ def _is_curator_managed_record(record: Any) -> bool:
 def _empty_record() -> Dict[str, Any]:
     return {
         "created_by": None,
+        "origin": None,
         "use_count": 0,
         "view_count": 0,
         "last_used_at": None,
@@ -654,11 +655,20 @@ def bump_patch(skill_name: str) -> None:
 def mark_agent_created(skill_name: str) -> None:
     """Opt a skill created by skill_manage into curator management.
 
-    Viewing or invoking a manually authored skill may still create telemetry,
-    but only this explicit marker makes it eligible for automatic curation.
+    This field is curator eligibility, not human-facing provenance. Viewing or
+    invoking a manually authored skill may still create telemetry, but only
+    this explicit marker makes it eligible for automatic curation.
     """
     def _apply(rec: Dict[str, Any]) -> None:
         rec["created_by"] = "agent"
+    _mutate(skill_name, _apply, require_curation_eligible=True)
+
+
+def mark_background_review_created(skill_name: str) -> None:
+    """Record immutable provenance for background self-improvement sediment."""
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["created_by"] = "agent"
+        rec["origin"] = "background_review"
     _mutate(skill_name, _apply, require_curation_eligible=True)
 
 
@@ -901,17 +911,56 @@ def agent_created_report() -> List[Dict[str, Any]]:
     return rows
 
 
-def provenance(skill_name: str) -> str:
-    """Classify a skill's origin: 'hub', 'bundled', or 'agent'.
+def provenance(
+    skill_name: str,
+    *,
+    bundled_names: Optional[Set[str]] = None,
+    hub_names: Optional[Set[str]] = None,
+) -> str:
+    """Return the legacy ownership class used by older Desktop clients.
 
-    'agent' covers both agent-authored and local manually-authored skills —
-    anything not seeded from the bundled repo or installed via the hub.
+    ``agent`` intentionally means any local/user-owned skill here. The separate
+    :func:`origin` field carries human-facing provenance without breaking older
+    clients that rely on ``agent`` to keep local skills editable.
     """
-    if is_hub_installed(skill_name):
+    is_hub = skill_name in hub_names if hub_names is not None else is_hub_installed(skill_name)
+    if is_hub:
         return "hub"
-    if is_bundled(skill_name):
+    is_bundled_skill = (
+        skill_name in bundled_names
+        if bundled_names is not None
+        else is_bundled(skill_name)
+    )
+    if is_bundled_skill:
         return "bundled"
     return "agent"
+
+
+def origin(
+    skill_name: str,
+    usage_record: Any = None,
+    *,
+    bundled_names: Optional[Set[str]] = None,
+    hub_names: Optional[Set[str]] = None,
+) -> str:
+    """Return explicit human-facing origin for a skill.
+
+    Ambiguous and legacy local records are classified conservatively as
+    ``local``. Only the immutable marker written by the background-review fork
+    may produce ``background_review``.
+    """
+    legacy = provenance(
+        skill_name,
+        bundled_names=bundled_names,
+        hub_names=hub_names,
+    )
+    if legacy in {"hub", "bundled"}:
+        return legacy
+    if usage_record is None:
+        usage_record = load_usage().get(skill_name)
+    if isinstance(usage_record, dict) and usage_record.get("origin") == "background_review":
+        return "background_review"
+    return "local"
 
 
 def usage_report() -> List[Dict[str, Any]]:
@@ -921,13 +970,17 @@ def usage_report() -> List[Dict[str, Any]]:
     candidates), this surfaces all skills — bundled built-ins and
     hub-installed included — so callers can answer "how often is this skill
     used" independent of whether it's ever curated. Rows carry a
-    ``provenance`` field ('agent' | 'bundled' | 'hub') and ``_persisted``
-    (whether a real ``.usage.json`` record backs the row).
+    ``provenance`` field ('agent' | 'bundled' | 'hub') for legacy ownership,
+    an explicit ``origin`` field ('background_review' | 'local' | 'bundled' |
+    'hub') for human-facing labels, and ``_persisted`` (whether a real
+    ``.usage.json`` record backs the row).
     """
     base = _skills_dir()
     if not base.exists():
         return []
     data = load_usage()
+    bundled_names = _read_bundled_manifest_names()
+    hub_names = _read_hub_installed_names()
     rows: List[Dict[str, Any]] = []
     seen: set = set()
     for skill_md in base.rglob("SKILL.md"):
@@ -946,7 +999,17 @@ def usage_report() -> List[Dict[str, Any]]:
         row = {
             "name": name,
             **rec,
-            "provenance": provenance(name),
+            "provenance": provenance(
+                name,
+                bundled_names=bundled_names,
+                hub_names=hub_names,
+            ),
+            "origin": origin(
+                name,
+                rec,
+                bundled_names=bundled_names,
+                hub_names=hub_names,
+            ),
             "_persisted": persisted,
         }
         row["last_activity_at"] = latest_activity_at(row)

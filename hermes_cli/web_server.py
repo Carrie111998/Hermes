@@ -15444,25 +15444,33 @@ async def get_skills(profile: Optional[str] = None):
         _read_hub_installed_names,
         activity_count,
         load_usage,
+        origin,
+        provenance,
     )
     with _profile_scope(profile):
         config = load_config()
         disabled = get_disabled_skills(config)
         skills = _find_all_skills(skip_disabled=True)
         usage = load_usage()
-        # Set-based provenance (same classification as skill_usage.provenance,
-        # without a per-skill manifest read): hub > bundled > agent, where
-        # "agent" covers agent-authored AND local hand-made skills — the ones
-        # the user may edit/delete from the UI.
+        # Set-based classification avoids per-skill manifest reads. The legacy
+        # ``provenance`` field preserves broad local ownership for older Desktop
+        # clients; ``origin`` carries the explicit human-facing source.
         bundled_names = _read_bundled_manifest_names()
         hub_names = _read_hub_installed_names()
     for s in skills:
+        usage_record = usage.get(s["name"], {})
         s["enabled"] = s["name"] not in disabled
-        s["usage"] = activity_count(usage.get(s["name"], {}))
-        s["provenance"] = (
-            "hub" if s["name"] in hub_names
-            else "bundled" if s["name"] in bundled_names
-            else "agent"
+        s["usage"] = activity_count(usage_record)
+        s["provenance"] = provenance(
+            s["name"],
+            bundled_names=bundled_names,
+            hub_names=hub_names,
+        )
+        s["origin"] = origin(
+            s["name"],
+            usage_record,
+            bundled_names=bundled_names,
+            hub_names=hub_names,
         )
     return skills
 

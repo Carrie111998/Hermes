@@ -58,14 +58,14 @@ function toolset(overrides: Record<string, unknown> = {}) {
   }
 }
 
-async function renderSkills() {
+async function renderSkills(initialEntry = '/skills?tab=toolsets') {
   const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
       // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <SkillsView />
         </MemoryRouter>
       </QueryClientProvider>
@@ -152,5 +152,36 @@ describe('SkillsView toolset management', () => {
     // Internal route change into the Models section with the aux slot target —
     // consumed by ModelSettings' deep-link highlight. Never an external URL.
     await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith('/settings?tab=config:model&aux=vision'))
+  })
+})
+
+describe('SkillsView skill provenance', () => {
+  it('distinguishes local and background-learned skills', async () => {
+    getSkills.mockResolvedValue([
+      {
+        name: 'manual-skill',
+        description: 'Written by the user',
+        category: 'demo',
+        enabled: true,
+        usage: 1,
+        provenance: 'agent'
+      },
+      {
+        name: 'learned-skill',
+        description: 'Created by background review',
+        category: 'demo',
+        enabled: true,
+        usage: 1,
+        provenance: 'agent',
+        origin: 'background_review'
+      }
+    ])
+
+    await renderSkills('/skills?tab=skills')
+
+    expect((await screen.findAllByText(/local/i)).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText(/learned/i)).length).toBeGreaterThan(0)
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Archive' })).toBeTruthy()
   })
 })
