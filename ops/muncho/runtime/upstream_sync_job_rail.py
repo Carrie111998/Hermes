@@ -386,7 +386,12 @@ def render_sync_timer() -> bytes:
     return result
 
 
-def render_report_service(*, release: Path, sender_release: Path) -> bytes:
+def render_report_service(
+    *,
+    release: Path,
+    sender_release: Path,
+    sender_python_sha256: str,
+) -> bytes:
     interpreter = release / ".venv/bin/python"
     reporter = release / REPORTER_RELATIVE
     sender_python = sender_release / ".venv/bin/python"
@@ -420,6 +425,7 @@ def render_report_service(*, release: Path, sender_release: Path) -> bytes:
             f"--state-dir {REPORT_STATE_ROOT} "
             f"--channel-id {DISCORD_CHANNEL_ID} "
             f"--sender-python {sender_python} "
+            f"--sender-python-sha256 {sender_python_sha256} "
             "--timezone Europe/Sofia --window-hours 24"
         ),
         "TimeoutStartSec=120s",
@@ -463,6 +469,7 @@ def render_report_service(*, release: Path, sender_release: Path) -> bytes:
         result,
         release=release,
         sender_release=sender_release,
+        sender_python_sha256=sender_python_sha256,
     )
     return result
 
@@ -540,6 +547,7 @@ def validate_report_service(
     *,
     release: Path,
     sender_release: Path,
+    sender_python_sha256: str,
 ) -> None:
     text = value.decode("utf-8", errors="strict")
     required = (
@@ -550,6 +558,7 @@ def validate_report_service(
         f"InaccessiblePaths=-{STATE_ROOT}\n",
         f"--channel-id {DISCORD_CHANNEL_ID} ",
         f"--sender-python {sender_release / '.venv/bin/python'} ",
+        f"--sender-python-sha256 {sender_python_sha256} ",
         "NoNewPrivileges=yes\n",
     )
     forbidden = (
@@ -561,6 +570,8 @@ def validate_report_service(
         "muncho-auto-deploy-release",
     )
     if (
+        _SHA256.fullmatch(sender_python_sha256) is None
+        or
         not text.endswith("\n")
         or any(text.count(item) != 1 for item in required)
         or any(item in text for item in forbidden)
@@ -610,6 +621,7 @@ def build_package(revision: str, sender_revision: str) -> RailPackage:
     sender_python = sender_release / ".venv/bin/python"
     if not sender_python.is_file() or not os.access(sender_python, os.X_OK):
         raise DualSyncRailError("dual_sync_sender_interpreter_unavailable")
+    sender_python_sha = digest_file(sender_python)
     paths = source_paths(release)
     source_digests = {name: digest_file(path) for name, path in paths.items()}
     binary_digests = {
@@ -627,6 +639,7 @@ def build_package(revision: str, sender_revision: str) -> RailPackage:
         REPORT_SERVICE_UNIT: render_report_service(
             release=release,
             sender_release=sender_release,
+            sender_python_sha256=sender_python_sha,
         ),
         REPORT_TIMER_UNIT: render_report_timer(),
     }
@@ -657,7 +670,7 @@ def build_package(revision: str, sender_revision: str) -> RailPackage:
         "release_root": str(release),
         "sender_revision": sender_revision,
         "sender_release_root": str(sender_release),
-        "sender_interpreter_sha256": digest_file(sender_python),
+        "sender_interpreter_sha256": sender_python_sha,
         "jobs": jobs,
         "source_digests": source_digests,
         "host_binary_digests": binary_digests,

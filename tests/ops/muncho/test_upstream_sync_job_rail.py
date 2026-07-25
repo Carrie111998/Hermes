@@ -106,6 +106,10 @@ def test_package_has_exact_two_jobs_and_split_credentials(
     assert f"ReadOnlyPaths={rail.PUBLIC_REPORT_ROOT}" in report_service
     assert f"InaccessiblePaths=-{rail.STATE_ROOT}" in report_service
     assert str(release / rail.REPORTER_RELATIVE) in report_service
+    assert (
+        f"--sender-python-sha256 {manifest['sender_interpreter_sha256']}"
+        in report_service
+    )
 
     assert "OnUnitActiveSec=3h" in sync_timer
     assert "OnCalendar=" not in sync_timer

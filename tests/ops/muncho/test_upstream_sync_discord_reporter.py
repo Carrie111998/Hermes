@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -138,3 +139,31 @@ def test_delivery_failure_has_no_retry_loop() -> None:
     assert result["status"] == "BLOCKED"
     assert result["blocker"] == "discord_delivery_failed"
     assert attempts == 1
+
+
+def test_sender_interpreter_digest_drift_blocks_before_delivery(
+    tmp_path: Path,
+) -> None:
+    sender = tmp_path / "python"
+    sender.write_bytes(b"reviewed interpreter")
+    sender.chmod(0o755)
+    attempts = 0
+
+    def fake_runner(args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="{}", stderr="")
+
+    result = reporter.deliver_once(
+        "bounded report",
+        channel_id="1504852355588423801",
+        sender_python=sender,
+        sender_python_sha256=hashlib.sha256(b"different").hexdigest(),
+        runner=fake_runner,
+    )
+
+    assert result == {
+        "status": "BLOCKED",
+        "blocker": "sender_python_digest_drifted",
+    }
+    assert attempts == 0

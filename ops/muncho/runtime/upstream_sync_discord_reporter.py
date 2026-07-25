@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ MAX_MESSAGE_LENGTH = 1900
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _PR_URL = re.compile(r"^https://github\.com/lomliev/hermes-agent/pull/[0-9]+$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def parse_timestamp(value: object) -> datetime | None:
@@ -186,11 +188,20 @@ def delivery_succeeded(payload: object) -> bool:
     )
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(64 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def deliver_once(
     message: str,
     *,
     channel_id: str,
     sender_python: Path | None = None,
+    sender_python_sha256: str | None = None,
     runner: Any = subprocess.run,
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9]{15,22}", channel_id):
@@ -199,6 +210,11 @@ def deliver_once(
         sender = sender_python or Path(sys.executable)
         if not sender.is_absolute() or not sender.is_file():
             return {"status": "BLOCKED", "blocker": "sender_python_unavailable"}
+        if sender_python_sha256 is not None and (
+            _SHA256.fullmatch(sender_python_sha256) is None
+            or file_sha256(sender) != sender_python_sha256
+        ):
+            return {"status": "BLOCKED", "blocker": "sender_python_digest_drifted"}
         completed = runner(
             (
                 str(sender),
@@ -275,6 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--channel-id", default=DEFAULT_CHANNEL_ID)
     parser.add_argument("--sender-python", type=Path)
+    parser.add_argument("--sender-python-sha256")
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument("--window-hours", type=int, default=DEFAULT_WINDOW_HOURS)
     parser.add_argument("--now")
@@ -307,6 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         message,
         channel_id=args.channel_id,
         sender_python=args.sender_python,
+        sender_python_sha256=args.sender_python_sha256,
     )
     write_delivery_receipt(
         args.state_dir.resolve(),
