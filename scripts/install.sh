@@ -1654,12 +1654,33 @@ setup_path() {
     # the rm, `cat >` follows the symlink and overwrites the venv pip entry
     # point with this shim — making `exec "$HERMES_BIN"` self-recurse. (#21454)
     rm -f "$command_link_dir/hermes"
-    cat > "$command_link_dir/hermes" <<EOF
+    if [ "$USE_VENV" = true ]; then
+        # For venv installs, exec the venv's python interpreter directly
+        # against the checked-in `hermes` launcher script instead of the
+        # uv-generated console-script wrapper at $HERMES_BIN. uv's generated
+        # wrapper resolves its own location via the external `realpath`
+        # binary at runtime on some platforms; stock macOS (no Homebrew/
+        # coreutils) does not ship `realpath`, so that wrapper fails with
+        # `realpath: command not found` — followed by a misleading
+        # `ModuleNotFoundError` because the launcher never reaches the venv
+        # interpreter to report the real error. Invoking the interpreter and
+        # entrypoint script directly avoids that dependency entirely, and
+        # this shim gets regenerated on every `hermes update` regardless of
+        # what uv does to venv/bin/hermes. (#71320)
+        cat > "$command_link_dir/hermes" <<EOF
+#!/usr/bin/env bash
+unset PYTHONPATH
+unset PYTHONHOME
+exec "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/hermes" "\$@"
+EOF
+    else
+        cat > "$command_link_dir/hermes" <<EOF
 #!/usr/bin/env bash
 unset PYTHONPATH
 unset PYTHONHOME
 exec "$HERMES_BIN" "\$@"
 EOF
+    fi
     chmod +x "$command_link_dir/hermes"
     log_success "Installed hermes launcher → $command_link_display_dir/hermes"
 
