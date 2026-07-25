@@ -1520,6 +1520,10 @@ def test_named_custom_provider_without_api_mode_defaults(monkeypatch):
     assert resolved["api_mode"] == "chat_completions"
 
 
+def test_responses_alias_normalizes_to_codex_responses():
+    assert rp._parse_api_mode(" responses ") == "codex_responses"
+
+
 def test_anthropic_messages_in_valid_api_modes():
     """anthropic_messages should be accepted by _parse_api_mode."""
     assert rp._parse_api_mode("anthropic_messages") == "anthropic_messages"
