@@ -6222,6 +6222,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        # Slash commands that are not in the adapter's immediate bypass set
+        # remain queued for canonical runner command interception. They are
+        # never ordinary participant-visible conversation ingress.
+        if event.is_command():
+            return False
+
         if self._external_drain_active:
             logger.info(
                 "Refusing busy-session follow-up for %s — external drain active.",
@@ -13067,7 +13073,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key=session_key,
                     ),
                     reason=str(reason),
-                    offload_sync=True,
+                    offload_callbacks=True,
                 ),
                 timeout=GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS,
             )

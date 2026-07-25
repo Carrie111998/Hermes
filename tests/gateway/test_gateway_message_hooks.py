@@ -386,6 +386,100 @@ async def test_busy_external_drain_rejects_before_gateway_message_hook(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_busy_multiplexed_route_uses_profile_scoped_session_key(monkeypatch):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, _chat_id, _content, **_kwargs):
+        return SendResult(success=True, message_id="profile-out")
+
+    Adapter = type(
+        "BusyProfileAdapter",
+        (BasePlatformAdapter,),
+        {"connect": connect, "disconnect": disconnect, "send": send},
+    )
+    Adapter.__abstractmethods__ = frozenset()
+
+    runner, _old_adapter = _runner_for_dispatch()
+    runner.config.multiplex_profiles = True
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.DISCORD)
+    adapter.gateway_runner = runner
+    adapter._message_handler = runner._handle_message
+    adapter._busy_session_handler = runner._handle_active_session_busy_message
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter}}
+
+    event = _event()
+    event.source.profile = "work"
+    event.message_id = "busy-profile-in"
+    profile_key = runner._session_key_for_source(event.source)
+    legacy_key = build_session_key(event.source)
+    assert profile_key != legacy_key
+    adapter._active_sessions[profile_key] = asyncio.Event()
+    adapter._active_sessions[legacy_key] = asyncio.Event()
+    runner._running_agents[profile_key] = MagicMock()
+    runner._running_agents[legacy_key] = MagicMock()
+    seen = []
+
+    async def hook(_name, **kwargs):
+        seen.append(kwargs["route"].session_key)
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
+
+    await adapter.handle_message(event)
+
+    assert seen == [profile_key]
+
+
+@pytest.mark.asyncio
+async def test_busy_slash_command_queues_without_gateway_message_hook(monkeypatch):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, _chat_id, _content, **_kwargs):
+        return SendResult(success=True, message_id="command-out")
+
+    Adapter = type(
+        "BusyCommandAdapter",
+        (BasePlatformAdapter,),
+        {"connect": connect, "disconnect": disconnect, "send": send},
+    )
+    Adapter.__abstractmethods__ = frozenset()
+
+    runner, _old_adapter = _runner_for_dispatch()
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.DISCORD)
+    adapter._message_handler = AsyncMock(return_value="unknown command")
+    adapter._busy_session_handler = runner._handle_active_session_busy_message
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter}}
+    event = _event()
+    event.text = "/plugin-command"
+    event.message_id = "busy-command-in"
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    seen = []
+
+    async def hook(name, **_kwargs):
+        seen.append(name)
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
+
+    await adapter.handle_message(event)
+
+    assert seen == []
+    adapter._message_handler.assert_not_awaited()
+    assert adapter._pending_messages[session_key] is event
+
+
+@pytest.mark.asyncio
 async def test_awaited_cold_hook_cannot_start_duplicate_agents(monkeypatch):
     runner, adapter = _runner_for_dispatch()
     first_hook_entered = asyncio.Event()
@@ -706,8 +800,8 @@ async def test_gateway_session_cancel_hook_receives_only_route_and_reason(monkey
     await runner._notify_gateway_session_cancel(session_key, source, reason="stop")
 
     assert captured["name"] == "gateway_session_cancel"
-    assert set(captured["kwargs"]) == {"route", "reason", "offload_sync"}
-    assert captured["kwargs"]["offload_sync"] is True
+    assert set(captured["kwargs"]) == {"route", "reason", "offload_callbacks"}
+    assert captured["kwargs"]["offload_callbacks"] is True
     assert captured["kwargs"]["reason"] == "stop"
     assert captured["kwargs"]["route"] == GatewayMessageRoute.from_source(
         source, session_key=session_key
@@ -734,6 +828,49 @@ async def test_gateway_session_cancel_hook_timeout_does_not_block_stop(monkeypat
     )
 
     assert entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_gateway_session_cancel_timeout_survives_cancel_suppressing_async_observer(
+    monkeypatch,
+):
+    from gateway import run as run_module
+    from hermes_cli.plugins import get_plugin_manager
+
+    runner, _adapter = _runner_for_dispatch()
+    manager = get_plugin_manager()
+    original = list(manager._hooks.get("gateway_session_cancel", []))
+    entered = threading.Event()
+    release = threading.Event()
+
+    async def cancellation_suppressing_observer(**_kwargs):
+        entered.set()
+        try:
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+
+    manager._hooks["gateway_session_cancel"] = [cancellation_suppressing_observer]
+    monkeypatch.setattr(run_module, "GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS", 0.01)
+    source = _source()
+    started = asyncio.get_running_loop().time()
+    try:
+        await asyncio.wait_for(
+            runner._notify_gateway_session_cancel(
+                build_session_key(source),
+                source,
+                reason="stop",
+            ),
+            timeout=0.1,
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        assert entered.is_set()
+        assert elapsed < 0.1
+    finally:
+        release.set()
+        manager._hooks["gateway_session_cancel"] = original
 
 
 @pytest.mark.asyncio

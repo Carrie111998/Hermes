@@ -42,6 +42,7 @@ import os
 import sys
 import threading
 import types
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
@@ -1249,10 +1250,10 @@ class PluginContext:
         )
 
 
-async def _invoke_sync_hook_off_thread(
+async def _invoke_hook_off_thread(
     callback: Callable[..., Any], kwargs: Dict[str, Any]
 ) -> Any:
-    """Run a synchronous hook in a disposable daemon thread.
+    """Run a sync or async hook in a disposable daemon thread.
 
     Cancellation observers are advisory and may be third-party code. A daemon
     thread keeps a stuck callback from blocking the event loop, consuming the
@@ -1275,6 +1276,11 @@ async def _invoke_sync_hook_off_thread(
     def run() -> None:
         try:
             result = callback(**kwargs)
+            if inspect.isawaitable(result):
+                async def _await_result(awaitable: Any) -> Any:
+                    return await awaitable
+
+                result = asyncio.run(_await_result(result))
         except BaseException as exc:
             try:
                 loop.call_soon_threadsafe(publish_result, None, exc)
@@ -1286,8 +1292,10 @@ async def _invoke_sync_hook_off_thread(
             except RuntimeError:
                 return
 
+    callback_context = copy_context()
     threading.Thread(
-        target=run,
+        target=callback_context.run,
+        args=(run,),
         name="hermes-plugin-hook",
         daemon=True,
     ).start()
@@ -1986,6 +1994,7 @@ class PluginManager:
         raise_exceptions: bool = False,
         stop_when: Optional[Callable[[Any], bool]] = None,
         offload_sync: bool = False,
+        offload_callbacks: bool = False,
         **kwargs: Any,
     ) -> List[Any]:
         """Await sync or async callbacks registered for *hook_name*.
@@ -1993,14 +2002,18 @@ class PluginManager:
         Callback failures are isolated by default, matching :meth:`invoke_hook`.
         Decision-style callers may request fail-fast behavior with
         ``raise_exceptions=True``. Task cancellation always propagates.
+        ``offload_callbacks=True`` moves every callback, including async ones,
+        to a context-preserving disposable daemon thread so advisory hooks can
+        be abandoned by a hard host timeout.
         """
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:
             try:
                 ret = (
-                    await _invoke_sync_hook_off_thread(cb, kwargs)
-                    if offload_sync and not inspect.iscoroutinefunction(cb)
+                    await _invoke_hook_off_thread(cb, kwargs)
+                    if offload_callbacks
+                    or (offload_sync and not inspect.iscoroutinefunction(cb))
                     else cb(**kwargs)
                 )
                 if inspect.isawaitable(ret):
@@ -2156,6 +2169,7 @@ async def invoke_hook_async(
     raise_exceptions: bool = False,
     stop_when: Optional[Callable[[Any], bool]] = None,
     offload_sync: bool = False,
+    offload_callbacks: bool = False,
     **kwargs: Any,
 ) -> List[Any]:
     """Invoke sync or async lifecycle-hook callbacks and await completion."""
@@ -2164,6 +2178,7 @@ async def invoke_hook_async(
         raise_exceptions=raise_exceptions,
         stop_when=stop_when,
         offload_sync=offload_sync,
+        offload_callbacks=offload_callbacks,
         **kwargs,
     )
 

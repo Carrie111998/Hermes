@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import time
+from contextvars import ContextVar
 
 import pytest
 
@@ -56,6 +57,30 @@ async def test_async_hook_can_offload_blocking_sync_callback_for_host_timeout():
 
     assert daemon is True
     assert finished is False
+
+
+@pytest.mark.asyncio
+async def test_async_hook_can_offload_all_callbacks_with_context_to_daemon_thread():
+    manager = PluginManager()
+    profile = ContextVar("profile", default="default")
+    seen = []
+
+    async def async_callback(**_kwargs):
+        seen.append((profile.get(), threading.current_thread().daemon))
+        return "done"
+
+    manager._hooks["gateway_session_cancel"] = [async_callback]
+    token = profile.set("work")
+    try:
+        results = await manager.invoke_hook_async(
+            "gateway_session_cancel",
+            offload_callbacks=True,
+        )
+    finally:
+        profile.reset(token)
+
+    assert results == ["done"]
+    assert seen == [("work", True)]
 
 
 @pytest.mark.asyncio
