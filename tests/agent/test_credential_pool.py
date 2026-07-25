@@ -3134,6 +3134,119 @@ def test_xai_oauth_concurrent_pool_instances_refresh_single_use_token_once(
     assert stored["refresh_token"] == "fresh-refresh-token"
 
 
+def _xai_single_entry_store() -> dict:
+    return {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "xai-oauth": [
+                {
+                    "id": "manual-xai",
+                    "label": "manual-xai",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:xai_pkce",
+                    "access_token": "old-access-token",
+                    "refresh_token": "one-time-refresh-token",
+                    "base_url": "https://api.x.ai/v1",
+                }
+            ],
+        },
+    }
+
+
+def test_try_refresh_matching_adopts_successor_for_superseded_hint(
+    tmp_path, monkeypatch
+):
+    """A stale ``api_key_hint`` on a shared pool instance must not yield None.
+
+    ``load_pool`` is TTL-cached, so concurrent callers share one
+    ``CredentialPool`` object and a rotation performed by the first caller
+    rewrites the entry in place.  A second caller that was already in flight
+    still presents the superseded bearer as its hint.  Matching only against
+    live entries makes that hint look unknown, so the caller was told "no
+    credential" even though its refresh had just succeeded — and the single-use
+    refresh token it would have replayed is already spent.
+
+    Deterministic (sequential) counterpart to the threaded race test above.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_OAUTH_ACCESS_TOKEN", raising=False)
+    _write_auth_store(tmp_path, _xai_single_entry_store())
+
+    from agent.credential_pool import load_pool
+    import hermes_cli.auth as auth_mod
+
+    refresh_calls: list[tuple[str, str]] = []
+
+    def _refresh(access_token, refresh_token, **_kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": "fresh-access-token",
+            "refresh_token": "fresh-refresh-token",
+            "last_refresh": "2026-07-12T00:00:00+00:00",
+        }
+
+    monkeypatch.setattr(auth_mod, "refresh_xai_oauth_pure", _refresh)
+
+    pool = load_pool("xai-oauth")
+    winner = pool.try_refresh_matching("old-access-token")
+    assert winner is not None and winner.access_token == "fresh-access-token"
+
+    # The late caller still holds the pre-rotation bearer.
+    straggler = pool.try_refresh_matching("old-access-token")
+    assert straggler is not None, "superseded hint must not strand the caller"
+    assert straggler.id == winner.id
+    assert straggler.access_token == "fresh-access-token"
+
+    # ...and the consumed single-use refresh token was NOT replayed.
+    assert refresh_calls == [("old-access-token", "one-time-refresh-token")]
+
+
+def test_try_refresh_matching_does_not_adopt_quarantined_successor(
+    tmp_path, monkeypatch
+):
+    """The superseded-hint rescue must not hand back a DEAD credential.
+
+    Adopting a successor is only useful while it is still usable; once it has
+    been quarantined, returning None is the honest answer and lets the caller
+    fall back to another account.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_OAUTH_ACCESS_TOKEN", raising=False)
+    _write_auth_store(tmp_path, _xai_single_entry_store())
+
+    from dataclasses import replace as dataclass_replace
+
+    from agent.credential_pool import STATUS_DEAD, load_pool
+    import hermes_cli.auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_xai_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "fresh-access-token",
+            "refresh_token": "fresh-refresh-token",
+            "last_refresh": "2026-07-12T00:00:00+00:00",
+        },
+    )
+
+    pool = load_pool("xai-oauth")
+    rotated = pool.try_refresh_matching("old-access-token")
+    assert rotated is not None
+
+    pool._replace_entry(
+        rotated,
+        dataclass_replace(
+            rotated, last_status=STATUS_DEAD, last_status_at=time.time()
+        ),
+    )
+
+    assert pool.try_refresh_matching("old-access-token") is None
+
+
 # ---------------------------------------------------------------------------
 # Codex OAuth terminal error quarantine
 # ---------------------------------------------------------------------------
