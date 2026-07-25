@@ -1,0 +1,2042 @@
+From 6869573bce013dbf6edb654208c00bc8dadbc2dd Mon Sep 17 00:00:00 2001
+From: Yong Wook Lee <icerain@jj.ac.kr>
+Date: Sat, 25 Jul 2026 16:48:21 +0900
+Subject: [PATCH] feat(hegi): add professor-authorized memory commit workflow
+
+---
+ hegi/README.md                          |   9 +-
+ hegi/approval.py                        | 626 ++++++++++++++++++++----
+ hegi/config.py                          |  65 +++
+ hegi/config/default.yaml                |  31 +-
+ hegi/config/schema.json                 |  49 +-
+ hegi/docs/memory_policy.md              |  19 +-
+ hegi/docs/operations.md                 |  28 +-
+ hegi/gateway_plugin.py                  |  47 +-
+ hegi/memory.py                          |  79 ++-
+ hegi/models.py                          |   1 +
+ hegi/notify.py                          |   8 +-
+ hegi/state.py                           | 183 ++++++-
+ tests/hegi/test_approval_integration.py | 350 +++++++++++--
+ tests/hegi/test_config_state.py         |  35 ++
+ tests/hegi/test_memory_gate.py          |   9 +
+ tests/hegi/test_operational_flow.py     |  15 +-
+ 16 files changed, 1398 insertions(+), 156 deletions(-)
+
+diff --git a/hegi/README.md b/hegi/README.md
+index a83f95cdc..3b496aa76 100644
+--- a/hegi/README.md
++++ b/hegi/README.md
+@@ -10,9 +10,9 @@ Telegram 보고로 변환한다.
+ 쓰기 제안을 차단한다.
+ 
+ HEGI는 Hermes 핵심 agent loop나 tool schema를 수정하지 않는 독립 패키지다. LLM,
+-Telegram, MCP는 Hermes의 기존 호출 경로를 재사용한다. Memory Forest 자동 쓰기와
+-Commit은 구현하지 않으며, STM Draft는 설정된 교수 계정의 명시적 승인 이후에만
+-curator draft MCP를 호출한다.
++Telegram, MCP는 Hermes의 기존 호출 경로를 재사용한다. 일반 대화에는 Memory Forest
++approve/commit을 노출하지 않는다. 설정된 교수 계정의 명시적 Telegram 승인 이벤트가
++있을 때만 전용 worker가 professor-authorized commit을 수행한다.
+ 
+ `install.sh`은 현재 Hermes 환경에서 Memory Curator profile, Telegram group chat,
+ 교수 user ID와 회의 참여 agent DB를 탐지한다. 비활성 예제 설정을 복사하거나 YAML을
+@@ -30,7 +30,8 @@ python -m hegi status
+ 
+ 교수가 HEGI 회의록에 `기억해` 또는 `초안 만들어`라고 답하면 profile-local
+ pre-dispatch plugin이 일반 Memory Curator 응답보다 먼저 메시지를 처리한다. 승인
+-작업은 SQLite에 영속화되며 Memory Forest 재검색 뒤 pending STM Draft만 만든다.
++작업은 SQLite에 단계별로 영속화된다. `초안 만들어`는 pending Draft에서 멈추고,
++`기억해`는 fresh search부터 validate/audit/index/backup까지 한 번에 완료한다.
+ 
+ 설치와 운영은 [operations.md](docs/operations.md), 안전 경계는
+ [memory_policy.md](docs/memory_policy.md)를 참고한다.
+diff --git a/hegi/approval.py b/hegi/approval.py
+index 7364f2eda..094a74683 100644
+--- a/hegi/approval.py
++++ b/hegi/approval.py
+@@ -1,17 +1,51 @@
+-"""Durable Telegram approval processing for professor-authorized STM drafts."""
++"""Durable professor-authorized Memory Forest approval workflow."""
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import hashlib
+ import json
+-from typing import Any, Callable
++import os
++import subprocess
++from pathlib import Path
++from typing import Any, Callable, Protocol
+ 
+ from .config import HegiConfig
+-from .memory import DraftGate, MCPMemoryBackend, MemoryEvaluator
++from .memory import (
++    DraftGate,
++    MCPMemoryBackend,
++    MemoryEvaluator,
++    validate_draft_payload,
++)
+ from .notify import load_env_value
+ from .pipeline import minutes_from_dict
+ from .state import StateStore
+ 
+ 
++TERMINAL_STATES = {
++    "authentication_failed",
++    "meeting_not_found",
++    "duplicate_approval",
++    "duplicate_memory",
++    "draft_failed",
++    "validation_failed",
++    "approval_failed",
++    "commit_failed",
++    "post_commit_failed",
++    "manual_review_required",
++}
++
++
++class ApprovalBackend(Protocol):
++    def show(self, draft_id: str) -> dict[str, Any]: ...
++
++    def approve(self, draft_id: str, *, note: str) -> dict[str, Any]: ...
++
++    def commit(self, draft_id: str) -> dict[str, Any]: ...
++
++    def maintenance(self, operation: str) -> dict[str, Any]: ...
++
++
+ def _backend(config: HegiConfig) -> MCPMemoryBackend:
+     memory = config.section("memory")
+     return MCPMemoryBackend(
+@@ -30,7 +64,7 @@ def _send_status(
+ ) -> None:
+     token = load_env_value(config.curator_env, "TELEGRAM_BOT_TOKEN")
+     if not token:
+-        raise RuntimeError("TELEGRAM_BOT_TOKEN이 없습니다.")
++        raise RuntimeError("memory-curator Telegram token을 읽을 수 없습니다.")
+     if sender is None:
+         from tools.send_message_tool import _send_telegram
+ 
+@@ -42,123 +76,545 @@ def _send_status(
+         disable_link_previews=True,
+     )
+     if hasattr(result, "__await__"):
+-        import asyncio
++        try:
++            loop = asyncio.get_running_loop()
++        except RuntimeError:
++            asyncio.run(result)
++        else:
++            loop.create_task(result)
++
++
++def _approval_event(state: StateStore, platform_message_id: str) -> dict[str, str]:
++    with state.connect() as connection:
++        row = connection.execute(
++            """
++            SELECT command, user_id, raw_text FROM approval_events
++            WHERE platform_message_id=?
++            ORDER BY approved_at DESC LIMIT 1
++            """,
++            (platform_message_id,),
++        ).fetchone()
++    if row is None:
++        raise PermissionError("승인 이벤트를 찾을 수 없습니다.")
++    return {
++        "command": str(row["command"]),
++        "user_id": str(row["user_id"]),
++        "raw_text": str(row["raw_text"]),
++    }
++
++
++def _payload_object(raw: str, *, command: list[str]) -> dict[str, Any]:
++    try:
++        payload = json.loads(raw) if raw else {}
++    except json.JSONDecodeError as exc:
++        raise RuntimeError(
++            f"명령 결과가 JSON이 아닙니다: {' '.join(command)}"
++        ) from exc
++    if not isinstance(payload, dict):
++        raise RuntimeError(f"명령 결과가 object가 아닙니다: {' '.join(command)}")
++    if payload.get("ok") is False or payload.get("error"):
++        raise RuntimeError(str(payload.get("error", payload)))
++    return payload
++
++
++class CLIApprovalBackend:
++    """Private subprocess boundary; never registered as an LLM tool."""
++
++    def __init__(self, config: HegiConfig):
++        memory = config.section("memory")
++        approval = memory.get("approval", {})
++        if not isinstance(approval, dict):
++            approval = {}
++        self.cli = str(approval.get("cli", "")).strip() or "memory-forest-approve"
++        self.queue_root = str(approval.get("queue_root", "")).strip()
++        self.timeout = int(approval.get("timeout_seconds", 120))
++        self.forest_cli = str(approval.get("forest_cli", "")).strip() or "memory-forest"
++        self.forest_root = str(approval.get("forest_root", "")).strip()
++        self.backup_script = str(approval.get("backup_script", "")).strip()
++
++    def _run(self, command: list[str], *, timeout: int | None = None) -> dict[str, Any]:
++        env = os.environ.copy()
++        if self.queue_root:
++            env["MEMORY_FOREST_QUEUE_ROOT"] = self.queue_root
++        completed = subprocess.run(
++            command,
++            check=False,
++            env=env,
++            capture_output=True,
++            text=True,
++            timeout=timeout or self.timeout,
++        )
++        output = completed.stdout.strip() or completed.stderr.strip()
++        if completed.returncode != 0:
++            try:
++                detail = _payload_object(output, command=command)
++            except Exception:
++                detail = output
++            raise RuntimeError(
++                f"{Path(command[0]).name} 실패(exit={completed.returncode}): {detail}"
++            )
++        return _payload_object(output, command=command)
++
++    def show(self, draft_id: str) -> dict[str, Any]:
++        return self._run([self.cli, "show", draft_id])
+ 
+-        asyncio.run(result)
++    def approve(self, draft_id: str, *, note: str) -> dict[str, Any]:
++        return self._run(
++            [self.cli, "approve", draft_id, "--note", note, "--no-commit"]
++        )
++
++    def commit(self, draft_id: str) -> dict[str, Any]:
++        return self._run([self.cli, "commit", draft_id], timeout=max(self.timeout, 360))
++
++    def maintenance(self, operation: str) -> dict[str, Any]:
++        if operation == "backup":
++            if not self.backup_script:
++                raise RuntimeError("memory.approval.backup_script가 설정되지 않았습니다.")
++            completed = subprocess.run(
++                [self.backup_script],
++                check=False,
++                capture_output=True,
++                text=True,
++                timeout=max(self.timeout, 180),
++            )
++            if completed.returncode != 0:
++                raise RuntimeError(
++                    f"backup 실패(exit={completed.returncode}): "
++                    f"{completed.stderr.strip() or completed.stdout.strip()}"
++                )
++            return {"ok": True, "operation": "backup"}
++        if not self.forest_root:
++            raise RuntimeError("memory.approval.forest_root가 설정되지 않았습니다.")
++        return self._run(
++            [self.forest_cli, operation, self.forest_root],
++            timeout=max(self.timeout, 180),
++        )
++
++
++def _draft_id(draft: dict[str, Any]) -> str:
++    value = draft.get("draft_id") or draft.get("id")
++    if value:
++        return str(value)
++    structured = draft.get("structuredContent")
++    if isinstance(structured, dict) and structured.get("draft_id"):
++        return str(structured["draft_id"])
++    raise ValueError("생성된 STM Draft ID를 찾지 못했습니다.")
++
++
++def _draft_payload(result: dict[str, Any]) -> dict[str, Any]:
++    draft = result.get("draft")
++    if isinstance(draft, dict):
++        return draft
++    structured = result.get("structuredContent")
++    if isinstance(structured, dict):
++        nested = structured.get("draft")
++        return nested if isinstance(nested, dict) else structured
++    return result
++
++
++def _commit_identity(result: dict[str, Any]) -> tuple[str, str]:
++    forest = result.get("forest_result")
++    if not isinstance(forest, dict) or forest.get("ok") is not True:
++        raise RuntimeError("commit 결과에 명확한 forest_result.ok=true가 없습니다.")
++    path = str(forest.get("path", "")).strip()
++    memory_id = str(
++        forest.get("memory_id") or forest.get("sha256") or ""
++    ).strip()
++    if not path or not memory_id:
++        raise RuntimeError("commit 결과에 Memory ID 또는 저장 경로가 없습니다.")
++    return memory_id, path
++
++
++def _idempotency_key(
++    professor_user_id: str,
++    telegram_message_id: str,
++    meeting_id: str,
++    draft_id: str,
++) -> str:
++    material = (
++        professor_user_id + telegram_message_id + meeting_id + draft_id
++    ).encode("utf-8")
++    return hashlib.sha256(material).hexdigest()
++
++
++def _record(
++    state: StateStore,
++    job_id: int,
++    workflow_state: str,
++    **kwargs: Any,
++) -> None:
++    state.update_approval_workflow(job_id, workflow_state, **kwargs)
++
++
++def _notify_failure(
++    config: HegiConfig,
++    *,
++    meeting_id: str,
++    successful: list[str],
++    failed_step: str,
++    error: str,
++    sender: Callable[..., Any] | None,
++) -> None:
++    _send_status(
++        config,
++        "🌲 기억 저장 실패\n\n"
++        f"성공 단계:\n{', '.join(successful) if successful else '없음'}\n\n"
++        f"실패 단계:\n{failed_step}\n\n"
++        f"원인:\n{error}\n\n"
++        f"Meeting ID:\n{meeting_id}\n\n"
++        "Draft는 가능한 경우 현재 상태로 보존했습니다.\n"
++        "중복 Commit은 수행하지 않았습니다.",
++        sender=sender,
++    )
+ 
+ 
+ def process_pending_approvals(
+     config: HegiConfig,
+     *,
+     backend: Any | None = None,
++    approval_backend: ApprovalBackend | None = None,
+     sender: Callable[..., Any] | None = None,
+     limit: int = 10,
+ ) -> list[dict[str, Any]]:
+-    """Claim queued approvals exactly once and create draft-only Memory records."""
++    """Resume durable approval jobs and execute only authenticated commands."""
+     state = StateStore(config.state_db)
++    state.resume_recoverable_approval_jobs()
+     memory_backend = backend or _backend(config)
++    private_backend = approval_backend or CLIApprovalBackend(config)
+     memory = config.section("memory")
+-    gate = DraftGate(
+-        state,
+-        memory_backend,
+-        professor_user_ids=[
+-            str(item) for item in memory.get("professor_user_ids", [])
+-        ],
+-    )
++    professor_ids = [str(item) for item in memory.get("professor_user_ids", [])]
++    gate = DraftGate(state, memory_backend, professor_user_ids=professor_ids)
+     results: list[dict[str, Any]] = []
+     for _ in range(limit):
+         job = state.claim_approval_job()
+         if job is None:
+             break
++        job_id = int(job["id"])
+         meeting_id = str(job["meeting_id"])
++        successful: list[str] = []
++        current_step = "received"
++        forced_failure_state: str | None = None
+         try:
++            event = _approval_event(state, str(job["platform_message_id"]))
++            command = event["command"]
++            if event["user_id"] not in professor_ids:
++                _record(state, job_id, "authentication_failed")
++                raise PermissionError("설정된 교수 계정의 승인 이벤트가 아닙니다.")
++            _record(state, job_id, "authenticated")
++            successful.append("인증")
++
+             row = state.episode_by_id(meeting_id)
+-            if row is None or not row.get("minutes_json"):
+-                raise ValueError("승인 대상 회의록이 없습니다.")
++            if (
++                row is None
++                or row.get("status") != "reported"
++                or not row.get("minutes_json")
++            ):
++                _record(state, job_id, "meeting_not_found")
++                raise ValueError("reported 상태의 승인 대상 회의록이 없습니다.")
+             minutes = minutes_from_dict(json.loads(row["minutes_json"]))
+-            evaluation = MemoryEvaluator(memory_backend).evaluate(minutes)
+-            if evaluation.recommendation == "no_memory":
+-                result = {
+-                    "meeting_id": meeting_id,
+-                    "status": "no_memory",
+-                    "project": str(job["project"]),
+-                    "draft": None,
+-                    "commit": "not_performed",
+-                    "reasons": evaluation.reasons,
+-                }
+-                state.complete_approval_job(
+-                    int(job["id"]), status="completed", result=result
++            _record(state, job_id, "meeting_resolved")
++            successful.append("회의 연결")
++
++            workflow_state = str(job.get("workflow_state") or "received")
++            draft_id = str(job.get("draft_id") or "")
++            prior_committed = state.committed_approval_for_meeting(meeting_id)
++            if (
++                prior_committed
++                and int(prior_committed["id"]) != job_id
++                and prior_committed.get("memory_id")
++            ):
++                _record(
++                    state,
++                    job_id,
++                    "duplicate_memory",
++                    details={
++                        "memory_id": prior_committed.get("memory_id"),
++                        "path": prior_committed.get("memory_path"),
++                    },
++                )
++                forced_failure_state = "duplicate_memory"
++                raise RuntimeError("해당 meeting은 이미 Memory로 commit되었습니다.")
++            if workflow_state not in {"approved", "committed", "post_commit_failed"}:
++                current_step = "memory_researched"
++                evaluation = MemoryEvaluator(memory_backend).evaluate(minutes)
++                _record(
++                    state,
++                    job_id,
++                    "memory_researched",
++                    details={
++                        "searched_queries": evaluation.searched_queries,
++                        "search_findings": evaluation.search_findings,
++                        "memory_ids": [
++                            item.memory_id for item in evaluation.matched_memories
++                        ],
++                        "duplicate_reasons": evaluation.reasons,
++                        "search_recall_warning": evaluation.search_recall_warning,
++                    },
+                 )
+-                results.append(result)
+-                try:
++                successful.append("Memory Forest 재검색")
++                if evaluation.search_recall_warning:
++                    _record(state, job_id, "manual_review_required")
++                    forced_failure_state = "manual_review_required"
++                    raise RuntimeError(
++                        "키워드 검색 결과가 충분하지 않아 중복 판단의 신뢰도가 낮습니다."
++                    )
++                if evaluation.recommendation in {
++                    "merge_existing",
++                    "needs_professor_review",
++                    "no_memory",
++                }:
++                    terminal = (
++                        "duplicate_memory"
++                        if evaluation.recommendation == "merge_existing"
++                        else "manual_review_required"
++                    )
++                    _record(
++                        state,
++                        job_id,
++                        terminal,
++                        details={"reasons": evaluation.reasons},
++                    )
++                    forced_failure_state = terminal
++                    raise RuntimeError("; ".join(evaluation.reasons))
++
++                current_step = "draft_created"
++                if command == "approve":
++                    pending = [
++                        item
++                        for item in state.pending_drafts_for_meeting(meeting_id)
++                        if int(item["id"]) != job_id
++                    ]
++                    if len(pending) > 1:
++                        forced_failure_state = "manual_review_required"
++                        raise RuntimeError(
++                            "pending Draft가 둘 이상이라 승인 대상을 특정할 수 없습니다."
++                        )
++                    if pending:
++                        draft_id = str(pending[0]["draft_id"])
++                if not draft_id:
++                    draft = gate.create_draft_after_recheck(
++                        minutes, evaluation, project=str(job["project"])
++                    )
++                    draft_id = _draft_id(draft)
++                _record(state, job_id, "draft_created", draft_id=draft_id)
++                successful.append("Draft 생성")
++
++                current_step = "draft_validated"
++                shown = private_backend.show(draft_id)
++                validate_draft_payload(_draft_payload(shown))
++                _record(state, job_id, "draft_validated", draft_id=draft_id)
++                successful.append("Draft 검증")
++
++                if command in {"draft", "merge"}:
++                    result = {
++                        "meeting_id": meeting_id,
++                        "status": (
++                            "manual_review_required"
++                            if command == "merge"
++                            else "draft_created"
++                        ),
++                        "draft_id": draft_id,
++                        "commit": "not_performed",
++                    }
++                    state.complete_approval_job(
++                        job_id, status="completed", result=result
++                    )
++                    results.append(result)
+                     _send_status(
+                         config,
+-                        "ℹ️ HEGI Memory 보류\n\n"
+-                        f"회의: {meeting_id}\n"
+-                        f"판정: no_memory\n"
+-                        f"근거: {'; '.join(evaluation.reasons)}\n"
+-                        "Draft와 Commit은 수행하지 않았습니다.",
++                        "🌲 STM Draft 생성 완료\n\n"
++                        f"Draft ID:\n{draft_id}\n\n"
++                        "상태:\npending\n\n"
++                        "아직 approve/commit하지 않았습니다.\n"
++                        "“@헤기 승인하고 저장해”라고 답하면 최종 저장합니다.",
+                         sender=sender,
+                     )
+-                except Exception as notify_exc:
+-                    state.add_dead_letter(
+-                        "approval_notification",
+-                        {"job_id": int(job["id"])},
+-                        str(notify_exc),
+-                        meeting_id,
+-                    )
+-                continue
+-            draft = gate.create_draft_after_recheck(
+-                minutes,
+-                evaluation,
+-                project=str(job["project"]),
++                    continue
++            if not draft_id:
++                raise RuntimeError("승인 이벤트에 연결된 Draft ID가 없습니다.")
++
++            key = str(job.get("idempotency_key") or "") or _idempotency_key(
++                event["user_id"],
++                str(job["platform_message_id"]),
++                meeting_id,
++                draft_id,
+             )
++            memory_id = str(job.get("memory_id") or "")
++            memory_path = str(job.get("memory_path") or "")
++            live_draft = private_backend.show(draft_id)
++            live_state = str(live_draft.get("state", "")).strip()
++            if live_state == "committed":
++                persisted_draft = _draft_payload(live_draft)
++                recovered_commit = {
++                    "ok": True,
++                    "draft_id": draft_id,
++                    "state": "committed",
++                    "forest_result": persisted_draft.get("forest_result"),
++                }
++                memory_id, memory_path = _commit_identity(recovered_commit)
++                _record(
++                    state,
++                    job_id,
++                    "committed",
++                    details={"recovered_from_approval_queue": True},
++                    draft_id=draft_id,
++                    idempotency_key=key,
++                    memory_id=memory_id,
++                    memory_path=memory_path,
++                )
++                workflow_state = "committed"
++                successful.append("commit 상태 복구")
++            if workflow_state not in {"approved", "committed", "post_commit_failed"}:
++                current_step = "approved"
++                if live_state == "approved":
++                    approval_result = {
++                        "ok": True,
++                        "draft_id": draft_id,
++                        "state": "approved",
++                        "recovered": True,
++                    }
++                else:
++                    approval_result = private_backend.approve(
++                        draft_id,
++                        note=(
++                            "HEGI professor-authorized Telegram approval "
++                            f"for {meeting_id}; idempotency={key}"
++                        ),
++                    )
++                    if approval_result.get("state") != "approved":
++                        raise RuntimeError("Draft approve 결과가 명확하지 않습니다.")
++                _record(
++                    state,
++                    job_id,
++                    "approved",
++                    draft_id=draft_id,
++                    idempotency_key=key,
++                )
++                workflow_state = "approved"
++                successful.append("approve")
++
++            if workflow_state not in {"committed", "post_commit_failed"}:
++                current_step = "committed"
++                commit_result = private_backend.commit(draft_id)
++                if commit_result.get("state") != "committed":
++                    raise RuntimeError("Draft commit 결과가 명확하지 않습니다.")
++                memory_id, memory_path = _commit_identity(commit_result)
++                _record(
++                    state,
++                    job_id,
++                    "committed",
++                    details={"commit": commit_result},
++                    draft_id=draft_id,
++                    idempotency_key=key,
++                    memory_id=memory_id,
++                    memory_path=memory_path,
++                )
++                workflow_state = "committed"
++                successful.append("commit")
++
++            maintenance_results: dict[str, str] = {}
++            completed_transitions = set(state.approval_transitions(job_id))
++            for operation, completed_state in (
++                ("validate", "validated"),
++                ("audit", "audited"),
++                ("index", "indexed"),
++                ("backup", "backed_up"),
++            ):
++                if completed_state in completed_transitions:
++                    maintenance_results[operation] = "PASS"
++                    continue
++                current_step = completed_state
++                maintenance = private_backend.maintenance(operation)
++                if maintenance.get("ok") is not True:
++                    raise RuntimeError(f"{operation} 결과가 PASS가 아닙니다.")
++                maintenance_results[operation] = "PASS"
++                _record(
++                    state,
++                    job_id,
++                    completed_state,
++                    details={operation: maintenance},
++                )
++                successful.append(operation)
++
++            _record(state, job_id, "completed")
+             result = {
+                 "meeting_id": meeting_id,
+-                "status": "draft_created",
+-                "project": str(job["project"]),
+-                "draft": draft,
+-                "commit": "not_performed",
++                "status": "completed",
++                "draft_id": draft_id,
++                "memory_id": memory_id,
++                "path": memory_path,
++                "maintenance": maintenance_results,
++                "idempotency_key": key,
+             }
+-            state.complete_approval_job(int(job["id"]), status="completed", result=result)
++            state.complete_approval_job(job_id, status="completed", result=result)
+             results.append(result)
+-            try:
+-                _send_status(
+-                    config,
+-                    "✅ HEGI STM Draft 생성 완료\n\n"
+-                    f"회의: {meeting_id}\n"
+-                    f"프로젝트: {job['project']}\n"
+-                    "Memory Forest 재검색: 완료\n"
+-                    "Commit: 수행하지 않음",
+-                    sender=sender,
++            _send_status(
++                config,
++                "🌲 기억 저장 완료\n\n"
++                f"회의:\n{minutes.title}\n\n"
++                f"Meeting ID:\n{meeting_id}\n\n"
++                f"Draft ID:\n{draft_id}\n\n"
++                f"Memory ID:\n{memory_id}\n\n"
++                f"저장 경로:\n{memory_path}\n\n"
++                "후속 검증:\n"
++                "- validate: PASS\n"
++                "- audit: PASS\n"
++                "- index: PASS\n"
++                "- backup: PASS\n\n"
++                "자동 판단이 아니라 교수님의 명시적 “기억해” 승인에 따라 저장했습니다.",
++                sender=sender,
++            )
++        except Exception as exc:
++            failure_state = forced_failure_state or {
++                "received": "authentication_failed",
++                "memory_researched": "manual_review_required",
++                "draft_created": "draft_failed",
++                "draft_validated": "validation_failed",
++                "approved": "approval_failed",
++                "committed": "commit_failed",
++                "validated": "post_commit_failed",
++                "audited": "post_commit_failed",
++                "indexed": "post_commit_failed",
++                "backed_up": "post_commit_failed",
++            }.get(current_step, "manual_review_required")
++            if forced_failure_state is None and str(job.get("workflow_state")) in {
++                "approved",
++                "committed",
++                "post_commit_failed",
++            }:
++                failure_state = (
++                    "post_commit_failed"
++                    if str(job.get("workflow_state")) in {
++                        "committed",
++                        "post_commit_failed",
++                    }
++                    else "commit_failed"
+                 )
+-            except Exception as notify_exc:
++            _record(
++                state,
++                job_id,
++                failure_state,
++                details={"error": str(exc), "failed_step": current_step},
++            )
++            state.complete_approval_job(job_id, status="failed", error=str(exc))
++            if failure_state not in {"manual_review_required", "duplicate_memory"}:
+                 state.add_dead_letter(
+-                    "approval_notification",
+-                    {"job_id": int(job["id"])},
+-                    str(notify_exc),
++                    "approval",
++                    {
++                        "job_id": job_id,
++                        "platform_message_id": str(job["platform_message_id"]),
++                        "workflow_state": failure_state,
++                    },
++                    str(exc),
+                     meeting_id,
+                 )
+-        except Exception as exc:
+-            state.complete_approval_job(
+-                int(job["id"]), status="failed", error=str(exc)
+-            )
+-            state.add_dead_letter(
+-                "approval",
+-                {
+-                    "job_id": int(job["id"]),
+-                    "platform_message_id": str(job["platform_message_id"]),
+-                },
+-                str(exc),
+-                meeting_id,
+-            )
+             try:
+-                _send_status(
++                _notify_failure(
+                     config,
+-                    "⚠️ HEGI Draft 생성 실패\n\n"
+-                    f"회의: {meeting_id}\n"
+-                    f"오류: {exc}\n"
+-                    "Commit은 수행하지 않았습니다.",
++                    meeting_id=meeting_id,
++                    successful=successful,
++                    failed_step=current_step,
++                    error=str(exc),
+                     sender=sender,
+                 )
+             except Exception:
+@@ -166,9 +622,9 @@ def process_pending_approvals(
+             results.append(
+                 {
+                     "meeting_id": meeting_id,
+-                    "status": "failed",
++                    "status": failure_state,
+                     "error": str(exc),
+-                    "commit": "not_performed",
++                    "commit": "not_repeated",
+                 }
+             )
+     return results
+diff --git a/hegi/config.py b/hegi/config.py
+index ecb3f5734..efb00f991 100644
+--- a/hegi/config.py
++++ b/hegi/config.py
+@@ -56,6 +56,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
+         "require_professor_approval": True,
+         "professor_user_ids": [],
+         "default_project": "",
++        "approval": {
++            "enabled": True,
++            "cli": "",
++            "queue_root": "",
++            "forest_cli": "",
++            "forest_root": "",
++            "backup_script": "",
++            "timeout_seconds": 120,
++            "allow_commit_after_explicit_remember_command": True,
++            "allow_autonomous_commit": False,
++            "require_reply_or_meeting_id": True,
++            "require_fresh_search": True,
++            "require_draft_validation": True,
++            "require_post_commit_validation": True,
++            "require_audit": True,
++            "require_index": True,
++            "require_backup": True,
++        },
++        "commands": {
++            "draft_only": ["초안 만들어"],
++            "approve_and_commit": ["기억해", "기억 승인해", "승인하고 저장해"],
++            "merge_existing": ["기존 기억에 합쳐"],
++            "reject": ["기억하지 마"],
++        },
+     },
+     "daemon": {"poll_seconds": 60},
+     "reports": {"telegram": True},
+@@ -213,6 +237,47 @@ def validate_config(config: HegiConfig, *, require_runtime: bool = False) -> lis
+         errors.append("memory.professor_user_ids가 비어 있습니다.")
+     if not str(memory.get("default_project", "")).strip():
+         errors.append("memory.default_project가 비어 있습니다.")
++    approval = memory.get("approval", {})
++    if not isinstance(approval, dict):
++        errors.append("memory.approval은 mapping이어야 합니다.")
++        approval = {}
++    if approval.get("allow_autonomous_commit"):
++        errors.append(
++            "memory.approval.allow_autonomous_commit은 true일 수 없습니다."
++        )
++    if not approval.get("enabled", False):
++        errors.append("memory.approval.enabled는 true여야 합니다.")
++    required_approval_flags = (
++        "allow_commit_after_explicit_remember_command",
++        "require_reply_or_meeting_id",
++        "require_fresh_search",
++        "require_draft_validation",
++        "require_post_commit_validation",
++        "require_audit",
++        "require_index",
++        "require_backup",
++    )
++    for key in required_approval_flags:
++        if not approval.get(key, False):
++            errors.append(f"memory.approval.{key}는 true여야 합니다.")
++    commands = memory.get("commands", {})
++    if not isinstance(commands, dict):
++        errors.append("memory.commands는 mapping이어야 합니다.")
++    else:
++        for key in ("draft_only", "approve_and_commit", "merge_existing", "reject"):
++            phrases = commands.get(key)
++            if not isinstance(phrases, list) or not any(
++                str(item).strip() for item in phrases
++            ):
++                errors.append(f"memory.commands.{key}가 비어 있습니다.")
++    approval_cli = str(approval.get("cli", "")).strip()
++    if approval_cli and require_runtime and not Path(approval_cli).expanduser().is_file():
++        errors.append(f"memory.approval.cli가 없습니다: {approval_cli}")
++    if require_runtime:
++        for key in ("forest_cli", "forest_root", "backup_script"):
++            value = str(approval.get(key, "")).strip()
++            if value and not Path(value).expanduser().exists():
++                errors.append(f"memory.approval.{key}가 없습니다: {value}")
+     if require_runtime:
+         for agent in config.agents:
+             if not agent.db_path.is_file():
+diff --git a/hegi/config/default.yaml b/hegi/config/default.yaml
+index 26a84be3a..21b1fc41b 100644
+--- a/hegi/config/default.yaml
++++ b/hegi/config/default.yaml
+@@ -48,8 +48,37 @@ memory:
+   auto_commit: false
+   auto_draft: false
+   require_professor_approval: true
+-  professor_user_ids: []
++  professor_user_ids:
++    - "8610230220"
+   default_project: ""
++  approval:
++    enabled: true
++    cli: ""
++    queue_root: ""
++    forest_cli: ""
++    forest_root: ""
++    backup_script: ""
++    timeout_seconds: 120
++    allow_commit_after_explicit_remember_command: true
++    allow_autonomous_commit: false
++    require_reply_or_meeting_id: true
++    require_fresh_search: true
++    require_draft_validation: true
++    require_post_commit_validation: true
++    require_audit: true
++    require_index: true
++    require_backup: true
++  commands:
++    draft_only:
++      - "초안 만들어"
++    approve_and_commit:
++      - "기억해"
++      - "기억 승인해"
++      - "승인하고 저장해"
++    merge_existing:
++      - "기존 기억에 합쳐"
++    reject:
++      - "기억하지 마"
+ 
+ daemon:
+   poll_seconds: 60
+diff --git a/hegi/config/schema.json b/hegi/config/schema.json
+index 5364555e5..ac98ac140 100644
+--- a/hegi/config/schema.json
++++ b/hegi/config/schema.json
+@@ -45,7 +45,54 @@
+           "items": {"type": ["string", "integer"]},
+           "minItems": 1
+         },
+-        "default_project": {"type": "string", "minLength": 1}
++        "default_project": {"type": "string", "minLength": 1},
++        "approval": {
++          "type": "object",
++          "required": [
++            "enabled",
++            "allow_commit_after_explicit_remember_command",
++            "allow_autonomous_commit",
++            "require_reply_or_meeting_id",
++            "require_fresh_search",
++            "require_draft_validation",
++            "require_post_commit_validation",
++            "require_audit",
++            "require_index",
++            "require_backup"
++          ],
++          "properties": {
++            "enabled": {"const": true},
++            "cli": {"type": "string"},
++            "queue_root": {"type": "string"},
++            "forest_cli": {"type": "string"},
++            "forest_root": {"type": "string"},
++            "backup_script": {"type": "string"},
++            "timeout_seconds": {"type": "integer", "minimum": 1},
++            "allow_commit_after_explicit_remember_command": {"const": true},
++            "allow_autonomous_commit": {"const": false},
++            "require_reply_or_meeting_id": {"const": true},
++            "require_fresh_search": {"const": true},
++            "require_draft_validation": {"const": true},
++            "require_post_commit_validation": {"const": true},
++            "require_audit": {"const": true},
++            "require_index": {"const": true},
++            "require_backup": {"const": true}
++          }
++        },
++        "commands": {
++          "type": "object",
++          "required": [
++            "draft_only",
++            "approve_and_commit",
++            "merge_existing",
++            "reject"
++          ],
++          "additionalProperties": {
++            "type": "array",
++            "items": {"type": "string", "minLength": 1},
++            "minItems": 1
++          }
++        }
+       }
+     }
+   }
+diff --git a/hegi/docs/memory_policy.md b/hegi/docs/memory_policy.md
+index 267c46b29..e5db8b6f6 100644
+--- a/hegi/docs/memory_policy.md
++++ b/hegi/docs/memory_policy.md
+@@ -1,7 +1,9 @@
+ # Memory Safety Policy
+ 
+-HEGI 자동화 계층은 Memory Forest read와 curator draft만 사용한다. 직접 STM write,
+-approval, commit 도구를 등록하거나 호출하지 않는다.
++HEGI의 일반 agent 계층은 Memory Forest read와 curator draft만 사용한다.
++approve/commit은 모델 도구 목록에 등록하지 않으며, 인증된 Telegram 승인 이벤트를
++처리하는 전용 approval worker만 private CLI 경계에서 호출한다. 이는 자율 Commit이
++아니라 professor-authorized commit이다.
+ 
+ Draft 생성 조건은 모두 충족되어야 한다.
+ 
+@@ -10,7 +12,14 @@ Draft 생성 조건은 모두 충족되어야 한다.
+ 3. platform message ID가 이전에 처리되지 않았다.
+ 4. 대상 meeting과 저장된 회의록이 존재한다.
+ 5. Draft 직전에 Memory Forest를 다시 검색한다.
+-6. 승인 명령이 기억·초안·병합 중 하나다. “기억하지 마”는 Draft를 차단한다.
++6. Draft payload의 제목·본문·schema가 유효하고 raw dict/JSON repr이 없다.
++7. 높은 중복·충돌·불확실·검색 recall 경고가 없다.
++8. commit 대상 Draft ID와 현재 승인 이벤트의 idempotency key가 연결된다.
+ 
+-생성 결과는 pending draft다. 이후 approve/commit은 HEGI 범위 밖의 별도 인간 검토
+-절차다.
++`초안 만들어`는 pending Draft에서 멈춘다. `기억해`, `기억 승인해`,
++`승인하고 저장해`는 같은 인증 이벤트 안에서 approve, commit, validate, audit,
++index, backup까지 수행한다. 중단 시 `state.db`의 마지막 성공 단계부터 재개하며
++commit 이후 재시작은 commit을 반복하지 않는다.
++
++일반 대화 중 임의 approve/commit, 교수 승인 없는 실행, read-only MCP의 write 전환,
++Memory Forest 파일 직접 쓰기는 계속 금지한다.
+diff --git a/hegi/docs/operations.md b/hegi/docs/operations.md
+index 98659b19b..f4856ae61 100644
+--- a/hegi/docs/operations.md
++++ b/hegi/docs/operations.md
+@@ -40,7 +40,7 @@ python -m hegi status
+ `daemon.lock`의 `flock`과 PID identity 검사로 중복 실행 및 PID 재사용을 막는다.
+ 비정상 종료 뒤 stale PID가 남아도 다음 시작에서 복구한다.
+ 
+-## Telegram 승인과 Draft
++## Telegram 승인과 one-command commit
+ 
+ 교수가 회의록에 `기억해` 또는 `초안 만들어`라고 답하면 Telegram
+ `pre_gateway_dispatch` plugin이 메시지를 일반 agent turn보다 먼저 선점한다. 회의록
+@@ -58,8 +58,30 @@ python -m hegi approve \
+   --message-id TELEGRAM_MESSAGE_ID
+ ```
+ 
+-`--project`를 생략하면 자동 탐지된 `memory.default_project`를 사용한다. 두 경로 모두
+-Memory Forest를 다시 검색한 뒤 pending STM Draft만 만든다. Commit은 없다.
++`--project`를 생략하면 자동 탐지된 `memory.default_project`를 사용한다.
++
++- `초안 만들어`: fresh search → Draft → Draft validation, pending에서 정지
++- `기억해`: fresh search → Draft → validation → approve → commit → validate →
++  audit → index → backup
++- `기존 기억에 합쳐`: 병합 대상을 보고하고 pending merge Draft에서 정지
++- `기억하지 마`: meeting을 rejected로 기록하고 재제안을 차단
++- `기억 승인해` / `승인하고 저장해`: 같은 meeting의 pending Draft를 연결해 저장
++
++approval worker는 다음 실제 실행 경계를 사용한다.
++
++```text
++memory-forest-approve show <draft_id>
++memory-forest-approve approve <draft_id> --no-commit
++memory-forest-approve commit <draft_id>
++memory-forest validate <forest_root>
++memory-forest audit <forest_root>
++memory-forest index <forest_root>
++backup-memory-forest.sh
++```
++
++`memory.approval.cli`, `forest_cli`, `forest_root`, `backup_script`는 `doctor`의
++runtime 검사를 통과해야 한다. `allow_autonomous_commit: true` 또는
++`require_professor_approval: false`는 설정 오류다.
+ 
+ ## 중지와 롤백
+ 
+diff --git a/hegi/gateway_plugin.py b/hegi/gateway_plugin.py
+index 1e1bd383d..9a02201c8 100644
+--- a/hegi/gateway_plugin.py
++++ b/hegi/gateway_plugin.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from concurrent.futures import ThreadPoolExecutor
++import re
+ from typing import Any
+ 
+ from .approval import process_pending_approvals
+@@ -11,6 +13,11 @@ from .memory import DraftGate, MCPMemoryBackend, parse_approval_command
+ from .state import StateStore
+ 
+ 
++_APPROVAL_EXECUTOR = ThreadPoolExecutor(
++    max_workers=1, thread_name_prefix="hegi-approval-worker"
++)
++
++
+ def _platform_name(event: Any) -> str:
+     platform = getattr(getattr(event, "source", None), "platform", "")
+     return str(getattr(platform, "value", platform)).lower()
+@@ -38,23 +45,34 @@ def _meeting_id(state: StateStore, event: Any) -> str | None:
+         matched = state.meeting_for_report_message(str(reply_id))
+         if matched:
+             return matched
+-    return state.latest_reported_meeting()
++    text = str(getattr(event, "text", "") or "")
++    explicit = re.search(
++        r"\bmeeting[_\s-]*id\s*[:=]\s*([A-Za-z0-9._:-]+)",
++        text,
++        flags=re.IGNORECASE,
++    )
++    return explicit.group(1) if explicit else None
++
++
++def _process_pending_background(config: Any) -> None:
++    _APPROVAL_EXECUTOR.submit(process_pending_approvals, config)
+ 
+ 
+ def intercept_telegram_approval(
+-    *, event: Any, gateway: Any, session_store: Any = None
++    *, event: Any, gateway: Any, session_store: Any = None, **_kwargs: Any
+ ) -> dict[str, str] | None:
+     del session_store
+     if _platform_name(event) != "telegram":
+         return None
+     text = str(getattr(event, "text", "") or "")
+-    command = parse_approval_command(text)
+-    if command is None:
+-        return None
+     try:
+         config = load_config()
+     except Exception:
+         return None
++    memory = config.section("memory")
++    command = parse_approval_command(text, memory.get("commands"))
++    if command is None:
++        return None
+     source = getattr(event, "source", None)
+     if (
+         not config.enabled
+@@ -67,7 +85,6 @@ def intercept_telegram_approval(
+     if not meeting_id:
+         _schedule_reply(gateway, event, "처리할 HEGI 회의록을 찾지 못했습니다.")
+         return {"action": "skip", "reason": "hegi-no-meeting"}
+-    memory = config.section("memory")
+     backend = MCPMemoryBackend(
+         read_server=str(memory.get("read_server", "memory-forest-read")),
+         search_tool=str(memory.get("search_tool", "")),
+@@ -89,8 +106,10 @@ def intercept_telegram_approval(
+             text=text,
+             user_id=user_id,
+             platform_message_id=message_id or None,
++            canonical_command=command,
+         )
+         if approved == "reject":
++            state.mark_meeting_rejected(meeting_id)
+             _schedule_reply(
+                 gateway,
+                 event,
+@@ -115,16 +134,16 @@ def intercept_telegram_approval(
+     _schedule_reply(
+         gateway,
+         event,
+-        "HEGI 승인을 접수했습니다.\n"
++        "HEGI 교수 승인 이벤트를 접수했습니다.\n"
+         f"회의: {meeting_id}\n"
+-        "Memory Forest를 다시 검색한 뒤 STM Draft만 생성합니다.",
++        + (
++            "Memory Forest 재검색, Draft 검증, approve/commit 및 "
++            "validate/audit/index/backup을 순서대로 수행합니다."
++            if approved in {"remember", "approve"}
++            else "Memory Forest를 다시 검색한 뒤 pending STM Draft만 생성합니다."
++        ),
+     )
+-    try:
+-        asyncio.get_running_loop().create_task(
+-            asyncio.to_thread(process_pending_approvals, config)
+-        )
+-    except RuntimeError:
+-        pass
++    _process_pending_background(config)
+     return {"action": "skip", "reason": "hegi-approval-queued"}
+ 
+ 
+diff --git a/hegi/memory.py b/hegi/memory.py
+index 7fd4a0b47..7a702d529 100644
+--- a/hegi/memory.py
++++ b/hegi/memory.py
+@@ -200,19 +200,82 @@ class MemoryEvaluator:
+ 
+ 
+ _COMMANDS = {
++    "승인하지 마": "reject",
++    "승인하지마": "reject",
+     "기억해": "remember",
++    "기억해줘": "remember",
++    "이거 기억해줘": "remember",
++    "기억 승인해": "approve",
++    "승인하고 저장해": "approve",
++    "기억으로 확정해": "approve",
++    "이 회의 승인하고 저장해": "approve",
+     "초안 만들어": "draft",
++    "승인한다고": "approve",
++    "승인한다": "approve",
++    "승인해": "approve",
++    "승인": "approve",
++    "approve": "approve",
+     "기존 기억에 합쳐": "merge",
+     "기억하지 마": "reject",
++    "취소": "reject",
++    "반려": "reject",
+ }
+ 
+ 
+-def parse_approval_command(text: str) -> str | None:
++def parse_approval_command(
++    text: str, commands: dict[str, Any] | None = None
++) -> str | None:
+     normalized = re.sub(r"\s+", " ", text).strip()
+-    for phrase, command in _COMMANDS.items():
+-        if phrase in normalized:
+-            return command
+-    return None
++    mention = re.match(r"^@(\S+)\s*", normalized)
++    if mention:
++        if mention.group(1).casefold() not in {
++            "헤기",
++            "기억관",
++            "memorycurator",
++        }:
++            return None
++        normalized = normalized[mention.end() :].strip()
++    normalized = re.sub(
++        r"\s+meeting[_\s-]*id\s*[:=]\s*[A-Za-z0-9._:-]+\s*$",
++        "",
++        normalized,
++        flags=re.IGNORECASE,
++    ).strip()
++    phrases = dict(_COMMANDS)
++    if isinstance(commands, dict):
++        configured_groups = {
++            "draft_only": "draft",
++            "approve_and_commit": "remember",
++            "merge_existing": "merge",
++            "reject": "reject",
++        }
++        for group, command in configured_groups.items():
++            values = commands.get(group, [])
++            if isinstance(values, list):
++                for value in values:
++                    phrase = re.sub(r"\s+", " ", str(value)).strip()
++                    if phrase:
++                        phrases.setdefault(phrase, command)
++    return phrases.get(normalized)
++
++
++def validate_draft_payload(draft: dict[str, Any]) -> None:
++    nested = draft.get("structuredContent")
++    payload = nested if isinstance(nested, dict) else draft
++    draft_id = payload.get("draft_id")
++    if not str(draft_id or "").strip():
++        raise ValueError("Draft ID가 비어 있습니다.")
++    for key in ("title", "observed_facts", "current_judgment"):
++        value = payload.get(key)
++        if not isinstance(value, str) or not value.strip():
++            raise ValueError(f"Draft {key}가 비어 있거나 문자열이 아닙니다.")
++        stripped = value.strip()
++        if (
++            (stripped.startswith("{") and stripped.endswith("}"))
++            or (stripped.startswith("[") and stripped.endswith("]"))
++            or re.search(r"\{\s*['\"][^}]+['\"]\s*:", stripped)
++        ):
++            raise ValueError(f"Draft {key}에 raw dict/JSON 표현이 포함되어 있습니다.")
+ 
+ 
+ class DraftGate:
+@@ -234,8 +297,10 @@ class DraftGate:
+         text: str,
+         user_id: str,
+         platform_message_id: str | None,
++        canonical_command: str | None = None,
++        commands: dict[str, Any] | None = None,
+     ) -> str:
+-        command = parse_approval_command(text)
++        command = canonical_command or parse_approval_command(text, commands)
+         if command is None:
+             raise ValueError("지원하는 헤기 승인 명령이 아닙니다.")
+         if not self.professor_user_ids or str(user_id) not in self.professor_user_ids:
+@@ -269,7 +334,7 @@ class DraftGate:
+                 """,
+                 (minutes.meeting_id,),
+             ).fetchone()
+-        if approval is None or approval["command"] not in {"remember", "draft", "merge"}:
++        if approval is None or approval["command"] not in {"remember", "draft", "merge", "approve"}:
+             raise PermissionError("교수의 명시적 승인 없이는 Draft를 생성할 수 없습니다.")
+         for query in evaluation.searched_queries:
+             self.backend.search(query)
+diff --git a/hegi/models.py b/hegi/models.py
+index 7f22ca818..6bad381a2 100644
+--- a/hegi/models.py
++++ b/hegi/models.py
+@@ -136,6 +136,7 @@ class MemoryEvaluation:
+     duplicate_targets: list[str] = field(default_factory=list)
+     novelty_basis: list[str] = field(default_factory=list)
+     reasons: list[str] = field(default_factory=list)
++    search_recall_warning: bool = False
+ 
+ 
+ @dataclass(slots=True)
+diff --git a/hegi/notify.py b/hegi/notify.py
+index bf57f0aae..80a20ee80 100644
+--- a/hegi/notify.py
++++ b/hegi/notify.py
+@@ -55,6 +55,12 @@ def telegram_parts(minutes: MeetingMinutes) -> list[str]:
+         f"중복 대상\n{_bullets(memory.duplicate_targets, 6)}\n"
+         f"신규성 근거\n{_bullets(memory.novelty_basis, 6)}\n"
+         f"판정 이유\n{_bullets(memory.reasons, 6)}"
++        + (
++            "\n\n⚠️ 키워드 검색 결과가 충분하지 않아 "
++            "중복 판단의 신뢰도가 낮습니다."
++            if memory.search_recall_warning
++            else ""
++        )
+         if memory
+         else "Memory Evaluation 미실행"
+     )
+@@ -73,7 +79,7 @@ def telegram_parts(minutes: MeetingMinutes) -> list[str]:
+         f"Action Items\n{_bullets(actions)}",
+         f"4/4 Memory Evaluation · {meeting}\n\n{memory_text}\n\n"
+         "@헤기 기억해\n@헤기 초안 만들어\n@헤기 기존 기억에 합쳐\n@헤기 기억하지 마\n\n"
+-        "자동 Commit은 수행하지 않습니다.",
++        "approve/commit은 교수님의 인증된 명시적 승인 명령이 있을 때만 수행합니다.",
+     ]
+ 
+ 
+diff --git a/hegi/state.py b/hegi/state.py
+index a41cca964..1768f26d7 100644
+--- a/hegi/state.py
++++ b/hegi/state.py
+@@ -77,11 +77,26 @@ CREATE TABLE IF NOT EXISTS approval_jobs (
+     status TEXT NOT NULL,
+     result_json TEXT,
+     last_error TEXT,
++    workflow_state TEXT NOT NULL DEFAULT 'received',
++    draft_id TEXT,
++    idempotency_key TEXT,
++    memory_id TEXT,
++    memory_path TEXT,
+     created_at REAL NOT NULL,
+     updated_at REAL NOT NULL
+ );
+ CREATE INDEX IF NOT EXISTS idx_approval_jobs_status
+ ON approval_jobs(status, created_at);
++CREATE TABLE IF NOT EXISTS approval_transitions (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    job_id INTEGER NOT NULL,
++    state TEXT NOT NULL,
++    details_json TEXT,
++    created_at REAL NOT NULL,
++    FOREIGN KEY(job_id) REFERENCES approval_jobs(id)
++);
++CREATE INDEX IF NOT EXISTS idx_approval_transitions_job
++ON approval_transitions(job_id, id);
+ CREATE TABLE IF NOT EXISTS action_items (
+     action_id TEXT PRIMARY KEY,
+     meeting_id TEXT NOT NULL,
+@@ -101,6 +116,40 @@ class StateStore:
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+         with self.connect() as connection:
+             connection.executescript(SCHEMA)
++            self._migrate_approval_jobs(connection)
++
++    @staticmethod
++    def _migrate_approval_jobs(connection: sqlite3.Connection) -> None:
++        columns = {
++            str(row["name"])
++            for row in connection.execute("PRAGMA table_info(approval_jobs)").fetchall()
++        }
++        additions = {
++            "workflow_state": "TEXT NOT NULL DEFAULT 'received'",
++            "draft_id": "TEXT",
++            "idempotency_key": "TEXT",
++            "memory_id": "TEXT",
++            "memory_path": "TEXT",
++        }
++        for name, definition in additions.items():
++            if name not in columns:
++                connection.execute(
++                    f"ALTER TABLE approval_jobs ADD COLUMN {name} {definition}"
++                )
++        connection.execute(
++            """
++            CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_jobs_idempotency
++            ON approval_jobs(idempotency_key)
++            WHERE idempotency_key IS NOT NULL
++            """
++        )
++        connection.execute(
++            """
++            CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_jobs_committed_meeting
++            ON approval_jobs(meeting_id)
++            WHERE memory_id IS NOT NULL
++            """
++        )
+ 
+     @contextmanager
+     def connect(self) -> Iterator[sqlite3.Connection]:
+@@ -334,7 +383,22 @@ class StateStore:
+         project: str,
+     ) -> bool:
+         now = time.time()
+-        with self.connect() as connection:
++        connection = sqlite3.connect(self.path, timeout=30)
++        connection.row_factory = sqlite3.Row
++        connection.execute("PRAGMA busy_timeout=30000")
++        try:
++            connection.execute("BEGIN IMMEDIATE")
++            active = connection.execute(
++                """
++                SELECT 1 FROM approval_jobs
++                WHERE meeting_id=? AND status IN ('pending', 'processing')
++                LIMIT 1
++                """,
++                (meeting_id,),
++            ).fetchone()
++            if active is not None:
++                connection.rollback()
++                return False
+             cursor = connection.execute(
+                 """
+                 INSERT OR IGNORE INTO approval_jobs(
+@@ -344,7 +408,119 @@ class StateStore:
+                 """,
+                 (meeting_id, platform_message_id, project, now, now),
+             )
+-        return cursor.rowcount == 1
++            connection.commit()
++            return cursor.rowcount == 1
++        except Exception:
++            connection.rollback()
++            raise
++        finally:
++            connection.close()
++
++    def committed_approval_for_meeting(
++        self, meeting_id: str
++    ) -> dict[str, Any] | None:
++        with self.connect() as connection:
++            row = connection.execute(
++                """
++                SELECT * FROM approval_jobs
++                WHERE meeting_id=? AND memory_id IS NOT NULL
++                LIMIT 1
++                """,
++                (meeting_id,),
++            ).fetchone()
++        return dict(row) if row else None
++
++    def pending_drafts_for_meeting(self, meeting_id: str) -> list[dict[str, Any]]:
++        with self.connect() as connection:
++            rows = connection.execute(
++                """
++                SELECT * FROM approval_jobs
++                WHERE meeting_id=? AND draft_id IS NOT NULL
++                  AND memory_id IS NULL
++                  AND workflow_state IN ('draft_created', 'draft_validated')
++                ORDER BY created_at DESC
++                """,
++                (meeting_id,),
++            ).fetchall()
++        return [dict(row) for row in rows]
++
++    def approval_job_for_meeting(self, meeting_id: str) -> dict[str, Any] | None:
++        query = """
++            SELECT * FROM approval_jobs
++            WHERE meeting_id=? AND draft_id IS NOT NULL
++        """
++        query += " ORDER BY created_at DESC LIMIT 1"
++        with self.connect() as connection:
++            row = connection.execute(query, (meeting_id,)).fetchone()
++        return dict(row) if row else None
++
++    def update_approval_workflow(
++        self,
++        job_id: int,
++        state: str,
++        *,
++        details: dict[str, Any] | None = None,
++        draft_id: str | None = None,
++        idempotency_key: str | None = None,
++        memory_id: str | None = None,
++        memory_path: str | None = None,
++    ) -> None:
++        now = time.time()
++        with self.connect() as connection:
++            connection.execute(
++                """
++                UPDATE approval_jobs SET workflow_state=?,
++                    draft_id=COALESCE(?, draft_id),
++                    idempotency_key=COALESCE(?, idempotency_key),
++                    memory_id=COALESCE(?, memory_id),
++                    memory_path=COALESCE(?, memory_path),
++                    updated_at=?
++                WHERE id=?
++                """,
++                (
++                    state,
++                    draft_id,
++                    idempotency_key,
++                    memory_id,
++                    memory_path,
++                    now,
++                    job_id,
++                ),
++            )
++            connection.execute(
++                """
++                INSERT INTO approval_transitions(job_id, state, details_json, created_at)
++                VALUES (?, ?, ?, ?)
++                """,
++                (
++                    job_id,
++                    state,
++                    json.dumps(details, ensure_ascii=False) if details else None,
++                    now,
++                ),
++            )
++
++    def approval_transitions(self, job_id: int) -> list[str]:
++        with self.connect() as connection:
++            rows = connection.execute(
++                """
++                SELECT state FROM approval_transitions
++                WHERE job_id=? ORDER BY id
++                """,
++                (job_id,),
++            ).fetchall()
++        return [str(row["state"]) for row in rows]
++
++    def resume_recoverable_approval_jobs(self) -> None:
++        with self.connect() as connection:
++            connection.execute(
++                """
++                UPDATE approval_jobs SET status='pending', updated_at=?
++                WHERE status='failed'
++                  AND workflow_state IN ('approved', 'committed', 'post_commit_failed')
++                """,
++                (time.time(),),
++            )
+ 
+     def claim_approval_job(
+         self, *, stale_after_seconds: int = 300
+@@ -411,6 +587,9 @@ class StateStore:
+                 ),
+             )
+ 
++    def mark_meeting_rejected(self, meeting_id: str) -> None:
++        self.update_episode(meeting_id, status="rejected")
++
+     def meeting_for_report_message(
+         self, platform_message_id: str
+     ) -> str | None:
+diff --git a/tests/hegi/test_approval_integration.py b/tests/hegi/test_approval_integration.py
+index 085e23608..3321e190f 100644
+--- a/tests/hegi/test_approval_integration.py
++++ b/tests/hegi/test_approval_integration.py
+@@ -15,19 +15,74 @@ from hegi.state import StateStore
+ 
+ 
+ class RecordingMemory:
+-    def __init__(self):
++    def __init__(self, *, matches: list[dict] | None = None):
+         self.searches: list[str] = []
+         self.drafts: list[dict] = []
++        self.matches = matches or []
+ 
+     def search(self, query: str, limit: int = 5):
+         self.searches.append(query)
+-        return {"results": []}
++        return {"results": self.matches}
+ 
+     def create_draft(self, arguments):
+         self.drafts.append(arguments)
+         return {"draft_id": "draft-1", "status": "pending"}
+ 
+ 
++class RecordingApproval:
++    def __init__(self, *, fail_operation: str = "", live_state: str = "pending"):
++        self.calls: list[str] = []
++        self.fail_operation = fail_operation
++        self.live_state = live_state
++        self.commits = 0
++
++    def show(self, draft_id: str):
++        self.calls.append(f"show:{draft_id}")
++        return {
++            "ok": True,
++            "state": self.live_state,
++            "draft": {
++                "draft_id": draft_id,
++                "title": "매체미학 연구회의",
++                "observed_facts": "인공자연을 매체적 조건으로 정의",
++                "current_judgment": "논문 장에 반영",
++                "forest_result": (
++                    {
++                        "ok": True,
++                        "sha256": "memory-sha",
++                        "path": "04 stm/media-aesthetics/memory.md",
++                    }
++                    if self.live_state == "committed"
++                    else None
++                ),
++            },
++        }
++
++    def approve(self, draft_id: str, *, note: str):
++        self.calls.append(f"approve:{draft_id}")
++        return {"ok": True, "draft_id": draft_id, "state": "approved"}
++
++    def commit(self, draft_id: str):
++        self.calls.append(f"commit:{draft_id}")
++        self.commits += 1
++        return {
++            "ok": True,
++            "draft_id": draft_id,
++            "state": "committed",
++            "forest_result": {
++                "ok": True,
++                "sha256": "memory-sha",
++                "path": "04 stm/media-aesthetics/memory.md",
++            },
++        }
++
++    def maintenance(self, operation: str):
++        self.calls.append(operation)
++        if operation == self.fail_operation:
++            raise RuntimeError(f"{operation} failed")
++        return {"ok": True, "operation": operation}
++
++
+ def _minutes() -> MeetingMinutes:
+     return MeetingMinutes(
+         meeting_id="meeting-1",
+@@ -84,12 +139,11 @@ memory:
+     config = load_config(config_path)
+     state = StateStore(config.state_db)
+     state.save_episode(
+-        "meeting-1",
+-        "hash-1",
+-        {"meeting_id": "meeting-1"},
+-        "reported",
++        "meeting-1", "hash-1", {"meeting_id": "meeting-1"}, "reported"
++    )
++    state.update_episode(
++        "meeting-1", status="reported", minutes=_minutes().to_dict()
+     )
+-    state.update_episode("meeting-1", status="reported", minutes=_minutes().to_dict())
+     state.record_delivery(
+         "meeting-1",
+         4,
+@@ -100,43 +154,276 @@ memory:
+     return config, state
+ 
+ 
+-def test_approval_job_rechecks_memory_creates_draft_and_never_commits(
+-    tmp_path, monkeypatch
+-):
++def _enqueue(state: StateStore, *, text: str, message_id: str, user_id: str = "42"):
++    gate = DraftGate(state, RecordingMemory(), professor_user_ids=["42"])
++    command = gate.approve(
++        meeting_id="meeting-1",
++        text=text,
++        user_id=user_id,
++        platform_message_id=message_id,
++    )
++    assert state.enqueue_approval_job(
++        meeting_id="meeting-1",
++        platform_message_id=message_id,
++        project="media_aesthetics",
++    )
++    return command
++
++
++def test_remember_runs_full_professor_authorized_workflow(tmp_path, monkeypatch):
+     config, state = _config(tmp_path, monkeypatch)
+-    backend = RecordingMemory()
+-    gate = DraftGate(state, backend, professor_user_ids=["42"])
++    assert _enqueue(state, text="@헤기 기억해", message_id="500") == "remember"
++    memory = RecordingMemory()
++    approval = RecordingApproval()
++    sent: list[str] = []
++
++    result = process_pending_approvals(
++        config,
++        backend=memory,
++        approval_backend=approval,
++        sender=lambda _token, _chat, text, **_kwargs: sent.append(text),
++    )
++
++    assert result[0]["status"] == "completed"
++    assert result[0]["memory_id"] == "memory-sha"
++    assert approval.calls == [
++        "show:draft-1",
++        "show:draft-1",
++        "approve:draft-1",
++        "commit:draft-1",
++        "validate",
++        "audit",
++        "index",
++        "backup",
++    ]
++    job = state.approval_job_for_meeting("meeting-1")
++    assert job and job["idempotency_key"]
++    assert state.approval_transitions(int(job["id"]))[-6:] == [
++        "committed",
++        "validated",
++        "audited",
++        "indexed",
++        "backed_up",
++        "completed",
++    ]
++    assert any("🌲 기억 저장 완료" in item for item in sent)
++
++
++def test_draft_only_stops_pending(tmp_path, monkeypatch):
++    config, state = _config(tmp_path, monkeypatch)
++    assert _enqueue(state, text="@헤기 초안 만들어", message_id="501") == "draft"
++    approval = RecordingApproval()
++
++    result = process_pending_approvals(
++        config,
++        backend=RecordingMemory(),
++        approval_backend=approval,
++        sender=lambda *_args, **_kwargs: None,
++    )
++
++    assert result[0]["status"] == "draft_created"
++    assert approval.calls == ["show:draft-1"]
++    assert approval.commits == 0
++
++
++def test_unauthorized_user_cannot_create_draft_or_job(tmp_path, monkeypatch):
++    _config(tmp_path, monkeypatch)
++    state = StateStore(tmp_path / "runtime" / "hegi" / "state.db")
++    gate = DraftGate(state, RecordingMemory(), professor_user_ids=["42"])
++
++    with pytest.raises(PermissionError):
++        gate.approve(
++            meeting_id="meeting-1",
++            text="기억해",
++            user_id="99",
++            platform_message_id="502",
++        )
++
++    assert state.approval_job_counts() == {}
++
++
++def test_duplicate_telegram_approval_is_idempotent(tmp_path, monkeypatch):
++    _config(tmp_path, monkeypatch)
++    state = StateStore(tmp_path / "runtime" / "hegi" / "state.db")
++    gate = DraftGate(state, RecordingMemory(), professor_user_ids=["42"])
+     assert gate.approve(
+         meeting_id="meeting-1",
+         text="기억해",
+         user_id="42",
+-        platform_message_id="500",
+-    ) == "remember"
++        platform_message_id="503",
++    )
++    with pytest.raises(ValueError, match="이미 처리"):
++        gate.approve(
++            meeting_id="meeting-1",
++            text="기억해",
++            user_id="42",
++            platform_message_id="503",
++        )
++
++
++def test_one_active_approval_job_per_meeting(tmp_path, monkeypatch):
++    _config(tmp_path, monkeypatch)
++    state = StateStore(tmp_path / "runtime" / "hegi" / "state.db")
+     assert state.enqueue_approval_job(
+         meeting_id="meeting-1",
+-        platform_message_id="500",
++        platform_message_id="active-1",
+         project="media_aesthetics",
+     )
+-    sent: list[str] = []
++    assert not state.enqueue_approval_job(
++        meeting_id="meeting-1",
++        platform_message_id="active-2",
++        project="media_aesthetics",
++    )
++
++
++def test_multiple_pending_drafts_require_manual_selection(tmp_path, monkeypatch):
++    config, state = _config(tmp_path, monkeypatch)
++    for message_id, draft_id in (("draft-a", "draft-a"), ("draft-b", "draft-b")):
++        _enqueue(state, text="초안 만들어", message_id=message_id)
++        job = state.claim_approval_job()
++        assert job
++        state.update_approval_workflow(
++            int(job["id"]), "draft_validated", draft_id=draft_id
++        )
++        state.complete_approval_job(
++            int(job["id"]),
++            status="completed",
++            result={"draft_id": draft_id, "status": "draft_created"},
++        )
++    _enqueue(state, text="승인하고 저장해", message_id="approve-ambiguous")
++    approval = RecordingApproval()
+ 
+     result = process_pending_approvals(
+         config,
+-        backend=backend,
+-        sender=lambda _token, _chat, text, **_kwargs: sent.append(text),
++        backend=RecordingMemory(),
++        approval_backend=approval,
++        sender=lambda *_args, **_kwargs: None,
+     )
+ 
+-    assert result[0]["status"] == "draft_created"
+-    assert result[0]["commit"] == "not_performed"
+-    assert backend.searches
+-    assert len(backend.drafts) == 1
+-    assert backend.drafts[0]["status"] == "provisional"
+-    assert "commit" not in backend.drafts[0]
+-    assert state.approval_job_counts() == {"completed": 1}
+-    assert any("Commit: 수행하지 않음" in item for item in sent)
++    assert result[0]["status"] == "manual_review_required"
++    assert approval.commits == 0
++
++
++def test_high_duplicate_requires_manual_review_without_commit(tmp_path, monkeypatch):
++    config, state = _config(tmp_path, monkeypatch)
++    _enqueue(state, text="기억해", message_id="504")
++    approval = RecordingApproval()
++
++    result = process_pending_approvals(
++        config,
++        backend=RecordingMemory(
++            matches=[
++                {
++                    "memory_id": "existing-1",
++                    "title": "기존 기억",
++                    "relation": "높은 중복",
++                }
++            ]
++        ),
++        approval_backend=approval,
++        sender=lambda *_args, **_kwargs: None,
++    )
++
++    assert result[0]["status"] == "duplicate_memory"
++    assert approval.commits == 0
++
++
++def test_restart_after_approved_resumes_at_commit(tmp_path, monkeypatch):
++    config, state = _config(tmp_path, monkeypatch)
++    _enqueue(state, text="기억해", message_id="505")
++    job = state.claim_approval_job()
++    assert job
++    state.update_approval_workflow(
++        int(job["id"]),
++        "approved",
++        draft_id="draft-1",
++        idempotency_key="stable-key",
++    )
++    state.complete_approval_job(int(job["id"]), status="failed", error="crash")
++    approval = RecordingApproval()
++
++    result = process_pending_approvals(
++        config,
++        backend=RecordingMemory(),
++        approval_backend=approval,
++        sender=lambda *_args, **_kwargs: None,
++    )
++
++    assert result[0]["status"] == "completed"
++    assert "approve:draft-1" not in approval.calls
++    assert approval.commits == 1
++
++
++def test_committed_meeting_never_commits_again(tmp_path, monkeypatch):
++    config, state = _config(tmp_path, monkeypatch)
++    _enqueue(state, text="기억해", message_id="506")
++    first = RecordingApproval()
++    process_pending_approvals(
++        config,
++        backend=RecordingMemory(),
++        approval_backend=first,
++        sender=lambda *_args, **_kwargs: None,
++    )
++    _enqueue(state, text="기억해", message_id="507")
++    second = RecordingApproval()
++
++    result = process_pending_approvals(
++        config,
++        backend=RecordingMemory(),
++        approval_backend=second,
++        sender=lambda *_args, **_kwargs: None,
++    )
++
++    assert result[0]["status"] == "duplicate_memory"
++    assert second.commits == 0
++
++
++def test_external_commit_crash_window_recovers_without_recommit(tmp_path, monkeypatch):
++    config, state = _config(tmp_path, monkeypatch)
++    _enqueue(state, text="기억해", message_id="507b")
++    approval = RecordingApproval(live_state="committed")
++
++    result = process_pending_approvals(
++        config,
++        backend=RecordingMemory(),
++        approval_backend=approval,
++        sender=lambda *_args, **_kwargs: None,
++    )
++
++    assert result[0]["status"] == "completed"
++    assert approval.commits == 0
++    assert result[0]["memory_id"] == "memory-sha"
++
++
++def test_post_commit_failure_retries_audit_without_recommit(tmp_path, monkeypatch):
++    config, state = _config(tmp_path, monkeypatch)
++    _enqueue(state, text="기억해", message_id="508")
++    failing = RecordingApproval(fail_operation="audit")
++
++    first = process_pending_approvals(
++        config,
++        backend=RecordingMemory(),
++        approval_backend=failing,
++        sender=lambda *_args, **_kwargs: None,
++    )
++    assert first[0]["status"] == "post_commit_failed"
++    assert failing.commits == 1
++
++    retry = RecordingApproval()
++    second = process_pending_approvals(
++        config,
++        backend=RecordingMemory(),
++        approval_backend=retry,
++        sender=lambda *_args, **_kwargs: None,
++    )
++    assert second[0]["status"] == "completed"
++    assert retry.commits == 0
++    assert "validate" not in retry.calls
++    assert "audit" in retry.calls
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_gateway_plugin_intercepts_professor_reply_before_curator_agent(
++async def test_gateway_requires_reply_and_accepts_telemetry_kwargs(
+     tmp_path, monkeypatch
+ ):
+     _config(tmp_path, monkeypatch)
+@@ -149,7 +436,7 @@ async def test_gateway_plugin_intercepts_professor_reply_before_curator_agent(
+     gateway = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+     event = SimpleNamespace(
+         text="초안 만들어",
+-        message_id="501",
++        message_id="509",
+         reply_to_message_id="400",
+         source=SimpleNamespace(
+             platform=SimpleNamespace(value="telegram"),
+@@ -159,12 +446,13 @@ async def test_gateway_plugin_intercepts_professor_reply_before_curator_agent(
+     )
+ 
+     decision = intercept_telegram_approval(
+-        event=event, gateway=gateway, session_store=None
++        event=event,
++        gateway=gateway,
++        session_store=None,
++        telemetry_schema_version="v1",
+     )
+     await asyncio.sleep(0.05)
+ 
+     assert decision == {"action": "skip", "reason": "hegi-approval-queued"}
+     adapter.send.assert_awaited()
+     assert processed == ["-1001"]
+-    state = StateStore(tmp_path / "runtime" / "hegi" / "state.db")
+-    assert state.approval_job_counts() == {"pending": 1}
+diff --git a/tests/hegi/test_config_state.py b/tests/hegi/test_config_state.py
+index c6214a783..7831c6fae 100644
+--- a/tests/hegi/test_config_state.py
++++ b/tests/hegi/test_config_state.py
+@@ -23,6 +23,8 @@ memory:
+   auto_commit: true
+   auto_draft: true
+   require_professor_approval: false
++  approval:
++    allow_autonomous_commit: true
+ """,
+         encoding="utf-8",
+     )
+@@ -30,6 +32,39 @@ memory:
+     assert any("auto_commit" in error for error in errors)
+     assert any("auto_draft" in error for error in errors)
+     assert any("require_professor_approval" in error for error in errors)
++    assert any("allow_autonomous_commit" in error for error in errors)
++
++
++def test_existing_state_database_migrates_approval_workflow_columns(tmp_path):
++    path = tmp_path / "legacy.db"
++    import sqlite3
++
++    connection = sqlite3.connect(path)
++    connection.execute(
++        """
++        CREATE TABLE approval_jobs (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            meeting_id TEXT NOT NULL,
++            platform_message_id TEXT NOT NULL UNIQUE,
++            project TEXT NOT NULL,
++            status TEXT NOT NULL,
++            result_json TEXT,
++            last_error TEXT,
++            created_at REAL NOT NULL,
++            updated_at REAL NOT NULL
++        )
++        """
++    )
++    connection.commit()
++    connection.close()
++
++    store = StateStore(path)
++    with store.connect() as migrated:
++        columns = {
++            row["name"]
++            for row in migrated.execute("PRAGMA table_info(approval_jobs)").fetchall()
++        }
++    assert {"workflow_state", "draft_id", "idempotency_key", "memory_id"} <= columns
+ 
+ 
+ def test_state_delivery_is_idempotent_and_dead_letter_is_durable(tmp_path):
+diff --git a/tests/hegi/test_memory_gate.py b/tests/hegi/test_memory_gate.py
+index 52c22d8f3..e0171b6d6 100644
+--- a/tests/hegi/test_memory_gate.py
++++ b/tests/hegi/test_memory_gate.py
+@@ -45,7 +45,16 @@ def _minutes() -> MeetingMinutes:
+ 
+ def test_approval_parser_recognizes_supported_phrases():
+     assert parse_approval_command("@헤기 초안 만들어") == "draft"
++    assert parse_approval_command("@헤기 승인한다고") == "approve"
++    assert parse_approval_command("@헤기 approve") == "approve"
++    assert parse_approval_command("@헤기 이거 기억해줘") == "remember"
++    assert parse_approval_command("@헤기 이 회의 승인하고 저장해") == "approve"
++    assert parse_approval_command("@헤기 기억으로 확정해") == "approve"
++    assert parse_approval_command('@헤기 “기억해”라고 하지 않았어') is None
++    assert parse_approval_command("@헤기 승인하지 않음") is None
++    assert parse_approval_command("@다른봇 기억해") is None
+     assert parse_approval_command("@헤기 기억하지 마") == "reject"
++    assert parse_approval_command("@헤기 승인하지 마") == "reject"
+     assert parse_approval_command("그냥 확인") is None
+ 
+ 
+diff --git a/tests/hegi/test_operational_flow.py b/tests/hegi/test_operational_flow.py
+index cafb59b60..e4c619fc8 100644
+--- a/tests/hegi/test_operational_flow.py
++++ b/tests/hegi/test_operational_flow.py
+@@ -173,10 +173,10 @@ memory:
+     gate = DraftGate(pipeline.state, memory, professor_user_ids=["9001"])
+     assert gate.approve(
+         meeting_id=meeting_id,
+-        text="기억해",
++        text="초안 만들어",
+         user_id="9001",
+         platform_message_id="approval-1",
+-    ) == "remember"
++    ) == "draft"
+     assert pipeline.state.enqueue_approval_job(
+         meeting_id=meeting_id,
+         platform_message_id="approval-1",
+@@ -185,6 +185,17 @@ memory:
+     approval_results = process_pending_approvals(
+         pipeline.config,
+         backend=memory,
++        approval_backend=SimpleNamespace(
++            show=lambda draft_id: {
++                "ok": True,
++                "draft": {
++                    "draft_id": draft_id,
++                    "title": "인공자연 연구회의",
++                    "observed_facts": "인공자연을 매체적 조건으로 다룸",
++                    "current_judgment": "논문 장의 핵심 개념으로 발전",
++                },
++            }
++        ),
+         sender=lambda _token, _chat, text, **_kwargs: sent.append(text),
+     )
+ 
+-- 
+2.43.0
+
