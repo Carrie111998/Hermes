@@ -25,7 +25,19 @@ export interface HermesReadyOptions {
 export function isMissingHealthEndpointError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? '')
 
-  return /^404:/.test(message) || message.includes('endpoint is likely missing')
+  // 404 / HTML: route genuinely absent (SPA returns JSON 404 for unknown /api/*).
+  // Gated 401 no_cookie: pre-/api/health backends (e.g. release 0.19.0) run the
+  // auth gate before the SPA catch-all, so an unknown /api/health is rejected as
+  // unauthenticated instead of 404. Only that gate shape falls back — a generic
+  // 401 must not skip a real (misconfigured) health endpoint.
+  const gatedMissingHealth =
+    /^401:/.test(message) && (message.includes('"reason":"no_cookie"') || message.includes('no_cookie'))
+
+  return (
+    /^404:/.test(message) ||
+    gatedMissingHealth ||
+    message.includes('endpoint is likely missing')
+  )
 }
 
 function supersededError() {
@@ -78,8 +90,9 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
     } catch (error) {
       lastError = error
 
-      // Only an explicitly missing route means the backend predates
-      // /api/health; timeouts and server errors keep polling health.
+      // Missing or gate-rejected /api/health means the backend predates the
+      // public health probe (404, or gated 401 no_cookie on older builds).
+      // Timeouts, 5xx, and other 401s keep polling health.
       if (!useStatusFallback && isMissingHealthEndpointError(error)) {
         useStatusFallback = true
 
