@@ -301,6 +301,91 @@ async def test_real_base_adapter_busy_ingress_reaches_gateway_message_hook_once(
 
 
 @pytest.mark.asyncio
+async def test_busy_pass_event_crosses_gateway_message_hook_only_once_after_replay(monkeypatch):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, _chat_id, _content, **_kwargs):
+        return SendResult(success=True, message_id="busy-pass-out")
+
+    Adapter = type(
+        "BusyPassAdapter",
+        (BasePlatformAdapter,),
+        {"connect": connect, "disconnect": disconnect, "send": send},
+    )
+    Adapter.__abstractmethods__ = frozenset()
+
+    runner, _old_adapter = _runner_for_dispatch()
+    runner._busy_text_mode = "queue"
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.DISCORD)
+    adapter._message_handler = runner._handle_message
+    adapter._busy_session_handler = runner._handle_active_session_busy_message
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter}}
+    runner._busy_ack_ts = {}
+
+    event = MessageEvent(
+        text="busy passing follow-up",
+        message_type=MessageType.TEXT,
+        source=_source(),
+        message_id="busy-pass-in",
+    )
+    session_key = build_session_key(event.source)
+    running_agent = MagicMock()
+    running_agent.get_activity_summary.return_value = {}
+    runner._running_agents[session_key] = running_agent
+    adapter._active_sessions[session_key] = asyncio.Event()
+    calls = []
+
+    async def hook(name, **kwargs):
+        calls.append((name, kwargs["event"].message_id))
+        return [{"decision": "pass"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+
+    await adapter.handle_message(event)
+    assert calls == [("gateway_message", "busy-pass-in")]
+    queued = adapter._pending_messages.pop(session_key)
+
+    adapter._active_sessions.pop(session_key, None)
+    runner._running_agents.pop(session_key, None)
+    await adapter.handle_message(queued)
+    await adapter._session_tasks[session_key]
+
+    assert calls == [("gateway_message", "busy-pass-in")]
+
+
+@pytest.mark.asyncio
+async def test_busy_external_drain_rejects_before_gateway_message_hook(monkeypatch):
+    runner, adapter = _runner_for_dispatch()
+    runner._external_drain_active = True
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="drain-refusal")
+    )
+    event = _event()
+    event.message_id = "busy-drain-in"
+    session_key = build_session_key(event.source)
+    calls = []
+
+    async def hook(name, **_kwargs):
+        calls.append(name)
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
+
+    handled = await runner._handle_active_session_busy_message(event, session_key)
+
+    assert handled is True
+    assert calls == []
+    adapter._send_with_retry.assert_awaited_once()
+    assert "draining for a maintenance action" in adapter._send_with_retry.await_args.kwargs["content"]
+
+
+@pytest.mark.asyncio
 async def test_awaited_cold_hook_cannot_start_duplicate_agents(monkeypatch):
     runner, adapter = _runner_for_dispatch()
     first_hook_entered = asyncio.Event()

@@ -6222,6 +6222,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        if self._external_drain_active:
+            logger.info(
+                "Refusing busy-session follow-up for %s — external drain active.",
+                session_key,
+            )
+            reply_anchor = self._reply_anchor_for_event(event)
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=(
+                    "⏳ This agent is draining for a maintenance action and isn't "
+                    "accepting new turns right now. It'll be back in a moment — "
+                    "please resend shortly."
+                ),
+                reply_to=reply_anchor,
+                metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+            )
+            return True
+
         # Real busy-session ingress returns from BasePlatformAdapter after this
         # handler. Invoke the post-authorization participant seam before any
         # host queue, steer, redirect, or interrupt effect so ordinary live
@@ -12922,6 +12940,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
     ) -> bool:
         """Return True when an ordinary user-message hook suppresses dispatch."""
+        result_marker = "_hermes_gateway_message_hook_result"
+        prior_result = getattr(event, result_marker, None)
+        if prior_result == "suppress":
+            return True
+        if prior_result == "continue":
+            return False
+        if prior_result == "pending":
+            # The same mutable host event must never enter participant hooks
+            # concurrently. Fail closed until its first invocation resolves.
+            return True
+
+        def _finish(suppress: bool) -> bool:
+            setattr(event, result_marker, "suppress" if suppress else "continue")
+            return suppress
+
         from gateway.message_hooks import (
             GatewayDelivery,
             GatewayMessageEvent,
@@ -12970,6 +13003,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             decision = str(result.get("decision", "")).strip().lower()
             return decision not in {"continue", "pass"}
 
+        setattr(event, result_marker, "pending")
         try:
             results = await invoke_hook_async(
                 "gateway_message",
@@ -12983,13 +13017,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 stop_when=_stop_after_terminal_result,
             )
         except asyncio.CancelledError:
+            if getattr(event, result_marker, None) == "pending":
+                delattr(event, result_marker)
             raise
         except Exception as exc:
             logger.warning(
                 "gateway_message hook failed; suppressing normal dispatch (%s)",
                 type(exc).__name__,
             )
-            return True
+            return _finish(True)
 
         for result in results:
             if not isinstance(result, dict):
@@ -12998,18 +13034,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "suppressing normal dispatch",
                     type(result).__name__,
                 )
-                return True
+                return _finish(True)
             decision = str(result.get("decision", "")).strip().lower()
             if decision in {"handled", "suppress"}:
-                return True
+                return _finish(True)
             if decision in {"continue", "pass"}:
                 continue
             logger.warning(
                 "gateway_message hook returned an invalid decision; "
                 "suppressing normal dispatch"
             )
-            return True
-        return False
+            return _finish(True)
+        return _finish(False)
 
     async def _notify_gateway_session_cancel(
         self,
