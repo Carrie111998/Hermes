@@ -175,6 +175,9 @@ voice = [
   "sounddevice==0.5.5",
   "numpy==2.4.3",
 ]
+# Experimental Codex GPT-Live WebRTC speech interface. Kept separate from
+# classic voice because aiortc/PyAV are only needed when this route is enabled.
+codex-realtime-voice = ["aiortc==1.15.0", "numpy==2.4.3"]
 honcho = ["honcho-ai==2.2.0"]
 # Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
 # (memory.supermemory / memory.mem0) at first use. Exact pins MUST match the
@@ -281,6 +284,7 @@ all = [
   #   anthropic, exa, firecrawl, parallel-web, fal, edge-tts,
   #   modal, daytona, messaging (telegram/discord/slack),
   #   matrix, slack, honcho, voice (faster-whisper),
+  #   codex-realtime-voice (aiortc),
   #   dingtalk, feishu, bedrock, tts-premium (elevenlabs)
   #
   # Why: the matrix extra in particular pulls `mautrix[encryption]`

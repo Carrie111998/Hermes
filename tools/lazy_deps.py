@@ -136,6 +136,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
+    # OAuth-compatible Codex GPT-Live uses a local WebRTC peer. This is
+    # intentionally opt-in because aiortc/PyAV are not needed by classic STT/TTS.
+    "voice.codex_realtime": (
+        "aiortc==1.15.0",
+        "numpy==2.4.3",
+    ),
 
     # ─── Image generation backends ─────────────────────────────────────────
     "image.fal": ("fal-client==0.13.1",),
