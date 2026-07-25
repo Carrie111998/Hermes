@@ -136,6 +136,13 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 # dedup in #58265.
 NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS = 60.0
 
+# How many superseded runtime api keys a pool remembers per instance, so a
+# reactive caller still holding a just-rotated bearer as its ``api_key_hint``
+# can be handed the rotated successor instead of ``None``.  Only requests that
+# were already in flight when the rotation landed can present such a hint, so a
+# handful of entries covers the window; see _record_superseded_api_key.
+SUPERSEDED_API_KEY_HISTORY = 8
+
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
 # custom_providers name: 'custom:<normalized_name>'.
@@ -594,6 +601,9 @@ class CredentialPool:
         # Re-armed to None on every successful selection so a recover→re-exhaust
         # transition logs promptly instead of being swallowed by a stale window.
         self._last_no_entries_log_at: Optional[float] = None
+        # Runtime api keys this pool has rotated away from, mapped to the entry
+        # that superseded them.  See _record_superseded_api_key.
+        self._superseded_api_keys: Dict[str, str] = {}
 
     def has_credentials(self) -> bool:
         return bool(self._entries)
@@ -615,7 +625,59 @@ class CredentialPool:
         for idx, entry in enumerate(self._entries):
             if entry.id == old.id:
                 self._entries[idx] = new
+                self._record_superseded_api_key(old, new)
                 return
+
+    def _record_superseded_api_key(
+        self, old: PooledCredential, new: PooledCredential
+    ) -> None:
+        """Remember the runtime key an entry has just rotated away from.
+
+        ``load_pool`` hands the *same* ``CredentialPool`` object to every caller
+        inside its TTL cache window, so a rotation performed by one caller is
+        immediately visible to the others — including callers that are still
+        holding the superseded bearer as their ``api_key_hint``.  Recording the
+        old key lets ``try_refresh_matching`` tell "this credential was already
+        refreshed for you" apart from "no such credential", which are otherwise
+        indistinguishable once the entry has been rewritten in place.
+
+        Bounded to the last ``SUPERSEDED_API_KEY_HISTORY`` rotations: only
+        in-flight requests can still be carrying a superseded bearer, so there
+        is nothing to gain from an unbounded map of spent tokens.
+        """
+        try:
+            old_key = old.runtime_api_key
+            if not old_key or old_key == new.runtime_api_key:
+                return
+            # Re-insert so the bound below evicts genuinely-oldest keys.
+            self._superseded_api_keys.pop(old_key, None)
+            self._superseded_api_keys[old_key] = new.id
+            while len(self._superseded_api_keys) > SUPERSEDED_API_KEY_HISTORY:
+                self._superseded_api_keys.pop(next(iter(self._superseded_api_keys)))
+        except Exception as exc:
+            # Bookkeeping must never break a credential mutation.
+            logger.debug("Failed to record superseded api key: %s", exc)
+
+    def _entry_rotated_from(self, api_key_hint: str) -> Optional[PooledCredential]:
+        """Return the live entry that superseded ``api_key_hint``, if usable.
+
+        Only rescues a hint whose successor is still present and still eligible
+        for use: a successor that has since been quarantined is no better than
+        no answer, and the caller's own fallback should pick another account.
+        """
+        entry_id = self._superseded_api_keys.get(api_key_hint)
+        if not entry_id:
+            return None
+        entry = next((item for item in self._entries if item.id == entry_id), None)
+        if entry is None or entry.runtime_api_key == api_key_hint:
+            return None
+        if entry.last_status == STATUS_DEAD:
+            return None
+        if entry.last_status == STATUS_EXHAUSTED:
+            exhausted_until = _exhausted_until(entry)
+            if exhausted_until is not None and time.time() < exhausted_until:
+                return None
+        return entry
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
         write_credential_pool(
@@ -1848,6 +1910,12 @@ class CredentialPool:
         issuing credential. With no hint, select an entry without first doing
         the normal proactive refresh; the forced refresh below must consume a
         rotating refresh token exactly once.
+
+        A hint that matches no live entry is not necessarily unknown: it may be
+        a bearer that a *concurrent caller sharing this pool instance* has
+        already rotated away (see ``_record_superseded_api_key``).  That caller
+        spent the single-use refresh token, so the correct answer is the rotated
+        successor, not ``None``.
         """
         with self._lock:
             entry = None
@@ -1860,6 +1928,22 @@ class CredentialPool:
                     ),
                     None,
                 )
+                if entry is None:
+                    rotated = self._entry_rotated_from(api_key_hint)
+                    if rotated is not None:
+                        # The refresh this caller is asking for has already
+                        # happened on this very pool object.  Re-running it
+                        # would replay a consumed single-use refresh token and
+                        # earn a ``refresh_token_reused`` 4xx; returning None
+                        # would strand a caller that has a usable credential
+                        # sitting right here.  Adopt the successor instead.
+                        logger.debug(
+                            "credential pool: hint for %s already rotated by a "
+                            "concurrent caller — adopting the refreshed entry",
+                            rotated.label or rotated.id[:8],
+                        )
+                        self._current_id = rotated.id
+                        return rotated
             else:
                 entry = self.current() or self._select_unlocked(refresh=False)
             if entry is None:
