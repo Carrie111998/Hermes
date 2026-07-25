@@ -436,6 +436,26 @@ class WorkflowEngine:
                 return nid
         return None
 
+    def _fire_completion_notification(self, workflow_name, workflow, states, layers, layer_idx, context=None):
+        """Fire completion notification after all layers complete."""
+        try:
+            from plugins.workflow import _notify_workflow_complete
+            _notif_state = {
+                "workflow_name": workflow_name,
+                "kanban_board": self.kanban_board,
+                "run_id": workflow.run_id,
+                "session_info": (context or {}).get("_session_info", {}),
+                "states": {nid: {"status": s.status, "kanban_card_id": s.kanban_card_id} for nid, s in states.items()},
+                "layers": layers,
+                "current_layer": layer_idx,
+            }
+            for nid in reversed(list(states.keys())):
+                if states[nid].status == "done" and states[nid].kanban_card_id:
+                    _notify_workflow_complete(states[nid].kanban_card_id, state=_notif_state)
+                    break
+        except Exception as _notify_exc:
+            print(f"   ⚠  Completion notification failed: {_notify_exc}")
+
     def _find_loop_zones(self, workflow: Workflow, layers: list[list[str]]) -> list[int]:
         """Return sorted layer indices that contain verify nodes (nodes with revision dependents)."""
         loop_layers: list[int] = []
@@ -2316,24 +2336,7 @@ class WorkflowEngine:
                                       current_layer=len(layers) - 1)
 
                 # Fire completion notification for simple (no-loop) workflows
-                try:
-                    from plugins.workflow import _notify_workflow_complete
-                    # Build a minimal state dict for the notification
-                    _notif_state = {
-                        "workflow_name": workflow_name,
-                        "kanban_board": self.kanban_board,
-                        "run_id": workflow.run_id,
-                        "session_info": _session_info or {},
-                        "states": {nid: {"status": s.status, "kanban_card_id": s.kanban_card_id} for nid, s in states.items()},
-                        "layers": layers,
-                        "current_layer": len(layers) - 1,
-                    }
-                    for nid in reversed(list(states.keys())):
-                        if states[nid].status == "done" and states[nid].kanban_card_id:
-                            _notify_workflow_complete(states[nid].kanban_card_id, state=_notif_state)
-                            break
-                except Exception as _notify_exc:
-                    print(f"   ⚠  Completion notification failed: {_notify_exc}")
+                self._fire_completion_notification(workflow_name, workflow, states, layers, len(layers) - 1, context)
 
                 return results
 
@@ -2672,23 +2675,7 @@ class WorkflowEngine:
 
         # Fire completion notification BEFORE clearing state
         if final_status == "completed":
-            try:
-                from plugins.workflow import _notify_workflow_complete
-                _notif_state = {
-                    "workflow_name": workflow_name,
-                    "kanban_board": self.kanban_board,
-                    "run_id": workflow.run_id,
-                    "session_info": (context or {}).get("_session_info", {}),
-                    "states": {nid: {"status": s.status, "kanban_card_id": s.kanban_card_id} for nid, s in states.items()},
-                    "layers": layers,
-                    "current_layer": layer_idx,
-                }
-                for nid in reversed(list(states.keys())):
-                    if states[nid].status == "done" and states[nid].kanban_card_id:
-                        _notify_workflow_complete(states[nid].kanban_card_id, state=_notif_state)
-                        break
-            except Exception as _notify_exc:
-                print(f"   ⚠  Completion notification failed: {_notify_exc}")
+            self._fire_completion_notification(workflow_name, workflow, states, layers, layer_idx, context)
 
         self._clear_state(workflow_name, run_id=workflow.run_id)
 
