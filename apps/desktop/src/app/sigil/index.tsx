@@ -53,7 +53,11 @@ const STAGE_TONE: Record<PipelineStage['state'], SigilTone> = {
 
 function StatusLabel({ children, tone = 'muted' }: { children: React.ReactNode; tone?: SigilTone }) {
   return (
-    <Badge aria-label={`${children}: ${tone}`} variant={TONE_BADGE[tone]}>
+    <Badge
+      aria-label={`${children}: ${tone}`}
+      className="rounded-[2px] font-mono tracking-wide"
+      variant={TONE_BADGE[tone]}
+    >
       <span aria-hidden className={cn('size-1.5 rounded-full', tone === 'danger' ? 'bg-destructive' : 'bg-current')} />
       {children}
     </Badge>
@@ -103,16 +107,16 @@ function MetricStrip({ snapshot }: { snapshot: SigilSnapshot }) {
   ] as const
 
   return (
-    <dl className="grid border-b border-(--ui-stroke-tertiary) sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+    <dl className="grid border-b border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary) sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-7">
       {metrics.map(metric => (
         <div
-          className="min-w-0 border-b border-(--ui-stroke-tertiary) px-4 py-3 last:border-b-0 sm:border-r lg:border-b-0"
+          className="min-w-0 border-b border-(--ui-stroke-tertiary) px-4 py-2.5 last:border-b-0 sm:border-r lg:border-b-0"
           key={metric.label}
         >
           <dt className="text-[0.625rem] font-medium uppercase tracking-[0.12em] text-(--ui-text-tertiary)">
             {metric.label}
           </dt>
-          <dd className="mt-1 truncate text-sm font-semibold">{metric.value}</dd>
+          <dd className="mt-1 truncate font-mono text-xs font-semibold">{metric.value}</dd>
           <dd className="mt-0.5 truncate text-[0.6875rem] text-(--ui-text-tertiary)">{metric.detail}</dd>
         </div>
       ))}
@@ -125,19 +129,32 @@ function Pipeline({ stages, compact = false }: { stages: PipelineStage[]; compac
     <ol
       aria-label="Sigil governance stages"
       className={cn(
-        'grid gap-px overflow-hidden bg-(--ui-stroke-tertiary)',
-        compact ? 'grid-cols-1 sm:grid-cols-3 xl:grid-cols-9' : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
+        'grid gap-px overflow-hidden border border-(--ui-stroke-tertiary) bg-(--ui-stroke-tertiary)',
+        compact ? 'grid-cols-1 sm:grid-cols-3 2xl:grid-cols-9' : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
       )}
     >
       {stages.map((stage, index) => (
-        <li className="min-w-0 bg-(--ui-bg-primary) p-3" key={stage.id}>
+        <li className="relative min-w-0 bg-(--ui-bg-secondary) px-3 py-3" key={stage.id}>
+          <span
+            aria-hidden
+            className={cn(
+              'absolute inset-x-0 top-0 h-px',
+              stage.state === 'complete'
+                ? 'bg-emerald-500'
+                : stage.state === 'pending'
+                  ? 'bg-amber-500'
+                  : stage.state === 'blocked'
+                    ? 'bg-destructive'
+                    : 'bg-primary'
+            )}
+          />
           <div className="flex items-center justify-between gap-2">
             <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)">
               {String(index + 1).padStart(2, '0')}
             </span>
             <StatusLabel tone={STAGE_TONE[stage.state]}>{stage.state}</StatusLabel>
           </div>
-          <div className="mt-3 text-xs font-medium">{stage.label}</div>
+          <div className="mt-3 text-[0.6875rem] font-semibold uppercase tracking-[0.04em]">{stage.label}</div>
           <div className="mt-0.5 text-[0.6875rem] text-(--ui-text-tertiary)">{stage.detail}</div>
         </li>
       ))}
@@ -205,6 +222,80 @@ function ProposalDetails({
         </div>
       </div>
     </article>
+  )
+}
+
+function ContextInspector({ proposal }: { proposal: Proposal }) {
+  return (
+    <aside
+      aria-label="Contextual inspector"
+      className="min-h-0 border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary) xl:w-[21rem] xl:shrink-0"
+    >
+      <div className="border-b border-(--ui-stroke-tertiary) px-5 py-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="font-mono text-[0.625rem] uppercase tracking-[0.14em] text-(--ui-text-tertiary)">
+              Contextual inspector
+            </p>
+            <h2 className="mt-1 text-sm font-semibold">{proposal.id}</h2>
+          </div>
+          <StatusLabel tone={proposal.status === 'pending' ? 'warning' : 'danger'}>{proposal.status}</StatusLabel>
+        </div>
+      </div>
+      <div className="space-y-6 overflow-y-auto px-5 py-4 text-xs">
+        <section>
+          <h3 className="border-b border-(--ui-stroke-tertiary) pb-2 text-[0.625rem] font-semibold uppercase tracking-[0.12em] text-(--ui-text-tertiary)">
+            Contextual metadata
+          </h3>
+          <dl className="mt-3 space-y-3">
+            {[
+              ['Symbol', proposal.symbol],
+              ['Side / quantity', `${proposal.side} ${proposal.quantity}`],
+              ['Estimated notional', proposal.estimatedNotional],
+              ['Strategy', proposal.strategy],
+              ['Account protection', 'Masked identity']
+            ].map(([label, value]) => (
+              <div className="flex items-start justify-between gap-4" key={label}>
+                <dt className="text-(--ui-text-tertiary)">{label}</dt>
+                <dd className="text-right font-mono text-[0.6875rem]">{value}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+        <section>
+          <h3 className="border-b border-(--ui-stroke-tertiary) pb-2 text-[0.625rem] font-semibold uppercase tracking-[0.12em] text-(--ui-text-tertiary)">
+            Governance operator log
+          </h3>
+          <div className="mt-3 border border-(--ui-stroke-tertiary) bg-(--ui-bg-primary) p-3 font-mono text-[0.6875rem] leading-5 text-(--ui-text-secondary)">
+            <p>&gt;&gt; INIT policy_check({proposal.id})</p>
+            {proposal.riskResults.map(result => (
+              <p key={result}>&gt;&gt; PASS {result}</p>
+            ))}
+            <p className="text-amber-500">&gt;&gt; HOLD: manual confirmation required</p>
+            <p className="text-primary">&gt;&gt; SYSTEM: broker transport unavailable</p>
+          </div>
+        </section>
+        <section>
+          <h3 className="border-b border-(--ui-stroke-tertiary) pb-2 text-[0.625rem] font-semibold uppercase tracking-[0.12em] text-(--ui-text-tertiary)">
+            Evidence &amp; verification
+          </h3>
+          <ul className="mt-3 space-y-2">
+            {proposal.evidenceReferences.map(reference => (
+              <li
+                className="flex items-center gap-2 border border-(--ui-stroke-tertiary) bg-(--ui-bg-primary) px-3 py-2 font-mono text-[0.6875rem]"
+                key={reference}
+              >
+                <Codicon name="verified-filled" />
+                {reference}
+              </li>
+            ))}
+          </ul>
+        </section>
+      </div>
+      <div className="border-t border-(--ui-stroke-tertiary) px-5 py-3 text-[0.6875rem] text-(--ui-text-tertiary)">
+        Local simulation only · confirmation required
+      </div>
+    </aside>
   )
 }
 
@@ -342,11 +433,11 @@ function AuditTable({ events }: { events: AuditEvent[] }) {
               <summary className="grid cursor-pointer list-none gap-2 text-xs md:grid-cols-[1fr_1fr_1fr_2fr_auto]">
                 <span className="font-mono text-[0.6875rem]">{event.timestamp}</span>
                 <span className="font-mono text-[0.6875rem] text-(--ui-text-tertiary)">{event.orderId}</span>
-                <span className="font-mono text-[0.6875rem] text-(--ui-text-tertiary)">
-                  {event.evidenceReference}
-                </span>
+                <span className="font-mono text-[0.6875rem] text-(--ui-text-tertiary)">{event.evidenceReference}</span>
                 <span>{event.summary}</span>
-                <StatusLabel tone={event.status === 'rejected' || event.status === 'outcome-uncertain' ? 'danger' : 'muted'}>
+                <StatusLabel
+                  tone={event.status === 'rejected' || event.status === 'outcome-uncertain' ? 'danger' : 'muted'}
+                >
                   {event.status}
                 </StatusLabel>
               </summary>
@@ -372,6 +463,7 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
   const [operatorActionsEnabled, setOperatorActionsEnabled] = useState(false)
   const [pendingAction, setPendingAction] = useState<SimulatedOperatorAction | null>(null)
   const [reloadGeneration, setReloadGeneration] = useState(0)
+  const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -455,17 +547,29 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
 
   const actionLocked = !operatorActionsEnabled || snapshot.brokerConnection !== 'disconnected'
 
+  const selectedProposal =
+    snapshot.proposals.find(proposal => proposal.id === selectedProposalId) ??
+    snapshot.proposals.find(proposal => proposal.status === 'pending') ??
+    snapshot.proposals[0]
+
   return (
-    <section className="flex h-full min-h-0 flex-col bg-(--ui-bg-primary)" data-testid="sigil-operator">
-      <header className={cn('shrink-0 border-b border-(--ui-stroke-tertiary) py-4', PAGE_INSET_X)}>
-        <div className="flex flex-wrap items-start justify-between gap-4">
+    <section
+      className="flex h-full min-h-0 flex-col bg-(--ui-bg-primary) text-[0.8125rem]"
+      data-testid="sigil-operator"
+    >
+      <header
+        className={cn('shrink-0 border-b border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary) py-3', PAGE_INSET_X)}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="text-lg font-semibold tracking-tight">Sigil Operator</h1>
-            <p className="mt-1 text-xs text-(--ui-text-tertiary)">
-              Governed trading mission control · monitoring and local simulation only
-            </p>
+            <div className="flex items-baseline gap-3">
+              <h1 className="text-base font-bold uppercase tracking-[0.025em]">Sigil Operator</h1>
+              <span className="font-mono text-[0.625rem] uppercase tracking-[0.12em] text-(--ui-text-tertiary)">
+                Mission control
+              </span>
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-3">
             <StatusLabel tone={snapshot.environment === 'paper' ? 'info' : 'danger'}>
               {snapshot.environment.toUpperCase()}
             </StatusLabel>
@@ -473,6 +577,11 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
             <StatusLabel tone={snapshot.brokerConnection === 'connected' ? 'success' : 'danger'}>
               {snapshot.brokerConnection.toUpperCase()}
             </StatusLabel>
+            <span className="hidden h-5 w-px bg-(--ui-stroke-tertiary) sm:block" />
+            <span className="font-mono text-[0.6875rem] font-semibold text-primary">
+              HEALTH · {snapshot.systemHealth === 'Governance healthy' ? '99.8%' : snapshot.systemHealth}
+            </span>
+            <StatusLabel tone="success">{snapshot.certificationStatus}</StatusLabel>
           </div>
         </div>
       </header>
@@ -480,7 +589,7 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
       <nav
         aria-label="Sigil sections"
         className={cn(
-          'flex shrink-0 gap-1 overflow-x-auto border-b border-(--ui-stroke-tertiary)',
+          'flex shrink-0 gap-5 overflow-x-auto border-b border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)',
           PAGE_INSET_X
         )}
       >
@@ -488,7 +597,7 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
           <button
             aria-current={section === item ? 'page' : undefined}
             className={cn(
-              'shrink-0 border-b-2 px-2 py-2.5 text-xs transition-colors',
+              'shrink-0 border-b-2 px-0 py-2.5 text-[0.6875rem] font-semibold uppercase tracking-[0.06em] transition-colors',
               section === item
                 ? 'border-primary text-foreground'
                 : 'border-transparent text-(--ui-text-tertiary) hover:text-foreground'
@@ -503,33 +612,66 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
       </nav>
       <div className="min-h-0 flex-1 overflow-y-auto">
         {section === 'overview' ? (
-          <>
-            <MetricStrip snapshot={snapshot} />
-            <div className={cn('py-5', PAGE_INSET_X)}>
-              <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-xs font-semibold uppercase tracking-[0.1em]">Governance pipeline</h2>
-                <span className="text-[0.6875rem] text-(--ui-text-tertiary)">9 immutable control stages</span>
-              </div>
-              <Pipeline compact stages={snapshot.stages} />
-              <div className="mt-6 grid gap-6 xl:grid-cols-[1.35fr_1fr]">
-                <div>
-                  <h2 className="mb-2 text-xs font-semibold uppercase tracking-[0.1em]">Pending proposals</h2>
-                  {snapshot.proposals.filter(proposal => proposal.status === 'pending').slice(0, 2).map(proposal => (
-                    <ProposalDetails
-                      actionLocked
-                      key={proposal.id}
-                      onAction={setPendingAction}
-                      proposal={proposal}
-                    />
-                  ))}
+          <div className="flex min-h-full flex-col xl:flex-row">
+            <div className="min-w-0 flex-1">
+              <MetricStrip snapshot={snapshot} />
+              <div className={cn('py-4', PAGE_INSET_X)}>
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="text-xs font-semibold uppercase tracking-[0.1em]">Governance pipeline</h2>
+                  <span className="font-mono text-[0.625rem] text-(--ui-text-tertiary)">
+                    09 immutable control stages
+                  </span>
                 </div>
-                <div>
-                  <h2 className="mb-4 text-xs font-semibold uppercase tracking-[0.1em]">Launch control</h2>
-                  <LaunchControl actionLocked onAction={setPendingAction} snapshot={snapshot} />
+                <Pipeline compact stages={snapshot.stages} />
+                <div className="mt-5 grid gap-6 2xl:grid-cols-[1.35fr_1fr]">
+                  <div>
+                    <div className="mb-2 flex items-center justify-between">
+                      <h2 className="text-xs font-semibold uppercase tracking-[0.1em]">Pending proposals</h2>
+                      <span className="font-mono text-[0.625rem] text-(--ui-text-tertiary)">
+                        {snapshot.pendingApprovals} awaiting review
+                      </span>
+                    </div>
+                    {snapshot.proposals
+                      .filter(proposal => proposal.status === 'pending')
+                      .slice(0, 2)
+                      .map(proposal => (
+                        <button
+                          aria-pressed={selectedProposal?.id === proposal.id}
+                          className={cn(
+                            'grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-t border-(--ui-stroke-tertiary) px-2 py-3 text-left transition-colors last:border-b hover:bg-(--chrome-action-hover)',
+                            selectedProposal?.id === proposal.id && 'border-l-2 border-l-primary bg-(--ui-bg-secondary)'
+                          )}
+                          key={proposal.id}
+                          onClick={() => setSelectedProposalId(proposal.id)}
+                          type="button"
+                        >
+                          <span className="min-w-0">
+                            <span className="flex items-center gap-2">
+                              <span className="font-mono text-xs font-semibold">{proposal.symbol}</span>
+                              <StatusLabel tone={proposal.side === 'BUY' ? 'info' : 'warning'}>
+                                {proposal.side}
+                              </StatusLabel>
+                            </span>
+                            <span className="mt-1 block truncate text-[0.6875rem] text-(--ui-text-tertiary)">
+                              {proposal.id} · {proposal.strategy}
+                            </span>
+                          </span>
+                          <span className="text-right font-mono text-[0.6875rem]">
+                            <span className="block">{proposal.estimatedNotional}</span>
+                            <span className="text-(--ui-text-tertiary)">{proposal.quantity} shares</span>
+                          </span>
+                        </button>
+                      ))}
+                  </div>
+                  <div>
+                    <h2 className="mb-3 text-xs font-semibold uppercase tracking-[0.1em]">Launch control</h2>
+                    <LaunchControl actionLocked onAction={setPendingAction} snapshot={snapshot} />
+                  </div>
                 </div>
               </div>
             </div>
-          </>
+            {selectedProposal ? <ContextInspector proposal={selectedProposal} /> : null}
+          </div>
         ) : null}
         {section === 'pipeline' ? (
           <div className={cn('py-5', PAGE_INSET_X)}>
@@ -602,9 +744,7 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
           <div className={cn('py-5', PAGE_INSET_X)}>
             <div className="mb-4">
               <h2 className="text-sm font-semibold">Chronological audit evidence</h2>
-              <p className="mt-1 text-xs text-(--ui-text-tertiary)">
-                Expand a row to inspect sanitized event details.
-              </p>
+              <p className="mt-1 text-xs text-(--ui-text-tertiary)">Expand a row to inspect sanitized event details.</p>
             </div>
             <AuditTable events={snapshot.auditEvents} />
           </div>
