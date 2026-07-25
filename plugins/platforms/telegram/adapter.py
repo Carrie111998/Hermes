@@ -4110,11 +4110,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_photo_batches.clear()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
-        for handle in getattr(self, "_pending_location_expiry_handles", {}).values():
-            handle.cancel()
-        getattr(self, "_pending_location_expiry_handles", {}).clear()
-        getattr(self, "_pending_location_context", {}).clear()
-        getattr(self, "_pending_location_ack_intents", {}).clear()
+        self._clear_pending_location_state()
         if getattr(self, "_polling_error_task", None) is not current_task:
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
@@ -4220,6 +4216,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Error during Telegram disconnect: %s",
                     self.name, _redact_telegram_error_text(e),
                 )
+        # Updater shutdown can race a final location handler after the first
+        # cleanup pass. This authoritative second pass prevents precise pins,
+        # acknowledgement intents, or timer handles from surviving teardown.
+        self._clear_pending_location_state()
         self._release_platform_lock()
 
         self._app = None
@@ -8453,6 +8453,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if handle is not None:
             handle.cancel()
 
+    def _clear_pending_location_state(self) -> None:
+        """Cancel and discard all staged pins and in-flight acknowledgements."""
+        for handle in getattr(
+            self, "_pending_location_expiry_handles", {}
+        ).values():
+            handle.cancel()
+        getattr(self, "_pending_location_expiry_handles", {}).clear()
+        getattr(self, "_pending_location_context", {}).clear()
+        getattr(self, "_pending_location_ack_intents", {}).clear()
+
     def _expire_staged_location(self, key: str, token: object) -> None:
         """Discard a pin at its deadline unless a newer pin replaced it."""
         pending = self._pending_location_context.get(key)
@@ -8566,6 +8576,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg:
             return
+        if self._should_drop_delayed_delivery():
+            return
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
@@ -8657,6 +8669,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[Telegram] Location pin acknowledgement failed; pin not staged: %s",
                     _redact_telegram_error_text(exc),
                 )
+                return
+            if self._should_drop_delayed_delivery():
+                if self._pending_location_ack_intents.get(location_key) is ack_intent:
+                    self._pending_location_ack_intents.pop(location_key, None)
                 return
             if self._pending_location_ack_intents.get(location_key) is not ack_intent:
                 logger.info(

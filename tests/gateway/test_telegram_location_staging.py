@@ -53,6 +53,7 @@ def _adapter(*, mode: str = "stage_next", ttl: float = 300.0):
         str(event.source.thread_id or ""),
     ))
     adapter._is_user_authorized_from_message = lambda msg: True
+    adapter._should_drop_delayed_delivery = lambda: False
     adapter._should_process_message = lambda msg, **kwargs: True
     adapter._effective_update_message = lambda update: update.effective_message
     adapter._apply_telegram_group_observe_attribution = lambda event: event
@@ -409,6 +410,45 @@ async def test_delayed_older_ack_cannot_replace_newer_pin():
     pending_text = next(iter(adapter._pending_location_context.values()))[2]
     assert "latitude: 88.8888" in pending_text
     assert "latitude: 11.1111" not in pending_text
+
+
+@pytest.mark.asyncio
+async def test_location_pin_is_dropped_after_disconnect_fence():
+    adapter = _adapter()
+    adapter._should_drop_delayed_delivery = lambda: True
+    msg = _message()
+
+    await adapter._handle_location_message(_update(msg), None)
+
+    msg.reply_text.assert_not_awaited()
+    assert adapter._pending_location_context == {}
+    assert adapter._pending_location_ack_intents == {}
+    assert adapter._pending_location_expiry_handles == {}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_ack_does_not_stage_location():
+    adapter = _adapter()
+    disconnecting = False
+    adapter._should_drop_delayed_delivery = lambda: disconnecting
+    ack_started = asyncio.Event()
+    release_ack = asyncio.Event()
+    msg = _message()
+
+    async def delayed_ack(*args, **kwargs):
+        ack_started.set()
+        await release_ack.wait()
+
+    msg.reply_text.side_effect = delayed_ack
+    task = asyncio.create_task(adapter._handle_location_message(_update(msg), None))
+    await ack_started.wait()
+    disconnecting = True
+    release_ack.set()
+    await task
+
+    assert adapter._pending_location_context == {}
+    assert adapter._pending_location_ack_intents == {}
+    assert adapter._pending_location_expiry_handles == {}
 
 
 def test_stage_mode_text_batches_are_always_sender_scoped():
