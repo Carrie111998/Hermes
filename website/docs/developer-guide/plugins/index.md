@@ -621,7 +621,7 @@ The kanban lifecycle hooks fire **after** the board DB change commits, so a call
 
 ### `pre_llm_call` context injection
 
-This is the only hook whose return value matters. When a `pre_llm_call` callback returns a dict with a `"context"` key (or a plain string), Hermes injects that text into the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context.
+For `pre_llm_call`, a callback return value can inject context into the current turn. When it returns a dict with a `"context"` key (or a plain string), Hermes prepends that text to the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context. (`gateway_message` has its separate terminal-decision contract above.)
 
 #### Return format
 

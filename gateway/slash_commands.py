@@ -103,17 +103,23 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(
+        self,
+        event: MessageEvent,
+        *,
+        cancel_notified: bool = False,
+    ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
         # Get existing session key
         session_key = self._session_key_for_source(source)
-        await self._notify_gateway_session_cancel(
-            session_key,
-            source,
-            reason="reset",
-        )
+        if not cancel_notified:
+            await self._notify_gateway_session_cancel(
+                session_key,
+                source,
+                reason="reset",
+            )
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return

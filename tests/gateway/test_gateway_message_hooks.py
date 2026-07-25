@@ -1,6 +1,8 @@
 """Public contract tests for the generic gateway user-message hook."""
 
 import asyncio
+import dataclasses
+import threading
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -457,6 +459,81 @@ async def test_active_session_stop_notifies_cancel_hook_before_interrupt(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_active_session_new_notifies_cancel_hook_before_interrupt(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    source = _source()
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = MagicMock()
+    order = []
+
+    async def notify(*_args, **_kwargs):
+        order.append("notify")
+
+    async def interrupt(*_args, **_kwargs):
+        order.append("interrupt")
+
+    async def reset(*_args, **kwargs):
+        order.append(("reset", kwargs))
+        return "reset"
+
+    runner._notify_gateway_session_cancel = notify
+    runner._interrupt_and_clear_session = interrupt
+    runner._handle_reset_command = reset
+    event = _event()
+    event.text = "/new"
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+
+    assert await runner._handle_message(event) == "reset"
+
+    assert order == ["notify", "interrupt", ("reset", {"cancel_notified": True})]
+
+
+@pytest.mark.asyncio
+async def test_cold_hook_sees_recovered_telegram_route(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        profile="default",
+        scope_id="scope-1",
+        chat_id="chat-1",
+        chat_name="Room",
+        chat_type="dm",
+        thread_id="stale-thread",
+        user_id="user-1",
+        user_name="User",
+    )
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="native-1")),
+        _pending_messages={},
+        _active_sessions={},
+        _session_locks={},
+        _stop_typing=AsyncMock(),
+        _pending_lock=threading.Lock(),
+        cancel_pending_drain=lambda _key: None,
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True, token="***")
+    runner._recover_telegram_topic_thread_id = lambda _source: "canonical-thread"
+    runner._is_telegram_topic_root_lobby = lambda _source: False
+    captured = {}
+
+    async def hook(_name, **kwargs):
+        captured.update(kwargs)
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
+    event = MessageEvent(text="hello", source=source, message_id="in-1")
+
+    await runner._handle_message(event)
+
+    assert captured["route"].thread_id == "canonical-thread"
+    assert captured["route"].session_key == build_session_key(
+        dataclasses.replace(source, thread_id="canonical-thread")
+    )
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_gateway_session_cancel_hook_receives_only_route_and_reason(monkeypatch):
     runner, _adapter = _runner_for_dispatch()
     captured = {}
@@ -478,3 +555,25 @@ async def test_gateway_session_cancel_hook_receives_only_route_and_reason(monkey
     assert captured["kwargs"]["route"] == GatewayMessageRoute.from_source(
         source, session_key=session_key
     )
+
+
+@pytest.mark.asyncio
+async def test_gateway_session_cancel_hook_timeout_does_not_block_stop(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    entered = asyncio.Event()
+
+    async def stuck_hook(_name, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", stuck_hook)
+    monkeypatch.setattr("gateway.run.GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS", 0.01)
+    source = _source()
+
+    await runner._notify_gateway_session_cancel(
+        build_session_key(source),
+        source,
+        reason="stop",
+    )
+
+    assert entered.is_set()

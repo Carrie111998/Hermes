@@ -2572,6 +2572,7 @@ _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
+GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS = 2.0
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
@@ -10907,6 +10908,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Resolve Telegram topic-mode routing before deriving the session key or
+        # exposing the immutable post-authorization plugin route. A stale or
+        # foreign thread ID must not escape through a route-bound capability.
+        recovered = None
+        if not event.is_command():
+            recovered = await asyncio.to_thread(
+                self._recover_telegram_topic_thread_id,
+                source,
+            )
+        if recovered is not None:
+            logger.info(
+                "telegram topic recovery: chat=%s user=%s %r -> %s",
+                source.chat_id,
+                source.user_id,
+                source.thread_id,
+                recovered,
+            )
+            source = dataclasses.replace(source, thread_id=recovered)
+            event = dataclasses.replace(event, source=source)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -11208,6 +11229,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # doesn't get re-processed as a user message after the
             # interrupt completes.
             if _cmd_def_inner and _cmd_def_inner.name == "new":
+                # Notify plugin-owned work before the hard host interruption.
+                # The reset handler is told not to emit the same boundary twice.
+                await self._notify_gateway_session_cancel(
+                    _quick_key,
+                    source,
+                    reason="reset",
+                )
                 # Clear any pending messages so the old text doesn't replay
                 await self._interrupt_and_clear_session(
                     _quick_key,
@@ -11217,7 +11245,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
-                return await self._handle_reset_command(event)
+                return await self._handle_reset_command(event, cancel_notified=True)
 
             # /queue <prompt> — queue without interrupting.
             # Semantics: each /queue invocation produces its own full agent
@@ -12960,16 +12988,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.plugins import invoke_hook_async
 
         try:
-            await invoke_hook_async(
-                "gateway_session_cancel",
-                route=GatewayMessageRoute.from_source(
-                    source,
-                    session_key=session_key,
+            await asyncio.wait_for(
+                invoke_hook_async(
+                    "gateway_session_cancel",
+                    route=GatewayMessageRoute.from_source(
+                        source,
+                        session_key=session_key,
+                    ),
+                    reason=str(reason),
                 ),
-                reason=str(reason),
+                timeout=GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            logger.warning(
+                "gateway_session_cancel hook exceeded %.1fs for %s; "
+                "continuing the host session boundary",
+                GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS,
+                session_key,
+            )
         except Exception as exc:
             logger.warning(
                 "gateway_session_cancel hook failed for %s (%s)",
@@ -12990,22 +13028,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
 
-        # Get or create session
-        # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
-        # last-active topic so a cross-topic Reply or stripped plain reply
-        # doesn't fragment the conversation across sessions.
-        recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
-        if recovered is not None:
-            logger.info(
-                "telegram topic recovery: chat=%s user=%s %r -> %s",
-                source.chat_id, source.user_id, source.thread_id, recovered,
-            )
-            source = dataclasses.replace(source, thread_id=recovered)
-            try:
-                event.source = source
-            except Exception:
-                pass
-
+        # Get or create session. Telegram topic-mode recovery has already run
+        # before the post-authorization hook and session-key derivation.
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         pinned_session_id = str(

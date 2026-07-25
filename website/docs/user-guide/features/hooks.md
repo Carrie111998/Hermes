@@ -372,9 +372,9 @@ def register(ctx):
 **General rules for all hooks:**
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility — new parameters may be added in future versions without breaking your plugin.
-- If a callback **crashes**, it's logged and skipped. Other hooks and the agent continue normally. A misbehaving plugin can never break the agent.
-- Two hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, and [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call. All other hooks are fire-and-forget observers.
-- Observer callbacks receive `telemetry_schema_version` automatically. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat `api_request_id` as an opaque identifier; do not parse its string format.
+- Callback failures are normally logged and skipped. `gateway_message` is deliberately stricter: once a callback matches, an exception or invalid terminal result suppresses normal dispatch. Task cancellation always propagates.
+- Three hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call, and [`gateway_message`](#gateway_message) can terminate or continue gateway dispatch. Other hooks are observers.
+- Observer callbacks invoked through the synchronous observer path receive `telemetry_schema_version` automatically. Async gateway hooks receive only the arguments documented for their specific contracts. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat `api_request_id` as an opaque identifier; do not parse its string format.
 
 ### Quick reference
 
@@ -1028,7 +1028,7 @@ This hook is not invoked for unauthorized, internal, slash-command, or already-i
 
 ### `gateway_session_cancel`
 
-Fires after Hermes confirms an explicit `/stop` or `/new`/reset boundary. The callback receives the immutable `route` and a `reason` (`"stop"` or `"reset"`) so plugin-owned schedulers can invalidate active and pending work. It is an observer notification: returns are ignored, callback failures are logged, and task cancellation propagates.
+Fires after Hermes confirms an explicit `/stop` or `/new`/reset boundary. The callback receives the immutable `route` and a `reason` (`"stop"` or `"reset"`) so plugin-owned schedulers can invalidate active and pending work. It is a bounded best-effort observer notification: returns are ignored, callback failures are logged, and Hermes proceeds with the host interruption/reset if callbacks do not finish within two seconds. Caller task cancellation still propagates.
 
 ```python
 async def cancel_plugin_work(route, reason, **kwargs):
