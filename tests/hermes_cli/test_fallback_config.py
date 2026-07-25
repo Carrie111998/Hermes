@@ -51,6 +51,7 @@ class TestGetFallbackChainOrder:
             ),
         )
         cfg = {
+            "fleet": {"enabled": True},
             "fallback_providers": [
                 {"provider": "grok", "model": "grok-4.5"},
                 {"provider": "chatgpt_codex", "model": "gpt-5.6-sol"},

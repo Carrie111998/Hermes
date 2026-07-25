@@ -12932,6 +12932,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "logout",
         "auth",
         "status",
+        "fleet",
         "cron",
         "doctor",
         "config",
