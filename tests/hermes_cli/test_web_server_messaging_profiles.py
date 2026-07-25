@@ -108,11 +108,13 @@ class TestProfileScopedMessagingReads:
             yaml.safe_dump({"platforms": {"telegram": {"enabled": True}}}),
             encoding="utf-8",
         )
-        monkeypatch.setattr(web_server, "get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            web_server, "get_running_pid", lambda *a, **k: None
+        )
         monkeypatch.setattr(
             web_server,
             "read_runtime_status",
-            lambda: {
+            lambda *a, **k: {
                 "gateway_state": "startup_failed",
                 "exit_reason": "all configured messaging platforms failed to connect",
                 "platforms": {},
