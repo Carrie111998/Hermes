@@ -25,7 +25,9 @@ the core:
   `upstream_sync_discord_reporter.py` service reads only that public result and
   reuses `hermes send`; it has no GitHub credential. This separation keeps
   model/provider, Muncho brain, SkyAI customer data, and Discord credentials
-  outside the mechanical sync service.
+  outside the mechanical sync service. Rail-owned Muncho worktrees are removed
+  after their structured result is captured so a blocked Muncho merge cannot
+  consume the disk-space gate reserved for the following SkyAI job.
 - `planned_gateway_restart.sh` writes the existing Hermes planned-stop marker
   before an external service manager restarts the gateway.
 - `production_config_model_sovereignty.py` plans, applies, and rolls back the
