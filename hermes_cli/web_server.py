@@ -15815,7 +15815,13 @@ def mount_spa(application: FastAPI):
                 status_code=404,
             )
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
-        gated = bool(getattr(app.state, "auth_required", False))
+        # Read gating from the app this SPA was mounted on, not the module
+        # global. Production calls ``mount_spa(app)`` so the two are the same
+        # object and behaviour is unchanged, but every route above registers
+        # on ``application`` — deciding the auth scheme from a different app
+        # than the one serving the request is how a gated mount could end up
+        # emitting the long-lived token that gated mode exists to withhold.
+        gated = bool(getattr(application.state, "auth_required", False))
         gated_js = "true" if gated else "false"
         if gated:
             bootstrap_script = (
