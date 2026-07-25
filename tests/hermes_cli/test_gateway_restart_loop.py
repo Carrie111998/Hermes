@@ -338,6 +338,35 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
+    def test_blocks_lifecycle_command_hidden_in_script_inside_gateway(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "delayed_restart.sh"
+        script.write_text(
+            "#!/bin/bash\n"
+            "launchctl kickstart -k user/501/ai.hermes.gateway-mission-control\n"
+        )
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "cwd": str(tmp_path),
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+
+        result = json.loads(tt.terminal_tool(
+            command="sleep 75; ./delayed_restart.sh"
+        ))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt

@@ -66,11 +66,73 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 )
 
 
+_SHELL_SCRIPT_REF_PATTERN = re.compile(
+    r"(?<![\w./~-])"
+    r"("
+    r"(?:~|/|\./|\../)?"
+    r"[A-Za-z0-9_./:@%+=,\-]+\.sh"
+    r")"
+)
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(text))
+
+
+def _resolve_terminal_script_path(script_path: str, cwd: Optional[Path | str]) -> Path:
+    raw = Path(script_path).expanduser()
+    if raw.is_absolute():
+        return raw
+    base = Path(cwd).expanduser() if cwd else Path.cwd()
+    return base / raw
+
+
+def _read_file_for_scanning(path: Path) -> str:
+    try:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _iter_shell_script_refs(text: str) -> list[str]:
+    seen: set[str] = set()
+    refs: list[str] = []
+    for match in _SHELL_SCRIPT_REF_PATTERN.finditer(text or ""):
+        ref = match.group(1)
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
+def contains_gateway_lifecycle_invocation(
+    text: str,
+    *,
+    cwd: Optional[Path | str] = None,
+) -> bool:
+    """Return True if a shell command directly or indirectly targets the gateway.
+
+    ``contains_gateway_lifecycle_command`` intentionally scans only the supplied
+    text.  Terminal execution needs one more layer: a command can invoke a
+    helper script, e.g. ``sleep 75; /tmp/restart.sh``, whose contents contain
+    the actual ``launchctl``/``hermes gateway restart`` foot-gun.  This helper
+    scans readable ``*.sh`` references as they would be resolved from the
+    command cwd.
+    """
+    if contains_gateway_lifecycle_command(text):
+        return True
+
+    for ref in _iter_shell_script_refs(text):
+        script_text = _read_file_for_scanning(
+            _resolve_terminal_script_path(ref, cwd)
+        )
+        if script_text and contains_gateway_lifecycle_command(script_text):
+            return True
+
+    return False
 
 
 def _resolve_script_path(script_path: str) -> Path:
@@ -101,12 +163,7 @@ def _read_script_for_scanning(script_path: str) -> str:
     an attacker hide the command in binary noise.  Returns an empty string
     only when the file cannot be read at all.
     """
-    try:
-        return _resolve_script_path(script_path).read_bytes().decode(
-            "utf-8", errors="replace"
-        )
-    except OSError:
-        return ""
+    return _read_file_for_scanning(_resolve_script_path(script_path))
 
 
 def check_gateway_lifecycle(
