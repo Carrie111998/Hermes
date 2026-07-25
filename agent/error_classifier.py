@@ -736,9 +736,16 @@ def classify_api_error(
     # ``self.tools`` in the retry loop and retry once. Cloud providers are
     # unaffected — they accept these keywords and we never hit this branch.
     if (
-        status_code == 400
+        (
+            status_code == 400
+            or (
+                status_code is None
+                and "predict request returned 400" in error_msg
+            )
+        )
         and (
             "error parsing grammar" in error_msg
+            or "failed to parse grammar" in error_msg
             or "json-schema-to-grammar" in error_msg
             or (
                 "unable to generate parser" in error_msg

@@ -4205,6 +4205,73 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_lm_studio_grammar_error_strips_schema_and_retries_once(self, agent):
+        """LM Studio's wrapped 400 triggers the full llama.cpp recovery chain."""
+        self._setup_agent(agent)
+        agent.provider = "custom"
+        agent.model = "qwen3.6-35b-a3b"
+        agent.base_url = "http://localhost:1234/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "periodic_note",
+                    "description": "Read a dated note",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "date": {
+                                "type": "string",
+                                "pattern": r"^\d{4}-\d{2}-\d{2}$",
+                                "format": "date",
+                            }
+                        },
+                    },
+                },
+            }
+        ]
+        recovered = _mock_response(
+            content="HERMES_LM_GRAMMAR_RECOVERY_OK",
+            finish_reason="stop",
+        )
+        request_tools = []
+
+        def _lm_studio_then_recover(api_kwargs):
+            request_tools.append(json.loads(json.dumps(api_kwargs["tools"])))
+            if len(request_tools) == 1:
+                raise Exception(
+                    'Engine protocol predict request returned 400: '
+                    '{"error":{"code":400,"message":"Failed to initialize '
+                    'samplers: failed to parse grammar","type":"invalid_request_error"}}'
+                )
+            return recovered
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=_lm_studio_then_recover,
+            ) as mock_api_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("reply with the recovery sentinel")
+
+        assert result["final_response"] == "HERMES_LM_GRAMMAR_RECOVERY_OK"
+        assert result["completed"] is True
+        assert mock_api_call.call_count == 2
+        assert request_tools[0][0]["function"]["parameters"]["properties"]["date"] == {
+            "type": "string",
+            "pattern": r"^\d{4}-\d{2}-\d{2}$",
+            "format": "date",
+        }
+        assert request_tools[1][0]["function"]["parameters"]["properties"]["date"] == {
+            "type": "string",
+        }
+        assert agent.tools == request_tools[1]
+
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
         agent._cached_system_prompt = "stable instructions\n\nsession context"

@@ -932,6 +932,37 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_compress is False
 
+    def test_lm_studio_failed_to_parse_grammar(self):
+        """LM Studio wraps llama.cpp grammar failures in a sampler error."""
+        e = MockAPIError(
+            "Failed to initialize samplers: failed to parse grammar",
+            status_code=400,
+        )
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="qwen3.6-35b-a3b",
+        )
+        assert result.reason == FailoverReason.llama_cpp_grammar_pattern
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_lm_studio_embedded_400_failed_to_parse_grammar(self):
+        """LM Studio's SDK wrapper may expose HTTP 400 only in the message."""
+        e = Exception(
+            'Engine protocol predict request returned 400: '
+            '{"error":{"code":400,"message":"Failed to initialize samplers: '
+            'failed to parse grammar","type":"invalid_request_error"}}'
+        )
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="qwen3.6-35b-a3b",
+        )
+        assert result.reason == FailoverReason.llama_cpp_grammar_pattern
+        assert result.retryable is True
+        assert result.should_compress is False
+
     def test_llama_cpp_unable_to_generate_parser(self):
         """Older llama.cpp builds surface the error as 'unable to generate parser'."""
         e = MockAPIError(
