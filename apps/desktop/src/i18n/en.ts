@@ -438,6 +438,8 @@ export const en: Translations = {
       uiScaleTitle: 'UI Scale',
       uiScaleDesc: (percent: number) =>
         `Scales text and controls across the whole app. Cmd/Ctrl with +, - and 0 also works. Current: ${percent}%.`,
+      zoomScrollTitle: 'Mouse Wheel Zoom',
+      zoomScrollDesc: 'Allow Cmd/Ctrl with the mouse wheel to change the app scale.',
       translucencyTitle: 'Window Translucency',
       translucencyDesc: 'See your desktop through the whole window. macOS and Windows only.',
       backdropTitle: 'Chat Backdrop',

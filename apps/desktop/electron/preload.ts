@@ -140,6 +140,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     // Current zoom of this window, as { level, percent }.
     get: () => ipcRenderer.invoke('hermes:zoom:get'),
     setPercent: percent => ipcRenderer.send('hermes:zoom:set-percent', percent),
+    getScrollEnabled: () => ipcRenderer.invoke('hermes:zoom:get-scroll-enabled'),
+    setScrollEnabled: enabled => ipcRenderer.send('hermes:zoom:set-scroll-enabled', Boolean(enabled)),
     // Fires on every zoom change, including the Ctrl/Cmd +/-/0 shortcuts,
     // so the settings UI can stay in sync with the keyboard.
     onChanged: callback => {

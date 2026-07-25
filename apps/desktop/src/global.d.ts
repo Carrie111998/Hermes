@@ -153,7 +153,9 @@ declare global {
       }
       zoom?: {
         get: () => Promise<{ level: number; percent: number }>
+        getScrollEnabled: () => Promise<boolean>
         setPercent: (percent: number) => void
+        setScrollEnabled: (enabled: boolean) => void
         onChanged: (callback: (payload: { level: number; percent: number }) => void) => () => void
       }
       revealLogs: () => Promise<{ ok: boolean; path: string; error?: string }>

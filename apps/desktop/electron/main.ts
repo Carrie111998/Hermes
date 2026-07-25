@@ -2331,6 +2331,7 @@ const schedulePersistWindowState = debounce(persistWindowState, 250)
 // recovered from a crash (#56726). JSON survives; localStorage is kept as a
 // secondary mirror so pre-JSON installs migrate transparently on first read.
 const DESKTOP_ZOOM_STATE_PATH = path.join(app.getPath('userData'), 'zoom-state.json')
+const DESKTOP_ZOOM_SCROLL_STATE_PATH = path.join(app.getPath('userData'), 'zoom-scroll.json')
 
 function readZoomState() {
   try {
@@ -2351,6 +2352,25 @@ function writeZoomState(zoomLevel) {
     rememberLog(`[zoom] json persist failed: ${error?.message || error}`)
   }
 }
+
+function readPersistedZoomScrollEnabled() {
+  try {
+    return JSON.parse(fs.readFileSync(DESKTOP_ZOOM_SCROLL_STATE_PATH, 'utf8')).enabled !== false
+  } catch {
+    return true
+  }
+}
+
+function writePersistedZoomScrollEnabled(enabled) {
+  try {
+    fs.mkdirSync(path.dirname(DESKTOP_ZOOM_SCROLL_STATE_PATH), { recursive: true })
+    writeFileAtomic(DESKTOP_ZOOM_SCROLL_STATE_PATH, JSON.stringify({ enabled }, null, 2))
+  } catch (error) {
+    rememberLog(`[zoom] scroll preference persist failed: ${error?.message || error}`)
+  }
+}
+
+let zoomScrollEnabled = readPersistedZoomScrollEnabled()
 
 // Match the backend's source resolution but bias toward a real git checkout.
 // Dev → SOURCE_REPO_ROOT. Packaged/CLI install → ACTIVE_HERMES_ROOT.
@@ -5426,6 +5446,7 @@ function installPreviewShortcut(window) {
 import {
   applyZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  handleZoomChanged,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
   ZOOM_STEP,
@@ -5539,9 +5560,12 @@ function installZoomShortcuts(window) {
   // so wheel zoom survives restarts and the settings Scale control stays in
   // sync, and use the same half step for consistency.
   window.webContents.on('zoom-changed', (event, zoomDirection) => {
-    event.preventDefault()
-    const delta = zoomDirection === 'in' ? ZOOM_STEP : -ZOOM_STEP
-    setAndPersistZoomLevel(window, window.webContents.getZoomLevel() + delta)
+    handleZoomChanged(event, zoomDirection, {
+      currentLevel: window.webContents.getZoomLevel(),
+      enabled: zoomScrollEnabled,
+      onZoom: level => setAndPersistZoomLevel(window, level),
+      step: ZOOM_STEP
+    })
   })
 }
 
@@ -9469,6 +9493,11 @@ ipcMain.on('hermes:zoom:set-percent', (event, percent) => {
 
   setAndPersistZoomLevel(window, percentToZoomLevel(Number(percent)))
 })
+ipcMain.on('hermes:zoom:set-scroll-enabled', (_event, enabled) => {
+  zoomScrollEnabled = Boolean(enabled)
+  writePersistedZoomScrollEnabled(zoomScrollEnabled)
+})
+ipcMain.handle('hermes:zoom:get-scroll-enabled', () => zoomScrollEnabled)
 
 // --- Pet overlay (pop-out mascot) -----------------------------------------
 // `request` is `{ bounds, screen }`. A fresh pop-out passes viewport-space

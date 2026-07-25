@@ -57,6 +57,27 @@ export function applyZoomLevel(webContents, level) {
   return clamped
 }
 
+/**
+ * Consume Chromium's native Ctrl/Cmd+wheel zoom event.
+ *
+ * The event must always be prevented: when wheel zoom is disabled, letting the
+ * event fall through would re-enable Chromium's default 0.2-step page zoom.
+ * Keyboard shortcuts and the settings scale control use separate paths and
+ * remain available.
+ */
+export function handleZoomChanged(event, direction, { currentLevel, enabled, onZoom, step = 0.1 }) {
+  event.preventDefault()
+
+  if (!enabled) {
+    return false
+  }
+
+  const delta = direction === 'in' ? step : -step
+  onZoom(currentLevel + delta)
+
+  return true
+}
+
 // Chromium can drop webContents zoom when a BrowserWindow is resized, minimized
 // and restored, or crosses onto a monitor with different display scaling. macOS
 // and Windows provide trailing `resized`/`moved` events; Linux only provides the

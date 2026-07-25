@@ -430,6 +430,8 @@ export const zh: Translations = {
       uiScaleTitle: '界面缩放',
       uiScaleDesc: (percent: number) =>
         `缩放整个应用的文字和界面。也可使用 Cmd/Ctrl 加 +、- 或 0 调整。当前：${percent}%`,
+      zoomScrollTitle: '鼠标滚轮缩放',
+      zoomScrollDesc: '允许使用 Cmd/Ctrl 加鼠标滚轮调整应用界面缩放。',
       translucencyTitle: '窗口透明',
       translucencyDesc: '让整个窗口透出桌面。仅支持 macOS 和 Windows。',
       backdropTitle: '聊天背景',

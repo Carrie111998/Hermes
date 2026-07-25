@@ -12,6 +12,7 @@ import {
   applyZoomLevel,
   clampZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  handleZoomChanged,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
   ZOOM_RESIZE_REASSERT_DELAY_MS,
@@ -214,4 +215,34 @@ test('applyZoomLevel clamps garbage before applying and notifying', () => {
     ['setZoomLevel', clamped],
     ['send', 'hermes:zoom:changed', { level: clamped, percent: zoomLevelToPercent(clamped) }]
   ])
+})
+
+test('wheel zoom applies the configured half-step when enabled', () => {
+  const event = { preventDefault: vi.fn() }
+  const levels: number[] = []
+
+  const handled = handleZoomChanged(event, 'in', {
+    currentLevel: 2,
+    enabled: true,
+    onZoom: level => levels.push(level)
+  })
+
+  assert.equal(handled, true)
+  assert.equal(event.preventDefault.mock.calls.length, 1)
+  assert.deepEqual(levels, [2.1])
+})
+
+test('disabled wheel zoom consumes the gesture without changing scale', () => {
+  const event = { preventDefault: vi.fn() }
+  const levels: number[] = []
+
+  const handled = handleZoomChanged(event, 'out', {
+    currentLevel: 2,
+    enabled: false,
+    onZoom: level => levels.push(level)
+  })
+
+  assert.equal(handled, false)
+  assert.equal(event.preventDefault.mock.calls.length, 1)
+  assert.deepEqual(levels, [])
 })
