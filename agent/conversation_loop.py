@@ -41,6 +41,12 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.loop_foreground import (
+    decide_foreground_loop_route,
+    enforce_foreground_loop_plan,
+    foreground_loop_tool_choice,
+    validate_loop_plan_arguments,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -992,12 +998,42 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
+    # Foreground Loop routing is a per-turn decision.  Keep it outside the
+    # cached system prompt and reset it before evaluating the new user turn.
+    agent._foreground_loop_routed = False
+    agent._foreground_loop_plan_attempted = False
+    agent._foreground_loop_route_failures = 0
+    _foreground_loop_decision = decide_foreground_loop_route(agent, user_message)
+    _foreground_loop_required = _foreground_loop_decision.route
+    if _foreground_loop_required:
+        logger.info(
+            "Foreground ultra request routed through Loop planning (%s, session=%s)",
+            _foreground_loop_decision.reason,
+            getattr(agent, "session_id", None) or "-",
+        )
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        if _foreground_loop_required:
+            _plan_ok, _plan_error = enforce_foreground_loop_plan(agent, user_message)
+            if not _plan_ok:
+                _turn_exit_reason = "foreground_loop_plan_rejected"
+                return {
+                    "final_response": (
+                        "The foreground request requires a Loop planning boundary "
+                        f"before Codex app-server work can begin: {_plan_error}."
+                    ),
+                    "messages": messages,
+                    "api_calls": 0,
+                    "completed": False,
+                    "partial": True,
+                    "interrupted": False,
+                    "error": _plan_error,
+                }
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -1768,6 +1804,12 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                if _foreground_loop_required:
+                    _loop_tool_choice = foreground_loop_tool_choice(agent)
+                    if _loop_tool_choice is not None:
+                        # This is a transient per-request guard.  It does not
+                        # touch request_overrides or the cached system prompt.
+                        api_kwargs["tool_choice"] = _loop_tool_choice
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -5686,6 +5728,60 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
+                # A canonical ultra foreground turn cannot silently degrade
+                # into an ordinary answer or ephemeral delegation.  Validate
+                # the first model round's Loop plan before any tool side effect
+                # runs; malformed plans receive matching tool results and are
+                # retried with the named-tool guard still active.
+                if _foreground_loop_required:
+                    _loop_plan_error = "the first round did not call delegate_task(mode='loop')"
+                    _loop_plan_valid = False
+                    for _loop_tc in assistant_message.tool_calls:
+                        if _loop_tc.function.name != "delegate_task":
+                            continue
+                        try:
+                            _loop_raw_args = _loop_tc.function.arguments or "{}"
+                            _loop_args = (
+                                _loop_raw_args
+                                if isinstance(_loop_raw_args, dict)
+                                else json.loads(_loop_raw_args)
+                            )
+                        except (TypeError, json.JSONDecodeError):
+                            _loop_args = None
+                        _loop_plan_valid, _loop_plan_error = validate_loop_plan_arguments(
+                            _loop_args
+                        )
+                        if _loop_plan_valid:
+                            break
+                    if not _loop_plan_valid:
+                        for _loop_tc in assistant_message.tool_calls:
+                            messages.append({
+                                "role": "tool",
+                                "name": _loop_tc.function.name,
+                                "tool_call_id": _loop_tc.id,
+                                "content": (
+                                    "Loop routing rejected this first-round plan: "
+                                    f"{_loop_plan_error}. Retry with a substantive "
+                                    "goal, boundaries/context, and acceptance criteria."
+                                ),
+                            })
+                        agent._foreground_loop_route_failures = (
+                            getattr(agent, "_foreground_loop_route_failures", 0) + 1
+                        )
+                        if agent._foreground_loop_route_failures >= 3:
+                            _turn_exit_reason = "foreground_loop_plan_rejected"
+                            final_response = (
+                                "The foreground request requires a valid Loop plan "
+                                "before work can begin, but the model did not provide one."
+                            )
+                            failed = True
+                            break
+                        agent._persist_session(messages, conversation_history)
+                        continue
+                    _foreground_loop_required = False
+                    agent._foreground_loop_routed = True
+                    agent._foreground_loop_route_failures = 0
+
                 try:
                     # Persist the assistant tool-call turn before any tool
                     # side effects run. If a destructive tool restarts or
@@ -5900,6 +5996,14 @@ def run_conversation(
             
             else:
                 # No tool calls - this is the final response
+                if _foreground_loop_required:
+                    _turn_exit_reason = "foreground_loop_tool_required"
+                    final_response = (
+                        "The foreground request requires a Loop plan before work "
+                        "can begin, but the model returned no delegate_task call."
+                    )
+                    failed = True
+                    break
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch
