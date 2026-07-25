@@ -50,6 +50,12 @@ from .models import (
     SubmissionRequest,
 )
 from .policy import ExecutionPolicy
+from .promotion_readiness import (
+    PaperPromotionReadinessAssessment,
+    PaperPromotionReadinessPolicy,
+    PaperPromotionReadinessStatus,
+    assess_paper_trading_promotion_readiness,
+)
 from .performance_evaluation import (
     PaperPerformanceEvaluation,
     PaperPerformancePolicy,
@@ -134,4 +140,8 @@ __all__ = [
     "PaperPerformanceRecommendation",
     "PaperTradeOutcome",
     "evaluate_paper_trading_performance",
+    "PaperPromotionReadinessAssessment",
+    "PaperPromotionReadinessPolicy",
+    "PaperPromotionReadinessStatus",
+    "assess_paper_trading_promotion_readiness",
 ]
