@@ -436,6 +436,116 @@ def test_runner_defers_for_active_async_delegation(tmp_path, monkeypatch):
     assert runner._renewal_should_defer("route-a", "shared") is True
 
 
+def _renewal_runner(tmp_path, monkeypatch, *, cached=None, capable=None):
+    """Build a bare runner wired to reach the successor-runtime resolution."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._pending_messages = {}
+    runner._pending_steer = {}
+    runner._running_agents = {}
+    runner._turn_lease_tokens = {}
+    runner._agent_cache = dict(cached or {})
+    runner.session_store = _store(tmp_path)
+    now = _now()
+    runner.session_store._entries = {
+        "route-a": SessionEntry("route-a", "shared", now, now),
+    }
+    runner.session_store._loaded = True
+    monkeypatch.setattr(runner, "_get_proxy_url", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        "tools.async_delegation.has_pending_completion_for_session",
+        lambda session_id: False,
+    )
+    if capable is not None:
+        runner.session_store.set_session_metadata(
+            "route-a", "continuity_capsule_capable", capable
+        )
+    return runner
+
+
+def test_cached_supported_agent_does_not_mask_successor_runtime_change(
+    tmp_path, monkeypatch
+):
+    # A supported predecessor agent is still cached AND the last turn recorded a
+    # capable verdict, but config now routes the successor through Codex
+    # app-server / MoA.  Renewal must resolve the successor runtime and defer
+    # rather than trusting the stale cached capability.
+    runner = _renewal_runner(
+        tmp_path,
+        monkeypatch,
+        cached={
+            "route-a": (
+                SimpleNamespace(api_mode="chat_completions", moa_config=None),
+                "sig",
+            )
+        },
+        capable=True,
+    )
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_session_agent_runtime",
+        MagicMock(return_value=("codex", {"api_mode": "codex_app_server"})),
+    )
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_session_agent_runtime",
+        MagicMock(
+            return_value=(
+                "default",
+                {"api_mode": "chat_completions", "requested_provider": "moa"},
+            )
+        ),
+    )
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
+    # Unchanged supported config still renews — and only after resolving the
+    # successor runtime, not by trusting the cached agent alone.
+    resolve = MagicMock(
+        return_value=("default", {"api_mode": "chat_completions"})
+    )
+    monkeypatch.setattr(runner, "_resolve_session_agent_runtime", resolve)
+    assert runner._renewal_should_defer("route-a", "shared") is False
+    assert resolve.called
+
+
+def test_unknown_or_missing_runtime_defers_and_known_mode_renews(
+    tmp_path, monkeypatch
+):
+    # No cached agent remains (post-restart); resolution is the only signal.
+    runner = _renewal_runner(tmp_path, monkeypatch)
+
+    unproven_runtimes = (
+        {},
+        {"api_mode": None},
+        {"api_mode": ""},
+        {"api_mode": "made_up_mode"},
+        {"provider": "openai"},
+    )
+    for runtime in unproven_runtimes:
+        monkeypatch.setattr(
+            runner,
+            "_resolve_session_agent_runtime",
+            MagicMock(return_value=("m", runtime)),
+        )
+        assert runner._renewal_should_defer("route-a", "shared") is True
+
+    proven_runtimes = (
+        {"api_mode": "chat_completions"},
+        {"api_mode": "anthropic_messages"},
+        {"api_mode": "codex_responses"},
+        {"api_mode": "bedrock_converse"},
+    )
+    for runtime in proven_runtimes:
+        monkeypatch.setattr(
+            runner,
+            "_resolve_session_agent_runtime",
+            MagicMock(return_value=("m", runtime)),
+        )
+        assert runner._renewal_should_defer("route-a", "shared") is False
+
+
 def test_exact_row_acknowledgement_and_restart(tmp_path):
     store = _store(tmp_path)
     source = _source()
@@ -501,6 +611,48 @@ def test_failed_local_sidecar_persistence_keeps_capsule_pending(tmp_path):
     restarted = _store(tmp_path)
     pending = restarted.get_or_create_session(source, defer_renewal=True)
     assert pending.continuity_capsule == capsule
+
+
+def test_capsule_ack_requires_exact_first_successor_user_row(tmp_path):
+    store = _store(tmp_path)
+    source = _source()
+    predecessor = _seed(store, source)
+    _expire(store, predecessor)
+    successor = store.get_or_create_session(source)
+    capsule = successor.continuity_capsule
+    assert capsule
+
+    highwater = store._db.latest_message_id(successor.session_id)
+    # The exact first successor user row does NOT carry the capsule...
+    store._db.append_message(successor.session_id, "user", "unrelated first")
+    # ...and a later user row happens to contain the capsule text. The later
+    # match must NOT clear the capsule while an earlier successor row exists.
+    store._db.append_message(
+        successor.session_id,
+        "user",
+        "hello",
+        api_content=compose_user_api_content("hello", "", capsule),
+    )
+    assert store._db.find_new_user_message_with_capsule(
+        successor.session_id,
+        capsule,
+        after_message_id=highwater,
+    ) is None
+
+    # When the exact first successor row after the high-water mark carries the
+    # capsule, that row's id is returned.
+    fresh_highwater = store._db.latest_message_id(successor.session_id)
+    first_id = store._db.append_message(
+        successor.session_id,
+        "user",
+        "renew",
+        api_content=compose_user_api_content("renew", "", capsule),
+    )
+    assert store._db.find_new_user_message_with_capsule(
+        successor.session_id,
+        capsule,
+        after_message_id=fresh_highwater,
+    ) == first_id
 
 
 def test_listing_projects_latest_child_activity_with_root_title(tmp_path):

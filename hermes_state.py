@@ -4164,18 +4164,25 @@ class SessionDB:
         *,
         after_message_id: int,
     ) -> Optional[int]:
-        """Find the newest exact successor user row created after a turn began."""
+        """Return the exact first successor user row iff it carries the capsule.
+
+        The capsule may only be acknowledged by the FIRST user row created after
+        the supplied high-water mark. If that earliest successor row does not
+        contain the capsule, a later matching row cannot clear it — return None
+        so the capsule stays pending.
+        """
         with self._lock:
             assert self._conn is not None
-            rows = self._conn.execute(
+            row = self._conn.execute(
                 "SELECT id, api_content FROM messages "
                 "WHERE session_id = ? AND role = 'user' AND active = 1 AND id > ? "
-                "ORDER BY id DESC",
+                "ORDER BY id ASC LIMIT 1",
                 (session_id, int(after_message_id)),
-            ).fetchall()
-        for row in rows:
-            if capsule in str(row["api_content"] or ""):
-                return int(row["id"])
+            ).fetchone()
+        if row is None:
+            return None
+        if capsule in str(row["api_content"] or ""):
+            return int(row["id"])
         return None
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]:

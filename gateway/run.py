@@ -2210,6 +2210,21 @@ _AGENT_PENDING_SENTINEL = object()
 # across restarts for runtimes that cannot stamp an exact user-row sidecar.
 _CONTINUITY_CAPSULE_CAPABLE_METADATA = "continuity_capsule_capable"
 
+# api_mode values whose turns durably stamp an exact api_content user-row
+# sidecar, so a bounded continuity capsule can later be acknowledged. This
+# mirrors the persisted-capability verdict (every resolved API mode except
+# ``codex_app_server``, which hands the turn to a subprocess). MoA and proxy
+# are handled separately, and any missing/unknown api_mode is unproven and
+# defers rather than being trusted.
+_CONTINUITY_RENEWAL_SUPPORTED_API_MODES = frozenset(
+    {
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+        "bedrock_converse",
+    }
+)
+
 # Conversation-scoped per-session state registry.  Every GatewayRunner dict
 # keyed by session_key whose entries must NOT survive a conversation boundary
 # (/new, /resume, auto-reset, expiry finalization, compression-exhausted
@@ -5966,30 +5981,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sidecar, so they cannot satisfy capsule acknowledgement safely.
             return True
 
-        if cached_agent is None:
-            # After a restart no cache remains to reveal the runtime. Resolve
-            # it from persisted session/channel configuration rather than
-            # assuming sidecar support. Unknown resolution fails closed.
-            try:
-                with store._lock:
-                    entry = store._entries.get(session_key)
-                    source = entry.origin if entry is not None else None
-                _model, runtime = self._resolve_session_agent_runtime(
-                    source=source,
-                    session_key=session_key,
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to resolve continuity runtime before renewal",
-                    exc_info=True,
-                )
-                return True
-            if (
-                runtime.get("api_mode") == "codex_app_server"
-                or runtime.get("provider") == "moa"
-                or runtime.get("requested_provider") == "moa"
-            ):
-                return True
+        # A cached supported predecessor does NOT prove the successor runtime:
+        # a config change to Codex app-server or MoA must still defer even while
+        # an old supported agent remains cached (proxy is already caught above).
+        # Resolve the runtime that will actually handle the successor — from a
+        # live cache or, after a restart, from persisted session/channel
+        # configuration — and only proceed for a proven-supported api_mode.
+        # A missing/unknown api_mode or an MoA provider is unproven and fails
+        # closed rather than being trusted.
+        try:
+            with store._lock:
+                entry = store._entries.get(session_key)
+                source = entry.origin if entry is not None else None
+            _model, runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to resolve continuity runtime before renewal",
+                exc_info=True,
+            )
+            return True
+        if (
+            runtime.get("api_mode") not in _CONTINUITY_RENEWAL_SUPPORTED_API_MODES
+            or runtime.get("provider") == "moa"
+            or runtime.get("requested_provider") == "moa"
+        ):
+            return True
         return False
 
     def _active_session_limit_message(self, session_key: str) -> Optional[str]:
