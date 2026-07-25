@@ -7909,26 +7909,40 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    "closed") cannot authorize a retry, and no network/API failure can
     #    silently turn an unresolved PR into a closed one.  The strict
     #    timestamp comparison stays fail-closed when ordering is ambiguous.
+    #
+    #    Comments and resume events must come from one SQLite statement.  The
+    #    connection runs in autocommit mode, so separate SELECTs would open
+    #    separate snapshots and let a newer unresolved PR commit between them
+    #    while an older resume event incorrectly authorizes another worker.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    latest_pr_comment_at: Optional[int] = None
-    for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
+    pr_inputs = conn.execute(
+        "SELECT 'comment' AS record_type, id AS record_id, body, created_at, "
+        "NULL AS kind, NULL AS payload "
+        "FROM task_comments WHERE task_id = ? AND created_at >= ? "
+        "UNION ALL "
+        "SELECT 'event' AS record_type, id AS record_id, NULL AS body, "
+        "created_at, kind, payload FROM task_events "
         "WHERE task_id = ? AND created_at >= ? "
-        "ORDER BY created_at DESC, id DESC",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            latest_pr_comment_at = int(c["created_at"])
+        "AND kind IN ('status', 'unblocked', 'promoted_manual') "
+        "ORDER BY record_type, created_at DESC, record_id DESC",
+        (task_id, pr_cutoff, task_id, pr_cutoff),
+    ).fetchall()
+
+    latest_pr_comment_at: Optional[int] = None
+    for record in pr_inputs:
+        if record["record_type"] != "comment":
+            continue
+        if record["body"] and _RESPAWN_GUARD_PR_URL_RE.search(record["body"]):
+            latest_pr_comment_at = int(record["created_at"])
             break
 
     if latest_pr_comment_at is not None:
-        for event in conn.execute(
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? "
-            "AND kind IN ('status', 'unblocked', 'promoted_manual') "
-            "AND created_at > ?",
-            (task_id, latest_pr_comment_at),
-        ).fetchall():
+        for event in pr_inputs:
+            if (
+                event["record_type"] != "event"
+                or int(event["created_at"]) <= latest_pr_comment_at
+            ):
+                continue
             if event["kind"] == "unblocked":
                 return None
             try:
