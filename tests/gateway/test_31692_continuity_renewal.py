@@ -723,6 +723,11 @@ async def test_gateway_acknowledges_capsule_after_agent_session_rotation(
     source = _source()
     predecessor = await runner.async_session_store.get_or_create_session(source)
     runner.session_store._db.replace_messages(predecessor.session_id, PRED_MESSAGES)
+    runner.session_store.set_session_metadata(
+        predecessor.session_key,
+        gateway_run._CONTINUITY_CAPSULE_CAPABLE_METADATA,
+        True,
+    )
     _expire(runner.session_store, predecessor)
     successor = await runner.async_session_store.get_or_create_session(source)
     successor_id = successor.session_id

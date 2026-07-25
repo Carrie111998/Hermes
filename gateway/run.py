@@ -12997,10 +12997,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or event_metadata.get("_hermes_process_completion")
             or getattr(event, "media_urls", None)
         )
-        session_entry = await self.async_session_store.get_or_create_session(
-            source,
-            defer_renewal=defer_renewal,
-        )
+        if defer_renewal:
+            session_entry = await self.async_session_store.get_or_create_session(
+                source,
+                defer_renewal=True,
+            )
+        else:
+            session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
