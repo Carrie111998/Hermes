@@ -1,6 +1,7 @@
 import { useAuiState } from '@assistant-ui/react'
-import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
+import { type RefObject, useCallback, useEffect, useId, useRef, useState } from 'react'
 
+import { PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { $composerPoppedOut } from '@/store/composer-popout'
@@ -14,6 +15,9 @@ interface UseComposerMetricsArgs {
   editorRef: RefObject<HTMLDivElement | null>
   poppedOut: boolean
 }
+
+const COMPOSER_METRICS_OWNER_ATTR = 'data-composer-metrics-owner'
+const HIDDEN_PANE_SELECTOR = `[${PANE_HIDDEN_ATTR}]`
 
 /**
  * Owns the composer's *sizing* engine: the stacked-vs-inline layout decision
@@ -31,6 +35,7 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
   const [tight, setTight] = useState(false)
   // Wider than `tight`: the pill goes icon-only before the row has to stack.
   const [compactPill, setCompactPill] = useState(false)
+  const metricsOwnerId = useId()
   const narrow = useMediaQuery('(max-width: 30rem)')
 
   // Edge signals, not the live text: these only re-render when emptiness / the
@@ -84,6 +89,10 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
       return
     }
 
+    if (composer.closest(HIDDEN_PANE_SELECTOR)) {
+      return
+    }
+
     // Floating composer is out of the thread's flow — it must not reserve any
     // bottom clearance. Zero the measured vars so the thread reclaims the space.
     // (Read globals here so the callback stays stable; mirror the popoutAllowed
@@ -92,6 +101,7 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
       const root = document.documentElement
       lastBucketedHeightRef.current = 0
       lastBucketedSurfaceHeightRef.current = 0
+      root.setAttribute(COMPOSER_METRICS_OWNER_ATTR, metricsOwnerId)
       root.style.setProperty('--composer-measured-height', '0px')
       root.style.setProperty('--composer-surface-measured-height', '0px')
 
@@ -101,6 +111,7 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
     const { height, width } = composer.getBoundingClientRect()
     const surfaceHeight = composerSurfaceRef.current?.getBoundingClientRect().height
     const root = document.documentElement
+    root.setAttribute(COMPOSER_METRICS_OWNER_ATTR, metricsOwnerId)
 
     if (width > 0) {
       const nextTight = width < COMPOSER_STACK_BREAKPOINT_PX
@@ -147,7 +158,7 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
         root.style.setProperty('--composer-surface-measured-height', `${bucket}px`)
       }
     }
-  }, [composerRef, composerSurfaceRef, editorRef])
+  }, [composerRef, composerSurfaceRef, editorRef, metricsOwnerId])
 
   useResizeObserver(syncComposerMetrics, composerRef, composerSurfaceRef, editorRef)
 
@@ -162,10 +173,17 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
   useEffect(() => {
     return () => {
       const root = document.documentElement
+
+      if (root.getAttribute(COMPOSER_METRICS_OWNER_ATTR) !== metricsOwnerId) {
+        return
+      }
+
       root.style.removeProperty('--composer-measured-height')
       root.style.removeProperty('--composer-surface-measured-height')
+
+      root.removeAttribute(COMPOSER_METRICS_OWNER_ATTR)
     }
-  }, [])
+  }, [metricsOwnerId])
 
   // Pill compacts on real width (tile/pane), OR when stacked for any reason
   // (viewport-narrow / wrapped) so the controls row never over-runs.
