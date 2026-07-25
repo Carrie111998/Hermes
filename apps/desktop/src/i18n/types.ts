@@ -1896,6 +1896,8 @@ export interface Translations {
     freeTier: string
     priceTitle: string
     wasPrice: string
+    connected: string
+    needsSetup: string
   }
 
   modelVisibility: {
@@ -1903,6 +1905,8 @@ export interface Translations {
     search: string
     noAuthenticatedProviders: string
     addProvider: string
+    connected: string
+    needsSetup: string
   }
 
   shell: {
@@ -1916,6 +1920,8 @@ export interface Translations {
       refreshModels: string
       fast: string
       medium: string
+      connected: string
+      needsSetup: string
     }
     modelOptions: {
       noOptions: string
