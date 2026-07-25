@@ -41,6 +41,7 @@ import agent.credential_pool as credential_pool  # noqa: E402
 def _isolate_op_token(monkeypatch):
     """Each test starts with OP_SERVICE_ACCOUNT_TOKEN unset and a clean cache."""
     monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN_WORK", raising=False)
     env_loader.reset_secret_source_cache()
     yield
     env_loader.reset_secret_source_cache()
@@ -84,6 +85,58 @@ def test_op_env_does_not_override_existing_token(tmp_path, monkeypatch):
 
     # override=False AND the explicit guard both protect the live token.
     assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "live-token"
+
+
+def test_op_env_loads_additional_account_tokens_without_overriding_existing(
+    tmp_path, monkeypatch
+):
+    """An existing default token must not suppress other account token vars."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text("FOO=bar\n", encoding="utf-8")
+    (home / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=file-default\n"
+        "OP_SERVICE_ACCOUNT_TOKEN_WORK=file-work\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN\n"
+        "    env:\n"
+        "      WORK:\n"
+        "        reference: op://Work/Service/credential\n"
+        "        service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN_WORK\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "live-default")
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "live-default"
+    assert os.environ["OP_SERVICE_ACCOUNT_TOKEN_WORK"] == "file-work"
+
+
+def test_op_env_ignores_variables_that_are_not_configured_token_names(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=allowed\n"
+        "UNRELATED_PROVIDER_KEY=must-not-load\n"
+        "OP_CONNECT_TOKEN=must-not-load\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("UNRELATED_PROVIDER_KEY", raising=False)
+    monkeypatch.delenv("OP_CONNECT_TOKEN", raising=False)
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "allowed"
+    assert "UNRELATED_PROVIDER_KEY" not in os.environ
+    assert "OP_CONNECT_TOKEN" not in os.environ
 
 
 def test_missing_op_env_is_a_noop(tmp_path):

@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from utils import atomic_replace, fast_safe_load
 
 
@@ -329,11 +329,23 @@ def load_hermes_dotenv(
     # committed .env file.
     # Users on systemd can alternatively use:
     #   EnvironmentFile=-/path/to/.hermes/.op.env
-    # in their gateway unit, which takes precedence (override=False below
-    # ensures .op.env never clobbers a token already in the environment).
+    # in their gateway unit, which takes precedence because `.op.env` never
+    # clobbers a token already present in the process environment.
+    # .op.env may hold one bootstrap variable per 1Password account. Load only
+    # token names selected by valid 1Password routes; this is not a general
+    # additive env file. Existing environment values keep precedence.
     op_env = home_path / ".op.env"
-    if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+    if op_env.exists():
+        _sanitize_env_file_if_needed(op_env)
+        allowed = _configured_onepassword_token_envs(home_path)
+        try:
+            values = dotenv_values(op_env, encoding="utf-8", interpolate=False)
+        except UnicodeDecodeError:
+            values = dotenv_values(op_env, encoding="latin-1", interpolate=False)
+        for key in allowed:
+            value = values.get(key)
+            if value is not None and key not in os.environ:
+                os.environ[key] = value
 
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
@@ -343,6 +355,31 @@ def load_hermes_dotenv(
     _apply_managed_env()
 
     return loaded
+
+
+def _configured_onepassword_token_envs(home_path: Path) -> frozenset[str]:
+    """Return the bootstrap-token names that `.op.env` may populate."""
+    try:
+        from agent.secret_sources import onepassword as op_src
+
+        secrets_cfg = _load_secrets_config(home_path)
+        op_cfg = secrets_cfg.get("onepassword")
+        op_cfg = op_cfg if isinstance(op_cfg, dict) else {}
+        raw_default = op_cfg.get(
+            "service_account_token_env", op_src._DEFAULT_TOKEN_ENV
+        )
+        default_token_env = (
+            op_src._DEFAULT_TOKEN_ENV
+            if raw_default is None
+            else str(raw_default).strip()
+        )
+        raw_env = op_cfg.get("env")
+        valid, _warnings = op_src._validate_references(
+            raw_env if isinstance(raw_env, dict) else None
+        )
+        return op_src._configured_token_envs(valid, default_token_env)
+    except Exception:  # noqa: BLE001 — dotenv loading must never block startup
+        return frozenset({"OP_SERVICE_ACCOUNT_TOKEN"})
 
 
 def _apply_managed_env() -> None:
@@ -505,7 +542,7 @@ def _load_secrets_config(home_path: Path) -> dict:
     if not config_path.exists():
         return {}
     try:
-        import yaml  # type: ignore
+        import yaml
     except ImportError:
         return {}
     try:
