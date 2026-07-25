@@ -741,7 +741,7 @@ export function usePromptActions({
 
   const reloadFromMessage = useCallback(
     async (parentId: string | null) => {
-      const sessionId = activeSessionId || activeSessionIdRef.current
+      const sessionId = activeSessionIdRef.current
 
       if (!sessionId || $busy.get()) {
         return
@@ -775,7 +775,7 @@ export function usePromptActions({
         notifyError(err, copy.regenerateFailed)
       }
     },
-    [activeSessionId, activeSessionIdRef, copy.regenerateFailed, requestGateway, updateSessionState]
+    [activeSessionIdRef, copy.regenerateFailed, requestGateway, updateSessionState]
   )
 
   // Cursor-style "restore checkpoint": rewind the conversation to a past user

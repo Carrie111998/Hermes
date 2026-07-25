@@ -1665,15 +1665,17 @@ describe('usePromptActions reloadFromMessage', () => {
       expect.any(Number)
     )
   })
-  it('falls back to activeSessionIdRef.current when activeSessionId is stale-null', async () => {
+  it('always targets activeSessionIdRef.current, never the stale activeSessionId value', async () => {
     const requestGateway = vi.fn(async () => ({}) as never)
-    const staleRef = { current: RUNTIME_SESSION_ID }
+    const liveRef = { current: 'session-b' }
+    const updatedSessionIds: (null | string)[] = []
     let handle: HarnessHandle | null = null
     await actRender(
       <Harness
-        activeSessionId={null}
-        activeSessionIdRef={staleRef}
+        activeSessionId="session-a"
+        activeSessionIdRef={liveRef}
         onReady={h => (handle = h)}
+        onUpdateState={sessionId => updatedSessionIds.push(sessionId)}
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
       />
@@ -1682,11 +1684,36 @@ describe('usePromptActions reloadFromMessage', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       expect.objectContaining({
-        session_id: RUNTIME_SESSION_ID,
+        session_id: 'session-b',
         text: 'second prompt'
       }),
       expect.any(Number)
     )
+    expect(updatedSessionIds.length).toBeGreaterThan(0)
+    expect(updatedSessionIds.every(id => id === 'session-b')).toBe(true)
+    expect(updatedSessionIds).not.toContain('session-a')
+  })
+  it('rolls back state against activeSessionIdRef.current, never the stale activeSessionId value, on gateway failure', async () => {
+    const requestGateway = vi.fn(async () => {
+      throw new Error('gateway exploded')
+    })
+    const liveRef = { current: 'session-b' }
+    const updatedSessionIds: (null | string)[] = []
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="session-a"
+        activeSessionIdRef={liveRef}
+        onReady={h => (handle = h)}
+        onUpdateState={sessionId => updatedSessionIds.push(sessionId)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+    await handle!.reloadFromMessage('a2')
+    expect(updatedSessionIds.length).toBeGreaterThan(0)
+    expect(updatedSessionIds.every(id => id === 'session-b')).toBe(true)
+    expect(updatedSessionIds).not.toContain('session-a')
   })
   it('silently no-ops when both activeSessionId and the ref are null', async () => {
     const requestGateway = vi.fn(async () => ({}) as never)
