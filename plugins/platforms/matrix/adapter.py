@@ -2428,12 +2428,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 # failures like M_UNKNOWN_TOKEN.  Detect and stop immediately.
                 _sync_msg = getattr(sync_data, "message", None)
                 if _sync_msg and isinstance(_sync_msg, str):
-                    _lower = _sync_msg.lower()
-                    if "m_unknown_token" in _lower or "unknown_token" in _lower:
-                        logger.error(
-                            "Matrix: permanent auth error from sync: %s — stopping",
-                            _sync_msg,
-                        )
+                    if self._is_token_expiry(_sync_msg):
+                        # matrix.org MAS issues short-lived access tokens; on
+                        # expiry re-authenticate instead of stopping forever.
+                        self._trigger_reauth(_sync_msg)
                         return
 
                 if isinstance(sync_data, dict):
@@ -2470,6 +2468,11 @@ class MatrixAdapter(BasePlatformAdapter):
                     return
                 # Detect permanent auth/permission failures.
                 err_str = str(exc).lower()
+                if self._is_token_expiry(err_str):
+                    # matrix.org MAS access-token expiry — re-login rather than
+                    # spinning forever against a dead token.
+                    self._trigger_reauth(str(exc))
+                    return
                 if (
                     "401" in err_str
                     or "403" in err_str
@@ -2482,6 +2485,65 @@ class MatrixAdapter(BasePlatformAdapter):
                     return
                 logger.warning("Matrix: sync error: %s — retrying in 5s", exc)
                 await asyncio.sleep(5)
+
+    # ------------------------------------------------------------------
+    # Token-expiry auto re-authentication
+    #
+    # matrix.org migrated to the Matrix Authentication Service (MAS), which
+    # issues short-lived access tokens. When one expires the homeserver returns
+    # "Token is not active" / "Unable to introspect the access token"; the sync
+    # loop cannot recover on its own, so we detect those and re-run the normal
+    # password login via connect(is_reconnect=True).
+    # ------------------------------------------------------------------
+    _TOKEN_EXPIRY_MARKERS = (
+        "token is not active",
+        "unable to introspect",
+        "m_unknown_token",
+        "unknown_token",
+        "soft_logout",
+    )
+
+    @classmethod
+    def _is_token_expiry(cls, msg: Optional[str]) -> bool:
+        """True when ``msg`` looks like an expired/invalidated access token."""
+        lowered = (msg or "").lower()
+        return any(marker in lowered for marker in cls._TOKEN_EXPIRY_MARKERS)
+
+    def _trigger_reauth(self, reason: str) -> None:
+        """Schedule a background re-login after a token-expiry error.
+
+        Runs in a *separate* task so the calling _sync_loop can return first:
+        connect(is_reconnect=True) calls disconnect(), which cancels the sync
+        task, and a coroutine must not cancel itself mid-await. A guard avoids
+        launching overlapping re-auth attempts.
+        """
+        existing = getattr(self, "_reauth_task", None)
+        if existing is not None and not existing.done():
+            return
+        logger.warning(
+            "Matrix: access token expired (%s) — re-authenticating", reason
+        )
+        self._reauth_task = asyncio.create_task(self._reauthenticate())
+
+    async def _reauthenticate(self) -> None:
+        """Re-login with exponential backoff until the connection is restored."""
+        delay = 5
+        while not self._closing:
+            try:
+                if await self.connect(is_reconnect=True):
+                    logger.info("Matrix: re-authenticated after token expiry")
+                    return
+                logger.warning(
+                    "Matrix: re-auth attempt failed — retrying in %ss", delay
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Matrix: re-auth error: %s — retrying in %ss", exc, delay
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
 
     # ------------------------------------------------------------------
     # Event callbacks

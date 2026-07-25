@@ -5312,3 +5312,210 @@ class TestMatrixDispatchSyncIsolation:
 
         assert ran["ok"] is True  # the sibling handler still ran
         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
+
+
+# ---------------------------------------------------------------------------
+# Auto re-authentication on matrix.org MAS token expiry
+# ---------------------------------------------------------------------------
+
+class TestTokenExpiryDetection:
+    @pytest.mark.parametrize("msg", [
+        "Token is not active",
+        "TOKEN IS NOT ACTIVE",
+        "Unable to introspect the access token",
+        "M_UNKNOWN_TOKEN",
+        "unknown_token: no such token",
+        "soft_logout required",
+    ])
+    def test_recognizes_expiry_markers(self, msg):
+        adapter = _make_adapter()
+        assert adapter._is_token_expiry(msg) is True
+
+    @pytest.mark.parametrize("msg", [
+        "M_FORBIDDEN: you are not in this room",
+        "connection reset by peer",
+        "",
+        None,
+    ])
+    def test_ignores_unrelated_errors(self, msg):
+        adapter = _make_adapter()
+        assert adapter._is_token_expiry(msg) is False
+
+
+class TestTriggerReauth:
+    @pytest.mark.asyncio
+    async def test_schedules_reauth_task(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_reauthenticate", AsyncMock(return_value=None)) as mock_reauth:
+            adapter._trigger_reauth("Token is not active")
+            assert adapter._reauth_task is not None
+            await adapter._reauth_task
+        mock_reauth.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_logs_the_expiry_reason(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        with patch.object(adapter, "_reauthenticate", AsyncMock(return_value=None)):
+            with caplog.at_level(logging.WARNING):
+                adapter._trigger_reauth("Token is not active")
+            await adapter._reauth_task
+        assert "access token expired" in caplog.text
+        assert "Token is not active" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_does_not_stack_overlapping_reauth_attempts(self):
+        """A second _trigger_reauth call while one is already in flight must
+        not spawn a competing task — connect(is_reconnect=True) disconnects
+        the client, so two concurrent re-auth attempts would race each other."""
+        adapter = _make_adapter()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_reauth():
+            started.set()
+            await release.wait()
+
+        with patch.object(adapter, "_reauthenticate", _slow_reauth):
+            adapter._trigger_reauth("Token is not active")
+            await started.wait()
+            first_task = adapter._reauth_task
+
+            adapter._trigger_reauth("Token is not active")
+            assert adapter._reauth_task is first_task
+
+            release.set()
+            await first_task
+
+    @pytest.mark.asyncio
+    async def test_allows_a_new_attempt_once_the_previous_one_finished(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_reauthenticate", AsyncMock(return_value=None)):
+            adapter._trigger_reauth("Token is not active")
+            first_task = adapter._reauth_task
+            await first_task
+
+            adapter._trigger_reauth("Token is not active")
+            second_task = adapter._reauth_task
+            await second_task
+
+        assert second_task is not first_task
+
+
+class TestReauthenticate:
+    @pytest.mark.asyncio
+    async def test_succeeds_on_first_attempt_without_delay(self):
+        adapter = _make_adapter()
+        adapter.connect = AsyncMock(return_value=True)
+        with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
+            await adapter._reauthenticate()
+
+        adapter.connect.assert_awaited_once_with(is_reconnect=True)
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retries_with_exponential_backoff_until_success(self):
+        adapter = _make_adapter()
+        adapter.connect = AsyncMock(side_effect=[False, False, True])
+        delays = []
+
+        async def _record_sleep(seconds):
+            delays.append(seconds)
+
+        with patch("asyncio.sleep", _record_sleep):
+            await adapter._reauthenticate()
+
+        assert adapter.connect.await_count == 3
+        assert delays == [5, 10]
+
+    @pytest.mark.asyncio
+    async def test_survives_connect_exceptions_and_keeps_retrying(self):
+        adapter = _make_adapter()
+        adapter.connect = AsyncMock(side_effect=[RuntimeError("network down"), True])
+        with patch("asyncio.sleep", AsyncMock()):
+            await adapter._reauthenticate()
+
+        assert adapter.connect.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stops_retrying_once_the_adapter_is_closing(self):
+        adapter = _make_adapter()
+        adapter._closing = True
+        adapter.connect = AsyncMock(return_value=False)
+
+        await adapter._reauthenticate()
+
+        adapter.connect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_backoff_caps_at_300_seconds(self):
+        adapter = _make_adapter()
+        adapter.connect = AsyncMock(side_effect=[False] * 8 + [True])
+        delays = []
+
+        async def _record_sleep(seconds):
+            delays.append(seconds)
+
+        with patch("asyncio.sleep", _record_sleep):
+            await adapter._reauthenticate()
+
+        assert delays == [5, 10, 20, 40, 80, 160, 300, 300]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_instead_of_being_swallowed(self):
+        adapter = _make_adapter()
+        adapter.connect = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._reauthenticate()
+
+
+class TestSyncLoopTriggersReauthOnTokenExpiry:
+    @pytest.mark.asyncio
+    async def test_sync_message_field_triggers_reauth_and_returns(self):
+        """nio surfaces auth failures like MAS token expiry as SyncError
+        objects (not exceptions) carrying a `.message` string."""
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.sync_store.get_next_batch = AsyncMock(return_value=None)
+        sync_error = MagicMock()
+        sync_error.message = "M_UNKNOWN_TOKEN: Token is not active"
+        client.sync = AsyncMock(return_value=sync_error)
+        adapter._client = client
+        adapter._closing = False
+
+        with patch.object(adapter, "_trigger_reauth") as mock_trigger:
+            await adapter._sync_loop()
+
+        mock_trigger.assert_called_once_with("M_UNKNOWN_TOKEN: Token is not active")
+        client.sync.assert_awaited_once()  # loop returned, no retry
+
+    @pytest.mark.asyncio
+    async def test_sync_exception_triggers_reauth_and_returns(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.sync_store.get_next_batch = AsyncMock(return_value=None)
+        client.sync = AsyncMock(side_effect=RuntimeError("Unable to introspect the access token"))
+        adapter._client = client
+        adapter._closing = False
+
+        with patch.object(adapter, "_trigger_reauth") as mock_trigger:
+            await adapter._sync_loop()
+
+        mock_trigger.assert_called_once_with("Unable to introspect the access token")
+        client.sync.assert_awaited_once()  # loop returned, no retry
+
+    @pytest.mark.asyncio
+    async def test_unrelated_sync_exception_does_not_trigger_reauth(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.sync_store.get_next_batch = AsyncMock(return_value=None)
+        client.sync = AsyncMock(side_effect=[RuntimeError("boom"), asyncio.CancelledError()])
+        adapter._client = client
+        adapter._closing = False
+
+        with patch.object(adapter, "_trigger_reauth") as mock_trigger, \
+                patch("asyncio.sleep", AsyncMock()):
+            await adapter._sync_loop()
+
+        mock_trigger.assert_not_called()
