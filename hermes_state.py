@@ -3264,10 +3264,10 @@ class SessionDB:
         ``agent.session_estimated_cost_usd`` and ``agent.session_cost_status``
         so a gateway restart doesn't reset the live counter to $0 (issue #67762).
 
-        Returns a dict with ``estimated_cost_usd`` (float, sum of all per-model
-        rows for this session) and ``cost_status`` (sticky priority across the
-        same rows: ``actual`` wins, then ``included``, then ``unknown``, then
-        the most recent call's status). Returns ``None`` if the session has
+        Returns a dict with ``estimated_cost_usd`` (float, sum of all main-loop
+        ``session_model_usage`` rows for this session — ``task=''`` only, no
+        auxiliary-task rows like title-generation or delegate summaries) and
+        ``cost_status`` (sticky priority across the same rows). Returns ``None`` if the session has
         no per-model rows yet — callers use this to distinguish "no spend"
         from "explicit zero spend".
 
@@ -3291,14 +3291,14 @@ class SessionDB:
                             THEN 'unknown'
                         ELSE COALESCE(
                             (SELECT cost_status FROM session_model_usage
-                             WHERE session_id = :sid
+                             WHERE session_id = :sid AND task = ''
                              ORDER BY last_seen DESC LIMIT 1),
                             'estimated'
                         )
                     END AS cost_status,
                     COUNT(*) AS row_count
                 FROM session_model_usage
-                WHERE session_id = :sid
+                WHERE session_id = :sid AND task = ''
                 """,
                 {"sid": session_id},
             )

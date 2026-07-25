@@ -317,3 +317,97 @@ class TestInitAgentRehydratesCost:
         assert agent.session_estimated_cost_usd == pytest.approx(
             expected_pre + new_call_cost, rel=1e-6
         )
+
+
+class TestGetSessionCostSummaryAuxExclusion:
+    """Verify ``get_session_cost_summary`` excludes auxiliary-task rows
+    (issue #67762 reviewer feedback — task=vision/title-generation/etc.
+    writes to session_model_usage must not leak into the rehydrated
+    live counter)."""
+
+    def test_aux_rows_excluded_from_summary(self, db):
+        """Main-loop rows (task='') contribute; aux rows (task='vision') do not."""
+        sid = "s1"
+        db.create_session(sid, source="cli")
+
+        # Main-loop call: accounted through update_token_counts (task='')
+        db.update_token_counts(
+            sid,
+            input_tokens=1000, output_tokens=200,
+            model="anthropic/claude-opus-4-8",
+            billing_provider="anthropic",
+            api_call_count=10,
+            estimated_cost_usd=2.10,
+            cost_status="estimated",
+        )
+        # Aux call: title generation or vision (task != '')
+        db.record_auxiliary_usage(
+            sid,
+            task="title_generation",
+            model="anthropic/claude-haiku-4-5",
+            input_tokens=100, output_tokens=20,
+            estimated_cost_usd=0.03,
+        )
+
+        summary = db.get_session_cost_summary(sid)
+
+        # Only main-loop ($2.10) should appear; aux ($0.03) excluded
+        assert summary is not None
+        assert summary["estimated_cost_usd"] == pytest.approx(2.10, rel=1e-6)
+
+    def test_summary_returns_none_when_only_aux_rows_exist(self, db):
+        """A session with ONLY auxiliary rows (e.g., title generation ran
+        but the main loop never wrote a cost) returns None, matching the
+        pre-existing contract of 'no per-model rows'."""
+        sid = "s2"
+        db.create_session(sid, source="cli")
+
+        db.record_auxiliary_usage(
+            sid,
+            task="title_generation",
+            model="anthropic/claude-haiku-4-5",
+            input_tokens=50, output_tokens=10,
+            estimated_cost_usd=0.01,
+        )
+
+        # No main-loop rows at all — summary returns None (pre-existing contract)
+        assert db.get_session_cost_summary(sid) is None
+
+    def test_aux_rows_do_not_affect_rehydration(self, db):
+        """Rehydration through _rehydrate_session_cost sees only main-loop cost
+        even when auxiliary rows exist in session_model_usage."""
+        sid = "s3"
+        db.create_session(sid, source="cli")
+
+        # Main-loop: $5.00
+        db.update_token_counts(
+            sid,
+            input_tokens=2000, output_tokens=500,
+            model="anthropic/claude-opus-4-8",
+            billing_provider="anthropic",
+            api_call_count=20,
+            estimated_cost_usd=5.00,
+            cost_status="estimated",
+        )
+        # Aux: title gen $0.01, vision $0.02 — not main-loop
+        db.record_auxiliary_usage(
+            sid, task="title_generation",
+            model="anthropic/claude-haiku-4-5",
+            estimated_cost_usd=0.01,
+        )
+        db.record_auxiliary_usage(
+            sid, task="vision",
+            model="google/gemini-2.5-flash",
+            estimated_cost_usd=0.02,
+        )
+
+        agent = SimpleNamespace(
+            session_id=sid, _session_db=db,
+            session_estimated_cost_usd=0.0,
+            session_cost_status="unknown",
+        )
+        from agent.agent_init import _rehydrate_session_cost
+        _rehydrate_session_cost(agent)
+
+        # Only main-loop $5.00, not $5.00 + $0.01 + $0.02 = $5.03
+        assert agent.session_estimated_cost_usd == pytest.approx(5.00, rel=1e-6)
