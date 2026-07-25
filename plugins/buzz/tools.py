@@ -48,7 +48,7 @@ def _docker_compose_cmd(compose_path: str) -> list[str]:
 
 def _run(cmd: list[str]) -> dict[str, Any]:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=180, stdin=subprocess.DEVNULL)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=180, stdin=subprocess.DEVNULL)
         return {
             "ok": proc.returncode == 0,
             "code": proc.returncode,

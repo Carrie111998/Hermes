@@ -143,7 +143,7 @@ def create_mp4(image_path: Path, audio_path: Path, output_path: Path) -> bool:
         str(output_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
         if result.returncode == 0:
             print(f"MP4 created: {output_path}")
             return True
@@ -181,7 +181,7 @@ def post_via_hermes_lm_twitterer(media_path: Path, tweet_text: str) -> bool:
 
     print(f"Running: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=str(HERMES_REPO_ROOT))
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, cwd=str(HERMES_REPO_ROOT))
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         if result.returncode == 0 and '"posted": false' not in combined and '"ok": false' not in combined:
             print(result.stdout.strip())

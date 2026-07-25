@@ -79,7 +79,7 @@ def create_mp4(image_path: Path, audio_path: Path, output_path: Path) -> bool:
         str(output_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
         if result.returncode == 0:
             print(f"MP4 created: {output_path}")
             return True
@@ -101,7 +101,7 @@ def upload_media_and_post(media_path: Path, tweet_text: str) -> bool:
     ]
     try:
         print("Uploading media...")
-        result = subprocess.run(upload_cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(upload_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
         if result.returncode != 0:
             print(f"Media upload failed: {result.stderr}", file=sys.stderr)
             return False
@@ -119,7 +119,7 @@ def upload_media_and_post(media_path: Path, tweet_text: str) -> bool:
             tweet_text,
         ]
         print("Posting tweet...")
-        result = subprocess.run(tweet_cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(tweet_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         if result.returncode == 0:
             print(f"Tweet posted: {result.stdout.strip()}")
             return True

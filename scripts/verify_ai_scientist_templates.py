@@ -28,7 +28,7 @@ def bootstrap_baselines(vendor: bool = False) -> list[dict[str, object]]:
             results.append({"template": template_dir.name, "status": "missing"})
             continue
         cmd = [sys.executable, "experiment.py", "--out_dir=run_0"]
-        proc = subprocess.run(cmd, cwd=str(template_dir), capture_output=True, text=True)
+        proc = subprocess.run(cmd, cwd=str(template_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
         baseline = template_dir / "run_0" / "final_info.json"
         results.append(
             {

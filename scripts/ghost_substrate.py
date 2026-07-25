@@ -128,7 +128,7 @@ class GhostSubstrate:
         stealth_file = SYNAPSE_DIR / "stealth.level"
         if stealth_file.exists():
             try:
-                self.stealth_level = int(stealth_file.read_text().strip())
+                self.stealth_level = int(stealth_file.read_text(encoding="utf-8").strip())
                 logger.info(f"ASI_GHOST: Stealth Protocol set to Level {self.stealth_level}")
             except Exception:
                 pass

@@ -541,7 +541,7 @@ def _start_via_powershell(settings: LlamaFallbackSettings) -> None:
         "-WaitSeconds",
         str(settings.wait_seconds),
     ]
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    completed = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
         raise RuntimeError(detail or f"powershell launcher exited {completed.returncode}")

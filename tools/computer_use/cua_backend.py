@@ -445,11 +445,13 @@ def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "--help"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3.0,
-            stdin=subprocess.DEVNULL,
-            env=_sanitize_subprocess_env(cua_driver_child_env()),
+            capture_output=True,
+            text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=3.0,
+            stdin=subprocess.DEVNULL,
+            env=_sanitize_subprocess_env(cua_driver_child_env()),
         )
         help_text = (proc.stdout or "") + (proc.stderr or "")
         return "--no-overlay" in help_text
