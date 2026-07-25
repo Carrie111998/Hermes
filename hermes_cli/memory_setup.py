@@ -22,6 +22,7 @@ _CANCELLED = -1
 # Curses-based interactive picker (same pattern as hermes tools)
 # ---------------------------------------------------------------------------
 
+
 def _curses_select(
     title: str,
     items: list[tuple[str, str]],
@@ -40,11 +41,10 @@ def _curses_select(
         cancel_returns = default
 
     # Format (label, desc) tuples into display strings
-    display_items = [
-        f"{label} - {desc}" if desc else label
-        for label, desc in items
-    ]
-    result = curses_radiolist(title, display_items, selected=default, cancel_returns=cancel_returns)
+    display_items = [f"{label} - {desc}" if desc else label for label, desc in items]
+    result = curses_radiolist(
+        title, display_items, selected=default, cancel_returns=cancel_returns
+    )
     _clear_interactive_transition()
     return result
 
@@ -77,6 +77,7 @@ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str
 # Provider discovery
 # ---------------------------------------------------------------------------
 
+
 def _install_dependencies(provider_name: str) -> None:
     """Install pip dependencies declared in plugin.yaml."""
     import subprocess
@@ -91,6 +92,7 @@ def _install_dependencies(provider_name: str) -> None:
 
     try:
         import yaml
+
         with open(yaml_path, encoding="utf-8") as f:
             meta = yaml.safe_load(f) or {}
     except Exception:
@@ -163,6 +165,7 @@ def _get_available_providers() -> list:
     """
     try:
         from plugins.memory import discover_memory_providers, load_memory_provider
+
         raw = discover_memory_providers()
     except Exception:
         raw = []
@@ -176,7 +179,11 @@ def _get_available_providers() -> list:
         except Exception:
             continue
 
-        schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
+        schema = (
+            provider.get_config_schema()
+            if hasattr(provider, "get_config_schema")
+            else []
+        )
         has_secrets = any(f.get("secret") for f in schema)
         has_non_secrets = any(not f.get("secret") for f in schema)
         if has_secrets and has_non_secrets:
@@ -195,6 +202,7 @@ def _get_available_providers() -> list:
 # ---------------------------------------------------------------------------
 # Setup wizard
 # ---------------------------------------------------------------------------
+
 
 def cmd_setup_provider(provider_name: str) -> None:
     """Run memory setup for a specific provider, skipping the picker."""
@@ -252,7 +260,9 @@ def cmd_setup(args) -> None:
     items.append(("Built-in only", "— MEMORY.md / USER.md (default)"))
 
     builtin_idx = len(items) - 1
-    selected = _curses_select("Memory provider setup", items, default=builtin_idx, cancel_returns=_CANCELLED)
+    selected = _curses_select(
+        "Memory provider setup", items, default=builtin_idx, cancel_returns=_CANCELLED
+    )
     if selected == _CANCELLED:
         _print_cancelled_setup()
         return
@@ -283,7 +293,9 @@ def cmd_setup(args) -> None:
         provider.post_setup(hermes_home, config)
         return
 
-    schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
+    schema = (
+        provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
+    )
 
     provider_config = config["memory"].get(name, {})
     if not isinstance(provider_config, dict):
@@ -325,7 +337,12 @@ def cmd_setup(args) -> None:
                 current_idx = 0
                 if current and current in choices:
                     current_idx = choices.index(current)
-                sel = _curses_select(f"  {desc}", choice_items, default=current_idx, cancel_returns=_CANCELLED)
+                sel = _curses_select(
+                    f"  {desc}",
+                    choice_items,
+                    default=current_idx,
+                    cancel_returns=_CANCELLED,
+                )
                 if sel == _CANCELLED:
                     _print_cancelled_setup()
                     return
@@ -335,7 +352,9 @@ def cmd_setup(args) -> None:
                 existing = os.environ.get(env_var, "") if env_var else ""
                 if existing:
                     masked = f"...{existing[-4:]}" if len(existing) > 4 else "set"
-                    val = _prompt(f"{desc} (current: {masked}, blank to keep)", secret=True)
+                    val = _prompt(
+                        f"{desc} (current: {masked}, blank to keep)", secret=True
+                    )
                 else:
                     hint = f"  Get yours at {url}" if url else ""
                     if hint:
@@ -347,7 +366,9 @@ def cmd_setup(args) -> None:
                 # Regular text prompt
                 current = provider_config.get(key)
                 effective_default = current or default
-                val = _prompt(desc, default=str(effective_default) if effective_default else None)
+                val = _prompt(
+                    desc, default=str(effective_default) if effective_default else None
+                )
                 if val:
                     provider_config[key] = val
                     # Also write to .env if this field has an env_var
@@ -420,6 +441,7 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
     # Restrict permissions — .env holds API keys and tokens.
     try:
         import stat
+
         env_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
     except OSError:
         pass  # Windows or read-only FS
@@ -428,6 +450,7 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
 # ---------------------------------------------------------------------------
 # Status
 # ---------------------------------------------------------------------------
+
 
 def cmd_status(args) -> None:
     """Show current memory provider config."""
@@ -446,6 +469,7 @@ def cmd_status(args) -> None:
     # Check if the memory tool is enabled for the CLI platform via the
     # canonical resolver (handles composite toolsets like hermes-cli).
     from hermes_cli.tools_config import _get_platform_tools
+
     cli_tools = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
     memory_tool_enabled = "memory" in cli_tools
     tool_mark = "enabled ✓" if memory_tool_enabled else "disabled ✗"
@@ -471,7 +495,11 @@ def cmd_status(args) -> None:
             try:
                 display_config = provider.get_status_config(provider_config)
             except Exception as e:
-                display_config = dict(provider_config) if isinstance(provider_config, dict) else provider_config
+                display_config = (
+                    dict(provider_config)
+                    if isinstance(provider_config, dict)
+                    else provider_config
+                )
                 if isinstance(display_config, dict):
                     display_config["status_config_error"] = str(e)
 
@@ -481,12 +509,22 @@ def cmd_status(args) -> None:
                 print(f"    {key}: {val}")
 
         if provider:
-            print("\n  Plugin:    installed ✓")
+            # `provider` existing means the plugin was discovered on disk.
+            # Report that distinctly from runtime readiness: a discovered
+            # plugin whose SDK dependency is not importable is not "installed"
+            # in the functional sense, so label it accordingly instead of a
+            # blanket "installed OK".
             if provider.is_available():
+                print("\n  Plugin:    installed ✓")
                 print("  Status:    available ✓")
             else:
+                print("\n  Plugin:    discovered, dependency missing ✗")
                 print("  Status:    not available ✗")
-                schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
+                schema = (
+                    provider.get_config_schema()
+                    if hasattr(provider, "get_config_schema")
+                    else []
+                )
                 # Check all fields that have env_var (both secret and non-secret)
                 required_fields = [f for f in schema if f.get("env_var")]
                 if required_fields:
@@ -500,9 +538,22 @@ def cmd_status(args) -> None:
                         if url and not is_set:
                             line += f"  → {url}"
                         print(line)
+                # Surface the importable-SDK gap specifically so the user knows
+                # the fix is `uv sync --extra mem0` / `hermes memory setup mem0`.
+                try:
+                    import importlib.util as _ilu
+
+                    if _ilu.find_spec("mem0") is None:
+                        print(
+                            "    ✗ mem0ai SDK not importable — run: uv sync --extra mem0"
+                        )
+                except Exception:
+                    pass
         else:
             print("\n  Plugin:    NOT installed ✗")
-            print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
+            print(
+                f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/"
+            )
 
     if providers:
         print("\n  Installed plugins:")
@@ -516,6 +567,7 @@ def cmd_status(args) -> None:
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
+
 
 def memory_command(args) -> None:
     """Route memory subcommands."""
