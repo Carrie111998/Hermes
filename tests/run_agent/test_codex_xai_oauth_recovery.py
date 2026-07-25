@@ -102,6 +102,138 @@ def test_codex_stream_wire_error_event_surfaces_stream_error_event(provider_mess
     assert excinfo.value.body["error"]["message"] == provider_message
 
 
+# ---------------------------------------------------------------------------
+# Nested error envelope on ``type=error`` SSE frames (opencode#36130 port)
+#
+# The Responses spec carries error details at the top level of the frame,
+# but the official OpenAI SDK and several OpenAI-compatible proxies wrap
+# them in an HTTP-style nested envelope:
+#   {"type": "error", "error": {"code": ..., "message": ..., "param": ...}}
+# Before the fix, _raise_stream_error only read top-level fields, so these
+# frames collapsed to the generic "stream emitted error event" placeholder
+# and the error classifier never saw the provider's real code/message.
+# ---------------------------------------------------------------------------
+
+
+def test_codex_stream_wire_error_event_nested_envelope_dict():
+    """Details nested under ``error`` (dict shape) are surfaced."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield {
+                "type": "error",
+                "sequence_number": 2,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "prompt too long",
+                    "param": "input",
+                },
+            }
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "prompt too long" in str(excinfo.value)
+    assert excinfo.value.code == "context_length_exceeded"
+    assert excinfo.value.param == "input"
+    assert excinfo.value.body["error"]["message"] == "prompt too long"
+
+
+def test_codex_stream_wire_error_event_nested_envelope_attr_style():
+    """Details nested under ``error`` (SDK attr-object shape) are surfaced."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield SimpleNamespace(
+                type="error",
+                message=None,
+                code=None,
+                param=None,
+                error=SimpleNamespace(
+                    type="rate_limit_error",
+                    code="rate_limit_exceeded",
+                    message="Slow down",
+                    param=None,
+                ),
+            )
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "Slow down" in str(excinfo.value)
+    assert excinfo.value.code == "rate_limit_exceeded"
+
+
+def test_codex_stream_wire_error_event_top_level_wins_over_envelope():
+    """Top-level fields keep precedence when both shapes are present."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield {
+                "type": "error",
+                "message": "top-level message",
+                "code": "top_level_code",
+                "error": {"message": "nested message", "code": "nested_code"},
+            }
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "top-level message" in str(excinfo.value)
+    assert excinfo.value.code == "top_level_code"
+
+
+def test_codex_stream_wire_error_event_null_fields_fall_back_to_placeholder():
+    """Spec-compliant frames with null fields keep the stable placeholder."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield {"type": "error", "code": None, "message": None, "param": None, "error": None}
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "stream emitted error event" in str(excinfo.value)
+    assert excinfo.value.code is None
+
+
 def test_codex_stream_retries_remote_protocol_error_once():
     """Transport errors (``httpx.RemoteProtocolError``) trigger a single retry.
 
@@ -574,7 +706,7 @@ def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
@@ -624,7 +756,7 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
     class _FakePool:
         provider = "xai-oauth"
 
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
@@ -684,7 +816,7 @@ def test_recover_with_credential_pool_skips_refresh_on_bare_403_for_xai_oauth():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
@@ -725,7 +857,7 @@ def test_recover_with_credential_pool_still_refreshes_genuine_auth_failure():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             # Return a fake refreshed entry — semantically "refresh worked"
             entry = MagicMock()
@@ -906,7 +1038,7 @@ def test_recover_with_credential_pool_refreshes_on_xai_bad_credentials_403():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             entry = MagicMock()
             entry.id = "entry_refreshed_after_stale"
@@ -962,7 +1094,7 @@ def test_recover_with_credential_pool_still_blocks_real_entitlement():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
