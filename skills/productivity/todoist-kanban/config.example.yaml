@@ -1,0 +1,29 @@
+# Merge this block into ~/.hermes/config.yaml.
+# Keep TODOIST_API_TOKEN in ~/.hermes/.env, not here.
+todoist_kanban:
+  board: personal
+  tenant: todoist
+  default_assignee: codex
+  include_labels:
+    - hermes
+    - agent
+  agent_labels:
+    - hermes
+    - agent
+    - codex
+    - automatable
+  human_labels:
+    - human
+    - manual
+    - errand
+    - call
+    - waiting
+  exclude_labels:
+    - human
+    - manual
+    - waiting
+  workspace: scratch
+  goal_mode: true
+  goal_max_turns: 20
+  max_tasks: 100
+  skills: []
