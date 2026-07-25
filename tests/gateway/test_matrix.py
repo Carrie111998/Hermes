@@ -5312,3 +5312,90 @@ class TestMatrixDispatchSyncIsolation:
 
         assert ran["ok"] is True  # the sibling handler still ran
         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
+
+
+# ---------------------------------------------------------------------------
+# Stale cross-signing signature detection
+# ---------------------------------------------------------------------------
+
+def _make_xsign_client(device_sigs, ssk_pubkey="sskpubkey"):
+    """Client whose query_keys returns a device signed with the given sigs."""
+    client = MagicMock()
+    client.mxid = "@bot:example.org"
+    client.device_id = "DEVICE1"
+
+    device_keys = MagicMock()
+    device_keys.serialize.return_value = {
+        "algorithms": ["m.megolm.v1.aes-sha2"],
+        "device_id": "DEVICE1",
+        "keys": {"ed25519:DEVICE1": "devpubkey"},
+        "user_id": "@bot:example.org",
+        "signatures": {"@bot:example.org": device_sigs},
+    }
+    ssk_obj = MagicMock()
+    ssk_obj.keys = {f"ed25519:{ssk_pubkey}": ssk_pubkey}
+    client.query_keys = AsyncMock(return_value=MagicMock(
+        device_keys={"@bot:example.org": {"DEVICE1": device_keys}},
+        self_signing_keys={"@bot:example.org": ssk_obj},
+    ))
+    return client
+
+
+class TestStaleCrossSigningSignatureWarning:
+    @pytest.mark.asyncio
+    async def test_invalid_signature_logs_actionable_error(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        client = _make_xsign_client({"ed25519:sskpubkey": "bogus-signature"})
+
+        with patch(
+            "mautrix.crypto.signature.verify_signature_json", return_value=False
+        ), caplog.at_level(logging.ERROR):
+            result = await adapter._warn_if_cross_signing_signature_stale(client)
+
+        assert result is False
+        assert "stale cross-signing signature" in caplog.text
+        assert "new access token" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_valid_signature_is_quiet(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        client = _make_xsign_client({"ed25519:sskpubkey": "good-signature"})
+
+        with patch(
+            "mautrix.crypto.signature.verify_signature_json", return_value=True
+        ), caplog.at_level(logging.WARNING):
+            result = await adapter._warn_if_cross_signing_signature_stale(client)
+
+        assert result is True
+        assert caplog.text == ""
+
+    @pytest.mark.asyncio
+    async def test_missing_signature_warns(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        client = _make_xsign_client({"ed25519:DEVICE1": "self-sig-only"})
+
+        with patch(
+            "mautrix.crypto.signature.verify_signature_json", return_value=True
+        ), caplog.at_level(logging.WARNING):
+            result = await adapter._warn_if_cross_signing_signature_stale(client)
+
+        assert result is False
+        assert "no cross-signing signature" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_query_failure_returns_none(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.mxid = "@bot:example.org"
+        client.device_id = "DEVICE1"
+        client.query_keys = AsyncMock(side_effect=RuntimeError("network down"))
+
+        with caplog.at_level(logging.WARNING):
+            result = await adapter._warn_if_cross_signing_signature_stale(client)
+
+        assert result is None
+        assert "could not check cross-signing signature state" in caplog.text
