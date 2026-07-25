@@ -1,6 +1,9 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 
 from gateway.config import Platform
@@ -395,6 +398,83 @@ def test_notifier_delivers_subscription_owned_by_active_profile(tmp_path, monkey
     assert tid in adapter.sent[0]["text"]
 
 
+@pytest.mark.parametrize(
+    "notification_sources",
+    (["coder"], "coder,creator", ["*"]),
+)
+def test_notifier_allows_configured_foreign_profile_via_active_adapter(
+    tmp_path, monkeypatch, notification_sources
+):
+    db_path = tmp_path / "allowed-foreign-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by coder", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-coder",
+            notifier_profile="coder",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "default"
+    runner._profile_adapters = {}
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "kanban": {"dispatch_in_gateway": True},
+            "notification_sources": notification_sources,
+        },
+    ):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [item["chat_id"] for item in adapter.sent] == ["chat-coder"]
+
+
+def test_notifier_skips_foreign_profile_outside_allowlist(tmp_path, monkeypatch):
+    db_path = tmp_path / "disallowed-foreign-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by other", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-other",
+            notifier_profile="other",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "default"
+    runner._profile_adapters = {}
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "kanban": {"dispatch_in_gateway": True},
+            "notification_sources": "coder,creator",
+        },
+    ):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-other")] == ["completed"]
+
+
 def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypatch):
     """A subscription owned by a secondary profile whose profile-adapter
     registry entry EXISTS but lacks this platform must NOT fall back to the
@@ -439,7 +519,14 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     runner._profile_adapters = {"beta": {Platform.DISCORD: other_adapter}}
     runner._kanban_sub_fail_counts = {}
 
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "kanban": {"dispatch_in_gateway": True},
+            "notification_sources": ["*"],
+        },
+    ):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     # The default profile's adapter must never receive beta's notification.
     assert default_adapter.sent == [], (
@@ -451,6 +538,116 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     )
     # The claim is rewound (adapter resolved to None → treated as disconnected),
     # so the event is still unseen and will deliver once beta's adapter connects.
+    assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
+
+
+def test_notifier_delivers_multiplex_foreign_profile_without_config(tmp_path, monkeypatch):
+    """Backward-compat: a foreign profile that owns its OWN adapter-registry
+    entry for the subscribed platform is delivered through THAT profile's
+    adapter even when ``notification_sources`` is unset.
+
+    This is the pre-existing multiplex delivery path. Issue #39838 requires that
+    unset ``notification_sources`` "fall back to the current behaviour", so the
+    new config must be purely additive — it may only OPEN single-gateway
+    cross-profile delivery, never STOP multiplex deliveries that already worked.
+
+    Mutation check: removing the ``_owner_adapters`` guard from the collection
+    filter (skipping every foreign profile when ``notification_sources`` is unset)
+    makes this test FAIL — beta's own adapter never receives the delivery.
+    """
+    db_path = tmp_path / "multiplex-foreign-default-config.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by beta", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-beta",
+            notifier_profile="beta",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    default_adapter = RecordingAdapter()
+    beta_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: default_adapter}
+    runner._kanban_notifier_profile = "default"
+    # beta runs its OWN telegram adapter in the multiplex registry, so the
+    # subscription resolves to beta's bot — not the default profile's.
+    runner._profile_adapters = {"beta": {Platform.TELEGRAM: beta_adapter}}
+    runner._kanban_sub_fail_counts = {}
+
+    # No notification_sources key at all — must preserve current behaviour.
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"kanban": {"dispatch_in_gateway": True}},
+    ):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Delivered through beta's OWN adapter, never the default profile's bot.
+    assert [item["chat_id"] for item in beta_adapter.sent] == ["chat-beta"]
+    assert default_adapter.sent == [], (
+        f"multiplex delivery must use beta's own bot; got {default_adapter.sent!r}"
+    )
+
+
+def test_notifier_partial_registry_no_leak_without_config(tmp_path, monkeypatch):
+    """Safety at the OUT-OF-THE-BOX default: with ``notification_sources`` unset
+    (``DEFAULT_CONFIG['notification_sources'] == []``), a subscription owned by a
+    secondary profile whose registry entry EXISTS but LACKS the subscribed
+    platform must NOT leak to the default profile's bot — it rewinds and waits
+    for that profile's own adapter to connect.
+
+    Companion to ``test_notifier_owning_profile_adapter_no_default_fallback``,
+    which pins the same no-leak invariant under ``notification_sources=['*']``.
+    This one pins it for the default config state most users actually run, and
+    exercises the *other* branch of the delivery-time fallback guard: here
+    ``source_allowed`` is False (unset config), so the guard must refuse the
+    fallback for a different reason than the allow-listed case does.
+    """
+    db_path = tmp_path / "partial-registry-default-config.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by beta", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-beta",
+            notifier_profile="beta",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    default_adapter = RecordingAdapter()
+    other_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: default_adapter}
+    runner._kanban_notifier_profile = "default"
+    # beta HAS a registry entry, but only for discord — not the telegram sub.
+    runner._profile_adapters = {"beta": {Platform.DISCORD: other_adapter}}
+    runner._kanban_sub_fail_counts = {}
+
+    # No notification_sources key — the default, out-of-the-box state.
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"kanban": {"dispatch_in_gateway": True}},
+    ):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert default_adapter.sent == [], (
+        f"unset config must not leak beta's telegram sub to the default bot; got {default_adapter.sent!r}"
+    )
+    assert other_adapter.sent == [], (
+        f"beta's discord adapter must not receive a telegram sub; got {other_adapter.sent!r}"
+    )
+    # Claim rewound — event still unseen, delivers once beta's telegram connects.
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
 
 
