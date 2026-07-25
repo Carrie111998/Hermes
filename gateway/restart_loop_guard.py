@@ -119,6 +119,77 @@ def clear() -> None:
         pass
 
 
+DEFAULT_NOTIFICATION_COOLDOWN_SECONDS = 60
+
+
+def _notification_state_path():
+    return get_hermes_home() / "gateway" / "shutdown_notifications.json"
+
+
+def _load_notification_timestamps() -> dict:
+    try:
+        raw = _notification_state_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        last_notified = data.get("last_notified", {})
+        return {str(k): float(v) for k, v in last_notified.items() if isinstance(v, (int, float))}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_notification_timestamps(timestamps: dict) -> None:
+    try:
+        path = _notification_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"last_notified": timestamps}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def should_suppress_shutdown_notification(
+    destination_key: str,
+    cooldown_seconds: float = DEFAULT_NOTIFICATION_COOLDOWN_SECONDS,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """Return True when a shutdown notification for ``destination_key`` was
+    already sent within ``cooldown_seconds`` (#71180).
+
+    ``_notify_active_sessions_of_shutdown`` in ``gateway/run.py`` dedupes
+    sends within a *single* shutdown via a local in-memory set, but that set
+    starts empty on every fresh gateway process. When something outside
+    Hermes repeatedly cycles the host (OS suspend/resume tearing a WSL
+    distro down and back up, a flapping supervisor, ...), each new process
+    is free to announce a "first" shutdown again seconds after the previous
+    process already announced one, flooding the destination.
+
+    This persists the last-notified timestamp per destination across
+    process restarts (mirroring the restart-loop breaker's own persistence
+    model) so a genuinely rapid re-cycle is suppressed while an isolated
+    shutdown still notifies normally.
+
+    When NOT suppressing, this call also records the current attempt as the
+    new "last notified" timestamp — callers should call this immediately
+    before sending, not after, so a failed send doesn't leave the window
+    unrecorded and re-flood on retry.
+
+    Best-effort / fails OPEN: any read/write error never suppresses a
+    legitimate notification (``cooldown_seconds <= 0`` also disables it).
+    """
+    if cooldown_seconds <= 0:
+        return False
+    ts = time.time() if now is None else now
+    try:
+        timestamps = _load_notification_timestamps()
+    except Exception:  # pragma: no cover — _load_notification_timestamps already guards
+        return False
+    last = timestamps.get(destination_key)
+    if last is not None and (ts - last) < cooldown_seconds:
+        return True
+    timestamps[destination_key] = ts
+    _save_notification_timestamps(timestamps)
+    return False
+
+
 def check_and_record(
     max_restarts: int = DEFAULT_MAX_RESTARTS,
     window_seconds: int = DEFAULT_WINDOW_SECONDS,

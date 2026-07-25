@@ -4912,6 +4912,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         return max_restarts, window_seconds
 
+    def _shutdown_notification_cooldown_seconds(self) -> float:
+        """Return the cooldown (seconds) that suppresses re-sending the same
+        home/session shutdown notification across rapid gateway restart
+        cycles (#71180), read from
+        ``gateway.shutdown_notification_cooldown_seconds`` in config.yaml
+        with the module default as fallback. ``<= 0`` disables the cooldown
+        (every process announces its own shutdown, matching legacy
+        behavior).
+        """
+        from gateway import restart_loop_guard as _rlg
+
+        cooldown = _rlg.DEFAULT_NOTIFICATION_COOLDOWN_SECONDS
+        try:
+            user_cfg = _load_gateway_config()
+            gw = user_cfg.get("gateway") if isinstance(user_cfg, dict) else None
+            raw = gw.get("shutdown_notification_cooldown_seconds") if isinstance(gw, dict) else None
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                cooldown = raw
+        except Exception:  # noqa: BLE001
+            pass
+        return cooldown
+
     def _scale_to_zero_should_arm(self) -> bool:
         """Whether to start the idle watcher (D1/D11/§3.4(1))."""
         from gateway.relay import relay_wake_url
@@ -6649,6 +6671,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Shutdown notification suppressed for active session: %s has gateway_restart_notification=false",
                         platform_str,
                     )
+                    continue
+
+                from gateway import restart_loop_guard as _rlg
+
+                cooldown = self._shutdown_notification_cooldown_seconds()
+                if _rlg.should_suppress_shutdown_notification(
+                    f"{platform_str}:{chat_id}:{thread_id or ''}",
+                    cooldown,
+                ):
+                    logger.info(
+                        "Shutdown notification suppressed for %s:%s — already notified within the last %ss "
+                        "(#71180 rapid-restart flood guard)",
+                        platform_str,
+                        chat_id,
+                        cooldown,
+                    )
+                    notified.add(dedup_key)
                     continue
 
                 reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
