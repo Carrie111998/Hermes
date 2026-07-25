@@ -5,6 +5,7 @@ import { isMac } from '../lib/platform.js'
 import type { Theme } from '../theme.js'
 import type { ApprovalReq, ClarifyReq, ConfirmReq } from '../types.js'
 
+import { chipRowProps } from './overlayPrimitives.js'
 import { TextInput } from './textInput.js'
 
 const APPROVAL_OPTS = ['once', 'session', 'always', 'deny'] as const
@@ -124,7 +125,7 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
 
       {opts.map((o, i) => (
         <Text key={o}>
-          <Text bold={sel === i} color={sel === i ? t.color.warn : t.color.muted} inverse={sel === i}>
+          <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? '▸ ' : '  '}
             {i + 1}. {LABELS[o]}
           </Text>
@@ -186,7 +187,13 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
 
         <Box>
           <Text color={t.color.label}>{'> '}</Text>
-          <TextInput columns={Math.max(20, cols - 6)} onChange={setCustom} onSubmit={onAnswer} value={custom} />
+          <TextInput
+            color={t.color.text}
+            columns={Math.max(20, cols - 6)}
+            onChange={setCustom}
+            onSubmit={onAnswer}
+            value={custom}
+          />
         </Box>
 
         <Text color={t.color.muted}>
@@ -203,7 +210,7 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
 
       {[...choices, 'Other (type your answer)'].map((c, i) => (
         <Text key={i}>
-          <Text bold={sel === i} color={sel === i ? t.color.label : t.color.muted} inverse={sel === i}>
+          <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? '▸ ' : '  '}
             {i + 1}. {c}
           </Text>

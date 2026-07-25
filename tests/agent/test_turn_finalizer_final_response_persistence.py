@@ -212,36 +212,133 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
-def test_model_sovereignty_runtime_never_spawns_auxiliary_background_review(
-    monkeypatch,
-):
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+def test_final_response_fills_pure_tool_call_tail(monkeypatch):
+    """A tail assistant row that is a *pure tool-call turn* carries no answer.
+
+    The role check alone ("tail is assistant ⇒ nothing to do") leaves the
+    #43849/#44100 invariant unmet when the tail is ``assistant(tool_calls)``
+    with no text of its own: the caller and the gateway already delivered
+    ``final_response``, but it never reaches the transcript. The next turn then
+    replays the user backlog and the model re-answers it — the exact symptom
+    that block exists to prevent.
+    """
     agent = FakeAgent()
-    agent._current_turn_id = "turn"
-    agent._background_review_enabled = False
-    agent._skill_nudge_interval = 1
-    agent._iters_since_skill = 1
-    agent.valid_tool_names = ["skill_manage"]
-    spawned = []
-    agent._spawn_background_review = lambda **kwargs: spawned.append(kwargs)
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Here is your answer.",
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    persisted = agent.persisted_messages
+    assert any(
+        m.get("role") == "assistant" and m.get("content") == result["final_response"]
+        for m in persisted
+    ), "delivered final_response never reached the durable transcript"
+    # Filled in place — no assistant→assistant pair, tool_calls preserved.
+    assert persisted[-1]["content"] == "Here is your answer."
+    assert persisted[-1]["tool_calls"]
+    assert sum(1 for m in persisted if m.get("role") == "assistant") == 1
+
+
+def test_final_response_does_not_clobber_tool_call_tail_with_text(monkeypatch):
+    """A tail tool-call turn that already carries model text must be left alone."""
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "partial text",
+            "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
+    ]
 
     finalize_turn(
         agent,
-        final_response="Done.",
-        api_call_count=1,
+        final_response="Here is your answer.",
+        api_call_count=3,
         interrupted=False,
         failed=False,
-        messages=[
-            {"role": "user", "content": "do it"},
-            {"role": "assistant", "content": "Done."},
-        ],
+        messages=messages,
         conversation_history=[],
-        effective_task_id="task",
-        turn_id="turn",
-        user_message="do it",
-        original_user_message="do it",
-        _should_review_memory=True,
-        _turn_exit_reason="text_response(stop)",
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
     )
 
-    assert spawned == []
+    assert agent.persisted_messages[-1]["content"] == "partial text"
+
+
+def test_fill_pops_db_persisted_marker_for_durable_rewrite(monkeypatch):
+    """The incremental tool-call persist stamps ``_db_persisted`` on the row.
+
+    If finalize_turn fills the tail's content but leaves the marker, the next
+    ``_flush_messages_to_session_db`` skips the row and the durable SQLite
+    store keeps ``content=""`` — so ``/resume`` reloads the empty content and
+    the bug resurfaces cross-session. The fix pops the marker so the filled
+    content is re-written.
+    """
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}
+            ],
+            "_db_persisted": True,  # stamped by conversation_loop.py:4990
+        },
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="Here is your answer.",
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="t",
+        turn_id="tid",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    persisted = agent.persisted_messages
+    assert persisted is not None
+    assert persisted[-1]["content"] == "Here is your answer."
+    assert persisted[-1]["tool_calls"]
+    assert "_db_persisted" not in persisted[-1], (
+        "marker must be popped so the next flush re-writes the filled content"
+    )

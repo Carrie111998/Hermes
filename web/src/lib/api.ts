@@ -830,7 +830,14 @@ export const api = {
       body: JSON.stringify(body)
     }),
   authMcpServer: (name: string) =>
-    fetchJSON<McpTestResult>(`/api/mcp/servers/${encodeURIComponent(name)}/auth`, { method: 'POST' }),
+    fetchJSON<McpOAuthFlow>(
+      `/api/mcp/servers/${encodeURIComponent(name)}/auth`,
+      { method: "POST" },
+    ),
+  getMcpOAuthFlow: (flowId: string) =>
+    fetchJSON<McpOAuthFlow>(
+      `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`,
+    ),
   removeMcpServer: (name: string) =>
     fetchJSON<{ ok: boolean }>(`/api/mcp/servers/${encodeURIComponent(name)}`, {
       method: 'DELETE'
@@ -1239,6 +1246,15 @@ export interface McpTestResult {
   tools: Array<{ name: string; description: string }>
 }
 
+export interface McpOAuthFlow {
+  flow_id: string;
+  server_name: string;
+  status: "starting" | "authorization_required" | "approved" | "error";
+  authorization_url: string | null;
+  error: string | null;
+  tools?: Array<{ name: string; description: string }>;
+}
+
 export interface MessagingPlatformEnvVar {
   key: string
   required: boolean
@@ -1563,7 +1579,14 @@ export interface StatusResponse {
   /** Phase 7: registered ``DashboardAuthProvider`` names (e.g. ``["nous"]``).
    * Empty in loopback mode; empty + ``auth_required=true`` is a
    * fail-closed state (the dashboard will refuse to bind). */
-  auth_providers?: string[]
+  auth_providers?: string[];
+  /** Supported dashboard auth flows for the client to choose from. In gated
+   * mode always includes ``"cookie"``; includes ``"native_pkce"`` when a
+   * brokerable OAuth provider is registered, signalling that the desktop can
+   * use the RFC 8252 system-browser + loopback + PKCE flow (no embedded
+   * webview, no session cookies). Absent / missing ``"native_pkce"`` ⇒ an
+   * older gateway ⇒ the desktop falls back to the embedded-webview flow. */
+  auth_flows?: string[];
   /** False when the dashboard is running in a hosted/managed layout where
    * updates are handled by the outer launcher instead of ``hermes update``. */
   can_update_hermes?: boolean
@@ -2079,33 +2102,35 @@ export interface MoaModelSlot {
   provider: string
   model: string
   /** Optional per-slot reasoning effort — round-tripped, not edited here. */
-  reasoning_effort?: string
+  reasoning_effort?: string;
+  enabled?: boolean;
 }
 
 export interface MoaConfigResponse {
-  default_preset: string
-  active_preset: string
-  presets: Record<
-    string,
-    {
-      reference_models: MoaModelSlot[]
-      aggregator: MoaModelSlot
-      reference_temperature: number
-      aggregator_temperature: number
-      max_tokens: number
-      /** Optional advisor output cap — round-tripped, not edited here. */
-      reference_max_tokens?: number | null
-      /** Fan-out cadence (per_iteration | user_turn) — round-tripped. */
-      fanout?: string
-      enabled: boolean
-    }
-  >
-  reference_models: MoaModelSlot[]
-  aggregator: MoaModelSlot
-  reference_temperature: number
-  aggregator_temperature: number
-  max_tokens: number
-  enabled: boolean
+  default_preset: string;
+  active_preset: string;
+  presets: Record<string, {
+    reference_models: MoaModelSlot[];
+    aggregator: MoaModelSlot;
+    reference_temperature: number;
+    aggregator_temperature: number;
+    reference_timeout: number | null;
+    degraded_reference_policy: "loud" | "silent";
+    max_tokens: number;
+    /** Optional advisor output cap — round-tripped, not edited here. */
+    reference_max_tokens?: number | null;
+    /** Fan-out cadence (user_turn default | per_iteration | every_n:N) — round-tripped. */
+    fanout?: string;
+    enabled: boolean;
+  }>;
+  reference_models: MoaModelSlot[];
+  aggregator: MoaModelSlot;
+  reference_temperature: number;
+  aggregator_temperature: number;
+  reference_timeout: number | null;
+  degraded_reference_policy: "loud" | "silent";
+  max_tokens: number;
+  enabled: boolean;
 }
 
 export interface ModelAssignmentRequest {

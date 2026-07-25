@@ -303,8 +303,8 @@ def bootstrap_production_secret_foundation(
     existing fixed sources and foundation.
     """
 
-    effective_uid = os.geteuid()
-    effective_gid = os.getegid()
+    effective_uid = getattr(os, "geteuid", lambda: -1)()
+    effective_gid = getattr(os, "getegid", lambda: -1)()
     if require_root and (
         effective_uid != 0
         or not sys.platform.startswith("linux")
