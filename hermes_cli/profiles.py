@@ -1238,6 +1238,11 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
     ``.env`` via the process environment). Users can then diverge per
     profile from there.
 
+    Distribution-installed profiles are the exception: they never shared the
+    default profile's ``.env`` (credentials are excluded from the payload), so
+    copying secrets into them would break isolation. Those get an empty
+    placeholder instead.
+
     Falls back to the placeholder header when the default install has no
     ``.env`` itself. Never overwrites an existing profile ``.env``.
 
@@ -1249,6 +1254,11 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
         return backfilled
 
     default_env = _get_default_hermes_home() / ".env"
+    placeholder = (
+        "# Per-profile secrets for this Hermes profile.\n"
+        "# API keys and tokens set here override the shell environment.\n"
+        "# Behavioral settings belong in config.yaml, not here.\n"
+    )
 
     for entry in sorted(profiles_root.iterdir()):
         if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
@@ -1258,16 +1268,15 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
         env_path = entry / ".env"
         if env_path.exists():
             continue
+        # Distribution installs never shared the default profile's .env.
+        # Copying secrets into them breaks credential isolation (same class
+        # as a missing install-time sentinel).
+        is_distribution = (entry / "distribution.yaml").is_file()
         try:
-            if default_env.is_file():
+            if default_env.is_file() and not is_distribution:
                 shutil.copy2(default_env, env_path)
             else:
-                env_path.write_text(
-                    "# Per-profile secrets for this Hermes profile.\n"
-                    "# API keys and tokens set here override the shell environment.\n"
-                    "# Behavioral settings belong in config.yaml, not here.\n",
-                    encoding="utf-8",
-                )
+                env_path.write_text(placeholder, encoding="utf-8")
             os.chmod(str(env_path), 0o600)
             backfilled.append(entry.name)
         except OSError as e:

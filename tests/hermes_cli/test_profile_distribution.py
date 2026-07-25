@@ -405,6 +405,26 @@ class TestInstall:
             install_distribution(str(staged), name="noseed")
         assert not (profile_env / ".hermes" / "profiles" / "noseed").exists()
 
+    def test_backfill_seeds_empty_env_for_distribution_profile(self, profile_env):
+        """Pre-fix dist installs (no .env) must not receive default secrets."""
+        default_home = profile_env / ".hermes"
+        (default_home / ".env").write_text(
+            "OPENAI_API_KEY=sk-SECRET-DEFAULT\n", encoding="utf-8"
+        )
+        staged = _make_staging_dir(profile_env, "src")
+        plan = install_distribution(str(staged), name="legacy-dist")
+        (plan.target_dir / ".env").unlink()  # simulate pre-fix install
+
+        backfilled = backfill_profile_envs(quiet=True)
+
+        assert "legacy-dist" in backfilled
+        content = (plan.target_dir / ".env").read_text(encoding="utf-8")
+        assert "sk-SECRET-DEFAULT" not in content
+        assert all(
+            line.startswith("#") or not line.strip()
+            for line in content.splitlines()
+        )
+
     def test_install_enforces_hermes_requires(self, profile_env, monkeypatch):
         # Pin current Hermes version to something well below the requirement
         import hermes_cli
