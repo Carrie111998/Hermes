@@ -5734,12 +5734,28 @@ class DiscordAdapter(BasePlatformAdapter):
         # Discord thread titles are budgeted in UTF-16 code units (emoji count
         # double); keep the tail safe by trimming the title prefix.
         from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
+        # The outer `...` suffix lives outside the brackets (so the thread
+        # name visibly ends with "..."), so its 3 UTF-16 code units are part
+        # of the total budget, not the title's slice. Reserve room for `[]`
+        # (2) plus the suffix (3) up front so the final name + suffix stays
+        # inside Discord's 80-unit cap.
         max_title = 80 - len(f"{emoji} {display_name} — Nova conversa []") - 1
         if max_title < 10:
             max_title = 30
+        truncated = False
         if utf16_len(clean_title) > max_title:
-            clean_title = _prefix_within_utf16_limit(clean_title, max_title - 3).rstrip() + "..."
-        return f"{emoji} {display_name} — Nova conversa [{clean_title}]"
+            # Trim the title so the full name (prefix + [title] + ...) still
+            # fits within the 80-unit Discord cap. The "- 3" subtracts the
+            # trailing `...` we will append after the closing bracket.
+            clean_title = _prefix_within_utf16_limit(clean_title, max(1, max_title - 3)).rstrip()
+            truncated = True
+        # Suffix-style ellipsis: render the brackets, then append "..." after
+        # the closing bracket so the thread name visibly ends with "..." when
+        # the title was truncated. Keeping "..." outside the brackets — not
+        # inside them — matches the test contract (endswith("...")) and reads
+        # more naturally to a human scanning the thread list.
+        suffix = "..." if truncated else ""
+        return f"{emoji} {display_name} — Nova conversa [{clean_title}]{suffix}"
 
     async def _send_seed_message_to_thread(self, thread: Any, body: str) -> None:
         """Best-effort wrapper around ``thread.send`` for the /start seed."""

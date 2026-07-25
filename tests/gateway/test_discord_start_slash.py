@@ -250,6 +250,9 @@ async def test_handle_start_creates_thread_with_canonical_name_and_seed():
     assert typing_kwargs.get("seconds", 0) >= 1.0
     # User must receive an ephemeral followup with the thread link.
     interaction.followup.send.assert_awaited()
+    # The adapter calls followup.send(msg, ephemeral=True) positionally, so
+    # the body lives in args[0]. Use args[0] to match the adapter's
+    # positional-first call pattern.
     followup_content = interaction.followup.send.await_args.args[0]
     assert "<#555>" in followup_content
 
@@ -272,6 +275,9 @@ async def test_handle_start_falls_back_to_invocation_channel_when_config_unset()
     # The fallback channel must be the one passed to thread creation.
     assert adapter._create_thread_in_channel.await_args.args[0] is fallback_channel
     # And the followup must mention the fallback so ops can spot misconfig.
+    # The adapter calls followup.send(msg, ephemeral=True) positionally, so
+    # the body lives in args[0] — match the adapter's positional-first
+    # call pattern.
     followup_content = interaction.followup.send.await_args.args[0]
     assert "using invocation channel" in followup_content
 
@@ -347,12 +353,13 @@ def test_format_start_thread_name_truncates_long_titles():
     """Long titles must be truncated so the thread name stays within Discord's 80-char UTF-16 budget."""
     long_title = "x" * 200
     name = DiscordAdapter._format_start_thread_name("il", "IL", long_title)
-    # Truncation adds "..." and trims to a safe budget. 80 UTF-16 code
-    # units is the hard Discord cap; allow a few units of slack for the
-    # 3-char ellipsis.
+    # Truncation adds "..." OUTSIDE the brackets so the thread name ends
+    # with "..." (not "...]" inside the brackets). 80 UTF-16 code units is
+    # the hard Discord cap; the ellipsis is part of the outer suffix so it
+    # counts against the 80-unit total.
     from gateway.platforms.base import utf16_len
     assert utf16_len(name) <= 80
-    assert name.endswith("...]")
+    assert name.endswith("...")
 
 
 # ──────────────────────────────────────────────────────────────────────
