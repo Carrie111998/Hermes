@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,6 +78,44 @@ def test_perform_uninstall_full_without_remove_profiles_keeps_data(
     assert profile_home.is_dir()
     assert (profile_home / "config.yaml").read_text(encoding="utf-8") == "profile: coder\n"
     assert not (hermes_home / "config.yaml").exists()
+
+
+def test_perform_uninstall_full_with_remove_profiles_wipes_home(
+    monkeypatch, tmp_path
+):
+    project_root = tmp_path / "repo"
+    hermes_home = tmp_path / ".hermes"
+    project_root.mkdir()
+    profile_home = _seed_default_home(hermes_home)
+    removed_profiles: list[str] = []
+
+    monkeypatch.setattr(uninstall, "uninstall_gateway_service", lambda: False)
+    monkeypatch.setattr(uninstall, "remove_path_from_shell_configs", lambda: [])
+    monkeypatch.setattr(uninstall, "remove_wrapper_script", lambda: [])
+    monkeypatch.setattr(uninstall, "remove_node_symlinks", lambda _home: [])
+    monkeypatch.setattr(uninstall, "_is_windows", lambda: False)
+
+    def _fake_uninstall_profile(profile):
+        removed_profiles.append(profile.name)
+        # Mirror production: wipe the profile home before step 5b.
+        if profile.path.exists():
+            shutil.rmtree(profile.path)
+
+    monkeypatch.setattr(uninstall, "_uninstall_profile", _fake_uninstall_profile)
+
+    uninstall._perform_uninstall(
+        project_root=project_root,
+        hermes_home=hermes_home,
+        full_uninstall=True,
+        remove_profiles=True,
+        named_profiles=[
+            SimpleNamespace(name="coder", path=profile_home, alias_path=None)
+        ],
+    )
+
+    assert removed_profiles == ["coder"]
+    assert not project_root.exists()
+    assert not hermes_home.exists()
 
 
 def test_yes_full_uninstall_does_not_wipe_named_profiles(monkeypatch, tmp_path):
