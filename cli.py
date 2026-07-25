@@ -3887,7 +3887,7 @@ def save_config_value(key_path: str, value: any) -> bool:
 
 
 def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Map a ``moa:<preset>`` model string to ``(provider, preset)``.
+    """Map a MoA model string to ``(provider, preset)``.
 
     Returns ``("moa", "<preset>")`` when *model* selects the MoA virtual
     provider, otherwise ``(None, model)`` unchanged. This gives non-interactive
@@ -3897,6 +3897,14 @@ def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[
     MoAClient off ``provider == "moa"``. Without this the raw ``moa:<preset>``
     string is sent to the real provider and rejected with a 401/400 "model not
     supported" (#56828).
+
+    A *bare* ``moa`` token (no preset, e.g. ``hermes chat -Q -m moa``) selects
+    the MoA virtual provider and falls back to the configured default preset,
+    mirroring what ``switch_model`` does for ``--provider moa`` with no model
+    and what the model picker does for the MoA row. Without this the bare
+    ``moa`` was left as the model id while the provider stayed on whatever was
+    active, so ``moa`` was sent to the real provider as a literal model name
+    and rejected with a 404 (#71244).
     """
     if isinstance(model, str):
         stripped = model.strip()
@@ -3904,6 +3912,27 @@ def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[
             preset = stripped.split(":", 1)[1].strip()
             if preset:
                 return "moa", preset
+            # ``moa:`` with an empty preset is intentionally left untouched —
+            # it is not a valid MoA selector and may be a real provider:model
+            # form for a provider whose slug happens to be "moa".
+        elif stripped.lower() == "moa":
+            # Bare ``moa`` (no preset, no colon) selects the MoA virtual
+            # provider and falls back to the configured default preset, mirroring
+            # what ``switch_model`` does for ``--provider moa`` with no model and
+            # what the model picker does for the MoA row. Without this the bare
+            # ``moa`` was left as the model id while the provider stayed on
+            # whatever was active, so ``moa`` was sent to the real provider as a
+            # literal model name and rejected with a 404 (#71244).
+            try:
+                from hermes_cli.config import load_config
+                from hermes_cli.moa_config import normalize_moa_config
+
+                preset = normalize_moa_config(load_config().get("moa") or {})[
+                    "default_preset"
+                ]
+            except Exception:
+                preset = "default"
+            return "moa", preset
     return None, model
 
 
