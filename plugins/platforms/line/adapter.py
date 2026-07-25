@@ -541,6 +541,21 @@ def _text_message(text: str) -> Dict[str, Any]:
     return {"type": "text", "text": text}
 
 
+def _text_v2_message(
+    text: str, substitutions: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Build a LINE textV2 message with substitution rules.
+
+    ``substitutions`` is a dict of placeholder keys to mention/emoji rules,
+    e.g. ``{"you": {"type": "mention", "mentionee": {"type": "user",
+    "userId": "U..."}}}``.  LINE clients resolve mentions to the
+    display name automatically — no Profile API call is needed.
+    """
+    if len(text) > LINE_PER_BUBBLE_CHARS:
+        text = text[: LINE_PER_BUBBLE_CHARS - 1] + "…"
+    return {"type": "textV2", "text": text, "substitution": substitutions}
+
+
 def _image_message(original_url: str, preview_url: Optional[str] = None) -> Dict[str, Any]:
     return {
         "type": "image",
@@ -1092,7 +1107,9 @@ class LineAdapter(BasePlatformAdapter):
         # postback cache and route directly to LINE so they reach the user
         # as visible bubbles. Source: PR #18153.
         if _is_system_bypass(content):
-            return await self._send_text_chunks(chat_id, content, force_push=False)
+            return await self._send_text_chunks(
+                chat_id, content, force_push=False, metadata=metadata,
+            )
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
@@ -1101,7 +1118,9 @@ class LineAdapter(BasePlatformAdapter):
             self._cache.set_ready(pending_rid, content)
             return SendResult(success=True, message_id=pending_rid)
 
-        return await self._send_text_chunks(chat_id, content, force_push=False)
+        return await self._send_text_chunks(
+            chat_id, content, force_push=False, metadata=metadata,
+        )
 
     async def _send_text_chunks(
         self,
@@ -1109,6 +1128,7 @@ class LineAdapter(BasePlatformAdapter):
         content: str,
         *,
         force_push: bool,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
@@ -1116,7 +1136,15 @@ class LineAdapter(BasePlatformAdapter):
         chunks = split_for_line(strip_markdown_preserving_urls(content))
         if not chunks:
             return SendResult(success=True, message_id=None)
-        messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+        messages: List[Dict[str, Any]]
+        text_v2_subs = (metadata or {}).get("text_v2_substitutions")
+        if isinstance(text_v2_subs, dict) and text_v2_subs:
+            # All bubbles use textV2 so mentions in any chunk are resolved.
+            messages = [
+                _text_v2_message(c, text_v2_subs) for c in chunks
+            ][:LINE_MAX_MESSAGES_PER_CALL]
+        else:
+            messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
 
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply and not force_push:
