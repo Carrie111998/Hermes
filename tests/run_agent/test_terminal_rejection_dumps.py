@@ -11,6 +11,7 @@ import pytest
 
 # Import the function we want to test
 from agent.agent_runtime_helpers import dump_api_response_debug, _ra
+from utils import atomic_json_write, env_var_enabled
 
 
 def test_dump_api_response_debug_creates_correct_file(monkeypatch, tmp_path):
@@ -30,11 +31,12 @@ def test_dump_api_response_debug_creates_correct_file(monkeypatch, tmp_path):
     mock_agent.logger = MagicMock()
 
     # Ensure atomic_json_write and env_var_enabled behave predictably
+    from utils import atomic_json_write, env_var_enabled
     def mock_write(f, content, default=None):
         with open(f, 'w') as fp:
             fp.write(json.dumps(content, indent=2))
-    monkeypatch.setattr('agent.utils.atomic_json_write', mock_write)
-    monkeypatch.setattr('agent.env_var.env_var_enabled', lambda var_name: var_name in os.environ)
+    monkeypatch.setattr('utils.atomic_json_write', mock_write)
+    monkeypatch.setattr('utils.env_var_enabled', lambda var_name: var_name in os.environ)
 
     # 2. Test case 1: Dump a dictionary-style response
     print("Testing dictionary-style payload...")
