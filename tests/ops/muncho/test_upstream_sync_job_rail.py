@@ -53,7 +53,7 @@ def _package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "host_binary_fact",
         lambda path: "4" * 64 if path == rail.GH_PATH else "5" * 64,
     )
-    return release, rail.build_package(REVISION)
+    return release, rail.build_package(REVISION, REVISION)
 
 
 def test_package_has_exact_two_jobs_and_split_credentials(
@@ -82,7 +82,14 @@ def test_package_has_exact_two_jobs_and_split_credentials(
     assert manifest["sync_service_discord_dependency"] is False
     assert manifest["reporter_github_credential_dependency"] is False
     assert manifest["package_installs_or_starts_units"] is False
-    assert rail.validate_manifest(manifest, revision=REVISION) == manifest
+    assert (
+        rail.validate_manifest(
+            manifest,
+            revision=REVISION,
+            sender_revision=REVISION,
+        )
+        == manifest
+    )
 
     assert "DynamicUser=yes" in sync_service
     assert "LoadCredential=github-token:" in sync_service

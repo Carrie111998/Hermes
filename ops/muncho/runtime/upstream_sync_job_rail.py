@@ -90,6 +90,8 @@ class DualSyncRailError(RuntimeError):
 class RailPackage:
     revision: str
     release_root: Path
+    sender_revision: str
+    sender_release_root: Path
     source_digests: Mapping[str, str]
     host_binary_digests: Mapping[str, str]
     artifacts: Mapping[str, bytes]
@@ -384,9 +386,10 @@ def render_sync_timer() -> bytes:
     return result
 
 
-def render_report_service(*, release: Path) -> bytes:
+def render_report_service(*, release: Path, sender_release: Path) -> bytes:
     interpreter = release / ".venv/bin/python"
     reporter = release / REPORTER_RELATIVE
+    sender_python = sender_release / ".venv/bin/python"
     lines = [
         "# Separate daily reporter; no GitHub credential is loaded.",
         "[Unit]",
@@ -395,13 +398,14 @@ def render_report_service(*, release: Path) -> bytes:
         "After=network-online.target",
         f"AssertPathExists={interpreter}",
         f"AssertPathExists={reporter}",
+        f"AssertPathExists={sender_python}",
         f"AssertPathExists={PUBLIC_REPORT_ROOT}",
         "",
         "[Service]",
         "Type=oneshot",
         f"User={REPORT_USER}",
         f"Group={REPORT_GROUP}",
-        f"WorkingDirectory={release}",
+        f"WorkingDirectory={sender_release}",
         f"StateDirectory={REPORT_STATE_DIRECTORY_NAME}",
         "StateDirectoryMode=0700",
         f"Environment=HOME={HERMES_HOME}",
@@ -415,6 +419,7 @@ def render_report_service(*, release: Path) -> bytes:
             f"--public-report-dir {PUBLIC_REPORT_ROOT} "
             f"--state-dir {REPORT_STATE_ROOT} "
             f"--channel-id {DISCORD_CHANNEL_ID} "
+            f"--sender-python {sender_python} "
             "--timezone Europe/Sofia --window-hours 24"
         ),
         "TimeoutStartSec=120s",
@@ -444,6 +449,7 @@ def render_report_service(*, release: Path) -> bytes:
         "RestrictSUIDSGID=yes",
         "SystemCallArchitectures=native",
         f"ReadOnlyPaths={release}",
+        f"ReadOnlyPaths={sender_release}",
         f"ReadOnlyPaths={HERMES_HOME}",
         f"ReadOnlyPaths={PUBLIC_REPORT_ROOT}",
         f"ReadWritePaths={REPORT_STATE_ROOT}",
@@ -453,7 +459,11 @@ def render_report_service(*, release: Path) -> bytes:
         "StandardError=journal",
     ]
     result = ("\n".join(lines) + "\n").encode("utf-8")
-    validate_report_service(result, release=release)
+    validate_report_service(
+        result,
+        release=release,
+        sender_release=sender_release,
+    )
     return result
 
 
@@ -525,15 +535,21 @@ def validate_sync_timer(value: bytes) -> None:
         raise DualSyncRailError("dual_sync_timer_unit_invalid")
 
 
-def validate_report_service(value: bytes, *, release: Path) -> None:
+def validate_report_service(
+    value: bytes,
+    *,
+    release: Path,
+    sender_release: Path,
+) -> None:
     text = value.decode("utf-8", errors="strict")
     required = (
         f"User={REPORT_USER}\n",
-        f"WorkingDirectory={release}\n",
+        f"WorkingDirectory={sender_release}\n",
         f"StateDirectory={REPORT_STATE_DIRECTORY_NAME}\n",
         f"ReadOnlyPaths={PUBLIC_REPORT_ROOT}\n",
         f"InaccessiblePaths=-{STATE_ROOT}\n",
         f"--channel-id {DISCORD_CHANNEL_ID} ",
+        f"--sender-python {sender_release / '.venv/bin/python'} ",
         "NoNewPrivileges=yes\n",
     )
     forbidden = (
@@ -563,7 +579,7 @@ def validate_report_timer(value: bytes) -> None:
         raise DualSyncRailError("dual_sync_report_timer_unit_invalid")
 
 
-def build_package(revision: str) -> RailPackage:
+def build_package(revision: str, sender_revision: str) -> RailPackage:
     release = release_root(revision)
     try:
         resolved = release.resolve(strict=True)
@@ -578,6 +594,22 @@ def build_package(revision: str) -> RailPackage:
     if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
         raise DualSyncRailError("dual_sync_interpreter_unavailable")
     validate_credential_metadata()
+    sender_release = release_root(sender_revision)
+    try:
+        resolved_sender = sender_release.resolve(strict=True)
+    except OSError as exc:
+        raise DualSyncRailError("dual_sync_sender_release_unavailable") from exc
+    if resolved_sender != sender_release:
+        raise DualSyncRailError("dual_sync_sender_release_not_final_address")
+    sender_marker = read_regular(
+        sender_release / SOURCE_MARKER_RELATIVE,
+        maximum=128,
+    )
+    if sender_marker.decode("ascii", errors="strict").strip() != sender_revision:
+        raise DualSyncRailError("dual_sync_sender_release_marker_mismatch")
+    sender_python = sender_release / ".venv/bin/python"
+    if not sender_python.is_file() or not os.access(sender_python, os.X_OK):
+        raise DualSyncRailError("dual_sync_sender_interpreter_unavailable")
     paths = source_paths(release)
     source_digests = {name: digest_file(path) for name, path in paths.items()}
     binary_digests = {
@@ -592,7 +624,10 @@ def build_package(revision: str) -> RailPackage:
             binary_digests=binary_digests,
         ),
         SYNC_TIMER_UNIT: render_sync_timer(),
-        REPORT_SERVICE_UNIT: render_report_service(release=release),
+        REPORT_SERVICE_UNIT: render_report_service(
+            release=release,
+            sender_release=sender_release,
+        ),
         REPORT_TIMER_UNIT: render_report_timer(),
     }
     jobs = [
@@ -620,6 +655,9 @@ def build_package(revision: str) -> RailPackage:
         "rail_schema": RAIL_SCHEMA,
         "release_revision": revision,
         "release_root": str(release),
+        "sender_revision": sender_revision,
+        "sender_release_root": str(sender_release),
+        "sender_interpreter_sha256": digest_file(sender_python),
         "jobs": jobs,
         "source_digests": source_digests,
         "host_binary_digests": binary_digests,
@@ -636,6 +674,8 @@ def build_package(revision: str) -> RailPackage:
     return RailPackage(
         revision=revision,
         release_root=release,
+        sender_revision=sender_revision,
+        sender_release_root=sender_release,
         source_digests=source_digests,
         host_binary_digests=binary_digests,
         artifacts=artifacts,
@@ -648,6 +688,7 @@ def validate_manifest(
     manifest: Mapping[str, Any],
     *,
     revision: str,
+    sender_revision: str,
 ) -> dict[str, Any]:
     if (
         not isinstance(manifest, Mapping)
@@ -655,6 +696,13 @@ def validate_manifest(
         or manifest.get("rail_schema") != RAIL_SCHEMA
         or manifest.get("release_revision") != revision
         or manifest.get("release_root") != str(release_root(revision))
+        or manifest.get("sender_revision") != sender_revision
+        or manifest.get("sender_release_root")
+        != str(release_root(sender_revision))
+        or _SHA256.fullmatch(
+            str(manifest.get("sender_interpreter_sha256") or "")
+        )
+        is None
         or manifest.get("github_credential_value_recorded") is not False
         or manifest.get("sync_service_model_or_provider_dependency") is not False
         or manifest.get("sync_service_discord_dependency") is not False
@@ -722,7 +770,11 @@ def write_artifact(path: Path, value: bytes, *, mode: int) -> None:
 
 def stage_package(package: RailPackage, *, output_root: Path = PACKAGE_ROOT) -> None:
     manifest = json.loads(package.manifest_bytes.decode("ascii"))
-    validate_manifest(manifest, revision=package.revision)
+    validate_manifest(
+        manifest,
+        revision=package.revision,
+        sender_revision=package.sender_revision,
+    )
     for name, value in package.artifacts.items():
         write_artifact(output_root / name, value, mode=0o444)
     write_artifact(output_root / "manifest.json", package.manifest_bytes, mode=0o444)
@@ -1144,9 +1196,11 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     package = commands.add_parser("package")
     package.add_argument("--revision", required=True)
+    package.add_argument("--sender-revision", required=True)
     package.add_argument("--output-root", type=Path, default=PACKAGE_ROOT)
     verify = commands.add_parser("verify-package")
     verify.add_argument("--revision", required=True)
+    verify.add_argument("--sender-revision", required=True)
     verify.add_argument("--output-root", type=Path, default=PACKAGE_ROOT)
     run = commands.add_parser("run-all")
     run.add_argument("--revision", required=True)
@@ -1166,12 +1220,12 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     if args.command == "package":
-        package = build_package(args.revision)
+        package = build_package(args.revision, args.sender_revision)
         stage_package(package, output_root=args.output_root)
         verify_package(package, output_root=args.output_root)
         return 0
     if args.command == "verify-package":
-        package = build_package(args.revision)
+        package = build_package(args.revision, args.sender_revision)
         verify_package(package, output_root=args.output_root)
         return 0
     if args.command == "run-all":

@@ -190,14 +190,18 @@ def deliver_once(
     message: str,
     *,
     channel_id: str,
+    sender_python: Path | None = None,
     runner: Any = subprocess.run,
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9]{15,22}", channel_id):
         return {"status": "BLOCKED", "blocker": "invalid_discord_channel_id"}
     try:
+        sender = sender_python or Path(sys.executable)
+        if not sender.is_absolute() or not sender.is_file():
+            return {"status": "BLOCKED", "blocker": "sender_python_unavailable"}
         completed = runner(
             (
-                sys.executable,
+                str(sender),
                 "-m",
                 "hermes_cli.main",
                 "send",
@@ -270,6 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--public-report-dir", type=Path, required=True)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--channel-id", default=DEFAULT_CHANNEL_ID)
+    parser.add_argument("--sender-python", type=Path)
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument("--window-hours", type=int, default=DEFAULT_WINDOW_HOURS)
     parser.add_argument("--now")
@@ -298,7 +303,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         timezone_name=args.timezone,
         window_hours=args.window_hours,
     )
-    result = deliver_once(message, channel_id=args.channel_id)
+    result = deliver_once(
+        message,
+        channel_id=args.channel_id,
+        sender_python=args.sender_python,
+    )
     write_delivery_receipt(
         args.state_dir.resolve(),
         result=result,
