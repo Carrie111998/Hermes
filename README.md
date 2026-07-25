@@ -20,6 +20,16 @@
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.
 
+---
+
+> **Bright Data Web Scraping & LinkedIn Search:** Installed skills include `brightdata-cli`, `bright-data-mcp`, `data-feeds`, and `agent-onboarding`.
+> - **Authenticate:** Run `brightdata login` or set `export BRIGHTDATA_API_TOKEN=<key>`
+> - **LinkedIn Search Profiles:** `brightdata search linkedin profiles "<First>" --last-name "<Last>"`
+> - **LinkedIn Search Jobs:** `brightdata search linkedin jobs --keyword "<Keyword>" --location "<City>"`
+> - **LinkedIn Scrape URL:** `brightdata scrape linkedin profiles "<Profile_URL>"`
+
+---
+
 <table>
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>

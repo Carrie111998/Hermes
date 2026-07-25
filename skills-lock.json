@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "skills": {
+    "agent-onboarding": {
+      "source": "brightdata/skills",
+      "sourceType": "github",
+      "skillPath": "skills/agent-onboarding/SKILL.md",
+      "computedHash": "8fca5649e5eabe8698537ded60415b90457820fac7b65974f0b16c6d2e2433a5"
+    },
+    "bright-data-mcp": {
+      "source": "brightdata/skills",
+      "sourceType": "github",
+      "skillPath": "skills/bright-data-mcp/SKILL.md",
+      "computedHash": "4c8bae0bae93b5b062633f06f9fb919ab6d31287a43ce844d8717c4bd6bd6759"
+    },
+    "brightdata-cli": {
+      "source": "brightdata/skills",
+      "sourceType": "github",
+      "skillPath": "skills/brightdata-cli/SKILL.md",
+      "computedHash": "0f9aa9c91b4c3e9dc93d539f9b6c0432190c91ae2b645c0e44e9a6cea117fa10"
+    },
+    "data-feeds": {
+      "source": "brightdata/skills",
+      "sourceType": "github",
+      "skillPath": "skills/data-feeds/SKILL.md",
+      "computedHash": "f23c1803ac9915886c48393fd89fd6c3bd8f65c7bf66925ba5c4a7f34eba6865"
+    }
+  }
+}
