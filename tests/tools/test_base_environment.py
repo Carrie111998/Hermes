@@ -6,7 +6,11 @@ init_session() failure handling, and the CWD marker contract.
 
 from unittest.mock import MagicMock
 
-from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
+from tools.environments.base import (
+    BaseEnvironment,
+    _BoundedOutputCollector,
+    _export_dump_excluding_session_vars,
+)
 
 
 class _TestableEnv(BaseEnvironment):
@@ -67,7 +71,7 @@ class TestWrapCommand:
         assert "cd -- /tmp" in wrapped or "cd -- '/tmp'" in wrapped
         assert "eval 'echo hello'" in wrapped
         assert "__hermes_ec=$?" in wrapped
-        assert "export -p" in wrapped and "> " in wrapped
+        assert "compgen -e" in wrapped and "export -p" in wrapped and "> " in wrapped
         # cwd travels via the stdout marker only — no temp-file write.
         assert "pwd -P >" not in wrapped
         assert env._cwd_marker in wrapped
@@ -141,7 +145,7 @@ class TestAtomicSnapshotWrite:
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
         # Env dump goes to a temp file, not directly over the live snapshot.
-        assert "export -p" in wrapped and "> " in wrapped
+        assert "compgen -e" in wrapped and "export -p" in wrapped and "> " in wrapped
         assert ".tmp." in wrapped
         # Then an atomic rename onto the real snapshot path.
         assert "mv -f " in wrapped
@@ -180,14 +184,13 @@ class TestAtomicSnapshotWrite:
         # word-split into two args and break the redirect/mv).
         assert " space/hermes-snap-x.sh.tmp.$BASHPID" not in wrapped
 
-    def test_wrap_command_mv_chained_on_export_success(self):
-        """A failed/partial ``export -p`` must NOT mv a torn temp over a good
-        snapshot.  The mv is chained with ``&&`` on the export, and the temp is
-        removed on failure."""
+    def test_wrap_command_mv_chained_on_dump_success(self):
+        """A failed/partial env dump must not replace a good snapshot."""
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "export -p" in wrapped and "> " in wrapped and "&& mv -f " in wrapped
+        assert "compgen -e" in wrapped and "export -p" in wrapped
+        assert "> " in wrapped and "&& mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
     def test_init_session_bootstrap_also_atomic_and_bashpid(self):
@@ -210,6 +213,7 @@ class TestAtomicSnapshotWrite:
         assert ".tmp." in boot and "mv -f " in boot, boot
         assert "$BASHPID" in boot
         assert ".tmp.$$" not in boot
+        assert "|| { rm -f " in boot and "exit 1; }" in boot
 
     def test_snapshot_writes_use_private_umask_after_user_command(self):
         env = _TestableEnv()
@@ -259,15 +263,23 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         if not shutil.which("bash"):
             import pytest
             pytest.skip("bash required")
+        # macOS /bin/bash 3.2 has no BASHPID. The production strategy and this
+        # stress test require a per-background-subshell identifier; using the
+        # empty expansion would make every writer share one temp path and test
+        # a guarantee the shell cannot provide (pre-existing #38249 limitation).
+        if self._run('test -n "${BASHPID:-}"').returncode != 0:
+            import pytest
+            pytest.skip("Bash lacks BASHPID for unique concurrent temp paths")
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
         _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
         # One writer iteration = the exact atomic sequence _wrap_command emits.
+        dump = _export_dump_excluding_session_vars(_snap_tmp)
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
+            f"{{ {dump} && mv -f {_snap_tmp} {_q(snap)}; }} "
             f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
             "done"
         )
@@ -280,7 +292,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
             "case \"$PATH\" in *'declare -x'*|*'export '*) echo CORRUPT;; esac ); "
             "done"
         )
-        self._run(f"export -p > {_q(snap)}")  # seed a valid snapshot
+        self._run(_export_dump_excluding_session_vars(_q(snap)))
         # 4 concurrent writers + 4 readers, repeated.
         w = " & ".join([writer] * 4)
         r = " & ".join([reader] * 4)
@@ -290,9 +302,8 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         final = self._run(f"source {_q(snap)} >/dev/null 2>&1 && echo OK || echo BROKEN")
         assert "OK" in final.stdout, f"final snapshot not sourceable: {final.stdout} {final.stderr}"
 
-    def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path):
-        """If ``export -p`` fails, the ``&&``-chained mv must NOT clobber the
-        existing good snapshot."""
+    def test_failed_dump_does_not_destroy_good_snapshot(self, tmp_path):
+        """If the env dump fails, the chained move preserves the snapshot."""
         import shutil
         if not shutil.which("bash"):
             import pytest
@@ -301,11 +312,12 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         snap = str(tmp_path / "snap.sh")
         _q = shlex.quote
         self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
-        # Redirect export into an unwritable dir so the export side fails; mv
+        # Redirect the dump into an unwritable dir so it fails; mv
         # must then NOT run (&&) and not clobber snap.
         bad_tmp = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID"
+        dump = _export_dump_excluding_session_vars(bad_tmp)
         script = (
-            f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
+            f"{{ {dump} && mv -f {bad_tmp} {_q(snap)}; }} "
             f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"
         )
         self._run(script)

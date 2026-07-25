@@ -16,56 +16,101 @@ CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
 """
 
 import os
-import re
+from fnmatch import fnmatchcase
+import shlex
+import subprocess
 import sys
 
 import pytest
 
 from tools.environments.base import (
-    _SNAPSHOT_EXCLUDED_ENV_REGEX,
+    _SNAPSHOT_EXCLUDED_ENV_PATTERNS,
     _export_dump_excluding_session_vars,
 )
 
 
 # ---------------------------------------------------------------------------
-# Unit: the exclusion regex matches exactly the bridged vars, nothing else.
+# Unit: exclusion is decided from the variable name, never serialized values.
 # ---------------------------------------------------------------------------
 
-def test_regex_matches_bridged_session_vars():
-    rx = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
-    # Every var the gateway bridges must be excluded.
+def test_name_filter_matches_bridged_session_vars():
     from gateway.session_context import _VAR_MAP
 
     for name in _VAR_MAP:
-        line = f'declare -x {name}="whatever"'
-        assert rx.search(line), f"{name} should be excluded from the snapshot"
+        assert any(
+            fnmatchcase(name, pattern)
+            for pattern in _SNAPSHOT_EXCLUDED_ENV_PATTERNS
+        ), f"{name} should be excluded from the snapshot"
 
 
-def test_regex_preserves_user_env():
-    rx = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
-    for line in (
-        'declare -x PATH="/usr/bin:/bin"',
-        'declare -x HOME="/home/user"',
-        'declare -x HERMES_HOME="/home/user/.hermes"',  # NOT a session var
-        'declare -x HERMESX="x"',
-        'declare -x MY_HERMES_SESSION_ID="x"',  # prefix must anchor after "declare -x "
+def test_name_filter_preserves_user_env():
+    for name in (
+        "PATH",
+        "HOME",
+        "HERMES_HOME",
+        "HERMESX",
+        "MY_HERMES_SESSION_ID",
     ):
-        assert not rx.search(line), f"{line!r} must be preserved in the snapshot"
+        assert not any(
+            fnmatchcase(name, pattern)
+            for pattern in _SNAPSHOT_EXCLUDED_ENV_PATTERNS
+        ), f"{name!r} must be preserved in the snapshot"
 
 
-def test_export_snippet_shape():
+def test_export_snippet_filters_names_before_export_serialization():
     snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
+    assert "compgen -e" in snippet
+    assert "export -n" in snippet
     assert "export -p" in snippet
-    assert "grep -vE" in snippet
+    assert 'case "${HERMES_SESSION___SNAPSHOT_VAR}"' in snippet
+    assert "grep" not in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
-    # The redirection must be attached to a brace group wrapping the pipeline,
-    # NOT to the grep segment: a redirect on grep expands $BASHPID inside
-    # grep's pipeline subshell (a different PID than the parent shell that
-    # expands the follow-up ``mv`` operand), silently orphaning the dump and
-    # breaking snapshot env persistence entirely.
-    assert snippet.lstrip().startswith("{ ")
-    assert "|| true; }" in snippet
+    assert snippet.lstrip().startswith("{ ( while ")
     assert snippet.rstrip().endswith("> /tmp/snap.tmp.$BASHPID")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX bash")
+def test_multiline_session_metadata_cannot_escape_snapshot_filter(tmp_path):
+    """A bridged value's continuation lines must never enter the snapshot."""
+    snapshot = tmp_path / "snapshot.sh"
+    marker = tmp_path / "injected-command-ran"
+    preserved_marker = tmp_path / "preserved-value-command-ran"
+    env = os.environ.copy()
+    env["HERMES_SESSION_CHAT_NAME"] = (
+        f"matrix room\ntouch {shlex.quote(str(marker))} #"
+    )
+    env["HERMES_SESSION_USER_NAME"] = "alice\nprintf ignored"
+    safe_value = (
+        f"first\n$(touch {shlex.quote(str(preserved_marker))})\nsecond"
+    )
+    env["HERMES_SAFE_MULTILINE"] = safe_value
+    oldpwd_value = str(tmp_path / "previous-directory")
+
+    dump = _export_dump_excluding_session_vars(shlex.quote(str(snapshot)))
+    script = (
+        f"export OLDPWD={shlex.quote(oldpwd_value)}\n"
+        f"{dump}\n"
+        "unset HERMES_SESSION_CHAT_NAME HERMES_SESSION_USER_NAME\n"
+        f"source {shlex.quote(str(snapshot))} >/dev/null 2>&1 || true\n"
+        "printf '%s' \"$HERMES_SAFE_MULTILINE\"\n"
+    )
+    completed = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == safe_value
+    assert not marker.exists(), "snapshot continuation executed as shell code"
+    assert not preserved_marker.exists(), "serialized value ran command substitution"
+    persisted = snapshot.read_text(encoding="utf-8")
+    assert "HERMES_SESSION_CHAT_NAME" not in persisted
+    assert "HERMES_SESSION_USER_NAME" not in persisted
+    assert "HERMES_SAFE_MULTILINE" in persisted
+    assert f'declare -x OLDPWD="{oldpwd_value}"' in persisted
 
 
 # ---------------------------------------------------------------------------

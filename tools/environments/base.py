@@ -396,36 +396,44 @@ def _cwd_marker(session_id: str) -> str:
 # should only carry the user's own shell state (PATH, functions, exports they
 # set), not Hermes' per-turn session identity.
 #
-# Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes.
-_SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+# Kept in sync with gateway.session_context._VAR_MAP. Shell ``case`` globs
+# let us decide from the variable NAME before serializing its value. That is a
+# security boundary: ``export -p`` renders embedded newlines as continuation
+# lines, so filtering its text line-by-line can remove the declaration header
+# while leaving attacker-controlled continuation lines executable (#71296).
+_SNAPSHOT_EXCLUDED_ENV_PATTERNS = (
+    "HERMES_SESSION_*",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_CRON_AUTO_DELIVER_*",
 )
 
 
 def _export_dump_excluding_session_vars(tmp_path: str) -> str:
-    """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
-    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+    """Return a shell snippet that dumps exports without session metadata.
 
-    ``export -p`` emits one ``declare -x NAME="value"`` line per exported var.
-    We drop the HERMES_SESSION_* / UI / CRON_AUTO_DELIVER lines so they never
-    persist across sessions in the shared snapshot. ``grep -vE`` returns exit 1
-    when it filters everything, so ``|| true`` keeps the pipeline's success
-    contract intact for the callers that chain on it.
+    Work in a subshell, enumerate exported variable NAMES with ``compgen -e``,
+    and remove the export attribute from bridged session variables before
+    invoking Bash's own ``export -p`` serializer.  The values of excluded
+    variables are therefore never rendered at all, so an embedded newline in a
+    Matrix room/member name cannot leave executable continuation lines in the
+    shared snapshot (#71296).
 
-    The pipeline MUST be wrapped in a brace group with the redirection applied
-    to the group, not to the last pipeline segment. *tmp_path* typically embeds
-    ``$BASHPID`` for concurrency-safe temp names; a redirection attached
-    directly to ``grep`` is expanded inside grep's own pipeline subshell, where
-    ``$BASHPID`` resolves to the grep subshell's PID — while the caller's
-    follow-up ``mv $tmp`` expands in the parent shell to a DIFFERENT PID. The
-    dump then lands in an orphaned temp file and the snapshot silently never
-    updates (all exported-env persistence breaks). The brace-group redirect is
-    expanded in the current shell, keeping both expansions consistent.
+    Using ``export -n`` rather than rebuilding declarations one name at a time
+    preserves Bash's exact snapshot semantics for special exported variables
+    such as ``OLDPWD``.  It also works for readonly variables because only the
+    export attribute changes.  The mutation is confined to the subshell.
+
+    The redirection remains attached to the outer brace group. *tmp_path*
+    usually embeds ``$BASHPID``; expanding that path in the current shell keeps
+    it identical to the caller's subsequent ``mv`` operand.
     """
+    patterns = "|".join(_SNAPSHOT_EXCLUDED_ENV_PATTERNS)
+    loop_var = "HERMES_SESSION___SNAPSHOT_VAR"
     return (
-        f"{{ export -p | grep -vE '{_SNAPSHOT_EXCLUDED_ENV_REGEX}' || true; }} "
-        f"> {tmp_path}"
+        f"{{ ( while IFS= read -r {loop_var}; do "
+        f'case "${{{loop_var}}}" in {patterns}) '
+        f'export -n "${{{loop_var}}}" || exit 1 ;; esac; '
+        f"done < <(compgen -e); export -p ); }} > {tmp_path}"
     )
 
 
@@ -545,7 +553,8 @@ class BaseEnvironment(ABC):
         _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
         bootstrap = (
             f"umask 077\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp)} "
+            f"|| {{ rm -f {_snap_tmp}; exit 1; }}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -686,14 +695,11 @@ class BaseEnvironment(ABC):
         parts.append("umask 077")
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
-        # Chain mv on the export succeeding so a failed/partial dump never
-        # replaces a good snapshot; drop the temp on failure so it isn't
+        # Chain mv on a successful name-filtered dump so a failed/partial write
+        # never replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the redirection must be attached to a brace group, not to the
-        # grep pipeline segment — ``_snap_tmp`` embeds ``$BASHPID``, and a
-        # redirect on grep is expanded inside grep's pipeline subshell (a
-        # different PID than the parent shell that expands the ``mv`` operand),
-        # silently orphaning the dump. See _export_dump_excluding_session_vars.
+        # The helper owns the outer redirection so ``$BASHPID`` is expanded in
+        # the same shell as the following ``mv`` operand.
         if self._snapshot_ready:
             parts.append(
                 f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
