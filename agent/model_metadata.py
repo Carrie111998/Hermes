@@ -862,6 +862,24 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
             pricing["completion"] = str(float(novita_output) / 10_000 / 1_000_000)
         return pricing
 
+    # xAI ships integer prices as 1/10_000 USD per 1M tokens on the models
+    # endpoint (e.g. prompt_text_token_price=20000 → $2.00/MTok). Same scale
+    # as Novita's input_token_price_per_m. Long-context tier fields exist
+    # (*_long_context) but the generic cost path has no context-tier switch,
+    # so we map the base rates only.
+    xai_prompt = payload.get("prompt_text_token_price")
+    xai_completion = payload.get("completion_text_token_price")
+    xai_cache = payload.get("cached_prompt_text_token_price")
+    if xai_prompt is not None or xai_completion is not None:
+        pricing = {}
+        if xai_prompt is not None:
+            pricing["prompt"] = str(float(xai_prompt) / 10_000 / 1_000_000)
+        if xai_completion is not None:
+            pricing["completion"] = str(float(xai_completion) / 10_000 / 1_000_000)
+        if xai_cache is not None:
+            pricing["cache_read"] = str(float(xai_cache) / 10_000 / 1_000_000)
+        return pricing
+
     # DeepInfra ships pricing under ``metadata.pricing`` with $/MTok values:
     # ``input_tokens``, ``output_tokens``, ``cache_read_tokens``. Convert to
     # per-token strings so the generic cost machinery (usage_pricing.py)

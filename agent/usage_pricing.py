@@ -14,6 +14,7 @@ DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
+_XAI_DEFAULT_BASE_URL = "https://api.x.ai/v1"
 
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
 CostSource = Literal[
@@ -867,6 +868,34 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://docs.fireworks.ai/serverless/pricing",
         pricing_version="fireworks-pricing-2026-07",
     ),
+    # ── xAI Grok ─────────────────────────────────────────────────────────
+    # Base (< long-context threshold) rates from docs.x.ai + live
+    # GET /v1/models fields (prompt_text_token_price etc., unit 1/10_000 $/M).
+    # Long-context tier is ~2x; estimate_usage_cost has no tier switch yet, so
+    # fat sessions can understate until that lands. Verified 2026-07-25.
+    # Source: https://docs.x.ai/developers/models
+    (
+        "xai",
+        "grok-4.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("6.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://docs.x.ai/developers/models",
+        pricing_version="xai-pricing-2026-07",
+    ),
+    (
+        "xai",
+        "grok-4.3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.25"),
+        output_cost_per_million=Decimal("2.50"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        source="official_docs_snapshot",
+        source_url="https://docs.x.ai/developers/models",
+        pricing_version="xai-pricing-2026-07",
+    ),
 }
 
 # GPT-5.6 "-pro" high-effort variants bill at the same per-token rates as
@@ -905,8 +934,8 @@ def resolve_billing_route(
     model = (model_name or "").strip()
     if not provider_name and "/" in model:
         inferred_provider, bare_model = model.split("/", 1)
-        if inferred_provider in {"anthropic", "openai", "google"}:
-            provider_name = inferred_provider
+        if inferred_provider in {"anthropic", "openai", "google", "xai", "x-ai"}:
+            provider_name = "xai" if inferred_provider in {"xai", "x-ai"} else inferred_provider
             model = bare_model
 
     if provider_name == "openai-codex":
@@ -925,6 +954,21 @@ def resolve_billing_route(
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    # xAI API-key and SuperGrok OAuth both bill at the same published Grok
+    # rates. Prefer live /v1/models when base_url+key work; snapshot is the
+    # offline/insights fallback (see get_pricing_entry).
+    if (
+        provider_name in {"xai", "xai-oauth", "x-ai"}
+        or base_url_host_matches(base_url or "", "api.x.ai")
+        or base_url_host_matches(base_url or "", "x.ai")
+    ):
+        bare = model.split("/")[-1]
+        return BillingRoute(
+            provider="xai",
+            model=bare,
+            base_url=base_url or _XAI_DEFAULT_BASE_URL,
+            billing_mode="official_docs_snapshot",
+        )
     # Vertex AI hosts the same Gemini models as Google AI Studio; price them
     # off the gemini official-docs snapshot. Strip the "google/" vendor prefix
     # the OpenAI-compat endpoint requires so the pricing key matches.

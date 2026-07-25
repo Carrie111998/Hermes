@@ -636,3 +636,69 @@ def test_deepseek_v4_flash_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $0.14/M + 500K output × $0.28/M = $0.14 + $0.14 = $0.28
     assert float(result.amount_usd) == 0.28
+
+def test_xai_grok_snapshot_pricing_when_models_api_empty(monkeypatch):
+    """xAI Grok sessions must not stay cost_status=unknown.
+
+    Before this fix, resolve_billing_route left provider xai on
+    billing_mode=unknown with no snapshot row, so every xAI session
+    wrote estimated_cost_usd=0 / cost_status=unknown.
+    """
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda base_url, api_key=None: {},
+    )
+
+    entry = get_pricing_entry("grok-4.5", provider="xai")
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 2.0
+    assert float(entry.output_cost_per_million) == 6.0
+    assert float(entry.cache_read_cost_per_million) == 0.30
+
+    entry43 = get_pricing_entry("xai/grok-4.3", provider="xai")
+    assert entry43 is not None
+    assert float(entry43.input_cost_per_million) == 1.25
+    assert float(entry43.cache_read_cost_per_million) == 0.20
+
+    # Prefixed model id with no explicit provider still resolves.
+    entry_inferred = get_pricing_entry("xai/grok-4.5")
+    assert entry_inferred is not None
+    assert float(entry_inferred.input_cost_per_million) == 2.0
+
+
+def test_xai_grok_cached_session_estimates_not_unknown(monkeypatch):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda base_url, api_key=None: {},
+    )
+    result = estimate_usage_cost(
+        "grok-4.5",
+        CanonicalUsage(
+            input_tokens=100_000,
+            output_tokens=10_000,
+            cache_read_tokens=500_000,
+        ),
+        provider="xai",
+        base_url="https://api.x.ai/v1",
+    )
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 100k*$2 + 10k*$6 + 500k*$0.30 per 1M = 0.20 + 0.06 + 0.15 = 0.41
+    assert abs(float(result.amount_usd) - 0.41) < 1e-9
+
+
+def test_xai_models_api_price_fields_are_extracted():
+    from agent.model_metadata import _extract_pricing
+
+    pricing = _extract_pricing(
+        {
+            "id": "grok-4.5",
+            "prompt_text_token_price": 20000,
+            "cached_prompt_text_token_price": 3000,
+            "completion_text_token_price": 60000,
+        }
+    )
+    # Unit is 1/10_000 USD per 1M tokens → per-token strings for usage_pricing.
+    assert float(pricing["prompt"]) == 2.0 / 1_000_000
+    assert float(pricing["cache_read"]) == 0.30 / 1_000_000
+    assert float(pricing["completion"]) == 6.0 / 1_000_000
