@@ -741,7 +741,9 @@ export function usePromptActions({
 
   const reloadFromMessage = useCallback(
     async (parentId: string | null) => {
-      if (!activeSessionId || $busy.get()) {
+      const sessionId = activeSessionId || activeSessionIdRef.current
+
+      if (!sessionId || $busy.get()) {
         return
       }
 
@@ -752,20 +754,20 @@ export function usePromptActions({
       }
 
       clearNotifications()
-      updateSessionState(activeSessionId, state => applyReloadOptimistic(state, plan))
+      updateSessionState(sessionId, state => applyReloadOptimistic(state, plan))
 
       try {
         await requestGateway(
           'prompt.submit',
           {
-            session_id: activeSessionId,
+            session_id: sessionId,
             text: plan.text,
             ...truncateSubmitParams(plan.truncateOrdinal)
           },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
       } catch (err) {
-        updateSessionState(activeSessionId, state => ({
+        updateSessionState(sessionId, state => ({
           ...state,
           busy: false,
           awaitingResponse: false
@@ -773,7 +775,7 @@ export function usePromptActions({
         notifyError(err, copy.regenerateFailed)
       }
     },
-    [activeSessionId, copy.regenerateFailed, requestGateway, updateSessionState]
+    [activeSessionId, activeSessionIdRef, copy.regenerateFailed, requestGateway, updateSessionState]
   )
 
   // Cursor-style "restore checkpoint": rewind the conversation to a past user
