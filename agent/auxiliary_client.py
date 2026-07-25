@@ -2689,6 +2689,97 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     return CodexAuxiliaryClient(real_client, model), model
 
 
+def _active_profile_credential_home() -> Optional[Path]:
+    """Return the ACTIVE PROFILE's Hermes home when this process is root-scoped.
+
+    ``hermes_cli.auth._global_auth_file_path()`` makes the auth-store fallback
+    deliberately ONE-WAY: a profile process can read providers authed at the
+    global root, but a ROOT-mode process has no path to a profile's store. That
+    is correct for the gateway (which always runs profile-scoped, see
+    ``hermes_cli/main.py`` ``HERMES_HOME`` propagation) but leaves supervisor
+    processes that must run at the root blind to the credential the gateway
+    actually uses.
+
+    The SR-470 canary is exactly that case: its Scheduled Task wrapper
+    (``~/.hermes/ops/canary/canary-backend-conformance.ps1``) leaves
+    ``HERMES_HOME`` UNSET **on purpose**, so ``events.paths`` resolves the
+    cross-profile root for the event bus + sentinel (the CLAUDE.md
+    notification-layer invariant). Before 2026-07-25 the canary only worked
+    because a duplicate Codex credential also sat in the root store; pruning
+    that duplicate (two live copies of a single-use rotating refresh token is
+    the fragmentation bug we just closed) exposed the gap as
+    ``no Codex token configured``.
+
+    Returns ``None`` — meaning "change nothing" — whenever the process is
+    already profile-scoped, no profile is sticky-active, the active profile is
+    ``default``, or the profile has no store of its own.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root()
+        home = get_hermes_home()
+    except Exception as exc:  # pragma: no cover - resolution must never break a probe
+        logger.debug("Probe credential scope: home resolution failed: %s", exc)
+        return None
+
+    # Only ROOT-mode processes need this. A profile-scoped process (the
+    # gateway, a profile worker) already reads the right store.
+    try:
+        if home.resolve(strict=False) != root.resolve(strict=False):
+            return None
+    except OSError:
+        if home != root:
+            return None
+
+    try:
+        active = (root / "active_profile").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not active or active == "default":
+        return None
+
+    candidate = root / "profiles" / active
+    return candidate if (candidate / "auth.json").is_file() else None
+
+
+@contextlib.contextmanager
+def probe_credential_scope():
+    """Resolve credentials from the active profile's store, root paths intact.
+
+    Uses the CONTEXT-LOCAL home override, never ``os.environ``: ``get_hermes_home()``
+    (auth store + credential pool) follows the override, while
+    ``get_default_hermes_root()`` — and therefore every ``events.paths`` helper
+    and the canary's own sentinel path — reads only the process environment and
+    is unaffected. That split is what lets the probe read the gateway's
+    credential without relocating the event bus or the sentinel, and without
+    copying a rotating refresh token back to the root store.
+
+    The pool cache is dropped on both edges: ``agent.credential_pool._POOL_CACHE``
+    is keyed by provider alone, so a pool loaded under a different home would
+    otherwise be served across the boundary.
+
+    A no-op (yields ``None``) whenever ``_active_profile_credential_home()``
+    finds nothing to redirect to.
+    """
+    profile_home = _active_profile_credential_home()
+    if profile_home is None:
+        yield None
+        return
+
+    from agent.credential_pool import invalidate_pool_cache
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    logger.debug("Probe credential scope: reading auth store from %s", profile_home)
+    token = set_hermes_home_override(profile_home)
+    invalidate_pool_cache()
+    try:
+        yield profile_home
+    finally:
+        reset_hermes_home_override(token)
+        invalidate_pool_cache()
+
+
 def build_codex_probe_client() -> "Optional[Tuple[OpenAI, str]]":
     """Return a RAW OpenAI client + model for the backend-conformance canary
     (SR-470), or None if no Codex OAuth credentials are available.
@@ -2699,8 +2790,14 @@ def build_codex_probe_client() -> "Optional[Tuple[OpenAI, str]]":
     the raw openai.OpenAI client. The canary needs the raw client so it can
     issue its own responses.stream() and inspect the raw response.completed
     snapshot the SDK parser chokes on. Read-only; one cheap request per run.
+
+    Wrapped in ``probe_credential_scope()`` so a root-mode supervisor (the SR-470
+    Scheduled Task) probes the SAME credential the profile-scoped gateway uses.
+    The returned client carries a resolved token, so the scope can close before
+    the request is issued.
     """
-    wrapped, model = _build_codex_client(_CODEX_AUX_MODEL)
+    with probe_credential_scope():
+        wrapped, model = _build_codex_client(_CODEX_AUX_MODEL)
     raw = getattr(wrapped, "_real_client", None)
     if raw is None:
         return None
@@ -2715,8 +2812,16 @@ def build_anthropic_probe_client() -> "Optional[Tuple[Any, str]]":
     Delegates to _try_anthropic() (same pool / config.yaml base_url resolution
     as the production auxiliary path), then unwraps the AnthropicAuxiliaryClient
     shim to expose the raw native client for client.messages.create().
+
+    Shares ``probe_credential_scope()`` with the Codex arm so BOTH backends are
+    probed against the store the gateway uses. Without it the two arms would
+    silently diverge the moment the profile and root stores disagree — the same
+    class of blind spot that hid the Codex breakage. ``read_credential_pool()``
+    still falls back to the root store per-provider when the profile has no
+    entries, so this can only widen what resolves, never narrow it.
     """
-    wrapped, model = _try_anthropic()
+    with probe_credential_scope():
+        wrapped, model = _try_anthropic()
     raw = getattr(wrapped, "_real_client", None)
     if raw is None:
         return None
