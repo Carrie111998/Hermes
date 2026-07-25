@@ -858,6 +858,14 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+def _attested_discord_mentions(message) -> tuple[tuple[str, ...], bool]:
+    """Extract immutable Discord user and room mention facts from native ingress."""
+    mentioned_user_ids = tuple(
+        sorted({str(user.id) for user in (getattr(message, "mentions", None) or ())})
+    )
+    return mentioned_user_ids, bool(getattr(message, "mention_everyone", False))
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -7567,6 +7575,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
 
+        mentioned_user_ids, mentions_room = _attested_discord_mentions(message)
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,
@@ -7581,6 +7590,10 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata={
+                "mentioned_user_ids": mentioned_user_ids,
+                "mentions_room": mentions_room,
+            },
         )
 
         # Track thread participation so the bot won't require @mention for
@@ -7642,6 +7655,13 @@ class DiscordAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            existing_mentions = set(existing.metadata.get("mentioned_user_ids", ()))
+            existing_mentions.update(event.metadata.get("mentioned_user_ids", ()))
+            existing.metadata["mentioned_user_ids"] = sorted(existing_mentions)
+            existing.metadata["mentions_room"] = bool(
+                existing.metadata.get("mentions_room")
+                or event.metadata.get("mentions_room")
+            )
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():

@@ -44,7 +44,11 @@ def _event() -> MessageEvent:
         media_types=["image/png"],
         reply_to_message_id="prior-1",
         reply_to_text="prior text",
-        metadata={"secret": "must-not-leak"},
+        metadata={
+            "secret": "must-not-leak",
+            "mentioned_user_ids": ["user-2", "user-3"],
+            "mentions_room": True,
+        },
         raw_message={"token": "must-not-leak"},
     )
 
@@ -59,6 +63,8 @@ def test_message_and_route_contexts_are_immutable_normalized_snapshots():
     assert normalized_event.message_type == "photo"
     assert normalized_event.media_urls == ("/tmp/a.png",)
     assert normalized_event.media_types == ("image/png",)
+    assert normalized_event.mentioned_user_ids == ("user-2", "user-3")
+    assert normalized_event.mentions_room is True
     assert normalized_event.reply_to_message_id == "prior-1"
     assert route.platform == "discord"
     assert route.profile == "work"
@@ -75,6 +81,17 @@ def test_message_and_route_contexts_are_immutable_normalized_snapshots():
     assert not hasattr(normalized_event, "source")
     assert not hasattr(route, "role_authorized")
     assert not hasattr(route, "delivered_via_upstream_relay")
+
+
+def test_message_snapshot_marks_unattested_mentions_unknown():
+    event = _event()
+    event.metadata["mentioned_user_ids"] = None
+    event.metadata["mentions_room"] = "unknown"
+
+    normalized_event = GatewayMessageEvent.from_event(event)
+
+    assert normalized_event.mentioned_user_ids is None
+    assert normalized_event.mentions_room is None
 
 
 def test_route_snapshot_fills_resolved_active_profile_when_source_is_unset(monkeypatch):

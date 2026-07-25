@@ -12,6 +12,9 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 
+GATEWAY_MESSAGE_HOOK_API_VERSION = 2
+
+
 _profile_fallback_warned: bool = False
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(

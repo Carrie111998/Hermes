@@ -589,6 +589,24 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+def _attested_mention_user_ids(entities) -> tuple[str, ...] | None:
+    """Return transport-bound mention IDs, or None when Telegram cannot attest them."""
+    mentioned_user_ids: set[str] = set()
+    for entity in entities or ():
+        entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+        if entity_type == "mention":
+            # Username mentions carry text offsets but no immutable Telegram user ID.
+            return None
+        if entity_type != "text_mention":
+            continue
+        mentioned_user = getattr(entity, "user", None)
+        mentioned_user_id = getattr(mentioned_user, "id", None)
+        if mentioned_user_id is None:
+            return None
+        mentioned_user_ids.add(str(mentioned_user_id))
+    return tuple(sorted(mentioned_user_ids))
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -9350,6 +9368,10 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        mentioned_user_ids = _attested_mention_user_ids(
+            getattr(message, "entities", None) or ()
+        )
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
@@ -9362,6 +9384,10 @@ class TelegramAdapter(BasePlatformAdapter):
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
+            metadata={
+                "mentioned_user_ids": mentioned_user_ids,
+                "mentions_room": False,
+            },
         )
 
     # ── Message reactions (processing lifecycle) ──────────────────────────

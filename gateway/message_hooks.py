@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Literal, Optional
 
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
+from hermes_constants import GATEWAY_MESSAGE_HOOK_API_VERSION
 
 
 DeliveryStatus = Literal["sent", "failed", "unknown"]
@@ -32,6 +33,8 @@ class GatewayMessageEvent:
     timestamp: str
     media_urls: tuple[str, ...]
     media_types: tuple[str, ...]
+    mentioned_user_ids: tuple[str, ...] | None
+    mentions_room: bool | None
     reply_to_message_id: Optional[str]
     reply_to_text: Optional[str]
     reply_to_author_id: Optional[str]
@@ -43,6 +46,17 @@ class GatewayMessageEvent:
         timestamp = getattr(event, "timestamp", None)
         timestamp_text = timestamp.isoformat() if hasattr(timestamp, "isoformat") else ""
         message_type = getattr(getattr(event, "message_type", None), "value", None)
+        metadata = getattr(event, "metadata", None)
+        raw_mentioned_user_ids = (
+            metadata.get("mentioned_user_ids") if isinstance(metadata, dict) else None
+        )
+        mentioned_user_ids = None
+        if isinstance(raw_mentioned_user_ids, (list, tuple)) and all(
+            isinstance(item, str) and item for item in raw_mentioned_user_ids
+        ):
+            mentioned_user_ids = tuple(raw_mentioned_user_ids)
+        raw_mentions_room = metadata.get("mentions_room") if isinstance(metadata, dict) else None
+        mentions_room = raw_mentions_room if isinstance(raw_mentions_room, bool) else None
         return cls(
             text=str(getattr(event, "text", "") or ""),
             message_id=_optional_text(getattr(event, "message_id", None)),
@@ -50,6 +64,8 @@ class GatewayMessageEvent:
             timestamp=timestamp_text,
             media_urls=tuple(str(item) for item in (getattr(event, "media_urls", None) or ())),
             media_types=tuple(str(item) for item in (getattr(event, "media_types", None) or ())),
+            mentioned_user_ids=mentioned_user_ids,
+            mentions_room=mentions_room,
             reply_to_message_id=_optional_text(
                 getattr(event, "reply_to_message_id", None)
             ),

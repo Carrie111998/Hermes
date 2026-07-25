@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-from hermes_constants import get_hermes_home
+from hermes_constants import GATEWAY_MESSAGE_HOOK_API_VERSION, get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -394,6 +394,11 @@ class PluginContext:
             return get_active_profile_name()
         except Exception:
             return "default"
+
+    @property
+    def gateway_message_hook_api_version(self) -> int:
+        """Return the semantic version of the immutable gateway-message hook API."""
+        return GATEWAY_MESSAGE_HOOK_API_VERSION
 
     # -- tool registration --------------------------------------------------
 
