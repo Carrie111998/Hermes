@@ -1606,3 +1606,58 @@ updates:
 #     command: "cat /run/user/1000/hermes-secrets.env"
 #     helper_timeout_seconds: 3
 #     override_existing: false             # .env/shell win by default
+
+# =============================================================================
+# Hybrid local/cloud routing
+# =============================================================================
+# Send SIMPLE prompts to a fast, free, private LOCAL model (Ollama, LM Studio,
+# llama.cpp, vLLM, …) and keep COMPLEX prompts on your usual (primary) model —
+# decided per turn by a zero-cost, rule-based classifier (no extra AI call, no
+# latency).
+#
+# INERT until you fill in routing.local.model: with a blank local model, every
+# prompt goes to your normal (primary) model, exactly as before. If a local
+# turn fails to initialize (server down, or the model's context window is below
+# the 64K minimum), the turn degrades to the primary model with a warning
+# rather than being dropped.
+#
+# Session commands (CLI/TUI): /route [auto|local|cloud|on|off|status], /local,
+# /cloud. Here "cloud" is shorthand for your primary model — the complex-prompt
+# target is always the model you selected via `hermes model`. Docs:
+# docs/hybrid-routing.md
+#
+# routing:
+#   enabled: true
+#   local:
+#     provider: ollama                     # ollama | lmstudio | vllm | openai-compatible …
+#     model: ""                            # e.g. "llama3.2:latest" — BLANK = routing off
+#     base_url: http://localhost:11434/v1  # your local server's OpenAI-compatible endpoint
+#   complexity:
+#     max_prompt_chars: 1500               # longer prompt → cloud
+#     max_prompt_tokens: 400               # more estimated tokens → cloud
+#     # ANY of these substrings (case-insensitive) → cloud. Setting this key
+#     # REPLACES the built-in list (it is not merged), so copy the defaults
+#     # below before adding/removing words.
+#     cloud_keywords:
+#       - refactor
+#       - debug
+#       - architect
+#       - architecture
+#       - analyze
+#       - analyse
+#       - prove
+#       - design
+#       - optimize
+#       - optimise
+#       - migrate
+#       - security
+#       - vulnerab
+#       - trace
+#       - root cause
+#       - why does
+#       - why is
+#       - explain why
+#       - step by step
+#       - algorithm
+#     escalate_on_images: true             # any image/file attachment → cloud
+#     escalate_on_code_fence: true         # a ``` code block in the prompt → cloud

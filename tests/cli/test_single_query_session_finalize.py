@@ -251,6 +251,11 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             calls.append(("init", kwargs))
             return True
 
+        # Turn-route rebuild + hybrid-fallback wrapper (real logic, delegates
+        # to the mocked _init_agent above). Route has no "_primary" key, so no
+        # fallback path is exercised here.
+        _init_agent_for_turn = cli_mod.HermesCLI._init_agent_for_turn
+
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)

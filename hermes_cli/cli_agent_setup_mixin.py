@@ -215,6 +215,11 @@ class CLIAgentSetupMixin:
             ),
         }
 
+        # Hybrid routing: send SIMPLE prompts to the configured local model and
+        # COMPLEX prompts to the cloud (primary) model. Fail-safe — any error
+        # leaves the primary-model route untouched.  See hermes_cli/hybrid_routing.py.
+        self._apply_hybrid_route(route, user_message)
+
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:
             route["request_overrides"] = None
@@ -226,6 +231,184 @@ class CLIAgentSetupMixin:
             overrides = None
         route["request_overrides"] = overrides
         return route
+
+    def _init_agent_for_turn(self, turn_route: dict, *, quiet: bool = False) -> bool:
+        """Rebuild the agent for a turn's route, falling back on local failure.
+
+        Handles the signature-change check and ``_init_agent`` call shared by
+        the CLI and TUI turn paths.  When a hybrid *local* route fails to
+        initialize (local server down, model context below the 64K minimum,
+        etc.), it warns once and retries with the primary (cloud) route saved
+        in ``turn_route["_primary"]`` — so a bad local model degrades the turn
+        to cloud instead of dropping it.
+
+        ``quiet`` suppresses the "Initializing agent…" banner and routes the
+        fallback notice to stderr, keeping stdout machine-readable for the
+        quiet one-shot path.
+
+        Returns True if an agent is ready (on either route), False otherwise.
+        """
+        from cli import _DIM, _RST, _cprint, logger
+
+        if turn_route["signature"] != self._active_agent_route_signature:
+            self.agent = None
+
+        if self.agent is None and not quiet:
+            _cprint(f"{_DIM}Initializing agent...{_RST}")
+
+        if self._init_agent(
+            model_override=turn_route["model"],
+            runtime_override=turn_route["runtime"],
+            request_overrides=turn_route.get("request_overrides"),
+        ):
+            return True
+
+        # Init failed.  If this was a hybrid-local turn, degrade to the primary
+        # (cloud) route rather than losing the user's message.
+        primary = turn_route.get("_primary")
+        if not isinstance(primary, dict):
+            return False
+
+        logger.debug(
+            "hybrid local route init failed for model %r; falling back to primary %r",
+            turn_route.get("model"),
+            primary.get("model"),
+        )
+        _notice = (
+            f"Local model '{turn_route.get('model')}' unavailable — "
+            f"falling back to '{primary.get('model')}' for this turn."
+        )
+        if quiet:
+            print(_notice, file=sys.stderr)
+        else:
+            _cprint(f"{_DIM}{_notice} (/route status){_RST}")
+
+        if primary["signature"] != self._active_agent_route_signature:
+            self.agent = None
+        return self._init_agent(
+            model_override=primary["model"],
+            runtime_override=primary["runtime"],
+            request_overrides=turn_route.get("request_overrides"),
+        )
+
+    def _apply_hybrid_route(self, route: dict, user_message) -> None:
+        """Override *route* in place to send simple prompts to a local model.
+
+        Consults the ``routing`` config block and, when routing is enabled and a
+        local endpoint is configured, classifies the prompt (or honors a
+        ``/local`` / ``/cloud`` force flag) and — for a LOCAL decision — swaps
+        ``route["model"]`` / ``route["runtime"]`` / ``route["signature"]`` to the
+        local endpoint via ``resolve_runtime_provider``.
+
+        Never raises: MoA turns, disabled routing, an unconfigured local
+        endpoint, or any resolution error all leave the primary-model route
+        untouched (fail-safe to cloud/primary).
+        """
+        from cli import logger
+
+        try:
+            # MoA owns the whole turn's dispatch — don't second-guess it.
+            if (self.provider or "").strip().lower() == "moa":
+                return
+
+            cfg = getattr(self, "config", None)
+            routing_cfg = cfg.get("routing") if isinstance(cfg, dict) else None
+
+            from hermes_cli.hybrid_routing import LOCAL, decide_route, is_local_configured
+
+            # Cheap gate before doing any classification work.
+            if not is_local_configured(routing_cfg):
+                return
+
+            prompt_text = user_message if isinstance(user_message, str) else ""
+            has_images = self._turn_has_attachments(user_message)
+            force = getattr(self, "_route_force", None)
+
+            target = decide_route(
+                prompt_text,
+                routing_cfg,
+                has_images=has_images,
+                force=force,
+            )
+            if target != LOCAL:
+                return  # CLOUD → keep the primary-model route as-is.
+
+            local = routing_cfg.get("local") if isinstance(routing_cfg, dict) else {}
+            local = local if isinstance(local, dict) else {}
+            local_model = (local.get("model") or "").strip()
+            local_provider = (local.get("provider") or "").strip()
+            local_base_url = (local.get("base_url") or "").strip()
+
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            resolve_kwargs = {"target_model": local_model}
+            if local_provider:
+                resolve_kwargs["requested"] = local_provider
+            if local_base_url:
+                resolve_kwargs["explicit_base_url"] = local_base_url
+
+            local_runtime = resolve_runtime_provider(**resolve_kwargs)
+
+            api_key = local_runtime.get("api_key")
+            base_url = local_runtime.get("base_url") or local_base_url
+            # Keyless local servers (llama.cpp / Ollama / vLLM / LM Studio) — use
+            # a placeholder so the OpenAI SDK doesn't reject the request; local
+            # servers ignore auth. Mirrors _ensure_runtime_credentials.
+            if not (isinstance(api_key, str) and api_key) and not callable(api_key):
+                api_key = "no-key-required"
+
+            new_runtime = {
+                "api_key": api_key,
+                "base_url": base_url,
+                "provider": local_runtime.get("provider") or local_provider,
+                "requested_provider": local_runtime.get("requested_provider")
+                or local_provider
+                or local_runtime.get("provider"),
+                "api_mode": local_runtime.get("api_mode", "chat_completions"),
+                "command": local_runtime.get("command"),
+                "args": list(local_runtime.get("args") or []),
+                "credential_pool": local_runtime.get("credential_pool"),
+            }
+
+            # Snapshot the primary (cloud) route BEFORE we overwrite it, so the
+            # caller can fall back to it if the local endpoint fails to
+            # initialize (e.g. local server down, or model context below the
+            # 64K minimum).  Present only on hybrid-local turns → its presence
+            # is the signal that a fallback target exists.  See
+            # ``_init_agent_for_turn``.
+            route["_primary"] = {
+                "model": route["model"],
+                "runtime": route["runtime"],
+                "signature": route["signature"],
+            }
+
+            route["model"] = local_model
+            route["runtime"] = new_runtime
+            route["signature"] = (
+                local_model,
+                new_runtime["provider"],
+                new_runtime["requested_provider"],
+                new_runtime["base_url"],
+                new_runtime["api_mode"],
+                new_runtime["command"],
+                tuple(new_runtime["args"]),
+            )
+        except Exception as exc:
+            logger.debug("hybrid routing skipped (falling back to primary): %s", exc)
+
+    @staticmethod
+    def _turn_has_attachments(user_message) -> bool:
+        """True when a turn's message carries non-text (image/file) content.
+
+        Text-only turns are plain strings; multimodal turns are a list of
+        OpenAI-style content parts where a non-``text`` part signals an
+        attachment.
+        """
+        if isinstance(user_message, list):
+            for part in user_message:
+                if isinstance(part, dict) and part.get("type") not in (None, "text"):
+                    return True
+        return False
 
     def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
         """

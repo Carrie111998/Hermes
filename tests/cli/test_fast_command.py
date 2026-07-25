@@ -243,6 +243,10 @@ class TestFastModeRouting(unittest.TestCase):
             acp_args=[],
             _credential_pool=None,
             service_tier="priority",
+            # Hybrid routing hook is a no-op here (these tests exercise fast
+            # mode, not routing). Stored as an instance attr → called without
+            # an implicit self, so it takes (route, user_message).
+            _apply_hybrid_route=lambda route, user_message: None,
         )
 
         route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
@@ -265,6 +269,7 @@ class TestFastModeRouting(unittest.TestCase):
             acp_args=[],
             _credential_pool=None,
             service_tier="priority",
+            _apply_hybrid_route=lambda route, user_message: None,
         )
 
         route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
@@ -416,6 +421,7 @@ class TestAnthropicFastMode(unittest.TestCase):
             acp_args=[],
             _credential_pool=None,
             service_tier="priority",
+            _apply_hybrid_route=lambda route, user_message: None,
         )
 
         route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")

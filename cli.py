@@ -4198,6 +4198,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # turns (e.g. after /model or credential rotation).
         self._active_agent_route_signature = None
 
+        # Hybrid-routing force override: None → auto (classify each prompt),
+        # "local"/"cloud" → pin upcoming turns to that target. Set by the
+        # /local, /cloud, and /route commands. See hermes_cli/hybrid_routing.py.
+        self._route_force: Optional[str] = None
+
         # Agent will be initialized on first use
         self.agent: Optional[Any] = None
         self._tool_callbacks_installed = False
@@ -9326,6 +9331,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
             self._handle_fast_command(cmd_original)
+        elif canonical in ("route", "local", "cloud"):
+            self._handle_route_command(canonical, cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
         elif canonical == "usage":
@@ -12279,17 +12286,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
-        if turn_route["signature"] != self._active_agent_route_signature:
-            self.agent = None
-
-        # Initialize agent if needed
-        if self.agent is None:
-            _cprint(f"{_DIM}Initializing agent...{_RST}")
-        if not self._init_agent(
-            model_override=turn_route["model"],
-            runtime_override=turn_route["runtime"],
-            request_overrides=turn_route.get("request_overrides"),
-        ):
+        # Rebuild the agent for this turn's route.  Handles hybrid-routing
+        # fallback: if a local route fails to init, degrades to the primary
+        # (cloud) route rather than dropping the turn.
+        if not self._init_agent_for_turn(turn_route):
             return None
         agent = self.agent
         if agent is None:
@@ -16526,13 +16526,7 @@ def main(
                                 announce=False,
                             )
                     turn_route = cli._resolve_turn_agent_config(effective_query)
-                    if turn_route["signature"] != cli._active_agent_route_signature:
-                        cli.agent = None
-                    if cli._init_agent(
-                        model_override=turn_route["model"],
-                        runtime_override=turn_route["runtime"],
-                        request_overrides=turn_route.get("request_overrides"),
-                    ):
+                    if cli._init_agent_for_turn(turn_route, quiet=True):
                         cli.agent.quiet_mode = True
                         cli.agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays

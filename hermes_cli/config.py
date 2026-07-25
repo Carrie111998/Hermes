@@ -2470,6 +2470,52 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Hybrid routing — send SIMPLE prompts to a cheap/local model and keep
+    # COMPLEX prompts on the session's primary model (the one selected via
+    # ``hermes model``). The classifier is pure heuristics (prompt length,
+    # keywords, code fences, attachments) — no extra model round-trip, no added
+    # latency or cost. Routing is a per-turn decision made in
+    # ``_resolve_turn_agent_config``; the existing route-signature machinery
+    # swaps the live agent transparently (same seam ``/fast`` and MoA use).
+    #
+    # SAFE BY DEFAULT: with ``local`` unconfigured (empty model/base_url) the
+    # router no-ops to the primary model, so existing users see zero behavior
+    # change until they point ``local`` at an endpoint. A classifier error, or a
+    # local endpoint that fails to initialize, also falls through to the primary
+    # model.
+    "routing": {
+        "enabled": True,
+        # The local endpoint for SIMPLE prompts. Leave blank to configure later
+        # (e.g. LM Studio: provider "lmstudio", base_url "http://localhost:1234/v1";
+        # Ollama: provider "ollama", base_url "http://localhost:11434/v1"). While
+        # ``model`` (and, for keyless local servers, ``base_url``) is blank the
+        # router stays inert and everything runs on the primary model.
+        "local": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+        },
+        # Heuristic knobs for the SIMPLE-vs-COMPLEX decision. A prompt routes to
+        # cloud when ANY escalation trigger fires; otherwise it stays local.
+        "complexity": {
+            # Prompt longer than this many characters → complex.
+            "max_prompt_chars": 1500,
+            # Prompt longer than this many estimated tokens (~chars/4) → complex.
+            "max_prompt_tokens": 400,
+            # Case-insensitive substrings that signal a hard task → complex.
+            "cloud_keywords": [
+                "refactor", "debug", "architect", "architecture", "analyze",
+                "analyse", "prove", "design", "optimize", "optimise", "migrate",
+                "security", "vulnerab", "trace", "root cause", "why does",
+                "why is", "explain why", "step by step", "algorithm",
+            ],
+            # Any image/file attachment on the turn → complex.
+            "escalate_on_images": True,
+            # A fenced code block (```), likely a code task → complex.
+            "escalate_on_code_fence": True,
+        },
+    },
+
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.

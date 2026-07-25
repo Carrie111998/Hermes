@@ -2719,6 +2719,84 @@ class CLICommandsMixin:
         else:
             _cprint(f"  {_ACCENT}✓ {feature_name} set to {label} (this session — use --global to persist){_RST}")
 
+    def _handle_route_command(self, canonical: str, cmd: str):
+        """Handle /route, /local, /cloud — hybrid local/cloud routing control.
+
+        ``/local`` and ``/cloud`` pin upcoming turns to that target (overriding
+        the automatic classifier). ``/route auto`` (or ``/route on``) returns to
+        automatic per-prompt classification; ``/route off`` disables the whole
+        feature for the session. ``/route`` / ``/route status`` shows state.
+        """
+        from cli import _ACCENT, _DIM, _RST, _cprint
+        from hermes_cli.hybrid_routing import is_local_configured
+
+        cfg = getattr(self, "config", None)
+        routing_cfg = cfg.get("routing") if isinstance(cfg, dict) else None
+        local_ready = is_local_configured(routing_cfg)
+        enabled = bool(routing_cfg.get("enabled")) if isinstance(routing_cfg, dict) else False
+
+        def _local_label() -> str:
+            local = routing_cfg.get("local") if isinstance(routing_cfg, dict) else {}
+            local = local if isinstance(local, dict) else {}
+            model = (local.get("model") or "").strip()
+            provider = (local.get("provider") or "").strip()
+            if model and provider:
+                return f"{provider} / {model}"
+            return model or "(not configured)"
+
+        def _show_status():
+            force = getattr(self, "_route_force", None)
+            if not enabled:
+                mode = "disabled"
+            elif not local_ready:
+                mode = "inert (local endpoint not configured)"
+            elif force == "local":
+                mode = "pinned → LOCAL"
+            elif force == "cloud":
+                mode = "pinned → CLOUD"
+            else:
+                mode = "auto (classify each prompt)"
+            _cprint(f"  {_ACCENT}Hybrid routing: {mode}{_RST}")
+            _cprint(f"  {_DIM}Local model: {_local_label()}{_RST}")
+            _cprint(f"  {_DIM}Usage: /route [auto|local|cloud|off] · /local · /cloud{_RST}")
+
+        # Resolve the requested action from either the command name or its arg.
+        if canonical in ("local", "cloud"):
+            action = canonical
+        else:  # canonical == "route"
+            parts = cmd.strip().split(maxsplit=1)
+            action = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+        if action in ("status", ""):
+            _show_status()
+            return
+
+        if action == "off":
+            self._route_force = None
+            _cprint(f"  {_ACCENT}✓ Hybrid routing disabled for this session (use /route on to re-enable){_RST}")
+            _cprint(f"  {_DIM}Note: to disable persistently, set routing.enabled: false in config.{_RST}")
+            return
+
+        if action in ("auto", "on"):
+            self._route_force = None
+            _cprint(f"  {_ACCENT}✓ Hybrid routing set to AUTO — each prompt is classified{_RST}")
+            if not local_ready:
+                _cprint(f"  {_DIM}(._.) Local endpoint not configured — routing stays on the primary model until you set routing.local.{_RST}")
+            return
+
+        if action in ("local", "cloud"):
+            if action == "local" and not local_ready:
+                _cprint("  (._.) No local model configured. Set routing.local (provider/model/base_url) in config or via `hermes model`.")
+                return
+            self._route_force = action
+            self.agent = None  # Force agent re-init on the next turn with the pinned route.
+            self._active_agent_route_signature = None
+            _cprint(f"  {_ACCENT}✓ Upcoming turns pinned to {action.upper()} (use /route auto to resume classification){_RST}")
+            return
+
+        _cprint(f"  {_DIM}(._.) Unknown argument: {action}{_RST}")
+        _cprint(f"  {_DIM}Usage: /route [auto|local|cloud|off|status]{_RST}")
+
     def _handle_debug_command(self, cmd_original: str = ""):
         """Handle /debug — upload debug report + logs and print share URLs.
 
