@@ -52,6 +52,32 @@ test('falls back to /api/status only for old backends without /api/health', asyn
   ])
 })
 
+test('falls back to /api/status when auth middleware masks a missing health route as 401', async () => {
+  const calls: string[][] = []
+
+  await waitForHermesReady('http://127.0.0.1:9000', {
+    token: 'secret-token',
+    fetchPublicJson: async url => {
+      calls.push(['public', url])
+
+      throw new Error('401: {"error":"unauthenticated","reason":"no_cookie"}')
+    },
+    fetchJson: async (url, token) => {
+      calls.push(['token', url, token ?? ''])
+
+      return { version: 'old' }
+    },
+    sleep: async () => {},
+    timeoutMs: 100,
+    pollMs: 1
+  })
+
+  assert.deepEqual(calls, [
+    ['public', 'http://127.0.0.1:9000/api/health'],
+    ['token', 'http://127.0.0.1:9000/api/status', 'secret-token']
+  ])
+})
+
 test('does not fall back to heavyweight /api/status for transient health failures', async () => {
   const calls: string[][] = []
   let currentTime = 0

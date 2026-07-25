@@ -28,6 +28,16 @@ export function isMissingHealthEndpointError(error: unknown): boolean {
   return /^404:/.test(message) || message.includes('endpoint is likely missing')
 }
 
+export function shouldFallbackFromHealthProbe(error: unknown): boolean {
+  if (isMissingHealthEndpointError(error)) {
+    return true
+  }
+
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return /^401:/.test(message)
+}
+
 function supersededError() {
   const error: any = new Error('SSH bootstrap was superseded by newer connection settings.')
   error.kind = 'superseded'
@@ -80,7 +90,7 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
 
       // Only an explicitly missing route means the backend predates
       // /api/health; timeouts and server errors keep polling health.
-      if (!useStatusFallback && isMissingHealthEndpointError(error)) {
+      if (!useStatusFallback && shouldFallbackFromHealthProbe(error)) {
         useStatusFallback = true
 
         continue
