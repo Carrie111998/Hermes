@@ -75,10 +75,12 @@ def runtime_server(tmp_path, monkeypatch):
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
 
-    # SPA must be present for real browser shell load.
-    assert (web_server.WEB_DIST / "index.html").is_file(), (
-        f"missing SPA at {web_server.WEB_DIST}; run: cd web && npm run build"
-    )
+    # NOTE: the SPA build is deliberately NOT required here. `web_dist` is a
+    # gitignored build artifact and CI's Python slices never run `npm run build`,
+    # so asserting on it in the fixture failed both tests in CI even though only
+    # the browser test needs a shell to load. web_server guards its own SPA mount
+    # (`not WEB_DIST.exists()`), so the server boots fine without it. The browser
+    # test skips on a missing SPA itself, next to its agent-browser skip.
 
     port = _free_port()
     host = "127.0.0.1"
@@ -186,6 +188,12 @@ def test_s5_ttl_and_revocation_contract(runtime_server, monkeypatch):
 
 def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
     """Real Chromium via agent-browser: handoff consume + gated buildWsUrl path."""
+    # This test, unlike the TTL contract above, genuinely needs the built shell:
+    # it asserts on the gated SPA's injected globals. `web_dist` is gitignored and
+    # CI does not build it, so skip rather than fail there.
+    if not (web_server.WEB_DIST / "index.html").is_file():
+        pytest.skip(f"SPA not built at {web_server.WEB_DIST}; run: cd web && npm run build")
+
     base = runtime_server["base"]
     sid = "s5-browser-session"
     _seed_session(sid)
