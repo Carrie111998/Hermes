@@ -4822,6 +4822,11 @@ class AIAgent:
         custom endpoint) also wins: edits are only adopted while the
         session's current base_url is still the registry default or the
         previously-seen env value.
+
+        Covers api-key registry providers and named custom providers with a
+        ``key_env`` (#67935) — the latter resolve to ``provider="custom"``
+        with no registry entry, so they are matched through the runtime
+        provider's config lookup instead.
         """
         if self.api_mode != "chat_completions":
             return False
@@ -4832,73 +4837,126 @@ class AIAgent:
             from hermes_cli.auth import PROVIDER_REGISTRY
         except ImportError:
             return False
+
         pconfig = PROVIDER_REGISTRY.get(self.provider)
         if (
-            not pconfig
-            or getattr(pconfig, "auth_type", "") != "api_key"
-            or not getattr(pconfig, "api_key_env_vars", ())
+            pconfig
+            and getattr(pconfig, "auth_type", "") == "api_key"
+            and getattr(pconfig, "api_key_env_vars", ())
         ):
+            api_key = ""
+            for env_var in pconfig.api_key_env_vars:
+                api_key = get_env_prefer_dotenv(env_var).strip()
+                if api_key:
+                    break
+            if not api_key:
+                return False
+
+            env_url = ""
+            if pconfig.base_url_env_var:
+                env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip().rstrip("/")
+            default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
+            base_url = env_url or default_base
+            if self.provider == "kimi-coding":
+                from hermes_cli.auth import _resolve_kimi_base_url
+
+                base_url = _resolve_kimi_base_url(
+                    api_key, pconfig.inference_base_url, env_url
+                ).rstrip("/")
+            elif self.provider == "zai":
+                from hermes_cli.auth import _resolve_zai_base_url
+
+                base_url = _resolve_zai_base_url(
+                    api_key, pconfig.inference_base_url, env_url
+                ).rstrip("/")
+        elif self.provider == "custom":
+            # Named custom provider (#67935): identity lives in config
+            # (``providers.<name>`` / ``custom_providers``), the credential in
+            # the env var it names via ``key_env``. Re-resolve through the
+            # same config lookup the runtime resolver uses; entries without
+            # ``key_env`` (inline ``api_key``, pool-backed) have no
+            # env-sourced credential to watch.
+            try:
+                from hermes_cli.runtime_provider import _get_named_custom_provider
+            except ImportError:
+                return False
+            custom_provider = _get_named_custom_provider(
+                getattr(self, "requested_provider", "") or ""
+            )
+            if not custom_provider:
+                return False
+            key_env = str(custom_provider.get("key_env") or "").strip()
+            if not key_env:
+                return False
+            api_key = get_env_prefer_dotenv(key_env).strip()
+            if not api_key:
+                return False
+            # Custom providers pin their endpoint in config, not env — the
+            # config base_url is both the resolved and the "default" base, so
+            # only key edits are ever adopted here.
+            default_base = str(custom_provider.get("base_url") or "").strip().rstrip("/")
+            base_url = default_base
+        else:
             return False
 
-        api_key = ""
-        for env_var in pconfig.api_key_env_vars:
-            api_key = get_env_prefer_dotenv(env_var).strip()
-            if api_key:
-                break
-        if not api_key:
-            return False
-
-        env_url = ""
-        if pconfig.base_url_env_var:
-            env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip().rstrip("/")
-        default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
-        base_url = env_url or default_base
-        if self.provider == "kimi-coding":
-            from hermes_cli.auth import _resolve_kimi_base_url
-
-            base_url = _resolve_kimi_base_url(
-                api_key, pconfig.inference_base_url, env_url
-            ).rstrip("/")
-        elif self.provider == "zai":
-            from hermes_cli.auth import _resolve_zai_base_url
-
-            base_url = _resolve_zai_base_url(
-                api_key, pconfig.inference_base_url, env_url
-            ).rstrip("/")
         if not base_url:
             return False
 
         resolved = (base_url, api_key)
         prev = getattr(self, "_env_creds_seen", None)
-        self._env_creds_seen = resolved
         current_base = (self.base_url or "").strip().rstrip("/")
 
         if prev is None:
             # First look — no baseline to diff against. Adopt only the
             # boot-default case (worker spawned before the user saved an
             # override); anything else is unattributable on turn one.
-            if current_base != default_base:
-                return False
-            if base_url == current_base and api_key == self.api_key:
-                return False
+            adopt = current_base == default_base and not (
+                base_url == current_base and api_key == self.api_key
+            )
         else:
-            if resolved == prev:
-                # Env unchanged; any drift from self.* is rotation/failover
-                # or config precedence — leave it alone.
-                return False
-            if current_base not in {default_base, prev[0]}:
-                return False
-            if base_url == current_base and api_key == self.api_key:
-                return False
+            # Env unchanged → no-op; any drift from self.* is rotation/
+            # failover or config precedence — leave it alone. An edit is
+            # only adopted while the session still runs on the registry
+            # default or the previously-seen env value.
+            adopt = (
+                resolved != prev
+                and current_base in {default_base, prev[0]}
+                and not (base_url == current_base and api_key == self.api_key)
+            )
+
+        if not adopt:
+            self._env_creds_seen = resolved
+            return False
+
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
+            base_url
+        )
+        prior_api_key = self.api_key
+        prior_base_url = self.base_url
+        prior_client_kwargs = dict(self._client_kwargs)
 
         self.api_key = api_key
         self.base_url = base_url
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
+        # A base-url change moves the route: TLS material and default
+        # headers derived from the old endpoint must be recomputed, exactly
+        # as on credential-pool rotation.
+        self._reapply_route_client_config(route_changed=route_changed)
 
         if not self._replace_primary_openai_client(reason="env_credential_refresh"):
+            # Leave the baseline un-advanced so the unchanged edit is
+            # retried next turn, and roll the agent back so its state keeps
+            # matching the still-live old client.
+            self.api_key = prior_api_key
+            self.base_url = prior_base_url
+            self._client_kwargs.clear()
+            self._client_kwargs.update(prior_client_kwargs)
             return False
 
+        self._env_creds_seen = resolved
         logger.info(
             "Applied updated .env credentials for %s: endpoint %s",
             self.provider,
@@ -5158,6 +5216,19 @@ class AIAgent:
         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
+        self._reapply_route_client_config(route_changed=route_changed)
+        self._replace_primary_openai_client(reason="credential_rotation")
+
+    def _reapply_route_client_config(self, *, route_changed: bool) -> None:
+        """Recompute route-derived client kwargs for the current ``self.base_url``.
+
+        TLS material (``ssl_verify``/``ssl_ca_cert``) and default headers are
+        derived from the endpoint, not the credential — any client rebuild
+        that may have moved ``base_url`` must recompute them or the new
+        endpoint inherits configuration computed for the old one. Shared by
+        credential-pool rotation and the per-turn env refresh so the two
+        paths cannot drift.
+        """
         self._client_kwargs.pop("ssl_verify", None)
         self._client_kwargs.pop("ssl_ca_cert", None)
         try:
@@ -5181,7 +5252,6 @@ class AIAgent:
             self.base_url,
             apply_user_headers=not route_changed,
         )
-        self._replace_primary_openai_client(reason="credential_rotation")
 
     def _recover_with_credential_pool(
         self,
