@@ -84,21 +84,23 @@ export const ToolTurnPaginationProvider: FC<PropsWithChildren<{ tools: readonly 
     const nextStart = Math.max(0, visibleStart - TOOL_TURN_PAGE_SIZE)
     const nextOldest = tools[nextStart]?.key ?? null
 
-    focusAfterRevealRef.current = nextStart === 0 ? nextOldest : null
+    focusAfterRevealRef.current = nextOldest
     setState({ expanded: true, oldestVisibleKey: nextOldest, turnKey })
   }, [currentState.expanded, currentState.oldestVisibleKey, tools, turnKey])
 
   useLayoutEffect(() => {
     const focusKey = focusAfterRevealRef.current
 
-    if (!focusKey || hiddenCount > 0) {
+    if (!focusKey) {
       return
     }
 
     focusAfterRevealRef.current = null
 
-    const target = Array.from(rootRef.current?.querySelectorAll<HTMLElement>('[data-tool-page-key]') ?? []).find(
-      element => element.dataset.toolPageKey === focusKey
+    const target = Array.from(
+      rootRef.current?.querySelectorAll<HTMLElement>('[data-tool-page-key], [data-tool-page-pager]') ?? []
+    ).find(element =>
+      hiddenCount > 0 ? element.dataset.toolPagePager === focusKey : element.dataset.toolPageKey === focusKey
     )
 
     const frame = requestAnimationFrame(() => target?.focus({ preventScroll: true }))

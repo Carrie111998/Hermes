@@ -354,6 +354,32 @@ describe('representative long tool-heavy session contract (#68467)', () => {
     expect(messages.flatMap(message => message.parts).filter(part => part.type === 'tool-call')).toHaveLength(160)
   })
 
+  it('transfers focus through every pager before focusing the final revealed tool', async () => {
+    const view = render(<Harness messages={makeInterleavedHeavyTurnFixture(65)} onSubmit={() => true} />)
+
+    for (const expectedPagerKey of [
+      'interleaved-assistant-1:interleaved-tool-25',
+      'interleaved-assistant-0:interleaved-tool-5'
+    ]) {
+      const pager = screen.getByRole('button', { name: 'Show earlier tool calls' })
+
+      pager.focus()
+      fireEvent.click(pager)
+
+      const nextPager = screen.getByRole('button', { name: 'Show earlier tool calls' })
+      await waitFor(() => expect(globalThis.document.activeElement).toBe(nextPager))
+      expect(nextPager.dataset.toolPagePager).toBe(expectedPagerKey)
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show earlier tool calls' }))
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Show earlier tool calls' })).toBeNull())
+    const firstTool = view.container.querySelector<HTMLElement>('[data-tool-page-key]')
+
+    expect(firstTool?.dataset.toolPageKey).toBe('interleaved-assistant-0:interleaved-tool-0')
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(firstTool))
+  })
+
   it('keeps the oldest revealed tool stable when the same turn appends another call', async () => {
     const initial = makeInterleavedHeavyTurnFixture(30)
     const view = render(<Harness messages={initial} onSubmit={() => true} />)

@@ -133,9 +133,7 @@ describe('SyntaxHighlighter viewport and worker lifecycle', () => {
   it('never commits tokens from the previous code after props change', async () => {
     vi.stubGlobal('IntersectionObserver', undefined)
 
-    const staleTokens: ShikiWorkerToken[][] = [
-      [{ content: 'stale highlighted code', htmlStyle: { color: '#ff0000' } }]
-    ]
+    const staleTokens: ShikiWorkerToken[][] = [[{ content: 'stale highlighted code', htmlStyle: { color: '#ff0000' } }]]
 
     let resolveStaleTokens: (tokens: ShikiWorkerToken[][]) => void = () => {}
     startShikiHighlight.mockImplementationOnce(() => ({

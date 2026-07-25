@@ -791,6 +791,7 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
         {(showTurnPager || (!turnPagination && localHiddenCount > 0)) && (
           <button
             className="mx-auto mb-1 block rounded-full border border-border/65 bg-(--composer-fill) px-2.5 py-0.5 text-[0.65rem] text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            data-tool-page-pager={turnPagination?.pagerKey ?? undefined}
             onClick={() =>
               turnPagination
                 ? turnPagination.revealEarlier()
