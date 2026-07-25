@@ -117,6 +117,29 @@ export const $petUnread = atom(false)
 export const markPetUnread = () => $petUnread.set(true)
 export const clearPetUnread = () => $petUnread.set(false)
 
+/**
+ * Latest agent reply text for the overlay's speech bubble. Set alongside
+ * $petUnread when a turn finishes while the app isn't focused; cleared when
+ * the user opens the app or clicks the reply bubble. Null = no reply to show
+ * (falls back to the mail icon if $petUnread is also set).
+ *
+ * Capped at 200 chars at write time; the overlay further truncates to ~120 for
+ * display with an ellipsis.
+ */
+export const $petReplyText = atom<string | null>(null)
+
+const REPLY_TEXT_MAX = 200
+
+export const setPetReplyText = (text: string) => {
+  const trimmed = text.trim()
+  if (!trimmed) return
+  // Skip [SILENT] replies - they're internal control signals, not user-facing.
+  if (/^\[SILENT\]/i.test(trimmed)) return
+  $petReplyText.set(trimmed.length > REPLY_TEXT_MAX ? trimmed.slice(0, REPLY_TEXT_MAX) : trimmed)
+}
+
+export const clearPetReplyText = () => $petReplyText.set(null)
+
 /** Steady activity flags (toolRunning / reasoning) set + cleared by the stream. */
 export const setPetActivity = (next: Partial<PetActivity>) => $petActivity.set({ ...$petActivity.get(), ...next })
 

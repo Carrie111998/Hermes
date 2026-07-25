@@ -39,7 +39,7 @@ from typing import Any, List, Optional
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
@@ -2441,6 +2441,71 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _cron_heartbeat_sister(job: dict) -> str:
+    """Resolve the family sister associated with a heartbeat cron job."""
+    explicit = str(job.get("sister") or "").strip().lower()
+    if explicit:
+        return explicit
+    prompt = str(job.get("prompt") or "")
+    match = re.search(r"\bhb-start\s+([A-Za-z0-9_-]+)\b", prompt)
+    if match:
+        return match.group(1).lower()
+    name = str(job.get("name") or "").lower()
+    for candidate in ("bookkeeper", "lune", "cres", "nova", "apollo", "kai", "vivi", "sol"):
+        if candidate in name:
+            return candidate
+    home = _get_hermes_home()
+    return home.name if home.parent.name == "profiles" else "unknown"
+
+
+def _job_uses_auto_heartbeat(job: dict) -> bool:
+    """Return whether the runner owns this job's heartbeat lifecycle."""
+    toolsets = {str(name).strip().lower() for name in (job.get("enabled_toolsets") or [])}
+    return bool(job.get("auto_heartbeat") is True or "heartbeat" in toolsets or "hb-start" in str(job.get("prompt") or ""))
+
+
+def _run_family_command(args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a shared-family ``fam`` command from a profile-scoped scheduler."""
+    root = get_default_hermes_root()
+    fam = root / "family" / "fam"
+    env = os.environ.copy()
+    env["FAMILY_DB"] = str(root / "family" / "family.db")
+    env["OPS_DB"] = str(root / "family" / "ops.db")
+    return subprocess.run(
+        [str(fam), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def _start_cron_heartbeat(job: dict) -> str:
+    sister = _cron_heartbeat_sister(job)
+    result = _run_family_command(["hb-start", sister, str(job["id"])])
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "fam hb-start failed").strip()
+        raise RuntimeError(f"cron heartbeat start failed for {job['id']}: {detail}")
+    heartbeat_id = next((line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()), "")
+    if not heartbeat_id.isdigit():
+        raise RuntimeError(f"cron heartbeat start returned no heartbeat ID for {job['id']}")
+    return heartbeat_id
+
+
+def _end_cron_heartbeat(heartbeat_id: str, status: str) -> None:
+    result = _run_family_command(["hb-end", heartbeat_id, status])
+    if result.returncode != 0:
+        logger.warning("Cron heartbeat %s close failed: %s", heartbeat_id, (result.stderr or result.stdout).strip())
+
+
+def _strip_legacy_heartbeat_commands(prompt: str) -> str:
+    """Remove prompt-owned hb-start/hb-end shell lines after runner takeover."""
+    return "\n".join(
+        line for line in prompt.splitlines()
+        if not re.search(r"\bhb-(?:start|end)\b", line)
+    )
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2452,7 +2517,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
     """
-    user_prompt = str(job.get("prompt") or "")
+    user_prompt = _strip_legacy_heartbeat_commands(str(job.get("prompt") or ""))
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -2783,6 +2848,10 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    heartbeat_id = None
+    heartbeat_status = "ok"
+    prior_hb_id = os.environ.get("HB_ID")
+    had_hb_id = "HB_ID" in os.environ
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3129,6 +3198,10 @@ def run_job(
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     try:
+        if _job_uses_auto_heartbeat(job):
+            heartbeat_id = _start_cron_heartbeat(job)
+            os.environ["HB_ID"] = heartbeat_id
+            logger.info("Job '%s': runner-owned heartbeat %s started", job_id, heartbeat_id)
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -3701,6 +3774,7 @@ def run_job(
         return True, output, final_response, None
         
     except Exception as e:
+        heartbeat_status = "error"
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
@@ -3723,6 +3797,12 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        if heartbeat_id is not None:
+            _end_cron_heartbeat(heartbeat_id, heartbeat_status)
+        if had_hb_id:
+            os.environ["HB_ID"] = prior_hb_id
+        else:
+            os.environ.pop("HB_ID", None)
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

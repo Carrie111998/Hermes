@@ -66,6 +66,9 @@ export function PetOverlayApp() {
   const [draft, setDraft] = useState('')
   // Mirrored from the main renderer: a finish landed while you were away.
   const [unread, setUnread] = useState(false)
+  // Mirrored reply text - when set, shows in the speech bubble instead of the
+  // mail icon. Cleared on click (opens app) or when the main window focuses.
+  const [replyText, setReplyTextState] = useState<string | null>(null)
 
   const dragRef = useRef<DragState | null>(null)
   // Last Alt+wheel anchor, consumed by the resize effect to zoom toward the
@@ -94,6 +97,7 @@ export function PetOverlayApp() {
       setBusy(Boolean(payload.busy))
       setAwaitingResponse(Boolean(payload.awaiting))
       setUnread(Boolean(payload.unread))
+      setReplyTextState(payload.replyText ?? null)
 
       // Play a reaction on a new id (ignore the first sync, which just primes it).
       const reaction = payload.reaction ?? null
@@ -294,8 +298,9 @@ export function PetOverlayApp() {
   }
 
   const openApp = () => {
-    // Hide the icon immediately; the main renderer also clears the source flag.
+    // Hide the icon/reply immediately; the main renderer also clears the source flags.
     setUnread(false)
+    setReplyTextState(null)
     window.hermesDesktop?.petOverlay?.control({ type: 'open-app' })
   }
 
@@ -438,11 +443,49 @@ export function PetOverlayApp() {
             petW={(info.frameW ?? DEFAULT_FRAME_W) * (info.scale ?? DEFAULT_SCALE)}
           />
 
-          {/* Mail icon: only when a finish landed while you were away. Jumps to
-              the app's most recent thread. Anchored to the sprite (kept inside
-              its box so the overlay's click-through hit-test still catches it);
-              stopPropagation keeps a click from starting a window drag. */}
-          {unread && (
+          {/* Reply bubble / mail icon: shown when a finish landed while you were
+              away. If we have reply text, show it in a clickable speech bubble
+              (replaces the bare mail icon). Otherwise fall back to the mail icon.
+              Both open the app's most recent thread on click. Anchored to the
+              sprite (kept inside its box so the overlay's click-through hit-test
+              still catches it); stopPropagation keeps a click from starting a
+              window drag. */}
+          {unread && replyText && (() => {
+            const display = replyText.length > 120 ? replyText.slice(0, 120) + '…' : replyText
+            return (
+              <button
+                aria-label="Open reply in Hermes"
+                onClick={openApp}
+                onPointerDown={e => e.stopPropagation()}
+                onPointerUp={e => e.stopPropagation()}
+                style={{
+                  background: 'var(--ui-bg-elevated)',
+                  border: '1px solid var(--ui-stroke-secondary)',
+                  borderRadius: 10,
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.22)',
+                  color: 'var(--foreground)',
+                  cursor: 'pointer',
+                  display: 'inline-block',
+                  fontSize: 11,
+                  fontWeight: 500,
+                  lineHeight: 1.3,
+                  maxWidth: 220,
+                  padding: '5px 8px',
+                  position: 'absolute',
+                  right: 0,
+                  textAlign: 'left',
+                  top: 0,
+                  whiteSpace: 'normal',
+                  wordBreak: 'break-word'
+                }}
+                title="Open in Hermes"
+                type="button"
+              >
+                {display}
+              </button>
+            )
+          })()}
+          {unread && !replyText && (
             <button
               aria-label="Open in Hermes"
               onClick={openApp}

@@ -26,7 +26,7 @@ import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding, requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { revealDesktopPane } from '@/store/pane-focus'
-import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
+import { flashPetActivity, markPetUnread, setPetActivity, setPetReplyText } from '@/store/pet'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { followActiveSessionCwd } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
@@ -648,10 +648,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
 
           // Light up the pet's mail icon if the user wasn't looking when the turn
-          // finished — a glanceable "new message" hint on the popped-out overlay.
+          // finished - a glanceable "new message" hint on the popped-out overlay.
           // Cleared when they open the app via the mail icon or refocus the window.
+          // Also push the reply text so the overlay can show it in the speech
+          // bubble instead of a bare mail icon.
           if (typeof document !== 'undefined' && !document.hasFocus()) {
             markPetUnread()
+            if (finalText) {
+              setPetReplyText(finalText)
+            }
           }
         }
 

@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import sqlite3
 import shutil
 import tempfile
 import threading
@@ -67,17 +68,53 @@ HERMES_DIR = get_hermes_home().resolve()
 # These constants remain the default-profile fallback and a compatibility
 # surface for existing callers/tests. Cross-profile callers must scope paths
 # with use_cron_store() instead of mutating them process-wide.
-CRON_DIR = HERMES_DIR / "cron"
-JOBS_FILE = CRON_DIR / "jobs.json"
+def _get_jobs_file() -> Path:
+    """Resolve the default jobs store from the active Hermes home."""
+    return get_hermes_home().resolve() / "cron" / "jobs.json"
+
+
+class _LazyPath:
+    """Path-like compatibility wrapper that resolves its path on use."""
+
+    def __init__(self, resolver):
+        self._resolver = resolver
+
+    def _resolve(self) -> Path:
+        return self._resolver()
+
+    def __fspath__(self):
+        return os.fspath(self._resolve())
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+    def __str__(self):
+        return str(self._resolve())
+
+    def __repr__(self):
+        return repr(self._resolve())
+
+    def __eq__(self, other):
+        return self is other or self._resolve() == other
+
+    def __hash__(self):
+        return hash(self._resolve())
+
+    def __truediv__(self, other):
+        return self._resolve() / other
+
+
+CRON_DIR = _LazyPath(lambda: get_hermes_home().resolve() / "cron")
+JOBS_FILE = _LazyPath(_get_jobs_file)
 # Heartbeat file the in-process ticker touches on every loop iteration. The
 # gateway process and the (separate) ``hermes cron status`` process share it
 # so status can tell whether the ticker THREAD is alive, not just whether the
 # gateway PROCESS exists — a ticker that dies silently inside a live gateway
 # would otherwise report healthy (#32612, #32895).
-TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
+TICKER_HEARTBEAT_FILE = _LazyPath(lambda: CRON_DIR / "ticker_heartbeat")
 # Last tick that completed WITHOUT raising. Distinguishing this from the plain
 # heartbeat lets status detect a ticker that is alive but failing every tick.
-TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
+TICKER_SUCCESS_FILE = _LazyPath(lambda: CRON_DIR / "ticker_last_success")
 # Default ticker loop interval (seconds). The single source of truth shared by
 # the in-process ticker (cron/scheduler_provider.py) and the staleness
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
@@ -98,7 +135,7 @@ _jobs_lock_state = threading.local()
 # legitimate critical section (field updates only) while keeping the ticker's
 # worst-case stall well under one status-alarm threshold.
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
-OUTPUT_DIR = CRON_DIR / "output"
+OUTPUT_DIR = _LazyPath(lambda: CRON_DIR / "output")
 ONESHOT_GRACE_SECONDS = 120
 
 
@@ -115,42 +152,12 @@ _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
 )
 
 
-# Import-time snapshot of the compatibility constants, so deliberate
-# re-pointing of the module surface (monkeypatched CRON_DIR/JOBS_FILE/
-# OUTPUT_DIR — the documented escape hatch existing tests/embedders use)
-# is distinguishable from the constants merely being stale.
-_IMPORT_STORE = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
-
-
 def _current_cron_store() -> _CronStorePaths:
-    """Return paths pinned to this execution context's profile.
-
-    Precedence, most explicit first:
-
-    1. an active use_cron_store() override (ContextVar);
-    2. deliberately re-pointed module constants — if CRON_DIR/JOBS_FILE/
-       OUTPUT_DIR no longer match their import-time values, someone chose
-       the documented process-wide compatibility surface; honor it;
-    3. the ACTIVE profile home, resolved fresh via get_hermes_home()
-       (context-local override, then the HERMES_HOME env var) — so a test
-       or embedder that re-points HERMES_HOME after this module was
-       imported reads/writes ITS OWN store, not whatever jobs.json the
-       import happened to freeze (the filed incident: fixtures that patched
-       the env too late silently rewrote the user's real jobs file);
-    4. the import-time constants (home unchanged since import — the common
-       path, returned unchanged).
-    """
+    """Return paths pinned to this execution context's profile."""
     override = _cron_store_override.get()
     if override is not None:
         return override
-    live_constants = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
-    if live_constants != _IMPORT_STORE:
-        return live_constants
-    home = get_hermes_home().resolve()
-    if home == HERMES_DIR:
-        return live_constants
-    cron_dir = home / "cron"
-    return _CronStorePaths(cron_dir, cron_dir / "jobs.json", cron_dir / "output")
+    return _CronStorePaths(CRON_DIR, Path(JOBS_FILE), OUTPUT_DIR)
 
 
 @contextlib.contextmanager
@@ -239,13 +246,7 @@ def _job_running_in_this_process(job_id: str) -> bool:
         from cron.scheduler import get_running_job_ids
         return job_id in get_running_job_ids()
     except Exception:
-        logger.warning(
-            "Cron running-set liveness check failed for job %r; keeping the "
-            "entry to avoid deleting a possibly live one-shot run",
-            job_id,
-            exc_info=True,
-        )
-        return True
+        return False
 
 
 def _jobs_lock_file() -> Path:
@@ -977,16 +978,13 @@ def load_jobs() -> List[Dict[str, Any]]:
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        # utf-8-sig: Windows Notepad / PowerShell 5.1 Set-Content -Encoding UTF8
-        # write a leading BOM; json.load under plain utf-8 raises
-        # JSONDecodeError("Unexpected UTF-8 BOM") and takes down cron.
-        with open(jobs_file, 'r', encoding='utf-8-sig') as f:
+        with open(jobs_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(jobs_file, 'r', encoding='utf-8-sig') as f:
+            with open(jobs_file, 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -1445,14 +1443,6 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
-    try:
-        from cron.executions import latest_executions
-
-        latest = latest_executions([job.get("id", "") for job in jobs])
-    except Exception:
-        latest = {}
-    for job in jobs:
-        job["latest_execution"] = latest.get(job.get("id", ""))
     return jobs
 
 
@@ -1690,6 +1680,24 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
                     # Check if we've hit the repeat limit
                     if times is not None and times > 0 and completed >= times:
+                        if not success and kind == "once":
+                            try:
+                                family_db = Path.home() / ".hermes" / "family" / "family.db"
+                                with sqlite3.connect(str(family_db), timeout=6) as con:
+                                    con.execute(
+                                        "INSERT INTO events (sister, type, detail) VALUES (?, ?, ?)",
+                                        (
+                                            "cron",
+                                            "oneshot_failed",
+                                            f"Job {job['id']} ({job.get('name') or job['id']}) failed: {error or 'unknown error'}",
+                                        ),
+                                    )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to record one-shot cron failure for job %s",
+                                    job["id"],
+                                    exc_info=True,
+                                )
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)

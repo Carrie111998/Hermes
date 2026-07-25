@@ -25,6 +25,7 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   thread_id    -- Telegram forum-topic id / thread root id (string; empty
                   when not in a thread / topic)
   chat_type    -- "dm" | "group" | "forum" (empty if unknown)
+  profile      -- active Hermes profile name (e.g. "default", "apollo")
   session_id   -- Hermes session id
   message      -- inbound message text (truncated to 500 chars)
 

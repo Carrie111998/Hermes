@@ -12,6 +12,7 @@ import {
   $petRoam,
   $petRoamDir,
   clearPetUnread,
+  clearPetReplyText,
   type PetInfo,
   petProfile,
   setPetInfo
@@ -238,7 +239,10 @@ export function FloatingPet() {
       return
     }
 
-    const onFocus = () => clearPetUnread()
+    const onFocus = () => {
+      clearPetUnread()
+      clearPetReplyText()
+    }
     window.addEventListener('focus', onFocus)
 
     return () => window.removeEventListener('focus', onFocus)

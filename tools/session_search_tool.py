@@ -57,13 +57,124 @@ _DISCOVER_SCAN_LIMIT = 300
 
 # Prefixes that identify generated context-compaction handoff summaries.
 # These are inserted by agent/context_compressor.py as normal user/assistant
-# messages but contain machine-generated summary metadata — not user content.
+# messages but contain machine-generated summary metadata - not user content.
 # They must be excluded from discovery bookends to avoid re-introducing huge
 # compaction payloads into fresh sessions via session_search.  (#43175)
 _COMPACTION_PREFIXES = (
     "[CONTEXT COMPACTION",
     "[CONTEXT SUMMARY]:",
 )
+
+# These defaults are intentionally retrieval-only. The raw transcripts stay in
+# state.db so operators can inspect them through admin/debug surfaces.
+_DEFAULT_EXCLUDE_PATTERNS = {
+    "session_id": ("bookkeeper",),
+    "messages": ("p_send", "stats-update", "form_scores"),
+}
+
+
+def _session_search_exclude_patterns() -> Dict[str, tuple[str, ...]]:
+    """Load configured persona-search exclusions, retaining safe defaults.
+
+    ``session_search.exclude_patterns`` accepts either the structured form::
+
+        session_search:
+          exclude_patterns:
+            session_id: [bookkeeper]
+            messages: [p_send, stats-update, form_scores]
+
+    or a flat list, whose entries are checked against both the session id and
+    message content. Configured values extend the built-in safety defaults;
+    an empty/malformed setting cannot accidentally re-expose the transcripts.
+    """
+    patterns = {
+        key: list(values) for key, values in _DEFAULT_EXCLUDE_PATTERNS.items()
+    }
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        configured = cfg_get(
+            load_config_readonly(),
+            "session_search",
+            "exclude_patterns",
+            default=None,
+        )
+    except Exception:
+        logging.debug("Could not load session_search exclusions", exc_info=True)
+        configured = None
+
+    if isinstance(configured, dict):
+        aliases = {
+            "session_id": "session_id",
+            "session_ids": "session_id",
+            "messages": "messages",
+            "message": "messages",
+            "content": "messages",
+        }
+        for raw_key, target in aliases.items():
+            values = configured.get(raw_key)
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, (list, tuple, set)):
+                patterns[target].extend(values)
+    elif isinstance(configured, str):
+        patterns["session_id"].append(configured)
+        patterns["messages"].append(configured)
+    elif isinstance(configured, (list, tuple, set)):
+        patterns["session_id"].extend(configured)
+        patterns["messages"].extend(configured)
+
+    return {
+        key: tuple(
+            str(value).casefold()
+            for value in values
+            if isinstance(value, str) and value.strip()
+        )
+        for key, values in patterns
+    }
+
+
+def _session_is_excluded(
+    db,
+    session_id: str,
+    *,
+    source: Optional[str] = None,
+    patterns: Optional[Dict[str, tuple[str, ...]]] = None,
+) -> bool:
+    """Whether a cron session is hidden from persona-facing retrieval."""
+    if not session_id:
+        return False
+    try:
+        if source is None:
+            source = (db.get_session(session_id) or {}).get("source")
+        if str(source or "").casefold() != "cron":
+            return False
+
+        patterns = patterns or _session_search_exclude_patterns()
+        session_id_folded = str(session_id).casefold()
+        if any(pattern in session_id_folded for pattern in patterns["session_id"]):
+            return True
+
+        # Check the complete session, not just the FTS row that happened to
+        # match the query. This is still retrieval filtering; nothing is
+        # removed from the database or its FTS index.
+        messages = db.get_messages(session_id)
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else message
+            if isinstance(content, str) and any(
+                pattern in content.casefold() for pattern in patterns["messages"]
+            ):
+                return True
+    except Exception:
+        # A cron transcript that cannot be inspected is safer to hide from a
+        # persona than to return without applying the privacy filter.
+        logging.warning(
+            "Could not inspect cron session %s for session_search exclusions; hiding it",
+            session_id,
+            exc_info=True,
+        )
+        return True
+    return False
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -384,14 +495,23 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    *,
+    exclude_sensitive: bool = True,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = db.list_sessions_rich(
-            limit=limit + 5,
+            # Filter after fetching because the message-vocabulary exclusion
+            # is evaluated against the complete transcript.
+            limit=limit + 50,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
         )  # fetch extra so we can skip current
+        patterns = _session_search_exclude_patterns() if exclude_sensitive else None
 
         current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
 
@@ -402,6 +522,13 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
                 continue
             # Skip child / delegation sessions
             if s.get("parent_session_id"):
+                continue
+            if exclude_sensitive and _session_is_excluded(
+                db,
+                sid,
+                source=s.get("source"),
+                patterns=patterns,
+            ):
                 continue
             results.append({
                 "session_id": sid,
@@ -433,6 +560,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    exclude_sensitive: bool = True,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -475,6 +603,8 @@ def _scroll(
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         session_meta = {}
     if not session_meta:
+        return tool_error(f"session_id not found: {session_id}", success=False)
+    if exclude_sensitive and _session_is_excluded(db, session_id, source=session_meta.get("source")):
         return tool_error(f"session_id not found: {session_id}", success=False)
 
     # Fetch the window
@@ -560,6 +690,9 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    *,
+    exclude_sensitive: bool = True,
+    patterns: Optional[Dict[str, tuple[str, ...]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -584,6 +717,13 @@ def _title_match_result(
         logging.debug("get_session failed for title match %s", session_id, exc_info=True)
         session_meta = {}
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
+        return None
+    if exclude_sensitive and _session_is_excluded(
+        db,
+        session_id,
+        source=session_meta.get("source"),
+        patterns=patterns,
+    ):
         return None
 
     try:
@@ -630,11 +770,19 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    exclude_sensitive: bool = True,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    patterns = _session_search_exclude_patterns() if exclude_sensitive else None
+    title_result = _title_match_result(
+        db,
+        query,
+        current_lineage_root,
+        exclude_sensitive=exclude_sensitive,
+        patterns=patterns,
+    )
 
     try:
         raw_results = db.search_messages(
@@ -656,6 +804,18 @@ def _discover(
     # top `limit` results (#19434). Stable — preserves BM25/recency order
     # within each class.
     raw_results = _order_for_recall(raw_results)
+
+    if exclude_sensitive:
+        raw_results = [
+            row
+            for row in raw_results
+            if not _session_is_excluded(
+                db,
+                row.get("session_id"),
+                source=row.get("source"),
+                patterns=patterns,
+            )
+        ]
 
     if not raw_results and not title_result:
         _empty_payload = {
@@ -790,6 +950,9 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    # Internal admin/debug escape hatch. Deliberately not part of the model
+    # schema; normal persona and heartbeat calls always keep exclusions on.
+    admin_debug: bool = False,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -835,6 +998,8 @@ def session_search(
             db = profile_db
             current_session_id = None
 
+    exclude_sensitive = not admin_debug
+
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
         return _scroll(
@@ -843,11 +1008,14 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            exclude_sensitive=exclude_sensitive,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
+        if exclude_sensitive and _session_is_excluded(db, sid):
+            return tool_error(f"session_id not found: {sid}", success=False)
         result = _read_session(db, sid)
         if json.loads(result).get("success"):
             return result
@@ -858,6 +1026,8 @@ def session_search(
         located, owner = _locate_session_db(sid)
         if located is not None:
             try:
+                if exclude_sensitive and _session_is_excluded(located, sid):
+                    return tool_error(f"session_id not found: {sid}", success=False)
                 found = json.loads(_read_session(located, sid))
             finally:
                 located.close()
@@ -876,7 +1046,12 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            exclude_sensitive=exclude_sensitive,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -897,6 +1072,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        exclude_sensitive=exclude_sensitive,
     )
 
 
@@ -1075,6 +1251,7 @@ registry.register(
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
+        admin_debug=bool(kw.get("admin_debug", False)),
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",

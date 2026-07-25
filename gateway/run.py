@@ -13889,6 +13889,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "chat_id": source.chat_id or "",
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
+                "profile": getattr(source, "profile", "") or self._active_profile_name(),
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }

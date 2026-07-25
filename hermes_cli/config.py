@@ -936,6 +936,14 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Retrieval-only exclusions for persona-facing session_search. The
+    # transcripts remain in state.db for admin/debug access and retention.
+    "session_search": {
+        "exclude_patterns": {
+            "session_id": ["bookkeeper"],
+            "messages": ["p_send", "stats-update", "form_scores"],
+        },
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,

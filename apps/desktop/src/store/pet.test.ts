@@ -4,10 +4,12 @@ import {
   $petActivity,
   $petAtRest,
   $petMotion,
+  $petReplyText,
   $petState,
   derivePetState,
   flashPetActivity,
-  setPetActivity
+  setPetActivity,
+  setPetReplyText
 } from './pet'
 
 describe('derivePetState', () => {
@@ -87,5 +89,30 @@ describe('flashPetActivity', () => {
     expect($petState.get()).toBe('jump')
 
     setPetActivity({})
+  })
+})
+
+describe('replyText', () => {
+  it('stores trimmed reply text', () => {
+    setPetReplyText('  hello world  ')
+    expect($petReplyText.get()).toBe('hello world')
+  })
+
+  it('skips empty / whitespace-only text', () => {
+    $petReplyText.set(null)
+    setPetReplyText('   ')
+    expect($petReplyText.get()).toBeNull()
+  })
+
+  it('skips [SILENT] replies', () => {
+    $petReplyText.set(null)
+    setPetReplyText('[SILENT] heartbeat sent')
+    expect($petReplyText.get()).toBeNull()
+  })
+
+  it('truncates to 200 chars', () => {
+    const long = 'a'.repeat(250)
+    setPetReplyText(long)
+    expect($petReplyText.get()?.length).toBe(200)
   })
 })

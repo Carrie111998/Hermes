@@ -1,7 +1,7 @@
 import { atom } from 'nanostores'
 
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
-import { $petActivity, $petInfo, $petUnread, clearPetUnread, type PetActivity, type PetInfo } from '@/store/pet'
+import { $petActivity, $petInfo, $petReplyText, $petUnread, clearPetUnread, clearPetReplyText, type PetActivity, type PetInfo } from '@/store/pet'
 import { $awaitingResponse, $busy } from '@/store/session'
 
 /**
@@ -46,7 +46,9 @@ export interface PetOverlayStatePayload {
   awaiting: boolean
   /** Drives the overlay's mail icon: a finish landed while you were away. */
   unread: boolean
-  /** Latest reaction — bumping its id forwards a burst to the overlay. */
+  /** Latest reply text to show in the speech bubble instead of the mail icon. */
+  replyText: string | null
+  /** Latest reaction - bumping its id forwards a burst to the overlay. */
   reaction: PetReaction | null
 }
 
@@ -147,6 +149,7 @@ function currentPayload(): PetOverlayStatePayload {
     busy: $busy.get(),
     awaiting: $awaitingResponse.get(),
     unread: $petUnread.get(),
+    replyText: $petReplyText.get(),
     reaction: $petReaction.get()
   }
 }
@@ -184,6 +187,7 @@ function openOverlay(request: PetOverlayOpenRequest): void {
     $busy.subscribe(pushNow),
     $awaitingResponse.subscribe(pushNow),
     $petUnread.subscribe(pushNow),
+    $petReplyText.subscribe(pushNow),
     $petReaction.subscribe(pushNow)
   ]
 }
@@ -292,9 +296,11 @@ export function initPetOverlayBridge(): () => void {
       // overlay on the next push, keeping both surfaces in sync.
       scaleHandler?.(payload.scale)
     } else if (payload?.type === 'open-app') {
-      // Mail icon: surface the app on the most recent thread (main.ts already
-      // focused the window before forwarding this) and mark it read.
+      // Mail icon / reply bubble: surface the app on the most recent thread
+      // (main.ts already focused the window before forwarding this) and mark
+      // it read.
       clearPetUnread()
+      clearPetReplyText()
       openAppHandler?.()
     }
   })
