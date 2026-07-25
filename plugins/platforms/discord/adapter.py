@@ -5655,19 +5655,19 @@ class DiscordAdapter(BasePlatformAdapter):
     _DEFAULT_START_PROJECTS: Dict[str, Dict[str, str]] = {
         "il": {
             "channel_id": "1528777357505069167",
-            # TODO: replace when a Discord member matching worker-il exists.
+            # TODO: resolve to <@id> when worker-il bot is added to the guild.
             "worker_mention": "@worker-il ",
             "display_name": "IL",
         },
         "il-cortes": {
             "channel_id": "1528777364069154972",
-            # TODO: replace when a Discord member matching worker-ilcortes exists.
+            # TODO: resolve to <@id> when worker-ilcortes bot is added to the guild.
             "worker_mention": "@worker-ilcortes ",
             "display_name": "IL Cortes",
         },
         "il-launcher": {
             "channel_id": "1529554075375370404",
-            # TODO: replace when a Discord member matching worker-illauncher exists.
+            # TODO: resolve to <@id> when worker-illauncher bot is added to the guild.
             "worker_mention": "@worker-illauncher ",
             "display_name": "IL Launcher",
         },
@@ -5678,8 +5678,10 @@ class DiscordAdapter(BasePlatformAdapter):
         },
         "hermes/improve": {
             "channel_id": "1528777372042662111",
-            # TODO: replace when a Discord member matching worker-improve exists.
-            "worker_mention": "@worker-improve ",
+            # Resolved to Norph (luizfelipe7300) — the user who owns the improve
+            # project. Replace with the dedicated worker-improve bot's <@id> once
+            # that bot is invited to the guild.
+            "worker_mention": "<@305205937998659585>",
             "display_name": "Hermes Improve",
         },
         "default": {
