@@ -2469,7 +2469,7 @@ class WorkflowEngine:
                     # the card before the worker picks it up.
                     try:
                         from hermes_cli import kanban_db as _kb
-                        with _kb.connect(board=self.kanban_board) as _conn:
+                        with _kb.connect_closing(board=self.kanban_board) as _conn:
                             _kb.heartbeat_worker(_conn, card_id)
                     except Exception:
                         pass  # Non-fatal: heartbeat sweep has created_at fallback
@@ -2875,7 +2875,7 @@ class WorkflowEngine:
                                 if upstream_state.kanban_card_id:
                                     try:
                                         from hermes_cli import kanban_db as kb
-                                        with kb.connect(board=self.kanban_board) as conn:
+                                        with kb.connect_closing(board=self.kanban_board) as conn:
                                             existing_body = kb.get_task(conn, upstream_state.kanban_card_id).body or ""
                                             feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
                                             new_body = existing_body + feedback
