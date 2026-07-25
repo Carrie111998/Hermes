@@ -647,7 +647,13 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         if task and task.status == "ready" and task.assignee:
             try:
                 from hermes_cli.kanban import _check_dispatcher_presence
-                running, message = _check_dispatcher_presence()
+                from hermes_constants import get_hermes_home
+
+                # Prefer the active request/profile home so a machine-root
+                # dashboard backend still probes named-profile gateways (#71211).
+                running, message = _check_dispatcher_presence(
+                    hermes_home=get_hermes_home()
+                )
                 if not running and message:
                     body["warning"] = message
             except Exception:

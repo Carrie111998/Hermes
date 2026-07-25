@@ -8592,6 +8592,7 @@ def _messaging_platform_payload(
     env_on_disk: dict[str, str],
     runtime: dict | None,
     scoped: bool = False,
+    profile_home: Optional[Path] = None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     runtime_platforms = runtime.get("platforms") if runtime else {}
@@ -8600,10 +8601,22 @@ def _messaging_platform_payload(
         if isinstance(runtime_platforms, dict)
         else {}
     )
-    gateway_running = (
-        get_running_pid() is not None
-        or get_runtime_status_running_pid(runtime) is not None
-    )
+    # gateway/status readers intentionally ignore HERMES_HOME contextvar
+    # overrides (see #56986 / #69143). When the dashboard scopes to a named
+    # profile, pass explicit paths so we don't read the process-root state.
+    if profile_home is not None:
+        gateway_running = (
+            get_running_pid(pid_path=profile_home / "gateway.pid") is not None
+            or get_runtime_status_running_pid(
+                runtime, expected_home=profile_home
+            )
+            is not None
+        )
+    else:
+        gateway_running = (
+            get_running_pid() is not None
+            or get_runtime_status_running_pid(runtime) is not None
+        )
     env_vars = []
 
     for key in entry["env_vars"]:
@@ -9605,17 +9618,28 @@ async def cancel_telegram_onboarding(pairing_id: str):
 async def get_messaging_platforms(profile: Optional[str] = None):
     # Profile-scoped so the dashboard's global profile switcher shows the
     # TARGET profile's channel credentials/state, not the root install's.
-    # Inside _profile_scope, load_env()/read_runtime_status()/get_running_pid()
-    # all resolve against the requested profile's HERMES_HOME.
+    # load_env() honors the HERMES_HOME override; gateway status readers do
+    # not (process-level home only) — pass explicit paths for those.
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
-        runtime = read_runtime_status()
+        # Explicit state path: read_runtime_status() ignores contextvar HERMES_HOME
+        # overrides and would otherwise read the machine-root gateway_state.json
+        # while env_path/start command are correctly profile-scoped (#71211).
+        runtime = (
+            read_runtime_status(path=scoped_dir / "gateway_state.json")
+            if scoped_dir is not None
+            else read_runtime_status()
+        )
         return {
             "env_path": str(get_env_path()),
             "gateway_start_command": _gateway_display_command(profile, "start"),
             "platforms": [
                 _messaging_platform_payload(
-                    entry, env_on_disk, runtime, scoped=scoped_dir is not None
+                    entry,
+                    env_on_disk,
+                    runtime,
+                    scoped=scoped_dir is not None,
+                    profile_home=scoped_dir,
                 )
                 for entry in _messaging_platform_catalog()
             ]
@@ -9750,8 +9774,17 @@ async def test_messaging_platform(platform_id: str, profile: Optional[str] = Non
 
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
+        runtime = (
+            read_runtime_status(path=scoped_dir / "gateway_state.json")
+            if scoped_dir is not None
+            else read_runtime_status()
+        )
         payload = _messaging_platform_payload(
-            entry, env_on_disk, read_runtime_status(), scoped=scoped_dir is not None
+            entry,
+            env_on_disk,
+            runtime,
+            scoped=scoped_dir is not None,
+            profile_home=scoped_dir,
         )
     if not payload["enabled"]:
         message = f"{entry['name']} is disabled. Enable it, then restart the gateway."

@@ -134,7 +134,9 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
-def _check_dispatcher_presence() -> tuple[bool, str]:
+def _check_dispatcher_presence(
+    hermes_home: Path | str | None = None,
+) -> tuple[bool, str]:
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
@@ -143,6 +145,10 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     - ``running=False``: either no gateway is running, or the gateway
       is running but the config flag is off. Message is human guidance
       explaining the next step.
+
+    ``hermes_home`` scopes the PID probe to a named profile directory when
+    the dashboard backend process HERMES_HOME is the machine root (#71211).
+    The CLI path leaves it ``None`` (unchanged behavior).
 
     Used by ``hermes kanban create`` (and callers) to warn when a task
     will sit in ``ready`` because nothing is there to pick it up.
@@ -155,7 +161,13 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     except Exception:
         return (True, "")  # can't probe — silent
     try:
-        pid = get_running_pid()
+        if hermes_home is not None:
+            from pathlib import Path as _Path
+
+            home = _Path(hermes_home)
+            pid = get_running_pid(pid_path=home / "gateway.pid")
+        else:
+            pid = get_running_pid()
     except Exception:
         return (True, "")  # probe errored — silent
 

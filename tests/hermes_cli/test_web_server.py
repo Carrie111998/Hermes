@@ -397,6 +397,91 @@ class TestWebServerEndpoints:
         assert data["gateway_pid"] == 4321
         assert data["gateway_state"] == "running"
 
+    def test_messaging_platforms_profile_scopes_gateway_state_reads(self, monkeypatch, tmp_path):
+        """?profile=<name> messaging endpoints must read profile gateway_state (#71211)."""
+        from pathlib import Path
+        import json
+
+        worker_home = tmp_path / "profiles" / "worker"
+        worker_home.mkdir(parents=True)
+        (worker_home / "gateway_state.json").write_text(
+            json.dumps(
+                {
+                    "gateway_state": "running",
+                    "pid": 424242,
+                    "updated_at": "2026-07-25T00:00:00+00:00",
+                    "platforms": {
+                        "telegram": {
+                            "state": "connected",
+                            "updated_at": "2026-07-25T00:00:00+00:00",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (worker_home / ".env").write_text("", encoding="utf-8")
+        (worker_home / "config.yaml").write_text(
+            "platforms:\n  telegram:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+
+        seen = {"runtime_path": None, "pid_path": None}
+
+        def _resolve(name: str):
+            assert name == "worker"
+            return worker_home
+
+        def _read_runtime(path=None):
+            seen["runtime_path"] = path
+            if path is None:
+                return {
+                    "gateway_state": "stopped",
+                    "platforms": {},
+                }
+            import json as _json
+            return _json.loads(Path(path).read_text(encoding="utf-8"))
+
+        def _running_pid(pid_path=None, cleanup_stale=True, **kwargs):
+            seen["pid_path"] = pid_path
+            if pid_path is not None and Path(pid_path).parent == worker_home:
+                return 424242
+            return None
+
+        def _runtime_pid(runtime=None, *, expected_home=None):
+            if expected_home is not None and Path(expected_home) == worker_home:
+                return 424242
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.web_server._resolve_profile_dir", _resolve
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.read_runtime_status", _read_runtime
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.get_running_pid", _running_pid
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.get_runtime_status_running_pid", _runtime_pid
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_env", lambda: {"TELEGRAM_BOT_TOKEN": "1:abc"}
+        )
+        monkeypatch.setattr(
+            "hermes_cli.web_server.load_config",
+            lambda: {"platforms": {"telegram": {"enabled": True}}},
+        )
+
+        resp = self.client.get("/api/messaging/platforms?profile=worker")
+        assert resp.status_code == 200, resp.text
+        assert seen["runtime_path"] == worker_home / "gateway_state.json"
+        assert seen["pid_path"] == worker_home / "gateway.pid"
+        platforms = {p["id"]: p for p in resp.json()["platforms"]}
+        assert platforms["telegram"]["gateway_running"] is True
+        assert platforms["telegram"]["state"] == "connected"
+
+
     def test_get_status_unknown_profile_404s(self):
         resp = self.client.get("/api/status?profile=no-such-profile")
         assert resp.status_code == 404
