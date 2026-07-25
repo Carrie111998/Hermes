@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 from hermes_constants import get_hermes_home
 
-_ROUTE_FIELDS = ("default", "provider", "api_mode")
+_ROUTE_FIELDS = ("default", "provider", "api_mode", "base_url")
 _STALE_ENDPOINT_FIELDS = ("api_key", "api", "base_url", "context_length")
 
 
@@ -29,18 +29,25 @@ class ModelRoute:
     model: str
     provider: str
     api_mode: str
+    base_url: str = ""
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ModelRoute":
         model = str(raw.get("model") or raw.get("default") or "").strip()
         provider = str(raw.get("provider") or "").strip()
         api_mode = str(raw.get("api_mode") or raw.get("transport") or "").strip()
+        base_url = str(raw.get("base_url") or "").strip()
         if not model or not provider or not api_mode:
             raise ValueError("model, provider, and api_mode are required")
-        return cls(model=model, provider=provider, api_mode=api_mode)
+        return cls(model=model, provider=provider, api_mode=api_mode, base_url=base_url)
 
     def as_config(self) -> dict[str, str]:
-        return {"default": self.model, "provider": self.provider, "api_mode": self.api_mode}
+        return {
+            "default": self.model,
+            "provider": self.provider,
+            "api_mode": self.api_mode,
+            "base_url": self.base_url,
+        }
 
 
 @dataclass(frozen=True)
@@ -90,7 +97,7 @@ def _validate_target(route: ModelRoute, config: Mapping[str, Any]) -> None:
     if route.api_mode not in supported_modes:
         raise ModelActivationError(f"unsupported api_mode: {route.api_mode}")
 
-    mandated = host_mandated_api_mode(provider.base_url)
+    mandated = host_mandated_api_mode(route.base_url or provider.base_url)
     declared = TRANSPORT_TO_API_MODE.get(provider.transport)
     required = mandated or declared
     if required and route.api_mode != required:
@@ -148,6 +155,15 @@ class _ActivationLock:
             self._handle = None
 
 
+def model_activation_lock() -> _ActivationLock:
+    """Serialize complete main-model route transactions across processes.
+
+    Existing model writers must hold this lock from their config read through
+    their write so an activation CAS cannot race a stale route snapshot.
+    """
+    return _ActivationLock(_lock_path())
+
+
 def activate_model_profile(
     profile: ModelRoute | Mapping[str, Any],
     *,
@@ -193,7 +209,7 @@ def activate_model_profile(
         )
 
     config_path = get_config_path()
-    with _CONFIG_LOCK, _ActivationLock(_lock_path()):
+    with _CONFIG_LOCK, model_activation_lock():
         if not config_path.exists():
             raise ModelActivationError("current config.yaml is missing")
         try:
@@ -229,8 +245,10 @@ def activate_model_profile(
             model_cfg["main"] = target.model
         else:
             model_cfg.pop("main", None)
-        new_generation = generation + 1
-        model_cfg["routing_generation"] = new_generation
+        route_changed = current != target
+        new_generation = generation + 1 if route_changed else generation
+        if route_changed:
+            model_cfg["routing_generation"] = new_generation
 
         atomic_config_write(config_path, raw, sort_keys=False)
         path_key = str(config_path)
@@ -253,5 +271,6 @@ __all__ = [
     "ModelActivationError",
     "ModelRoute",
     "activate_model_profile",
+    "model_activation_lock",
     "route_fingerprint",
 ]

@@ -43,6 +43,7 @@ def test_activation_writes_whole_route_and_preserves_templates(tmp_path, monkeyp
         model="anthropic/claude-fable-5",
         provider="anthropic",
         api_mode="anthropic_messages",
+        base_url="${CLAUDE_PROXY_URL}",
     )
 
     result = activate_model_profile(
@@ -50,6 +51,7 @@ def test_activation_writes_whole_route_and_preserves_templates(tmp_path, monkeyp
             "model": "codex/gpt-5.6-sol",
             "provider": "codex",
             "api_mode": "codex_responses",
+            "base_url": "https://api.openai.com/v1",
         },
         expected_current=expected,
         expected_fingerprint=route_fingerprint(expected),
@@ -63,6 +65,7 @@ def test_activation_writes_whole_route_and_preserves_templates(tmp_path, monkeyp
         "main": "codex/gpt-5.6-sol",
         "provider": "codex",
         "api_mode": "codex_responses",
+        "base_url": "https://api.openai.com/v1",
         "routing_generation": 8,
     }
     assert "${CLAUDE_PROXY" not in raw_text
@@ -70,6 +73,25 @@ def test_activation_writes_whole_route_and_preserves_templates(tmp_path, monkeyp
     assert result.old_route == expected
     assert result.generation == 8
     assert result.runtime_rollover_required is True
+
+
+def test_activation_preserves_target_base_url_and_skips_noop_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path)
+    target = ModelRoute(
+        "anthropic/claude-fable-5",
+        "anthropic",
+        "anthropic_messages",
+        "${CLAUDE_PROXY_URL}",
+    )
+
+    result = activate_model_profile(target, expected_generation=7)
+
+    raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["model"]["base_url"] == "${CLAUDE_PROXY_URL}"
+    assert raw["model"]["routing_generation"] == 7
+    assert result.generation == 7
+    assert result.runtime_rollover_required is False
 
 
 def test_activation_rejects_stale_cas_without_writing(tmp_path, monkeypatch):
