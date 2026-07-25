@@ -388,6 +388,36 @@ Only users listed in `DISCORD_ALLOWED_USERS` can interact via voice. Other users
 DISCORD_ALLOWED_USERS=284102345871466496
 ```
 
+### Experimental Codex realtime WebRTC
+
+The opt-in `discord.codex_realtime_voice` route streams one configured user's Discord PCM over WebRTC to Codex GPT-Live. It uses Codex for transcription and speaking only; Hermes remains the assistant and retains the normal session, memory, tool, and approval pipeline. Codex startup context is excluded and the realtime session receives a speech-interface-only prompt. Remote audio is additionally blocked until Hermes explicitly submits response text with `appendSpeech`.
+
+```yaml
+discord:
+  codex_realtime_voice:
+    enabled: true
+    user_id: "284102345871466496"  # exactly one bound Discord user
+    voice: ""                      # empty uses Codex's v1 default
+    fallback_to_classic: true
+    codex_bin: "codex"
+    codex_home: ""                 # optional isolated Codex config/auth home
+```
+
+The route requires Codex CLI `0.145.0` or newer plus its own Codex login. The standard Hermes `openai-codex` provider authentication does not replace that CLI login. Install the optional dependency extra manually with `hermes-agent[codex-realtime-voice]`, or allow Hermes' normal lazy dependency installation.
+
+Capability boundaries are explicit:
+
+- WebRTC realtime protocol `v1`
+- supported voice names are discovered at startup
+- Codex app-server thread state is ephemeral for each voice session
+- while the route is active, audio from users other than the configured `user_id` is ignored
+- realtime reasoning effort is not configurable
+- language/locale selection is not exposed
+- automatic language detection is not a contractual guarantee
+- account entitlement is checked at session start and can be denied independently of a valid login
+
+With `fallback_to_classic: true`, any missing dependency, unsupported Codex version, entitlement error, SDP failure, or transport close leaves classic STT/TTS voice available. `/voice join` reports whether Codex Live or classic voice is active.
+
 ---
 
 ## Configuration Reference
