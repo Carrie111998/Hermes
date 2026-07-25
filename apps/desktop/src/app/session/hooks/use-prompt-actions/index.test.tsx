@@ -76,7 +76,6 @@ interface HarnessHandle {
   editMessage: (edited: Parameters<ReturnType<typeof usePromptActions>['editMessage']>[0]) => Promise<void>
   reloadFromMessage: (parentId: null | string) => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
-  reloadFromMessage: (parentId: string | null) => Promise<void>
   redirectPrompt: (text: string) => Promise<boolean>
   /** @deprecated Use `redirectPrompt`. */
   steerPrompt: (text: string) => Promise<boolean>
@@ -183,8 +182,6 @@ function Harness({
         act(async () => actions.reloadFromMessage(...args)) as Promise<void>,
       restoreToMessage: (...args: Parameters<typeof actions.restoreToMessage>) =>
         act(async () => actions.restoreToMessage(...args)) as Promise<void>,
-      reloadFromMessage: (...args: Parameters<typeof actions.reloadFromMessage>) =>
-        act(async () => actions.reloadFromMessage(...args)) as Promise<void>,
       redirectPrompt: (...args: Parameters<typeof actions.redirectPrompt>) =>
         act(async () => actions.redirectPrompt(...args)) as Promise<boolean>,
       steerPrompt: (...args: Parameters<typeof actions.steerPrompt>) =>
@@ -198,7 +195,6 @@ function Harness({
     actions.editMessage,
     actions.reloadFromMessage,
     actions.restoreToMessage,
-    actions.reloadFromMessage,
     actions.redirectPrompt,
     actions.steerPrompt,
     actions.submitText,
