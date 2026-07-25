@@ -205,15 +205,8 @@ ds = load_dataset("json", data_files="trajectory_samples.jsonl")
 
 ## 控制轨迹保存
 
-在 CLI 中，轨迹保存通过以下方式控制：
-
-```yaml
-# config.yaml
-agent:
-  save_trajectories: true  # default: false
-```
-
-或通过 `--save-trajectories` 标志。当 agent 以 `save_trajectories=True` 初始化时，
+程序化集成可以在构建 agent 时传递 `save_trajectories=True`。独立的 `run_agent.py` 脚本也接受
+`--save_trajectories` 参数。当 agent 以 `save_trajectories=True` 初始化时，
 `_save_trajectory()` 方法在每次对话轮次结束时调用。
 
 批量运行器始终保存轨迹（这是其主要用途）。

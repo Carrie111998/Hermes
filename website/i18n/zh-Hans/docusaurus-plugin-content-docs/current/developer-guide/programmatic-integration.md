@@ -115,7 +115,7 @@ GET  /health, /health/detailed
 - **CLI / TUI：** `/model claude-sonnet-4` 或 `/model openrouter:anthropic/claude-sonnet-4.6`
 - **TUI gateway RPC：** 使用 `{"command": "/model claude-sonnet-4"}` 调用 `command.dispatch`
 - **ACP：** IDE 将 slash 命令作为 prompt 发送，agent 负责分发
-- **API server：** 在请求体中包含 `model` 字段，或设置 `X-Hermes-Model`
+- **API server：** 在请求体中包含 `model` 字段
 
 内置 provider 感知解析（相同的模型名称会根据当前 provider 自动选择正确格式）。参见 `hermes_cli/model_switch.py`。
 

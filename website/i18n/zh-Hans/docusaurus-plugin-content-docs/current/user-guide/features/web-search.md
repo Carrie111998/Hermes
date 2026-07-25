@@ -25,7 +25,7 @@ Hermes Agent 内置两个可供模型调用的网页工具，由多个提供商�
 | **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | 1 000 次搜索/月 |
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 次搜索/月 |
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | 付费 |
-| **xAI (Grok)** | `XAI_API_KEY` 或 `hermes auth login xai-oauth` | ✔ | — | 付费（SuperGrok 或按 token 计费） |
+| **xAI (Grok)** | `XAI_API_KEY` 或 `hermes auth add xai-oauth` | ✔ | — | 付费（SuperGrok 或按 token 计费） |
 
 Brave Search、DDGS 和 xAI 均为**仅搜索**——如果同时需要 `web_extract`，可将其中任意一个与 Firecrawl/Tavily/Exa/Parallel 配合使用。DDGS 底层使用 [`ddgs` Python 包](https://pypi.org/project/ddgs/)；若尚未安装，请运行 `pip install ddgs`（或让 Hermes 在首次使用时懒加载安装）。xAI 通过 Responses API 运行 Grok 服务端的 `web_search` 工具——结果由 LLM 生成而非基于索引，因此标题、描述和 URL 选择均为模型输出（参见下方[信任模型说明](#xai-grok)）。
 
@@ -288,7 +288,7 @@ XAI_API_KEY=sk-xai-your-key-here
 或对于 SuperGrok 订阅用户：
 
 ```bash
-hermes auth login xai-oauth
+hermes auth add xai-oauth
 ```
 
 然后选择 xAI 作为搜索后端：

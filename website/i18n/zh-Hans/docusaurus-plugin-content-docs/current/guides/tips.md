@@ -177,11 +177,11 @@ Hermes 在会话启动时从当前工作目录加载顶层 `AGENTS.md`。子目�
 
 ### 对不可信代码使用 Docker
 
-在处理不可信仓库或运行陌生代码时，使用 Docker 或 Daytona 作为终端后端。在 `.env` 中设置 `TERMINAL_BACKEND=docker`。容器内的破坏性命令不会影响宿主系统。
+在处理不可信仓库或运行陌生代码时，使用 Docker 或 Daytona 作为终端后端。在 `.env` 中设置 `TERMINAL_ENV=docker`。容器内的破坏性命令不会影响宿主系统。
 
 ```bash
 # In your .env:
-TERMINAL_BACKEND=docker
+TERMINAL_ENV=docker
 TERMINAL_DOCKER_IMAGE=hermes-sandbox:latest
 ```
 
