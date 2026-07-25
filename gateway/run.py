@@ -12901,6 +12901,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=metadata,
             )
 
+        def _stop_after_terminal_result(result: Any) -> bool:
+            if not isinstance(result, dict):
+                return True
+            decision = str(result.get("decision", "")).strip().lower()
+            return decision not in {"continue", "pass"}
+
         try:
             results = await invoke_hook_async(
                 "gateway_message",
@@ -12911,6 +12917,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 delivery=GatewayDelivery(_send_to_source),
                 raise_exceptions=True,
+                stop_when=_stop_after_terminal_result,
             )
         except asyncio.CancelledError:
             raise

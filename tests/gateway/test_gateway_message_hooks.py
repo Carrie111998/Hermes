@@ -213,8 +213,16 @@ async def test_terminal_hook_handling_suppresses_cold_agent_dispatch(
     assert result is None
     runner._handle_message_with_agent.assert_not_awaited()
     assert captured["name"] == "gateway_message"
-    assert set(captured["kwargs"]) == {"event", "route", "delivery", "raise_exceptions"}
+    assert set(captured["kwargs"]) == {
+        "event",
+        "route",
+        "delivery",
+        "raise_exceptions",
+        "stop_when",
+    }
     assert captured["kwargs"]["raise_exceptions"] is True
+    assert captured["kwargs"]["stop_when"]({"decision": "handled"}) is True
+    assert captured["kwargs"]["stop_when"]({"decision": "pass"}) is False
     assert not isinstance(captured["kwargs"]["event"], MessageEvent)
     assert captured["kwargs"]["route"].session_key == build_session_key(_source())
     adapter.send.assert_awaited_once_with(

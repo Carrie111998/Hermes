@@ -1939,6 +1939,7 @@ class PluginManager:
         hook_name: str,
         *,
         raise_exceptions: bool = False,
+        stop_when: Optional[Callable[[Any], bool]] = None,
         **kwargs: Any,
     ) -> List[Any]:
         """Await sync or async callbacks registered for *hook_name*.
@@ -1956,6 +1957,8 @@ class PluginManager:
                     ret = await ret
                 if ret is not None:
                     results.append(ret)
+                    if stop_when is not None and stop_when(ret):
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2101,12 +2104,14 @@ async def invoke_hook_async(
     hook_name: str,
     *,
     raise_exceptions: bool = False,
+    stop_when: Optional[Callable[[Any], bool]] = None,
     **kwargs: Any,
 ) -> List[Any]:
     """Invoke sync or async lifecycle-hook callbacks and await completion."""
     return await get_plugin_manager().invoke_hook_async(
         hook_name,
         raise_exceptions=raise_exceptions,
+        stop_when=stop_when,
         **kwargs,
     )
 
