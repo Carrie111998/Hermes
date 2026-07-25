@@ -40,11 +40,23 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.turn_retry_state import ZERO_DELIVERY_STREAM_TIMEOUT_ATTR
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+
+
+def _is_stream_timeout(error: BaseException) -> bool:
+    """Use one timeout classifier for stream retries and outer-loop routing."""
+    import httpx
+    from openai import APITimeoutError
+
+    return isinstance(
+        error,
+        (APITimeoutError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout),
+    )
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -3725,14 +3737,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             type(e).__name__,
                         )
                         return
-                    _is_timeout = isinstance(
-                        e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
-                    )
+                    _is_timeout = _is_stream_timeout(e)
                     _is_conn_err = isinstance(
                         e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                     )
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
+
+                    # A timeout before the first delivered delta is escalated
+                    # immediately to the outer recovery pipeline. Retrying the
+                    # identical payload in both this loop and the outer loop
+                    # multiplies long provider timeouts. The marker lets the
+                    # outer loop preserve one primary transport rebuild and
+                    # configured fallbacks without another ordinary retry cycle.
+                    if _is_timeout and not deltas_were_sent["yes"]:
+                        setattr(e, ZERO_DELIVERY_STREAM_TIMEOUT_ATTR, True)
+                        result["error"] = e
+                        return
 
                     # If the stream died AFTER some tokens were delivered:
                     # normally we don't retry (the user already saw text,
