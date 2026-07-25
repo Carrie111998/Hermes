@@ -16107,6 +16107,23 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _task_owner() -> "str | None":
+        # The run that currently owns the card. If it differs from the run
+        # this worker was spawned under, the card was re-claimed (or routed
+        # through the review lane and picked up by its reviewer) and this
+        # loop must not act on it any more.
+        c = _kb.connect()
+        try:
+            t = _kb.get_task(c, task_id)
+            if t is None or getattr(t, "current_run_id", None) is None:
+                return None
+            return str(t.current_run_id)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
@@ -16126,6 +16143,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        task_owner_fn=_task_owner,
+        expected_owner=(_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip() or None,
     )
 
 

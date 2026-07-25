@@ -381,3 +381,107 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# Handoff terminality: a goal-mode worker may ROUTE its card onward instead of
+# terminating it. Driving on past a handoff let the judge nudge and then BLOCK
+# a card that already belonged to someone else, silently overwriting the
+# routing (observed in production: a review REJECT back to the implementer was
+# overwritten by a goal-loop block 41s later).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["review", "ready", "todo"])
+def test_loop_stops_when_worker_routes_card_onward(monkeypatch, status):
+    _patch_judge(monkeypatch, ["done", "done"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_handoff",
+        goal_text="review the candidate",
+        run_turn=lambda p: pytest.fail("should not run another turn after a handoff"),
+        task_status_fn=lambda: status,
+        block_fn=lambda r: pytest.fail("must never block a handed-off card"),
+        max_turns=10,
+        first_response="approved=false; rejected back to the implementer",
+    )
+    assert res["outcome"] == "handed_off"
+    assert status in res["reason"]
+
+
+def test_loop_does_not_block_review_reject_regression(monkeypatch):
+    """Regression: review send -> reject leaves the card `ready` on another
+    assignee. The loop must stop, not nudge-and-block."""
+    _patch_judge(monkeypatch, ["done", "done", "done"])
+    statuses = iter(["ready"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_reject",
+        goal_text="verify the adapter",
+        run_turn=lambda p: pytest.fail("no turn after reject"),
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("blocking here destroys the rejection routing"),
+        max_turns=10,
+        first_response="review complete, approval withheld",
+    )
+    assert res["outcome"] == "handed_off"
+
+
+def test_loop_stops_when_another_run_owns_the_task(monkeypatch):
+    """Card is `running` again — but under a different run (re-claimed)."""
+    _patch_judge(monkeypatch, ["done", "done"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_owner",
+        goal_text="task",
+        run_turn=lambda p: pytest.fail("should not run a turn for another run's card"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("must not block another run's card"),
+        max_turns=10,
+        first_response="looks done",
+        task_owner_fn=lambda: "904",
+        expected_owner="861",
+    )
+    assert res["outcome"] == "handed_off"
+    assert "904" in res["reason"]
+
+
+def test_loop_continues_while_this_run_still_owns_the_task(monkeypatch):
+    """Ownership match must not change the normal drive path."""
+    _patch_judge(monkeypatch, ["continue", "done"])
+    statuses = iter(["running", "done"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_same_owner",
+        goal_text="task",
+        run_turn=lambda p: turns.append(p) or "progress",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="starting",
+        task_owner_fn=lambda: "861",
+        expected_owner="861",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1
+
+
+def test_owner_check_is_skipped_when_run_id_unavailable(monkeypatch):
+    """Back-compat: no owner info (older dispatcher) → legacy behaviour."""
+    _patch_judge(monkeypatch, ["done", "done"])
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_no_owner",
+        goal_text="task",
+        run_turn=lambda p: "still not finalizing",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=10,
+        first_response="looks done",
+        task_owner_fn=lambda: None,
+        expected_owner=None,
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert "finalize" in blocked["reason"].lower()

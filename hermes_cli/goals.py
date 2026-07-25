@@ -1647,6 +1647,13 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "stop without calling one of them."
 )
 
+# Statuses that mean "this card is no longer this worker's to drive". A
+# goal-mode worker terminates its card with kanban_complete / kanban_block,
+# but it can also legitimately ROUTE it onward — the review lane sets
+# `review` on send and `ready` on reject, and a reclaim requeues to
+# `ready`/`todo`. The loop must treat all of those as terminal for itself.
+HANDOFF_STATUSES = ("review", "ready", "todo")
+
 # Fed when the judge believes the work is done but the worker never called
 # kanban_complete / kanban_block. One explicit nudge to terminate the task
 # the right way before the loop gives up.
@@ -1669,6 +1676,8 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    task_owner_fn=None,
+    expected_owner=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1677,8 +1686,15 @@ def run_kanban_goal_loop(
     first turn has already run by the time this is called; ``first_response``
     is that turn's reply. From here we:
 
-    1. Check whether the worker already terminated the task (called
-       ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
+    1. Check whether the card is still this worker's to drive. It is not if
+       the worker terminated it (``kanban_complete`` / ``kanban_block``), if
+       it ROUTED it onward (``review`` via the review lane's send,
+       ``ready``/``todo`` via a review reject or a reclaim — see
+       ``HANDOFF_STATUSES``), or if ``task_owner_fn`` reports a different
+       owner than ``expected_owner`` (the card was re-claimed by another
+       run). In all of those cases stop: driving on would let the judge
+       nudge and then BLOCK a card that now belongs to someone else,
+       overwriting the routing the worker just performed.
     2. Otherwise judge the latest response against ``goal_text`` (the card's
        title + body). ``continue`` → feed a continuation prompt and run
        another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
@@ -1695,7 +1711,7 @@ def run_kanban_goal_loop(
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"handed_off"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -1728,10 +1744,41 @@ def run_kanban_goal_loop(
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
             return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
-        if status not in ("running", "ready"):
-            # Reclaimed / archived / unexpected — let the dispatcher own it.
+        if status in HANDOFF_STATUSES:
+            # The worker routed the card onward instead of terminating it:
+            # `review` (sent to the review lane), `ready`/`todo` (returned to
+            # another assignee — e.g. a review REJECT — or requeued after a
+            # reclaim). These are legitimate terminal outcomes for THIS
+            # worker. Continuing here is actively harmful: the judge sees
+            # finished-looking work, nudges, and then blocks a card that now
+            # belongs to someone else, silently overwriting the routing.
+            _log(f"kanban goal loop: task {task_id} handed off (status={status!r}); stopping")
+            return {"outcome": "handed_off", "turns_used": turns_used, "reason": f"handed off (status={status})"}
+        if status != "running":
+            # Archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
+
+        # Still `running`, but is it still OUR run? A card can be reclaimed
+        # and re-spawned (or handed to the review lane and immediately
+        # claimed by the reviewer) while this loop is between turns; the
+        # status alone cannot tell those apart from our own run.
+        if task_owner_fn is not None and expected_owner is not None:
+            try:
+                current_owner = task_owner_fn()
+            except Exception as exc:
+                _log(f"kanban goal loop: owner check failed ({exc}); stopping")
+                return {"outcome": "stopped", "turns_used": turns_used, "reason": "owner check failed"}
+            if current_owner is not None and str(current_owner) != str(expected_owner):
+                _log(
+                    f"kanban goal loop: task {task_id} now owned by "
+                    f"{current_owner!r} (this run: {expected_owner!r}); stopping"
+                )
+                return {
+                    "outcome": "handed_off",
+                    "turns_used": turns_used,
+                    "reason": f"another run owns the task ({current_owner})",
+                }
 
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish
