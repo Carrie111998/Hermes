@@ -3098,6 +3098,13 @@ def delegate_task(
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
+            # The children this one batch record stands for. The TUI joins on
+            # these so a batch never double-counts its own live subagents.
+            subagent_ids=[
+                _sid
+                for _sid in (getattr(_c, "_subagent_id", None) for _c in _child_agents)
+                if isinstance(_sid, str)
+            ],
         )
 
         if dispatch.get("status") == "dispatched":

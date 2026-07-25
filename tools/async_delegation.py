@@ -757,6 +757,7 @@ def dispatch_async_delegation_batch(
     steer_fn: Optional[Callable[[str], bool]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
+    subagent_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -803,6 +804,11 @@ def dispatch_async_delegation_batch(
         "interrupt_fn": interrupt_fn,
         "steer_fn": steer_fn,
         "is_batch": True,
+        # Ids of the live children this ONE record stands for. The TUI's docked
+        # panel joins on these to drop the batch row while its children are
+        # still emitting live subagent events — otherwise a 3-child batch
+        # paints 4 rows (3 children + the batch) and claims 4 agents running.
+        "subagent_ids": [s for s in (subagent_ids or []) if isinstance(s, str)],
     }
     with _records_lock:
         running = sum(

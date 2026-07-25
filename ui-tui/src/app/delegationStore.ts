@@ -87,9 +87,40 @@ export const $asyncDelegations = atom<AsyncDelegationRecord[]>([])
 
 export const getAsyncDelegations = () => $asyncDelegations.get()
 
-/** Replace the async-delegation snapshot from a raw RPC response. */
+/**
+ * Fields the panel actually renders. Two snapshots that agree on all of
+ * them produce an identical frame, so re-setting the atom would repaint
+ * the whole app for nothing.
+ */
+const sameRecord = (a: AsyncDelegationRecord, b: AsyncDelegationRecord) =>
+  a.delegation_id === b.delegation_id &&
+  a.status === b.status &&
+  a.goal === b.goal &&
+  a.role === b.role &&
+  a.dispatched_at === b.dispatched_at &&
+  a.completed_at === b.completed_at
+
+const sameSnapshot = (a: AsyncDelegationRecord[], b: AsyncDelegationRecord[]) =>
+  a.length === b.length && a.every((rec, i) => sameRecord(rec, b[i]!))
+
+/**
+ * Replace the async-delegation snapshot from a raw RPC response.
+ *
+ * The poll runs every 1.5s whether or not anything moved; most ticks are
+ * byte-identical (finished rows are retained for a long time and running
+ * rows only change on status transitions — elapsed is derived at render
+ * time from `dispatched_at`, not carried in the record). Bail out when the
+ * projection is unchanged so a quiet background delegation doesn't force
+ * a full-app repaint 40 times a minute.
+ */
 export const applyAsyncList = (r: DelegationAsyncListResponse | null | undefined) => {
-  $asyncDelegations.set(Array.isArray(r?.delegations) ? r!.delegations : [])
+  const next = Array.isArray(r?.delegations) ? r!.delegations : []
+
+  if (sameSnapshot($asyncDelegations.get(), next)) {
+    return
+  }
+
+  $asyncDelegations.set(next)
 }
 
 export const resetAsyncDelegations = () => $asyncDelegations.set([])

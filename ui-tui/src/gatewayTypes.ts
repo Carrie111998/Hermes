@@ -529,17 +529,24 @@ export interface DelegationPauseResponse {
 }
 
 // One async-delegation record as projected by `delegation.async_list`.
-// Mirrors tools/async_delegation.py list_async_delegations() (control
-// closures stripped server-side).
+// Mirrors tui_gateway/server.py `_project_async_delegation` — the registry
+// record is trimmed there (control closures, the dispatch context, the goals
+// list and the result payload never cross the wire on a 1.5s poll), so a
+// field added here must be added to that projection too.
 export interface AsyncDelegationRecord {
   completed_at?: null | number
   delegation_id: string
-  depth?: number
   dispatched_at?: number
   goal?: string
+  /** True when this one record stands for a whole fan-out batch. */
+  is_batch?: boolean
   model?: null | string
   role?: string
   status?: string
+  /** Live subagent ids this batch record covers — the panel drops the batch
+   * row while these children are still reporting, so N children never paint
+   * N+1 rows. Batch records only. */
+  subagent_ids?: string[]
 }
 
 export interface DelegationAsyncListResponse {

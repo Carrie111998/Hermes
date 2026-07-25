@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { isSessionBusyError, markSubmitting, submitPrompt, type SubmitPromptDeps } from '../app/submissionCore.js'
+import {
+  dispatchSteer,
+  isSessionBusyError,
+  markSubmitting,
+  type SteerDispatchDeps,
+  submitPrompt,
+  type SubmitPromptDeps
+} from '../app/submissionCore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
 
@@ -107,6 +114,126 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
     await Promise.resolve()
 
     expect(calls).toContain('prompt.submit')
+  })
+})
+
+// `@<id> text` never reaches prompt.submit, so dispatchSteer is the only place
+// that can put the steered text in the transcript. Before this, the session
+// showed `delivered → @b7c2` with no record of what was actually sent.
+describe('submissionCore.dispatchSteer — transcript record of steered text', () => {
+  function makeSteerDeps(request: ReturnType<typeof vi.fn>, over: Partial<SteerDispatchDeps> = {}): SteerDispatchDeps {
+    return {
+      appendMessage: vi.fn(),
+      clearIn: vi.fn(),
+      gw: { request } as unknown as GatewayClient,
+      pushHistory: vi.fn(),
+      sys: vi.fn(),
+      ...over
+    }
+  }
+
+  const settle = async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  }
+
+  it('echoes the steer body into the transcript for a live subagent', async () => {
+    const request = vi.fn().mockResolvedValue({ delivered: true })
+    const deps = makeSteerDeps(request)
+
+    const handled = dispatchSteer(
+      { body: 'check the retry budget', token: 'b7c2' },
+      { subagentId: 'sub-b7c2-full' },
+      '@b7c2 check the retry budget',
+      deps
+    )
+
+    expect(handled).toBe(true)
+    expect(deps.appendMessage).toHaveBeenCalledWith({ role: 'user', text: '@b7c2 check the retry budget' })
+    expect(request).toHaveBeenCalledWith('subagent.send', {
+      subagent_id: 'sub-b7c2-full',
+      text: 'check the retry budget'
+    })
+
+    await settle()
+    expect(deps.sys).toHaveBeenCalledWith('delivered → @b7c2')
+  })
+
+  it('routes a background delegation to delegation.send and still echoes', async () => {
+    const request = vi.fn().mockResolvedValue({ delivered: true })
+    const deps = makeSteerDeps(request)
+
+    const handled = dispatchSteer(
+      { body: 'stop after the current file', token: 'd41d' },
+      { delegationId: 'del-d41d-full', subagentId: null },
+      '@d41d stop after the current file',
+      deps
+    )
+
+    expect(handled).toBe(true)
+    expect(request).toHaveBeenCalledWith('delegation.send', {
+      delegation_id: 'del-d41d-full',
+      text: 'stop after the current file'
+    })
+    expect(deps.appendMessage).toHaveBeenCalledWith({ role: 'user', text: '@d41d stop after the current file' })
+
+    await settle()
+    expect(deps.sys).toHaveBeenCalledWith('delivered → @d41d')
+  })
+
+  it('prefers the live subagent when a token resolves on both sides', () => {
+    const request = vi.fn().mockResolvedValue({ delivered: true })
+    const deps = makeSteerDeps(request)
+
+    dispatchSteer({ body: 'ping', token: 'aa11' }, { delegationId: 'del-aa11', subagentId: 'sub-aa11' }, 'x', deps)
+
+    expect(request).toHaveBeenCalledWith('subagent.send', { subagent_id: 'sub-aa11', text: 'ping' })
+  })
+
+  it('keeps the echo but reports when the target already finished', async () => {
+    const request = vi.fn().mockResolvedValue({ delivered: false })
+    const deps = makeSteerDeps(request)
+
+    dispatchSteer({ body: 'too late', token: 'b7c2' }, { subagentId: 'sub-b7c2' }, '@b7c2 too late', deps)
+
+    await settle()
+    expect(deps.appendMessage).toHaveBeenCalledWith({ role: 'user', text: '@b7c2 too late' })
+    expect(deps.sys).toHaveBeenCalledWith('@b7c2 already finished')
+  })
+
+  it('reports an unreachable target when the RPC rejects', async () => {
+    const request = vi.fn().mockRejectedValue(new Error('closed'))
+    const deps = makeSteerDeps(request)
+
+    dispatchSteer({ body: 'hello', token: 'b7c2' }, { subagentId: 'sub-b7c2' }, '@b7c2 hello', deps)
+
+    await settle()
+    expect(deps.sys).toHaveBeenCalledWith('steer failed — @b7c2 unreachable')
+  })
+
+  it('returns false with NO side effects when the token matches nothing', () => {
+    const request = vi.fn()
+    const deps = makeSteerDeps(request)
+
+    // "@john ping me" must fall through to an ordinary prompt: no echo, no
+    // history push, and the composer must keep its text for submitPrompt.
+    const handled = dispatchSteer({ body: 'ping me', token: 'john' }, {}, '@john ping me', deps)
+
+    expect(handled).toBe(false)
+    expect(request).not.toHaveBeenCalled()
+    expect(deps.appendMessage).not.toHaveBeenCalled()
+    expect(deps.pushHistory).not.toHaveBeenCalled()
+    expect(deps.clearIn).not.toHaveBeenCalled()
+  })
+
+  it('pushes the expanded history entry and clears the composer before sending', () => {
+    const request = vi.fn().mockResolvedValue({ delivered: true })
+    const deps = makeSteerDeps(request)
+
+    dispatchSteer({ body: 'see [[paste]]', token: 'b7c2' }, { subagentId: 'sub-b7c2' }, '@b7c2 see EXPANDED', deps)
+
+    expect(deps.pushHistory).toHaveBeenCalledWith('@b7c2 see EXPANDED')
+    expect(deps.clearIn).toHaveBeenCalled()
   })
 })
 

@@ -236,9 +236,7 @@ const TranscriptPane = memo(function TranscriptPane({
                 />
               )}
 
-              {row.index === lastUserIdx && (
-                <LiveTodoPanel />
-              )}
+              {row.index === lastUserIdx && <LiveTodoPanel />}
             </Box>
           ))}
 
@@ -556,7 +554,7 @@ export const AppLayout = memo(function AppLayout({
         {!overlay.agents && !overlay.journey && (
           <>
             <PerfPane id="agents-panel">
-              <LiveAgentsPanel />
+              <LiveAgentsPanel cols={composer.cols} />
             </PerfPane>
 
             <PerfPane id="prompt">

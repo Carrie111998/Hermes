@@ -9724,19 +9724,56 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 
+def _project_async_delegation(record: dict) -> dict:
+    """One registry record trimmed to what the docked panel / overlay render.
+
+    Mirrors ``AsyncDelegationRecord`` in ui-tui/src/gatewayTypes.ts. Anything
+    added here must be added there too, and nothing large (context, goals,
+    results) belongs in a 1.5s poll.
+    """
+    projected = {
+        "completed_at": record.get("completed_at"),
+        "delegation_id": record.get("delegation_id"),
+        "dispatched_at": record.get("dispatched_at"),
+        "goal": record.get("goal"),
+        "model": record.get("model"),
+        "role": record.get("role"),
+        "status": record.get("status"),
+    }
+    if record.get("is_batch"):
+        projected["is_batch"] = True
+        # Join key for the panel's live-subagent dedupe; short id strings only.
+        projected["subagent_ids"] = [
+            s for s in (record.get("subagent_ids") or []) if isinstance(s, str)
+        ]
+    return projected
+
+
 @method("delegation.async_list")
 def _(rid, params: dict) -> dict:
     """Read projection of the async-delegation registry for the docked panel.
 
     Pure snapshot — no state change. ``list_async_delegations`` already strips
-    the non-serialisable ``interrupt_fn`` and returns running + recently
-    completed records; ``active_count`` is the header's "N running" figure.
+    the non-serialisable ``interrupt_fn``/``steer_fn`` and returns running +
+    recently completed records; ``active_count`` is the header's "N running".
+
+    The raw record also carries the whole dispatch spec — ``context`` (the
+    full prompt hand-off, unbounded), the per-child ``goals`` list, the
+    ``result``/``summary`` payload of finished runs and session routing keys.
+    The TUI paints five short cells and never reads any of it, but this poll
+    runs every 1.5s per client, so the record is projected down to the fields
+    the panel actually uses before it goes on the wire.
     """
     from tools.async_delegation import active_count, list_async_delegations
 
     return _ok(
         rid,
-        {"delegations": list_async_delegations(), "running": active_count()},
+        {
+            "delegations": [
+                _project_async_delegation(d) for d in list_async_delegations()
+            ],
+            "running": active_count(),
+        },
     )
 
 

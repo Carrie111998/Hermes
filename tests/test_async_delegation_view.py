@@ -306,3 +306,267 @@ def test_async_list_reflects_status_transition():
         assert result["delegations"][0]["status"] == "completed"
     finally:
         _clear_async_records()
+
+
+# ── delegation.async_list server-side projection ─────────────────────────
+
+
+def _register_fat_async(delegation_id: str, **extra):
+    """A registry record carrying the whole dispatch spec, as the real
+    ``dispatch_async_delegation*`` writers leave it."""
+    with async_delegation._records_lock:
+        record = {
+            "delegation_id": delegation_id,
+            "goal": "3 parallel subagents: a; b; c",
+            "goals": ["a" * 4000, "b", "c"],
+            "context": "x" * 20000,
+            "toolsets": ["files", "shell"],
+            "role": "fixer",
+            "model": "opus-4.8",
+            "session_key": "agent:main:deadbeef",
+            "origin_ui_session_id": "ui-1",
+            "origin_session_id": "sess-1",
+            "parent_session_id": "sess-0",
+            "status": "running",
+            "depth": 1,
+            "dispatched_at": 1.0,
+            "completed_at": None,
+            "result": {"results": [{"summary": "y" * 10000}]},
+            "summary": "z" * 10000,
+            "interrupt_fn": lambda: None,
+            "steer_fn": lambda _t: True,
+        }
+        record.update(extra)
+        async_delegation._records[delegation_id] = record
+
+
+# Every key the docked panel / overlay may read, mirroring
+# ``AsyncDelegationRecord`` in ui-tui/src/gatewayTypes.ts.
+_PANEL_KEYS = {
+    "completed_at",
+    "delegation_id",
+    "dispatched_at",
+    "goal",
+    "is_batch",
+    "model",
+    "role",
+    "status",
+    "subagent_ids",
+}
+
+
+def test_async_list_projects_away_the_dispatch_spec():
+    """The 1.5s poll must not carry context/goals/results/session routing."""
+    _clear_async_records()
+    try:
+        _register_fat_async("d-fat")
+
+        payload = server._methods["delegation.async_list"]("r", {})["result"]
+        record = payload["delegations"][0]
+
+        for leaked in (
+            "context",
+            "goals",
+            "toolsets",
+            "session_key",
+            "origin_ui_session_id",
+            "origin_session_id",
+            "parent_session_id",
+            "result",
+            "summary",
+            "interrupt_fn",
+            "steer_fn",
+        ):
+            assert leaked not in record, f"{leaked} still on the wire"
+
+        # What the panel does read survives intact.
+        assert record["delegation_id"] == "d-fat"
+        assert record["goal"] == "3 parallel subagents: a; b; c"
+        assert record["role"] == "fixer"
+        assert record["model"] == "opus-4.8"
+        assert record["status"] == "running"
+        assert record["dispatched_at"] == 1.0
+        assert record["completed_at"] is None
+    finally:
+        _clear_async_records()
+
+
+def test_async_list_projection_stays_within_the_declared_contract():
+    """No key may reach the client that gatewayTypes.ts does not declare."""
+    _clear_async_records()
+    try:
+        _register_fat_async("d-a")
+        _register_fat_async("d-b", is_batch=True, subagent_ids=["b7c2"])
+
+        payload = server._methods["delegation.async_list"]("r", {})["result"]
+
+        for record in payload["delegations"]:
+            assert set(record) <= _PANEL_KEYS, set(record) - _PANEL_KEYS
+    finally:
+        _clear_async_records()
+
+
+def test_async_list_projection_is_small():
+    """A fat record must not turn into a fat frame — size is the whole point."""
+    import json
+
+    _clear_async_records()
+    try:
+        _register_fat_async("d-fat")
+        payload = server._methods["delegation.async_list"]("r", {})["result"]
+
+        assert len(json.dumps(payload)) < 512
+    finally:
+        _clear_async_records()
+
+
+def test_async_list_carries_batch_join_keys_only_for_batches():
+    """The dedupe join key rides along for batches, and only for batches."""
+    _clear_async_records()
+    try:
+        _register_fat_async("d-plain")
+        _register_fat_async(
+            "d-batch", is_batch=True, subagent_ids=["b7c2", "a11a", "3f0d"]
+        )
+
+        payload = server._methods["delegation.async_list"]("r", {})["result"]
+        by_id = {d["delegation_id"]: d for d in payload["delegations"]}
+
+        assert by_id["d-batch"]["is_batch"] is True
+        assert by_id["d-batch"]["subagent_ids"] == ["b7c2", "a11a", "3f0d"]
+        # A single-subagent record has no children to dedupe against.
+        assert "subagent_ids" not in by_id["d-plain"]
+        assert "is_batch" not in by_id["d-plain"]
+    finally:
+        _clear_async_records()
+
+
+def test_async_list_batch_join_keys_are_strings_only():
+    """Ids come from child agents by getattr — nothing else may pass."""
+    _clear_async_records()
+    try:
+        _register_fat_async(
+            "d-batch", is_batch=True, subagent_ids=["b7c2", None, 7, "a11a"]
+        )
+
+        payload = server._methods["delegation.async_list"]("r", {})["result"]
+
+        assert payload["delegations"][0]["subagent_ids"] == ["b7c2", "a11a"]
+    finally:
+        _clear_async_records()
+
+
+def test_async_list_batch_without_children_projects_empty_list():
+    """A batch whose children never got ids still renders — as its own row."""
+    _clear_async_records()
+    try:
+        _register_fat_async("d-batch", is_batch=True, subagent_ids=[])
+
+        record = server._methods["delegation.async_list"]("r", {})["result"][
+            "delegations"
+        ][0]
+
+        assert record["is_batch"] is True
+        assert record["subagent_ids"] == []
+    finally:
+        _clear_async_records()
+
+
+def test_async_list_tolerates_a_record_missing_optional_fields():
+    """Partially-written records must not break the poll."""
+    _clear_async_records()
+    try:
+        with async_delegation._records_lock:
+            async_delegation._records["d-thin"] = {"delegation_id": "d-thin"}
+
+        record = server._methods["delegation.async_list"]("r", {})["result"][
+            "delegations"
+        ][0]
+
+        assert record["delegation_id"] == "d-thin"
+        assert record["status"] is None
+        assert record["goal"] is None
+    finally:
+        _clear_async_records()
+
+
+# ── batch dispatch records the ids of the children it stands for ─────────
+
+
+class _NoopExecutor:
+    """Keeps the dispatch bookkeeping under test without running the batch."""
+
+    def submit(self, *_args, **_kwargs):
+        return None
+
+
+def _dispatch_batch(monkeypatch, subagent_ids):
+    monkeypatch.setattr(async_delegation, "_persist_dispatch", lambda _r: None)
+    monkeypatch.setattr(
+        async_delegation, "_get_executor", lambda *_a, **_kw: _NoopExecutor()
+    )
+
+    return async_delegation.dispatch_async_delegation_batch(
+        goals=["a", "b"],
+        context=None,
+        toolsets=None,
+        role="fixer",
+        model="opus-4.8",
+        session_key="agent:main:deadbeef",
+        runner=lambda: {"results": []},
+        subagent_ids=subagent_ids,
+    )
+
+
+def test_batch_dispatch_records_its_child_subagent_ids(monkeypatch):
+    _clear_async_records()
+    try:
+        dispatch = _dispatch_batch(monkeypatch, ["b7c2", "a11a"])
+
+        assert dispatch["status"] == "dispatched"
+        record = async_delegation._records[dispatch["delegation_id"]]
+        assert record["is_batch"] is True
+        assert record["subagent_ids"] == ["b7c2", "a11a"]
+    finally:
+        _clear_async_records()
+
+
+def test_batch_dispatch_drops_non_string_child_ids(monkeypatch):
+    """``getattr(child, "_subagent_id", None)`` yields None for a child that
+    never got one — a None must never become a join key."""
+    _clear_async_records()
+    try:
+        dispatch = _dispatch_batch(monkeypatch, ["b7c2", None, 3])
+
+        record = async_delegation._records[dispatch["delegation_id"]]
+        assert record["subagent_ids"] == ["b7c2"]
+    finally:
+        _clear_async_records()
+
+
+def test_batch_dispatch_without_child_ids_defaults_to_empty(monkeypatch):
+    """Older callers pass nothing; the field must still exist and be a list."""
+    _clear_async_records()
+    try:
+        dispatch = _dispatch_batch(monkeypatch, None)
+
+        record = async_delegation._records[dispatch["delegation_id"]]
+        assert record["subagent_ids"] == []
+    finally:
+        _clear_async_records()
+
+
+def test_batch_dispatch_child_ids_reach_the_panel_payload(monkeypatch):
+    """End to end: dispatch → registry → RPC projection, one join key set."""
+    _clear_async_records()
+    try:
+        dispatch = _dispatch_batch(monkeypatch, ["b7c2", "a11a"])
+
+        payload = server._methods["delegation.async_list"]("r", {})["result"]
+        record = payload["delegations"][0]
+
+        assert record["delegation_id"] == dispatch["delegation_id"]
+        assert record["subagent_ids"] == ["b7c2", "a11a"]
+        assert "context" not in record
+    finally:
+        _clear_async_records()
