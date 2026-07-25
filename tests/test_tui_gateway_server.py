@@ -1356,6 +1356,78 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         assert captured["auto_restart"] is False
 
 
+
+def test_voice_record_start_stops_all_tts_before_recording(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        server, "_tts_stream_stop", lambda: calls.append("stop_streaming")
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=lambda **_kwargs: calls.append("start_recording"),
+            stop_continuous=lambda **_kwargs: None,
+            stop_speaking=lambda: calls.append("stop_fallback"),
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {}})
+
+    response = server.dispatch(
+        {
+            "id": "voice-record-stop-tts",
+            "method": "voice.record",
+            "params": {"action": "start"},
+        }
+    )
+
+    assert response["result"]["status"] == "recording"
+    assert calls == ["stop_streaming", "stop_fallback", "start_recording"]
+
+
+def test_voice_tts_binds_cancel_token_before_worker_start(monkeypatch):
+    captured: dict = {}
+
+    def fake_speak_text(text, stop_event=None, cancel_token=None):
+        captured["called"] = (text, stop_event, cancel_token)
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon, args=()):
+            captured.update(target=target, args=args, daemon=daemon)
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            capture_speech_token=lambda: 17,
+            speak_text=fake_speak_text,
+        ),
+    )
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    monkeypatch.setenv("HERMES_VOICE", "0")
+
+    response = server.dispatch(
+        {"id": "voice-tts-token", "method": "voice.tts", "params": {"text": "hi"}}
+    )
+
+    assert response["result"]["status"] == "speaking"
+    assert captured["daemon"] is True
+    assert captured["started"] is True
+    assert "called" not in captured
+
+    # The deferred worker keeps the token captured before Thread.start().
+    captured["target"](*captured["args"])
+    text, stop_event, cancel_token = captured["called"]
+    assert text == "hi"
+    assert isinstance(stop_event, threading.Event)
+    assert cancel_token == 17
+
+
 def test_prompt_submit_typed_stop_phrase_ends_voice_chat(monkeypatch):
     """Typed bare stop phrase during an active voice chat is consumed at the
     prompt.submit choke point: voice mode flips off, a distinct

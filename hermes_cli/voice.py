@@ -219,6 +219,7 @@ from tools.voice_mode import (
     is_voice_stop_phrase,
     is_whisper_hallucination,
     play_audio_file,
+    stop_playback,
     transcribe_recording,
 )
 
@@ -287,6 +288,9 @@ _recorder_lock = threading.Lock()
 _continuous_lock = threading.Lock()
 _continuous_active = False
 _continuous_stopping = False
+# A cancelled TTS worker can leave the active recorder intentionally paused.
+# Guarded by _continuous_lock; the next start_continuous call must re-arm it.
+_continuous_paused_for_tts = False
 _continuous_auto_restart: bool = True
 _continuous_recorder: Any = None
 
@@ -301,6 +305,9 @@ _continuous_recorder: Any = None
 # leak into the mic.
 _tts_playing = threading.Event()
 _tts_playing.set()  # initially "not playing"
+_tts_cancel_lock = threading.Lock()
+_tts_cancel_generation = 0
+_tts_active_stop_events: set[threading.Event] = set()
 
 # ── Silence-count hold (agent busy) ──────────────────────────────────
 # While the agent is mid-turn (thinking / tool-calling, possibly for
@@ -458,15 +465,17 @@ def start_continuous(
     global _continuous_active, _continuous_recorder, _continuous_auto_restart
     global _continuous_on_transcript, _continuous_on_status, _continuous_on_silent_limit
     global _continuous_on_stop_phrase
-    global _continuous_no_speech_count
+    global _continuous_no_speech_count, _continuous_paused_for_tts
 
     with _continuous_lock:
-        if _continuous_active:
+        if _continuous_active and not _continuous_paused_for_tts:
             _debug("start_continuous: already active — no-op")
             return True
         if _continuous_stopping:
             _debug("start_continuous: stop/transcribe in progress — busy")
             return False
+        # Fresh start, or a PTT re-arm after cancelled TTS paused the mic.
+        _continuous_paused_for_tts = False
         _continuous_active = True
         _continuous_auto_restart = auto_restart
         _continuous_on_transcript = on_transcript
@@ -531,11 +540,13 @@ def stop_continuous(force_transcribe: bool = False) -> None:
     global _continuous_on_status, _continuous_on_silent_limit
     global _continuous_on_stop_phrase
     global _continuous_recorder, _continuous_no_speech_count
+    global _continuous_paused_for_tts
 
     with _continuous_lock:
         if not _continuous_active:
             return
         _continuous_active = False
+        _continuous_paused_for_tts = False
         rec = _continuous_recorder
         on_status = _continuous_on_status
         on_transcript = _continuous_on_transcript
@@ -914,20 +925,67 @@ def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = Non
     return done_event.is_set()
 
 
-def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
-    """Synthesize ``text`` with the configured TTS provider and play it.
+def capture_speech_token() -> int:
+    """Capture the generation that a queued TTS worker belongs to."""
+    with _tts_cancel_lock:
+        return _tts_cancel_generation
 
-    Mirrors cli.py:_voice_speak_response exactly — same markdown strip
-    pipeline, same 4000-char cap, same explicit mp3 output path, same
-    MP3-over-OGG playback choice (afplay misbehaves on OGG), same cleanup
-    of both extensions. Keeping these in sync means a voice-mode TTS
-    session in the TUI sounds identical to one in the classic CLI.
 
-    While playback is in flight the module-level _tts_playing Event is
-    cleared so the continuous-recording loop knows to wait before
-    re-arming the mic (otherwise the agent's spoken reply feedback-loops
-    through the microphone and the agent ends up replying to itself).
+def _speech_was_cancelled(cancel_token: int) -> bool:
+    with _tts_cancel_lock:
+        return cancel_token != _tts_cancel_generation
+
+
+def stop_speaking() -> None:
+    """Cancel queued synthesis and interrupt every active one-shot playback."""
+    global _tts_cancel_generation
+
+    with _tts_cancel_lock:
+        _tts_cancel_generation += 1
+        stop_events = tuple(_tts_active_stop_events)
+    for event in stop_events:
+        event.set()
+
+    # A cancelled worker must not keep recorder hand-off waiting for playback.
+    _tts_playing.set()
+    try:
+        stop_playback()
+    except Exception as exc:
+        logger.warning("failed to stop voice playback: %s", exc)
+
+
+def _cleanup_tts_outputs(*paths: Optional[str]) -> None:
+    """Remove generated audio and messaging-side OGG conversions."""
+    cleanup_paths: set[str] = set()
+    for path in paths:
+        if not path:
+            continue
+        cleanup_paths.add(path)
+        cleanup_paths.add(path.rsplit(".", 1)[0] + ".ogg")
+
+    for path in cleanup_paths:
+        try:
+            if os.path.isfile(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def speak_text(
+    text: str,
+    stop_event: Optional[threading.Event] = None,
+    cancel_token: Optional[int] = None,
+) -> None:
+    """Synthesize ``text`` and play it unless the queued job is cancelled.
+
+    ``stop_event`` supports spoken barge-in during streaming playback.
+    ``cancel_token`` is captured before a daemon worker starts, closing the
+    queueing race where push-to-talk begins before that worker reaches this
+    function. Cancellation is re-checked after synthesis so slow providers
+    cannot start stale audio after recording has begun.
     """
+    global _continuous_paused_for_tts
+
     if not text or not text.strip():
         return
 
@@ -935,70 +993,84 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
     import tempfile
     import time
 
-    # Cancel any live capture before we open the speakers — otherwise the
-    # last ~200ms of the user's turn tail + the first syllables of our TTS
-    # both end up in the next recording window.  The continuous loop will
-    # re-arm itself after _tts_playing flips back (see _continuous_on_silence).
+    if cancel_token is None:
+        cancel_token = capture_speech_token()
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    # Atomically bind this worker to both its generation and stop event. If PTT
+    # won the race before registration, the stale generation rejects the job;
+    # if it wins after registration, stop_speaking sees and sets this event.
+    with _tts_cancel_lock:
+        if cancel_token != _tts_cancel_generation:
+            return
+        _tts_active_stop_events.add(stop_event)
+
     paused_recording = False
-    with _continuous_lock:
-        if (
-            _continuous_active
-            and _continuous_recorder is not None
-            and getattr(_continuous_recorder, "is_recording", False)
-        ):
-            try:
-                _continuous_recorder.cancel()
-                paused_recording = True
-            except Exception as e:
-                logger.warning("failed to pause recorder for TTS: %s", e)
-
-    _tts_playing.clear()
-    _debug(f"speak_text: TTS begin (paused_recording={paused_recording})")
-
     try:
+        if stop_event.is_set() or _speech_was_cancelled(cancel_token):
+            return
+
+        # Cancel live capture before opening the speakers. A cancellation after
+        # this point deliberately leaves the pause marker for start_continuous
+        # to re-arm instead of reporting "recording" with a dead microphone.
+        with _continuous_lock:
+            if (
+                _continuous_active
+                and _continuous_recorder is not None
+                and getattr(_continuous_recorder, "is_recording", False)
+            ):
+                try:
+                    _continuous_recorder.cancel()
+                    paused_recording = True
+                    _continuous_paused_for_tts = True
+                except Exception as exc:
+                    logger.warning("failed to pause recorder for TTS: %s", exc)
+
+        _tts_playing.clear()
+        _debug(f"speak_text: TTS begin (paused_recording={paused_recording})")
+
         from tools.tts_tool import text_to_speech_tool
 
-        # One dispatcher, zero parallel streaming implementations (#58930):
-        # when the configured provider has a chunked streamer registered in
-        # tools.tts_streaming, route the whole reply through the same
-        # stream_tts_to_speaker pipeline the CLI voice mode uses — audio
-        # starts on sentence one instead of after full synthesis. Falls
-        # through to the legacy whole-file path when no streamer resolves.
+        # Route providers with chunked synthesis through the shared streaming
+        # dispatcher while retaining the same external stop event.
         try:
             from tools.tts_streaming import resolve_streaming_provider
             from tools.tts_tool import _load_tts_config
 
             if resolve_streaming_provider(_load_tts_config()) is not None:
-                if _speak_text_streaming(text, stop_event):
+                streamed = _speak_text_streaming(text, stop_event)
+                if stop_event.is_set() or _speech_was_cancelled(cancel_token):
                     return
-        except Exception as e:
-            _debug(f"speak_text: streaming dispatch unavailable ({e}); using sync path")
+                if streamed:
+                    return
+        except Exception as exc:
+            _debug(
+                f"speak_text: streaming dispatch unavailable ({exc}); using sync path"
+            )
 
-        # Shared cleaner (tools/tts_text_normalize): markdown, emoji,
-        # <think> blocks, verifier footer, units, newline flattening.
+        if stop_event.is_set() or _speech_was_cancelled(cancel_token):
+            return
+
         try:
             from tools.tts_text_normalize import prepare_spoken_text
+
             tts_text = prepare_spoken_text(text, max_chars=4000)
         except Exception:
-            # Legacy fallback pipeline — keep speak_text best-effort.
             tts_text = text[:4000] if len(text) > 4000 else text
-            tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)             # fenced code blocks
-            tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)    # [text](url) → text
-            tts_text = re.sub(r'https?://\S+', '', tts_text)                # bare URLs
-            tts_text = re.sub(r'\*\*(.+?)\*\*', r'\1', tts_text)            # bold
-            tts_text = re.sub(r'\*(.+?)\*', r'\1', tts_text)                # italic
-            tts_text = re.sub(r'`(.+?)`', r'\1', tts_text)                  # inline code
-            tts_text = re.sub(r'^#+\s*', '', tts_text, flags=re.MULTILINE)  # headers
-            tts_text = re.sub(r'^\s*[-*]\s+', '', tts_text, flags=re.MULTILINE)  # list bullets
-            tts_text = re.sub(r'---+', '', tts_text)                        # horizontal rules
-            tts_text = re.sub(r'\n{3,}', '\n\n', tts_text)                  # excess newlines
-            tts_text = tts_text.strip()
+            tts_text = re.sub(r"```[\s\S]*?```", " ", tts_text)
+            tts_text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", tts_text)
+            tts_text = re.sub(r"https?://\S+", "", tts_text)
+            tts_text = re.sub(r"\*\*(.+?)\*\*", r"\1", tts_text)
+            tts_text = re.sub(r"\*(.+?)\*", r"\1", tts_text)
+            tts_text = re.sub(r"`(.+?)`", r"\1", tts_text)
+            tts_text = re.sub(r"^#+\s*", "", tts_text, flags=re.MULTILINE)
+            tts_text = re.sub(r"^\s*[-*]\s+", "", tts_text, flags=re.MULTILINE)
+            tts_text = re.sub(r"---+", "", tts_text)
+            tts_text = re.sub(r"\n{3,}", "\n\n", tts_text).strip()
         if not tts_text:
             return
 
-        # MP3 output path, pre-chosen so we can play the MP3 directly even
-        # when text_to_speech_tool auto-converts to OGG for messaging
-        # platforms.  afplay's OGG support is flaky, MP3 always works.
         os.makedirs(os.path.join(tempfile.gettempdir(), "hermes_voice"), exist_ok=True)
         mp3_path = os.path.join(
             tempfile.gettempdir(),
@@ -1013,39 +1085,38 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         except Exception:
             tts_result = {}
 
-        # Prefer the requested MP3 when the provider produced it. This
-        # preserves reliable local playback while still supporting providers
-        # that write to and return a different path.
         audio_path = mp3_path
         if not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) == 0:
             audio_path = tts_result.get("file_path") or mp3_path
 
+        if stop_event.is_set() or _speech_was_cancelled(cancel_token):
+            _debug("speak_text: cancelled before playback")
+            _cleanup_tts_outputs(mp3_path, audio_path)
+            return
+
         if os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
-            _debug(f"speak_text: playing {audio_path} ({os.path.getsize(audio_path)} bytes)")
+            _debug(
+                f"speak_text: playing {audio_path} ({os.path.getsize(audio_path)} bytes)"
+            )
             play_audio_file(audio_path)
-            try:
-                cleanup_paths = {audio_path, mp3_path}
-                for path in list(cleanup_paths):
-                    ogg_path = path.rsplit(".", 1)[0] + ".ogg"
-                    cleanup_paths.add(ogg_path)
-                for path in cleanup_paths:
-                    if os.path.isfile(path):
-                        os.unlink(path)
-            except OSError:
-                pass
+            _cleanup_tts_outputs(mp3_path, audio_path)
         else:
             _debug(f"speak_text: TTS tool produced no audio at {audio_path}")
-    except Exception as e:
-        logger.warning("Voice TTS playback failed: %s", e)
-        _debug(f"speak_text raised {type(e).__name__}: {e}")
+    except Exception as exc:
+        logger.warning("Voice TTS playback failed: %s", exc)
+        _debug(f"speak_text raised {type(exc).__name__}: {exc}")
     finally:
+        with _tts_cancel_lock:
+            _tts_active_stop_events.discard(stop_event)
         _tts_playing.set()
         _debug("speak_text: TTS done")
 
-        # Re-arm the mic so the user can answer without pressing Ctrl+B.
-        # Small delay lets the OS flush speaker output and afplay fully
-        # release the audio device before sounddevice re-opens the input.
-        if paused_recording:
+        # Only the still-current, un-interrupted worker may re-arm the mic.
+        if (
+            paused_recording
+            and not stop_event.is_set()
+            and not _speech_was_cancelled(cancel_token)
+        ):
             time.sleep(0.3)
             with _continuous_lock:
                 if _continuous_active and _continuous_recorder is not None:
@@ -1053,8 +1124,7 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
                         _continuous_recorder.start(
                             on_silence_stop=_continuous_on_silence
                         )
+                        _continuous_paused_for_tts = False
                         _debug("speak_text: recording resumed after TTS")
-                    except Exception as e:
-                        logger.warning(
-                            "failed to resume recorder after TTS: %s", e
-                        )
+                    except Exception as exc:
+                        logger.warning("failed to resume recorder after TTS: %s", exc)

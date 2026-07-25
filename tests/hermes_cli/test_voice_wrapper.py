@@ -11,6 +11,8 @@ stack.
 
 import os
 import sys
+import types
+from pathlib import Path
 
 import pytest
 
@@ -21,13 +23,17 @@ class TestPublicAPI:
     def test_gateway_symbols_importable(self):
         """Match the exact import shape tui_gateway/server.py uses."""
         from hermes_cli.voice import (
+            capture_speech_token,
             speak_text,
             start_recording,
             stop_and_transcribe,
+            stop_speaking,
         )
 
         assert callable(start_recording)
         assert callable(stop_and_transcribe)
+        assert callable(capture_speech_token)
+        assert callable(stop_speaking)
         assert callable(speak_text)
 
 
@@ -333,6 +339,76 @@ class TestSpeakTextGuards:
 
         assert voice.speak_text("Hello world") is None
         assert played == requested_paths
+
+
+@pytest.mark.real_audio_playback
+class TestSpeechCancellation:
+    def test_stop_invalidates_token_captured_before_worker_start(self, monkeypatch):
+        """A PTT stop after queueing but before thread start cancels the job."""
+        import hermes_cli.voice as voice
+
+        calls: list[str] = []
+        monkeypatch.setattr(voice, "_tts_cancel_generation", 0)
+        monkeypatch.setattr(voice, "stop_playback", lambda: calls.append("stop"))
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.tts_tool",
+            types.SimpleNamespace(
+                text_to_speech_tool=lambda **_kwargs: calls.append("synthesize")
+            ),
+        )
+
+        token = voice.capture_speech_token()
+        voice.stop_speaking()
+        voice.speak_text("queued speech", cancel_token=token)
+
+        assert calls == ["stop"]
+        assert voice._tts_cancel_generation == 1
+        assert voice._tts_playing.is_set()
+
+    def test_stop_during_synthesis_skips_playback_and_recorder_resume(
+        self, monkeypatch
+    ):
+        import hermes_cli.voice as voice
+
+        played: list[str] = []
+
+        class Recorder:
+            is_recording = True
+
+            def __init__(self):
+                self.cancel_count = 0
+                self.start_count = 0
+
+            def cancel(self):
+                self.cancel_count += 1
+
+            def start(self, **_kwargs):
+                self.start_count += 1
+
+        recorder = Recorder()
+        monkeypatch.setattr(voice, "_tts_cancel_generation", 0)
+        monkeypatch.setattr(voice, "_continuous_active", True)
+        monkeypatch.setattr(voice, "_continuous_recorder", recorder)
+        monkeypatch.setattr(voice, "stop_playback", lambda: None)
+        monkeypatch.setattr(voice, "play_audio_file", lambda path: played.append(path))
+
+        def fake_tts_tool(*, text, output_path):
+            Path(output_path).write_bytes(b"mp3")
+            voice.stop_speaking()
+
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.tts_tool",
+            types.SimpleNamespace(text_to_speech_tool=fake_tts_tool),
+        )
+
+        voice.speak_text("hello")
+
+        assert recorder.cancel_count == 1
+        assert recorder.start_count == 0
+        assert played == []
+        assert voice._tts_playing.is_set()
 
 
 class TestContinuousAPI:

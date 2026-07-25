@@ -9434,12 +9434,9 @@ def _run_prompt_submit(
                 and _voice_tts_enabled()
             ):
                 try:
-                    spoken = raw
-                    # Barge-aware: spoken interruptions must cut this
-                    # fallback playback too, not just the streaming path.
-                    threading.Thread(
-                        target=_speak_text_with_barge, args=(spoken,), daemon=True
-                    ).start()
+                    # Capture the cancellation generation before the daemon
+                    # worker starts, while retaining spoken barge-in support.
+                    _spawn_voice_tts(raw)
                 except ImportError:
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
@@ -12259,16 +12256,15 @@ def _full_duplex_listener() -> None:
             _fd_listener_active = False
 
 
-def _speak_text_with_barge(text: str) -> None:
-    """Speak *text* via hermes_cli.voice.speak_text with spoken barge-in.
+def _spawn_voice_tts(text: str) -> None:
+    """Bind a cancellation generation before queueing fallback TTS."""
+    from hermes_cli.voice import capture_speech_token
 
-    The fallback whole-reply path (streaming couldn't start) and the
-    ``voice.tts`` RPC previously called ``speak_text`` bare — speech over
-    those paths was UNINTERRUPTIBLE by voice. The full-duplex agent-turn
-    listener covers this path too: the (stop, done) pair is registered in
-    ``_fd_speak_pipelines`` so the listener can cut the private stop event
-    on a playback trip and keeps listening while this speak is pending.
-    """
+    _speak_text_with_barge(text, cancel_token=capture_speech_token())
+
+
+def _speak_text_with_barge(text: str, cancel_token: Optional[int] = None) -> None:
+    """Speak *text* with both queue-safe cancellation and spoken barge-in."""
     from hermes_cli.voice import speak_text
 
     stop = threading.Event()
@@ -12278,10 +12274,13 @@ def _speak_text_with_barge(text: str) -> None:
 
     def _speak():
         try:
-            speak_text(text, stop)
+            speak_text(text, stop, cancel_token=cancel_token)
         except TypeError:
-            # Older wrapper without the stop_event parameter.
-            speak_text(text)
+            # Keep external wrappers that only accept the stop event usable.
+            try:
+                speak_text(text, stop)
+            except TypeError:
+                speak_text(text)
         finally:
             done.set()
             with _fd_listener_lock:
@@ -12794,7 +12793,21 @@ def _(rid, params: dict) -> dict:
                 global _voice_event_sid, _voice_wake_owner
                 _voice_event_sid = params.get("session_id") or _voice_event_sid
 
+            # Hand microphone ownership to recording before start_continuous.
+            # This stops the turn-stream pipeline and invalidates fallback TTS
+            # even if its daemon worker has not started yet.
+            _tts_stream_stop()
             from hermes_cli.voice import start_continuous
+
+            try:
+                from hermes_cli.voice import stop_speaking
+
+                stop_speaking()
+            except Exception as exc:
+                logger.warning(
+                    "voice: failed to stop fallback TTS before recording: %s",
+                    exc,
+                )
 
             # Register the agent-busy probe so the shared voice wrapper can
             # hold the no-speech counter during long agent turns (item:
@@ -12924,13 +12937,7 @@ def _(rid, params: dict) -> dict:
     if not text:
         return _err(rid, 4020, "text required")
     try:
-        # Import check up front so a missing voice module still returns the
-        # documented 5026 instead of failing silently in the thread.
-        import hermes_cli.voice  # noqa: F401
-
-        threading.Thread(
-            target=_speak_text_with_barge, args=(text,), daemon=True
-        ).start()
+        _spawn_voice_tts(text)
         return _ok(rid, {"status": "speaking"})
     except ImportError:
         return _err(rid, 5026, "voice module not available")
