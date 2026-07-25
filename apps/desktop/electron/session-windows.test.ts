@@ -6,7 +6,8 @@ import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
-  instanceWindowBounds
+  instanceWindowBounds,
+  wireChatWindowFullscreenState
 } from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
@@ -217,4 +218,26 @@ test('chatWindowWebPreferences allows autoplay so wake-started voice speaks its 
   const prefs = chatWindowWebPreferences('/tmp/preload.cjs')
 
   assert.equal(prefs.autoplayPolicy, 'no-user-gesture-required')
+})
+
+test('wireChatWindowFullscreenState reports fullscreen against the window that changed', () => {
+  // Regression: the pop-out builder wired `() => sendWindowStateChanged(true)`
+  // with no target, so both events fell through to the `mainWindow` default and
+  // a fullscreen pop-out rewrote the PRIMARY window's titlebar inset.
+  const win = makeFakeWindow()
+  const sent: { isFullscreen: boolean; target: unknown }[] = []
+
+  wireChatWindowFullscreenState(win, (isFullscreen, target) => {
+    sent.push({ isFullscreen, target })
+  })
+
+  win.emit('enter-full-screen')
+  win.emit('leave-full-screen')
+
+  assert.deepEqual(
+    sent.map(entry => entry.isFullscreen),
+    [true, false]
+  )
+  assert.equal(sent[0].target, win, 'enter-full-screen names its own window, not the primary')
+  assert.equal(sent[1].target, win, 'leave-full-screen names its own window, not the primary')
 })
