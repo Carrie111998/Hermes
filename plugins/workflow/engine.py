@@ -2813,29 +2813,6 @@ class WorkflowEngine:
                             print(f"   ✓ {nid} completed ({elapsed:.0f}s)"
                                   f" [validation error: {e}]")
 
-                    # ── Review states (kanban has 'review' status) ──
-                    elif card_status_lower == "review":
-                        # Card moved to review — check if this node has a review pipeline
-                        body = self.get_card_body(state.kanban_card_id)
-                        node = workflow.nodes.get(nid)
-                        if node and node.reviews:
-                            # This node has a review pipeline — mark as done so DAG
-                            # advances to the reviewer node. The reviewer node is
-                            # already in the DAG with depends_on pointing to this node.
-                            state.status = "done"
-                            state.completed_at = datetime.now(timezone.utc).isoformat()
-                            state.result = body
-                            results[nid] = "done"
-                            print(f"   🔍 {nid} → REVIEW — marking done, DAG advances to {node.reviews[0]}")
-                            pending.discard(nid)
-                        else:
-                            # No review pipeline — use legacy LOOP convention
-                            state.status = "revision_needed"
-                            state.error = f"Review returned: {body[:100]}"
-                            results[nid] = "revision_needed"
-                            print(f"   🔄 {nid} returned REVIEW — checking for loop")
-                            pending.discard(nid)
-
                     # ── Blocked states ──
                     elif card_status_lower in ("blocked",):
                         body = self.get_card_body(state.kanban_card_id)
@@ -2893,7 +2870,7 @@ class WorkflowEngine:
                                 print(f"   🚫 {nid} BLOCKED (reviewer) — enriching {reviewer_for} with feedback")
                                 pending.discard(nid)
                                 
-                                # Enrich upstream card with review feedback
+                                # Enrich upstream card with review feedback and reset to ready
                                 if upstream_state.kanban_card_id:
                                     try:
                                         from hermes_cli import kanban_db as kb
@@ -2901,11 +2878,16 @@ class WorkflowEngine:
                                             existing_body = kb.get_task(conn, upstream_state.kanban_card_id).body or ""
                                             feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
                                             new_body = existing_body + feedback
+                                            # Move from done back to ready with enriched feedback
                                             conn.execute(
-                                                "UPDATE tasks SET body = ?, status = 'ready' WHERE id = ?",
+                                                "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL WHERE id = ?",
                                                 (new_body, upstream_state.kanban_card_id)
                                             )
                                             conn.commit()
+                                        # Reset upstream state for re-work
+                                        upstream_state.status = "ready"
+                                        upstream_state.completed_at = None
+                                        upstream_state.result = None
                                         print(f"   ↩  {reviewer_for} enriched with feedback, reset to ready")
                                     except Exception as e:
                                         print(f"   ⚠  Failed to enrich upstream card: {e}")
