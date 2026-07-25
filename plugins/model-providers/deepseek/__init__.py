@@ -72,12 +72,14 @@ class DeepSeekProfile(ProviderProfile):
         # Effort mapping. Pass low/medium/high through; stronger levels → max.
         # When no effort is set we omit reasoning_effort so DeepSeek applies
         # its server default (currently high).
+        # "minimal" is normalised to "low" for parity with CustomProfile's
+        # _NORMALIZE_EFFORT — see plugins/model-providers/custom/__init__.py.
         if isinstance(reasoning_config, dict):
             effort = (reasoning_config.get("effort") or "").strip().lower()
             if effort in {"xhigh", "max", "ultra"}:
                 top_level["reasoning_effort"] = "max"
-            elif effort in {"low", "medium", "high"}:
-                top_level["reasoning_effort"] = effort
+            elif effort in {"low", "medium", "high", "minimal"}:
+                top_level["reasoning_effort"] = "low" if effort == "minimal" else effort
 
         return extra_body, top_level
 
