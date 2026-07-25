@@ -34,10 +34,15 @@ import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
-import { waitForHermesReady } from './backend-health'
+import {
+  isAuthRejectionError,
+  isReauthRequiredError,
+  makeReauthRequiredError,
+  waitForHermesReady
+} from './backend-health'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { shouldLatchBackendStartFailure } from './backend-start-failure'
+import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -119,7 +124,12 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
-import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './native-auth-decisions'
+import {
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveOauthRestAuth,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -1016,6 +1026,13 @@ let bootstrapFailure = null
 // Latched non-bootstrap backend spawn failure — stops getConnection() from
 // respawning hermes serve backend children in a tight loop while boot is broken.
 let backendStartFailure = null
+// Latched remote reauth failure: a confirmed 401/403 from a remote/oauth boot
+// means the session is expired and only a user sign-in can fix it. Retrying just
+// re-emits running:true on every getConnection/api call, flickering the "Sign
+// in" overlay out from under the user. Latch it (separately from the transient-
+// safe backendStartFailure) so subsequent startHermes() calls re-throw without
+// re-driving the boot UI. Cleared by the sign-in / reset / apply-config paths.
+let remoteReauthFailure = null
 // Active first-launch install, so the renderer's Cancel button (and app quit)
 // can abort the in-flight install.sh/ps1 instead of leaving it running.
 let bootstrapAbortController = null
@@ -4815,12 +4832,51 @@ function closePreviewWatchers() {
   }
 }
 
-async function waitForHermes(baseUrl, token, signal?) {
+// Build the /api/health readiness probe for a connection's authMode. Local and
+// unknown modes stay credential-free; oauth/token remotes probe WITH the same
+// credentials the real REST calls use, so an auth-gated /api/health can't 401-
+// loop the boot. A confirmed 401/403 becomes the terminal reauth error (only
+// for oauth, whose recovery is a sign-in; a bad static token surfaces as a plain
+// connectivity failure). Mirrors mintGatewayWsTicket's bearer-or-cookie choice.
+function buildReadinessHealthProbe(baseUrl, token, authMode) {
+  if (authMode !== 'oauth' && authMode !== 'token') {
+    return fetchPublicJson
+  }
+
+  return async (url, options: any = {}) => {
+    const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl).catch(() => null) : null
+    const auth = resolveReadinessProbeAuth(authMode, nativeAt)
+
+    try {
+      switch (auth.kind) {
+        case 'bearer':
+          return await fetchJson(url, null, { ...options, bearer: auth.token })
+        case 'cookie':
+          return await fetchJsonViaOauthSession(url, options)
+        case 'token':
+          return await fetchJson(url, token, options)
+        default:
+          return await fetchPublicJson(url, options)
+      }
+    } catch (error) {
+      // Only an oauth session lapse maps to "sign in again"; a rejected static
+      // token is a connectivity/config error, so leave it to the poll/timeout.
+      if (authMode === 'oauth' && isAuthRejectionError(error)) {
+        throw makeReauthRequiredError(error)
+      }
+
+      throw error
+    }
+  }
+}
+
+async function waitForHermes(baseUrl, token, signal?, authMode?) {
   return waitForHermesReady(baseUrl, {
     token,
     signal,
     fetchPublicJson,
-    fetchJson
+    fetchJson,
+    probeHealth: buildReadinessHealthProbe(baseUrl, token, authMode)
   })
 }
 
@@ -7536,6 +7592,7 @@ function stopBackendChild(child) {
 // switch / crash recovery), which still resets boot progress + reloads.
 function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
+  remoteReauthFailure = null
   remoteLiveness.clear()
   const hermesProcess = backendConnectionState.invalidate()
   stopBackendChild(hermesProcess)
@@ -7736,7 +7793,7 @@ async function spawnPoolBackend(profile, entry) {
   const remote = await resolveRemoteBackend(profile)
 
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token)
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
 
     return {
       ...remote,
@@ -7928,6 +7985,13 @@ async function startHermes() {
     throw backendStartFailure
   }
 
+  // A latched remote reauth failure re-throws before any advanceBootProgress,
+  // so a repeated getConnection/api call can't re-emit running:true and flicker
+  // the "Sign in" overlay. Cleared by the sign-in / reset / apply-config paths.
+  if (remoteReauthFailure) {
+    throw remoteReauthFailure
+  }
+
   // E2E: simulate a boot failure without breaking the real backend. The boot
   // progresses a few steps, then fails with the given error message.
   if (BOOT_FAKE_ERROR) {
@@ -7954,7 +8018,7 @@ async function startHermes() {
   const connectionPromise = (async () => {
     const connectRemote = async remote => {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token)
+      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -8189,6 +8253,13 @@ async function startHermes() {
     // "Sign out & sign in" reload, and the wake-recovery revalidate path.
     if (shouldLatchBackendStartFailure({ attemptedRemote })) {
       backendStartFailure = error instanceof Error ? error : new Error(message)
+    }
+
+    // A confirmed remote reauth rejection latches separately: it stays retryable
+    // for transient remote failures (above), but an expired session must stop
+    // re-driving the boot UI until the user signs in.
+    if (shouldLatchRemoteReauthFailure({ attemptedRemote, isReauth: isReauthRequiredError(error) })) {
+      remoteReauthFailure = error instanceof Error ? error : new Error(message)
     }
 
     updateBootProgress(
@@ -8994,6 +9065,7 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   await teardownPrimaryBackendAndWait()
   bootstrapFailure = null
   backendStartFailure = null
+  remoteReauthFailure = null
   getFirstRunSetupGate().resetForRetry()
   resetBootstrapSnapshot()
 
@@ -9016,6 +9088,7 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
 
   bootstrapFailure = null
   backendStartFailure = null
+  remoteReauthFailure = null
   getFirstRunSetupGate().resetForRepair()
   resetHermesConnection()
 
@@ -9126,6 +9199,12 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
 
       _storeNativeTokens(baseUrl, tokens)
 
+      // A confirmed sign-in is a real recovery — drop the reauth latch (it lives
+      // in the main process and survives the "Sign in" overlay's renderer-only
+      // reload) so the post-login boot re-probes the fresh session. Cleared only
+      // on success, so a cancelled/failed login leaves the overlay actionable.
+      remoteReauthFailure = null
+
       return { ok: true, baseUrl, connected: true }
     } catch (error) {
       rememberLog(
@@ -9141,7 +9220,14 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
   // Legacy embedded-webview cookie flow.
   await openOauthLoginWindow(baseUrl)
 
-  return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
+  const connected = await hasOauthSessionCookie(baseUrl)
+
+  // Same as the native path: clear the latch only once a session is confirmed.
+  if (connected) {
+    remoteReauthFailure = null
+  }
+
+  return { ok: true, baseUrl, connected }
 })
 ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
   const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''
@@ -9211,6 +9297,9 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
           // A remote connection bypasses local runtime/bootstrap failures. Clear
           // the local-install latch so unsupported/failure escape paths can re-home.
           bootstrapFailure = null
+          // Applying a new/edited gateway is a deliberate recovery — drop any
+          // reauth latch so the freshly-configured session boots.
+          remoteReauthFailure = null
         },
         mode: config.mode,
         notifyConnectionApplied: sendConnectionApplied,

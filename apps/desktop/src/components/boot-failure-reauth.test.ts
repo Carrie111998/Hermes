@@ -105,6 +105,16 @@ describe('isRemoteReauthError', () => {
     expect(isRemoteReauthError('OAuth: please sign in')).toBe(true)
   })
 
+  it('recognizes the exact readiness-probe reauth message the backend emits', () => {
+    // Cross-module contract: this literal MUST stay in sync with
+    // REMOTE_SESSION_EXPIRED_MESSAGE in electron/backend-health.ts. When the
+    // authed /api/health probe hits a confirmed 401, that message becomes
+    // boot.error, and the overlay's Sign In branch depends on it classifying here.
+    expect(isRemoteReauthError('Your remote gateway session has expired. Open Settings → Gateway and sign in again.')).toBe(
+      true
+    )
+  })
+
   it('ignores non-auth boot errors and nullish', () => {
     expect(isRemoteReauthError('Hermes background process exited during startup.')).toBe(false)
     expect(isRemoteReauthError(null)).toBe(false)

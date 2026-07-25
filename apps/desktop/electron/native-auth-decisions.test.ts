@@ -10,7 +10,12 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './native-auth-decisions'
+import {
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveOauthRestAuth,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
 
 // --- 1. body encoding (guards the double-JSON.stringify 422) ---
 
@@ -65,4 +70,25 @@ test('resolveOauthRestAuth falls back to cookie when there is no native token', 
   assert.deepEqual(resolveOauthRestAuth(undefined), { kind: 'cookie' })
   // Empty string is not a usable bearer — must fall back, not send "Bearer ".
   assert.deepEqual(resolveOauthRestAuth(''), { kind: 'cookie' })
+})
+
+// --- 4. readiness-probe auth selection (guards the boot 401 no_cookie loop) ---
+
+test('resolveReadinessProbeAuth uses the oauth bearer-or-cookie choice for oauth remotes', () => {
+  // The exact bug: a credential-free /api/health probe 401s ("no_cookie") on a
+  // gated gateway and loops boot forever. An oauth remote must probe WITH creds.
+  assert.deepEqual(resolveReadinessProbeAuth('oauth', 'bearer-abc'), { kind: 'bearer', token: 'bearer-abc' })
+  assert.deepEqual(resolveReadinessProbeAuth('oauth', null), { kind: 'cookie' })
+})
+
+test('resolveReadinessProbeAuth sends the static session token for token remotes', () => {
+  assert.deepEqual(resolveReadinessProbeAuth('token', null), { kind: 'token' })
+  // Token mode never consults the native bearer.
+  assert.deepEqual(resolveReadinessProbeAuth('token', 'ignored'), { kind: 'token' })
+})
+
+test('resolveReadinessProbeAuth stays credential-free for local/unknown modes', () => {
+  assert.deepEqual(resolveReadinessProbeAuth('local', null), { kind: 'public' })
+  assert.deepEqual(resolveReadinessProbeAuth(undefined, null), { kind: 'public' })
+  assert.deepEqual(resolveReadinessProbeAuth(null, 'has-token'), { kind: 'public' })
 })

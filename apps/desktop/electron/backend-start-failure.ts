@@ -39,3 +39,24 @@ export interface BackendStartFailureContext {
 export function shouldLatchBackendStartFailure(context: BackendStartFailureContext): boolean {
   return !context.attemptedRemote
 }
+
+export interface RemoteReauthFailureContext {
+  /** True when the failed boot was resolving/dialing a remote (or cloud) backend. */
+  attemptedRemote: boolean
+  /** True when the failure is a confirmed reauth-shaped rejection (401/403). */
+  isReauth: boolean
+}
+
+/**
+ * Whether a remote boot failure should latch into a SEPARATE `remoteReauthFailure`
+ * latch. Distinct from `shouldLatchBackendStartFailure`: a transient remote
+ * failure must still self-heal (never latch), but a confirmed reauth rejection
+ * cannot be fixed by retrying — only by the user signing in. Latching it stops
+ * startHermes() from re-driving the boot UI on every subsequent getConnection/
+ * api call, which otherwise re-emits running:true and flickers the "Sign in"
+ * recovery overlay out from under the user. Recovery paths (sign-in, reset,
+ * apply-config) clear the latch so the next boot re-probes the fresh session.
+ */
+export function shouldLatchRemoteReauthFailure(context: RemoteReauthFailureContext): boolean {
+  return context.attemptedRemote && context.isReauth
+}

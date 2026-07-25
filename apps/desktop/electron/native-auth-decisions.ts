@@ -60,3 +60,29 @@ export function resolveOauthRestAuth(nativeAccessToken: string | null | undefine
 
   return { kind: 'cookie' }
 }
+
+export type ReadinessProbeAuth = OauthRestAuth | { kind: 'public' } | { kind: 'token' }
+
+/**
+ * Decide how the boot readiness probe (`GET /api/health`) authenticates for a
+ * connection's authMode. A credential-free probe 401s ("no_cookie") on any
+ * gateway that also gates /api/health, looping boot forever even seconds after
+ * a successful sign-in — so oauth/token remotes must probe WITH credentials:
+ * oauth reuses the bearer-or-cookie choice (resolveOauthRestAuth), token sends
+ * its static session token, and local/unknown stays public. `nativeAccessToken`
+ * is ensureNativeAccessToken's result (only consulted for oauth).
+ */
+export function resolveReadinessProbeAuth(
+  authMode: string | null | undefined,
+  nativeAccessToken: string | null | undefined
+): ReadinessProbeAuth {
+  if (authMode === 'oauth') {
+    return resolveOauthRestAuth(nativeAccessToken)
+  }
+
+  if (authMode === 'token') {
+    return { kind: 'token' }
+  }
+
+  return { kind: 'public' }
+}
