@@ -62,7 +62,7 @@ customer data. Repeated identical results are marked as duplicates.
 
 ## Daily Discord Summary
 
-A separate daily reporting automation reads the previous 24 hours of private
+A separate daily reporting job reads the previous 24 hours of private
 structured reports and sends one bounded Bulgarian summary to the explicitly
 configured internal Discord target. It uses:
 
@@ -97,9 +97,21 @@ deploy, change runtime state, or retry failed delivery.
 
 ## Scheduler Contract
 
-The scheduler runs every three hours with bounded timing jitter. Its only job
-is to invoke the exact deterministic candidate command and report the generated
-status.
+On the canonical macOS host, `launchd` runs the deterministic wrapper every
+three hours:
+
+```bash
+python3 scripts/skyai_v2_upstream_sync_scheduler.py --job sync
+```
+
+The wrapper invokes the same candidate rail and sends exactly one bounded
+result through `hermes send` to the configured internal Discord channel. A
+separate `launchd` calendar job runs the same wrapper with `--job daily` at
+09:00 Europe/Sofia. These jobs do not invoke Codex or an LLM and therefore do
+not create Codex tasks/threads.
+
+Delivery is attempted once. A delivery failure is logged and is not retried in
+a loop. The next normal scheduled execution remains eligible to run.
 
 The scheduler is not authority for:
 
