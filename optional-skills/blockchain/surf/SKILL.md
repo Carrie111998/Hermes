@@ -4,7 +4,7 @@ description: Query crypto prices, wallets, DeFi, and on-chain data.
 version: 0.0.6
 author: Sean Zhao (HappySean2845), Surf (asksurf.ai)
 license: MIT
-platforms: [linux, macos]
+platforms: [linux, macos, windows]
 required_environment_variables:
   - name: SURF_API_KEY
     prompt: Surf API key
@@ -41,8 +41,8 @@ full access.
 ## Prerequisites
 
 - **Install** the CLI once via the official guide:
-  https://agents.asksurf.ai/docs/cli/introduction (installs to `~/.local/bin/surf`;
-  ensure it is on `PATH`).
+  https://agents.asksurf.ai/docs/cli/introduction (Linux, macOS, and Windows builds
+  for amd64/arm64; ensure the installed `surf` binary is on `PATH`).
 - **API key is optional** — without one you get 30 free credits/day. For full
   access the user signs up at https://agents.asksurf.ai and runs
   `surf auth --api-key <key>` in their own terminal. Never handle the key in chat.
