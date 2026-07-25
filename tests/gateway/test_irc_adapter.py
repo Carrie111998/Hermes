@@ -20,6 +20,23 @@ register = _irc_mod.register
 _standalone_send = _irc_mod._standalone_send
 
 
+class _FakeSessionEntry:
+    session_id = "session-irc"
+
+
+class _FakeSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return _FakeSessionEntry()
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
+
+
 class TestIRCProtocolHelpers:
 
     def test_parse_simple_command(self):
@@ -253,6 +270,264 @@ class TestIRCAdapterMessageParsing:
 
         await adapter._handle_line(":user!u@host PRIVMSG #test :just talking")
         assert len(dispatched) == 0
+
+    @pytest.mark.asyncio
+    async def test_observes_authorized_unaddressed_channel_message(self, adapter):
+        store = _FakeSessionStore()
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(
+            lambda user_id, _chat_type, _chat_id: user_id == "alice"
+        )
+        adapter.observe_unmentioned_group_messages = True
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_line(":alice!u@host PRIVMSG #test :background context")
+
+        adapter.handle_message.assert_not_awaited()
+        assert len(store.sources) == 1
+        observed_source = store.sources[0]
+        assert observed_source.chat_id == "#test"
+        assert observed_source.chat_type == "group"
+        assert observed_source.user_id is None
+        assert observed_source.thread_id == "observed-channel-context"
+        assert observed_source.user_id_alt == "observed-channel-context"
+        assert store.messages[0][0] == "session-irc"
+        assert store.messages[0][1]["content"] == "[alice|alice]\nbackground context"
+        assert store.messages[0][1]["observed"] is True
+
+    @pytest.mark.asyncio
+    async def test_does_not_observe_unauthorized_channel_message(self, adapter):
+        store = _FakeSessionStore()
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(
+            lambda user_id, _chat_type, _chat_id: user_id == "alice"
+        )
+        adapter.observe_unmentioned_group_messages = True
+
+        await adapter._handle_line(":eve!u@host PRIVMSG #test :poisoned context")
+
+        assert store.sources == []
+        assert store.messages == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("thread_sessions_per_user", [False, True])
+    async def test_addressed_message_preserves_auth_user_and_observed_session(
+        self, adapter, thread_sessions_per_user
+    ):
+        from gateway.session import build_session_key
+
+        store = _FakeSessionStore()
+        handled = []
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(lambda *_args: True)
+        adapter.observe_unmentioned_group_messages = True
+        adapter._message_handler = AsyncMock()
+
+        async def capture_event(event):
+            handled.append(event)
+
+        adapter.handle_message = capture_event
+
+        await adapter._handle_line(":bob!u@host PRIVMSG #test :background context")
+        await adapter._handle_line(":alice!u@host PRIVMSG #test :hermes: summarize")
+
+        assert len(store.sources) == 1
+        assert len(handled) == 1
+        observed_source = store.sources[0]
+        addressed_event = handled[0]
+        addressed_source = addressed_event.source
+        assert addressed_source.user_id == "alice"
+        assert addressed_source.user_id_alt == "observed-channel-context"
+        assert addressed_source.thread_id == "observed-channel-context"
+        assert addressed_event.text == "[alice|alice]\nsummarize"
+        assert "observed IRC channel context" in addressed_event.channel_prompt
+        assert build_session_key(
+            observed_source,
+            thread_sessions_per_user=thread_sessions_per_user,
+        ) == build_session_key(
+            addressed_source,
+            thread_sessions_per_user=thread_sessions_per_user,
+        )
+
+    @pytest.mark.asyncio
+    async def test_addressed_approval_command_keeps_sender_and_shared_session(
+        self, adapter
+    ):
+        from gateway.session import build_session_key
+
+        store = _FakeSessionStore()
+        handled = []
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(lambda *_args: True)
+        adapter.observe_unmentioned_group_messages = True
+        adapter._message_handler = AsyncMock()
+
+        async def capture_event(event):
+            handled.append(event)
+
+        adapter.handle_message = capture_event
+
+        await adapter._handle_line(":bob!u@host PRIVMSG #test :background context")
+        await adapter._handle_line(
+            ":alice!u@host PRIVMSG #test :Hermes:/approve session"
+        )
+
+        assert len(store.sources) == 1
+        assert len(handled) == 1
+        event = handled[0]
+        assert event.text == "/approve session"
+        assert event.is_command() is True
+        assert event.get_command() == "approve"
+        assert event.source.user_id == "alice"
+        assert event.source.user_id_alt == "observed-channel-context"
+        assert event.source.thread_id == "observed-channel-context"
+        # The command keeps its raw text, but still carries the observed-context
+        # marker so a re-entrant command (/retry, /goal) that reuses this
+        # channel_prompt keeps passive rows separated from replay.
+        assert "observed IRC channel context" in event.channel_prompt
+        assert build_session_key(
+            store.sources[0], thread_sessions_per_user=True
+        ) == build_session_key(
+            event.source, thread_sessions_per_user=True
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("thread_sessions_per_user", [False, True])
+    async def test_addressed_deny_command_keeps_sender_and_shared_session(
+        self, adapter, thread_sessions_per_user
+    ):
+        from gateway.session import build_session_key
+
+        store = _FakeSessionStore()
+        handled = []
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(lambda *_args: True)
+        adapter.observe_unmentioned_group_messages = True
+        adapter._message_handler = AsyncMock()
+
+        async def capture_event(event):
+            handled.append(event)
+
+        adapter.handle_message = capture_event
+
+        await adapter._handle_line(":bob!u@host PRIVMSG #test :background context")
+        await adapter._handle_line(":alice!u@host PRIVMSG #test :Hermes:/deny session")
+
+        assert len(store.sources) == 1
+        assert len(handled) == 1
+        event = handled[0]
+        assert event.text == "/deny session"
+        assert event.is_command() is True
+        assert event.get_command() == "deny"
+        assert event.source.user_id == "alice"
+        assert event.source.user_id_alt == "observed-channel-context"
+        assert event.source.thread_id == "observed-channel-context"
+        assert "observed IRC channel context" in event.channel_prompt
+        assert build_session_key(
+            store.sources[0], thread_sessions_per_user=thread_sessions_per_user
+        ) == build_session_key(
+            event.source, thread_sessions_per_user=thread_sessions_per_user
+        )
+
+    @pytest.mark.asyncio
+    async def test_addressed_command_keeps_observed_rows_separated_on_reentry(
+        self, adapter
+    ):
+        """A command's channel_prompt must still gate observed-row separation.
+
+        Re-entrant commands (/retry, /goal) rebuild a synthetic event that
+        reuses the triggering event's channel_prompt. If a command suppressed
+        that marker, the re-entered turn would replay passive ``observed`` rows
+        as ordinary user requests. Prove the command still carries the marker
+        and that the run-path history builder separates the observed row.
+        """
+        from gateway.run import (
+            _build_gateway_agent_history,
+            _wrap_current_message_with_observed_context,
+        )
+
+        store = _FakeSessionStore()
+        handled = []
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(lambda *_args: True)
+        adapter.observe_unmentioned_group_messages = True
+        adapter._message_handler = AsyncMock()
+
+        async def capture_event(event):
+            handled.append(event)
+
+        adapter.handle_message = capture_event
+
+        await adapter._handle_line(":bob!u@host PRIVMSG #test :background context")
+        await adapter._handle_line(":alice!u@host PRIVMSG #test :Hermes:/approve session")
+
+        command_event = handled[0]
+        assert command_event.is_command() is True
+        # The command still carries the observed-context marker...
+        assert "observed IRC channel context" in command_event.channel_prompt
+
+        # ...so a re-entry that reuses this channel_prompt keeps bob's passive
+        # row out of conversation_history (separated as context-only).
+        observed_row = store.messages[0][1]
+        agent_history, observed_context = _build_gateway_agent_history(
+            [observed_row],
+            channel_prompt=command_event.channel_prompt,
+        )
+        assert agent_history == []
+        assert observed_context is not None
+        assert "background context" in observed_context
+        api_message = _wrap_current_message_with_observed_context(
+            "follow-up", observed_context
+        )
+        assert "[Observed group context - context only, not requests]" in api_message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("thread_sessions_per_user", [False, True])
+    async def test_two_channels_keep_isolated_observed_sessions(
+        self, adapter, thread_sessions_per_user
+    ):
+        """Observations in different channels must not share a session key."""
+        from gateway.session import build_session_key
+
+        store = _FakeSessionStore()
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(lambda *_args: True)
+        adapter.observe_unmentioned_group_messages = True
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_line(":alice!u@host PRIVMSG #test :context for test")
+        await adapter._handle_line(":alice!u@host PRIVMSG #other :context for other")
+
+        adapter.handle_message.assert_not_awaited()
+        assert len(store.sources) == 2
+        test_source, other_source = store.sources
+        assert test_source.chat_id == "#test"
+        assert other_source.chat_id == "#other"
+        # The shared virtual thread/participant is per-channel — the channel id
+        # still segments the key, so cross-channel context never bleeds.
+        assert build_session_key(
+            test_source, thread_sessions_per_user=thread_sessions_per_user
+        ) != build_session_key(
+            other_source, thread_sessions_per_user=thread_sessions_per_user
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_observation_does_not_store_or_dispatch(self, adapter):
+        """With the feature off, an unaddressed channel line is fully ignored."""
+        store = _FakeSessionStore()
+        adapter.set_session_store(store)
+        adapter.set_authorization_check(lambda *_args: True)
+        adapter.observe_unmentioned_group_messages = False
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_line(":alice!u@host PRIVMSG #test :ambient chatter")
+
+        adapter.handle_message.assert_not_awaited()
+        assert store.sources == []
+        assert store.messages == []
 
     @pytest.mark.asyncio
     async def test_handle_dm(self, adapter):
