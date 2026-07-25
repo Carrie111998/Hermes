@@ -74,12 +74,11 @@ class TestNousFallbackLocalAvailability:
             return_value={},
         ):
             agent._try_activate_fallback(None)
-        key = (
-            "nous",
-            "anthropic/claude-sonnet-4.6",
-            "",
-        )
-        assert key in getattr(agent, "_unavailable_fallback_keys", set())
+        keys = getattr(agent, "_unavailable_fallback_keys", set())
+        # Key is a 4-tuple: (provider, model, base_url, api_mode)
+        assert any(
+            k[:2] == ("nous", "anthropic/claude-sonnet-4.6") for k in keys
+        ), f"Expected nous entry in unavailable keys, got {keys}"
 
     def test_present_nous_token_allows_activation(self):
         """Nous is considered when token material exists."""
