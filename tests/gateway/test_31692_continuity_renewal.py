@@ -367,6 +367,18 @@ def test_runner_defers_for_alias_route_and_session_lease(tmp_path, monkeypatch):
     )
     assert runner._renewal_should_defer("route-a", "shared") is True
 
+    monkeypatch.setattr(
+        runner,
+        "_resolve_session_agent_runtime",
+        MagicMock(
+            return_value=(
+                "default",
+                {"api_mode": "chat_completions", "provider": "moa"},
+            )
+        ),
+    )
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
     monkeypatch.setattr(runner, "_get_proxy_url", MagicMock(return_value="http://proxy"))
     assert runner._renewal_should_defer("route-a", "shared") is True
 

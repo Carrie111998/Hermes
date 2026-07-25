@@ -5983,7 +5983,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
                 return True
-            if runtime.get("api_mode") == "codex_app_server":
+            if (
+                runtime.get("api_mode") == "codex_app_server"
+                or runtime.get("provider") == "moa"
+                or runtime.get("requested_provider") == "moa"
+            ):
                 return True
         return False
 
