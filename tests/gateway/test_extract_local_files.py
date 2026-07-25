@@ -60,7 +60,7 @@ class TestBasicDetection:
         assert "~/photos/cat.jpg" not in cleaned
 
     def test_video_extensions(self):
-        for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+        for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"):
             text = f"Video at /tmp/clip{ext} here"
             paths, _ = _extract(text)
             assert len(paths) == 1, f"Failed for {ext}"

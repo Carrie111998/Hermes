@@ -644,6 +644,35 @@ class TestMediaExtensionAllowlistParity:
         # that motivated the bug are present in the shared set.
         for ext in (".md", ".json", ".yaml", ".yml", ".xml", ".html", ".htm"):
             assert ext in MEDIA_DELIVERY_EXTS
+        # Video partition must match gateway peer `_VIDEO_EXTS` (incl. .3gp).
+        for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"):
+            assert ext in MEDIA_DELIVERY_EXTS
+
+    def test_3gp_media_tag_extracts_and_is_stripped(self):
+        """`.3gp` drifted out of MEDIA_DELIVERY_EXTS while remaining in
+        dispatch `_VIDEO_EXTS` — MEDIA:/clip.3gp was neither extracted nor
+        cleaned, so the tag leaked as plain text and the file was not sent.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        # Cleanup recognizes .3gp even when the path does not exist.
+        path = "/tmp/clip.3gp"
+        text = f"Clip: MEDIA:{path}"
+        stripped = MEDIA_TAG_CLEANUP_RE.sub("", text).strip()
+        assert "MEDIA:" not in stripped
+        assert path not in stripped
+        assert "Clip:" in stripped
+
+        # extract_media delivers when the file exists.
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "clip.3gp"
+            p.write_bytes(b"\x00" * 16)
+            media, cleaned = BasePlatformAdapter.extract_media(f"MEDIA:{p}")
+            assert media == [(str(p), False)]
+            assert "MEDIA:" not in cleaned
 
     def test_unknown_extension_not_black_holed_by_cleanup(self):
         """A MEDIA: tag with an unknown extension is NOT stripped from the
