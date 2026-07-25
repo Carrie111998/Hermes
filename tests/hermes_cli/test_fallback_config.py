@@ -40,16 +40,57 @@ class TestResolveEntryApiKey:
         assert resolve_entry_api_key(entry) == "env-key"
 
 
-class TestGetFallbackChainOrder:
-    def test_get_fallback_chain_preserves_configured_order(self, monkeypatch):
+class TestGetFallbackChainRanking:
+    def test_disabled_fleet_preserves_configured_chain_without_ranking(self, monkeypatch):
         from hermes_cli.fallback_config import get_fallback_chain
 
         monkeypatch.setattr(
             "gateway.fleet_safety.selector.rank_fallback_chain",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("ordinary fallbacks must not invoke fleet reranking")
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("disabled Fleet must not invoke the ranker")
             ),
         )
+        configured = [
+            {"provider": "paid-provider", "model": "paid-model"},
+            {"provider": "safe-provider", "model": "safe-model"},
+        ]
+
+        assert get_fallback_chain(
+            {
+                "fleet": {"enabled": False},
+                "fallback_providers": configured,
+            }
+        ) == configured
+
+    def test_enabled_fleet_ranker_exception_fails_closed(self, monkeypatch):
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        monkeypatch.setattr(
+            "gateway.fleet_safety.selector.rank_fallback_chain",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("safety engine unavailable")
+            ),
+        )
+
+        assert get_fallback_chain(
+            {
+                "fleet": {"enabled": True},
+                "fallback_providers": [
+                    {"provider": "paid-provider", "model": "paid-model"},
+                ],
+            }
+        ) == []
+
+    def test_get_fallback_chain_routes_through_rank_fallback_chain(self, monkeypatch):
+        from hermes_cli.fallback_config import get_fallback_chain
+        from gateway.fleet_safety.usage_verify import VerifiedUsage
+
+        def fake_verified(provider, **kwargs):
+            if provider == "chatgpt_codex":
+                return VerifiedUsage(provider=provider, used_percent=15.0, source="cache", stale=False, suspect=False)
+            return VerifiedUsage(provider=provider, used_percent=50.0, source="cache", stale=False, suspect=False)
+
+        monkeypatch.setattr("gateway.fleet_safety.selector.verified_usage_for", fake_verified)
         cfg = {
             "fleet": {"enabled": True},
             "fallback_providers": [
@@ -58,7 +99,6 @@ class TestGetFallbackChainOrder:
             ]
         }
         chain = get_fallback_chain(cfg)
-        assert [entry["provider"] for entry in chain] == [
-            "grok",
-            "chatgpt_codex",
-        ]
+        assert len(chain) >= 2
+        # codex has higher headroom (~85%) than grok (~50%) so rank_fallback_chain orders codex first
+        assert chain[0]["provider"] == "chatgpt_codex"
