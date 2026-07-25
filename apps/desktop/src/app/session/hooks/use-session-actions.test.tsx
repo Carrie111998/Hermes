@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
@@ -587,6 +588,8 @@ function ResumeHarness({
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
 
+  const stateRef = sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>())
+
   const actions = useSessionActions({
     activeSessionId: null,
     activeSessionIdRef: ref<string | null>(null),
@@ -601,10 +604,15 @@ function ResumeHarness({
     runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>()),
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
-    sessionStateByRuntimeIdRef: sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>()),
+    sessionStateByRuntimeIdRef: stateRef,
     syncSessionStateToView: vi.fn(),
     updateSessionState: (sessionId, updater) => {
-      const next = updater({} as ClientSessionState)
+      // Mirror use-session-state-cache: the updater sees the runtime's CURRENT
+      // state (resume's staleness guard reads `busyRevision` off it) and the
+      // result is committed back, so a later read observes what was written.
+      const next = updater(stateRef.current.get(sessionId) ?? ({} as ClientSessionState))
+
+      stateRef.current.set(sessionId, next)
       onStateUpdate?.(sessionId, next)
 
       return next
@@ -930,6 +938,7 @@ describe('resumeSession failure recovery', () => {
           'runtime-stale',
           {
             awaitingResponse: false,
+            busyRevision: 0,
             branch: '',
             busy: false,
             cwd: '',
@@ -980,6 +989,147 @@ describe('resumeSession failure recovery', () => {
     expect(sessionStateByRuntimeIdRef.current.has('runtime-stale')).toBe(false)
     expect($activeSessionId.get()).toBe('runtime-1')
     expect($messages.get().length).toBe(1)
+  })
+})
+
+// ── Resume must not rewind a turn that started while it was in flight ────────
+// #70449: viewing a session cleared its "working" indicator. `busy` is written
+// from a resume snapshot, and the snapshot is as old as the RPC round trip, so
+// a turn that starts during that window is described as idle by a response
+// that was already stale on arrival. `busyRevision` (bumped by the state cache
+// on every committed `busy` change) lets resume tell the two apart.
+//
+// The pair matters: the first test proves a live turn survives, the SECOND
+// proves the guard still lets a genuinely-finished session go idle. A fix that
+// simply refused to ever clear `busy` would pass the first and fail the second.
+describe('resumeSession busy ordering guard', () => {
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setResumeFailedSessionId(null)
+    setMessages([])
+    setSessions([])
+    vi.restoreAllMocks()
+  })
+
+  function warmCache(state: Partial<ClientSessionState>) {
+    const runtimeIdByStoredSessionIdRef = {
+      current: new Map([['stored-1', 'runtime-live']])
+    } satisfies MutableRefObject<Map<string, string>>
+
+    const sessionStateByRuntimeIdRef = {
+      current: new Map([
+        [
+          'runtime-live',
+          {
+            ...clientState('stored-1'),
+            messages: [{ id: 'm1', parts: [{ text: 'earlier turn', type: 'text' }], role: 'user' }] as ChatMessage[],
+            ...state
+          }
+        ]
+      ])
+    } satisfies MutableRefObject<Map<string, ClientSessionState>>
+
+    return { runtimeIdByStoredSessionIdRef, sessionStateByRuntimeIdRef }
+  }
+
+  async function runResume(
+    requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>,
+    options: {
+      runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
+      sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
+    }
+  ): Promise<void> {
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={r => (resume = r)} requestGateway={requestGateway} {...options} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-1', true)
+  }
+
+  it('keeps a turn that started while session.activate was in flight', async () => {
+    const refs = warmCache({ busy: false, busyRevision: 3 })
+
+    setSessions([storedSession({ message_count: 2 })])
+    vi.mocked(getSessionMessages).mockResolvedValue({
+      messages: [{ content: 'earlier turn', role: 'user', timestamp: 1 }],
+      session_id: 'stored-1'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        // The user sent a prompt (or a stream event arrived) between this RPC
+        // going out and its reply landing — exactly the window the bug lives in.
+        const live = refs.sessionStateByRuntimeIdRef.current.get('runtime-live')!
+
+        // What a real prompt submit / stream event writes: the flags plus the
+        // counter bump the state cache applies on any committed `busy` change.
+        refs.sessionStateByRuntimeIdRef.current.set('runtime-live', {
+          ...live,
+          awaitingResponse: true,
+          busy: true,
+          busyRevision: live.busyRevision + 1
+        })
+
+        // The backend answered before that turn existed, so it reports idle.
+        return { info: {}, messages: [], running: false, session_id: 'runtime-live' } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, refs)
+
+    const committed = refs.sessionStateByRuntimeIdRef.current.get('runtime-live')!
+
+    // Before the guard this was false: the stale snapshot won and the sidebar
+    // dropped the session out of $workingSessionIds mid-turn.
+    expect(committed.busy).toBe(true)
+    expect(committed.awaitingResponse).toBe(true)
+  })
+
+  it('still clears busy when no live event overtook the snapshot', async () => {
+    // Cache says busy from a turn that has since finished; nothing moves the
+    // counter during the RPC, so the snapshot is the freshest thing we have.
+    const refs = warmCache({ awaitingResponse: true, busy: true, busyRevision: 3 })
+
+    setSessions([storedSession({ message_count: 2 })])
+    vi.mocked(getSessionMessages).mockResolvedValue({
+      messages: [{ content: 'earlier turn', role: 'user', timestamp: 1 }],
+      session_id: 'stored-1'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return { info: {}, messages: [], running: false, session_id: 'runtime-live' } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, refs)
+
+    const committed = refs.sessionStateByRuntimeIdRef.current.get('runtime-live')!
+
+    expect(committed.busy).toBe(false)
+    expect(committed.awaitingResponse).toBe(false)
+  })
+
+  it('applies a running snapshot when the counter is untouched', async () => {
+    const refs = warmCache({ busy: false, busyRevision: 3 })
+
+    setSessions([storedSession({ message_count: 2 })])
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return { info: {}, messages: [], running: true, session_id: 'runtime-live' } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, refs)
+
+    expect(refs.sessionStateByRuntimeIdRef.current.get('runtime-live')!.busy).toBe(true)
   })
 })
 

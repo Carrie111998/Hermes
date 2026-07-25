@@ -692,6 +692,11 @@ export function useSessionActions({
           setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
 
+          // Read before the RPC goes out: anything that changes `busy` while we
+          // await moves this counter, which is how the handler below knows its
+          // snapshot has been overtaken by a live event (#70449).
+          const busyRevisionAtActivate = cachedViewState.busyRevision
+
           try {
             let activated: SessionResumeResponse | null = null
 
@@ -739,12 +744,26 @@ export function useSessionActions({
 
               const running = Boolean(activated.running ?? cachedViewState.busy)
 
+              // `activated.running` describes the session as it was when the
+              // backend built the response. If a live event moved `busy` while
+              // that was in flight, the live flag is newer — trust it instead
+              // (#70449). This decides the transcript merge below as well as
+              // the state write: treating a live turn as idle would let the
+              // persisted transcript overwrite a prompt that has not been
+              // persisted yet.
+              const liveDuringActivate = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
+
+              const effectiveRunning =
+                liveDuringActivate && liveDuringActivate.busyRevision !== busyRevisionAtActivate
+                  ? liveDuringActivate.busy
+                  : running
+
               // While idle, the persisted REST transcript is the display
               // authority: session.activate returns the runtime's compressed
               // context projection, not necessarily the complete conversation.
               // During a live turn, keep the runtime/cache projection so an
               // accepted but not-yet-persisted prompt or stream is never lost.
-              if (!running && persistedTranscriptPromise) {
+              if (!effectiveRunning && persistedTranscriptPromise) {
                 const persisted = await persistedTranscriptPromise
 
                 if (!isCurrentResume()) {
@@ -765,19 +784,30 @@ export function useSessionActions({
 
               const activatedState = updateSessionState(
                 cachedRuntimeId,
-                state => ({
-                  ...state,
-                  ...(runtimeInfo ?? {}),
-                  messages: activatedMessages,
-                  busy: running,
-                  awaitingResponse: running
-                }),
+                state => {
+                  // A live event moved `busy` while session.activate was in
+                  // flight, so `running` describes the session as it was BEFORE
+                  // that event. Keep what the UI already knows rather than
+                  // rewinding it — the common case is a turn that started
+                  // during the round trip and would otherwise look idle.
+                  // Re-checked here rather than reused from above: awaiting the
+                  // persisted transcript opens a second window for a live event.
+                  const overtaken = state.busyRevision !== busyRevisionAtActivate
+
+                  return {
+                    ...state,
+                    ...(runtimeInfo ?? {}),
+                    messages: activatedMessages,
+                    busy: overtaken ? state.busy : effectiveRunning,
+                    awaitingResponse: overtaken ? state.awaitingResponse : effectiveRunning
+                  }
+                },
                 storedSessionId
               )
 
-              busyRef.current = running
-              setBusy(running)
-              setAwaitingResponse(running)
+              busyRef.current = activatedState.busy
+              setBusy(activatedState.busy)
+              setAwaitingResponse(activatedState.awaitingResponse)
               syncSessionStateToView(cachedRuntimeId, activatedState)
 
               return
@@ -860,6 +890,18 @@ export function useSessionActions({
         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
         const prefetchPromise = watchWindow ? null : getSessionMessages(storedSessionId, sessionProfile)
 
+        // A cold resume does not know its runtime id until the response lands,
+        // so capture which runtime (if any) currently backs this stored session
+        // along with its busy counter. The guard below only applies when the
+        // backend hands back that SAME runtime — a genuinely fresh runtime id
+        // has no live state to protect (#70449).
+        const mappedRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ?? null
+        const priorState = mappedRuntimeId ? sessionStateByRuntimeIdRef.current.get(mappedRuntimeId) : undefined
+        // Only trust the mapping when the runtime still claims this stored id —
+        // the same staleness check getRuntimeIdForStoredSession makes.
+        const priorRuntimeId = priorState?.storedSessionId === storedSessionId ? mappedRuntimeId : null
+        const busyRevisionAtResume = priorRuntimeId ? (priorState?.busyRevision ?? null) : null
+
         const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
@@ -934,6 +976,19 @@ export function useSessionActions({
               })()
 
         resumedRunning = Boolean((resumed as { running?: boolean }).running)
+
+        // Same runtime came back, but its busy counter moved while we awaited:
+        // a stream event or prompt submit landed after this snapshot was taken,
+        // so the snapshot's `running` is stale. Defer to the live flag — every
+        // downstream use below (journal recovery, state write, busy setters)
+        // reads `resumedRunning`, so correcting it here corrects all of them.
+        if (priorRuntimeId && priorRuntimeId === resumed.session_id && busyRevisionAtResume !== null) {
+          const live = sessionStateByRuntimeIdRef.current.get(resumed.session_id)
+
+          if (live && live.busyRevision !== busyRevisionAtResume) {
+            resumedRunning = live.busy
+          }
+        }
 
         // Crash-survivable turn progress: fold a journaled in-flight tail
         // (persisted by use-session-state-cache while the turn streamed;

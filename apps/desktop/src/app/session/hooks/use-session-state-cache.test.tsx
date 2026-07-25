@@ -493,3 +493,64 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
     expect(cache.getRuntimeIdForStoredSession('stored-A')).toBeNull()
   })
 })
+
+describe('useSessionStateCache — busy revision counter (#70449)', () => {
+  // Session resume reads `busy` from an RPC snapshot and applies it after the
+  // round trip. This counter is how resume distinguishes "nothing happened
+  // while I waited" from "a turn started while I waited" — so the cache must
+  // move it on every committed busy change, no matter which writer caused it,
+  // and must NOT move it for unrelated writes (or every resume would look
+  // overtaken and could never clear a finished turn).
+  it('bumps only when busy actually changes', () => {
+    let cache!: Cache
+    render(<Harness activeSessionId={null} onReady={value => (cache = value)} selectedStoredSessionId={null} />)
+
+    act(() => {
+      cache.ensureSessionState('runtime-A', 'stored-A')
+    })
+
+    const initial = cache.sessionStateByRuntimeIdRef.current.get('runtime-A')!.busyRevision
+
+    act(() => {
+      cache.updateSessionState('runtime-A', state => ({ ...state, busy: true }))
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')!.busyRevision).toBe(initial + 1)
+
+    // Unrelated write: same busy value, counter must hold still.
+    act(() => {
+      cache.updateSessionState('runtime-A', state => ({ ...state, cwd: '/tmp' }))
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')!.busyRevision).toBe(initial + 1)
+
+    // Turn ends: busy goes the other way, which counts too.
+    act(() => {
+      cache.updateSessionState('runtime-A', state => ({ ...state, busy: false }))
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')!.busyRevision).toBe(initial + 2)
+  })
+
+  it('ignores a busyRevision an updater tries to set itself', () => {
+    // The counter is the cache's to own: a caller writing it (by spreading a
+    // stale snapshot back in, say) would defeat the staleness check.
+    let cache!: Cache
+    render(<Harness activeSessionId={null} onReady={value => (cache = value)} selectedStoredSessionId={null} />)
+
+    act(() => {
+      cache.ensureSessionState('runtime-A', 'stored-A')
+      cache.updateSessionState('runtime-A', state => ({ ...state, busy: true, busyRevision: 99 }))
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')!.busyRevision).toBe(1)
+
+    // Also overruled when `busy` holds steady — the counter must not drift on
+    // a write that says nothing about whether a turn is running.
+    act(() => {
+      cache.updateSessionState('runtime-A', state => ({ ...state, busyRevision: 0 }))
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-A')!.busyRevision).toBe(1)
+  })
+})
