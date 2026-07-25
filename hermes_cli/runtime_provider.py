@@ -1035,11 +1035,13 @@ def _resolve_named_custom_runtime(
             return pool_result
         _da_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
         _da_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
+        _da_is_ollama       = base_url_host_matches(base_url, "ollama.com")
         api_key_candidates = [
             (explicit_api_key or "").strip(),
-            # Gate env key fallbacks on authoritative hosts (#28660)
+            # Gate env key fallbacks on authoritative hosts (#28660 / GHSA-76xc-57q6-vm5m)
             (_getenv("OPENAI_API_KEY", "").strip()     if _da_is_openai_url else ""),
             (_getenv("OPENROUTER_API_KEY", "").strip() if _da_is_openrouter  else ""),
+            (_getenv("OLLAMA_API_KEY", "").strip()     if _da_is_ollama      else ""),
             # Bonus (#28660): derive `<VENDOR>_API_KEY` from the host so users
             # who set DEEPSEEK_API_KEY / GROQ_API_KEY / MISTRAL_API_KEY get the
             # intuitive match without configuring `custom_providers` first.
@@ -1094,14 +1096,18 @@ def _resolve_named_custom_runtime(
 
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
     _cp_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
+    _cp_is_ollama       = base_url_host_matches(base_url, "ollama.com")
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
         _getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
         # Gate provider env keys on their authoritative hosts — sending
         # OPENAI_API_KEY to a local-llm endpoint leaks credentials (#28660).
+        # OLLAMA_API_KEY mirrors the openrouter custom-endpoint host-gate
+        # (GHSA-76xc-57q6-vm5m) so named custom + direct-alias paths agree.
         (_getenv("OPENAI_API_KEY", "").strip()     if _cp_is_openai_url  else ""),
         (_getenv("OPENROUTER_API_KEY", "").strip() if _cp_is_openrouter  else ""),
+        (_getenv("OLLAMA_API_KEY", "").strip()     if _cp_is_ollama      else ""),
         # Bonus (#28660): derive `<VENDOR>_API_KEY` from the host as a final
         # fallback when key_env wasn't set explicitly.
         _host_derived_api_key(base_url),

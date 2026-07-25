@@ -1637,7 +1637,11 @@ def switch_model(
                     base_url = runtime["base_url"]
                 if runtime.get("api_mode"):
                     api_mode = runtime.get("api_mode", "")
-            except Exception:
+            except Exception as e:
+                logger.debug(
+                    "direct-alias credential re-resolve failed for %s: %s",
+                    resolved_alias, e,
+                )
                 api_key = "no-key-required"
 
     # --- Resolve api_mode from the final (provider, base_url) before validation ---

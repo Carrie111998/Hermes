@@ -461,6 +461,56 @@ class TestSwitchModelDirectAliasOverride:
         assert result.api_key == host_key
         assert result.base_url.rstrip("/") == alias_url.rstrip("/")
 
+    def test_switch_model_alias_ollama_uses_env_key_not_foreign(self, monkeypatch):
+        """Real resolve path: drop OpenRouter session key, pick OLLAMA_API_KEY."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        foreign = "sk-or-v1-FOREIGN-OPENROUTER-KEY"
+        alias_url = "https://ollama.com/v1"
+        monkeypatch.setenv("OLLAMA_API_KEY", "ollama-cloud-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.setattr(
+            ms,
+            "DIRECT_ALIASES",
+            {"qwen": DirectAlias("qwen3.5:397b", "custom", alias_url)},
+        )
+        monkeypatch.setattr(
+            ms,
+            "resolve_alias",
+            lambda raw, prov: ("custom", "qwen3.5:397b", "qwen"),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_model_config",
+            lambda: {"provider": "openrouter", "base_url": "", "default": "old"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **kw: {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.opencode_model_api_mode",
+            lambda *a, **kw: "chat_completions",
+        )
+
+        result = ms.switch_model(
+            "qwen",
+            "openrouter",
+            "old-model",
+            current_api_key=foreign,
+            current_base_url="https://openrouter.ai/api/v1",
+        )
+        assert result.success
+        assert result.api_key != foreign
+        assert result.api_key == "ollama-cloud-key"
+        assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+
 
 # ---------------------------------------------------------------------------
 # CLI state update: requested_provider persistence
