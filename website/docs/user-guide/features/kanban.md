@@ -242,6 +242,15 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+The gateway's notification watcher has separate ownership. Connected gateways
+contend for a machine-global notifier lease; only the lease owner polls board
+DBs and delivers subscribed completion/block events. Non-owners wait without
+opening boards for notification polling. This means
+`kanban.dispatch_in_gateway: false` disables worker dispatch without disabling
+notifications, and a notifier-only gateway can take over the lease if the
+current owner exits. Subscriptions still route through their stamped
+`notifier_profile`, including the default adapter for `notifier_profile=default`.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
@@ -860,7 +869,9 @@ Workers receive `$HERMES_TENANT` and namespace their memory writes by prefix. Th
 
 ## Gateway notifications
 
-When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
+When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The machine-global notifier lease owner polls `task_events` every few seconds and delivers one message per notifiable event (`completed`, `blocked`, `scheduled`, `gave_up`, `crashed`, `timed_out`) to that chat. Notifier ownership is independent from `kanban.dispatch_in_gateway`; non-owner gateways wait for the lease without polling board DBs. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
+
+`blocked`/`needs_input` and `scheduled` notifications preserve the complete decision brief from the event reason. Fields such as `ASK`, `WHY GATED`, `SCOPE`, `ROLLBACK`, `REPLY`, and a scheduled `WINDOW` are delivered without notifier-side truncation; the platform adapter handles any transport-specific chunking. For non-push clients such as the API server, the equivalent session wake must succeed before the notification cursor advances. A failed wake rewinds the claim for retry, and a scheduled event without a session target remains unseen rather than being marked delivered.
 
 You can manage subscriptions explicitly from the CLI — useful when a script / cron job wants to notify a chat it didn't originate from:
 

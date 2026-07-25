@@ -15,6 +15,36 @@ def _make_runner():
     return runner
 
 
+def test_non_owner_notifier_does_not_poll_board_dbs(monkeypatch):
+    """A gateway that loses the notifier lease must not fan out over boards."""
+    runner = _make_runner()
+    sleep_calls = []
+
+    async def _stop_after_lease_retry(delay):
+        sleep_calls.append(delay)
+        if delay != 5:
+            runner._running = False
+
+    with (
+        patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(None, "contended"),
+        ) as acquire_lock,
+        patch("hermes_cli.kanban_db.list_boards") as list_boards,
+        patch("hermes_cli.kanban_db.connect") as connect,
+        patch(
+            "gateway.kanban_watchers.asyncio.sleep",
+            side_effect=_stop_after_lease_retry,
+        ),
+    ):
+        asyncio.run(runner._kanban_notifier_watcher(interval=0.1))
+
+    acquire_lock.assert_called_once()
+    list_boards.assert_not_called()
+    connect.assert_not_called()
+    assert sleep_calls == [5, 0.1]
+
+
 def test_notifier_watcher_ignores_dispatch_disabled_env(monkeypatch):
     """The dispatcher env override must not disable notification delivery."""
     monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "false")
@@ -38,10 +68,13 @@ def test_notifier_watcher_does_not_read_dispatcher_config():
     async def _stop_after_start(_delay):
         runner._running = False
 
-    with patch(
-        "hermes_cli.config.load_config",
-        side_effect=AssertionError("notifier must not read dispatcher config"),
-    ), patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_stop_after_start):
+    with (
+        patch(
+            "hermes_cli.config.load_config",
+            side_effect=AssertionError("notifier must not read dispatcher config"),
+        ),
+        patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_stop_after_start),
+    ):
         asyncio.run(runner._kanban_notifier_watcher())
 
 

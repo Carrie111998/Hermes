@@ -70,8 +70,9 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
-def test_kanban_notifier_delivers_both_dev_boards_when_dispatch_disabled(
-    tmp_path, monkeypatch,
+def test_selected_notifier_owner_delivers_both_dev_boards_when_dispatch_disabled(
+    tmp_path,
+    monkeypatch,
 ):
     """Notifier ownership is independent from embedded dispatcher ownership.
 
@@ -121,6 +122,7 @@ def test_kanban_notifier_delivers_both_dev_boards_when_dispatch_disabled(
         assert f"[{board}]" in delivered
         assert tid in delivered
     dispatch_once.assert_not_called()
+    assert runner._kanban_notifier_lock_handle is None
 
 
 def _decision_brief(task_id, *, include_window=False):
