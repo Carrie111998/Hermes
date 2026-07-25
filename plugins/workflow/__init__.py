@@ -342,12 +342,10 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                 return
 
             # Get the failure report from the blocked card
-            from hermes_cli import kanban_db as kb
-            board = state.get("kanban_board")
-            if not board:
+            kb, conn = _get_board_conn(state)
+            if conn is None:
                 logger.error("kanban_board missing from state file — cannot process hook event")
                 return
-            conn = kb.connect(board=board)
             try:
                 blocked_card = kb.get_task(conn, task_id)
                 failure_report = blocked_card.body if blocked_card else (reason or "Unknown failure")
@@ -394,12 +392,10 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                 return
             layer_nodes = layers[current_layer]
             # Check actual card status from kanban DB, not just state file
-            from hermes_cli import kanban_db as kb
-            board = state.get("kanban_board")
-            if not board:
+            kb, conn = _get_board_conn(state)
+            if conn is None:
                 logger.error("kanban_board missing from state file — cannot process hook event")
                 return
-            conn = kb.connect(board=board)
             try:
                 all_done = True
                 for nid in layer_nodes:

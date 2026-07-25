@@ -36,6 +36,7 @@ import os
 import re
 import logging
 from pathlib import Path
+import hermes_cli.kanban_db as kanban_db
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
@@ -542,11 +543,10 @@ class WorkflowEngine:
                 pass
 
         # Use the kanban DB Python API directly — no subprocess.
-        from hermes_cli import kanban_db as kb
-        conn = kb.connect(board=self.kanban_board)
+        conn = kanban_db.connect(board=self.kanban_board)
         try:
             import datetime as _dt
-            new_tid = kb.create_task(
+            new_tid = kanban_db.create_task(
                 conn,
                 title=title,
                 body=task_with_context,
@@ -569,7 +569,7 @@ class WorkflowEngine:
                     from pathlib import Path as _P
                     p = _P(fpath)
                     if p.is_file():
-                        kb.store_attachment_bytes(
+                        kanban_db.store_attachment_bytes(
                             conn, new_tid, p.name, p.read_bytes(),
                             content_type=None,
                             uploaded_by="workflow-engine",
@@ -837,10 +837,9 @@ class WorkflowEngine:
         Uses the kanban DB Python API directly — no subprocess.
         Returns a dict with status, body, latest_summary, etc.
         """
-        from hermes_cli import kanban_db as kb
-        conn = kb.connect(board=self.kanban_board)
+        conn = kanban_db.connect(board=self.kanban_board)
         try:
-            task = kb.get_task(conn, card_id)
+            task = kanban_db.get_task(conn, card_id)
             if task is None:
                 return {"status": "unknown", "error": f"Card {card_id} not found"}
             result = {
@@ -2479,9 +2478,8 @@ class WorkflowEngine:
                     # Initialize heartbeat so the sweep doesn't auto-block
                     # the card before the worker picks it up.
                     try:
-                        from hermes_cli import kanban_db as _kb
-                        with _kb.connect_closing(board=self.kanban_board) as _conn:
-                            _kb.heartbeat_worker(_conn, card_id)
+                        with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                            _kanban_db.heartbeat_worker(_conn, card_id)
                     except Exception:
                         pass  # Non-fatal: heartbeat sweep has created_at fallback
                     print(f"   ✓ {nid} → card {card_id}")
@@ -2712,8 +2710,8 @@ class WorkflowEngine:
             # and cheap (single SELECT + conditional UPDATEs).
             try:
                 from hermes_cli import kanban_db as _kb
-                with _kb.connect_closing(board=self.kanban_board) as _conn:
-                    _kb.sweep_stale_heartbeats(_conn)
+                with _kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                    _kanban_db.sweep_stale_heartbeats(_conn)
             except Exception:
                 pass  # Non-fatal: heartbeat sweep is a safety net
 
@@ -2876,9 +2874,8 @@ class WorkflowEngine:
                                 # Enrich upstream card with review feedback and reset to ready
                                 if upstream_state.kanban_card_id:
                                     try:
-                                        from hermes_cli import kanban_db as kb
-                                        with kb.connect_closing(board=self.kanban_board) as conn:
-                                            existing_body = kb.get_task(conn, upstream_state.kanban_card_id).body or ""
+                                        with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                            existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
                                             feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
                                             new_body = existing_body + feedback
                                             # Move from done back to ready with enriched feedback
