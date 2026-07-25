@@ -1689,17 +1689,26 @@ def compress_context(
             )
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
-                if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                    logger.warning(
-                        "compression aborted: session=%s changed before lease "
-                        "acquisition; preserving newer durable messages",
-                        _lock_sid,
+                # Filter out display/service rows (e.g. model_switch markers)
+                # that are persisted to durable but absent from the runtime
+                # messages snapshot. These cause a permanent 1-row drift that
+                # blocks rotation compression indefinitely. (#71397)
+                if isinstance(durable_parent, list):
+                    _conversational_count = sum(
+                        1 for m in durable_parent
+                        if isinstance(m, dict) and not m.get("display_kind")
                     )
-                    _release_lock()
-                    existing_prompt = getattr(agent, "_cached_system_prompt", None)
-                    if not existing_prompt:
-                        existing_prompt = agent._build_system_prompt(system_message)
-                    return messages, existing_prompt
+                    if _conversational_count > len(messages):
+                        logger.warning(
+                            "compression aborted: session=%s changed before lease "
+                            "acquisition; preserving newer durable messages",
+                            _lock_sid,
+                        )
+                        _release_lock()
+                        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                        if not existing_prompt:
+                            existing_prompt = agent._build_system_prompt(system_message)
+                        return messages, existing_prompt
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
