@@ -1964,7 +1964,20 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+    base_url = str(client_kwargs.get("base_url", "") or "").rstrip("/")
+    from agent.agy_cli_adapter import AGY_SENTINEL_BASE_URL
+    if base_url == AGY_SENTINEL_BASE_URL:
+        from agent.agy_cli_adapter import AgyCliClient
+
+        client = AgyCliClient(**client_kwargs)
+        _ra().logger.info(
+            "agy CLI client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
+    if agent.provider == "copilot-acp" or base_url.startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
