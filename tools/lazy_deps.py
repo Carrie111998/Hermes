@@ -190,8 +190,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "image.fal": ("fal-client==0.13.1",),
 
     # ─── Memory providers ──────────────────────────────────────────────────
-    "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
+    "memory.honcho": ("honcho-ai==2.2.0",),      # take upstream's bump
+    "memory.hindsight": ("hindsight-client==0.8.5",),  # KEEP OURS — do not downgrade to 0.6.1
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
