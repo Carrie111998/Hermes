@@ -155,9 +155,15 @@ class TestCopilotProfileReasoningWireShape:
 
         assert extra_body == {"reasoning": {"effort": "high"}}
 
-    def test_unsupported_effort_is_not_emitted(self, copilot_profile):
-        """An effort the catalog doesn't list is dropped, not forced onto the wire."""
-        # Catalog advertises only low/medium/high/max, so 'ultra' is not valid.
+    def test_unsupported_effort_clamps_to_nearest_supported(self, copilot_profile):
+        """An effort the catalog doesn't list is clamped to the nearest
+        supported level, not dropped.
+
+        Contract unified with main's clamp behavior (commit cf73b3d41): an
+        unrecognized effort with no xhigh/minimal-specific rule falls back to
+        ``medium`` when the catalog lists it. The catalog here advertises
+        low/medium/high/max, so ``ultra`` -> ``medium``.
+        """
         with patch(
             "hermes_cli.models.fetch_github_model_catalog",
             return_value=_CLAUDE_CATALOG,
@@ -169,7 +175,7 @@ class TestCopilotProfileReasoningWireShape:
                 api_key="dummy-copilot-token",
             )
 
-        assert extra_body == {}
+        assert extra_body == {"reasoning": {"effort": "medium"}}
 
     def test_non_reasoning_model_emits_nothing(self, copilot_profile):
         """A chat model without ``reasoning_effort`` support emits no reasoning key."""
@@ -253,10 +259,19 @@ class TestCopilotReasoningEndToEnd:
 
 
 def _patch_efforts(monkeypatch, efforts):
-    """Stub the catalog lookup the profile calls for supported efforts."""
+    """Stub the supported-efforts resolution the profile actually calls.
+
+    The registered ``CopilotProfile`` resolves supported efforts through the
+    cached catalog helper ``get_copilot_reasoning_efforts(model, api_key)`` (see
+    PR #51953), NOT the bare ``github_model_reasoning_efforts(model)``. Patch the
+    seam the profile calls so these clamp tests exercise the live resolution
+    path; patching the bare resolver would be a no-op against the current code.
+    """
     import hermes_cli.models as models_mod
     monkeypatch.setattr(
-        models_mod, "github_model_reasoning_efforts", lambda model: list(efforts)
+        models_mod,
+        "get_copilot_reasoning_efforts",
+        lambda model, api_key=None: list(efforts),
     )
 
 
