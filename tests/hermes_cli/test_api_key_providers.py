@@ -377,6 +377,22 @@ class TestApiKeyProviderStatus:
         assert status["configured"] is True
         assert status["base_url"] == STEPFUN_STEP_PLAN_CN_BASE_URL
 
+    def test_deepseek_status_upgrades_canonical_http_base_url(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "http://api.deepseek.com/v1/")
+
+        status = get_api_key_provider_status("deepseek")
+
+        assert status["base_url"] == "https://api.deepseek.com/v1/"
+
+    def test_other_provider_status_preserves_configured_url_shape(self, monkeypatch):
+        monkeypatch.setenv("GMI_API_KEY", "gmi-key")
+        monkeypatch.setenv("GMI_BASE_URL", "http://proxy.internal/v1/")
+
+        status = get_api_key_provider_status("gmi")
+
+        assert status["base_url"] == "http://proxy.internal/v1/"
+
     def test_copilot_status_uses_gh_cli_token(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_gh_cli_token")
         status = get_api_key_provider_status("copilot")
@@ -572,6 +588,29 @@ class TestResolveApiKeyProviderCredentials:
         monkeypatch.setenv("GMI_BASE_URL", "https://custom.gmi.example/v1")
         creds = resolve_api_key_provider_credentials("gmi")
         assert creds["base_url"] == "https://custom.gmi.example/v1"
+
+    def test_resolve_deepseek_upgrades_canonical_http_base_url(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "http://api.deepseek.com/v1")
+
+        creds = resolve_api_key_provider_credentials("deepseek")
+
+        assert creds["base_url"] == "https://api.deepseek.com/v1"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://deepseek-proxy.internal/v1",
+            "http://api.deepseek.com.attacker.test/v1",
+        ],
+    )
+    def test_resolve_deepseek_preserves_noncanonical_http_base_url(self, monkeypatch, base_url):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", base_url)
+
+        creds = resolve_api_key_provider_credentials("deepseek")
+
+        assert creds["base_url"] == base_url
 
     def test_resolve_kilocode_custom_base_url(self, monkeypatch):
         monkeypatch.setenv("KILOCODE_API_KEY", "kilo-key")

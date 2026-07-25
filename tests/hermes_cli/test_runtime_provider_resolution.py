@@ -86,6 +86,50 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_deepseek_pool_upgrades_canonical_http_base_url():
+    entry = SimpleNamespace(
+        runtime_base_url="http://api.deepseek.com/v1",
+        runtime_api_key="pool-token",
+        access_token="pool-token",
+        source="manual",
+    )
+
+    resolved = rp._resolve_runtime_from_pool_entry(
+        provider="deepseek",
+        entry=entry,
+        requested_provider="deepseek",
+        model_cfg={"provider": "deepseek", "default": "deepseek-chat"},
+    )
+
+    assert resolved["base_url"] == "https://api.deepseek.com/v1"
+
+
+def test_deepseek_explicit_runtime_upgrades_canonical_http_base_url():
+    resolved = rp._resolve_explicit_runtime(
+        provider="deepseek",
+        requested_provider="deepseek",
+        model_cfg={"provider": "deepseek", "default": "deepseek-chat"},
+        explicit_api_key="deepseek-key",
+        explicit_base_url="http://api.deepseek.com/v1",
+    )
+
+    assert resolved is not None
+    assert resolved["base_url"] == "https://api.deepseek.com/v1"
+
+
+def test_deepseek_explicit_runtime_preserves_custom_http_proxy():
+    resolved = rp._resolve_explicit_runtime(
+        provider="deepseek",
+        requested_provider="deepseek",
+        model_cfg={"provider": "deepseek", "default": "deepseek-chat"},
+        explicit_api_key="deepseek-key",
+        explicit_base_url="http://deepseek-proxy.internal/v1",
+    )
+
+    assert resolved is not None
+    assert resolved["base_url"] == "http://deepseek-proxy.internal/v1"
+
+
 def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypatch):
     entry = SimpleNamespace(
         provider="nous",
@@ -2995,6 +3039,26 @@ def test_host_derived_key_picked_up_for_deepseek(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="custom")
 
     assert resolved["api_key"] == "sk-deepseek-secret"
+
+
+def test_deepseek_runtime_upgrades_persisted_canonical_http_base_url(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "deepseek")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "deepseek",
+            "base_url": "http://api.deepseek.com/v1",
+            "default": "deepseek-chat",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-secret")
+    monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="deepseek")
+
+    assert resolved["base_url"] == "https://api.deepseek.com/v1"
 
 
 def test_host_derived_key_picked_up_for_groq(monkeypatch):
