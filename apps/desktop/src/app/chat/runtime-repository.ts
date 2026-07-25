@@ -34,13 +34,9 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
       }
     })
 
-    // Existing projected identities win. New slots avoid every current source id
-    // on initial construction and every renderer id already assigned this render.
-    const repositoryIds = new Set(
-      slots
-        .map(slot => slot.previousRepositoryId)
-        .filter((id): id is string => id !== undefined)
-    )
+    // Historical projected identities stay reserved even while their source slot
+    // is absent, so a new source id cannot steal an identity that may return.
+    const repositoryIds = new Set([...repositoryIdsBySourceRef.current.values()].flat())
 
     let visibleParentId: string | null = null
     let headId: string | null = null
