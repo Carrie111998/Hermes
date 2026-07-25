@@ -16,6 +16,7 @@ import logging
 import os
 import html as _html
 import re
+import tempfile
 import threading
 import time
 from contextvars import ContextVar
@@ -290,13 +291,14 @@ from plugins.platforms.telegram.telegram_network import (
 )
 from utils import atomic_replace, env_float, env_int
 
-_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
     "image/webp": ".webp",
     "image/gif": ".gif",
+    "image/svg+xml": ".svg",
 }
 _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".png": "image/png",
@@ -373,6 +375,32 @@ def _probe_voice_duration_seconds(path: str) -> Optional[int]:
         pass
 
     return None
+
+
+def _rasterize_svg_bytes_for_telegram(data: bytes) -> bytes:
+    """Return a provider-safe PNG for an SVG Telegram document.
+
+    Telegram classifies SVG uploads as image documents, but downstream
+    multimodal providers accept only raster formats. Reuse the vision tool's
+    active-content checks and renderer before the payload enters conversation
+    history. The temporary SVG and raster are removed before returning.
+    """
+    from tools.vision_tools import _normalize_to_supported_image
+
+    raster_path = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-telegram-svg-") as tmp:
+            svg_path = _Path(tmp) / "upload.svg"
+            svg_path.write_bytes(data)
+            raster_path, mime, error = _normalize_to_supported_image(
+                svg_path, "image/svg+xml"
+            )
+            if error or raster_path is None or mime != "image/png":
+                raise ValueError(error or "SVG rasterization did not produce a PNG")
+            return raster_path.read_bytes()
+    finally:
+        if raster_path is not None:
+            raster_path.unlink(missing_ok=True)
 
 
 def check_telegram_requirements() -> bool:
@@ -9111,7 +9139,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     file_obj = await doc.get_file()
                     image_bytes = await file_obj.download_as_bytearray()
                     image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
+                    is_svg = image_ext == ".svg" or doc_mime == "image/svg+xml"
                     try:
+                        if is_svg:
+                            image_bytes = await asyncio.to_thread(
+                                _rasterize_svg_bytes_for_telegram,
+                                bytes(image_bytes),
+                            )
+                            image_ext = ".png"
                         cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
                     except ValueError as e:
                         logger.warning("[Telegram] Failed to cache image document: %s", _redact_telegram_error_text(e), exc_info=True)
@@ -9124,7 +9159,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     event.message_type = MessageType.PHOTO
                     event.media_urls = [cached_path]
-                    event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
+                    event.media_types = [
+                        "image/png"
+                        if is_svg
+                        else doc_mime if doc_mime.startswith("image/")
+                        else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")
+                    ]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
                     media_group_id = getattr(msg, "media_group_id", None)
