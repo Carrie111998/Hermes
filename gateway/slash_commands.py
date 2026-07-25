@@ -124,10 +124,9 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
-        # in-flight run's own guarded release (run_generation=old) will return
-        # False and leave its dead agent behind; clearing here keeps the slot
-        # from becoming a zombie that silently drops all later messages (#28686).
-        # Idempotent, so the run's finally calling it again is harmless.
+        # in-flight run's generation-scoped releases (inner _run_agent + outer
+        # dispatch finally) will return False and must not be relied on to clear
+        # this zombie (#28686 / #11016).
         self._release_running_agent_state(session_key)
 
         # Snapshot the old entry so on_session_finalize can report the
