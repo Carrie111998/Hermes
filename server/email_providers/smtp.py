@@ -48,6 +48,8 @@ class SmtpProvider:
         if email_msg.reply_to:
             message["Reply-To"] = email_msg.reply_to
         message["Subject"] = email_msg.subject
+        for name, value in email_msg.headers.items():
+            message[name] = value
         subtype = "html" if "<" in email_msg.body and ">" in email_msg.body else "plain"
         message.set_content(email_msg.body, subtype=subtype)
         return message

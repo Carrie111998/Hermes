@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,19 +16,22 @@ from .auth import AuthService
 from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
+from .observability import configure_logging, install as install_observability, log
 from .outreach_service import OutreachService
 from .postgres import create_database
 from .storage import create_storage
 from .agent_service import AgentRunService, StubRunExecutor
 from .chat_bridge import ChatBridge
 from .lead_research import LeadResearchService
-from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, research_campaigns, sales_intelligence
+from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, research_campaigns, sales_intelligence, unsubscribe
 
 
 def create_app(settings: Settings | None = None, db: Database | None = None,
                run_executor=None, chat_agent_factory=None) -> FastAPI:
     settings = settings or Settings.load()
+    configure_logging()
     database = db or create_database(settings)
+    _warn_on_incomplete_config(settings)
     service = AuthService(database, settings)
     service.bootstrap_admin()
     run_service = AgentRunService(database, run_executor)
@@ -56,7 +60,11 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.state.runs = run_service
     app.state.chat = chat_service
     app.state.cipher = CredentialCipher(settings.credential_key)
-    app.state.outreach = OutreachService(database, app.state.cipher)
+    app.state.outreach = OutreachService(
+        database, app.state.cipher,
+        public_base_url=settings.public_base_url,
+        credential_key=settings.credential_key,
+    )
     app.state.storage = create_storage(settings)
     app.state.lead_research = LeadResearchService(database)
     app.add_middleware(
@@ -84,6 +92,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         return response
 
+    install_observability(app, database)
+
     api_prefix = "/api/v1"
     app.include_router(auth.router, prefix=api_prefix)
     app.include_router(admin.router, prefix=api_prefix)
@@ -99,6 +109,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.include_router(integrations.router, prefix=api_prefix)
     app.include_router(outreach.router, prefix=api_prefix)
     app.include_router(operations.router, prefix=api_prefix)
+    app.include_router(unsubscribe.router, prefix=api_prefix)
     if chat_service:
         app.include_router(chat.router)
 
@@ -113,6 +124,32 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         _mount_webui(app, webui_dir, settings)
 
     return app
+
+
+def _warn_on_incomplete_config(settings: Settings) -> None:
+    """Surface deployment gaps at boot instead of at first customer action.
+
+    These are warnings, not hard failures: a developer running the API locally
+    to work on the dashboard should not be blocked by production-only config.
+    The individual code paths still fail closed when the value is actually
+    needed (crypto.CredentialCipher, compliance.sign_token).
+    """
+    if not settings.credential_key:
+        log("INTERFAZE_CREDENTIAL_KEY is unset: integrations cannot be connected "
+            "and outbound email cannot be sent (opt-out links require it)",
+            logging.WARNING)
+    if not settings.bootstrap_admin_email or not settings.bootstrap_admin_password:
+        log("INTERFAZE_BOOTSTRAP_ADMIN_EMAIL/_PASSWORD unset: no admin account "
+            "will be created, so nobody can sign in", logging.WARNING)
+    if settings.public_base_url.startswith("http://localhost"):
+        log("INTERFAZE_PUBLIC_BASE_URL is still localhost: unsubscribe links in "
+            "outbound email will not resolve for recipients", logging.WARNING)
+    if settings.auth_mode == "supabase" and not (settings.supabase_url and settings.supabase_anon_key):
+        log("auth_mode is supabase but SUPABASE_URL/SUPABASE_ANON_KEY are unset: "
+            "all authentication will return 503", logging.ERROR)
+    if shutil.which("hermes") is None:
+        log("hermes CLI is not on PATH: every agent run (lead discovery, "
+            "research, outreach generation) will fail", logging.ERROR)
 
 
 def _mount_webui(app: FastAPI, webui_dir: Path, settings: Settings) -> None:

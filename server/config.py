@@ -38,6 +38,9 @@ class Settings:
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     credential_key: str = ""
+    # Absolute origin used to build opt-out links in outbound email. Must be
+    # publicly reachable, so it cannot be inferred from the request host.
+    public_base_url: str = "http://localhost:8000"
     upload_dir: Path = field(default_factory=lambda: get_hermes_home() / "interfaze" / "uploads")
     webui_enabled: bool = True
     max_upload_bytes: int = 25 * 1024 * 1024
@@ -69,6 +72,11 @@ class Settings:
             bootstrap_admin_email=os.environ.get("INTERFAZE_BOOTSTRAP_ADMIN_EMAIL", ""),
             bootstrap_admin_password=os.environ.get("INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD", ""),
             credential_key=os.environ.get("INTERFAZE_CREDENTIAL_KEY", ""),
+            public_base_url=str(
+                os.environ.get("INTERFAZE_PUBLIC_BASE_URL")
+                or cfg.get("public_base_url")
+                or "http://localhost:8000"
+            ).rstrip("/"),
             upload_dir=Path(cfg.get("upload_dir") or home / "uploads").expanduser(),
             webui_enabled=cfg.get("webui_enabled") is not False,
             max_upload_bytes=max(0, int(cfg.get("max_upload_bytes", 25 * 1024 * 1024))),

@@ -763,8 +763,8 @@ POST   /api/v1/outreach/messages/:messageId/mark-replied
 GET    /api/v1/integrations/email
 POST   /api/v1/integrations/email/connect/google
 POST   /api/v1/integrations/email/connect/microsoft
-POST   /api/v1/integrations/email/connect/zoho
 POST   /api/v1/integrations/email/connect/smtp
+POST   /api/v1/integrations/email/connect/browser
 
 GET    /api/v1/integrations/email/:integrationId
 PATCH  /api/v1/integrations/email/:integrationId

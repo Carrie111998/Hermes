@@ -19,6 +19,9 @@ from server.app import create_app
 from server.config import Settings
 from server.db import json_dump, new_id, now
 
+# See tests/server/test_api_mvp.py: outbound email requires a signed opt-out link.
+TEST_CREDENTIAL_KEY = "KJ9KmdJiLL6itiwlEGTvGQ4ptS4dnd1ZZPyRPTwmjs4="
+
 
 def make_client(chat_agent_factory=None, **overrides):
     root = Path(tempfile.mkdtemp(prefix="interfaze-webui-test-"))
@@ -27,7 +30,7 @@ def make_client(chat_agent_factory=None, **overrides):
         upload_dir=root / "uploads",
         bootstrap_admin_email="admin@example.test",
         bootstrap_admin_password="correct-horse-battery",
-        **overrides,
+        **{"credential_key": TEST_CREDENTIAL_KEY, **overrides},
     )
     app = create_app(settings, run_executor=StubRunExecutor(),
                      chat_agent_factory=chat_agent_factory)
@@ -446,8 +449,10 @@ def test_phase4_promoted_routes_and_exports_are_tenant_safe():
     })
     assert profile.status_code == 200, profile.text
     assert profile.json()["profile_state"] == "saved"
+    # No credentials are connected in this fixture, so verification must report
+    # "incomplete". Only a successful Meta Graph call may report "verified".
     verified = client.post("/api/v1/integrations/whatsapp/profile/verify", headers=headers)
-    assert verified.status_code == 200 and verified.json()["status"] == "verified"
+    assert verified.status_code == 200 and verified.json()["status"] == "incomplete"
     assert client.get(
         "/api/v1/integrations/whatsapp/profile", headers=company_b_headers,
     ).json() is None

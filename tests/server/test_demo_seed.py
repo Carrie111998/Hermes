@@ -23,6 +23,7 @@ def test_demo_seed_is_idempotent_and_tenant_scoped(tmp_path):
         bootstrap_admin_email="admin@example.test",
         bootstrap_admin_password="correct-horse-battery",
         chat_enabled=False,
+        credential_key="KJ9KmdJiLL6itiwlEGTvGQ4ptS4dnd1ZZPyRPTwmjs4=",
     )
     db = Database(settings.database_path)
     first = seed_silverline(db, email="client@silverline.test", password="silverline-test-123")

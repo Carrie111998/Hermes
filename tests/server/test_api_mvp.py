@@ -17,6 +17,10 @@ from server.app import create_app
 from server.config import Settings
 from server.db import json_dump, new_id, now
 
+# Fixed test-only Fernet key. Real deployments read INTERFAZE_CREDENTIAL_KEY;
+# tests need one because outbound email must carry a signed opt-out link.
+TEST_CREDENTIAL_KEY = "KJ9KmdJiLL6itiwlEGTvGQ4ptS4dnd1ZZPyRPTwmjs4="
+
 
 def make_client():
     root = Path(tempfile.mkdtemp(prefix="interfaze-api-test-"))
@@ -25,6 +29,7 @@ def make_client():
         upload_dir=root / "uploads",
         bootstrap_admin_email="admin@example.test",
         bootstrap_admin_password="correct-horse-battery",
+        credential_key=TEST_CREDENTIAL_KEY,
     )
     app = create_app(settings, run_executor=StubRunExecutor())
     client = TestClient(app)

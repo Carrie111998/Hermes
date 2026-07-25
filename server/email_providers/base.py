@@ -19,6 +19,9 @@ class OutgoingEmail:
     cc: list[str] = field(default_factory=list)
     language: Optional[str] = None
     reply_to: Optional[str] = None
+    # RFC 2369/8058 opt-out headers. Providers that build MIME set them
+    # directly; JSON-API providers must map them to their own header field.
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

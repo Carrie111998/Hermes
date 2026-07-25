@@ -1,5 +1,18 @@
 -- Evidence-first lead research application tables.
 -- Mirrors server/lead_research/schema.py without SQLite-specific pragmas.
+-- Row level security for these tables lives in 004_lead_research_rls.sql; apply
+-- both together so the tables are never reachable by a direct Supabase client.
+
+-- Applied-migration ledger. Canonically defined in 001_initial.sql; repeated here
+-- so this file still records itself on databases that pre-date that definition.
+-- RLS with no policy in this file means deny-all for anon/authenticated roles;
+-- 001_initial.sql grants the admin read policy. The service role always bypasses.
+create table if not exists schema_migrations (
+  version text primary key,
+  applied_at timestamptz not null default now()
+);
+alter table schema_migrations enable row level security;
+
 CREATE TABLE IF NOT EXISTS research_campaigns (
   id text PRIMARY KEY, company_id text NOT NULL REFERENCES companies(id), name text NOT NULL,
   status text NOT NULL DEFAULT 'draft', version integer NOT NULL DEFAULT 1,
@@ -67,3 +80,6 @@ CREATE INDEX IF NOT EXISTS ix_research_sources_tenant ON dataset_definitions(com
 CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
 CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(company_id, campaign_id, source_id);
+
+insert into schema_migrations(version) values ('003_lead_research')
+on conflict (version) do nothing;

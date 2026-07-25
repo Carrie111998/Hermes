@@ -55,6 +55,8 @@ class GmailProvider:
         if email.reply_to:
             message["Reply-To"] = email.reply_to
         message["Subject"] = email.subject
+        for name, value in email.headers.items():
+            message[name] = value
         subtype = "html" if "<" in email.body and ">" in email.body else "plain"
         message.set_content(email.body, subtype=subtype)
         return base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")

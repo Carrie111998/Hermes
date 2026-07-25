@@ -165,13 +165,62 @@ language sql stable security definer set search_path=public as $$
   );
 $$;
 
+-- Applied-migration ledger. Created after the helper functions so its own policy
+-- can reference interfaze_is_admin(). `if not exists` keeps re-runs safe.
+create table if not exists schema_migrations (
+  version text primary key,
+  applied_at timestamptz not null default now()
+);
+alter table schema_migrations enable row level security;
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='schema_migrations'
+      and policyname='schema_migrations_admin_read'
+  ) then
+    create policy schema_migrations_admin_read on schema_migrations for select
+      using (interfaze_is_admin());
+  end if;
+end $$;
+
 alter table companies enable row level security;
-create policy companies_tenant_select on companies for select using (interfaze_company_access(id));
-create policy companies_admin_write on companies for all using (interfaze_is_admin()) with check (interfaze_is_admin());
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='companies'
+      and policyname='companies_tenant_select'
+  ) then
+    create policy companies_tenant_select on companies for select using (interfaze_company_access(id));
+  end if;
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='companies'
+      and policyname='companies_admin_write'
+  ) then
+    create policy companies_admin_write on companies for all using (interfaze_is_admin()) with check (interfaze_is_admin());
+  end if;
+end $$;
 
 alter table users enable row level security;
-create policy users_self_or_admin on users for select using (external_id=auth.uid()::text or interfaze_is_admin());
-create policy users_admin_write on users for all using (interfaze_is_admin()) with check (interfaze_is_admin());
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='users'
+      and policyname='users_self_or_admin'
+  ) then
+    create policy users_self_or_admin on users for select using (external_id=auth.uid()::text or interfaze_is_admin());
+  end if;
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='users'
+      and policyname='users_admin_write'
+  ) then
+    create policy users_admin_write on users for all using (interfaze_is_admin()) with check (interfaze_is_admin());
+  end if;
+end $$;
 
 -- Every remaining product row is guarded by its company_id. The API normally
 -- uses a server connection; these policies also protect direct Supabase reads.
@@ -185,25 +234,64 @@ begin
     'data_sources','exports','agent_runs','run_events','chat_sessions'
   ] loop
     execute format('alter table %I enable row level security', table_name);
-    execute format(
-      'create policy %I on %I for all using (interfaze_company_access(company_id)) '
-      'with check (interfaze_company_access(company_id))', table_name || '_tenant', table_name
-    );
+    if not exists (
+      select 1 from pg_policies
+      where schemaname='public' and tablename=table_name
+        and policyname=table_name || '_tenant'
+    ) then
+      execute format(
+        'create policy %I on %I for all using (interfaze_company_access(company_id)) '
+        'with check (interfaze_company_access(company_id))', table_name || '_tenant', table_name
+      );
+    end if;
   end loop;
 end $$;
 
 alter table activity_log enable row level security;
-create policy activity_tenant on activity_log for select
-  using (company_id is not null and interfaze_company_access(company_id));
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='activity_log'
+      and policyname='activity_tenant'
+  ) then
+    create policy activity_tenant on activity_log for select
+      using (company_id is not null and interfaze_company_access(company_id));
+  end if;
+end $$;
 
 insert into storage.buckets(id,name,public)
 values ('interfaze-documents','interfaze-documents',false)
 on conflict (id) do nothing;
 
-create policy interfaze_storage_read on storage.objects for select
-using (bucket_id='interfaze-documents' and interfaze_company_access((storage.foldername(name))[1]));
-create policy interfaze_storage_write on storage.objects for insert
-with check (bucket_id='interfaze-documents' and interfaze_company_access((storage.foldername(name))[1]));
-create policy interfaze_storage_delete on storage.objects for delete
-using (bucket_id='interfaze-documents' and interfaze_company_access((storage.foldername(name))[1]));
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='storage' and tablename='objects'
+      and policyname='interfaze_storage_read'
+  ) then
+    create policy interfaze_storage_read on storage.objects for select
+    using (bucket_id='interfaze-documents' and interfaze_company_access((storage.foldername(name))[1]));
+  end if;
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='storage' and tablename='objects'
+      and policyname='interfaze_storage_write'
+  ) then
+    create policy interfaze_storage_write on storage.objects for insert
+    with check (bucket_id='interfaze-documents' and interfaze_company_access((storage.foldername(name))[1]));
+  end if;
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='storage' and tablename='objects'
+      and policyname='interfaze_storage_delete'
+  ) then
+    create policy interfaze_storage_delete on storage.objects for delete
+    using (bucket_id='interfaze-documents' and interfaze_company_access((storage.foldername(name))[1]));
+  end if;
+end $$;
+
+insert into schema_migrations(version) values ('001_initial')
+on conflict (version) do nothing;
 

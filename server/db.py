@@ -88,6 +88,13 @@ CREATE TABLE IF NOT EXISTS contacts (
     do_not_contact INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
+-- Tenant-wide opt-out. Keyed on the address, not on a lead/contact row, so
+-- re-importing the same address as a new lead cannot resurrect it.
+CREATE TABLE IF NOT EXISTS suppressions (
+    company_id TEXT NOT NULL REFERENCES companies(id), email TEXT NOT NULL,
+    reason TEXT NOT NULL, created_at REAL NOT NULL,
+    PRIMARY KEY (company_id, email)
+);
 CREATE TABLE IF NOT EXISTS outreach_campaigns (
     id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
     channel TEXT NOT NULL DEFAULT 'email', status TEXT NOT NULL DEFAULT 'draft', data TEXT NOT NULL DEFAULT '{}',

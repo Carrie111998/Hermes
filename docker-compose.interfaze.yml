@@ -1,0 +1,100 @@
+# docker-compose file for the interfaze-agent Sales Agent API.
+#
+# Separate from ./docker-compose.yml on purpose: that file runs the upstream
+# Hermes gateway + dashboard (image `hermes-agent`, s6-overlay, host
+# networking). This one runs a single process — the FastAPI product API from
+# server/app.py, built by ./Dockerfile.interfaze-api.
+#
+#   docker compose -f docker-compose.interfaze.yml up -d --build
+#   docker compose -f docker-compose.interfaze.yml logs -f
+#   curl -fsS http://127.0.0.1:8000/health
+#
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# Create ./.env.interfaze before the first `up`. It is optional so the stack
+# still boots for a smoke test, but the API degrades without it: no admin
+# account is bootstrapped, and every integration-credential or opt-out-link
+# path raises because the Fernet key is missing (server/crypto.py).
+#
+# NOTE: .dockerignore already keeps `.env.*` out of the build context, but the
+# repo's .gitignore only lists `.env`, `.env.local`, `.env.development`, ... —
+# add `.env.interfaze` to .gitignore before you put real secrets in it.
+#
+#   # required
+#   INTERFAZE_CREDENTIAL_KEY=<44-char urlsafe base64 Fernet key>
+#       # generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#   INTERFAZE_BOOTSTRAP_ADMIN_EMAIL=admin@example.com
+#   INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD=<strong password>
+#   INTERFAZE_PUBLIC_BASE_URL=https://api.example.com   # absolute, publicly reachable
+#
+#   # optional — SQLite is the default; set INTERFAZE_DATABASE_PATH to move it
+#   # inside the volume, or set SUPABASE_DB_URL to switch to Postgres entirely
+#   # (server/postgres.py: create_database picks Postgres when it is non-empty).
+#   INTERFAZE_DATABASE_PATH=/data/interfaze/interfaze.db
+#   SUPABASE_DB_URL=
+#   SUPABASE_URL=
+#   SUPABASE_ANON_KEY=
+#   SUPABASE_SERVICE_ROLE_KEY=
+#
+#   # optional — only needed for real agent runs, which shell out to the
+#   # bundled `hermes` CLI (server/agent_service.py: HermesProcessExecutor).
+#   OPENROUTER_API_KEY=
+#
+# Non-secret behaviour (cors_origins, auth_mode, chat_model, upload_dir,
+# max_upload_bytes, ...) is read from $HERMES_HOME/config.yaml under the
+# `interfaze_server` key — i.e. /data/config.yaml inside the volume.
+#
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+# The published port is bound to 127.0.0.1 by default. This service stores
+# tenant integration credentials, so put it behind a TLS-terminating reverse
+# proxy before exposing it. Override the bind address only when you have done
+# that: INTERFAZE_BIND_ADDR=0.0.0.0 docker compose -f ... up -d
+#
+# (These ${...} substitutions are read from your shell or a plain ./.env file,
+# NOT from .env.interfaze — compose interpolation happens before env_file is
+# handed to the container.)
+
+name: interfaze
+
+services:
+  interfaze-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.interfaze-api
+    image: interfaze-api:local
+    container_name: interfaze-api
+    restart: unless-stopped
+    env_file:
+      - path: ./.env.interfaze
+        required: false
+    ports:
+      - "${INTERFAZE_BIND_ADDR:-127.0.0.1}:${INTERFAZE_HOST_PORT:-8000}:8000"
+    volumes:
+      # SQLite DB (/data/interfaze), uploads (/data/interfaze/uploads),
+      # HERMES_HOME (config.yaml, synced skills, sessions, logs) and the agent
+      # workspace all live here. Losing this volume loses every tenant.
+      - interfaze-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # First boot syncs bundled skills into /data/skills before uvicorn
+      # starts, so give it room before failures start counting.
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    # Agent runs can take minutes; don't SIGKILL a run mid-flight.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  interfaze-data:
+    name: interfaze-data

@@ -1,0 +1,172 @@
+name: Interfaze API
+
+# CI for the Sales Agent MVP in server/ — the one part of the tree the main
+# ci.yml pipeline never exercised on its own. Three things are checked:
+#
+#   1. the service installs from pyproject with the extras it actually needs
+#      (`[web]` + `[interfaze]`, plus `[dev]` for pytest),
+#   2. `pytest tests/server` passes,
+#   3. the packaged `interfaze-api` console script boots and /health answers —
+#      including `agent_runs_enabled`, which is only true when the `hermes`
+#      CLI landed on PATH (server/agent_service.py shells out to it).
+#
+# Deliberately a single fast job, no matrix. The heavier repo-wide suite is
+# sliced across a matrix in tests.yml; duplicating that here buys nothing.
+#
+# NOTE: this installs from pyproject.toml, NOT `uv sync --locked`. uv.lock's
+# `interfaze` extra is currently missing ddgs / scrapling / markdownify, so a
+# locked install would either fail or silently omit the web-research stack.
+# Once uv.lock is regenerated this can move to `uv sync --locked --extra web
+# --extra interfaze --extra dev`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - "tests/server/**"
+      - "pyproject.toml"
+      - "Dockerfile.interfaze-api"
+      - "docker-compose.interfaze.yml"
+      - ".github/workflows/interfaze-api.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - "tests/server/**"
+      - "pyproject.toml"
+      - "Dockerfile.interfaze-api"
+      - "docker-compose.interfaze.yml"
+      - ".github/workflows/interfaze-api.yml"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interfaze-api-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  interfaze-api:
+    name: Test + boot smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Match the Python pinned in Dockerfile.interfaze-api (pyproject allows
+      # >=3.11,<3.14).
+      PYTHON_VERSION: "3.13"
+      # Never let a test or the smoke boot reach a real provider.
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        run: uv python install "${PYTHON_VERSION}"
+
+      - name: Install interfaze-api and its extras
+        run: |
+          set -euo pipefail
+          uv venv --python "${PYTHON_VERSION}"
+          uv pip install --python .venv/bin/python ".[web,interfaze,dev]"
+
+      - name: Verify console scripts are on PATH
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          command -v interfaze-api
+          command -v hermes
+
+      - name: Run server tests
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest tests/server -q
+
+      - name: Boot smoke test (interfaze-api + /health)
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+
+          export HERMES_HOME="${RUNNER_TEMP}/hermes-home"
+          export INTERFAZE_DATABASE_PATH="${RUNNER_TEMP}/interfaze/interfaze.db"
+          export INTERFAZE_CREDENTIAL_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+          export INTERFAZE_BOOTSTRAP_ADMIN_EMAIL="ci-admin@interfaze.invalid"
+          export INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD="ci-smoke-test-password"
+          export INTERFAZE_PUBLIC_BASE_URL="http://127.0.0.1:8000"
+          mkdir -p "${HERMES_HOME}"
+
+          # 0.0.0.0 is what the container binds (server/api_cli.py defaults to
+          # 127.0.0.1, which is why the Dockerfile passes --host explicitly);
+          # exercise the same argument path here.
+          interfaze-api --host 0.0.0.0 --port 8000 > "${RUNNER_TEMP}/api.log" 2>&1 &
+          api_pid=$!
+
+          ready=""
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8000/health -o "${RUNNER_TEMP}/health.json"; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "${api_pid}" 2>/dev/null; then
+              echo "::error::interfaze-api exited before /health became reachable"
+              cat "${RUNNER_TEMP}/api.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ -z "${ready}" ]; then
+            echo "::error::/health did not respond within 60s"
+            cat "${RUNNER_TEMP}/api.log"
+            kill "${api_pid}" 2>/dev/null || true
+            exit 1
+          fi
+
+          python - "${RUNNER_TEMP}/health.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              payload = json.load(handle)
+          print("GET /health ->", json.dumps(payload, sort_keys=True))
+
+          assert payload["status"] == "ok", payload
+          assert payload["service"] == "interfaze-agent", payload
+          assert payload["api_version"] == "v1", payload
+          # False here means the `hermes` CLI is missing from PATH, which is the
+          # exact regression that would ship a container where every agent run
+          # fails at Popen time.
+          assert payload["agent_runs_enabled"] is True, payload
+          PY
+
+          # The API must serve the dashboard SPA and the OpenAPI schema too.
+          curl -fsS --max-time 5 http://127.0.0.1:8000/openapi.json -o /dev/null
+
+          kill "${api_pid}" 2>/dev/null || true
+          wait "${api_pid}" 2>/dev/null || true
+
+      - name: Lint Dockerfile.interfaze-api (hadolint)
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile.interfaze-api
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+      - name: Validate docker-compose.interfaze.yml
+        run: docker compose -f docker-compose.interfaze.yml config --quiet
+
+      - name: Minimize uv cache
+        if: always()
+        run: uv cache prune --ci

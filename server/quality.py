@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+# Unanchored variant for pulling a failed recipient out of a bounce subject.
+EMAIL_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 PLACEHOLDER_RE = re.compile(r"{{[^{}]+}}|\[[A-Z][^\]]*(?:HERE|SENTENCE|INSERT|TODO)[^\]]*\]", re.I)
 INTERNAL_MARKER_RE = re.compile(r"\[(?:SKIP|EXCEPTION|HEADER ROW|NOT RELEVANT)\]", re.I)
