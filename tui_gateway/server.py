@@ -7478,9 +7478,16 @@ def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
         return _session_info(agent)
-    cwd = _default_session_cwd()
+    # Resolve from the session itself, exactly like _session_info /
+    # _lazy_resume_info do. Reporting _default_session_cwd() here (the gateway
+    # launch dir) made activating a lazy session render the *previous*
+    # conversation's workspace, and omitting "branch" left the desktop's stale
+    # Git indicator in place — the renderer only clears it when the key is
+    # present, so a non-git cwd must send "" rather than nothing (#71254).
+    cwd = _display_session_cwd(session) or _default_session_cwd()
     return {
         "cwd": cwd,
+        "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
         "model": _resolve_model(),

@@ -12,7 +12,7 @@ import {
   registerRepoStatusCwd,
   repoStatusForCwd
 } from './coding-status'
-import { $currentCwd, $selectedStoredSessionId } from './session'
+import { $currentCwd, $selectedStoredSessionId, setWorkspaceCwdOwner } from './session'
 
 const sampleStatus: HermesRepoStatus = {
   branch: 'feature/login',
@@ -50,6 +50,7 @@ describe('refreshRepoStatus', () => {
     _resetCodingStatusForTests()
     $currentCwd.set('')
     $selectedStoredSessionId.set(null)
+    setWorkspaceCwdOwner(null)
     // Drain the cwd/session subscribe side-effects the sets above kick off.
     vi.advanceTimersByTime(200)
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
@@ -68,6 +69,29 @@ describe('refreshRepoStatus', () => {
     $currentCwd.set('/repo')
     await refreshRepoStatus('/repo')
     expect(repoStatusForCwd('/repo').get()).toEqual(sampleStatus)
+    expect($repoStatus.get()).toEqual(sampleStatus)
+  })
+
+  it('hides cached primary repo facts until the selected conversation owns the cwd', () => {
+    $currentCwd.set('/repo')
+    $repoStatusByCwd.set({ '/repo': sampleStatus })
+    $selectedStoredSessionId.set('session-a')
+    setWorkspaceCwdOwner('session-a')
+
+    expect($repoStatus.get()).toEqual(sampleStatus)
+
+    // Selection moves synchronously, while the new conversation's cwd arrives
+    // later from session.resume. The per-cwd cache remains valid for any tile
+    // still showing /repo, but the primary rail must hide it immediately.
+    $selectedStoredSessionId.set('session-b')
+
+    expect($repoStatus.get()).toBeNull()
+    expect(repoStatusForCwd('/repo').get()).toEqual(sampleStatus)
+
+    // If both conversations share the same cwd, the path atom never changes;
+    // ownership transfer alone must make the primary slice visible again.
+    setWorkspaceCwdOwner('session-b')
+
     expect($repoStatus.get()).toEqual(sampleStatus)
   })
 

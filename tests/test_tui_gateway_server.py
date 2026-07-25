@@ -11791,6 +11791,103 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
         server._sessions.pop("sid-b", None)
 
 
+def test_session_activate_lazy_info_reports_own_cwd_and_empty_branch(monkeypatch, tmp_path):
+    """A lazy session must report ITS workspace, not the gateway launch dir.
+
+    The fallback info builder used while ``agent is None`` reported
+    ``_default_session_cwd()`` and omitted ``branch`` entirely, so activating a
+    lazy session left the desktop showing the PREVIOUS conversation's workspace
+    and Git branch (the renderer only clears the indicator when the key is
+    present, so a non-git cwd has to send ``""``).
+    """
+    workspace = tmp_path / "not-a-repo"
+    workspace.mkdir()
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "lazy-model")
+    monkeypatch.setattr(
+        server,
+        "_default_session_cwd",
+        lambda: pytest.fail("lazy info fell back to the launch dir"),
+    )
+    session = _session(
+        agent_ready=threading.Event(),
+        session_key="key-lazy",
+        cwd=str(workspace),
+    )
+    # `_session()` coerces `agent=None` into a truthy SimpleNamespace, which
+    # sends `_fallback_session_info` down its `agent is not None` early return
+    # into `_session_info` — the fixed branch would never run. Null the agent
+    # explicitly (same idiom as the other lazy-window tests here) so this
+    # exercises the genuinely-not-yet-built session.
+    session["agent"] = None
+    server._sessions["sid-lazy"] = session
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.activate",
+                "params": {"session_id": "sid-lazy"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid-lazy", None)
+
+    info = resp["result"]["info"]
+    # Guards the lazy branch itself: if a refactor reroutes this payload back
+    # through `_session_info`, `lazy` disappears and this fails loudly instead
+    # of silently asserting the non-lazy builder's (already correct) output.
+    assert info["lazy"] is True
+    assert "branch" in info, "renderer only clears a stale branch when the key is present"
+    assert info["branch"] == ""
+    assert info["cwd"] == str(workspace)
+
+
+def test_session_activate_lazy_info_reports_branch_of_session_repo(monkeypatch, tmp_path):
+    """The lazy payload's branch must come from the session's own repo."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    expected = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert expected, "git did not report a current branch for the fixture repo"
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "lazy-model")
+    session = _session(
+        agent_ready=threading.Event(),
+        session_key="key-lazy-git",
+        cwd=str(repo),
+    )
+    # See the sibling test: `agent=None` alone is coerced to a truthy
+    # namespace, so null it after construction to reach the lazy branch.
+    session["agent"] = None
+    server._sessions["sid-lazy-git"] = session
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.activate",
+                "params": {"session_id": "sid-lazy-git"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid-lazy-git", None)
+
+    info = resp["result"]["info"]
+    assert info["lazy"] is True
+    assert info["cwd"] == str(repo)
+    assert "branch" in info
+    assert info["branch"] == expected
+
 # ── session.most_recent ──────────────────────────────────────────────
 
 

@@ -5,8 +5,8 @@ import { notify, notifyError } from '@/store/notifications'
 import {
   $currentCwd,
   $newChatWorkspaceTargetGeneration,
+  commitWorkspaceCwdForSelectedSession,
   setCurrentBranch,
-  setCurrentCwd,
   setNewChatWorkspaceTarget
 } from '@/store/session'
 import type { SessionRuntimeInfo } from '@/types/hermes'
@@ -60,7 +60,7 @@ export function useCwdActions({ activeSessionIdRef, onSessionRuntimeInfo, reques
       const sessionId = activeSessionIdRef.current
 
       if (!sessionId) {
-        setCurrentCwd(trimmed)
+        commitWorkspaceCwdForSelectedSession(trimmed)
         const workspaceGeneration = setNewChatWorkspaceTarget(trimmed)
 
         try {
@@ -76,7 +76,7 @@ export function useCwdActions({ activeSessionIdRef, onSessionRuntimeInfo, reques
           // Adopt the backend's normalized cwd so the persisted workspace and
           // branch stay consistent with what the agent will use.
           if (info.cwd) {
-            setCurrentCwd(info.cwd)
+            commitWorkspaceCwdForSelectedSession(info.cwd)
             setNewChatWorkspaceTarget(info.cwd)
           }
 
@@ -96,7 +96,7 @@ export function useCwdActions({ activeSessionIdRef, onSessionRuntimeInfo, reques
           cwd: trimmed
         })
 
-        setCurrentCwd(info.cwd || trimmed)
+        commitWorkspaceCwdForSelectedSession(info.cwd || trimmed)
         setCurrentBranch(info.branch || '')
         onSessionRuntimeInfo?.({ branch: info.branch || '', cwd: info.cwd || trimmed })
       } catch (err) {
@@ -108,7 +108,7 @@ export function useCwdActions({ activeSessionIdRef, onSessionRuntimeInfo, reques
           return
         }
 
-        setCurrentCwd(trimmed)
+        commitWorkspaceCwdForSelectedSession(trimmed)
         setCurrentBranch('')
         notify({
           kind: 'warning',

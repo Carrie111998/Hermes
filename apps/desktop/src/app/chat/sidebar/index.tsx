@@ -90,11 +90,13 @@ import {
   $messagingPlatformTotals,
   $messagingSessions,
   $messagingTruncated,
+  $selectedStoredSessionId,
   $sessionProfilesTruncated,
   $sessions,
   $sessionsLoading,
+  commitWorkspaceCwdForSelectedSession,
   sessionPinId,
-  setCurrentCwd
+  setWorkspaceCwdOwner
 } from '@/store/session'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 
@@ -770,9 +772,28 @@ export function ChatSidebar({
     (project: SidebarProjectTree) => {
       const target = projectTreeCwd(project)
 
-      if (target && target !== currentCwd) {
-        setCurrentCwd(target)
+      if (!target) {
+        return
       }
+
+      if (target !== currentCwd) {
+        commitWorkspaceCwdForSelectedSession(target)
+
+        return
+      }
+
+      // Entering a project IS the user choosing this workspace for what they are
+      // looking at, exactly like a folder pick, so ownership moves with the path.
+      // Repointing without it leaves the marker describing the folder we just
+      // navigated away from: probes then either run against a path the selected
+      // conversation doesn't own (the stale Git state in #71254) or stay withheld,
+      // blanking the rail this entry just repointed.
+      //
+      // Claimed outside the move guard on purpose. An entry that lands on the
+      // path already on screen still needs the claim — resuming a detached
+      // conversation leaves the workspace unowned, and skipping the claim because
+      // nothing moved would keep that blank rail while showing the project.
+      setWorkspaceCwdOwner($selectedStoredSessionId.get())
     },
     [currentCwd]
   )

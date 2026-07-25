@@ -8,6 +8,8 @@ import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/p
 import {
   $currentCwd,
   $sessions,
+  commitWorkspaceCwdForSelectedSession,
+  releaseWorkspaceCwdOwner,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
@@ -19,6 +21,7 @@ import {
   setCurrentServiceTier,
   setCurrentUsage,
   setSessions,
+  setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
 
@@ -734,7 +737,7 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.cwd !== undefined) {
-    setCurrentCwd(state.cwd)
+    commitWorkspaceCwdForSelectedSession(state.cwd)
   }
 
   if (state.branch !== undefined) {
@@ -821,6 +824,13 @@ export function applyRuntimeInfo(
   }
 
   if (foreground) {
+    // A foreground report owns the main pane's workspace. Background tile and
+    // branch runtimes skip this block entirely, preserving their per-session
+    // patch without re-homing the selected conversation (#71254).
+    if (sessionState.cwd === undefined) {
+      releaseWorkspaceCwdOwner()
+    }
+
     publishRuntimeToComposer(sessionState)
 
     if (info.usage) {
@@ -831,7 +841,10 @@ export function applyRuntimeInfo(
   return sessionState
 }
 
-export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } | undefined) {
+export function applyStoredSessionPreviewRuntimeInfo(
+  stored: { cwd?: null | string; model?: null | string } | undefined,
+  storedSessionId: null | string
+) {
   setCurrentModel(stored?.model || '')
   setCurrentProvider('')
   setCurrentReasoningEffort('')
@@ -839,6 +852,33 @@ export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | st
   setCurrentFastMode(false)
   setYoloActive(false)
   setCurrentPersonality('')
+
+  const storedCwd = stored?.cwd?.trim() || ''
+
+  if (storedCwd) {
+    // The stored row already knows this conversation's workspace, so seeding it
+    // at resume ENTRY closes the window #71254 lives in: the correct probe starts
+    // now instead of after session.resume settles. Persisting (rather than
+    // setCurrentCwdTransient) is right here because this is the workspace the
+    // user is switching INTO — the same commitment applyRuntimeInfo makes a
+    // moment later, so the remembered per-connection workspace ends up on the
+    // conversation actually in front of the user.
+    setCurrentCwd(storedCwd)
+    setWorkspaceCwdOwner(storedSessionId)
+  } else {
+    // A row with no cwd (the common shape for a bare ⌘N session, detached by
+    // design) says nothing about the workspace, while $currentCwd still holds the
+    // previous conversation's folder. Release so probes hold off until the resume
+    // reports the truth; clearing the path instead would collapse the
+    // workspace/review panes and drop file-tree state on every switch.
+    releaseWorkspaceCwdOwner()
+  }
+
+  // Stale-label guard for the same window: the branch is derived from the
+  // workspace, so carrying the previous conversation's label across a switch is
+  // never right. applyRuntimeInfo re-applies the real branch when the resume
+  // settles (the backend always sends the key), so this only governs the gap.
+  setCurrentBranch('')
 }
 
 // A "session genuinely doesn't exist" failure (deleted, or an id from a wiped /

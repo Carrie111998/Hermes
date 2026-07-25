@@ -394,6 +394,21 @@ export const $sessionProfilesTruncated = atom<Record<string, boolean>>({})
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
+// Which conversation the live `$currentCwd` is known to describe.
+//
+// A conversation switch publishes the new stored id immediately, but the new
+// workspace only arrives when the resume settles, so for that whole window
+// `$currentCwd` still holds the PREVIOUS conversation's folder. Without a way to
+// say "this path is not this conversation's yet", workspace-derived surfaces
+// treat the leftover path as authoritative and re-derive the old repo's Git
+// facts under the newly selected chat (#71254).
+//
+// Ownership, not emptiness, is what makes the switch atomic: clearing the path
+// would collapse the workspace panes and drop file-tree state on every switch,
+// so the path stays put and is simply marked as not-yet-owned. `null` means
+// "no conversation owns it" — which is exactly right for a fresh draft, where
+// the selected id is also `null` and the workspace is immediately usable.
+export const $workspaceCwdOwner = atom<string | null>(null)
 export interface ActiveSessionStoredIdRotation {
   nextStoredSessionId: string
   previousStoredSessionId: string
@@ -568,6 +583,47 @@ export const setCurrentCwd = (next: Updater<string>) => {
 }
 
 export const setCurrentCwdTransient = (next: Updater<string>) => updateAtom($currentCwd, next)
+
+// Released-ownership marker: the live path belongs to no conversation. `null`
+// cannot serve as the release value because it MATCHES a fresh draft (whose
+// selected id is also null), which would declare a leftover path to be the
+// draft's own workspace — #71254, one selection over. Kept here beside the atom
+// and the comparison so a release site cannot reinvent a subtly different value.
+const WORKSPACE_CWD_UNOWNED = 'desktop:workspace-cwd-unowned'
+
+/** Mark the live workspace as belonging to `storedSessionId`.
+ *
+ *  Call this wherever a cwd is established for a conversation (resume settling,
+ *  a warm switch, an explicit folder pick). Until it is called for the newly
+ *  selected conversation, workspace-derived probes know the path they can see is
+ *  the previous conversation's and hold off rather than publishing it (#71254).
+ */
+export const setWorkspaceCwdOwner = (storedSessionId: null | string) => updateAtom($workspaceCwdOwner, storedSessionId)
+
+/** Declare that no conversation owns the live workspace path.
+ *
+ *  For a conversation that reports no workspace of its own: the path on screen is
+ *  provably still the previous conversation's, so probes must hold off rather
+ *  than adopt it.
+ */
+export const releaseWorkspaceCwdOwner = () => updateAtom($workspaceCwdOwner, WORKSPACE_CWD_UNOWNED)
+
+/** Commit `cwd` as the workspace of the conversation the user is looking at.
+ *
+ *  The single primitive for "this path IS the selected conversation's" — a folder
+ *  pick, a project entry, the agent relocating itself. Prefer it over a bare
+ *  `setCurrentCwd`, which moves the path while leaving ownership naming whatever
+ *  held it before; the next workspace-derived refresh is then withheld and the
+ *  rail blanks even though the path is correct (#71254).
+ */
+export const commitWorkspaceCwdForSelectedSession = (cwd: string) => {
+  setCurrentCwd(cwd)
+  setWorkspaceCwdOwner($selectedStoredSessionId.get())
+}
+
+/** True when `$currentCwd` is known to describe the selected conversation. */
+export const workspaceCwdBelongsToSelectedSession = (): boolean =>
+  ($workspaceCwdOwner.get() ?? null) === ($selectedStoredSessionId.get() ?? null)
 
 export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number => {
   const generation = $newChatWorkspaceTargetGeneration.get() + 1

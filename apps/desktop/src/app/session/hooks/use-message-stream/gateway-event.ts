@@ -46,6 +46,8 @@ import {
   $currentCwd,
   $currentModel,
   $currentProvider,
+  $selectedStoredSessionId,
+  $sessions,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
@@ -57,6 +59,7 @@ import {
   setMessages,
   setSessions,
   setTurnStartedAt,
+  setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
 import { pruneDelegateFallbackSubagents, pruneFinishedSessionSubagents, upsertSubagent } from '@/store/subagents'
@@ -76,6 +79,31 @@ import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, 
 
 function firstBillingLine(text: string): string {
   return (text || '').split('\n')[0]?.trim() ?? ''
+}
+
+/**
+ * Whether a `session.info` payload's `stored_session_id` may be treated as the
+ * selected conversation's, so its cwd can be claimed for it (#71254).
+ *
+ * Absent is not the same as different: the backend omits the id on a
+ * not-yet-built (`lazy`) session, and refusing there would leave the workspace
+ * marked un-re-homed for the rest of the conversation. Matching goes through the
+ * lineage (see `sessionMatchesStoredId`) so a compression-rotated tip and the
+ * root the selection may hold still read as one conversation.
+ */
+function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined): boolean {
+  const infoStoredSessionId = storedSessionId?.trim() || null
+  const selected = $selectedStoredSessionId.get() ?? null
+
+  if (!infoStoredSessionId || !selected || infoStoredSessionId === selected) {
+    return true
+  }
+
+  // Either id may be the live tip or the lineage root, so ask whether ONE row
+  // answers to both rather than assuming which side rotated.
+  return $sessions
+    .get()
+    .some(session => sessionMatchesStoredId(session, infoStoredSessionId) && sessionMatchesStoredId(session, selected))
 }
 
 /**
@@ -387,6 +415,28 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
             lastCwdInfoSessionRef.current = sessionId
             setCurrentCwd(payload.cwd)
+
+            // This is the backend reporting the ACTIVE session's real workspace,
+            // so the selected conversation owns the path we just wrote. Without
+            // the claim the marker keeps naming whoever owned the cwd before —
+            // including the unowned state a detached resume leaves behind — and
+            // the next workspace-derived refresh is withheld, blanking the rail
+            // against a folder the backend has just confirmed (#71254).
+            //
+            // An id that names a DIFFERENT conversation is never claimable (a
+            // background session's info must not re-home the foreground). An
+            // absent id is the active session's own, which is what `apply`
+            // already scoped this block to.
+            //
+            // "Different" has to be judged through the lineage, not raw string
+            // equality: the backend id is the live session_key, which auto-
+            // compression rotates to the continuation tip, while a selection made
+            // from a pinned row holds the stable lineage root. Comparing those
+            // literally reads the same conversation as a stranger, refuses the
+            // claim, and leaves the withheld rail blank for the rest of the chat.
+            if (sessionInfoDescribesSelectedSession(payload.stored_session_id)) {
+              setWorkspaceCwdOwner($selectedStoredSessionId.get())
+            }
 
             if (cwdMoved && sameSession) {
               void followActiveSessionCwd(payload.cwd)
