@@ -104,6 +104,7 @@ import {
   MESSAGING_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
+  SIGIL_ROUTE,
   SKILLS_ROUTE
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
@@ -167,6 +168,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="files" {...props} />,
     route: ARTIFACTS_ROUTE,
     keybindActionId: 'nav.artifacts'
+  },
+  {
+    id: 'sigil',
+    label: 'Sigil',
+    icon: props => <Codicon name="shield" {...props} />,
+    route: SIGIL_ROUTE
   }
 ]
 
