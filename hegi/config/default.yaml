@@ -48,8 +48,37 @@ memory:
   auto_commit: false
   auto_draft: false
   require_professor_approval: true
-  professor_user_ids: []
+  professor_user_ids:
+    - "8610230220"
   default_project: ""
+  approval:
+    enabled: true
+    cli: ""
+    queue_root: ""
+    forest_cli: ""
+    forest_root: ""
+    backup_script: ""
+    timeout_seconds: 120
+    allow_commit_after_explicit_remember_command: true
+    allow_autonomous_commit: false
+    require_reply_or_meeting_id: true
+    require_fresh_search: true
+    require_draft_validation: true
+    require_post_commit_validation: true
+    require_audit: true
+    require_index: true
+    require_backup: true
+  commands:
+    draft_only:
+      - "초안 만들어"
+    approve_and_commit:
+      - "기억해"
+      - "기억 승인해"
+      - "승인하고 저장해"
+    merge_existing:
+      - "기존 기억에 합쳐"
+    reject:
+      - "기억하지 마"
 
 daemon:
   poll_seconds: 60

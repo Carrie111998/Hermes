@@ -45,7 +45,54 @@
           "items": {"type": ["string", "integer"]},
           "minItems": 1
         },
-        "default_project": {"type": "string", "minLength": 1}
+        "default_project": {"type": "string", "minLength": 1},
+        "approval": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "allow_commit_after_explicit_remember_command",
+            "allow_autonomous_commit",
+            "require_reply_or_meeting_id",
+            "require_fresh_search",
+            "require_draft_validation",
+            "require_post_commit_validation",
+            "require_audit",
+            "require_index",
+            "require_backup"
+          ],
+          "properties": {
+            "enabled": {"const": true},
+            "cli": {"type": "string"},
+            "queue_root": {"type": "string"},
+            "forest_cli": {"type": "string"},
+            "forest_root": {"type": "string"},
+            "backup_script": {"type": "string"},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "allow_commit_after_explicit_remember_command": {"const": true},
+            "allow_autonomous_commit": {"const": false},
+            "require_reply_or_meeting_id": {"const": true},
+            "require_fresh_search": {"const": true},
+            "require_draft_validation": {"const": true},
+            "require_post_commit_validation": {"const": true},
+            "require_audit": {"const": true},
+            "require_index": {"const": true},
+            "require_backup": {"const": true}
+          }
+        },
+        "commands": {
+          "type": "object",
+          "required": [
+            "draft_only",
+            "approve_and_commit",
+            "merge_existing",
+            "reject"
+          ],
+          "additionalProperties": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1
+          }
+        }
       }
     }
   }

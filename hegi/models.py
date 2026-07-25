@@ -136,6 +136,7 @@ class MemoryEvaluation:
     duplicate_targets: list[str] = field(default_factory=list)
     novelty_basis: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    search_recall_warning: bool = False
 
 
 @dataclass(slots=True)

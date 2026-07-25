@@ -56,6 +56,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "require_professor_approval": True,
         "professor_user_ids": [],
         "default_project": "",
+        "approval": {
+            "enabled": True,
+            "cli": "",
+            "queue_root": "",
+            "forest_cli": "",
+            "forest_root": "",
+            "backup_script": "",
+            "timeout_seconds": 120,
+            "allow_commit_after_explicit_remember_command": True,
+            "allow_autonomous_commit": False,
+            "require_reply_or_meeting_id": True,
+            "require_fresh_search": True,
+            "require_draft_validation": True,
+            "require_post_commit_validation": True,
+            "require_audit": True,
+            "require_index": True,
+            "require_backup": True,
+        },
+        "commands": {
+            "draft_only": ["초안 만들어"],
+            "approve_and_commit": ["기억해", "기억 승인해", "승인하고 저장해"],
+            "merge_existing": ["기존 기억에 합쳐"],
+            "reject": ["기억하지 마"],
+        },
     },
     "daemon": {"poll_seconds": 60},
     "reports": {"telegram": True},
@@ -213,6 +237,47 @@ def validate_config(config: HegiConfig, *, require_runtime: bool = False) -> lis
         errors.append("memory.professor_user_ids가 비어 있습니다.")
     if not str(memory.get("default_project", "")).strip():
         errors.append("memory.default_project가 비어 있습니다.")
+    approval = memory.get("approval", {})
+    if not isinstance(approval, dict):
+        errors.append("memory.approval은 mapping이어야 합니다.")
+        approval = {}
+    if approval.get("allow_autonomous_commit"):
+        errors.append(
+            "memory.approval.allow_autonomous_commit은 true일 수 없습니다."
+        )
+    if not approval.get("enabled", False):
+        errors.append("memory.approval.enabled는 true여야 합니다.")
+    required_approval_flags = (
+        "allow_commit_after_explicit_remember_command",
+        "require_reply_or_meeting_id",
+        "require_fresh_search",
+        "require_draft_validation",
+        "require_post_commit_validation",
+        "require_audit",
+        "require_index",
+        "require_backup",
+    )
+    for key in required_approval_flags:
+        if not approval.get(key, False):
+            errors.append(f"memory.approval.{key}는 true여야 합니다.")
+    commands = memory.get("commands", {})
+    if not isinstance(commands, dict):
+        errors.append("memory.commands는 mapping이어야 합니다.")
+    else:
+        for key in ("draft_only", "approve_and_commit", "merge_existing", "reject"):
+            phrases = commands.get(key)
+            if not isinstance(phrases, list) or not any(
+                str(item).strip() for item in phrases
+            ):
+                errors.append(f"memory.commands.{key}가 비어 있습니다.")
+    approval_cli = str(approval.get("cli", "")).strip()
+    if approval_cli and require_runtime and not Path(approval_cli).expanduser().is_file():
+        errors.append(f"memory.approval.cli가 없습니다: {approval_cli}")
+    if require_runtime:
+        for key in ("forest_cli", "forest_root", "backup_script"):
+            value = str(approval.get(key, "")).strip()
+            if value and not Path(value).expanduser().exists():
+                errors.append(f"memory.approval.{key}가 없습니다: {value}")
     if require_runtime:
         for agent in config.agents:
             if not agent.db_path.is_file():

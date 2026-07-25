@@ -40,7 +40,7 @@ python -m hegi status
 `daemon.lock`의 `flock`과 PID identity 검사로 중복 실행 및 PID 재사용을 막는다.
 비정상 종료 뒤 stale PID가 남아도 다음 시작에서 복구한다.
 
-## Telegram 승인과 Draft
+## Telegram 승인과 one-command commit
 
 교수가 회의록에 `기억해` 또는 `초안 만들어`라고 답하면 Telegram
 `pre_gateway_dispatch` plugin이 메시지를 일반 agent turn보다 먼저 선점한다. 회의록
@@ -58,8 +58,30 @@ python -m hegi approve \
   --message-id TELEGRAM_MESSAGE_ID
 ```
 
-`--project`를 생략하면 자동 탐지된 `memory.default_project`를 사용한다. 두 경로 모두
-Memory Forest를 다시 검색한 뒤 pending STM Draft만 만든다. Commit은 없다.
+`--project`를 생략하면 자동 탐지된 `memory.default_project`를 사용한다.
+
+- `초안 만들어`: fresh search → Draft → Draft validation, pending에서 정지
+- `기억해`: fresh search → Draft → validation → approve → commit → validate →
+  audit → index → backup
+- `기존 기억에 합쳐`: 병합 대상을 보고하고 pending merge Draft에서 정지
+- `기억하지 마`: meeting을 rejected로 기록하고 재제안을 차단
+- `기억 승인해` / `승인하고 저장해`: 같은 meeting의 pending Draft를 연결해 저장
+
+approval worker는 다음 실제 실행 경계를 사용한다.
+
+```text
+memory-forest-approve show <draft_id>
+memory-forest-approve approve <draft_id> --no-commit
+memory-forest-approve commit <draft_id>
+memory-forest validate <forest_root>
+memory-forest audit <forest_root>
+memory-forest index <forest_root>
+backup-memory-forest.sh
+```
+
+`memory.approval.cli`, `forest_cli`, `forest_root`, `backup_script`는 `doctor`의
+runtime 검사를 통과해야 한다. `allow_autonomous_commit: true` 또는
+`require_professor_approval: false`는 설정 오류다.
 
 ## 중지와 롤백
 

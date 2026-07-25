@@ -23,6 +23,8 @@ memory:
   auto_commit: true
   auto_draft: true
   require_professor_approval: false
+  approval:
+    allow_autonomous_commit: true
 """,
         encoding="utf-8",
     )
@@ -30,6 +32,39 @@ memory:
     assert any("auto_commit" in error for error in errors)
     assert any("auto_draft" in error for error in errors)
     assert any("require_professor_approval" in error for error in errors)
+    assert any("allow_autonomous_commit" in error for error in errors)
+
+
+def test_existing_state_database_migrates_approval_workflow_columns(tmp_path):
+    path = tmp_path / "legacy.db"
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE approval_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            meeting_id TEXT NOT NULL,
+            platform_message_id TEXT NOT NULL UNIQUE,
+            project TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT,
+            last_error TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = StateStore(path)
+    with store.connect() as migrated:
+        columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(approval_jobs)").fetchall()
+        }
+    assert {"workflow_state", "draft_id", "idempotency_key", "memory_id"} <= columns
 
 
 def test_state_delivery_is_idempotent_and_dead_letter_is_durable(tmp_path):

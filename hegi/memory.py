@@ -200,19 +200,82 @@ class MemoryEvaluator:
 
 
 _COMMANDS = {
+    "승인하지 마": "reject",
+    "승인하지마": "reject",
     "기억해": "remember",
+    "기억해줘": "remember",
+    "이거 기억해줘": "remember",
+    "기억 승인해": "approve",
+    "승인하고 저장해": "approve",
+    "기억으로 확정해": "approve",
+    "이 회의 승인하고 저장해": "approve",
     "초안 만들어": "draft",
+    "승인한다고": "approve",
+    "승인한다": "approve",
+    "승인해": "approve",
+    "승인": "approve",
+    "approve": "approve",
     "기존 기억에 합쳐": "merge",
     "기억하지 마": "reject",
+    "취소": "reject",
+    "반려": "reject",
 }
 
 
-def parse_approval_command(text: str) -> str | None:
+def parse_approval_command(
+    text: str, commands: dict[str, Any] | None = None
+) -> str | None:
     normalized = re.sub(r"\s+", " ", text).strip()
-    for phrase, command in _COMMANDS.items():
-        if phrase in normalized:
-            return command
-    return None
+    mention = re.match(r"^@(\S+)\s*", normalized)
+    if mention:
+        if mention.group(1).casefold() not in {
+            "헤기",
+            "기억관",
+            "memorycurator",
+        }:
+            return None
+        normalized = normalized[mention.end() :].strip()
+    normalized = re.sub(
+        r"\s+meeting[_\s-]*id\s*[:=]\s*[A-Za-z0-9._:-]+\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip()
+    phrases = dict(_COMMANDS)
+    if isinstance(commands, dict):
+        configured_groups = {
+            "draft_only": "draft",
+            "approve_and_commit": "remember",
+            "merge_existing": "merge",
+            "reject": "reject",
+        }
+        for group, command in configured_groups.items():
+            values = commands.get(group, [])
+            if isinstance(values, list):
+                for value in values:
+                    phrase = re.sub(r"\s+", " ", str(value)).strip()
+                    if phrase:
+                        phrases.setdefault(phrase, command)
+    return phrases.get(normalized)
+
+
+def validate_draft_payload(draft: dict[str, Any]) -> None:
+    nested = draft.get("structuredContent")
+    payload = nested if isinstance(nested, dict) else draft
+    draft_id = payload.get("draft_id")
+    if not str(draft_id or "").strip():
+        raise ValueError("Draft ID가 비어 있습니다.")
+    for key in ("title", "observed_facts", "current_judgment"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Draft {key}가 비어 있거나 문자열이 아닙니다.")
+        stripped = value.strip()
+        if (
+            (stripped.startswith("{") and stripped.endswith("}"))
+            or (stripped.startswith("[") and stripped.endswith("]"))
+            or re.search(r"\{\s*['\"][^}]+['\"]\s*:", stripped)
+        ):
+            raise ValueError(f"Draft {key}에 raw dict/JSON 표현이 포함되어 있습니다.")
 
 
 class DraftGate:
@@ -234,8 +297,10 @@ class DraftGate:
         text: str,
         user_id: str,
         platform_message_id: str | None,
+        canonical_command: str | None = None,
+        commands: dict[str, Any] | None = None,
     ) -> str:
-        command = parse_approval_command(text)
+        command = canonical_command or parse_approval_command(text, commands)
         if command is None:
             raise ValueError("지원하는 헤기 승인 명령이 아닙니다.")
         if not self.professor_user_ids or str(user_id) not in self.professor_user_ids:
@@ -269,7 +334,7 @@ class DraftGate:
                 """,
                 (minutes.meeting_id,),
             ).fetchone()
-        if approval is None or approval["command"] not in {"remember", "draft", "merge"}:
+        if approval is None or approval["command"] not in {"remember", "draft", "merge", "approve"}:
             raise PermissionError("교수의 명시적 승인 없이는 Draft를 생성할 수 없습니다.")
         for query in evaluation.searched_queries:
             self.backend.search(query)

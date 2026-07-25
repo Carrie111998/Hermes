@@ -45,7 +45,16 @@ def _minutes() -> MeetingMinutes:
 
 def test_approval_parser_recognizes_supported_phrases():
     assert parse_approval_command("@헤기 초안 만들어") == "draft"
+    assert parse_approval_command("@헤기 승인한다고") == "approve"
+    assert parse_approval_command("@헤기 approve") == "approve"
+    assert parse_approval_command("@헤기 이거 기억해줘") == "remember"
+    assert parse_approval_command("@헤기 이 회의 승인하고 저장해") == "approve"
+    assert parse_approval_command("@헤기 기억으로 확정해") == "approve"
+    assert parse_approval_command('@헤기 “기억해”라고 하지 않았어') is None
+    assert parse_approval_command("@헤기 승인하지 않음") is None
+    assert parse_approval_command("@다른봇 기억해") is None
     assert parse_approval_command("@헤기 기억하지 마") == "reject"
+    assert parse_approval_command("@헤기 승인하지 마") == "reject"
     assert parse_approval_command("그냥 확인") is None
 
 

@@ -173,10 +173,10 @@ memory:
     gate = DraftGate(pipeline.state, memory, professor_user_ids=["9001"])
     assert gate.approve(
         meeting_id=meeting_id,
-        text="기억해",
+        text="초안 만들어",
         user_id="9001",
         platform_message_id="approval-1",
-    ) == "remember"
+    ) == "draft"
     assert pipeline.state.enqueue_approval_job(
         meeting_id=meeting_id,
         platform_message_id="approval-1",
@@ -185,6 +185,17 @@ memory:
     approval_results = process_pending_approvals(
         pipeline.config,
         backend=memory,
+        approval_backend=SimpleNamespace(
+            show=lambda draft_id: {
+                "ok": True,
+                "draft": {
+                    "draft_id": draft_id,
+                    "title": "인공자연 연구회의",
+                    "observed_facts": "인공자연을 매체적 조건으로 다룸",
+                    "current_judgment": "논문 장의 핵심 개념으로 발전",
+                },
+            }
+        ),
         sender=lambda _token, _chat, text, **_kwargs: sent.append(text),
     )
 

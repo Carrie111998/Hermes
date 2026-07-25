@@ -55,6 +55,12 @@ def telegram_parts(minutes: MeetingMinutes) -> list[str]:
         f"중복 대상\n{_bullets(memory.duplicate_targets, 6)}\n"
         f"신규성 근거\n{_bullets(memory.novelty_basis, 6)}\n"
         f"판정 이유\n{_bullets(memory.reasons, 6)}"
+        + (
+            "\n\n⚠️ 키워드 검색 결과가 충분하지 않아 "
+            "중복 판단의 신뢰도가 낮습니다."
+            if memory.search_recall_warning
+            else ""
+        )
         if memory
         else "Memory Evaluation 미실행"
     )
@@ -73,7 +79,7 @@ def telegram_parts(minutes: MeetingMinutes) -> list[str]:
         f"Action Items\n{_bullets(actions)}",
         f"4/4 Memory Evaluation · {meeting}\n\n{memory_text}\n\n"
         "@헤기 기억해\n@헤기 초안 만들어\n@헤기 기존 기억에 합쳐\n@헤기 기억하지 마\n\n"
-        "자동 Commit은 수행하지 않습니다.",
+        "approve/commit은 교수님의 인증된 명시적 승인 명령이 있을 때만 수행합니다.",
     ]
 
 

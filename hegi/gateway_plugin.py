@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import re
 from typing import Any
 
 from .approval import process_pending_approvals
 from .config import load_config
 from .memory import DraftGate, MCPMemoryBackend, parse_approval_command
 from .state import StateStore
+
+
+_APPROVAL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="hegi-approval-worker"
+)
 
 
 def _platform_name(event: Any) -> str:
@@ -38,22 +45,33 @@ def _meeting_id(state: StateStore, event: Any) -> str | None:
         matched = state.meeting_for_report_message(str(reply_id))
         if matched:
             return matched
-    return state.latest_reported_meeting()
+    text = str(getattr(event, "text", "") or "")
+    explicit = re.search(
+        r"\bmeeting[_\s-]*id\s*[:=]\s*([A-Za-z0-9._:-]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return explicit.group(1) if explicit else None
+
+
+def _process_pending_background(config: Any) -> None:
+    _APPROVAL_EXECUTOR.submit(process_pending_approvals, config)
 
 
 def intercept_telegram_approval(
-    *, event: Any, gateway: Any, session_store: Any = None
+    *, event: Any, gateway: Any, session_store: Any = None, **_kwargs: Any
 ) -> dict[str, str] | None:
     del session_store
     if _platform_name(event) != "telegram":
         return None
     text = str(getattr(event, "text", "") or "")
-    command = parse_approval_command(text)
-    if command is None:
-        return None
     try:
         config = load_config()
     except Exception:
+        return None
+    memory = config.section("memory")
+    command = parse_approval_command(text, memory.get("commands"))
+    if command is None:
         return None
     source = getattr(event, "source", None)
     if (
@@ -67,7 +85,6 @@ def intercept_telegram_approval(
     if not meeting_id:
         _schedule_reply(gateway, event, "처리할 HEGI 회의록을 찾지 못했습니다.")
         return {"action": "skip", "reason": "hegi-no-meeting"}
-    memory = config.section("memory")
     backend = MCPMemoryBackend(
         read_server=str(memory.get("read_server", "memory-forest-read")),
         search_tool=str(memory.get("search_tool", "")),
@@ -89,8 +106,10 @@ def intercept_telegram_approval(
             text=text,
             user_id=user_id,
             platform_message_id=message_id or None,
+            canonical_command=command,
         )
         if approved == "reject":
+            state.mark_meeting_rejected(meeting_id)
             _schedule_reply(
                 gateway,
                 event,
@@ -115,16 +134,16 @@ def intercept_telegram_approval(
     _schedule_reply(
         gateway,
         event,
-        "HEGI 승인을 접수했습니다.\n"
+        "HEGI 교수 승인 이벤트를 접수했습니다.\n"
         f"회의: {meeting_id}\n"
-        "Memory Forest를 다시 검색한 뒤 STM Draft만 생성합니다.",
+        + (
+            "Memory Forest 재검색, Draft 검증, approve/commit 및 "
+            "validate/audit/index/backup을 순서대로 수행합니다."
+            if approved in {"remember", "approve"}
+            else "Memory Forest를 다시 검색한 뒤 pending STM Draft만 생성합니다."
+        ),
     )
-    try:
-        asyncio.get_running_loop().create_task(
-            asyncio.to_thread(process_pending_approvals, config)
-        )
-    except RuntimeError:
-        pass
+    _process_pending_background(config)
     return {"action": "skip", "reason": "hegi-approval-queued"}
 
 

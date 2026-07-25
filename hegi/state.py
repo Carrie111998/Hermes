@@ -77,11 +77,26 @@ CREATE TABLE IF NOT EXISTS approval_jobs (
     status TEXT NOT NULL,
     result_json TEXT,
     last_error TEXT,
+    workflow_state TEXT NOT NULL DEFAULT 'received',
+    draft_id TEXT,
+    idempotency_key TEXT,
+    memory_id TEXT,
+    memory_path TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_approval_jobs_status
 ON approval_jobs(status, created_at);
+CREATE TABLE IF NOT EXISTS approval_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    details_json TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(job_id) REFERENCES approval_jobs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_transitions_job
+ON approval_transitions(job_id, id);
 CREATE TABLE IF NOT EXISTS action_items (
     action_id TEXT PRIMARY KEY,
     meeting_id TEXT NOT NULL,
@@ -101,6 +116,40 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_approval_jobs(connection)
+
+    @staticmethod
+    def _migrate_approval_jobs(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(approval_jobs)").fetchall()
+        }
+        additions = {
+            "workflow_state": "TEXT NOT NULL DEFAULT 'received'",
+            "draft_id": "TEXT",
+            "idempotency_key": "TEXT",
+            "memory_id": "TEXT",
+            "memory_path": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE approval_jobs ADD COLUMN {name} {definition}"
+                )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_jobs_idempotency
+            ON approval_jobs(idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_jobs_committed_meeting
+            ON approval_jobs(meeting_id)
+            WHERE memory_id IS NOT NULL
+            """
+        )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -334,7 +383,22 @@ class StateStore:
         project: str,
     ) -> bool:
         now = time.time()
-        with self.connect() as connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1 FROM approval_jobs
+                WHERE meeting_id=? AND status IN ('pending', 'processing')
+                LIMIT 1
+                """,
+                (meeting_id,),
+            ).fetchone()
+            if active is not None:
+                connection.rollback()
+                return False
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO approval_jobs(
@@ -344,7 +408,119 @@ class StateStore:
                 """,
                 (meeting_id, platform_message_id, project, now, now),
             )
-        return cursor.rowcount == 1
+            connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def committed_approval_for_meeting(
+        self, meeting_id: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM approval_jobs
+                WHERE meeting_id=? AND memory_id IS NOT NULL
+                LIMIT 1
+                """,
+                (meeting_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def pending_drafts_for_meeting(self, meeting_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM approval_jobs
+                WHERE meeting_id=? AND draft_id IS NOT NULL
+                  AND memory_id IS NULL
+                  AND workflow_state IN ('draft_created', 'draft_validated')
+                ORDER BY created_at DESC
+                """,
+                (meeting_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def approval_job_for_meeting(self, meeting_id: str) -> dict[str, Any] | None:
+        query = """
+            SELECT * FROM approval_jobs
+            WHERE meeting_id=? AND draft_id IS NOT NULL
+        """
+        query += " ORDER BY created_at DESC LIMIT 1"
+        with self.connect() as connection:
+            row = connection.execute(query, (meeting_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_approval_workflow(
+        self,
+        job_id: int,
+        state: str,
+        *,
+        details: dict[str, Any] | None = None,
+        draft_id: str | None = None,
+        idempotency_key: str | None = None,
+        memory_id: str | None = None,
+        memory_path: str | None = None,
+    ) -> None:
+        now = time.time()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE approval_jobs SET workflow_state=?,
+                    draft_id=COALESCE(?, draft_id),
+                    idempotency_key=COALESCE(?, idempotency_key),
+                    memory_id=COALESCE(?, memory_id),
+                    memory_path=COALESCE(?, memory_path),
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    state,
+                    draft_id,
+                    idempotency_key,
+                    memory_id,
+                    memory_path,
+                    now,
+                    job_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO approval_transitions(job_id, state, details_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    state,
+                    json.dumps(details, ensure_ascii=False) if details else None,
+                    now,
+                ),
+            )
+
+    def approval_transitions(self, job_id: int) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT state FROM approval_transitions
+                WHERE job_id=? ORDER BY id
+                """,
+                (job_id,),
+            ).fetchall()
+        return [str(row["state"]) for row in rows]
+
+    def resume_recoverable_approval_jobs(self) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE approval_jobs SET status='pending', updated_at=?
+                WHERE status='failed'
+                  AND workflow_state IN ('approved', 'committed', 'post_commit_failed')
+                """,
+                (time.time(),),
+            )
 
     def claim_approval_job(
         self, *, stale_after_seconds: int = 300
@@ -410,6 +586,9 @@ class StateStore:
                     job_id,
                 ),
             )
+
+    def mark_meeting_rejected(self, meeting_id: str) -> None:
+        self.update_episode(meeting_id, status="rejected")
 
     def meeting_for_report_message(
         self, platform_message_id: str
