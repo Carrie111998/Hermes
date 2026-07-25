@@ -227,15 +227,22 @@ class CompressionCommitFence:
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
         self._last_progress = time.monotonic()
+        self._progress_sequence = 0
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
 
         Called from the compression worker thread; read by async waiters via
-        :meth:`seconds_since_progress`. A bare float store is atomic in
-        CPython, so no lock is needed.
+        :meth:`seconds_since_progress`. CPython serializes these simple field
+        updates under the GIL; waiters use the monotonic sequence to avoid
+        timing-boundary false timeouts when a token lands near a deadline.
         """
         self._last_progress = time.monotonic()
+        self._progress_sequence += 1
+
+    def progress_sequence(self) -> int:
+        """Return the monotonic count of worker progress notifications."""
+        return self._progress_sequence
 
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""

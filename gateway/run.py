@@ -13470,13 +13470,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
-                                    _hyg_future = loop.run_in_executor(
-                                        None,
-                                        lambda: _hyg_agent._compress_context(
+                                    _hyg_worker_started = threading.Event()
+
+                                    def _run_hygiene_compression():
+                                        # Executor pools can be briefly saturated. Queueing
+                                        # delay is not model inactivity: mark the first real
+                                        # worker instruction so the async waiter does not
+                                        # cancel a healthy compression before it starts.
+                                        _hyg_worker_started.set()
+                                        _hyg_commit_fence.touch_progress()
+                                        return _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
-                                        ),
+                                        )
+
+                                    _hyg_future = loop.run_in_executor(
+                                        None,
+                                        _run_hygiene_compression,
                                     )
                                     try:
                                         # Progress-aware wait: the timeout is an
@@ -13491,18 +13502,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # a degenerate trickle stream can't hold
                                         # the turn forever.
                                         _hyg_wait_started = time.monotonic()
+                                        # Sub-second inactivity windows are below the
+                                        # reliable scheduling granularity of a busy
+                                        # process/thread pool. Keep the configured total
+                                        # ceiling authoritative while flooring each idle
+                                        # observation window to avoid false hangs.
+                                        _hyg_inactivity_window = max(
+                                            _hyg_timeout_seconds, 0.5
+                                        )
                                         while True:
+                                            _progress_before_wait = (
+                                                _hyg_commit_fence.progress_sequence()
+                                            )
+                                            _hyg_remaining = max(
+                                                0.001,
+                                                _hyg_total_ceiling_seconds
+                                                - (time.monotonic() - _hyg_wait_started),
+                                            )
+                                            _hyg_wait_window = min(
+                                                _hyg_inactivity_window,
+                                                _hyg_remaining,
+                                            )
                                             try:
                                                 _compressed, _ = await asyncio.wait_for(
                                                     asyncio.shield(_hyg_future),
-                                                    timeout=_hyg_timeout_seconds,
+                                                    timeout=_hyg_wait_window,
                                                 )
                                                 break
                                             except asyncio.TimeoutError:
                                                 _hyg_waited = time.monotonic() - _hyg_wait_started
                                                 _idle = _hyg_commit_fence.seconds_since_progress()
                                                 if (
-                                                    _idle < _hyg_timeout_seconds
+                                                    (
+                                                        not _hyg_worker_started.is_set()
+                                                        or _hyg_commit_fence.progress_sequence()
+                                                        != _progress_before_wait
+                                                        or _idle < _hyg_inactivity_window
+                                                    )
                                                     and _hyg_waited < _hyg_total_ceiling_seconds
                                                 ):
                                                     logger.info(

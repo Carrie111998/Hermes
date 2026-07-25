@@ -1551,6 +1551,68 @@ async def test_hygiene_slow_but_streaming_worker_survives_past_timeout(
 
 
 @pytest.mark.asyncio
+async def test_hygiene_executor_queue_delay_is_not_model_inactivity(
+    monkeypatch, tmp_path
+):
+    """A queued executor job has not had a chance to report model progress.
+
+    Brief pool saturation must not cancel compression before its worker starts;
+    the total ceiling still bounds a queue that never drains.
+    """
+
+    class QueuedCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._print_fn = None
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            if commit_fence is not None and not commit_fence.begin_commit():
+                return (messages, None)
+            try:
+                self.session_id = f"{self.session_id}_compressed"
+                return ([{"role": "assistant", "content": "compressed"}], None)
+            finally:
+                if commit_fence is not None:
+                    commit_fence.finish_commit()
+
+    loop = asyncio.get_running_loop()
+    original_run_in_executor = loop.run_in_executor
+
+    def delayed_run_in_executor(executor, func, *args):
+        if getattr(func, "__name__", "") == "_run_hygiene_compression":
+            def delayed_worker():
+                time.sleep(0.3)
+                return func(*args)
+
+            return original_run_in_executor(executor, delayed_worker)
+        return original_run_in_executor(executor, func, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", delayed_run_in_executor)
+    runner, adapter, event = _make_progress_runner(
+        monkeypatch, tmp_path, QueuedCompressAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_timeout_seconds: 0.1\n"
+        "  hygiene_total_ceiling_seconds: 2\n"
+        "  hygiene_failure_cooldown_seconds: 120\n",
+    )
+    runner._hygiene_compression_failure_cooldowns = {}
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert QueuedCompressAgent.last_instance is not None
+    assert QueuedCompressAgent.last_instance.session_id.endswith("_compressed")
+    assert not [s for s in adapter.sent if "Context compression timed out" in s["content"]]
+    assert "sess-progress" not in runner._hygiene_compression_failure_cooldowns
+
+
+@pytest.mark.asyncio
 async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
     monkeypatch, tmp_path
 ):
