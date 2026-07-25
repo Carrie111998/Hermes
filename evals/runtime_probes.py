@@ -9,8 +9,10 @@ paths work.
 
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,20 +24,158 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 ProbeResult = dict[str, Any]
 
 
+def _fail(error: str) -> ProbeResult:
+    """Return the canonical fail-closed result shape."""
+    return {
+        "pass": False,
+        "api_calls": 0,
+        "production_modules": [],
+        "details": {"error": error},
+    }
+
+
+def _validate_result(result: Any) -> ProbeResult:
+    """Validate a probe result before the runner is allowed to trust it."""
+    if not isinstance(result, dict):
+        return _fail("runtime probe must return a dict")
+
+    passed = result.get("pass")
+    if type(passed) is not bool:
+        return _fail("runtime probe 'pass' must be a boolean")
+
+    api_calls = result.get("api_calls")
+    if type(api_calls) is not int or api_calls != 0:
+        return _fail("runtime probe must report integer zero API calls")
+
+    modules = result.get("production_modules")
+    if not isinstance(modules, list) or any(
+        not isinstance(module, str) or not module.strip() for module in modules
+    ):
+        return _fail(
+            "runtime probe 'production_modules' must be a list of non-empty strings"
+        )
+    if passed and not modules:
+        return _fail("a passing runtime probe must name production_modules")
+
+    details = result.get("details")
+    if not isinstance(details, dict):
+        return _fail("runtime probe 'details' must be a dict")
+
+    try:
+        json.dumps(result, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        return _fail(f"runtime probe result must be JSON-serializable: {exc}")
+
+    return dict(result)
+
+
+def _unique_task_id(prefix: str) -> str:
+    """Return a collision-resistant task id for process-global file-tool state."""
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def _cleanup_file_task(task_id: str, workspace: Path) -> None:
+    """Remove only state created for one probe task, preserving other callers."""
+    from tools import file_tools, terminal_tool
+    from tools.file_state import get_registry
+
+    # The probe registers an isolation-signalling env_type override, so this
+    # task id cannot collapse to the shared "default" environment.
+    terminal_tool.cleanup_vm(task_id)
+    terminal_tool.clear_task_env_overrides(task_id)
+    file_tools.clear_file_ops_cache(task_id)
+    with file_tools._read_tracker_lock:
+        file_tools._read_tracker.pop(task_id, None)
+    with file_tools._patch_failure_lock:
+        file_tools._patch_failure_tracker.pop(task_id, None)
+
+    registry = get_registry()
+    workspace_root = workspace.resolve()
+    with registry._state_lock:
+        registry._reads.pop(task_id, None)
+        for path, (writer_task_id, _timestamp) in list(registry._last_writer.items()):
+            if writer_task_id == task_id:
+                registry._last_writer.pop(path, None)
+    with registry._meta_lock:
+        for path in list(registry._path_locks):
+            try:
+                Path(path).resolve().relative_to(workspace_root)
+            except (OSError, ValueError):
+                continue
+            registry._path_locks.pop(path, None)
+
+
+@contextmanager
+def _isolated_file_task(workspace: Path, prefix: str) -> Iterator[str]:
+    """Yield a unique local file-tool task without consulting external backends."""
+    import time
+
+    from tools import file_tools, terminal_tool
+    from tools.environments.local import LocalEnvironment
+
+    task_id = _unique_task_id(prefix)
+    previous_max_read_chars = file_tools._max_read_chars_cached
+    previous_config_resolved = file_tools._hermes_config_resolved
+    previous_config_loaded = file_tools._hermes_config_resolved_loaded
+    try:
+        terminal_tool.register_task_env_overrides(
+            task_id,
+            {"env_type": "local", "cwd": str(workspace)},
+        )
+        # Pre-seed a real production LocalEnvironment. file_tools will find this
+        # live environment and cannot inherit a process-level Docker/SSH/Modal
+        # backend or invoke the backend factory, preserving the zero-external-call
+        # Tier-1 contract even when the caller normally uses a remote terminal.
+        environment = LocalEnvironment(cwd=str(workspace), timeout=60)
+        with terminal_tool._env_lock:
+            terminal_tool._active_environments[task_id] = environment
+            terminal_tool._last_activity[task_id] = time.time()
+        yield task_id
+    finally:
+        try:
+            _cleanup_file_task(task_id, workspace)
+        finally:
+            file_tools._max_read_chars_cached = previous_max_read_chars
+            file_tools._hermes_config_resolved = previous_config_resolved
+            file_tools._hermes_config_resolved_loaded = previous_config_loaded
+
+
 @contextmanager
 def _isolated_runtime() -> Iterator[tuple[Path, Path]]:
-    """Yield isolated Hermes/workspace roots and clean both on exit."""
-    with tempfile.TemporaryDirectory(prefix="hermes-eval-home-") as home_raw:
-        home = Path(home_raw)
-        for name in ("memories", "skills", "sessions", "cron"):
-            (home / name).mkdir(parents=True, exist_ok=True)
-        workspace = home / "workspace with spaces"
-        workspace.mkdir()
-        token = set_hermes_home_override(home)
-        try:
-            yield home, workspace
-        finally:
-            reset_hermes_home_override(token)
+    """Yield isolated roots and restore profile-scoped config caches on exit."""
+    from hermes_cli import config as config_module
+
+    # Hold the official re-entrant config lock across snapshot → probe →
+    # restore. Without this, restoring a snapshot could erase a legitimate
+    # concurrent config read/write that landed while the probe was running.
+    with config_module._CONFIG_LOCK:
+        config_snapshots = {
+            "_LAST_EXPANDED_CONFIG_BY_PATH": copy.deepcopy(
+                config_module._LAST_EXPANDED_CONFIG_BY_PATH
+            ),
+            "_LOAD_CONFIG_CACHE": copy.deepcopy(config_module._LOAD_CONFIG_CACHE),
+            "_RAW_CONFIG_CACHE": copy.deepcopy(config_module._RAW_CONFIG_CACHE),
+        }
+        env_cache_snapshot = copy.deepcopy(config_module._env_cache)
+
+        with tempfile.TemporaryDirectory(prefix="hermes-eval-home-") as home_raw:
+            home = Path(home_raw)
+            for name in ("memories", "skills", "sessions", "cron"):
+                (home / name).mkdir(parents=True, exist_ok=True)
+            workspace = home / "workspace with spaces"
+            workspace.mkdir()
+            token = set_hermes_home_override(home)
+            try:
+                yield home, workspace
+            finally:
+                try:
+                    for name, snapshot in config_snapshots.items():
+                        cache = getattr(config_module, name)
+                        cache.clear()
+                        cache.update(snapshot)
+                    config_module._env_cache = env_cache_snapshot
+                finally:
+                    reset_hermes_home_override(token)
 
 
 def _pass(modules: list[str], **details: Any) -> ProbeResult:
@@ -85,9 +225,17 @@ def _probe_cost_cache() -> ProbeResult:
         import model_tools
         from agent.system_prompt import build_system_prompt_parts
 
-        # This probe mutates the process-global tool-definitions cache; clear it
-        # before and after so it leaves no probe-time state behind for anything
-        # else sharing this interpreter (other suites, the test session).
+        # Preserve exact caller state. A probe can run in the same interpreter
+        # as a live agent or another test, so "clear on exit" would destroy warm
+        # entries and the caller's last-resolved tool snapshot.
+        from tools import registry as registry_module
+
+        previous_cache = copy.deepcopy(model_tools._tool_defs_cache)
+        previous_tool_names = list(model_tools._last_resolved_tool_names)
+        with registry_module._check_fn_cache_lock:
+            previous_check_cache = dict(registry_module._check_fn_cache)
+            previous_last_good = dict(registry_module._check_fn_last_good)
+
         model_tools._clear_tool_defs_cache()
         try:
             first_tools = model_tools.get_tool_definitions(
@@ -134,6 +282,13 @@ def _probe_cost_cache() -> ProbeResult:
             }
         finally:
             model_tools._clear_tool_defs_cache()
+            model_tools._tool_defs_cache.update(previous_cache)
+            model_tools._last_resolved_tool_names = previous_tool_names
+            with registry_module._check_fn_cache_lock:
+                registry_module._check_fn_cache.clear()
+                registry_module._check_fn_cache.update(previous_check_cache)
+                registry_module._check_fn_last_good.clear()
+                registry_module._check_fn_last_good.update(previous_last_good)
 
         return _pass(
             ["agent.system_prompt", "model_tools"],
@@ -145,30 +300,31 @@ def _probe_cost_cache() -> ProbeResult:
 
 def _probe_subagent_verify() -> ProbeResult:
     """Exercise verifiable-summary spill and independent read-back support."""
-    with _isolated_runtime():
+    with _isolated_runtime() as (_home, workspace):
         from tools.delegate_tool import _trim_summary_with_footer
-        from tools.file_tools import clear_file_ops_cache, read_file_tool
+        from tools.file_tools import read_file_tool
 
-        unique_evidence = "verified-tail-evidence-9f52"
-        full_summary = "\n".join(
-            [f"subagent claim line {i}" for i in range(1_500)] + [unique_evidence]
-        )
-        trimmed, spill_path = _trim_summary_with_footer(
-            full_summary, cap=2_000, task_index=0
-        )
-        assert spill_path is not None
-        assert "SUMMARY TRUNCATED" in trimmed
-        assert "Full subagent output saved to:" in trimmed
-        # The trimmed head+tail the parent sees must retain the closing
-        # evidence line even though the middle is elided.
-        assert unique_evidence in trimmed
+        with _isolated_file_task(workspace, "eval-verify") as task_id:
+            unique_evidence = "verified-tail-evidence-9f52"
+            full_summary = "\n".join(
+                [f"subagent claim line {i}" for i in range(1_500)]
+                + [unique_evidence]
+            )
+            trimmed, spill_path = _trim_summary_with_footer(
+                full_summary, cap=2_000, task_index=0
+            )
+            assert spill_path is not None
+            assert "SUMMARY TRUNCATED" in trimmed
+            assert "Full subagent output saved to:" in trimmed
+            # The trimmed head+tail the parent sees must retain the closing
+            # evidence line even though the middle is elided.
+            assert unique_evidence in trimmed
 
-        try:
             # Read the tail of the spilled file directly (the production
             # read_file tool caps a single read at 2000 lines, so page to the
             # end via offset) and confirm the full text was preserved on disk.
             head = json.loads(
-                read_file_tool(spill_path, offset=1, limit=1, task_id="eval-verify")
+                read_file_tool(spill_path, offset=1, limit=1, task_id=task_id)
             )
             assert not head.get("error"), head
             total_lines = head["total_lines"]
@@ -177,13 +333,11 @@ def _probe_subagent_verify() -> ProbeResult:
                     spill_path,
                     offset=max(1, total_lines - 5),
                     limit=10,
-                    task_id="eval-verify",
+                    task_id=task_id,
                 )
             )
             assert not tail.get("error"), tail
             assert unique_evidence in tail["content"], tail
-        finally:
-            clear_file_ops_cache("eval-verify")
 
         return _pass(
             ["tools.delegate_tool", "tools.file_tools"],
@@ -237,13 +391,12 @@ def _probe_memory_recall() -> ProbeResult:
 def _probe_windows_reliability() -> ProbeResult:
     """Exercise production file tools with spaces, Unicode, and a deep path."""
     with _isolated_runtime() as (_home, workspace):
-        from tools.file_tools import clear_file_ops_cache, read_file_tool, write_file_tool
+        from tools.file_tools import read_file_tool, write_file_tool
 
         nested = workspace.joinpath(*[f"subdir_{i:02d}_long_name" for i in range(12)])
         target = nested / "اختبار_🖥️.txt"
         content = "مرحبا بالعالم 🎉\ndeep file content"
-        task_id = "eval-windows"
-        try:
+        with _isolated_file_task(workspace, "eval-windows") as task_id:
             written = json.loads(
                 write_file_tool(str(target), content, task_id=task_id)
             )
@@ -252,8 +405,6 @@ def _probe_windows_reliability() -> ProbeResult:
             assert not read_back.get("error")
             assert "مرحبا بالعالم 🎉" in read_back["content"]
             assert "deep file content" in read_back["content"]
-        finally:
-            clear_file_ops_cache(task_id)
 
         return _pass(
             ["tools.file_tools"],
@@ -272,25 +423,18 @@ _PROBES: dict[str, Callable[[], ProbeResult]] = {
 }
 
 
-def run_runtime_probe(name: str) -> ProbeResult:
+def run_runtime_probe(name: Any) -> ProbeResult:
     """Run a registered production-path probe, failing closed on any error."""
+    if not isinstance(name, str) or not name.strip():
+        return _fail("runtime probe name must be a non-empty string")
+    name = name.strip()
     probe = _PROBES.get(name)
     if probe is None:
-        return {
-            "pass": False,
-            "api_calls": 0,
-            "production_modules": [],
-            "details": {"error": f"unknown runtime probe: {name}"},
-        }
+        return _fail(f"unknown runtime probe: {name}")
     try:
-        return probe()
+        return _validate_result(probe())
     except Exception as exc:
-        return {
-            "pass": False,
-            "api_calls": 0,
-            "production_modules": [],
-            "details": {"error": f"{type(exc).__name__}: {exc}"},
-        }
+        return _fail(f"{type(exc).__name__}: {exc}")
 
 
 __all__ = ["run_runtime_probe"]

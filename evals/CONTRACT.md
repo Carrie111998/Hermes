@@ -61,14 +61,20 @@ that runs first, before any fixture grading, whenever the suite executes in
 
 A runtime probe:
 
+- runs only in `--deterministic-only` mode — live mode measures the agent/provider
+  path and does not add a second deterministic probe;
 - imports and calls **real production modules** (e.g. `tools.memory_tool`,
   `tools.delegate_tool`, `agent.system_prompt`, `model_tools`,
   `hermes_cli.config`, `tools.file_tools`);
 - creates an isolated `HERMES_HOME` and workspace via
-  `set_hermes_home_override`, and removes them on exit;
-- makes **zero** model/API calls (`api_calls == 0`);
-- **fails closed** — an unknown probe name, an assertion failure, or any raised
-  exception yields `{"pass": false}` with a captured `details.error`.
+  `set_hermes_home_override`, and restores prior process-global cache/tool state
+  on every exit path;
+- makes **zero** model/API calls (`api_calls` must be the integer `0`);
+- returns a JSON-safe result with Boolean `pass`, integer `api_calls`, a list of
+  production modules, and mapping `details`;
+- **fails closed** — an invalid/unknown probe name, malformed result, assertion
+  failure, or raised exception yields `{"pass": false}` with a captured
+  `details.error`.
 
 Probes are registered in `evals/runtime_probes.py::_PROBES` and invoked by the
 runner. When a suite declares a probe that does not pass, the runner records a

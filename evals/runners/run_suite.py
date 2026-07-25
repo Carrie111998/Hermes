@@ -157,30 +157,53 @@ def _restore_config_overrides(snapshot: Dict[str, Any]) -> None:
         CLI_CONFIG.pop("agent", None)
 
 
-def run_scenario_live(scenario: dict, provider: str, model: str) -> dict:
-    """Run a single scenario against a live AIAgent and return the result dict."""
-    from run_agent import AIAgent
+def _live_error(error: str) -> dict:
+    """Return the canonical live-scenario failure shape."""
+    return {
+        "error": error,
+        "final_response": "",
+        "messages": [],
+        "api_calls": 0,
+    }
 
-    config_overrides = scenario.get("config_overrides", {})
+
+def _live_api_calls(result: dict, agent: Any) -> int:
+    """Read a non-negative API count from the result, then the agent budget."""
+    result_count = result.get("api_calls")
+    if type(result_count) is int and result_count >= 0:
+        return result_count
+    budget = getattr(agent, "iteration_budget", None)
+    budget_count = getattr(budget, "used", 0)
+    return budget_count if type(budget_count) is int and budget_count >= 0 else 0
+
+
+def run_scenario_live(scenario: dict, provider: str, model: str) -> dict:
+    """Run one live scenario and contain all provider/agent failure paths."""
+    config_overrides_raw = scenario.get("config_overrides", {})
+    config_overrides = (
+        config_overrides_raw if isinstance(config_overrides_raw, dict) else {}
+    )
     overrides = _coerce_flat_overrides(config_overrides)
 
-    enabled_toolsets = scenario.get("enabled_toolsets", ["terminal", "file", "delegation"])
-    max_iterations = (
-        overrides.get("agent", {}).get("max_iterations")
-        or config_overrides.get("agent.max_iterations", 12)
+    enabled_toolsets = scenario.get(
+        "enabled_toolsets", ["terminal", "file", "delegation"]
     )
+    max_iterations = overrides.get("agent", {}).get("max_iterations", 12)
     skip_memory = scenario.get("skip_memory", True)
-
     skip_context = scenario.get("skip_context_files", True)
-    system_msg = scenario.get("system_message", None)
+    system_msg = scenario.get("system_message")
 
-
-    _cfg_snapshot = _apply_config_overrides(config_overrides)
+    cfg_snapshot = _apply_config_overrides(config_overrides)
+    agent = None
     try:
+        from run_agent import AIAgent
+
         agent = AIAgent(
             provider=provider,
             model=model,
-            enabled_toolsets=enabled_toolsets if isinstance(enabled_toolsets, list) else None,
+            enabled_toolsets=(
+                enabled_toolsets if isinstance(enabled_toolsets, list) else None
+            ),
             quiet_mode=True,
             save_trajectories=False,
             skip_context_files=skip_context,
@@ -188,49 +211,100 @@ def run_scenario_live(scenario: dict, provider: str, model: str) -> dict:
             platform="cli",
             max_iterations=max_iterations,
         )
+        raw_result = agent.run_conversation(
+            user_message=scenario["user_message"],
+            system_message=system_msg,
+        )
 
-        try:
-            result = agent.run_conversation(
-                user_message=scenario["user_message"],
-                system_message=system_msg,
-            )
-        except Exception as e:
+        if not isinstance(raw_result, dict):
             return {
-                "error": f"{type(e).__name__}: {e}",
-                "traceback": traceback.format_exc(),
-                "final_response": "",
+                "final_response": "" if raw_result is None else str(raw_result),
                 "messages": [],
                 "api_calls": 0,
-            }
-
-        if isinstance(result, dict):
-            return {
-                "final_response": result.get("final_response", "") or "",
-                "messages": result.get("messages", []) or [],
-                "api_calls": getattr(agent, "iteration_budget", None) and agent.iteration_budget.used or 0,
                 "error": None,
             }
+
+        messages = raw_result.get("messages", []) or []
+        if not isinstance(messages, list) or any(
+            not isinstance(message, dict) for message in messages
+        ):
+            return _live_error("agent result messages must be a list of mappings")
+
+        final_response_raw = raw_result.get("final_response", "")
+        final_response = (
+            "" if final_response_raw is None else str(final_response_raw)
+        )
+        error_raw = raw_result.get("error")
+        error = None if error_raw in (None, "") else str(error_raw)
+        if error is None and any(
+            raw_result.get(flag) is True
+            for flag in ("failed", "partial", "interrupted")
+        ):
+            error = "agent reported an incomplete or failed result without an error"
+        if error is None and raw_result.get("completed") is False:
+            error = "agent reported completed=false without an error"
+
         return {
-            "final_response": str(result),
-            "messages": [],
-            "api_calls": 0,
-            "error": None,
+            "final_response": final_response,
+            "messages": messages,
+            "api_calls": _live_api_calls(raw_result, agent),
+            "error": error,
+        }
+    except Exception as exc:
+        return {
+            **_live_error(f"{type(exc).__name__}: {exc}"),
+            "traceback": traceback.format_exc(),
         }
     finally:
-        _restore_config_overrides(_cfg_snapshot)
+        if agent is not None:
+            try:
+                agent.close()
+            except Exception:
+                pass
+        _restore_config_overrides(cfg_snapshot)
+
+
+def _rubric_failure(message: str) -> dict:
+    """Return the canonical fail-closed grade for an invalid rubric result."""
+    return {"pass": False, "score": 0.0, "details": {"rubric_error": message}}
+
+
+def _normalize_grade(raw_grade: Any) -> dict:
+    """Validate the rubric boundary so malformed plugins cannot pass or crash."""
+    if not isinstance(raw_grade, dict):
+        return _rubric_failure("rubric must return a dict")
+    if type(raw_grade.get("pass")) is not bool:
+        return _rubric_failure("rubric 'pass' must be a boolean")
+
+    score = raw_grade.get("score")
+    if type(score) not in {int, float} or not 0.0 <= float(score) <= 1.0:
+        return _rubric_failure("rubric 'score' must be a finite number from 0 to 1")
+    details = raw_grade.get("details")
+    if not isinstance(details, dict):
+        return _rubric_failure("rubric 'details' must be a dict")
+    try:
+        json.dumps(raw_grade, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        return _rubric_failure(f"rubric result must be JSON-serializable: {exc}")
+    return {
+        **raw_grade,
+        "pass": raw_grade["pass"],
+        "score": float(score),
+        "details": details,
+    }
 
 
 def grade_scenario(scenario: dict, result: dict, rubric_module) -> dict:
     """Score a scenario using its rubric or pass_conditions."""
     if rubric_module and hasattr(rubric_module, "grade"):
         try:
-            return rubric_module.grade(scenario, result)
+            return _normalize_grade(rubric_module.grade(scenario, result))
         except Exception as e:
-            return {"pass": False, "score": 0.0, "details": {"rubric_error": str(e)}}
+            return _rubric_failure(f"{type(e).__name__}: {e}")
 
     # Fallback: check pass_conditions directly
     conditions = scenario.get("pass_conditions", [])
-    if not conditions:
+    if not isinstance(conditions, list) or not conditions:
         return {
             "pass": False,
             "score": 0.0,
@@ -241,6 +315,9 @@ def grade_scenario(scenario: dict, result: dict, rubric_module) -> dict:
     details = {}
     unsupported_conditions = []
     for cond in conditions:
+        if not isinstance(cond, dict):
+            unsupported_conditions.append("<invalid>")
+            continue
         ctype = cond.get("type", "")
         if ctype == "delegate_call_count":
             count = _count_delegate_calls(result.get("messages", []))
@@ -281,6 +358,50 @@ def grade_scenario(scenario: dict, result: dict, rubric_module) -> dict:
     }
 
 
+def _deterministic_fixture_error(scenario: dict) -> Optional[str]:
+    """Return a deterministic-fixture contract error, or None when valid."""
+    if "_mock_messages" in scenario:
+        messages = scenario["_mock_messages"]
+        if not isinstance(messages, list):
+            return "_mock_messages must be a list"
+        if any(not isinstance(message, dict) for message in messages):
+            return "every _mock_messages entry must be a mapping"
+
+    if "_mock_final_response" in scenario and not isinstance(
+        scenario["_mock_final_response"], (str, type(None))
+    ):
+        return "_mock_final_response must be a string or null"
+
+    if "_mock_api_calls" in scenario:
+        api_calls = scenario["_mock_api_calls"]
+        if type(api_calls) is not int or api_calls < 0:
+            return "_mock_api_calls must be a non-negative integer"
+
+    if "_mock_api_call_snapshots" in scenario:
+        snapshots = scenario["_mock_api_call_snapshots"]
+        if not isinstance(snapshots, list):
+            return "_mock_api_call_snapshots must be a list"
+
+    try:
+        json.dumps(
+            {
+                key: scenario[key]
+                for key in (
+                    "_mock_messages",
+                    "_mock_final_response",
+                    "_mock_api_calls",
+                    "_mock_api_call_snapshots",
+                )
+                if key in scenario
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        return f"deterministic fixture must be JSON-serializable: {exc}"
+    return None
+
+
 def _count_delegate_calls(messages: list) -> int:
     """Count delegate_task tool calls in the message transcript."""
     count = 0
@@ -315,6 +436,40 @@ def _has_tool_error(messages: list) -> bool:
     return False
 
 
+def _error_report(
+    *,
+    suite_name: str,
+    error: str,
+    provider: str,
+    model: str,
+    deterministic_only: bool,
+    output_path: Optional[Path],
+) -> dict:
+    """Build and optionally persist the canonical fail-closed suite report."""
+    report = {
+        "suite": suite_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "provider": provider,
+        "model": model,
+        "deterministic_only": deterministic_only,
+        "error": error,
+        "total": 0,
+        "passed": 0,
+        "failed": 0,
+        "errored": 1,
+        "skipped": 0,
+        "pass_rate": 0.0,
+        "scenarios": [],
+    }
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    return report
+
+
 def run_suite(
     suite_path: Path,
     provider: str = "openrouter",
@@ -325,33 +480,76 @@ def run_suite(
 ) -> dict:
     """Run a full eval suite and return the report dict."""
     suite = load_yaml(suite_path)
-    suite_name = suite.get("name", suite_path.stem)
+    if not isinstance(suite, dict):
+        return _error_report(
+            suite_name=suite_path.stem,
+            error="suite root must be a mapping",
+            provider=provider,
+            model=model,
+            deterministic_only=deterministic_only,
+            output_path=output_path,
+        )
+
+    suite_name_raw = suite.get("name", suite_path.stem)
+    if not isinstance(suite_name_raw, str) or not suite_name_raw.strip():
+        return _error_report(
+            suite_name=suite_path.stem,
+            error="suite name must be a non-empty string",
+            provider=provider,
+            model=model,
+            deterministic_only=deterministic_only,
+            output_path=output_path,
+        )
+    suite_name = suite_name_raw.strip()
     scenarios = suite.get("scenarios", [])
+    if not isinstance(scenarios, list):
+        return _error_report(
+            suite_name=suite_name,
+            error="scenarios must be a list",
+            provider=provider,
+            model=model,
+            deterministic_only=deterministic_only,
+            output_path=output_path,
+        )
+
+    seen_ids: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        if not isinstance(scenario, dict):
+            shape_error = f"scenario {index} must be a mapping"
+        elif "description" in scenario and not isinstance(
+            scenario["description"], str
+        ):
+            shape_error = f"scenario {index} description must be a string"
+        elif not isinstance(scenario.get("user_message"), str):
+            shape_error = f"scenario {index} user_message must be a string"
+        else:
+            scenario_id = scenario.get("id", f"S{index}")
+            if not isinstance(scenario_id, str) or not scenario_id.strip():
+                shape_error = f"scenario {index} id must be a non-empty string"
+            elif scenario_id in seen_ids:
+                shape_error = f"duplicate scenario id: {scenario_id}"
+            else:
+                seen_ids.add(scenario_id)
+                continue
+        return _error_report(
+            suite_name=suite_name,
+            error=shape_error,
+            provider=provider,
+            model=model,
+            deterministic_only=deterministic_only,
+            output_path=output_path,
+        )
 
     if not scenarios:
         print(f"WARNING: No scenarios found in {suite_path}", file=sys.stderr)
-        report = {
-            "suite": suite_name,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "provider": provider,
-            "model": model,
-            "deterministic_only": deterministic_only,
-            "error": "no scenarios",
-            "total": 0,
-            "passed": 0,
-            "failed": 0,
-            "errored": 1,
-            "skipped": 0,
-            "pass_rate": 0.0,
-            "scenarios": [],
-        }
-        if output_path:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(
-                json.dumps(report, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        return report
+        return _error_report(
+            suite_name=suite_name,
+            error="no scenarios",
+            provider=provider,
+            model=model,
+            deterministic_only=deterministic_only,
+            output_path=output_path,
+        )
 
     rubric = load_rubric(suite_name)
     results = []
@@ -365,11 +563,10 @@ def run_suite(
     # probe; otherwise a production regression could leave every YAML fixture
     # green.  Probes make no API calls and isolate HERMES_HOME/workspace state.
     runtime_probe = None
-    runtime_probe_name = suite.get("runtime_probe")
-    if runtime_probe_name:
+    if deterministic_only and "runtime_probe" in suite:
         from evals.runtime_probes import run_runtime_probe
 
-        runtime_probe = run_runtime_probe(str(runtime_probe_name))
+        runtime_probe = run_runtime_probe(suite.get("runtime_probe"))
         if not runtime_probe.get("pass"):
             errored += 1
 
@@ -430,6 +627,18 @@ def run_suite(
                             "set deterministic_skip"
                         )
                     },
+                    "api_calls": 0,
+                    "duration_s": round(time.time() - t0, 2),
+                })
+                continue
+            fixture_error = _deterministic_fixture_error(scenario)
+            if fixture_error:
+                errored += 1
+                results.append({
+                    "id": sid,
+                    "pass": False,
+                    "score": 0.0,
+                    "details": {"error": fixture_error},
                     "api_calls": 0,
                     "duration_s": round(time.time() - t0, 2),
                 })

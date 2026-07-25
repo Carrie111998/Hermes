@@ -315,8 +315,9 @@ python evals/runners/run_suite.py \
 - Whether the agent actually produces the expected tool-call patterns
 - Whether `pass_conditions` thresholds are correctly calibrated for a
   real model
-- Whether the system prompt is byte-stable (that requires live API-call
-  snapshots)
+- Live-provider behavior, latency, billing, or token usage. The `cost_cache`
+  runtime probe does verify local prompt/tool-schema byte stability, but only
+  live mode measures the provider's actual cache/accounting behavior.
 
 ### 3.2 Live mode (Tier 2)
 
