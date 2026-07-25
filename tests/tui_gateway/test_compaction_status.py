@@ -1,9 +1,9 @@
 """Auto-compaction status re-tagging for the desktop "Summarizing…" indicator.
 
-Auto-compaction reaches the gateway as a generic ``lifecycle`` status. The
-gateway re-tags it as ``kind="compacting"`` so drivers (the desktop app) can
-show an explicit summarizing indicator instead of the transcript appearing to
-silently reset mid-turn.
+Auto-compaction reaches the gateway as structured ``compression_progress``.
+The gateway re-tags it as ``kind="compacting"`` so drivers (the desktop app)
+can show an explicit summarizing indicator instead of the transcript appearing
+to silently reset mid-turn.
 """
 
 from __future__ import annotations
@@ -39,11 +39,11 @@ def _capture(server, monkeypatch):
     return events
 
 
-def test_compaction_lifecycle_is_retagged(server, monkeypatch):
+def test_compaction_progress_is_retagged(server, monkeypatch):
     from agent.conversation_compression import COMPACTION_STATUS
 
     events = _capture(server, monkeypatch)
-    server._status_update("sid", "lifecycle", COMPACTION_STATUS)
+    server._status_update("sid", "compression_progress", COMPACTION_STATUS)
 
     assert events == [{"kind": "compacting", "text": COMPACTION_STATUS}]
 
@@ -55,6 +55,7 @@ def test_compaction_completion_status_is_preserved(server, monkeypatch):
     server._status_update("sid", "compacted", COMPACTION_DONE_STATUS)
 
     assert events == [{"kind": "compacted", "text": COMPACTION_DONE_STATUS}]
+
 
 def test_other_lifecycle_status_stays_lifecycle(server, monkeypatch):
     events = _capture(server, monkeypatch)
@@ -70,12 +71,10 @@ def test_manual_compressing_kind_is_preserved(server, monkeypatch):
     assert events[0]["kind"] == "compressing"
 
 
-def test_compaction_status_contains_marker():
-    # Contract: the gateway matches COMPACTION_STATUS_MARKER inside the emitted
-    # status text. If the message is reworded, the marker must survive.
-    from agent.conversation_compression import (
-        COMPACTION_STATUS,
-        COMPACTION_STATUS_MARKER,
-    )
+def test_compaction_wording_alone_is_not_routing_authority(server, monkeypatch):
+    from agent.conversation_compression import COMPACTION_STATUS
 
-    assert COMPACTION_STATUS_MARKER in COMPACTION_STATUS
+    events = _capture(server, monkeypatch)
+    server._status_update("sid", "lifecycle", COMPACTION_STATUS)
+
+    assert events == [{"kind": "lifecycle", "text": COMPACTION_STATUS}]

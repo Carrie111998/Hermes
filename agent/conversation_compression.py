@@ -51,11 +51,9 @@ from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
 
-# Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
-# status as ``kind="compacting"`` (tui_gateway/server.py::_status_update), so
-# drivers like the desktop app can show an explicit "Summarizing…" indicator
-# instead of the transcript appearing to silently reset. Keep the marker phrase
-# intact if you reword COMPACTION_STATUS.
+# Stable human-facing phrase retained for compatibility with callers that
+# import it. Routing is carried by the structured ``compression_progress``
+# event type; gateways must not infer delivery policy from this wording.
 COMPACTION_STATUS_MARKER = "Compacting context"
 COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
