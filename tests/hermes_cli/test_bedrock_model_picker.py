@@ -240,6 +240,34 @@ class TestListAuthenticatedProvidersBedrock:
         assert calls["has_aws_credentials"] == 0
         assert all(p["slug"] != "bedrock" for p in providers)
 
+    def test_explicit_cloud_probe_discovers_instance_role_for_non_bedrock_picker(self, monkeypatch):
+        """User-triggered setup surfaces Bedrock backed by an EC2 instance role."""
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        for name in (
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        with patch("agent.bedrock_adapter.has_aws_credentials", return_value=True) as probe, \
+             patch("hermes_cli.models.cached_provider_model_ids", return_value=["us.amazon.nova-pro-v1:0"]):
+            providers = list_authenticated_providers(
+                current_provider="openrouter",
+                max_models=50,
+                probe_cloud_credentials=True,
+            )
+
+        probe.assert_called_once_with()
+        bedrock = next((p for p in providers if p["slug"] == "bedrock"), None)
+        assert bedrock is not None
+        assert bedrock["models"] == ["us.amazon.nova-pro-v1:0"]
+
     def test_bedrock_falls_back_to_curated_when_discovery_fails(self, monkeypatch):
         """When discover_bedrock_models() raises, fall back to curated list without crashing."""
         from hermes_cli.model_switch import list_authenticated_providers

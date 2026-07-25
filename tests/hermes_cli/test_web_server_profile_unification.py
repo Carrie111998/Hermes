@@ -381,12 +381,19 @@ class TestProfileScopedModel:
         assert calls[-1]["refresh"] is False
         assert calls[-1]["probe_custom_providers"] is False
         assert calls[-1]["probe_current_custom_provider"] is True
+        assert calls[-1]["probe_cloud_credentials"] is False
 
         resp = client.get("/api/model/options", params={"refresh": "1"})
         assert resp.status_code == 200
         assert calls[-1]["refresh"] is True
         assert calls[-1]["probe_custom_providers"] is True
         assert calls[-1]["probe_current_custom_provider"] is False
+
+        resp = client.get(
+            "/api/model/options", params={"probe_cloud_credentials": "1"}
+        )
+        assert resp.status_code == 200
+        assert calls[-1]["probe_cloud_credentials"] is True
 
     def test_model_options_hides_unconfigured_providers_by_default(self, client, monkeypatch):
         calls = []

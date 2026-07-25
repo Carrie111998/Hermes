@@ -276,6 +276,18 @@ def test_build_models_payload_can_probe_only_current_custom_provider():
     assert mock_list.call_args.kwargs["probe_current_custom_provider"] is True
 
 
+def test_build_models_payload_can_probe_cloud_credentials():
+    ctx = _empty_ctx()
+    with patch(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        return_value=[],
+    ) as mock_list:
+        build_models_payload(ctx, probe_cloud_credentials=True)
+
+    mock_list.assert_called_once()
+    assert mock_list.call_args.kwargs["probe_cloud_credentials"] is True
+
+
 def test_cli_model_picker_forwards_force_refresh_to_probe_flags():
     """CLI /model picker must pass force_refresh to probe flags (#65652, #65650).
 

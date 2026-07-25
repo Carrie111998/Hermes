@@ -100,7 +100,7 @@ export default function ProfileBuilderPage() {
     if (modelChoices !== null || modelLoading.current) return;
     modelLoading.current = true;
     api
-      .getModelOptions()
+      .getModelOptions({ probeCloudCredentials: true })
       .then((res) => {
         const flat: ModelChoice[] = [];
         for (const prov of res.providers ?? []) {

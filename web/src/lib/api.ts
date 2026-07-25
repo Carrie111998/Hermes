@@ -480,7 +480,11 @@ export const api = {
   getModelInfo: (profile = getManagementProfile()) =>
     fetchJSON<ModelInfoResponse>(appendProfileParam("/api/model/info", profile)),
   getModelOptions: (
-    profileOrOptions?: string | { profile?: string; refresh?: boolean },
+    profileOrOptions?: string | {
+      profile?: string;
+      refresh?: boolean;
+      probeCloudCredentials?: boolean;
+    },
   ) => {
     const profile =
       typeof profileOrOptions === "string"
@@ -488,9 +492,13 @@ export const api = {
         : profileOrOptions?.profile;
     const refresh =
       typeof profileOrOptions === "object" && !!profileOrOptions.refresh;
+    const probeCloudCredentials =
+      typeof profileOrOptions === "object" &&
+      !!profileOrOptions.probeCloudCredentials;
     const qs = new URLSearchParams();
     if (profile) qs.set("profile", profile);
     if (refresh) qs.set("refresh", "1");
+    if (probeCloudCredentials) qs.set("probe_cloud_credentials", "1");
     // Dashboard surfaces (Models page, profile builder, cron) are
     // management/setup UIs: keep the full provider universe with setup
     // affordances. The endpoint now defaults to the configured subset for

@@ -47,6 +47,20 @@ describe("api.getModelOptions", () => {
       expect.objectContaining({ credentials: "include" }),
     );
   });
+
+  it("requests full cloud credential discovery when asked", async () => {
+    vi.stubGlobal("window", {});
+
+    const fetchMock = jsonFetchMock({ providers: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getModelOptions({ probeCloudCredentials: true });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/model/options?probe_cloud_credentials=1&include_unconfigured=1",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
 });
 
 describe("api OAuth helpers", () => {

@@ -124,6 +124,7 @@ def build_models_payload(
     refresh: bool = False,
     probe_custom_providers: bool = True,
     probe_current_custom_provider: bool = False,
+    probe_cloud_credentials: bool = False,
     max_models: int | None = None,
 ) -> dict:
     """Build the ``{providers, model, provider}`` shape every consumer
@@ -168,6 +169,9 @@ def build_models_payload(
       false, still live-probe the current custom endpoint. This keeps normal
       GUI/TUI picker opens fast while making the active custom provider's model
       list match the classic CLI picker.
+    - ``probe_cloud_credentials``: allow cloud SDK providers to consult their
+      full credential chain. Keep false for routine picker opens; setup flows
+      can opt in when discovering instance-role credentials is user-triggered.
     """
     from hermes_cli.model_switch import list_authenticated_providers
 
@@ -182,6 +186,7 @@ def build_models_payload(
         refresh=refresh,
         probe_custom_providers=probe_custom_providers,
         probe_current_custom_provider=probe_current_custom_provider,
+        probe_cloud_credentials=probe_cloud_credentials,
         excluded_providers=ctx.excluded_providers or [],
     )
 
@@ -269,6 +274,7 @@ def build_model_options_payload(
     explicit_only: bool = False,
     include_unconfigured: bool = False,
     refresh: bool = False,
+    probe_cloud_credentials: bool = False,
 ) -> dict:
     """Build the shared API-server/dashboard/TUI model-options payload.
 
@@ -292,6 +298,7 @@ def build_model_options_payload(
         refresh=refresh,
         probe_custom_providers=refresh,
         probe_current_custom_provider=not refresh,
+        probe_cloud_credentials=bool(probe_cloud_credentials),
     )
 
 
