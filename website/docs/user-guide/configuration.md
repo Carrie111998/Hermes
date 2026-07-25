@@ -2104,10 +2104,13 @@ Connectivity workarounds for outbound HTTP:
 
 ```yaml
 network:
+  ipv4_first: true    # Try IPv4 answers before IPv6 while keeping IPv6 available (default: true)
   force_ipv4: false   # Force IPv4 for outbound connections (default: false)
 ```
 
-`force_ipv4` — on servers with broken or unreachable IPv6, Python resolves AAAA records first and can hang for the full TCP timeout before falling back to IPv4. Set this to `true` to skip IPv6 entirely and connect over IPv4 directly.
+`ipv4_first` — on servers with broken or unreachable IPv6 routes, dual-stack DNS can return AAAA records first and the TCP connect can hang before falling back to IPv4. This default-on setting keeps IPv6 usable, but reorders DNS results so IPv4 (`A`) answers are tried before IPv6 (`AAAA`) answers. Set `ipv4_first: false` to preserve the platform's original DNS ordering.
+
+`force_ipv4` — a stronger workaround for hosts where IPv6 should be skipped entirely. When set to `true`, Hermes requests IPv4 addresses directly instead of merely reordering dual-stack results. Use this only if `ipv4_first` is not enough.
 
 ## Onboarding
 
