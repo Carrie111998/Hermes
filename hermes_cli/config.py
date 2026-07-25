@@ -3233,6 +3233,61 @@ DEFAULT_CONFIG = {
         "fresh_final_after_seconds": 0.0,
     },
 
+    # Fleet-safety guards (gateway housekeeping). Stops a single agent session
+    # from silently draining a provider's wallet the way the 2026-07-25 incident
+    # did (a ~13h unattended loop, ~1,800 calls re-sending ~160k tokens each at
+    # effort=max, whole weekly limit gone in a day). Paper-safe: only kills
+    # agent loops and caps routing — never touches billing or credentials.
+    "fleet_safety": {
+        # Runaway-loop detector + hard-stop, evaluated once per housekeeping
+        # tick (~60s) over every running agent.
+        "deadloop_guard": {
+            "enabled": True,
+            # Rolling window (seconds) for the rate checks.
+            "window_seconds": 900,
+            # Trip if model calls in the window exceed this.
+            "max_calls_per_window": 100,
+            # Trip if estimated tokens in the window exceed this.
+            "max_tokens_per_window": 4000000,
+            # Trip if one continuous turn runs longer than this (seconds).
+            "max_runtime_seconds": 3600,
+            # Trip if the same non-retryable (4xx) error repeats this many
+            # consecutive samples.
+            "repeated_error_limit": 3,
+            # A context at/above this many tokens counts as "huge" for the
+            # no-forward-progress check.
+            "huge_context_tokens": 150000,
+            # Trip if a huge context is re-sent this many consecutive samples
+            # with no forward progress (unchanged state).
+            "no_progress_samples": 3,
+            # Per-call context size (tokens) assumed when the runtime doesn't
+            # expose a real token meter — drives the token-rate estimate.
+            "assumed_context_tokens": 160000,
+        },
+        # Per-provider spend cap on routing (consumed by usage-based routing).
+        "wallet_cap": {
+            "enabled": True,
+            # >= this weekly-usage %: stop routing new heavy/max-effort work
+            # to the provider (fall to the next provider).
+            "cap_percent": 90,
+            # >= this % (and < cap): still route, but downgrade reasoning effort.
+            "downgrade_percent": 80,
+            # Never downgrade effort below this rung.
+            "downgrade_floor": "medium",
+            # What to do for a heavy request when usage can't be verified:
+            # "allow" | "downgrade" | "fallback".
+            "on_unknown": "downgrade",
+        },
+        # Verification of the cached usage figure against the authoritative
+        # provider source (fixes the "10% cached vs 100% real" tracker bug).
+        "usage_verify": {
+            # Cache older than this (seconds) is flagged stale.
+            "max_age_seconds": 900,
+            # Cache diverging from authoritative by more than this many
+            # percentage points is flagged suspect (authoritative wins).
+            "divergence_points": 15,
+        },
+    },
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
     # state.db accumulates every session, message, tool call, and FTS5 index
     # entry forever.  Without auto-pruning, a heavy user (gateway + cron)
