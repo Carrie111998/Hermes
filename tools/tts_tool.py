@@ -2064,10 +2064,17 @@ def _check_piper_available() -> bool:
         return False
 
 
-def _check_voicevox_available() -> bool:
+def _check_voicevox_available(
+    tts_config: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Return True when a VOICEVOX-compatible engine responds to /version."""
-    tts_config = _load_tts_config()
+    if tts_config is None:
+        tts_config = _load_tts_config()
+    if not isinstance(tts_config, dict):
+        tts_config = {}
     vv_config = tts_config.get("voicevox") or {}
+    if not isinstance(vv_config, dict):
+        vv_config = {}
     base_url = str(vv_config.get("base_url") or DEFAULT_VOICEVOX_BASE_URL).rstrip("/")
     try:
         import urllib.request
@@ -2076,6 +2083,113 @@ def _check_voicevox_available() -> bool:
             return resp.status == 200
     except Exception:
         return False
+
+
+def _list_voicevox_voices(
+    tts_config: Optional[Dict[str, Any]] = None,
+) -> list[Dict[str, Any]]:
+    """Fetch and flatten the VOICEVOX ``GET /speakers`` catalog.
+
+    VOICEVOX groups synthesis IDs under speaker ``styles``. The shared TTS
+    picker contract expects one flat row per selectable voice, so every style
+    becomes an ``id`` / ``display`` entry.
+    """
+    import urllib.error
+    import urllib.request
+
+    if not isinstance(tts_config, dict):
+        tts_config = {}
+    vv_config = tts_config.get("voicevox") or {}
+    if not isinstance(vv_config, dict):
+        vv_config = {}
+    base_url = str(vv_config.get("base_url") or DEFAULT_VOICEVOX_BASE_URL).rstrip("/")
+    speakers_url = f"{base_url}/speakers"
+
+    try:
+        request = urllib.request.Request(speakers_url, method="GET")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"VOICEVOX speaker catalog failed (HTTP {exc.code}) at {speakers_url}"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot connect to VOICEVOX engine at {base_url}. Is the engine running?"
+        ) from exc
+
+    try:
+        catalog = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("VOICEVOX returned an invalid speaker catalog") from exc
+    if not isinstance(catalog, list):
+        raise RuntimeError("VOICEVOX returned an invalid speaker catalog")
+
+    voices: list[Dict[str, Any]] = []
+    for speaker in catalog:
+        if not isinstance(speaker, dict):
+            continue
+        speaker_name = str(speaker.get("name") or "VOICEVOX speaker").strip()
+        styles = speaker.get("styles")
+        if not isinstance(styles, list):
+            continue
+        for style in styles:
+            if not isinstance(style, dict):
+                continue
+            # ``POST /synthesis`` accepts talk styles. Newer engines may also
+            # advertise singing-only styles through the same catalog.
+            style_type = style.get("type")
+            if style_type not in (None, "", "talk"):
+                continue
+            style_id = style.get("id")
+            if isinstance(style_id, bool) or not isinstance(style_id, (int, str)):
+                continue
+            try:
+                style_id_text = str(int(style_id))
+            except (TypeError, ValueError):
+                continue
+            style_name = str(style.get("name") or "default").strip()
+            voices.append({
+                "id": style_id_text,
+                "display": f"{speaker_name} — {style_name} (ID {style_id_text})",
+                "language": "ja-JP",
+            })
+    return voices
+
+
+def list_voices(
+    provider: Optional[str] = None,
+    tts_config: Optional[Dict[str, Any]] = None,
+) -> list[Dict[str, Any]]:
+    """Return picker-compatible voices for the selected TTS provider.
+
+    Built-ins opt in here when they expose a catalog API. Plugin providers
+    continue to use :meth:`agent.tts_provider.TTSProvider.list_voices` through
+    the same public listing surface.
+    """
+    if tts_config is None:
+        tts_config = _load_tts_config()
+    if not isinstance(tts_config, dict):
+        tts_config = {}
+    key = str(provider or _get_provider(tts_config)).strip().lower()
+    if key == "voicevox":
+        return _list_voicevox_voices(tts_config)
+    if key in BUILTIN_TTS_PROVIDERS:
+        return []
+
+    try:
+        from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        plugin_provider = get_provider(key)
+        if plugin_provider is None:
+            return []
+        voices = plugin_provider.list_voices()
+        return voices if isinstance(voices, list) else []
+    except Exception:
+        logger.debug("Failed to list voices for TTS provider '%s'", key, exc_info=True)
+        return []
 
 
 def _get_piper_voices_dir() -> Path:
@@ -2317,7 +2431,7 @@ def _generate_voicevox_tts(text: str, output_path: str, tts_config: Dict[str, An
     # Write WAV, then convert to requested format if needed (same pattern as Piper)
     wav_path = output_path
     if not output_path.endswith(".wav"):
-        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+        wav_path = os.path.splitext(output_path)[0] + ".wav"
 
     with open(wav_path, "wb") as f:
         f.write(wav_bytes)
@@ -2338,7 +2452,9 @@ def _generate_voicevox_tts(text: str, output_path: str, tts_config: Dict[str, An
             except OSError:
                 pass
         else:
-            os.rename(wav_path, output_path)
+            # Keep the real WAV extension. Renaming WAV bytes to ``.mp3``
+            # produces a mislabeled file that players and gateways may reject.
+            output_path = wav_path
 
     return output_path
 
@@ -2633,7 +2749,7 @@ def text_to_speech_tool(
                              "on the configured base_url (default: http://127.0.0.1:50021)."
                 }, ensure_ascii=False)
             logger.info("Generating speech with VOICEVOX (local)...")
-            _generate_voicevox_tts(text, file_str, tts_config)
+            file_str = _generate_voicevox_tts(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback

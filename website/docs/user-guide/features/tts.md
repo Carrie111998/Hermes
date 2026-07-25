@@ -249,7 +249,7 @@ tts:
 
 **No pip install required.** VOICEVOX uses a simple HTTP API and Hermes talks to it with stdlib only.
 
-**Setup:** Install and start a VOICEVOX-compatible engine, then configure:
+**Setup:** Install and start a VOICEVOX-compatible engine, then run `hermes setup tts` or select VOICEVOX in `hermes tools`. Hermes reads `GET /speakers` and presents the available speaker/styles in the picker. You can also configure it manually:
 
 ```yaml
 tts:
@@ -259,7 +259,7 @@ tts:
     speaker: 3                          # speaker ID
 ```
 
-**Finding speaker IDs.** Query the engine's speaker list:
+**Finding speaker IDs manually.** If the setup picker cannot reach the engine, query its speaker list:
 
 ```bash
 curl -s http://127.0.0.1:50021/speakers | python3 -m json.tool
@@ -370,7 +370,7 @@ For TTS engines that can't be expressed as a single shell command — Python SDK
 | Two or three CLIs chained with shell pipes | **Command provider** |
 | A Python SDK only — no CLI | **Plugin** |
 | Streaming bytes you want to deliver chunked (mid-generation voice bubbles) | **Plugin** (override `stream()`) |
-| A voice-listing API used by `hermes setup` | **Plugin** (override `list_voices()`) |
+| A voice-listing API for a custom backend used by `hermes setup` | **Plugin** (override `list_voices()`) |
 | OAuth refresh flow (not a static bearer token) | **Plugin** |
 
 Built-ins always win, and command providers win over a same-name plugin — so plugins are safe to register against any non-built-in name without worrying about shadowing your existing config.

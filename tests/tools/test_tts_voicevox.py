@@ -6,7 +6,11 @@ without requiring a running VOICEVOX engine (HTTP calls are monkey-patched).
 """
 
 import json
+import threading
+import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,8 +24,87 @@ from tools.tts_tool import (
     _check_voicevox_available,
     _generate_voicevox_tts,
     check_tts_requirements,
+    list_voices,
     text_to_speech_tool,
 )
+
+
+def test_voicevox_http_contract_end_to_end(tmp_path):
+    """Exercise readiness, catalog, and synthesis over a real HTTP socket."""
+    requests = []
+    fake_query = b'{"accent_phrases": [], "speedScale": 1}'
+    fake_wav = b"RIFF" + b"\x00" * 100
+    catalog = [
+        {
+            "name": "四国めたん",
+            "styles": [{"name": "ノーマル", "id": 2, "type": "talk"}],
+        },
+    ]
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, body, content_type="application/json"):
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            requests.append(("GET", parsed.path, parse_qs(parsed.query), b""))
+            if parsed.path == "/version":
+                self._send(b'"0.24.0"')
+            elif parsed.path == "/speakers":
+                self._send(json.dumps(catalog).encode("utf-8"))
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            requests.append(("POST", parsed.path, parse_qs(parsed.query), body))
+            if parsed.path == "/audio_query":
+                self._send(fake_query)
+            elif parsed.path == "/synthesis":
+                self._send(fake_wav, "audio/wav")
+            else:
+                self.send_error(404)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    config = {
+        "voicevox": {
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "speaker": 2,
+        },
+    }
+
+    try:
+        assert _check_voicevox_available(config) is True
+        assert list_voices("voicevox", config) == [
+            {
+                "id": "2",
+                "display": "四国めたん — ノーマル (ID 2)",
+                "language": "ja-JP",
+            },
+        ]
+        output_path = str(tmp_path / "clip.wav")
+        assert _generate_voicevox_tts("こんにちは", output_path, config) == output_path
+        assert Path(output_path).read_bytes() == fake_wav
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    audio_query = next(request for request in requests if request[1] == "/audio_query")
+    assert audio_query[2] == {"text": ["こんにちは"], "speaker": ["2"]}
+    synthesis = next(request for request in requests if request[1] == "/synthesis")
+    assert synthesis[2] == {"speaker": ["2"]}
+    assert synthesis[3] == fake_query
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +147,92 @@ class TestCheckVoicevoxAvailable:
         with patch("urllib.request.urlopen", side_effect=Exception("connection refused")):
             assert _check_voicevox_available() is False
 
-    def test_returns_bool_without_raising(self):
-        assert isinstance(_check_voicevox_available(), bool)
+# ---------------------------------------------------------------------------
+# list_voices
+# ---------------------------------------------------------------------------
+
+class TestListVoicevoxVoices:
+    def test_flattens_speakers_and_styles_for_picker(self):
+        catalog = [
+            {
+                "name": "四国めたん",
+                "styles": [
+                    {"name": "ノーマル", "id": 2},
+                    {"name": "あまあま", "id": 0},
+                    {"name": "ソング", "id": 200, "type": "sing"},
+                ],
+            },
+            {
+                "name": "ずんだもん",
+                "styles": [{"name": "ノーマル", "id": 3}],
+            },
+        ]
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(catalog).encode("utf-8")
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            voices = list_voices(
+                "voicevox",
+                {"voicevox": {"base_url": "http://localhost:50021/"}},
+            )
+
+        assert voices == [
+            {
+                "id": "2",
+                "display": "四国めたん — ノーマル (ID 2)",
+                "language": "ja-JP",
+            },
+            {
+                "id": "0",
+                "display": "四国めたん — あまあま (ID 0)",
+                "language": "ja-JP",
+            },
+            {
+                "id": "3",
+                "display": "ずんだもん — ノーマル (ID 3)",
+                "language": "ja-JP",
+            },
+        ]
+        request = mock_open.call_args.args[0]
+        assert request.full_url == "http://localhost:50021/speakers"
+        assert request.get_method() == "GET"
+
+    def test_rejects_invalid_catalog_shape(self):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"not": "a list"}'
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            with pytest.raises(RuntimeError, match="invalid speaker catalog"):
+                list_voices("voicevox", {})
+
+    def test_connection_failure_has_actionable_error(self):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("connection refused"),
+        ):
+            with pytest.raises(RuntimeError, match="Is the engine running"):
+                list_voices("voicevox", {})
+
+    def test_other_builtin_without_catalog_returns_empty(self):
+        assert list_voices("edge", {}) == []
+
+    def test_plugin_provider_uses_same_listing_surface(self):
+        provider = MagicMock()
+        provider.list_voices.return_value = [
+            {"id": "voice-1", "display": "Plugin voice"},
+        ]
+
+        with (
+            patch("hermes_cli.plugins._ensure_plugins_discovered"),
+            patch("agent.tts_registry.get_provider", return_value=provider),
+        ):
+            assert list_voices("example-plugin", {}) == [
+                {"id": "voice-1", "display": "Plugin voice"},
+            ]
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +404,37 @@ class TestTextToSpeechToolWithVoicevox:
         assert data["success"] is False
         assert "VOICEVOX" in data["error"]
         assert "running" in data["error"].lower()
+
+    def test_without_ffmpeg_returns_wav_path_instead_of_mislabeled_mp3(
+        self, tmp_path, monkeypatch,
+    ):
+        fake_query = b'{"accent_phrases": []}'
+        fake_wav = b"RIFF" + b"\x00" * 100
+        cfg = {
+            "provider": "voicevox",
+            "voicevox": {"base_url": "http://localhost:50021", "speaker": 3},
+        }
+
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: cfg)
+        monkeypatch.setattr(tts_tool, "_check_voicevox_available", lambda: True)
+        monkeypatch.setattr(tts_tool.shutil, "which", lambda _name: None)
+
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=TestGenerateVoicevoxTts()._mock_urlopen(
+                [fake_query, fake_wav]
+            ),
+        ):
+            result = text_to_speech_tool(
+                text="こんにちは",
+                output_path=str(tmp_path / "clip.mp3"),
+            )
+
+        data = json.loads(result)
+        assert data["success"] is True, data
+        assert data["file_path"] == str(tmp_path / "clip.wav")
+        assert Path(data["file_path"]).read_bytes() == fake_wav
+        assert not (tmp_path / "clip.mp3").exists()
 
 
 # ---------------------------------------------------------------------------
