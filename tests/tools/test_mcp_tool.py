@@ -445,7 +445,9 @@ class TestSchemaConversion:
 
         assert schema["required"] == ["a"]
 
-    def test_required_removed_when_all_names_dangle(self):
+    def test_required_kept_as_empty_array_when_all_names_dangle(self):
+        # Regression for #59386: a missing ``required`` key is rejected as
+        # ``null`` by strict OpenAI-compatible backends. Keep an empty array.
         from tools.mcp_tool import _normalize_mcp_input_schema
 
         schema = _normalize_mcp_input_schema({
@@ -454,7 +456,7 @@ class TestSchemaConversion:
             "required": ["ghost"],
         })
 
-        assert "required" not in schema
+        assert schema["required"] == []
 
     def test_required_pruning_applies_recursively_inside_nested_objects(self):
         """Nested object schemas also get required pruning."""

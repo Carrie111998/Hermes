@@ -179,11 +179,25 @@ def test_required_pruned_to_existing_properties():
     assert out[0]["function"]["parameters"]["required"] == ["name"]
 
 
-def test_required_all_missing_is_dropped():
+def test_required_all_missing_keeps_empty_array():
+    # Regression for #59386: a *missing* ``required`` key is materialized as
+    # ``null`` by strict OpenAI-compatible proxies during schema validation,
+    # causing a non-retryable HTTP 400 ("null is not of type 'array'"). We must
+    # keep an explicit empty array instead of dropping the key.
     tools = [_tool("t", {
         "type": "object",
         "properties": {},
         "required": ["x", "y"],
+    })]
+    out = sanitize_tool_schemas(tools)
+    assert out[0]["function"]["parameters"]["required"] == []
+
+
+def test_no_required_key_is_not_injected():
+    # Schemas that genuinely never declared ``required`` should stay clean.
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
     })]
     out = sanitize_tool_schemas(tools)
     assert "required" not in out[0]["function"]["parameters"]

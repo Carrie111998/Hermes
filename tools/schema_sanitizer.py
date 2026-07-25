@@ -347,7 +347,13 @@ def _sanitize_node(node: Any, path: str) -> Any:
         props = out.get("properties") or {}
         valid = [r for r in out["required"] if isinstance(r, str) and r in props]
         if not valid:
-            out.pop("required", None)
+            # Keep an explicit empty ``required`` array instead of dropping the
+            # key. Strict OpenAI-compatible backends (and several API proxies)
+            # treat a *missing* ``required`` key as ``null`` during validation,
+            # which violates the JSON Schema spec ("required" must be an array)
+            # and triggers a non-retryable HTTP 400 ("null is not of type
+            # 'array'"). An empty array is always valid and preserves intent.
+            out["required"] = []
         elif len(valid) != len(out["required"]):
             out["required"] = valid
 

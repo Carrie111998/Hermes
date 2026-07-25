@@ -5166,7 +5166,13 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
                     if valid:
                         repaired["required"] = valid
                     else:
-                        repaired.pop("required", None)
+                        # Keep an explicit empty ``required`` array instead of
+                        # dropping the key. Strict OpenAI-compatible backends
+                        # materialize a missing ``required`` as ``null`` during
+                        # validation, which violates the JSON Schema spec and
+                        # triggers a non-retryable HTTP 400. An empty array is
+                        # always valid (see tools/schema_sanitizer.py).
+                        repaired["required"] = []
 
         return repaired
 
