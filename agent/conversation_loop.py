@@ -87,6 +87,12 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+_CODEX_RUNTIME_EAGER_FALLBACK_REASONS = frozenset({
+    FailoverReason.billing,
+    FailoverReason.rate_limit,
+    FailoverReason.upstream_rate_limit,
+})
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -1029,12 +1035,53 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        codex_result = agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
+        )
+        codex_error = codex_result.get("error")
+        if not codex_error or not agent._has_pending_fallback():
+            return codex_result
+
+        classified = classify_api_error(
+            RuntimeError(str(codex_error)),
+            provider=getattr(agent, "provider", "") or "",
+            model=getattr(agent, "model", "") or "",
+        )
+        if classified.reason not in _CODEX_RUNTIME_EAGER_FALLBACK_REASONS:
+            return codex_result
+
+        if classified.reason == FailoverReason.billing:
+            agent._buffer_status(
+                "⚠️ Codex billing or credits exhausted — "
+                "switching to fallback provider..."
+            )
+        elif classified.reason == FailoverReason.upstream_rate_limit:
+            agent._buffer_status(
+                "⚠️ Codex upstream rate-limited — switching to fallback provider..."
+            )
+        else:
+            agent._buffer_status(
+                "⚠️ Codex rate-limited — switching to fallback provider..."
+            )
+
+        if not agent._try_activate_fallback(reason=classified.reason):
+            return codex_result
+
+        # The fallback activation rewrites provider/model/api_mode and the
+        # cached prompt identity. Continue through the normal loop so the same
+        # user turn is retried by the newly selected runtime. Preserve any
+        # projected Codex messages and count the failed Codex call in this
+        # turn's accounting.
+        codex_messages = codex_result.get("messages")
+        if isinstance(codex_messages, list):
+            messages = codex_messages
+        api_call_count = int(codex_result.get("api_calls") or 0)
+        active_system_prompt = _sync_failover_system_message(
+            agent, None, active_system_prompt
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:

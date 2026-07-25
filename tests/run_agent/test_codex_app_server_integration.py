@@ -86,6 +86,130 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    @pytest.mark.parametrize(
+        ("error_message", "expected_reason"),
+        [
+            (
+                "insufficient_quota: exceeded your current quota",
+                run_agent.FailoverReason.billing,
+            ),
+            (
+                "rate limit exceeded; try again in 60 seconds",
+                run_agent.FailoverReason.rate_limit,
+            ),
+        ],
+    )
+    def test_fallback_eligible_codex_error_retries_with_fallback_provider(
+        self,
+        error_message,
+        expected_reason,
+    ):
+        agent = _make_codex_agent()
+        agent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback/model"}
+        ]
+        agent._fallback_index = 0
+        agent._disable_streaming = True
+
+        def fail_codex_turn(**kwargs):
+            return {
+                "final_response": f"Codex app-server turn failed: {error_message}",
+                "messages": kwargs["messages"],
+                "api_calls": 1,
+                "completed": False,
+                "partial": True,
+                "error": error_message,
+                "agent_persisted": True,
+            }
+
+        def activate_fallback(*, reason):
+            assert reason == expected_reason
+            agent._fallback_index += 1
+            agent.api_mode = "chat_completions"
+            agent.provider = "openrouter"
+            agent.model = "fallback/model"
+            agent._fallback_activated = True
+            agent._rate_limited_until = float("inf")
+            agent._transport_cache.clear()
+            return True
+
+        message = SimpleNamespace(
+            content="fallback answer",
+            tool_calls=None,
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=None,
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=message,
+                    finish_reason="stop",
+                )
+            ],
+            model="fallback/model",
+            usage=None,
+        )
+
+        with (
+            patch.object(
+                agent,
+                "_run_codex_app_server_turn",
+                side_effect=fail_codex_turn,
+            ),
+            patch.object(
+                agent,
+                "_try_activate_fallback",
+                side_effect=activate_fallback,
+            ) as fallback,
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                return_value=response,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        fallback.assert_called_once_with(reason=expected_reason)
+        assert result["completed"] is True
+        assert result["final_response"] == "fallback answer"
+        assert result["api_calls"] == 2
+
+    def test_unknown_codex_error_keeps_native_failure_result(self):
+        agent = _make_codex_agent()
+        agent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback/model"}
+        ]
+        agent._fallback_index = 0
+
+        def fail_codex_turn(**kwargs):
+            return {
+                "final_response": "Codex app-server turn failed: malformed event",
+                "messages": kwargs["messages"],
+                "api_calls": 1,
+                "completed": False,
+                "partial": True,
+                "error": "malformed event",
+                "agent_persisted": True,
+            }
+
+        with (
+            patch.object(
+                agent,
+                "_run_codex_app_server_turn",
+                side_effect=fail_codex_turn,
+            ),
+            patch.object(agent, "_try_activate_fallback") as fallback,
+        ):
+            result = agent.run_conversation("hello")
+
+        fallback.assert_not_called()
+        assert result["completed"] is False
+        assert result["error"] == "malformed event"
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -786,4 +910,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-
