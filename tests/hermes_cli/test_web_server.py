@@ -2837,7 +2837,13 @@ class TestThemeBootstrapCSS:
         # (same object in production, where mount_spa(app) is called with it).
         # Set gating there so these tests exercise the real seam.
         if auth_required is not None:
+            # Set BOTH seams so this test is independent of whether
+            # `_serve_index` reads gating from the module-level app or from the
+            # app it was mounted on (see fix/mount-spa-app-scope). Either way
+            # the invariant under test is the same: gated HTML carries no
+            # long-lived token.
             monkeypatch.setattr(ws.app.state, "auth_required", auth_required, raising=False)
+            spa_app.state.auth_required = auth_required
         ws.mount_spa(spa_app)
         return TestClient(spa_app)
 
