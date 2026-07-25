@@ -4354,6 +4354,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 if isinstance(chan_obj, discord.Thread)
                 else None,
             )
+            # ``interaction.channel`` is resolved from the client cache and is
+            # frequently ``None`` (or present without an id) even though the
+            # gateway payload carried ``channel_id`` — which is why
+            # ``channel_ids`` is derived from ``channel_id`` first above.
+            # Without this union ``channel_keys`` is empty in exactly that
+            # case, so the id-form membership tests below can never match:
+            # the allowlist rejects an allow-listed channel, and the
+            # ignore-list silently stops rejecting an ignored one.
+            channel_keys |= channel_ids
 
             allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
             if allowed_raw:

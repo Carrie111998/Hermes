@@ -324,6 +324,47 @@ async def test_channel_allowlist_wildcard_passes(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_allowlisted_channel_passes_when_interaction_channel_unresolved(
+    adapter, monkeypatch,
+):
+    """``interaction.channel_id`` alone is enough to satisfy the allowlist.
+
+    Discord resolves ``interaction.channel`` from the client cache, so it can
+    arrive as ``None`` while ``interaction.channel_id`` is populated (cold
+    cache, uncached guild, restart). The channel scope must key off the id
+    that is always present, not the object that is not — otherwise every
+    slash command in an allow-listed channel is rejected, including ``/reset``
+    and ``/new``, which are the operator's way out of a stuck session.
+    """
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "1111,2222")
+    interaction = _make_interaction("100200300", channel_id=1111)
+    interaction.channel = None
+
+    assert await adapter._check_slash_authorization(interaction, "/help") is True
+
+
+@pytest.mark.asyncio
+async def test_ignored_channel_rejected_when_interaction_channel_unresolved(
+    adapter, monkeypatch, caplog,
+):
+    """The same unresolved-channel payload must not fail *open* on the ignore list.
+
+    Asserting the rejection *reason* rather than just the boolean: with the
+    user allowlist satisfied, the ignore list is the only gate left that can
+    reject, so a bare ``is False`` would pass even when the ignore list was
+    skipped entirely.
+    """
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")
+    monkeypatch.setenv("DISCORD_IGNORED_CHANNELS", "1111")
+    interaction = _make_interaction("100200300", channel_id=1111)
+    interaction.channel = None
+
+    with caplog.at_level(logging.WARNING):
+        assert await adapter._check_slash_authorization(interaction, "/help") is False
+    assert any("DISCORD_IGNORED_CHANNELS" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_channel_allowlist_matches_by_name(adapter, monkeypatch):
     """Allowlist configured by channel NAME matches slash interactions too —
     the same name-form matching on_message gained. Without it, a deployment
