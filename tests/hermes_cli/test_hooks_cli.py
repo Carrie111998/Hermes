@@ -26,7 +26,7 @@ def _isolated_home(tmp_path, monkeypatch):
 
 def _hook_script(tmp_path: Path, body: str, name: str = "hook.sh") -> Path:
     p = tmp_path / name
-    p.write_text(body)
+    p.write_text(body, encoding="utf-8")
     p.chmod(0o755)
     return p
 
@@ -98,12 +98,13 @@ class TestHooksTest:
                 for_tool=None, payload_file=None,
             ))
 
-        seen = json.loads(capture.read_text())
-        # Same top-level keys _serialize_payload produces at runtime
+        seen = json.loads(capture.read_text(encoding="utf-8"))
+        # Same top-level keys _serialize_payload produces at runtime.
         assert set(seen.keys()) == {
             "hook_event_name", "tool_name", "tool_input",
-            "session_id", "cwd", "extra",
+            "session_id", "cwd", "transcript_path", "extra",
         }
+        assert seen["transcript_path"] == ""
         # parent_session_id was routed to top-level session_id (matches runtime)
         assert seen["session_id"] == "parent-sess"
         assert "parent_session_id" not in seen["extra"]
@@ -187,7 +188,7 @@ class TestHooksRevoke:
 class TestHooksDoctor:
     def test_flags_missing_exec_bit(self, tmp_path):
         script = tmp_path / "hook.sh"
-        script.write_text("#!/usr/bin/env bash\nprintf '{}\\n'\n")
+        script.write_text("#!/usr/bin/env bash\nprintf '{}\\n'\n", encoding="utf-8")
         # No chmod — intentionally not executable
         cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
         with patch("hermes_cli.config.load_config", return_value=cfg):
