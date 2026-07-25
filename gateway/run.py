@@ -20381,9 +20381,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            if session_key:
+            session_store = getattr(self, "session_store", None)
+            set_session_metadata = getattr(
+                session_store, "set_session_metadata", None
+            )
+            if session_key and callable(set_session_metadata):
                 await asyncio.to_thread(
-                    self.session_store.set_session_metadata,
+                    set_session_metadata,
                     session_key,
                     _CONTINUITY_CAPSULE_CAPABLE_METADATA,
                     False,
