@@ -23,7 +23,7 @@ describe('SigilOperatorView', () => {
     const apply = vi.spyOn(adapter, 'applySimulatedAction')
     render(<SigilOperatorView adapter={adapter} />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Proposals & approvals' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Proposals' }))
     expect(screen.getAllByRole('button', { name: 'Approve' })[0].hasAttribute('disabled')).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'Enable simulated operator actions' }))

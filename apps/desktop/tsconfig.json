@@ -19,10 +19,19 @@
       "@/*": ["./src/*"],
       "@hermes/plugin-sdk": ["./src/sdk/index.ts"],
       "@hermes/shared/billing": ["../shared/src/billing-types.ts"],
-      "@hermes/shared": ["../shared/src/index.ts"]
+      "@hermes/shared": ["../shared/src/index.ts"],
+      "@sigil/mission-control": ["../sigil-desktop/src/mission-control/index.tsx"],
+      "@sigil/mission-control/*": ["../sigil-desktop/src/mission-control/*"],
+      "@hermes-desktop/*": ["./src/*"]
     }
   },
-  "include": ["src", "../shared/src"],
-  "exclude": ["e2e", "electron", "playwright.config.ts"],
+  "include": ["src", "../shared/src", "../sigil-desktop/src/mission-control"],
+  "exclude": [
+    "e2e",
+    "electron",
+    "playwright.config.ts",
+    "../sigil-desktop/src/**/*.test.ts",
+    "../sigil-desktop/src/**/*.test.tsx"
+  ],
   "references": [{ "path": "./tsconfig.electron.json" }]
 }

@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["DOM", "DOM.Iterable", "ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "types": ["node", "vitest/globals"],
+    "paths": {
+      "@/*": ["../desktop/src/*"],
+      "@hermes-desktop/*": ["../desktop/src/*"],
+      "@sigil/mission-control": ["./src/mission-control/index.tsx"]
+    }
+  },
+  "include": ["src", "../desktop/src/components/ui", "../desktop/src/lib/utils.ts", "../desktop/src/app/layout-constants.ts"],
+  "exclude": ["electron"]
+}
