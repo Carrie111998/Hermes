@@ -1,0 +1,7 @@
+name: workspace_runtime
+version: "0.1.0"
+description: "Automatic Workspace discovery for Hermes. Detects whether the cwd is inside a Workspace OS workspace at session start and surfaces the verdict as a stable <workspace-runtime-verdict> block on the first user message. Pure syntactic discovery (file-presence + non-empty). Does NOT mutate the system prompt or touch the prompt prefix cache. Companion to workspace-os/docs/BOOTSTRAP-PROCEDURE.md."
+author: "Taras Polishchuk"
+hooks:
+  - on_session_start
+  - pre_llm_call
