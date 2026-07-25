@@ -36,6 +36,7 @@ import {
   importSummary,
   parseImportSessions,
 } from "@/lib/session-import";
+import { sessionsForSearchResults } from "./session-search";
 import type {
   SessionInfo,
   SessionMessage,
@@ -1246,10 +1247,11 @@ export default function SessionsPage() {
     }
   }
 
-  // When searching, filter sessions to those with FTS matches;
-  // when not searching, show all sessions
+  // FTS searches the entire store while `sessions` only holds the current
+  // pagination page. Render the FTS rows directly so an older matching session
+  // remains discoverable instead of being silently filtered out.
   const filtered = searchResults
-    ? sessions.filter((s) => snippetMap.has(s.id))
+    ? sessionsForSearchResults(sessions, searchResults)
     : sessions;
 
   const platformEntries = status
