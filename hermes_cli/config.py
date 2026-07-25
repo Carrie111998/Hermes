@@ -2647,6 +2647,24 @@ DEFAULT_CONFIG = {
         # override: DISCORD_APPROVAL_MENTIONS. Default false avoids surprise
         # pings.
         "approval_mentions": False,
+        # Optional hands-free Discord VC lifecycle. Disabled by default. Each
+        # route binds one guild/voice channel to an explicit text channel and
+        # only the listed user IDs may trigger a join. Trigger users must also
+        # pass the normal Discord access policy. One route per guild.
+        "voice_auto_join": {
+            "enabled": False,
+            "reconnect_on_startup": True,
+            "routes": [
+                # {
+                #     "guild_id": "123456789012345678",
+                #     "voice_channel_id": "123456789012345679",
+                #     "text_channel_id": "123456789012345680",
+                #     "trigger_user_ids": ["123456789012345681"],
+                #     "leave_when_no_trigger_users": True,
+                #     "leave_grace_seconds": 10,
+                # }
+            ],
+        },
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and

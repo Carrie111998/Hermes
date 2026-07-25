@@ -357,6 +357,28 @@ Use these in the Discord text channel where the bot is present:
 You must be in a voice channel before running `/voice join`. The bot joins the same VC you're in.
 :::
 
+### Optional Auto-Join
+
+You can opt into a narrowly scoped hands-free lifecycle. Auto-join is off by default and does not replace the manual commands:
+
+```yaml
+discord:
+  voice_auto_join:
+    enabled: true
+    reconnect_on_startup: true
+    routes:
+      - guild_id: "123456789012345678"
+        voice_channel_id: "123456789012345679"
+        text_channel_id: "123456789012345680"
+        trigger_user_ids: ["123456789012345681"]
+        leave_when_no_trigger_users: true
+        leave_grace_seconds: 10
+```
+
+Each route is fail-closed and binds one guild to one VC and one text channel. Only listed trigger users who also pass `DISCORD_ALLOWED_USERS` or `DISCORD_ALLOW_ALL_USERS` can start the connection; role-only admission does not authorize voice-state triggers. If `reconnect_on_startup` is enabled and a trigger user is already present after a gateway reconnect, Hermes rejoins. When `leave_when_no_trigger_users` is enabled and the last trigger user leaves, Hermes waits for `leave_grace_seconds` and disconnects. Manual voice connections are not moved or claimed by auto-join.
+
+Only one route per guild is supported because a Discord bot can have one voice connection per guild.
+
 ### How It Works
 
 When the bot joins a voice channel, it:

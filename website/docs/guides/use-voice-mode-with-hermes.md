@@ -373,6 +373,29 @@ In a Discord text channel where the bot is present:
 /voice status
 ```
 
+### Optional auto-join
+
+Auto-join is opt-in and disabled by default. It lets an authorized user enter one configured VC and have Hermes join without running `/voice join`:
+
+```yaml
+discord:
+  voice_auto_join:
+    enabled: true
+    reconnect_on_startup: true
+    routes:
+      - guild_id: "123456789012345678"
+        voice_channel_id: "123456789012345679"
+        text_channel_id: "123456789012345680"
+        trigger_user_ids:
+          - "123456789012345681"
+        leave_when_no_trigger_users: true
+        leave_grace_seconds: 10
+```
+
+The IDs in `trigger_user_ids` must also pass your normal Discord user access policy through `DISCORD_ALLOWED_USERS` or `DISCORD_ALLOW_ALL_USERS`. Role-only admission does not authorize a voice-state trigger. Hermes only reacts in the configured voice channel, uses the configured text channel for transcripts and responses, and leaves after the final trigger user departs when `leave_when_no_trigger_users` is enabled. A manual `/voice join` session is never moved or taken over by auto-join.
+
+Use one route per guild. Invalid or incomplete routes are ignored rather than falling back to a broader channel or user match.
+
 ### What happens when joined
 
 - users speak in the VC

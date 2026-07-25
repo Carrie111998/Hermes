@@ -8234,6 +8234,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
+                    await self._configure_voice_auto_join_adapter(adapter)
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -9259,6 +9260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
+                        await self._configure_voice_auto_join_adapter(adapter)
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
@@ -10101,6 +10103,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 if success:
                     profile_map[platform] = adapter
+                    self._sync_voice_mode_state_to_adapter(adapter)
+                    await self._configure_voice_auto_join_adapter(adapter)
                     connected += 1
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
                 else:
@@ -10171,6 +10175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if platform not in profile_map:
                             profile_map[platform] = adapter
                             self._sync_voice_mode_state_to_adapter(adapter)
+                            await self._configure_voice_auto_join_adapter(adapter)
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,
@@ -15218,6 +15223,179 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
 
+    def _wire_discord_voice_callbacks(self, adapter) -> None:
+        """Wire one Discord adapter into the shared voice pipeline."""
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = (
+                lambda guild_id, user_id, transcript: self._handle_voice_channel_input(
+                    guild_id, user_id, transcript, adapter=adapter
+                )
+            )
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+        if hasattr(adapter, "_voice_mode_getter"):
+            adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
+                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+            )
+
+    async def _join_discord_voice_channel(
+        self,
+        adapter,
+        voice_channel,
+        source: SessionSource,
+        guild_id: int,
+        *,
+        move_existing: bool = True,
+    ) -> bool:
+        """Join and bind a Discord VC to the normal Hermes voice session path."""
+        self._wire_discord_voice_callbacks(adapter)
+        if move_existing:
+            success = await adapter.join_voice_channel(voice_channel)
+        else:
+            success = await adapter.join_voice_channel(
+                voice_channel, move_existing=False
+            )
+        if not success:
+            return False
+
+        voice_key = self._voice_key(source.platform, source.chat_id)
+        previous_mode = self._voice_mode.get(voice_key)
+        had_previous_mode = voice_key in self._voice_mode
+        try:
+            adapter._voice_text_channels[guild_id] = int(source.chat_id)
+            if hasattr(adapter, "_voice_sources"):
+                adapter._voice_sources[guild_id] = source.to_dict()
+            self._voice_mode[voice_key] = "all"
+            self._save_voice_modes()
+            self._set_adapter_auto_tts_enabled(adapter, source.chat_id, enabled=True)
+        except Exception:
+            # A connected VC without its linked session route would receive
+            # audio with nowhere safe to send transcripts. Roll back instead.
+            adapter._voice_text_channels.pop(guild_id, None)
+            if hasattr(adapter, "_voice_sources"):
+                adapter._voice_sources.pop(guild_id, None)
+            if had_previous_mode:
+                assert previous_mode is not None
+                self._voice_mode[voice_key] = previous_mode
+            else:
+                self._voice_mode.pop(voice_key, None)
+            try:
+                self._save_voice_modes()
+            except Exception:
+                logger.warning(
+                    "Failed to persist Discord voice-mode rollback for guild %s",
+                    guild_id,
+                    exc_info=True,
+                )
+            try:
+                self._set_adapter_auto_tts_disabled(
+                    adapter, source.chat_id, disabled=True
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to roll back Discord auto-TTS for guild %s",
+                    guild_id,
+                    exc_info=True,
+                )
+            try:
+                await adapter.leave_voice_channel(guild_id)
+            except Exception:
+                logger.warning(
+                    "Failed to roll back Discord voice join for guild %s",
+                    guild_id,
+                    exc_info=True,
+                )
+            raise
+        return True
+
+    async def _handle_voice_auto_join(
+        self, adapter, action: str, route, voice_channel, member
+    ) -> bool:
+        """Apply adapter-detected auto-join lifecycle through runner-owned state."""
+        chat_id = str(route.text_channel_id)
+        if action == "leave":
+            try:
+                await adapter.leave_voice_channel(route.guild_id)
+            except Exception:
+                logger.warning(
+                    "Failed to auto-leave Discord voice channel for guild %s",
+                    route.guild_id,
+                    exc_info=True,
+                )
+                return False
+            self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
+            self._save_voice_modes()
+            self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+            voice_clients = getattr(adapter, "_voice_clients", None)
+            if not isinstance(voice_clients, dict) or not voice_clients:
+                adapter._voice_input_callback = None
+            return True
+
+        if action != "join" or member is None:
+            return False
+        text_channel = adapter._client.get_channel(route.text_channel_id)
+        text_guild_id = getattr(getattr(text_channel, "guild", None), "id", None)
+        if text_channel is None or text_guild_id != route.guild_id:
+            logger.warning(
+                "Discord voice auto-join text channel not found in configured guild: "
+                "guild=%s channel=%s",
+                route.guild_id,
+                route.text_channel_id,
+            )
+            return False
+
+        profile = getattr(adapter, "_profile_name", None)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=chat_id,
+            chat_name=getattr(text_channel, "name", None),
+            chat_type="channel",
+            user_id=str(member.id),
+            user_name=getattr(member, "display_name", str(member.id)),
+            scope_id=str(route.guild_id),
+            profile=profile,
+        )
+        if not self._is_user_authorized(source):
+            logger.warning(
+                "Discord voice auto-join trigger user %s is not authorized by "
+                "the gateway access policy",
+                member.id,
+            )
+            return False
+        try:
+            return await self._join_discord_voice_channel(
+                adapter,
+                voice_channel,
+                source,
+                route.guild_id,
+                move_existing=False,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to auto-join Discord voice channel for guild %s",
+                route.guild_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _configure_voice_auto_join_adapter(self, adapter) -> None:
+        """Attach the runner callback and reconcile one connected adapter."""
+        if getattr(adapter, "platform", None) != Platform.DISCORD:
+            return
+        routes = getattr(adapter, "_voice_auto_join_routes", ())
+        if routes:
+            adapter._voice_auto_join_callback = (
+                lambda action, route, channel, member: self._handle_voice_auto_join(
+                    adapter, action, route, channel, member
+                )
+            )
+        reconcile = getattr(adapter, "reconcile_voice_auto_join", None)
+        if callable(reconcile) and routes:
+            try:
+                await reconcile()
+            except Exception:
+                logger.warning("Discord voice auto-join reconciliation failed", exc_info=True)
+
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
         adapter = self._adapter_for_source(event.source)
@@ -15234,21 +15412,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not voice_channel:
             return "You need to be in a voice channel first."
 
-        # Wire callbacks BEFORE join so voice input arriving immediately
-        # after connection is not lost.
-        if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
-        if hasattr(adapter, "_on_voice_disconnect"):
-            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
-        # Let the adapter's inactivity timer see the live voice-reply mode so it
-        # doesn't disconnect a deliberately text-only (/voice off) session.
-        if hasattr(adapter, "_voice_mode_getter"):
-            adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
-                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
-            )
-
+        manual_claimed = False
         try:
-            success = await adapter.join_voice_channel(voice_channel)
+            begin_manual_join = getattr(
+                type(adapter), "_begin_manual_voice_join", None
+            )
+            if callable(begin_manual_join):
+                begin_manual_join(adapter, guild_id)
+                manual_claimed = True
+            success = await self._join_discord_voice_channel(
+                adapter, voice_channel, event.source, guild_id
+            )
         except Exception as e:
             logger.warning("Failed to join voice channel: %s", e)
             adapter._voice_input_callback = None
@@ -15259,14 +15433,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"Install with: `{sys.executable} -m pip install PyNaCl`"
                 )
             return f"Failed to join voice channel: {e}"
+        finally:
+            if manual_claimed:
+                end_manual_join = getattr(
+                    type(adapter), "_end_manual_voice_join", None
+                )
+                if callable(end_manual_join):
+                    end_manual_join(adapter, guild_id)
 
         if success:
-            adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
-            if hasattr(adapter, "_voice_sources"):
-                adapter._voice_sources[guild_id] = event.source.to_dict()
-            self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
-            self._save_voice_modes()
-            self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
@@ -15350,14 +15525,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self, guild_id: int, user_id: int, transcript: str, *, adapter: Any = None
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = cast(Any, adapter or self.adapters.get(Platform.DISCORD))
         if not adapter:
             return
 
