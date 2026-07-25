@@ -4854,6 +4854,25 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+
+    # Guard: refuse to overwrite a dict-typed section with a scalar value.
+    # `hermes config set model openai-codex/gpt-5.6-sol` would replace the
+    # entire ``model:`` mapping (losing ``provider``, ``base_url``,
+    # ``context_length``, etc.) with a bare string.  Route the user to the
+    # dotted key form instead (#71047).
+    _top = key.split(".")[0]
+    if "." not in key and isinstance(user_config.get(_top), dict):
+        print(
+            color(
+                f"⚠ Refusing to overwrite '{_top}' (a mapping with "
+                f"{len(user_config[_top])} keys) with a scalar value.\n"
+                f"  Use a dotted key, e.g. `hermes config set {_top}.default {value}`",
+                Colors.YELLOW,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
