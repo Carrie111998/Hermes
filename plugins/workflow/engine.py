@@ -2705,19 +2705,12 @@ class WorkflowEngine:
             time.sleep(self.POLL_INTERVAL)
             polls += 1
 
-            # Force WAL checkpoint to ensure fresh reads
-            try:
-                from hermes_cli import kanban_db as _kb
-                with _kb.connect(board=self.kanban_board) as _conn:
-                    _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
 
             # Sweep stale heartbeats once per poll tick.  Idempotent
             # and cheap (single SELECT + conditional UPDATEs).
             try:
                 from hermes_cli import kanban_db as _kb
-                with _kb.connect(board=self.kanban_board) as _conn:
+                with _kb.connect_closing(board=self.kanban_board) as _conn:
                     _kb.sweep_stale_heartbeats(_conn)
             except Exception:
                 pass  # Non-fatal: heartbeat sweep is a safety net
