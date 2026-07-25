@@ -2448,12 +2448,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         configured_default_assignee = (
             (_kanban_cfg.get("default_assignee") or "").strip() or None
         )
-        default_assignee_rule = kb.default_assignee_routing_rule(
-            kb.get_current_board(),
-            _kanban_cfg.get("default_assignee_boards", [kb.DEFAULT_BOARD]),
-        )
-        default_assignee = (
-            configured_default_assignee if default_assignee_rule else None
+        default_assignee_boards = _kanban_cfg.get(
+            "default_assignee_boards",
+            [kb.DEFAULT_BOARD],
         )
         default_assignee_dispatcher_profile = _profile_author()
 
@@ -2477,8 +2474,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_spawn")
         )
     except Exception:
-        default_assignee = None
-        default_assignee_rule = None
+        configured_default_assignee = None
+        default_assignee_boards = []
         default_assignee_dispatcher_profile = None
         max_in_progress_per_profile = None
         max_in_progress = None
@@ -2490,9 +2487,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-            default_assignee=default_assignee,
+            default_assignee=configured_default_assignee,
             default_assignee_dispatcher_profile=default_assignee_dispatcher_profile,
-            default_assignee_routing_rule=default_assignee_rule,
+            default_assignee_boards=default_assignee_boards,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
@@ -2536,7 +2533,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
     if res.auto_assigned_default:
         print(
-            f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
+            "Auto-assigned to "
+            f"kanban.default_assignee={configured_default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
         )
     if res.skipped_unassigned:

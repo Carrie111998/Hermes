@@ -52,7 +52,6 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
             conn, spawn_fn=_fake_spawn, dry_run=False,
             default_assignee="default",
             default_assignee_dispatcher_profile="default",
-            default_assignee_routing_rule="kanban.default_assignee_boards:default",
         )
     assert res.auto_assigned_default == [task_id]
     assert not res.skipped_unassigned
@@ -102,7 +101,7 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
 @pytest.mark.parametrize(
     ("board", "configured_boards", "expected"),
     [
-        ("default", None, "kanban.default_assignee_boards:default"),
+        ("default", None, None),
         ("project-a", None, None),
         ("default", [], None),
         ("project-a", ["project-a"], "kanban.default_assignee_boards:project-a"),
@@ -150,3 +149,48 @@ def test_default_config_preserves_legacy_default_board_only(isolated_kanban_home
     )
     assert load_config()["kanban"]["default_assignee_boards"] == []
 
+def test_dispatch_enforces_board_routing_at_assignment_boundary(
+    isolated_kanban_home,
+):
+    """A direct caller cannot bypass named-board fallback authorization."""
+    kb, _home = isolated_kanban_home
+    kb.create_board("project-a")
+    with kb.connect_closing(board="project-a") as conn:
+        task_id = kb.create_task(conn, title="named-board task", assignee=None)
+
+        denied = kb.dispatch_once(
+            conn,
+            board="project-a",
+            spawn_fn=_fake_spawn,
+            default_assignee="default",
+        )
+        assert denied.skipped_unassigned == [task_id]
+        untouched = kb.get_task(conn, task_id)
+        assert untouched is not None and untouched.assignee is None
+        assert conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'assigned'",
+            (task_id,),
+        ).fetchone() is None
+
+        allowed = kb.dispatch_once(
+            conn,
+            board="project-a",
+            spawn_fn=_fake_spawn,
+            default_assignee="default",
+            default_assignee_dispatcher_profile="default",
+            default_assignee_boards=["project-a"],
+        )
+
+        task = kb.get_task(conn, task_id)
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'assigned'",
+            (task_id,),
+        ).fetchone()
+
+    assert allowed.auto_assigned_default == [task_id]
+    assert task is not None and task.assignee == "default"
+    payload = json.loads(event["payload"])
+    assert payload["dispatcher_profile"] == "default"
+    assert payload["routing_rule"] == "kanban.default_assignee_boards:project-a"

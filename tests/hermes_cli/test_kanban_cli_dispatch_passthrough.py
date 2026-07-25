@@ -95,22 +95,21 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
 
 
 @pytest.mark.parametrize(
-    ("configured_boards", "expected_assignee", "expected_rule"),
+    ("configured_boards", "expected_boards"),
     [
-        (None, None, None),
-        ([], None, None),
-        (["project-a"], "default", "kanban.default_assignee_boards:project-a"),
-        (["*"], "default", "kanban.default_assignee_boards:*"),
+        (None, ["default"]),
+        ([], []),
+        (["project-a"], ["project-a"]),
+        (["*"], ["*"]),
     ],
 )
-def test_cli_dispatch_scopes_default_assignee_to_current_board(
+def test_cli_dispatch_passes_default_assignee_policy_to_dispatch_boundary(
     isolated_kanban_home,
     monkeypatch,
     configured_boards,
-    expected_assignee,
-    expected_rule,
+    expected_boards,
 ):
-    """Direct CLI dispatch enforces the same board fallback policy as gateway."""
+    """The database dispatcher, not the CLI, owns fallback authorization."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
 
@@ -134,6 +133,6 @@ def test_cli_dispatch_scopes_default_assignee_to_current_board(
     with kanban_db.scoped_current_board("project-a"):
         kb_cli._cmd_dispatch(args)
 
-    assert captured["default_assignee"] == expected_assignee
-    assert captured["default_assignee_routing_rule"] == expected_rule
+    assert captured["default_assignee"] == "default"
+    assert captured["default_assignee_boards"] == expected_boards
 

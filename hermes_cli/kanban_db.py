@@ -400,8 +400,8 @@ def default_assignee_routing_rule(
     ``kanban.default_assignee`` belongs to the profile hosting the singleton
     dispatcher, while boards are shared across profiles.  The fallback must
     therefore be explicitly board-scoped before it may mutate an unassigned
-    card.  A missing setting keeps the original single-board behavior by
-    authorizing only ``default``; an explicit empty list disables fallback
+    card.  Callers supply ``["default"]`` for a missing setting to keep the
+    original single-board behavior; an explicit empty list disables fallback
     assignment everywhere; and ``["*"]`` deliberately restores the historical
     all-board behavior.
 
@@ -410,7 +410,7 @@ def default_assignee_routing_rule(
     authorized for this board.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    entries = [DEFAULT_BOARD] if configured_boards is None else configured_boards
+    entries = configured_boards
     if not isinstance(entries, (list, tuple, set, frozenset)):
         return None
 
@@ -8108,7 +8108,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     default_assignee_dispatcher_profile: Optional[str] = None,
-    default_assignee_routing_rule: Optional[str] = None,
+    default_assignee_boards: object = (DEFAULT_BOARD,),
     max_in_progress_per_profile: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -8125,6 +8125,12 @@ def dispatch_once(
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
+
+    Fallback authorization is also enforced here, at the mutation boundary:
+    ``default_assignee`` is ignored unless the resolved board matches
+    ``default_assignee_boards`` (or its explicit ``"*"`` wildcard). Keeping
+    this check below gateway/CLI orchestration prevents sibling callers from
+    bypassing board scope.
     """
     try:
         db_path = kanban_db_path(board=board)
@@ -8144,7 +8150,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             default_assignee_dispatcher_profile=default_assignee_dispatcher_profile,
-            default_assignee_routing_rule=default_assignee_routing_rule,
+            default_assignee_boards=default_assignee_boards,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     with _dispatch_tick_lock(db_path) as held:
@@ -8162,7 +8168,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             default_assignee_dispatcher_profile=default_assignee_dispatcher_profile,
-            default_assignee_routing_rule=default_assignee_routing_rule,
+            default_assignee_boards=default_assignee_boards,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
@@ -8184,7 +8190,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     default_assignee_dispatcher_profile: Optional[str] = None,
-    default_assignee_routing_rule: Optional[str] = None,
+    default_assignee_boards: object = (DEFAULT_BOARD,),
     max_in_progress_per_profile: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -8302,7 +8308,14 @@ def _dispatch_once_locked(
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
-    _default_assignee = (default_assignee or "").strip() or None
+    effective_board = _normalize_board_slug(board) or get_current_board()
+    default_assignee_rule = default_assignee_routing_rule(
+        effective_board,
+        default_assignee_boards,
+    )
+    _default_assignee = (
+        (default_assignee or "").strip() or None
+    ) if default_assignee_rule else None
     _default_assignee_resolved = False
     if _default_assignee:
         try:
@@ -8331,6 +8344,7 @@ def _dispatch_once_locked(
             # by ``kanban.default_assignee``, not "unassigned but secretly
             # routed".
             if _default_assignee and _default_assignee_resolved:
+                assert default_assignee_rule is not None
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.
@@ -8350,10 +8364,9 @@ def _dispatch_once_locked(
                                 assignment_payload["dispatcher_profile"] = (
                                     default_assignee_dispatcher_profile
                                 )
-                            if default_assignee_routing_rule:
-                                assignment_payload["routing_rule"] = (
-                                    default_assignee_routing_rule
-                                )
+                            assignment_payload["routing_rule"] = (
+                                default_assignee_rule
+                            )
                             _append_event(
                                 conn,
                                 row["id"],

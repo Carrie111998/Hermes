@@ -1195,11 +1195,6 @@ class GatewayKanbanWatchersMixin:
             connection handle or accidentally claim across each other.
             """
             conn = None
-            fallback_rule = _kb.default_assignee_routing_rule(
-                slug,
-                default_assignee_boards,
-            )
-            board_default_assignee = default_assignee if fallback_rule else None
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
             if disabled_entry is not None:
@@ -1238,9 +1233,9 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
-                    default_assignee=board_default_assignee,
+                    default_assignee=default_assignee,
                     default_assignee_dispatcher_profile=dispatcher_profile,
-                    default_assignee_routing_rule=fallback_rule,
+                    default_assignee_boards=default_assignee_boards,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                 )
             except sqlite3.DatabaseError as exc:
