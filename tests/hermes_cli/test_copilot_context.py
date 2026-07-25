@@ -243,6 +243,9 @@ class TestModelMetadataCopilotIntegration:
         ctx = get_model_context_length("claude-opus-4.6-1m", provider="copilot")
         assert ctx == 1_000_000
 
+    @patch("hermes_cli.models.fetch_github_model_catalog", return_value=_SAMPLE_CATALOG)
+    def test_copilot_acp_provider_uses_live_api(self, mock_fetch):
+        from agent.model_metadata import get_model_context_length
 
         ctx = get_model_context_length("claude-sonnet-4", provider="copilot-acp")
         assert ctx == 200_000
