@@ -39,65 +39,63 @@ def _token_is_current(data: dict) -> bool:
     return expiry > datetime.now(timezone.utc) + timedelta(minutes=1)
 
 
-def _write_token(path: Path, data: dict) -> None:
-    data["type"] = "authorized_user"
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    params = urllib.parse.urlencode({
+        "client_id": token_data["client_id"],
+        "client_secret": token_data["client_secret"],
+        "refresh_token": token_data["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode()
+
+    req = urllib.request.Request(token_data["token_uri"], data=params)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"ERROR: Token refresh failed (HTTP {e.code}): {body}", file=sys.stderr)
+        print("Re-run setup.py to re-authenticate.", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, TimeoutError) as e:
+        print(f"ERROR: Token refresh failed (network): {e}", file=sys.stderr)
+        sys.exit(1)
+
+    token_data["token"] = result["access_token"]
+    token_data["expiry"] = datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() + result["expires_in"],
+        tz=timezone.utc,
+    ).isoformat()
+
+    get_token_path().write_text(
+        json.dumps(_normalize_authorized_user_payload(token_data), indent=2), encoding="utf-8"
+    )
+    return token_data
 
 
 def get_valid_token() -> str:
     token_path = get_token_path()
     if not token_path.exists():
-        print(f"Missing Google token file: {token_path}", file=sys.stderr)
-        raise SystemExit(1)
+        print("ERROR: No Google token found. Run setup.py --auth-url first.", file=sys.stderr)
+        sys.exit(1)
 
-    data = json.loads(token_path.read_text(encoding="utf-8"))
-    token = data.get("token") or data.get("access_token")
-    if token and _token_is_current(data):
-        return token
+    token_data = json.loads(token_path.read_text(encoding="utf-8"))
 
-    refresh_token = data.get("refresh_token")
-    token_uri = data.get("token_uri", "https://oauth2.googleapis.com/token")
-    client_id = data.get("client_id")
-    client_secret = data.get("client_secret")
-    if not (refresh_token and client_id and client_secret):
-        print("Google token is expired and lacks refresh material.", file=sys.stderr)
-        raise SystemExit(1)
+    expiry = token_data.get("expiry", "")
+    if expiry:
+        exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if now >= exp_dt:
+            token_data = refresh_token(token_data)
 
-    body = urllib.parse.urlencode(
-        {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        token_uri,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=TOKEN_REFRESH_TIMEOUT_SECONDS) as response:
-            refreshed = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        print(f"Google token refresh failed: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
-
-    access_token = refreshed.get("access_token")
-    if not access_token:
-        print("Google token refresh response did not include access_token.", file=sys.stderr)
-        raise SystemExit(1)
-
-    data["token"] = access_token
-    expires_in = int(refreshed.get("expires_in") or 3600)
-    data["expiry"] = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
-    _write_token(token_path, data)
-    return access_token
+    return token_data["token"]
 
 
-def main() -> None:
-    token = get_valid_token()
+def main():
+    """Refresh token if needed, then exec gws with remaining args."""
+    if len(sys.argv) < 2:
+        print("Usage: gws_bridge.py <gws args...>", file=sys.stderr)
+        sys.exit(1)
+
+    access_token = get_valid_token()
     env = os.environ.copy()
     env["GOOGLE_WORKSPACE_CLI_TOKEN"] = token
     proc = subprocess.run(["gws", *sys.argv[1:]], env=env)

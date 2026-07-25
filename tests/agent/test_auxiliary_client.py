@@ -5046,6 +5046,69 @@ class TestAuxiliaryAuthRefreshRetry:
         )
         stale_client.close.assert_called_once()
 
+    def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
+        """Vertex tokens live ~1h; on a long-running gateway the cached
+        auxiliary client's bearer token expires mid-session and 401s.
+        _refresh_provider_credentials("vertex") must re-mint the token via
+        the adapter (which refreshes in place when near expiry) and evict
+        the stale cached client so the next call rebuilds with a fresh one —
+        previously there was no "vertex" branch here at all, so this fell
+        through to the final `return False` and the stale client (and its
+        dead token) stayed cached until process restart."""
+        stale_client = MagicMock()
+        cache_key = ("vertex", False, None, None, None)
+
+        with (
+            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "google/gemini-3-flash-preview", None)}),
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                return_value=("ya29.FRESH", "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"),
+            ) as mock_get_config,
+        ):
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("vertex") is True
+
+        mock_get_config.assert_called_once()
+        stale_client.close.assert_called_once()
+
+    def test_refresh_provider_credentials_vertex_returns_false_when_unminted(self):
+        """No usable token/base_url (e.g. ADC and the service-account file
+        both failed) — refresh must report failure, not silently evict and
+        pretend the client is fixed."""
+        with patch("agent.vertex_adapter.get_vertex_config", return_value=(None, None)):
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("vertex") is False
+
+    def test_resolve_provider_client_vertex_builds_client_from_minted_token(self):
+        """End-to-end: resolve_provider_client("vertex", ...) must reach the
+        auth_type == "vertex" branch and build a working client, not die at
+        the PROVIDER_REGISTRY lookup (a plain HERMES_OVERLAYS-only fix would
+        leave this branch dead code — PROVIDER_REGISTRY is what
+        resolve_provider_client actually gates on)."""
+        with (
+            patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                return_value=("ya29.FRESH", "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"),
+            ),
+        ):
+            client, model = resolve_provider_client("vertex", "google/gemini-3-flash-preview")
+
+        assert client is not None
+        assert model == "google/gemini-3-flash-preview"
+        assert str(client.base_url).rstrip("/") == (
+            "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"
+        )
+
+    def test_resolve_provider_client_vertex_none_when_no_credentials(self):
+        with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
+            client, model = resolve_provider_client("vertex", "google/gemini-3-flash-preview")
+
+        assert client is None
+        assert model is None
+
     @pytest.mark.asyncio
     async def test_async_call_llm_refreshes_anthropic_on_401_for_non_vision(self):
         stale_client = MagicMock()
@@ -5559,7 +5622,7 @@ class TestCodexAdapterPromptCacheKey:
     """
 
     @staticmethod
-    def _build_adapter(base_url="https://chatgpt.com/backend-api/codex"):
+    def _build_adapter(base_url="https://chatgpt.com/backend-api/codex", model="gpt-5.5"):
         from agent.auxiliary_client import _CodexCompletionsAdapter
         from types import SimpleNamespace
 
@@ -5592,7 +5655,7 @@ class TestCodexAdapterPromptCacheKey:
         real_client = MagicMock()
         real_client.base_url = base_url
         real_client.responses.create = _create
-        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        adapter = _CodexCompletionsAdapter(real_client, model)
         return adapter, captured_kwargs
 
     def test_cache_key_set_and_prefixed(self):
@@ -5644,6 +5707,69 @@ class TestCodexAdapterPromptCacheKey:
             {"role": "user", "content": "hi"},
         ])
         assert "prompt_cache_key" not in captured
+
+    @pytest.mark.parametrize("model", [
+        "gpt-4.1",
+        "gpt-5.1-codex-max",
+        "openai.gpt-5.5-pro",
+    ])
+    def test_extended_cache_models_set_prompt_cache_retention(self, model):
+        adapter, captured = self._build_adapter(
+            base_url="https://bedrock-mantle.us-west-2.api.aws/v1",
+            model=model,
+        )
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert captured["prompt_cache_retention"] == "24h"
+
+    def test_prompt_cache_retention_skipped_for_codex_backend(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
+
+    @pytest.mark.parametrize("base_url", [
+        "https://api.openai.com/v1",
+        "https://example.services.ai.azure.com/openai/v1",
+        "https://responses.example.com/v1",
+    ])
+    def test_prompt_cache_retention_skipped_for_other_compatible_endpoints(self, base_url):
+        adapter, captured = self._build_adapter(base_url=base_url)
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
+
+    def test_prompt_cache_retention_skipped_for_xai_and_github_hosts(self):
+        adapter, captured = self._build_adapter(base_url="https://api.x.ai/v1")
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
+
+        adapter, captured = self._build_adapter(base_url="https://api.githubcopilot.com")
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
+
+    def test_prompt_cache_retention_skipped_for_github_models_host(self):
+        """models.github.ai is a GitHub Responses host in the main transport
+        (agent/chat_completion_helpers.py) — the auxiliary path must exclude
+        it from cache-retention emission the same way as githubcopilot.com."""
+        adapter, captured = self._build_adapter(base_url="https://models.github.ai/inference")
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
 
 
 class TestCodexAdapterGithubResponsesMessageIdDrop:

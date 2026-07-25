@@ -1,6 +1,6 @@
 ---
 name: hyperframes
-description: Default HTML-to-video skill. Motion graphics, captions, promos, site-to-video.
+description: Render MP4/WebM videos from HTML compositions.
 version: 1.0.0
 author: heygen-com
 license: Apache-2.0

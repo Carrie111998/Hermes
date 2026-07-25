@@ -27,7 +27,31 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents.readonly",
 ]
-TOKEN_PATH = get_hermes_home() / "google_token.json"
+
+
+def _normalize_authorized_user_payload(payload: dict) -> dict:
+    normalized = dict(payload)
+    if not normalized.get("type"):
+        normalized["type"] = "authorized_user"
+    return normalized
+
+
+def _ensure_authenticated():
+    if not TOKEN_PATH.exists():
+        print("Not authenticated. Run the setup script first:", file=sys.stderr)
+        print(f"  python {Path(__file__).parent / 'setup.py'}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _stored_token_scopes() -> list[str]:
+    try:
+        data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return list(SCOPES)
+    scopes = data.get("scopes")
+    if isinstance(scopes, list) and scopes:
+        return scopes
+    return list(SCOPES)
 
 
 def _gws_binary() -> str | None:
@@ -55,14 +79,108 @@ def _run_gws(
     if params is not None:
         cmd.extend(["--params", json.dumps(params, separators=(",", ":"))])
     if body is not None:
-        cmd.extend(["--body", json.dumps(body, separators=(",", ":"))])
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise SystemExit(proc.stderr or proc.returncode)
-    if not proc.stdout.strip():
+        cmd.extend(["--json", json.dumps(body)])
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True, encoding='utf-8', errors='replace',
+        env=_gws_env(),
+    )
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip() or "Unknown gws error"
+        print(err, file=sys.stderr)
+        sys.exit(result.returncode or 1)
+
+    stdout = result.stdout.strip()
+    if not stdout:
         return {}
     return json.loads(proc.stdout)
 
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: Unexpected non-JSON output from gws:", file=sys.stderr)
+        print(stdout, file=sys.stderr)
+        sys.exit(1)
+
+
+def _headers_dict(msg: dict) -> dict[str, str]:
+    return {
+        h["name"].lower(): h["value"]
+        for h in msg.get("payload", {}).get("headers", [])
+        if h.get("name")
+    }
+
+
+def _extract_message_body(msg: dict) -> str:
+    body = ""
+    payload = msg.get("payload", {})
+    if payload.get("body", {}).get("data"):
+        body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+    elif payload.get("parts"):
+        for part in payload["parts"]:
+            if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+                body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+                break
+        if not body:
+            for part in payload["parts"]:
+                if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
+                    body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+                    break
+    return body
+
+
+def _extract_doc_text(doc: dict) -> str:
+    text_parts = []
+    for element in doc.get("body", {}).get("content", []):
+        paragraph = element.get("paragraph", {})
+        for pe in paragraph.get("elements", []):
+            text_run = pe.get("textRun", {})
+            if text_run.get("content"):
+                text_parts.append(text_run["content"])
+    return "".join(text_parts)
+
+
+def _datetime_with_timezone(value: str) -> str:
+    if not value:
+        return value
+    if "T" not in value:
+        return value
+    if value.endswith("Z"):
+        return value
+    tail = value[10:]
+    if "+" in tail or "-" in tail:
+        return value
+    return value + "Z"
+
+
+def get_credentials():
+    """Load and refresh credentials from token file."""
+    _ensure_authenticated()
+
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        TOKEN_PATH.write_text(
+            json.dumps(
+                _normalize_authorized_user_payload(json.loads(creds.to_json())),
+                indent=2,
+            ), encoding="utf-8"
+        )
+    if not creds.valid:
+        print("Token is invalid. Re-run setup.", file=sys.stderr)
+        sys.exit(1)
+    return creds
+
+
+def build_service(api, version):
+    from googleapiclient.discovery import build
+
+    return build(api, version, credentials=get_credentials())
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

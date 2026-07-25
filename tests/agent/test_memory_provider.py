@@ -1595,35 +1595,24 @@ class TestMemoryToolToolsetGate:
     These tests exercise the shared gate used by agent init and ACP refreshes.
     The gate condition is:
 
+        disabled_toolsets includes memory → skip injection
         enabled_toolsets is None        → no filter, inject (backward compat)
         selected toolsets include memory → user opted in, inject
         otherwise (incl. [])            → skip injection
     """
 
     @staticmethod
-    def _run_memory_injection(enabled_toolsets, memory_manager):
-        """Simulate the gated memory-tool injection block from agent_init.py."""
-        tools = []
-        valid_tool_names = set()
-
-        if (
-            memory_manager
-            and tools is not None
-            and memory_provider_tools_enabled(enabled_toolsets)
-        ):
-            _existing = {
-                t.get("function", {}).get("name") for t in tools if isinstance(t, dict)
-            }
-            for _schema in memory_manager.get_all_tool_schemas():
-                _tname = _schema.get("name", "")
-                if _tname and _tname in _existing:
-                    continue
-                tools.append({"type": "function", "function": _schema})
-                if _tname:
-                    valid_tool_names.add(_tname)
-                    _existing.add(_tname)
-
-        return tools, valid_tool_names
+    def _run_memory_injection(enabled_toolsets, memory_manager, disabled_toolsets=None):
+        """Run the shared memory-tool injection helper against a fake agent."""
+        fake_agent = SimpleNamespace(
+            _memory_manager=memory_manager,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            tools=[],
+            valid_tool_names=set(),
+        )
+        inject_memory_provider_tools(fake_agent)
+        return fake_agent.tools, fake_agent.valid_tool_names
 
     def _mgr_with_tools(self, *tool_names):
         """Build a MemoryManager whose providers expose the named tool schemas."""
@@ -1654,6 +1643,18 @@ class TestMemoryToolToolsetGate:
         tools, names = self._run_memory_injection(["hermes-acp"], mgr)
         assert "hindsight_recall" in names
         assert any(t["function"]["name"] == "hindsight_recall" for t in tools)
+
+    @pytest.mark.parametrize("enabled_toolsets", [None, ["memory"], ["all"], ["hermes-acp"]])
+    def test_disabled_memory_toolset_blocks_injection(self, enabled_toolsets):
+        """An explicit memory disable wins over default or composite enablement."""
+        mgr = self._mgr_with_tools("hindsight_recall")
+        tools, names = self._run_memory_injection(
+            enabled_toolsets,
+            mgr,
+            disabled_toolsets=["memory"],
+        )
+        assert tools == []
+        assert names == set()
 
     def test_empty_toolsets_blocks_injection(self):
         """`platform_toolsets: telegram: []` must suppress memory tools. (#5544)"""

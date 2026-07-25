@@ -27,10 +27,27 @@ SCOPES = [
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib"]
 REDIRECT_URI = "http://localhost:1/"
 
-HERMES_HOME = get_hermes_home()
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
+REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
+
+# OAuth redirect for "out of band" manual code copy flow.
+# Google deprecated OOB, so we use a localhost redirect and tell the user to
+# copy the code from the browser's URL bar (or the page body).
+REDIRECT_URI = "http://localhost:1"
+
+
+def _normalize_authorized_user_payload(payload: dict) -> dict:
+    normalized = dict(payload)
+    if not normalized.get("type"):
+        normalized["type"] = "authorized_user"
+    return normalized
+
+
+def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
 
 
 def _deps_available() -> bool:
@@ -103,6 +120,40 @@ def check_auth_live():
         print("Failed to install Google dependencies via uv")
         return False
 
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            TOKEN_PATH.write_text(
+                json.dumps(
+                    _normalize_authorized_user_payload(json.loads(creds.to_json())),
+                    indent=2,
+                ), encoding="utf-8"
+            )
+            missing_scopes = _missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
+            if missing_scopes:
+                print(f"AUTHENTICATED (partial): Token refreshed but missing {len(missing_scopes)} scopes:")
+                for s in missing_scopes:
+                    print(f"  - {s}")
+            if not quiet:
+                print(f"AUTHENTICATED: Token refreshed at {TOKEN_PATH}")
+            return True
+        except Exception as e:
+            err_str = str(e).lower()
+            if "disabled_client" in err_str or "invalid_client" in err_str:
+                print(f"OAUTH_CLIENT_DISABLED: {e}")
+                print("  The OAuth client or Google account has been disabled.")
+                print("  Steps to resolve:")
+                print("    1. Check your Google Cloud Console — verify the OAuth client is not disabled")
+                print("    2. Check if your Google account itself has been disabled at myaccount.google.com")
+                print("    3. If the account is disabled, you can appeal at accounts.google.com/signin/recovery")
+                print("    4. Do NOT retry API calls with a disabled account — this may worsen the situation")
+                print("    5. If the OAuth client is disabled, create a new one in Google Cloud Console")
+            elif "token_revoked" in err_str or "invalid_grant" in err_str:
+                print(f"TOKEN_REVOKED: {e}")
+                print("  Re-run setup to re-authenticate.")
+            else:
+                print(f"REFRESH_FAILED: {e}")
+            return False
 
 def _ensure_deps() -> None:
     if install_deps():
@@ -114,14 +165,59 @@ def _flow_class():
     _ensure_deps()
     from google_auth_oauthlib.flow import Flow
 
-    return Flow
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print("ERROR: File is not valid JSON.")
+        sys.exit(1)
+
+    if "installed" not in data and "web" not in data:
+        print("ERROR: Not a Google OAuth client secret file (missing 'installed' key).")
+        print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
+        sys.exit(1)
+
+    CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
+
+
+def _save_pending_auth(*, state: str, code_verifier: str):
+    """Persist the OAuth session bits needed for a later token exchange."""
+    PENDING_AUTH_PATH.write_text(
+        json.dumps(
+            {
+                "state": state,
+                "code_verifier": code_verifier,
+                "redirect_uri": REDIRECT_URI,
+            },
+            indent=2,
+        ), encoding="utf-8"
+    )
 
 
 def _load_pending() -> dict:
     if not PENDING_AUTH_PATH.exists():
-        print("No pending OAuth session. Run --auth-url first.")
-        raise SystemExit(1)
-    return json.loads(PENDING_AUTH_PATH.read_text(encoding="utf-8"))
+        print("ERROR: No pending OAuth session found. Run --auth-url first.")
+        sys.exit(1)
+
+    try:
+        data = json.loads(PENDING_AUTH_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"ERROR: Could not read pending OAuth session: {e}")
+        print("Run --auth-url again to start a fresh OAuth session.")
+        sys.exit(1)
+
+    if not data.get("state") or not data.get("code_verifier"):
+        print("ERROR: Pending OAuth session is missing PKCE data.")
+        print("Run --auth-url again to start a fresh OAuth session.")
+        sys.exit(1)
+
+    return data
+
+
+def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
+    """Accept either a raw auth code or the full redirect URL pasted by the user."""
+    if not code_or_url.startswith("http"):
+        return code_or_url, None
 
 
 def _extract_code_and_scopes(value: str) -> tuple[str, list[str] | None, str | None]:
@@ -179,17 +275,30 @@ def exchange_auth_code(code_or_url: str) -> None:
     )
     try:
         flow.fetch_token(code=code)
-    except Exception as exc:
-        print(f"Token exchange failed: {exc}")
-        raise SystemExit(1) from exc
+    except Exception as e:
+        print(f"ERROR: Token exchange failed: {e}")
+        print("The code may have expired. Run --auth-url to get a fresh URL.")
+        sys.exit(1)
 
-    token_payload = json.loads(flow.credentials.to_json())
-    token_payload["type"] = "authorized_user"
-    granted = set(token_payload.get("scopes") or [])
-    missing = sorted(set(SCOPES) - granted) if granted else []
-    if missing:
-        print("Warning: token was granted narrower scopes; missing: " + ", ".join(missing))
-    _write_json(TOKEN_PATH, token_payload)
+    creds = flow.credentials
+    token_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))
+
+    # Store only the scopes actually granted by the user, not what was requested.
+    # creds.to_json() writes the requested scopes, which causes refresh to fail
+    # with invalid_scope if the user only authorized a subset.
+    actually_granted = list(creds.granted_scopes or []) if hasattr(creds, "granted_scopes") and creds.granted_scopes else []
+    if actually_granted:
+        token_payload["scopes"] = actually_granted
+    elif granted_scopes != SCOPES:
+        # granted_scopes was extracted from the callback URL
+        token_payload["scopes"] = granted_scopes
+
+    missing_scopes = _missing_scopes_from_payload(token_payload)
+    if missing_scopes:
+        print(f"WARNING: Token missing some Google Workspace scopes: {', '.join(missing_scopes)}")
+        print("Some services may not be available.")
+
+    TOKEN_PATH.write_text(json.dumps(token_payload, indent=2), encoding="utf-8")
     PENDING_AUTH_PATH.unlink(missing_ok=True)
 
 
