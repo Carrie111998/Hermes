@@ -8317,7 +8317,7 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = _resolve_spawn_fn(spawn_fn)
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -8415,7 +8415,7 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = _resolve_spawn_fn(spawn_fn)
         try:
             import inspect
             try:
@@ -8895,6 +8895,351 @@ def _default_spawn(
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
     return proc.pid
+
+
+# ---------------------------------------------------------------------------
+# Container-backed spawn (OrbStack / Docker)
+# ---------------------------------------------------------------------------
+#
+# When HERMES_KANBAN_SPAWN=container is set in the dispatcher's environment,
+# _container_spawn wraps the same `hermes -p <profile> chat -q ...` worker
+# invocation in `docker run`. This gives each worker its own filesystem /
+# process namespace — isolation between tasks, no shared /tmp pollution, and
+# the ability to cap CPU/memory per worker via HERMES_KANBAN_CONTAINER_*.
+#
+# Required env (set on the dispatcher, not the task):
+#   HERMES_KANBAN_SPAWN=container                 # enables this path
+#   HERMES_KANBAN_CONTAINER_IMAGE=<image>[:tag]   # e.g. hermes-agent:dev
+#
+# Optional env:
+#   HERMES_KANBAN_CONTAINER_CPUS=<float>          # default: inherit (no cap)
+#   HERMES_KANBAN_CONTAINER_MEMORY=<int>m|g       # default: inherit
+#   HERMES_KANBAN_CONTAINER_NETWORK=<name>        # default: bridge
+#   HERMES_KANBAN_CONTAINER_EXTRA=<json array>    # extra `docker run` argv,
+#                                                 # e.g. ["--read-only","--tmpfs","/tmp"]
+#
+# Volumes / env are derived from what _default_spawn already sets — we mount
+# HERMES_HOME, the task workspace, and the kanban DB dir read-write, and
+# forward the same HERMES_* / TERMINAL_* / BW_SESSION env vars so the worker
+# can authenticate to providers and find its profile + board state.
+#
+# The container is launched with `docker run --rm -d` so we can capture the
+# container ID (printed to stdout by `docker run -d`). We translate that to
+# a synthetic "PID" by reading the container's init PID via `docker inspect`,
+# so the dispatcher's crash-detection (which expects a numeric PID) still
+# works. The container's name is `hermes-worker-<task_id>` for easy filtering
+# from the agent-pause / agent-resume shell scripts.
+
+# Env vars the worker needs forwarded into the container. Anything NOT in
+# this list is dropped (container gets a clean env). Order doesn't matter.
+_CONTAINER_FORWARD_ENV = (
+    # Hermes identity / routing
+    "HERMES_HOME", "HERMES_PROFILE", "HERMES_TENANT",
+    "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_BRANCH", "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
+    # Worker file/terminal anchoring
+    "TERMINAL_CWD", "TERMINAL_TIMEOUT", "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+    # Provider auth — workers must be able to call the model
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    # Bitwarden session (workers pull secrets via claude-bw / bw)
+    "BW_SESSION",
+    # Common provider routing
+    "HERMES_PROVIDER", "HERMES_MODEL",
+    # PATH so the worker can find git, etc. — we also pass --env PATH=...
+    # explicitly below since the image's default PATH may differ.
+    "PATH",
+)
+
+
+def _container_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn a worker inside a Docker container.
+
+    See the module-level docs above for the env-var contract. Returns the
+    container's init PID (so the dispatcher's PID-based crash detection
+    still works) or None on failure.
+
+    Falls back to raising RuntimeError on docker failures so the dispatcher
+    records a spawn_failed outcome (matching _default_spawn's behavior).
+    """
+    import json
+    import subprocess
+
+    image = os.environ.get("HERMES_KANBAN_CONTAINER_IMAGE", "").strip()
+    # Per-task flavor override: tasks can request a specific worker flavor
+    # (e.g. "mcp", "builder-python", "builder-rust") via the task.toolset
+    # label. The flavor maps to an image hermes-worker:<flavor> from the
+    # image family in container/MANIFEST.yaml. Falls back to the env default
+    # if unset, then to the literal "core" flavor for a useful error message.
+    flavor = getattr(task, "toolset", None) or os.environ.get("HERMES_KANBAN_CONTAINER_FLAVOR", "")
+    if flavor:
+        # Allow either "hermes-worker:mcp" or the bare flavor name "mcp"
+        if "/" not in flavor and ":" not in flavor:
+            flavor_image = f"hermes-worker:{flavor.strip()}"
+        else:
+            flavor_image = flavor.strip()
+        # Flavor takes precedence over the env-default image, since the task
+        # explicitly asked for this toolset. Operators who want a single
+        # image for everything just don't set the task.toolset label.
+        image = flavor_image
+    if not image:
+        raise RuntimeError(
+            "HERMES_KANBAN_SPAWN=container but HERMES_KANBAN_CONTAINER_IMAGE is unset "
+            "(and task has no toolset flavor). Build or pull an image and set it, "
+            "e.g. HERMES_KANBAN_CONTAINER_IMAGE=hermes-worker:core."
+        )
+
+    if not task.assignee:
+        raise ValueError(f"task {task.id} has no assignee")
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    profile_arg = normalize_profile_name(task.assignee)
+
+    # --- Build the inner cmd (what runs INSIDE the container) ---------------
+    # Mirrors _default_spawn's argv shape, but we use a bare "hermes" because
+    # the image's PATH will resolve it (no need for the host's venv shim).
+    inner_cmd = [
+        "hermes",
+        "-p", profile_arg,
+        "--cli",
+        "--accept-hooks",
+    ]
+    if task.skills:
+        for sk in task.skills:
+            if sk:
+                inner_cmd.extend(["--skills", sk])
+    if task.model_override:
+        inner_cmd.extend(["-m", task.model_override])
+        if task.provider_override:
+            inner_cmd.extend(["--provider", task.provider_override])
+    worker_toolsets = _resolve_worker_cli_toolsets(
+        # Resolve to the profile-scoped HERMES_HOME, matching _default_spawn.
+        resolve_profile_env(profile_arg) if _profile_dir_exists(profile_arg) else None
+    )
+    if worker_toolsets:
+        inner_cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    inner_cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    if task.goal_mode:
+        inner_cmd.append("-Q")
+
+    # --- Build the env dict to forward -------------------------------------
+    # Resolve profile-scoped HERMES_HOME (the same logic as _default_spawn).
+    # We ALWAYS set HERMES_HOME — the container needs a real target to mount,
+    # even if the profile dir doesn't exist yet (the worker will create it).
+    fwd_env: dict[str, str] = {}
+    try:
+        fwd_env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        fwd_env["HERMES_HOME"] = os.path.expanduser("~/.hermes")
+    if task.tenant:
+        fwd_env["HERMES_TENANT"] = task.tenant
+    fwd_env["HERMES_KANBAN_TASK"] = task.id
+    fwd_env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+        fwd_env["TERMINAL_CWD"] = workspace
+    if task.branch_name:
+        fwd_env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    if task.current_run_id is not None:
+        fwd_env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.claim_lock:
+        fwd_env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if task.goal_mode:
+        fwd_env["HERMES_KANBAN_GOAL_MODE"] = "1"
+        if task.goal_max_turns is not None:
+            fwd_env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+    # Pin the board-relative paths so the worker writes to the same DB the
+    # dispatcher reads. These are HOST paths — we mount them at the same
+    # absolute location inside the container so the env vars stay accurate.
+    fwd_env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    fwd_env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    fwd_env["HERMES_KANBAN_BOARD"] = resolved_board
+    fwd_env["HERMES_PROFILE"] = profile_arg
+    # Carrier env from the dispatcher (auth tokens, BW_SESSION, PATH, ...)
+    for k in _CONTAINER_FORWARD_ENV:
+        v = os.environ.get(k)
+        if v:
+            fwd_env[k] = v
+    # TERMINAL_TIMEOUT scaling (same as _default_spawn)
+    for term_var in ("TERMINAL_TIMEOUT", "TERMINAL_MAX_FOREGROUND_TIMEOUT"):
+        scaled = _worker_terminal_timeout_env(
+            task.max_runtime_seconds,
+            fwd_env.get(term_var) or os.environ.get(term_var),
+        )
+        if scaled is not None:
+            fwd_env[term_var] = scaled
+
+    # --- Build the docker run wrapper --------------------------------------
+    name = f"hermes-worker-{task.id}"
+    docker_cmd: list[str] = [
+        "docker", "run",
+        "--rm",          # auto-cleanup on exit; worker is fire-and-forget
+        "-d",            # detached: we want the container ID on stdout
+        "--name", name,
+        "--init",        # tini as PID 1 → clean signal forwarding / reaping
+    ]
+
+    network = os.environ.get("HERMES_KANBAN_CONTAINER_NETWORK")
+    if network:
+        docker_cmd += ["--network", network]
+
+    cpus = os.environ.get("HERMES_KANBAN_CONTAINER_CPUS")
+    if cpus:
+        docker_cmd += ["--cpus", str(cpus)]
+    mem = os.environ.get("HERMES_KANBAN_CONTAINER_MEMORY")
+    if mem:
+        docker_cmd += ["--memory", mem]
+
+    # Volume mounts — bind-mount the same absolute paths so env vars line up.
+    # The worker's HERMES_HOME, workspace, and kanban DB dir must be visible
+    # inside the container at the SAME path they reference on the host.
+    hermes_home = fwd_env.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    docker_cmd += ["-v", f"{hermes_home}:{hermes_home}:rw"]
+    # Kanban DB lives under <hermes_home>/kanban usually, but the env var may
+    # point elsewhere on custom setups — mount its parent dir too.
+    kanban_db_abspath = fwd_env["HERMES_KANBAN_DB"]
+    kanban_db_parent = os.path.dirname(kanban_db_abspath)
+    if os.path.isdir(kanban_db_parent) and kanban_db_parent != hermes_home:
+        docker_cmd += ["-v", f"{kanban_db_parent}:{kanban_db_parent}:rw"]
+    # Task workspace
+    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+        docker_cmd += ["-v", f"{workspace}:{workspace}:rw"]
+        docker_cmd += ["-w", workspace]
+    else:
+        # Fallback: use the container's default cwd
+        docker_cmd += ["-w", "/workspace"]
+
+    # Shared repos volume: a named Docker volume containing bare clones of
+    # common repos (agent-collab, media-pipelines, etc.). Workers mount it
+    # read-only at /repos so they can `git worktree add` from the bare clone
+    # instead of re-cloning on every dispatch. Populated + kept fresh by
+    # agent-repos-sync (in agent-collab-hermes/bin/).
+    #
+    # Operators opt in by setting HERMES_KANBAN_REPOS_VOLUME; the volume is
+    # mounted read-only (workers should NOT write to the bare clones — they
+    # write to their own per-task worktree under the workspace mount).
+    repos_volume = os.environ.get("HERMES_KANBAN_REPOS_VOLUME", "").strip()
+    if repos_volume:
+        docker_cmd += ["-v", f"{repos_volume}:/repos:ro"]
+        # Surface the mount to the worker via env so its git-worktree helper
+        # knows where to find bare clones (see agent-repos-sync for the layout).
+        docker_cmd += ["-e", "HERMES_REPOS_VOLUME=/repos"]
+        # Forward HERMES_REPOS_* hints if the dispatcher has them
+        for k in ("HERMES_REPOS_CLONE_PREFIX", "HERMES_REPOS_DEFAULT_REMOTE"):
+            v = os.environ.get(k)
+            if v:
+                docker_cmd += ["-e", f"{k}={v}"]
+
+    # Forward env vars as -e KEY=VAL pairs
+    for k, v in fwd_env.items():
+        docker_cmd += ["-e", f"{k}={v}"]
+
+    # Operator-supplied extra argv (e.g. --read-only --tmpfs /tmp)
+    extra = os.environ.get("HERMES_KANBAN_CONTAINER_EXTRA", "").strip()
+    if extra:
+        try:
+            docker_cmd += list(json.loads(extra))
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"HERMES_KANBAN_CONTAINER_EXTRA must be a JSON array of strings: {e}"
+            )
+
+    # Finally: image + inner command
+    docker_cmd.append(image)
+    docker_cmd += inner_cmd
+
+    # --- Launch ------------------------------------------------------------ ---
+    # Open the same per-task log file _default_spawn uses, so `hermes kanban
+    # log <task>` keeps working unchanged for container-backed runs.
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    log_f = open(log_path, "ab")
+    try:
+        # `docker run -d` prints the container ID (64-char hex) to stdout.
+        # Capture it so we can fetch the init PID via inspect.
+        proc = subprocess.Popen(  # noqa: S603 -- argv built locally, image is operator-controlled
+            docker_cmd,
+            cwd=workspace if (workspace and os.path.isdir(workspace)) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=log_f,
+            env=os.environ,  # docker CLI needs the host env, NOT fwd_env
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            text=True,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "`docker` executable not found on PATH. "
+            "Start Docker / OrbStack before running the container-backed dispatcher."
+        )
+    container_id = proc.stdout.readline().strip() if proc.stdout else ""
+    proc.wait()
+    # `docker run -d` exits 0 immediately after printing the container ID;
+    # the container itself runs in the background.
+    if proc.returncode != 0 or not container_id:
+        log_f.close()
+        raise RuntimeError(
+            f"`docker run` failed (rc={proc.returncode}). "
+            f"Check the task log at {log_path} and `docker logs {name}`."
+        )
+    # We intentionally keep log_f open: container stdout/stderr are written
+    # via `docker run -d`'s captured streams above, but operators may also
+    # `docker logs hermes-worker-<task_id>` to inspect in real time. The
+    # file handle here will be GC'd; that's fine.
+    log_f.close()
+
+    # Translate container_id → init PID so dispatcher's crash detection
+    # (which treats the recorded value as a host PID) keeps working. For
+    # OrbStack the container PID is visible on the host as a real process.
+    try:
+        pid_out = subprocess.run(  # noqa: S603 -- argv built locally
+            ["docker", "inspect", "-f", "{{.State.Pid}}", container_id],
+            capture_output=True, text=True, check=False, timeout=10,
+        ).stdout.strip()
+        pid = int(pid_out)
+        return pid if pid > 0 else None
+    except (ValueError, subprocess.SubprocessError):
+        # If inspect fails (docker daemon hiccup), fall back to None.
+        # The container is still running — completion will still be
+        # observed via the worker's own kanban transitions.
+        return None
+
+
+def _profile_dir_exists(profile: str) -> bool:
+    """Cheap check used by _container_spawn to skip a resolve_profile_env call."""
+    from hermes_cli.profiles import resolve_profile_env
+    try:
+        return os.path.isdir(resolve_profile_env(profile))
+    except FileNotFoundError:
+        return False
+
+
+def _resolve_spawn_fn(spawn_fn):
+    """Pick the spawn backend based on HERMES_KANBAN_SPAWN.
+
+    Called from _dispatch_once_locked when no explicit spawn_fn was passed.
+    Tests that inject a stub spawn_fn bypass this entirely.
+    """
+    if spawn_fn is not None:
+        return spawn_fn
+    mode = os.environ.get("HERMES_KANBAN_SPAWN", "").strip().lower()
+    if mode in ("container", "docker"):
+        return _container_spawn
+    return _default_spawn
 
 
 # ---------------------------------------------------------------------------
