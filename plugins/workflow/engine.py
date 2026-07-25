@@ -2500,8 +2500,6 @@ class WorkflowEngine:
             else:
                 revision_result = None
 
-            # Check review pipelines for nodes in review_pending status
-            self._handle_review_pipeline(workflow, states, context, layer_idx, layers)
 
             # Re-check blocked nodes — if their dependencies unblocked,
             # dispatch them now instead of waiting for the next layer.
@@ -2821,15 +2819,15 @@ class WorkflowEngine:
                         body = self.get_card_body(state.kanban_card_id)
                         node = workflow.nodes.get(nid)
                         if node and node.reviews:
-                            # This node has a review pipeline — create first reviewer
-                            state.status = "review_pending"
-                            state.error = f"Awaiting review: {node.reviews[0]}"
-                            results[nid] = "review_pending"
-                            print(f"   🔍 {nid} → REVIEW — creating reviewer: {node.reviews[0]}")
+                            # This node has a review pipeline — mark as done so DAG
+                            # advances to the reviewer node. The reviewer node is
+                            # already in the DAG with depends_on pointing to this node.
+                            state.status = "done"
+                            state.completed_at = datetime.now(timezone.utc).isoformat()
+                            state.result = body
+                            results[nid] = "done"
+                            print(f"   🔍 {nid} → REVIEW — marking done, DAG advances to {node.reviews[0]}")
                             pending.discard(nid)
-                            # Store review context for the supervisor
-                            state.review_index = 0
-                            state.review_body = body
                         else:
                             # No review pipeline — use legacy LOOP convention
                             state.status = "revision_needed"
@@ -2877,16 +2875,51 @@ class WorkflowEngine:
                                 print(f"   🚫 {nid} — LOOP prefix but no revision node")
                                 pending.discard(nid)
                         else:
-                            # Genuine blocker — not a LOOP
-                            state.status = "blocked"
-                            state.error = f"Blocked: {body[:100]}"
-                            results[nid] = "blocked"
-                            print(f"   🚫 {nid} BLOCKED — notifying calling agent")
-                            pending.discard(nid)
-                            # Notify calling agent via analyst
-                            self._try_block_notify(
-                                workflow, nid, state, body, context
-                            )
+                            # Check if this node is a reviewer for an upstream node
+                            reviewer_for = None
+                            for upstream_nid, upstream_state in states.items():
+                                upstream_node = workflow.nodes.get(upstream_nid)
+                                if upstream_node and nid in upstream_node.reviews:
+                                    reviewer_for = upstream_nid
+                                    break
+                            
+                            if reviewer_for:
+                                # This is a reviewer — enrich upstream card with feedback
+                                upstream_state = states[reviewer_for]
+                                upstream_node = workflow.nodes[reviewer_for]
+                                state.status = "blocked"
+                                state.error = f"Review failed: {body[:100]}"
+                                results[nid] = "blocked"
+                                print(f"   🚫 {nid} BLOCKED (reviewer) — enriching {reviewer_for} with feedback")
+                                pending.discard(nid)
+                                
+                                # Enrich upstream card with review feedback
+                                if upstream_state.kanban_card_id:
+                                    try:
+                                        from hermes_cli import kanban_db as kb
+                                        with kb.connect(board=self.kanban_board) as conn:
+                                            existing_body = kb.get_task(conn, upstream_state.kanban_card_id).body or ""
+                                            feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
+                                            new_body = existing_body + feedback
+                                            conn.execute(
+                                                "UPDATE tasks SET body = ?, status = 'ready' WHERE id = ?",
+                                                (new_body, upstream_state.kanban_card_id)
+                                            )
+                                            conn.commit()
+                                        print(f"   ↩  {reviewer_for} enriched with feedback, reset to ready")
+                                    except Exception as e:
+                                        print(f"   ⚠  Failed to enrich upstream card: {e}")
+                            else:
+                                # Genuine blocker — not a LOOP
+                                state.status = "blocked"
+                                state.error = f"Blocked: {body[:100]}"
+                                results[nid] = "blocked"
+                                print(f"   🚫 {nid} BLOCKED — notifying calling agent")
+                                pending.discard(nid)
+                                # Notify calling agent via analyst
+                                self._try_block_notify(
+                                    workflow, nid, state, body, context
+                                )
 
                 except Exception as e:
                     # Card query failed — log and keep polling
@@ -3029,113 +3062,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # ── Review pipeline ──────────────────────────────────────────
-
-    def _handle_review_pipeline(self, workflow, states, context, layer_idx, layers):
-        """Check if any node has an active review pipeline and process it.
-        
-        Called from the main monitoring loop. For each node in 'review_pending'
-        status, creates the reviewer card if not yet created, or processes
-        the reviewer's completion.
-        """
-        for nid, state in states.items():
-            if state.status != "review_pending":
-                continue
-            
-            node = workflow.nodes.get(nid)
-            if not node or not node.reviews:
-                continue
-            
-            review_idx = state.review_index
-            if review_idx >= len(node.reviews):
-                # All reviews passed — mark creator as done
-                state.status = "done"
-                state.completed_at = datetime.now(timezone.utc).isoformat()
-                results = {}
-                results[nid] = "done"
-                print(f"   ✅ {nid} — all reviews passed ({len(node.reviews)} reviewers)")
-                continue
-            
-            reviewer_id = node.reviews[review_idx]
-            
-            # Check if reviewer card exists and get its status
-            if not hasattr(state, '_reviewer_card_id') or state._reviewer_card_id is None:
-                # Create the reviewer card
-                reviewer_node = workflow.nodes.get(reviewer_id)
-                if not reviewer_node:
-                    print(f"   ⚠  Reviewer node '{reviewer_id}' not found in workflow")
-                    state.status = "failed"
-                    state.error = f"Reviewer node '{reviewer_id}' not found"
-                    continue
-                
-                # Build task with context about what's being reviewed
-                review_task = f"Review the output of {nid}.\\n\\nOriginal task: {reviewer_node.task}\\n\\nReview findings should be placed in the card body."
-                
-                print(f"   🔍 Creating reviewer card: {reviewer_id} (reviewing {nid})")
-                try:
-                    reviewer_card_id = self.dispatch_node(
-                        NodeState(node_id=reviewer_id, status="running"),
-                        reviewer_node,
-                        context,
-                        workflow=workflow,
-                        states=states,
-                        layers=layers,
-                    )
-                    if reviewer_card_id:
-                        state._reviewer_card_id = reviewer_card_id
-                        print(f"   ✓ Reviewer card created: {reviewer_card_id}")
-                    else:
-                        print(f"   ⚠  Failed to create reviewer card")
-                except Exception as e:
-                    print(f"   ⚠  Failed to create reviewer card: {e}")
-            else:
-                # Reviewer card exists — check its status
-                reviewer_card_id = state._reviewer_card_id
-                try:
-                    card = self.get_card_status(reviewer_card_id)
-                    card_status = card.get("status", "").lower()
-                    
-                    if card_status in ("done", "completed", "complete"):
-                        # Reviewer passed — advance to next reviewer
-                        state.review_index += 1
-                        state._reviewer_card_id = None
-                        print(f"   ✅ {reviewer_id} passed review ({nid}) — advancing")
-                        
-                        if state.review_index >= len(node.reviews):
-                            # All reviews passed — mark creator as done
-                            state.status = "done"
-                            state.completed_at = datetime.now(timezone.utc).isoformat()
-                            print(f"   ✅ {nid} — all reviews passed ({len(node.reviews)} reviewers)")
-                    
-                    elif card_status in ("blocked",):
-                        # Reviewer failed — enrich creator with feedback and loop back
-                        review_body = card.get("body", "")
-                        state.review_index = 0
-                        state._reviewer_card_id = None
-                        state.review_body = review_body
-                        
-                        # Enrich the creator card with review feedback
-                        if state.kanban_card_id:
-                            try:
-                                from hermes_cli import kanban_db as kb
-                                with kb.connect(board=self.kanban_board) as conn:
-                                    existing_body = kb.get_task(conn, state.kanban_card_id).body or ""
-                                    feedback = f"\\n\\n--- Review Feedback ({reviewer_id}) ---\\n{review_body}"
-                                    new_body = existing_body + feedback
-                                    conn.execute(
-                                        "UPDATE tasks SET body = ?, status = 'ready' WHERE id = ?",
-                                        (new_body, state.kanban_card_id)
-                                    )
-                                    conn.commit()
-                                print(f"   ↩  {reviewer_id} rejected {nid} — enriching with feedback, resetting to ready")
-                            except Exception as e:
-                                print(f"   ⚠  Failed to enrich creator card: {e}")
-                    
-                    elif card_status in ("failed", "timed_out"):
-                        # Reviewer failed — treat as rejection
-                        state.review_index = 0
-                        state._reviewer_card_id = None
-                        print(f"   ⚠  {reviewer_id} {card_status} — resetting review pipeline")
-                
-                except Exception as e:
-                    logger.debug("review pipeline: card status check failed: %s", e)
