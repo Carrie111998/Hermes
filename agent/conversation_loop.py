@@ -3935,6 +3935,13 @@ def run_conversation(
                 _is_transport_failure = classified.reason in {
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
+                    # A provider-side 500/502 is as terminal for THIS provider
+                    # as a 503: retrying the same dead endpoint cannot help,
+                    # and without this the turn exhausts its retries and dies
+                    # even with a healthy fallback chain configured. The
+                    # retry_count gate below still lets a genuinely transient
+                    # blip recover on the primary before switching.
+                    FailoverReason.server_error,
                 }
                 # Z.AI Coding Plan GLM-5.2 overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
