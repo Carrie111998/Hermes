@@ -115,7 +115,11 @@ export function AgentsPanelView({
                 <Text color={g.color}>{g.glyph} </Text>
                 {cell.id && <Text color={t.color.accent}>{cell.id}</Text>}
                 {cell.name && <Text color={t.color.text}>{cell.name}</Text>}
-                {cell.goal && <Text color={t.color.statusFg}>{cell.goal}</Text>}
+                {cell.goal && (
+                  <Text color={t.color.statusFg} wrap="truncate-end">
+                    {cell.goal}
+                  </Text>
+                )}
                 {cell.elapsed && (
                   <Text color={t.color.muted} dim>
                     {cell.elapsed}
