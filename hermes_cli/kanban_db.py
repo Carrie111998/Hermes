@@ -8533,9 +8533,12 @@ def _module_hermes_argv() -> list[str]:
 def _absolute_hermes_path(path: str) -> str:
     """Return an absolute filesystem path for a resolved Hermes shim."""
     expanded = os.path.expanduser(path)
-    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
-
-
+    if os.path.isabs(expanded):
+        return expanded
+    # On Windows, treat a POSIX-style absolute path (starting with '/') as absolute.
+    if _IS_WINDOWS and expanded.startswith('/'):
+        return expanded
+    return os.path.abspath(expanded)
 def _looks_like_path(value: str) -> bool:
     """Return true when a command override is an explicit path, not a name."""
     expanded = os.path.expanduser(value)
@@ -8565,24 +8568,22 @@ def _path_search_names(command: str) -> list[str]:
 def _safe_which_no_cwd(command: str) -> Optional[str]:
     """Resolve a bare command from PATH without implicit current-dir search.
 
-    ``shutil.which`` follows platform search behavior. On Windows that can
-    include the current directory before PATH for bare names, which is not a
-    safe dispatcher primitive. This resolver only considers explicit PATH
-    entries and skips empty / ``.`` entries.
+    Mirrors :func:`shutil.which` but ignores empty and ``'.'`` entries in
+    ``PATH`` to avoid picking up executables from the current directory.
     """
     path_env = os.environ.get("PATH", "")
-    for raw_dir in path_env.split(os.pathsep):
-        if not raw_dir or raw_dir == ".":
-            continue
-        directory = os.path.expanduser(raw_dir)
-        for name in _path_search_names(command):
-            candidate = os.path.join(directory, name)
-            if not os.path.isfile(candidate):
-                continue
-            if _IS_WINDOWS or os.access(candidate, os.X_OK):
-                return candidate
-    return None
-
+    # Filter out empty and "." entries
+    paths = [p for p in path_env.split(os.pathsep) if p and p != "."]
+    # Temporarily replace PATH with filtered list
+    old_path = os.environ.get("PATH")
+    os.environ["PATH"] = os.pathsep.join(paths)
+    try:
+        return shutil.which(command)
+    finally:
+        if old_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = old_path
 
 def _hermes_path_argv(path: str) -> list[str]:
     """Return argv for a resolved Hermes executable path.
@@ -8596,7 +8597,6 @@ def _hermes_path_argv(path: str) -> list[str]:
         return _module_hermes_argv()
     return [_absolute_hermes_path(path)]
 
-
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv parts for ``Popen``.
 
@@ -8607,7 +8607,7 @@ def _resolve_hermes_argv() -> list[str]:
        semantics and never prefer a same-directory file before ``PATH``.
     2. ``shutil.which("hermes")`` — the console-script shim, normalized to
        an absolute path. On Windows, ``which`` can return a relative
-       ``.\\hermes.CMD`` when the current directory is on ``PATH``; directly
+       ``.\hermes.CMD`` when the current directory is on ``PATH``; directly
        launching batch shims is also unsafe with task-derived argv. The
        dispatcher therefore falls back to the interpreter-bound module form
        for implicit ``.cmd`` / ``.bat`` shims.
@@ -8632,11 +8632,10 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
-    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
+    hermes_bin = _safe_which_no_cwd("hermes")
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
-
 
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
