@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync as testSpawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdirSync,
@@ -10,7 +11,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { once } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { test } from 'node:test'
 
 import * as verifierLib from './desktop-verifier-lib.mjs'
@@ -19,6 +20,7 @@ import {
   buildWindowsCleanupPlan,
   cleanupUnlaunchedDesktopSpec,
   createDesktopLaunchSpec,
+  discoverWindowsDescendantPids,
   launchOwnedDesktop,
   parseDevToolsActivePort,
   runDesktopSmoke
@@ -63,6 +65,27 @@ async function waitForFile(filePath, timeoutMs = 5000) {
   }
 
   throw new Error(`timed out waiting for ${filePath}`)
+}
+
+async function waitForWindowsDescendantExit(ownedPid, descendantPid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() <= deadline) {
+    if (!discoverWindowsDescendantPids(ownedPid).includes(descendantPid)) {
+      return
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+
+  throw new Error(`owned Windows PID ${descendantPid} did not exit`)
+}
+
+function terminateExactOwnedTestPid(pid) {
+  testSpawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+    encoding: 'utf8',
+    windowsHide: true
+  })
 }
 
 test('two launch specs own unique roots, state paths, and app identities', () => {
@@ -240,6 +263,74 @@ test('Windows cleanup plan is exact and rejects invalid or unowned PIDs', () => 
   }
 
   assert.throws(() => buildWindowsCleanupPlan(4100, 4101), /unowned PID/)
+})
+
+test('Windows cleanup terminates verified descendants after the owned parent exits', async () => {
+  const spec = createNodeProcessSpec()
+  const fakeChild = Object.assign(new EventEmitter(), {
+    pid: 4100,
+    exitCode: 0,
+    signalCode: null
+  })
+  const calls = []
+  let discoveryCount = 0
+  const owned = await launchOwnedDesktop(spec, {
+    platform: 'win32',
+    spawnImpl: () => fakeChild,
+    discoverWindowsDescendantPidsImpl: ownedPid => {
+      assert.equal(ownedPid, 4100)
+      discoveryCount++
+      return discoveryCount === 1 ? [4101, 4102] : []
+    },
+    spawnSyncImpl: (command, args) => {
+      calls.push([command, args])
+      return { status: 0, stdout: '', stderr: '' }
+    }
+  })
+
+  await owned.cleanup()
+
+  assert.deepEqual(calls, [
+    ['taskkill.exe', ['/PID', '4102', '/T', '/F']],
+    ['taskkill.exe', ['/PID', '4101', '/T', '/F']]
+  ])
+  assert.equal(existsSync(spec.paths.root), false)
+})
+
+test('Windows cleanup discovers and terminates a detached descendant after parent exit', {
+  skip: process.platform !== 'win32'
+}, async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'desktop-verifier-win-early-exit-'))
+  const grandchildPidFile = join(parent, 'grandchild.pid')
+  const parentScript = [
+    "const fs = require('node:fs')",
+    "const { spawn } = require('node:child_process')",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' })",
+    `fs.writeFileSync(${JSON.stringify(grandchildPidFile)}, String(child.pid))`,
+    'child.unref()'
+  ].join(';')
+  const spec = createNodeProcessSpec({ script: parentScript, tempBaseDir: parent })
+  const owned = await launchOwnedDesktop(spec)
+  let grandchildPid
+
+  try {
+    await waitForFile(grandchildPidFile)
+    grandchildPid = Number(readFileSync(grandchildPidFile, 'utf8'))
+    await waitForExit(owned.child)
+    assert.ok(discoverWindowsDescendantPids(owned.ownedPid).includes(grandchildPid))
+
+    await owned.cleanup()
+    await waitForWindowsDescendantExit(owned.ownedPid, grandchildPid)
+
+    assert.equal(existsSync(spec.paths.root), false)
+  } finally {
+    if (Number.isSafeInteger(grandchildPid) &&
+        discoverWindowsDescendantPids(owned.ownedPid).includes(grandchildPid)) {
+      terminateExactOwnedTestPid(grandchildPid)
+    }
+
+    rmSync(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+  }
 })
 
 test('executable provenance accepts only current-worktree dist/release artifacts and rejects outside paths', () => {

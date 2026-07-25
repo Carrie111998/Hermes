@@ -328,7 +328,12 @@ function removeGeneratedRoot(spec) {
     return
   }
 
-  rmSync(ownership.root, { recursive: true, force: false })
+  rmSync(ownership.root, {
+    recursive: true,
+    force: false,
+    maxRetries: 10,
+    retryDelay: 50
+  })
   ownership.removed = true
 }
 
@@ -499,19 +504,128 @@ export function buildWindowsCleanupPlan(ownedPid, requestedPid = ownedPid) {
   }
 }
 
+export function discoverWindowsDescendantPids(ownedPid, {
+  spawnSyncImpl = nodeSpawnSync,
+  timeoutMs = DEFAULT_TERMINATION_TIMEOUT_MS
+} = {}) {
+  if (!isPositivePid(ownedPid)) {
+    throw new Error('Windows descendant discovery requires a valid owned PID')
+  }
+
+  const script = [
+    'Get-CimInstance Win32_Process',
+    'Select-Object ProcessId,ParentProcessId',
+    'ConvertTo-Json -Compress'
+  ].join(' | ')
+  const result = spawnSyncImpl(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', script],
+    {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      windowsHide: true
+    }
+  )
+
+  if (result.error) {
+    throw new Error(`owned Windows descendant discovery failed: ${result.error.message}`)
+  }
+
+  if (result.status !== 0) {
+    const detail = String(result.stderr || result.stdout || '').trim()
+    throw new Error(
+      `owned Windows descendant discovery exited ${result.status}` +
+      (detail ? `: ${detail}` : '')
+    )
+  }
+
+  let records
+
+  try {
+    const parsed = JSON.parse(String(result.stdout || '[]'))
+    records = Array.isArray(parsed) ? parsed : parsed ? [parsed] : []
+  } catch (error) {
+    throw new Error('owned Windows descendant discovery returned invalid JSON', { cause: error })
+  }
+
+  const childrenByParent = new Map()
+
+  for (const record of records) {
+    const pid = Number(record?.ProcessId)
+    const parentPid = Number(record?.ParentProcessId)
+
+    if (!isPositivePid(pid) || !isPositivePid(parentPid) || pid === ownedPid) {
+      continue
+    }
+
+    const children = childrenByParent.get(parentPid) ?? []
+    children.push(pid)
+    childrenByParent.set(parentPid, children)
+  }
+
+  const descendants = []
+  const visited = new Set([ownedPid])
+  const pending = [ownedPid]
+
+  while (pending.length) {
+    const parentPid = pending.shift()
+
+    for (const pid of childrenByParent.get(parentPid) ?? []) {
+      if (visited.has(pid)) {
+        continue
+      }
+
+      visited.add(pid)
+      descendants.push(pid)
+      pending.push(pid)
+    }
+  }
+
+  return descendants
+}
+
 async function terminateOwnedChild({
   child,
+  discoverWindowsDescendantPidsImpl,
   killImpl,
   ownedPid,
   platform,
   spawnSyncImpl,
   terminationTimeoutMs
 }) {
-  if (platform === 'win32' && childHasExited(child)) {
-    return
-  }
-
   if (platform === 'win32') {
+    if (childHasExited(child)) {
+      const discover = discoverWindowsDescendantPidsImpl ??
+        (pid => discoverWindowsDescendantPids(pid, {
+          spawnSyncImpl,
+          timeoutMs: terminationTimeoutMs
+        }))
+      const descendants = await discover(ownedPid)
+
+      for (const descendantPid of [...descendants].reverse()) {
+        if (!isPositivePid(descendantPid) || descendantPid === ownedPid) {
+          throw new Error(`Windows cleanup rejected invalid descendant PID ${descendantPid}`)
+        }
+
+        const plan = buildWindowsCleanupPlan(descendantPid, descendantPid)
+        spawnSyncImpl(plan.command, plan.args, {
+          encoding: 'utf8',
+          timeout: terminationTimeoutMs,
+          windowsHide: true
+        })
+      }
+
+      const remaining = await discover(ownedPid)
+
+      if (remaining.length) {
+        throw new Error(
+          `owned Windows cleanup left descendant PIDs: ${remaining.join(', ')}`
+        )
+      }
+
+      return
+    }
+
     const plan = buildWindowsCleanupPlan(ownedPid, child.pid)
     const result = spawnSyncImpl(plan.command, plan.args, {
       encoding: 'utf8',
@@ -616,6 +730,7 @@ async function terminateOwnedProcessGroup({
 function createOwnedCleanup({
   spec,
   child,
+  discoverWindowsDescendantPidsImpl,
   killImpl,
   ownedPid,
   platform,
@@ -629,6 +744,7 @@ function createOwnedCleanup({
       cleanupPromise = (async () => {
         await terminateOwnedChild({
           child,
+          discoverWindowsDescendantPidsImpl,
           killImpl,
           ownedPid,
           platform,
@@ -679,6 +795,7 @@ function waitForSpawn(child) {
 
 export async function launchOwnedDesktop(spec, {
   spawnImpl = nodeSpawn,
+  discoverWindowsDescendantPidsImpl,
   killImpl = nodeKill,
   platform = process.platform,
   spawnSyncImpl = nodeSpawnSync,
@@ -707,6 +824,7 @@ export async function launchOwnedDesktop(spec, {
     cleanup: createOwnedCleanup({
       spec,
       child,
+      discoverWindowsDescendantPidsImpl,
       killImpl,
       ownedPid,
       platform,
@@ -718,6 +836,7 @@ export async function launchOwnedDesktop(spec, {
 
 export async function runDesktopSmoke(spec, {
   spawnImpl = nodeSpawn,
+  discoverWindowsDescendantPidsImpl,
   killImpl = nodeKill,
   platform = process.platform,
   spawnSyncImpl = nodeSpawnSync,
@@ -737,6 +856,7 @@ export async function runDesktopSmoke(spec, {
   try {
     owned = await launchOwnedDesktop(spec, {
       spawnImpl,
+      discoverWindowsDescendantPidsImpl,
       killImpl,
       platform,
       spawnSyncImpl,

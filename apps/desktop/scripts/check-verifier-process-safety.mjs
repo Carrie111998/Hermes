@@ -8,6 +8,7 @@ const REPO_ROOT = resolve(SCRIPT_DIR, '..', '..', '..')
 const SELF_PATH = 'apps/desktop/scripts/check-verifier-process-safety.mjs'
 const SELF_TEST_PATH = 'apps/desktop/scripts/check-verifier-process-safety.node-test.mjs'
 const VERIFIER_LIB_PATH = 'apps/desktop/scripts/desktop-verifier-lib.mjs'
+const VERIFIER_LIB_TEST_PATH = 'apps/desktop/scripts/desktop-verifier-lib.node-test.mjs'
 const FIXTURE_PREFIX = 'apps/desktop/scripts/fixtures/process-safety/'
 const DESKTOP_PACKAGE_JSON = 'apps/desktop/package.json'
 const DESKTOP_CODE_ROOTS = [
@@ -42,7 +43,6 @@ const EXECUTABLE_EXTENSIONS = new Set([
 ])
 const DESKTOP_TSCONFIG_PATTERN = /^apps\/desktop\/tsconfig(?:\.[^/]+)?\.json$/i
 export const ROOT_SCRIPT_RELEVANCE_PATTERN = /(?:desktop|verif|^dev(?:[-_.]|$))/i
-const WORKFLOW_RELEVANCE_PATTERN = /(?:^|[-_.])(?:desktop|electron|js)(?:[-_.]|$)/i
 const RAW_PROCESS_REASON =
   'verifier harness uses raw process API outside canonical owned infrastructure'
 const SEMANTIC_PROCESS_VOCABULARY =
@@ -73,10 +73,20 @@ const RAW_PROCESS_API_ALLOWLIST = {
     functions: {
       // Launches exactly the candidate executable and records its owned PID.
       launchOwnedDesktop: new Set(['nodeSpawn', 'spawnImpl']),
+      // Reads PID/parent-PID metadata only to recover descendants of an owned exited root.
+      discoverWindowsDescendantPids: new Set(['nodeSpawnSync', 'spawnSyncImpl']),
       // Windows cleanup executes exact taskkill /PID <owned> /T /F.
       terminateOwnedChild: new Set(['nodeSpawnSync', 'spawnSyncImpl']),
       // POSIX cleanup signals only the negative PGID created for this launch.
       terminateOwnedProcessGroup: new Set(['killImpl'])
+    }
+  },
+  [VERIFIER_LIB_TEST_PATH]: {
+    // The integration test imports spawnSync only for exact-PID failure cleanup.
+    imports: new Set(['child_process']),
+    functions: {
+      // Test-only liveness probe; signal 0 never terminates a process.
+      windowsPidExists: new Set(['process.kill'])
     }
   }
 }
@@ -97,8 +107,7 @@ function isRelevantRootScript(normalized) {
 
 function isRelevantWorkflow(normalized) {
   return normalized.startsWith('.github/workflows/') &&
-    ['.yaml', '.yml'].includes(extname(normalized).toLowerCase()) &&
-    WORKFLOW_RELEVANCE_PATTERN.test(fileName(normalized))
+    ['.yaml', '.yml'].includes(extname(normalized).toLowerCase())
 }
 
 export function shouldScanRepositoryPath(relativePath) {
@@ -276,17 +285,19 @@ function maskStringContents(source, relativePath) {
   const supportsBackslashEscapes = ['.cjs', '.js', '.mjs', '.py', '.ts', '.tsx'].includes(extension)
   const supportsTemplateStrings = ['.cjs', '.js', '.mjs', '.ts', '.tsx'].includes(extension)
   const characters = [...source]
-  let quote = null
+  let mode = 'code'
+  const templateExpressionDepths = []
 
   for (let index = 0; index < characters.length; index++) {
     const current = characters[index]
 
-    if (quote) {
+    if (mode === 'single' || mode === 'double') {
       if (current === '\\' && supportsBackslashEscapes) {
         maskRange(characters, index, Math.min(index + 2, characters.length))
         index++
-      } else if (current === quote) {
-        quote = null
+      } else if ((mode === 'single' && current === "'") ||
+                 (mode === 'double' && current === '"')) {
+        mode = 'code'
       } else if (current !== '\n' && current !== '\r') {
         characters[index] = ' '
       }
@@ -294,8 +305,45 @@ function maskStringContents(source, relativePath) {
       continue
     }
 
-    if (current === "'" || current === '"' || (supportsTemplateStrings && current === '`')) {
-      quote = current
+    if (mode === 'template') {
+      if (current === '\\') {
+        maskRange(characters, index, Math.min(index + 2, characters.length))
+        index++
+      } else if (current === '`') {
+        mode = 'code'
+      } else if (current === '$' && characters[index + 1] === '{') {
+        templateExpressionDepths.push(1)
+        mode = 'code'
+        index++
+      } else if (current !== '\n' && current !== '\r') {
+        characters[index] = ' '
+      }
+
+      continue
+    }
+
+    if (templateExpressionDepths.length) {
+      const top = templateExpressionDepths.length - 1
+
+      if (current === '{') {
+        templateExpressionDepths[top]++
+      } else if (current === '}') {
+        templateExpressionDepths[top]--
+
+        if (templateExpressionDepths[top] === 0) {
+          templateExpressionDepths.pop()
+          mode = 'template'
+          continue
+        }
+      }
+    }
+
+    if (current === "'") {
+      mode = 'single'
+    } else if (current === '"') {
+      mode = 'double'
+    } else if (supportsTemplateStrings && current === '`') {
+      mode = 'template'
     }
   }
 
@@ -366,7 +414,7 @@ function rawProcessApiViolations(masked, relativePath) {
       [/\b(?:import\s+)?\{[^}]+\}\s+from\s+['"]/g, 'child_process'],
       [/\bimport\s+\*\s+as\s+\w+\s+from\s+['"]/g, 'child_process'],
       [/\{[^}]+\}\s*=\s*require\s*\(/g, 'child_process'],
-      [/\b(?:exec|execFile|execFileSync|execSync|nodeSpawn|nodeSpawnSync|spawn|spawnImpl|spawnSync|spawnSyncImpl)\s*\(/g, null],
+      [/(?<![.$\w])(?:exec|execFile|execFileSync|execSync|nodeSpawn|nodeSpawnSync|spawn|spawnImpl|spawnSync|spawnSyncImpl)\s*\(/g, null],
       [/\b(process\.kill|killImpl)\s*\(/g, null],
       [/\b[A-Za-z_$][\w$]*\.kill\s*\(/g, 'member.kill']
     ]
@@ -428,6 +476,18 @@ function rawProcessApiViolations(masked, relativePath) {
       /\.\s*(?:Kill|Terminate)\s*\(/gi
     ]) {
       for (const match of codeSource.matchAll(pattern)) {
+        const commandEnd = codeSource.indexOf('\n', match.index)
+        const command = codeSource.slice(
+          match.index,
+          commandEnd === -1 ? codeSource.length : commandEnd
+        )
+
+        if (/\b(?:Get-Process|Stop-Process|gps|spps)\b/i.test(match[0]) &&
+            /\s-Id\b/i.test(command) &&
+            !/\s-Name\b/i.test(command)) {
+          continue
+        }
+
         candidates.push({ index: match.index, api: match[0] })
       }
     }
@@ -476,6 +536,19 @@ function collectLiteralAssignments(source) {
     values.set(match[1], normalizeAdjacentQuotedFragments(match[2]))
   }
 
+  for (const object of source.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\{([\s\S]{0,1200}?)\}/g
+  )) {
+    for (const property of object[2].matchAll(
+      /\b([A-Za-z_$][\w$]*)\s*:\s*((?:(["'`])(?:\\[\s\S]|(?!\3)[\s\S])*?\3)(?:\s*\+\s*(?:(["'`])(?:\\[\s\S]|(?!\4)[\s\S])*?\4))*)/g
+    )) {
+      values.set(
+        `${object[1]}.${property[1]}`,
+        normalizeAdjacentQuotedFragments(property[2])
+      )
+    }
+  }
+
   return values
 }
 
@@ -500,11 +573,27 @@ function invocationReason(commandSource) {
     return REASONS.stopProcess
   }
 
-  if (/\b(?:Get-Process|gps)\b[\s\S]{0,900}?(?:\b(?:Stop-Process|spps)\b|\.(?:Kill|Terminate)\s*\()/i.test(commandSource)) {
-    return REASONS.getProcess
+  for (const match of commandSource.matchAll(/\b(?:Get-Process|gps)\b/gi)) {
+    const commandEnd = commandSource.indexOf('\n', match.index)
+    const selector = commandSource.slice(
+      match.index,
+      commandEnd === -1 ? commandSource.length : commandEnd
+    )
+
+    if (/\s-Id\b/i.test(selector) && !/\s-Name\b/i.test(selector)) {
+      continue
+    }
+
+    const nearby = commandSource.slice(match.index, match.index + 900)
+
+    if (/(?:\b(?:Stop-Process|spps)\b|\.(?:Kill|Terminate)\s*\()/i.test(nearby)) {
+      return REASONS.getProcess
+    }
   }
 
-  if (/\b(?:Get-CimInstance|Get-WmiObject)\b[\s\S]{0,1200}?\bWin32_Process\b[\s\S]{0,1200}?(?:\b(?:Remove-CimInstance|Invoke-CimMethod)\b|\.(?:Delete|Kill|Terminate)\s*\()/i.test(commandSource) ||
+  if (/\bWin32_Process\b/i.test(commandSource) &&
+      /\b(?:Get-CimInstance|Get-WmiObject)\b/i.test(commandSource) &&
+      /(?:\b(?:Remove-CimInstance|Invoke-CimMethod)\b|\.(?:Delete|Kill|Terminate)\s*\()/i.test(commandSource) ||
       /\bwmic(?:\.exe)?\b[\s\S]{0,500}?\bprocess\b[\s\S]{0,500}?\bname\b[\s\S]{0,500}?(?:call\s+terminate|delete)\b/i.test(commandSource)) {
     return REASONS.wmi
   }
@@ -530,12 +619,60 @@ function processCallAliases(source, extension) {
         aliases.add(parts.at(-1))
       }
     }
+
+    const namespaces = new Set()
+
+    for (const match of source.matchAll(
+      /\bimport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['"]node:child_process['"]/g
+    )) {
+      namespaces.add(match[1])
+    }
+
+    for (const match of source.matchAll(
+      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]node:child_process['"]\s*\)/g
+    )) {
+      namespaces.add(match[1])
+    }
+
+    if (namespaces.size) {
+      const namespacePattern = [...namespaces].map(escapeRegExp).join('|')
+      const memberAliasPattern = new RegExp(
+        `\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?:${namespacePattern})` +
+        `(?:\\.\\s*(?:exec|execFile|execFileSync|execSync|spawn|spawnSync)\\b|` +
+        `\\[\\s*['"](?:exec|execFile|execFileSync|execSync|spawn|spawnSync)['"]\\s*\\])`,
+        'g'
+      )
+
+      for (const match of source.matchAll(memberAliasPattern)) {
+        aliases.add(match[1])
+      }
+    }
   } else if (extension === '.py') {
     for (const match of source.matchAll(/from\s+subprocess\s+import\s+([^\r\n]+)/g)) {
       for (const binding of match[1].split(',')) {
         const parts = binding.trim().split(/\s+as\s+/)
         aliases.add(parts.at(-1))
       }
+    }
+
+    for (const match of source.matchAll(/\bimport\s+subprocess\s+as\s+([A-Za-z_]\w*)/g)) {
+      for (const api of ['run', 'call', 'check_call', 'check_output', 'Popen']) {
+        aliases.add(`${match[1]}.${api}`)
+      }
+    }
+
+    const moduleNames = ['subprocess']
+    for (const match of source.matchAll(/\bimport\s+subprocess\s+as\s+([A-Za-z_]\w*)/g)) {
+      moduleNames.push(match[1])
+    }
+    const modulePattern = moduleNames.map(escapeRegExp).join('|')
+    const localAliasPattern = new RegExp(
+      `\\b([A-Za-z_]\\w*)\\s*=\\s*(?:${modulePattern})\\.` +
+      '(?:run|call|check_call|check_output|Popen)\\b',
+      'g'
+    )
+    for (const match of source.matchAll(localAliasPattern)) {
+      aliases.add(match[1])
     }
   }
 
@@ -544,6 +681,12 @@ function processCallAliases(source, extension) {
 
 function findProcessInvocations(source, relativePath) {
   const extension = extname(relativePath).toLowerCase()
+  const isJavaScript = ['.cjs', '.js', '.mjs', '.ts', '.tsx'].includes(extension)
+
+  if (isJavaScript && !/['"]node:child_process['"]/.test(source)) {
+    return []
+  }
+
   const codeSource = maskStringContents(source, relativePath)
   const aliases = processCallAliases(source, extension)
   const aliasPattern = aliases.map(escapeRegExp).join('|')
@@ -586,8 +729,16 @@ function addInvocationViolations(violations, masked, relativePath) {
     let resolved = normalizeAdjacentQuotedFragments(invocation.source)
 
     for (const [name, value] of literals) {
-      if (new RegExp(`\\b${escapeRegExp(name)}\\b`).test(invocation.source)) {
-        resolved += ` ${value}`
+      const [owner, property] = name.split('.', 2)
+      const reference = property
+        ? new RegExp(
+          `\\b${escapeRegExp(owner)}(?:\\.${escapeRegExp(property)}\\b|` +
+          `\\[\\s*['"]${escapeRegExp(property)}['"]\\s*\\])`
+        )
+        : new RegExp(`\\b${escapeRegExp(name)}\\b`)
+
+      if (reference.test(invocation.source)) {
+        resolved = `${value} ${resolved}`
       }
     }
 
@@ -603,12 +754,84 @@ function addInvocationViolations(violations, masked, relativePath) {
   }
 }
 
+function isInertOutputCommand(command) {
+  return (/^\s*(?:echo|printf|Write-(?:Host|Output))\b/i.test(command) ||
+    /^\s*(?:powershell|pwsh)(?:\.exe)?\s+-Command\s+["']?Write-(?:Host|Output)\b/i.test(command)) &&
+    !/(?:&&|\|\||[;|])/.test(command)
+}
+
+function workflowExecutableSource(source) {
+  const output = [...source].map(character =>
+    character === '\r' || character === '\n' ? character : ' '
+  )
+  const lines = [...source.matchAll(/[^\r\n]*(?:\r?\n|$)/g)]
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex]
+    const run = /^(\s*)(?:-\s*)?run\s*:\s*(.*?)(?:\r?\n)?$/.exec(line[0])
+
+    if (!run) {
+      continue
+    }
+
+    const runIndent = run[1].length
+    const valueOffset = line.index + line[0].indexOf(run[2])
+
+    if (/^[|>][-+]?\s*$/.test(run[2])) {
+      for (let nestedIndex = lineIndex + 1; nestedIndex < lines.length; nestedIndex++) {
+        const nested = lines[nestedIndex]
+        const content = nested[0].replace(/\r?\n$/, '')
+        const indentation = /^\s*/.exec(content)[0].length
+
+        if (content.trim() && indentation <= runIndent) {
+          break
+        }
+
+        if (!isInertOutputCommand(content.trim())) {
+          for (let index = 0; index < content.length; index++) {
+            output[nested.index + index] = source[nested.index + index]
+          }
+        }
+      }
+    } else if (!isInertOutputCommand(run[2])) {
+      for (let index = 0; index < run[2].length; index++) {
+        output[valueOffset + index] = source[valueOffset + index]
+      }
+    }
+  }
+
+  return output.join('')
+}
+
+function powershellExecutableSource(source) {
+  const characters = [...source]
+
+  for (const assignment of source.matchAll(/^\s*\$([A-Za-z_]\w*)\s*=.*$/gm)) {
+    const variable = escapeRegExp(assignment[1])
+    const remainder = source.slice(assignment.index + assignment[0].length)
+    const isExecutableValue = new RegExp(
+      `(?:&|Get-CimInstance|Get-WmiObject|Invoke-CimMethod)\\s+\\$${variable}\\b`,
+      'i'
+    ).test(remainder)
+
+    if (!isExecutableValue) {
+      maskRange(characters, assignment.index, assignment.index + assignment[0].length)
+    }
+  }
+
+  return characters.join('')
+}
+
 function addShellViolations(violations, masked, relativePath) {
   const extension = extname(relativePath).toLowerCase()
-  const semanticSource = ['.bat', '.cmd'].includes(extension)
-    ? masked
-    : maskStringContents(masked, relativePath)
-  const normalized = normalizeAdjacentQuotedFragments(semanticSource)
+  const executableSource = ['.yaml', '.yml'].includes(extension)
+    ? workflowExecutableSource(masked)
+    : extension === '.ps1'
+      ? powershellExecutableSource(masked)
+      : masked
+  const normalized = normalizeAdjacentQuotedFragments(executableSource)
+    .replace(/['"]?Stop-\{0\}['"]?\s*-f\s*['"]?Process['"]?/gi, 'Stop-Process')
+    .replace(/\^(?=[A-Za-z])/g, '')
   const reason = invocationReason(normalized)
 
   if (reason) {
@@ -624,7 +847,7 @@ function addShellViolations(violations, masked, relativePath) {
 
     violations.push({
       file: relativePath,
-      line: lineNumberAt(masked, match?.index ?? 0),
+      line: lineNumberAt(executableSource, match?.index ?? 0),
       reason
     })
   }
@@ -674,10 +897,13 @@ function uniqueViolations(violations) {
 export function scanText(source, relativePath) {
   const normalizedPath = normalizeRelativePath(relativePath)
   const extension = extname(normalizedPath).toLowerCase()
+  const hasSemanticVocabulary =
+    SEMANTIC_PROCESS_VOCABULARY.test(source) ||
+    /(?:task\s*(?:\^|["'`+\s])*kill|pki\s*["'`+\s]*ll|kill\s*["'`+\s]*all|Stop-[\s\S]{0,80}?Process)/i.test(source)
 
   if (normalizedPath !== DESKTOP_PACKAGE_JSON &&
       !isVerifierHarnessPath(normalizedPath) &&
-      !SEMANTIC_PROCESS_VOCABULARY.test(source)) {
+      !hasSemanticVocabulary) {
     return []
   }
 
@@ -692,7 +918,7 @@ export function scanText(source, relativePath) {
 
   if (normalizedPath === DESKTOP_PACKAGE_JSON) {
     addPackageScriptViolations(violations, source, normalizedPath)
-  } else if (!SEMANTIC_PROCESS_VOCABULARY.test(masked)) {
+  } else if (!hasSemanticVocabulary) {
     return []
   } else if (['.cjs', '.js', '.mjs', '.py', '.ts', '.tsx'].includes(extension)) {
     addInvocationViolations(violations, masked, normalizedPath)

@@ -38,6 +38,23 @@ const REJECT_CASES = [
     source: 'process.kill(candidatePid, "SIGTERM")'
   },
   {
+    name: 'Node namespace API reassigned to a local alias',
+    path: 'apps/desktop/src/process-cleanup.test.ts',
+    source: [
+      "import * as cp from 'node:child_process'",
+      'const invoke = cp.spawnSync',
+      "invoke('taskkill.exe', ['/IM', 'Hermes.exe', '/F'])"
+    ].join('\n')
+  },
+  {
+    name: 'Node executable call inside template interpolation',
+    path: 'apps/desktop/src/process-cleanup.test.ts',
+    source: [
+      "import * as cp from 'node:child_process'",
+      'const receipt = `result=${cp.spawnSync(\'taskkill.exe\', [\'/IM\', \'Hermes.exe\', \'/F\'])}`'
+    ].join('\n')
+  },
+  {
     name: 'Python dynamic concatenation',
     path: 'apps/desktop/scripts/verify_dynamic.py',
     source: 'import subprocess\nsubprocess.run(["task" + "kill", "/IM", "Hermes.exe"])'
@@ -83,6 +100,11 @@ const REJECT_CASES = [
     source: 'pwsh -Command "Stop-Process -Name Hermes -Force"'
   },
   {
+    name: 'shell quoted taskkill image filter',
+    path: 'scripts/verify-desktop.sh',
+    source: "taskkill.exe /FI 'IMAGENAME eq Hermes.exe' /F"
+  },
+  {
     name: 'CMD inline taskkill image selector',
     path: 'scripts/desktop-verifier.cmd',
     source: '@echo off & taskkill /IM Hermes.exe /T /F'
@@ -126,6 +148,61 @@ const REJECT_CASES = [
     name: 'PowerShell direct external process still fails closed',
     path: 'scripts/desktop-verifier.ps1',
     source: 'git status --short'
+  },
+  {
+    name: 'workflow nested PowerShell termination',
+    path: '.github/workflows/verify.yml',
+    source: 'run: pwsh -Command "Stop-Process -Name Hermes -Force"'
+  },
+  {
+    name: 'workflow split shell process-name command alias',
+    path: '.github/workflows/verify.yml',
+    source: "run: |\n  killer='pki''ll'\n  \"$killer\" Hermes"
+  },
+  {
+    name: 'Node computed namespace member alias',
+    path: 'apps/desktop/src/computed-process.test.ts',
+    source: "import * as cp from 'node:child_process'\nconst invoke = cp['spawnSync']\ninvoke('taskkill.exe', ['/FI', 'IMAGENAME eq Hermes.exe', '/F'])"
+  },
+  {
+    name: 'Python subprocess module alias',
+    path: 'apps/desktop/scripts/process_probe.py',
+    source: "import subprocess as sp\nsp.run(['taskkill.exe', '/IM', 'Hermes.exe', '/F'])"
+  },
+  {
+    name: 'workflow CMD caret-split taskkill',
+    path: '.github/workflows/verify.yml',
+    source: 'run: cmd /d /c "task^kill /IM Hermes.exe /F"'
+  },
+  {
+    name: 'workflow concatenated PowerShell cmdlet',
+    path: '.github/workflows/verify.yml',
+    source: "run: pwsh -Command \"& ('Stop-' + 'Process') -Name Hermes -Force\""
+  },
+  {
+    name: 'workflow WMI class through a variable',
+    path: '.github/workflows/verify.yml',
+    source: "run: pwsh -Command \"$class='Win32_'+'Process'; Get-CimInstance $class | Remove-CimInstance\""
+  },
+  {
+    name: 'Node command stored in an object property',
+    path: 'apps/desktop/src/object-process.test.ts',
+    source: "import * as cp from 'node:child_process'\nconst commands = { kill: 'taskkill.exe' }\ncp.spawnSync(commands.kill, ['/IM', 'Hermes.exe', '/F'])"
+  },
+  {
+    name: 'Node command read from a bracket object property',
+    path: 'apps/desktop/src/object-process.test.ts',
+    source: "import * as cp from 'node:child_process'\nconst commands = { kill: 'taskkill.exe' }\ncp.spawnSync(commands['kill'], ['/IM', 'Hermes.exe', '/F'])"
+  },
+  {
+    name: 'Python subprocess API assigned to a local alias',
+    path: 'apps/desktop/scripts/process_probe.py',
+    source: "import subprocess\ninvoke = subprocess.run\ninvoke(['taskkill.exe', '/IM', 'Hermes.exe', '/F'])"
+  },
+  {
+    name: 'workflow PowerShell format-constructed cmdlet',
+    path: '.github/workflows/verify.yml',
+    source: "run: pwsh -Command \"& ('Stop-{0}' -f 'Process') -Name Hermes -Force\""
   }
 ]
 
@@ -203,6 +280,50 @@ const ALLOW_CASES = [
       'const warning = "Do not use Stop-Process -Name during verification"',
       'console.log(warning)'
     ].join('\n')
+  },
+  {
+    name: 'PowerShell independent PID-only lookup and cleanup',
+    path: 'scripts/desktop-verifier.ps1',
+    source: [
+      'Get-Process -Id $candidatePid',
+      "$note = 'owned child only'",
+      'Stop-Process -Id $ownedPid -Force'
+    ].join('\n')
+  },
+  {
+    name: 'workflow echo warning text',
+    path: '.github/workflows/verify.yml',
+    source: 'run: echo "Never run Stop-Process -Name Hermes"'
+  },
+  {
+    name: 'PowerShell warning-string assignment',
+    path: 'scripts/desktop-verifier.ps1',
+    source: '$warning = "Never run Stop-Process -Name Hermes"\nWrite-Output $warning'
+  },
+  {
+    name: 'local JavaScript mock method named spawnSync',
+    path: 'apps/desktop/src/process-policy.test.ts',
+    source: "const fake = { spawnSync() { return { status: 0 } } }\nfake.spawnSync('taskkill.exe', ['/IM', 'Hermes.exe', '/F'])"
+  },
+  {
+    name: 'workflow environment warning data',
+    path: '.github/workflows/verify.yml',
+    source: 'env:\n  PROCESS_POLICY_NOTE: "Never run Stop-Process -Name Hermes"\nsteps:\n  - run: echo "$PROCESS_POLICY_NOTE"'
+  },
+  {
+    name: 'JavaScript regex policy text',
+    path: 'apps/desktop/src/process-policy.test.ts',
+    source: 'const policyExample = /taskkill \\/IM Hermes\\.exe/'
+  },
+  {
+    name: 'PowerShell PID-only aliases',
+    path: 'scripts/desktop-verifier.ps1',
+    source: 'gps -Id $candidatePid\nspps -Id $ownedPid -Force'
+  },
+  {
+    name: 'workflow nested Write-Host warning text',
+    path: '.github/workflows/verify.yml',
+    source: "run: pwsh -Command \"Write-Host 'Never run Stop-Process -Name Hermes'\""
   }
 ]
 
@@ -234,7 +355,9 @@ test('scans Desktop verification/test/perf/dev code, root harness scripts, workf
     'scripts/verify-desktop.py',
     'scripts/dev-desktop.mjs',
     '.github/workflows/js-tests.yml',
-    '.github/workflows/e2e-desktop.yaml'
+    '.github/workflows/e2e-desktop.yaml',
+    '.github/workflows/verify.yml',
+    '.github/workflows/python-tests.yml'
   ]) {
     assert.equal(shouldScanRepositoryPath(relativePath), true, relativePath)
   }
@@ -246,7 +369,7 @@ test('scans Desktop verification/test/perf/dev code, root harness scripts, workf
     'apps/desktop/public/favicon.svg',
     'apps/desktop/scripts/perf/baseline.json',
     'scripts/install.ps1',
-    '.github/workflows/python-tests.yml',
+    '.github/actions/verify/action.yml',
     'website/docs/desktop-verification.md'
   ]) {
     assert.equal(shouldScanRepositoryPath(relativePath), false, relativePath)
@@ -341,16 +464,22 @@ test('repository scan uses tracked plus nonignored untracked Git enumeration', (
   }
 })
 
-test('scanner and executable scanner test safely scan themselves', () => {
-  const scannerPath = new URL('./check-verifier-process-safety.mjs', import.meta.url)
-  const testPath = new URL('./check-verifier-process-safety.node-test.mjs', import.meta.url)
+test('scanner and canonical verifier sources safely scan themselves', () => {
+  const paths = [
+    'check-verifier-process-safety.mjs',
+    'check-verifier-process-safety.node-test.mjs',
+    'desktop-verifier-lib.mjs',
+    'desktop-verifier-lib.node-test.mjs'
+  ]
 
-  assert.deepEqual(
-    scanText(readFileSync(scannerPath, 'utf8'), 'apps/desktop/scripts/check-verifier-process-safety.mjs'),
-    []
-  )
-  assert.deepEqual(
-    scanText(readFileSync(testPath, 'utf8'), 'apps/desktop/scripts/check-verifier-process-safety.node-test.mjs'),
-    []
-  )
+  for (const name of paths) {
+    assert.deepEqual(
+      scanText(
+        readFileSync(new URL(`./${name}`, import.meta.url), 'utf8'),
+        `apps/desktop/scripts/${name}`
+      ),
+      [],
+      name
+    )
+  }
 })
