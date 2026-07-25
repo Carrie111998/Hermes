@@ -2650,6 +2650,12 @@ class TestRetryAfterCap:
         agent.run_conversation("hello")
         return next((m for m in captured if "Waiting" in m), "")
 
+    @pytest.mark.parametrize("value", [None, "", "bogus", 0, -1, float("inf"), float("nan")])
+    def test_invalid_retry_after_values_are_ignored(self, value):
+        from agent.conversation_loop import _bounded_retry_after_seconds
+
+        assert _bounded_retry_after_seconds(value) is None
+
     def test_retry_after_under_cap_is_honored(self, agent):
         # 300s > old 120s cap but < new 600s cap → used verbatim.
         status = self._drive_once(agent, 300)
@@ -6490,6 +6496,64 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "rate limited" in result["error"]
+
+    def test_rate_limit_uses_exception_retry_after_hint_before_header_and_jitter(self, agent):
+        """Parsed provider RetryInfo controls the outer retry wait."""
+        self._setup_agent(agent)
+        agent._api_max_retries = 2
+        api_error = RuntimeError("rate limited")
+        api_error.status_code = 429
+        api_error.retry_after = 49.0
+        api_error.response = SimpleNamespace(headers={"Retry-After": "17"})
+        agent.client.chat.completions.create.side_effect = api_error
+
+        from agent import conversation_loop as _conv_loop
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_buffer_status") as buffer_status,
+            patch.object(agent, "_emit_status"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 2.5),
+        ):
+            result = agent.run_conversation("hello")
+
+        status_messages = "\n".join(
+            str(call.args[0]) for call in buffer_status.call_args_list if call.args
+        )
+        assert result.get("failed") is True
+        assert "Waiting 49.0s" in status_messages
+        assert "Waiting 17.0s" not in status_messages
+        assert "Waiting 2.5s" not in status_messages
+
+    def test_rate_limit_caps_exception_retry_after_hint_at_ten_minutes(self, agent):
+        self._setup_agent(agent)
+        agent._api_max_retries = 2
+        api_error = RuntimeError("rate limited")
+        api_error.status_code = 429
+        api_error.retry_after = 3600
+        api_error.response = SimpleNamespace(headers={})
+        agent.client.chat.completions.create.side_effect = api_error
+
+        from agent import conversation_loop as _conv_loop
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_buffer_status") as buffer_status,
+            patch.object(agent, "_emit_status"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+        ):
+            result = agent.run_conversation("hello")
+
+        status_messages = "\n".join(
+            str(call.args[0]) for call in buffer_status.call_args_list if call.args
+        )
+        assert result.get("failed") is True
+        assert "Waiting 600.0s" in status_messages
 
     def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.

@@ -20,6 +20,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import time
 import uuid
 from types import SimpleNamespace
@@ -793,6 +794,24 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
     return chunks
 
 
+def _positive_retry_delay_seconds(value: Any) -> Optional[float]:
+    """Parse protobuf-JSON Duration or numeric retry delays into seconds."""
+    seconds: float
+    try:
+        if isinstance(value, dict):
+            seconds = float(value.get("seconds") or 0)
+            seconds += float(value.get("nanos") or 0) / 1_000_000_000
+        elif isinstance(value, str) and value.strip().endswith("s"):
+            seconds = float(value.strip()[:-1])
+        else:
+            seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return seconds
+
+
 def gemini_http_error(
     response: httpx.Response, *, body_text: Optional[str] = None
 ) -> GeminiAPIError:
@@ -834,12 +853,13 @@ def gemini_http_error(
             md = detail.get("metadata")
             if isinstance(md, dict):
                 metadata = md
+        if retry_after is None and type_url.endswith("/google.rpc.RetryInfo"):
+            retry_after = _positive_retry_delay_seconds(detail.get("retryDelay"))
     header_retry = response.headers.get("Retry-After") or response.headers.get("retry-after")
     if header_retry:
-        try:
-            retry_after = float(header_retry)
-        except (TypeError, ValueError):
-            retry_after = None
+        parsed_header_retry = _positive_retry_delay_seconds(header_retry)
+        if parsed_header_retry is not None:
+            retry_after = parsed_header_retry
 
     code = f"gemini_http_{status}"
     if status == 401:

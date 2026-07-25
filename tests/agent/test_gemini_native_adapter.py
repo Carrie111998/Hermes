@@ -355,6 +355,84 @@ def test_native_http_error_keeps_status_and_retry_after():
     assert "quota exhausted" in str(err)
 
 
+def test_native_http_error_parses_retry_info_delay_without_header():
+    from agent.gemini_native_adapter import gemini_http_error
+
+    response = DummyResponse(
+        status_code=429,
+        headers={},
+        payload={
+            "error": {
+                "code": 429,
+                "message": "rate limited",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "49.25s",
+                    }
+                ],
+            }
+        },
+    )
+
+    err = gemini_http_error(response)
+
+    assert err.retry_after == 49.25
+
+
+def test_native_http_error_header_retry_after_overrides_retry_info():
+    from agent.gemini_native_adapter import gemini_http_error
+
+    response = DummyResponse(
+        status_code=429,
+        headers={"Retry-After": "17"},
+        payload={
+            "error": {
+                "code": 429,
+                "message": "rate limited",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": {"seconds": "49", "nanos": 500_000_000},
+                    }
+                ],
+            }
+        },
+    )
+
+    err = gemini_http_error(response)
+
+    assert err.retry_after == 17.0
+
+
+def test_native_http_error_ignores_nonpositive_retry_info():
+    from agent.gemini_native_adapter import gemini_http_error
+
+    response = DummyResponse(
+        status_code=429,
+        headers={},
+        payload={
+            "error": {
+                "code": 429,
+                "message": "rate limited",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "-1s",
+                    }
+                ],
+            }
+        },
+    )
+
+    err = gemini_http_error(response)
+
+    assert err.retry_after is None
+
+
 def test_native_client_accepts_injected_http_client():
     from agent.gemini_native_adapter import GeminiNativeClient
 

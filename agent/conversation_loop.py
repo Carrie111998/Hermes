@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -90,6 +91,17 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+def _bounded_retry_after_seconds(value: Any, *, maximum: float = 600.0) -> Optional[float]:
+    """Return a finite positive provider retry hint capped at ``maximum``."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return min(seconds, maximum)
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -5152,25 +5164,34 @@ def run_conversation(
                         "billing_block": _billing_block,
                     }
 
-                # For rate limits, respect the Retry-After header if present
+                # For rate limits, prefer a provider-parsed RetryInfo hint, then
+                # fall back to the transport Retry-After header. Cap both at ten
+                # minutes: long enough for real provider reset windows (#26293),
+                # bounded against pathological or malicious values.
                 _retry_after = None
                 if is_rate_limited:
-                    _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                    if _resp_headers and hasattr(_resp_headers, "get"):
-                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                        if _ra_raw:
-                            try:
-                                # Cap at 10 minutes. Anthropic Tier 1 input-token
-                                # buckets reset in ~171s, so a 120s cap caused us to
-                                # retry before the actual reset window and re-trip the
-                                # limit. 600s covers all realistic provider reset
-                                # windows while still rejecting pathological values. (#26293)
-                                _retry_after = min(float(_ra_raw), 600)
-                            except (TypeError, ValueError):
-                                pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    _retry_after = _bounded_retry_after_seconds(
+                        getattr(api_error, "retry_after", None)
+                    )
+                    if _retry_after is None:
+                        _resp_headers = getattr(
+                            getattr(api_error, "response", None), "headers", None
+                        )
+                        if _resp_headers and hasattr(_resp_headers, "get"):
+                            _ra_raw = (
+                                _resp_headers.get("retry-after")
+                                or _resp_headers.get("Retry-After")
+                            )
+                            _retry_after = _bounded_retry_after_seconds(_ra_raw)
+                wait_time = (
+                    _retry_after
+                    if _retry_after is not None
+                    else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                )
                 _backoff_policy = None
-                if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
+                if (
+                    is_rate_limited or _is_zai_coding_overload
+                ) and _retry_after is None:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
                         base_url=str(_base),
