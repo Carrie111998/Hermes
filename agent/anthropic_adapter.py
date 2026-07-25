@@ -1240,7 +1240,16 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     later refresh impossible because the static env token wins before we ever
     inspect Claude Code's refreshable credential file. If we have a refreshable
     Claude Code credential record, prefer it over the static env OAuth token.
+
+    Operators who manage ANTHROPIC_TOKEN deliberately (external rotation
+    scripts, multi-account pinning) can set
+    ``HERMES_ANTHROPIC_TOKEN_AUTHORITATIVE=1`` to disable this preference:
+    Claude Code's login may belong to a *different* account than the managed
+    token, and silently swapping it in moves Hermes onto the wrong account's
+    rate-limit pool.
     """
+    if os.getenv("HERMES_ANTHROPIC_TOKEN_AUTHORITATIVE", "").lower() in {"1", "true", "yes", "on"}:
+        return None
     if not env_token or not _is_oauth_token(env_token) or not isinstance(creds, dict):
         return None
     if not creds.get("refreshToken"):
