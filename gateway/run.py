@@ -12633,6 +12633,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             from gateway.session import _discord_tools_loaded as _disc_tools_loaded
             if _disc_tools_loaded():
+                # This note is internal routing metadata for the model, not
+                # something the user said — it must never reach persisted
+                # transcript storage. Keep it on `message_text` (what the
+                # model sees this turn) but do NOT fold it into
+                # `persist_user_message` below. See
+                # DISCORD_TRIGGERING_NOTE_RE in gateway/message_timestamps.py
+                # for the matching strip logic used at persistence time.
                 message_text = (
                     f"[Triggering message id: `{event.message_id}` — use as "
                     f"`message_id` for reply/react/pin via the discord tools.]\n\n"
@@ -13840,6 +13847,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.message_timestamps import (
                 coerce_message_timestamp as _coerce_msg_ts,
                 render_user_content_with_timestamp as _render_msg_ts,
+                strip_discord_triggering_note as _strip_discord_note,
                 strip_leading_message_timestamps as _strip_msg_ts,
             )
             _evt_tz = _get_evt_tz()
@@ -13847,6 +13855,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if message_text and isinstance(message_text, str):
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
+                # Strip the internal Discord "Triggering message id" routing
+                # note before it can be written to persisted transcript
+                # storage — it is gateway-generated metadata for the model,
+                # not something the user said (#71304). The model-facing
+                # `message_text` used for this turn's live conversation call
+                # keeps the note untouched.
+                _clean_message_text = _strip_discord_note(_clean_message_text)
                 persist_user_message = _clean_message_text
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
