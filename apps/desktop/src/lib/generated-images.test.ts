@@ -16,11 +16,11 @@ describe('generatedImageFromResult', () => {
         image: '/Users/me/.hermes/cache/images/cat.png',
         success: true
       })
-    ).toBe('/Users/me/.hermes/cache/images/cat.png')
+    ).toEqual(['/Users/me/.hermes/cache/images/cat.png'])
   })
 
   it('ignores failed image generation results', () => {
-    expect(generatedImageFromResult({ image: 'https://cdn.example/cat.png', success: false })).toBeNull()
+    expect(generatedImageFromResult({ image: 'https://cdn.example/cat.png', success: false })).toEqual([])
   })
 })
 

@@ -55,20 +55,53 @@ function imageResult(part: ToolLike): Record<string, unknown> | null {
   return record && record.success !== false ? record : null
 }
 
-/** Display source for a completed `image_generate` result (host path wins). */
-export function generatedImageFromResult(result: unknown): string | null {
+/** Display source for a completed `image_generate` result (host path wins).
+ *  Returns all images from a batch result (``images`` array), or the single
+ *  ``image`` field for non-batch results. */
+export function generatedImageFromResult(result: unknown): string[] {
   const record = recordFromUnknown(result)
 
   if (!record || record.success === false) {
-    return null
+    return []
   }
 
-  return stringFields(record, DISPLAY_KEYS)[0] ?? null
+  // Batch result: use the ``images`` array when present.
+  const images = record['images']
+  if (Array.isArray(images) && images.length > 0) {
+    const paths: string[] = []
+    for (const item of images) {
+      if (item && typeof item === 'object') {
+        const imgPaths = stringFields(item as Record<string, unknown>, DISPLAY_KEYS)
+        paths.push(...imgPaths)
+      }
+    }
+    if (paths.length > 0) return paths
+  }
+
+  // Single-image fallback.
+  const single = stringFields(record, DISPLAY_KEYS)[0]
+  return single ? [single] : []
 }
 
 /** Every path/URL a generated image might appear as in prose, for de-duping. */
 export function generatedImageEchoSources(parts: readonly ToolLike[]): string[] {
-  return unique(parts.flatMap(part => stringFields(imageResult(part) ?? {}, ECHO_KEYS)))
+  const sources: string[] = []
+  for (const part of parts) {
+    const record = imageResult(part)
+    if (!record) continue
+    // Single image.
+    sources.push(...stringFields(record, ECHO_KEYS))
+    // Batch images array.
+    const images = record['images']
+    if (Array.isArray(images)) {
+      for (const item of images) {
+        if (item && typeof item === 'object') {
+          sources.push(...stringFields(item as Record<string, unknown>, ECHO_KEYS))
+        }
+      }
+    }
+  }
+  return unique(sources)
 }
 
 /** Strip a generated image out of prose so it only ever shows in the tool slot.
