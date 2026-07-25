@@ -26,8 +26,8 @@ function RuntimeMessages() {
   )
 }
 
-function RuntimeHarness({ messages }: { messages: ChatMessage[] }) {
-  const messageRepository = useRuntimeMessageRepository(messages)
+function RuntimeHarness({ messages, scopeKey = 'lineage-a' }: { messages: ChatMessage[]; scopeKey?: string }) {
+  const messageRepository = useRuntimeMessageRepository(messages, scopeKey)
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
     messageRepository,
@@ -135,6 +135,61 @@ describe('runtime message repository', () => {
     expect(initialSource.map(item => item.id)).toEqual(['x', 'x'])
     expect(withoutDuplicate.map(item => item.id)).toEqual(['x', 'x:renderer-duplicate:2'])
     expect(restoredDuplicate.map(item => item.id)).toEqual(['x', 'x', 'x:renderer-duplicate:2'])
+  })
+
+  it('resets historical renderer-id reservations only when the transcript lineage changes', async () => {
+    const transcriptA = [message('a', 'user', 'one'), message('a', 'assistant', 'two')]
+    const { rerender } = render(<RuntimeHarness messages={transcriptA} scopeKey="lineage-a" />)
+
+    await waitFor(() =>
+      expect(renderedMessages()).toEqual([
+        { id: 'a', text: 'one' },
+        { id: 'a:renderer-duplicate:2', text: 'two' }
+      ])
+    )
+
+    const sameLineageWithoutDuplicate = [
+      { ...transcriptA[0] },
+      message('a:renderer-duplicate:2', 'assistant', 'same-lineage legitimate id')
+    ]
+    rerender(<RuntimeHarness messages={sameLineageWithoutDuplicate} scopeKey="lineage-a" />)
+
+    await waitFor(() =>
+      expect(renderedMessages()).toEqual([
+        { id: 'a', text: 'one' },
+        {
+          id: 'a:renderer-duplicate:2:renderer-duplicate:2',
+          text: 'same-lineage legitimate id'
+        }
+      ])
+    )
+
+    const sameLineageRestored = [
+      ...transcriptA.map(item => ({ ...item })),
+      { ...sameLineageWithoutDuplicate[1] }
+    ]
+    rerender(<RuntimeHarness messages={sameLineageRestored} scopeKey="lineage-a" />)
+
+    await waitFor(() =>
+      expect(renderedMessages()).toEqual([
+        { id: 'a', text: 'one' },
+        { id: 'a:renderer-duplicate:2', text: 'two' },
+        {
+          id: 'a:renderer-duplicate:2:renderer-duplicate:2',
+          text: 'same-lineage legitimate id'
+        }
+      ])
+    )
+
+    const transcriptB = [message('a:renderer-duplicate:2', 'user', 'unrelated lineage source id')]
+    rerender(<RuntimeHarness messages={transcriptB} scopeKey="lineage-b" />)
+
+    await waitFor(() =>
+      expect(renderedMessages()).toEqual([
+        { id: 'a:renderer-duplicate:2', text: 'unrelated lineage source id' }
+      ])
+    )
+    expect(transcriptB[0]?.id).toBe('a:renderer-duplicate:2')
   })
 
   it('preserves duplicate-id messages with deterministic renderer-only ids across updates', () => {
