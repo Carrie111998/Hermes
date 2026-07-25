@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.pulse_buttons import blocks, github, local_review, store
-from plugins.pulse_buttons import actions
+from plugins.pulse_buttons import actions, cli
 
 
 # --- store -----------------------------------------------------------------
@@ -233,6 +233,72 @@ def test_digest_stays_within_block_ceiling():
     assert len(bk) <= blocks.MAX_BLOCKS
 
 
+def _many_repos(n_repos: int, per_bucket: int, buckets=("ready",), detail="d"):
+    return [
+        {"repo": f"Strike48-public/repo{r}",
+         "buckets": {b: [dict(_staged(b, number=i), detail=detail,
+                              _key=f"repo{r}-{b}-{i}") for i in range(per_bucket)]
+                     for b in buckets}}
+        for r in range(n_repos)
+    ]
+
+
+def test_ceiling_holds_across_many_repos():
+    """Regression: per-repo divider/header and the '…and N more' tails are
+    appended outside the per-item guard, so many repos overflowed to 53 blocks
+    and Slack rejected the whole digest with invalid_blocks."""
+    bk = blocks.build_digest_blocks(_many_repos(12, 8))
+    assert len(bk) <= blocks.MAX_BLOCKS
+
+
+def test_ceiling_holds_with_every_bucket_populated():
+    bk = blocks.build_digest_blocks(
+        _many_repos(40, 9, buckets=("ready", "awaiting", "blocked", "new_prs", "rotting"))
+    )
+    assert len(bk) <= blocks.MAX_BLOCKS
+
+
+def test_truncation_is_announced_when_items_are_dropped():
+    bk = blocks.build_digest_blocks(_many_repos(12, 8))
+    assert any("truncated" in str(b) for b in bk)
+
+
+def test_no_title_line_is_stranded_without_its_action_row():
+    """A section that would land on the last slot must not push its buttons out."""
+    bk = blocks.build_digest_blocks(_many_repos(12, 8))
+    types = [b["type"] for b in bk]
+    # 'ready' items always carry a button row, and each repo contributes exactly
+    # one buttonless section (its name), so item sections must all be paired.
+    item_sections = types.count("section") - types.count("divider")
+    assert types.count("actions") == item_sections
+
+
+def test_long_detail_is_clamped_to_slack_text_cap():
+    """Regression: MAX_SECTION_TEXT was declared but never enforced — a long
+    'detail' produced a 4028-char section and Slack rejected the digest."""
+    item = dict(_staged("ready"), detail="x" * 4000)
+    bk = blocks.build_digest_blocks(
+        [{"repo": "Strike48-public/pick", "buckets": {"ready": [item]}}]
+    )
+    for b in bk:
+        if b["type"] == "section":
+            assert len(b["text"]["text"]) <= blocks.MAX_SECTION_TEXT
+
+
+def test_long_text_is_clamped_in_confirm_and_resolved_blocks():
+    item = dict(_staged("ready"), detail="y" * 5000)
+    for bk in (
+        blocks.build_confirm_merge_blocks(item, ["CI green"]),
+        blocks.build_resolved_blocks(item, text="z" * 5000, context="c" * 5000),
+    ):
+        for b in bk:
+            if b["type"] == "section":
+                assert len(b["text"]["text"]) <= blocks.MAX_SECTION_TEXT
+            if b["type"] == "context":
+                for e in b["elements"]:
+                    assert len(e["text"]) <= blocks.MAX_SECTION_TEXT
+
+
 def test_confirm_merge_blocks_have_confirm_button():
     bk = blocks.build_confirm_merge_blocks(_staged("ready"), ["CI green", "mergeable"])
     ids = [e["action_id"] for b in bk if b.get("type") == "actions" for e in b["elements"]]
@@ -313,3 +379,47 @@ def test_is_authorized_allows_listed(monkeypatch):
 def test_is_authorized_wildcard(monkeypatch):
     monkeypatch.setenv("SLACK_ALLOWED_USERS", "*")
     assert actions.is_authorized("anyone") is True
+
+
+# --- publish fails loud, never silent --------------------------------------
+
+def test_plain_text_fallback_lists_the_waiting_items():
+    staged = [{"repo": "Strike48-public/pick", "buckets": {
+        "ready": [{"repo": "Strike48-public/pick", "number": 302,
+                   "url": "https://gh/pull/302", "title": "docs: taxonomy", "_key": "k1"}]}}]
+    out = cli._plain_text_digest(staged, Exception("invalid_blocks"))
+    assert "invalid_blocks" in out and "302" in out and "docs: taxonomy" in out
+    assert len(out) <= 3900
+
+
+def test_publish_falls_back_to_plain_text_when_blocks_rejected(monkeypatch, tmp_path):
+    """Regression: an invalid_blocks rejection left the digest undelivered, so a
+    broken Pulse looked exactly like a quiet day (it sat dark for a full day)."""
+    posts = []
+
+    async def fake_post(client, channel, text, blocks_payload, thread_ts=None):
+        # Mirror Slack: reject the Block Kit call, accept plain text.
+        if blocks_payload:
+            raise RuntimeError("chat.postMessage: invalid_blocks")
+        posts.append(text)
+        return "1784991363.081599"
+
+    scanner = SimpleNamespace(scan_all=lambda advance_watermark=True: {
+        "repos": [{"repo": "Strike48-public/pick", "buckets": {
+            "ready": [{"repo": "Strike48-public/pick", "number": 302, "url": "u",
+                       "title": "t", "head_sha": "abc", "kind": "pr"}]}}],
+        "warnings": [],
+    })
+
+    monkeypatch.setattr(cli, "_load_pulse_scanner", lambda: scanner)
+    monkeypatch.setattr(cli.slackio, "post_message", fake_post)
+    monkeypatch.setattr(cli.slackio, "make_client", lambda: object())
+    monkeypatch.setattr(cli.slackio, "home_channel", lambda: "C123")
+    monkeypatch.setattr(store, "default_path", lambda: tmp_path / "pulse.json")
+
+    rc = cli.pulse_command(SimpleNamespace(pulse_action="publish", channel="", dry_run=False))
+
+    # Delivered something despite the rejection, and still reported failure.
+    assert posts, "no fallback message was delivered — Pulse went silent"
+    assert "302" in posts[0]
+    assert rc == 1, "must exit non-zero so the cron records the real error"

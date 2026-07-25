@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 
 MAX_BLOCKS = 50
 MAX_SECTION_TEXT = 3000
+MAX_ITEMS_PER_BUCKET = 6
 
 Block = Dict[str, Any]
 
@@ -37,12 +38,25 @@ _BUCKET_HEADINGS = [
 ]
 
 
+def _clamp(text: str, limit: int = MAX_SECTION_TEXT) -> str:
+    """Trim ``text`` to Slack's per-field character cap, marking the elision.
+
+    The digest is a scannable index, not the payload — an over-long field means
+    a pathological title/detail, so we truncate rather than spill into extra
+    blocks (which would push us toward the 50-block ceiling instead).
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def _section(text: str) -> Block:
-    return {"type": "section", "text": {"type": "mrkdwn", "text": text or " "}}
+    return {"type": "section", "text": {"type": "mrkdwn", "text": _clamp(text) or " "}}
 
 
 def _context(text: str) -> Block:
-    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": _clamp(text) or " "}]}
 
 
 def _title_line(item: Dict[str, Any]) -> str:
@@ -106,28 +120,55 @@ def build_digest_blocks(repos: List[Dict[str, Any]]) -> List[Block]:
     blocks: List[Block] = [
         {"type": "header", "text": {"type": "plain_text", "text": "Project Pulse", "emoji": False}},
     ]
+    # One slot is always held back for the truncation notice, so every early
+    # return below can append it without breaching the ceiling.
+    budget = MAX_BLOCKS - 1
+    truncated = False
+
     for entry in repos:
         repo = entry["repo"]
         buckets = entry["buckets"]
         if not any(buckets.get(k) for k, _ in _BUCKET_HEADINGS):
             continue
+        # A repo costs divider + name + at least one heading + one item before
+        # it says anything useful; skip it wholesale if that won't fit.
+        if len(blocks) + 4 > budget:
+            truncated = True
+            break
         blocks.append({"type": "divider"})
         blocks.append(_section(f"*{repo.split('/')[-1]}*"))
+
         for bucket, heading in _BUCKET_HEADINGS:
             items = buckets.get(bucket) or []
             if not items:
                 continue
+            if len(blocks) + 2 > budget:
+                truncated = True
+                break
             blocks.append(_context(heading))
-            for item in items[:6]:
-                if len(blocks) >= MAX_BLOCKS - 2:
-                    blocks.append(_context("…more items truncated to fit Slack's block limit"))
-                    return blocks
-                blocks.append(_section(_title_line(item)))
+            shown = 0
+            for item in items[:MAX_ITEMS_PER_BUCKET]:
                 row = _action_row(bucket, item)
+                # An item is a section plus an optional action row — reserve both
+                # so we never strand a title line without its buttons.
+                cost = 2 if row is not None else 1
+                if len(blocks) + cost > budget:
+                    truncated = True
+                    break
+                blocks.append(_section(_title_line(item)))
                 if row is not None:
                     blocks.append(row)
-            if len(items) > 6:
-                blocks.append(_context(f"…and {len(items) - 6} more"))
+                shown += 1
+            remaining = len(items) - shown
+            if remaining > 0 and len(blocks) + 1 <= budget:
+                blocks.append(_context(f"…and {remaining} more"))
+            if truncated:
+                break
+        if truncated:
+            break
+
+    if truncated:
+        blocks.append(_context("…more items truncated to fit Slack's block limit"))
     return blocks
 
 

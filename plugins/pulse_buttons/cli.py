@@ -89,6 +89,27 @@ def _stage_all(repos: list[dict]) -> list[dict]:
     return staged_repos
 
 
+def _plain_text_digest(staged: list[dict], exc: Exception) -> str:
+    """Degraded, button-free rendering used when Block Kit is rejected.
+
+    Buttons are lost, but the operator still learns what is waiting — a silent
+    Pulse is indistinguishable from a quiet day, which is the worse failure.
+    """
+    lines = [f":warning: Project Pulse fell back to plain text ({exc})", ""]
+    for entry in staged:
+        items = [i for its in entry["buckets"].values() for i in its]
+        if not items:
+            continue
+        lines.append(f"*{entry['repo'].split('/')[-1]}*")
+        for bucket, its in entry["buckets"].items():
+            for item in its[:6]:
+                num, url = item.get("number", ""), item.get("url", "")
+                title = (item.get("title") or "")[:80]
+                ref = f"<{url}|#{num}>" if url else f"#{num}"
+                lines.append(f"• [{bucket}] {ref} {title}")
+    return "\n".join(lines)[:3900]
+
+
 async def _cmd_publish(args: argparse.Namespace) -> int:
     mod = _load_pulse_scanner()
     if mod is None:
@@ -129,7 +150,20 @@ async def _cmd_publish(args: argparse.Namespace) -> int:
     try:
         ts = await slackio.post_message(client, channel, text, bk)
     except Exception as exc:
+        # A malformed digest must not read as a quiet day. Retry once with a
+        # plain-text rendering so the signal still lands, then keep the failing
+        # exit code so the cron's last_status records the real error.
         print(f"pulse publish: Slack post failed: {exc}", file=sys.stderr)
+        try:
+            ts = await slackio.post_message(
+                client, channel, _plain_text_digest(staged, exc), []
+            )
+        except Exception as fallback_exc:
+            print(f"pulse publish: plain-text fallback also failed: {fallback_exc}",
+                  file=sys.stderr)
+            return 1
+        print(f"pulse publish: posted plain-text fallback to {channel} (ts={ts})",
+              file=sys.stderr)
         return 1
 
     # Mark every staged item published against this message ts (buttons rewrite
