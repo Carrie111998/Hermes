@@ -433,6 +433,68 @@ def test_native_http_error_ignores_nonpositive_retry_info():
     assert err.retry_after is None
 
 
+def test_native_http_error_parses_retry_info_duration_object_without_header():
+    """The protobuf ``{seconds, nanos}`` Duration form is honored directly.
+
+    Without this test the object-parse branch is masked: the only other case
+    that supplies an object form also sends a ``Retry-After`` header, which
+    overrides it, so a regression in object parsing would go undetected.
+    """
+    from agent.gemini_native_adapter import gemini_http_error
+
+    response = DummyResponse(
+        status_code=429,
+        headers={},
+        payload={
+            "error": {
+                "code": 429,
+                "message": "rate limited",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": {"seconds": "49", "nanos": 500_000_000},
+                    }
+                ],
+            }
+        },
+    )
+
+    err = gemini_http_error(response)
+
+    assert err.retry_after == 49.5
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("49.25s", 49.25),
+        ("1s", 1.0),
+        ("  10s  ", 10.0),
+        ("120", 120.0),
+        (30, 30.0),
+        ({"seconds": "49", "nanos": 500_000_000}, 49.5),
+        ({"seconds": 49, "nanos": 500_000_000}, 49.5),
+        ({"nanos": 250_000_000}, 0.25),
+        ({"seconds": "3"}, 3.0),
+        ("-1s", None),
+        ("0s", None),
+        ({"seconds": 0, "nanos": 0}, None),
+        ("inf", None),
+        ("nan", None),
+        (float("inf"), None),
+        (float("nan"), None),
+        (None, None),
+        ("", None),
+        ("bogus", None),
+    ],
+)
+def test_positive_retry_delay_seconds(value, expected):
+    from agent.gemini_native_adapter import _positive_retry_delay_seconds
+
+    assert _positive_retry_delay_seconds(value) == expected
+
+
 def test_native_client_accepts_injected_http_client():
     from agent.gemini_native_adapter import GeminiNativeClient
 
