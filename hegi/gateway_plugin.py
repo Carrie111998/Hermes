@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import logging
 import re
+import threading
 from typing import Any
 
 from .approval import process_pending_approvals
@@ -13,9 +14,77 @@ from .memory import DraftGate, MCPMemoryBackend, parse_approval_command
 from .state import StateStore
 
 
-_APPROVAL_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="hegi-approval-worker"
-)
+_PIPELINE_LOCK = threading.Lock()
+_PIPELINE_THREAD: threading.Thread | None = None
+_PIPELINE_WAKE = threading.Event()
+_LOGGER = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows uses standalone recovery
+    fcntl = None  # type: ignore[assignment]
+
+
+def _pipeline_loop(config: Any) -> None:
+    from .pipeline import HegiPipeline
+
+    pipeline = HegiPipeline(config)
+    poll_seconds = max(
+        1, int(config.section("daemon").get("poll_seconds", 60))
+    )
+    while True:
+        _run_pipeline_cycle(config, pipeline)
+        _PIPELINE_WAKE.wait(poll_seconds)
+        _PIPELINE_WAKE.clear()
+
+
+def _run_pipeline_cycle(config: Any, pipeline: Any) -> bool:
+    """Run one cycle only while owning the standalone daemon's lock."""
+    if fcntl is None:
+        return False
+    lock_path = config.state_db.parent / "daemon.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="ascii") as lock_stream:
+        try:
+            fcntl.flock(
+                lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+            )
+        except BlockingIOError:
+            return False
+        try:
+            try:
+                pipeline.run_once(dry_run=False)
+            except Exception as exc:
+                _LOGGER.exception("embedded HEGI pipeline cycle failed")
+                pipeline.state.add_dead_letter(
+                    "gateway_pipeline", {}, str(exc)
+                )
+            try:
+                process_pending_approvals(config)
+            except Exception as exc:
+                _LOGGER.exception("embedded HEGI approval cycle failed")
+                pipeline.state.add_dead_letter(
+                    "gateway_approval", {}, str(exc)
+                )
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return True
+
+
+def _ensure_pipeline_worker(config: Any) -> None:
+    global _PIPELINE_THREAD
+    if fcntl is None:
+        return
+    with _PIPELINE_LOCK:
+        if _PIPELINE_THREAD is not None and _PIPELINE_THREAD.is_alive():
+            return
+        _PIPELINE_THREAD = threading.Thread(
+            target=_pipeline_loop,
+            args=(config,),
+            name="hegi-gateway-pipeline",
+            daemon=True,
+        )
+        _PIPELINE_THREAD.start()
 
 
 def _platform_name(event: Any) -> str:
@@ -55,7 +124,8 @@ def _meeting_id(state: StateStore, event: Any) -> str | None:
 
 
 def _process_pending_background(config: Any) -> None:
-    _APPROVAL_EXECUTOR.submit(process_pending_approvals, config)
+    _ensure_pipeline_worker(config)
+    _PIPELINE_WAKE.set()
 
 
 def intercept_telegram_approval(
@@ -70,9 +140,6 @@ def intercept_telegram_approval(
     except Exception:
         return None
     memory = config.section("memory")
-    command = parse_approval_command(text, memory.get("commands"))
-    if command is None:
-        return None
     source = getattr(event, "source", None)
     if (
         not config.enabled
@@ -80,7 +147,11 @@ def intercept_telegram_approval(
         or str(getattr(source, "chat_id", "")) != config.chat_id
     ):
         return None
+    _ensure_pipeline_worker(config)
     state = StateStore(config.state_db)
+    command = parse_approval_command(text, memory.get("commands"))
+    if command is None:
+        return None
     meeting_id = _meeting_id(state, event)
     if not meeting_id:
         _schedule_reply(gateway, event, "처리할 HEGI 회의록을 찾지 못했습니다.")
@@ -150,5 +221,8 @@ def intercept_telegram_approval(
 def register(context: Any) -> None:
     # Run additive state migrations at plugin load, before the first live
     # approval event reaches the worker.
-    StateStore(load_config().state_db)
+    config = load_config()
+    StateStore(config.state_db)
+    _ensure_pipeline_worker(config)
+    _PIPELINE_WAKE.set()
     context.register_hook("pre_gateway_dispatch", intercept_telegram_approval)

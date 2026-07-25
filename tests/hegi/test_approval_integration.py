@@ -136,6 +136,10 @@ memory:
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "hegi.gateway_plugin._ensure_pipeline_worker",
+        lambda _config: None,
+    )
     config = load_config(config_path)
     state = StateStore(config.state_db)
     state.save_episode(
@@ -224,6 +228,121 @@ def test_draft_only_stops_pending(tmp_path, monkeypatch):
     assert result[0]["status"] == "draft_created"
     assert approval.calls == ["show:draft-1"]
     assert approval.commits == 0
+
+
+def test_gateway_starts_embedded_pipeline_worker_once(monkeypatch):
+    import hegi.gateway_plugin as plugin
+
+    started = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.alive = False
+
+        def start(self):
+            self.alive = True
+            started.append(self.kwargs)
+
+        def is_alive(self):
+            return self.alive
+
+    monkeypatch.setattr(plugin.threading, "Thread", FakeThread)
+    monkeypatch.setattr(plugin, "_PIPELINE_THREAD", None)
+    config = SimpleNamespace(section=lambda _name: {"poll_seconds": 60})
+
+    plugin._ensure_pipeline_worker(config)
+    plugin._ensure_pipeline_worker(config)
+
+    assert len(started) == 1
+    assert started[0]["daemon"] is True
+    assert started[0]["name"] == "hegi-gateway-pipeline"
+
+
+def test_embedded_pipeline_shares_standalone_daemon_lock(tmp_path, monkeypatch):
+    import hegi.gateway_plugin as plugin
+
+    if plugin.fcntl is None:
+        pytest.skip("POSIX daemon lock is unavailable")
+    state_db = tmp_path / "hegi" / "state.db"
+    config = SimpleNamespace(state_db=state_db)
+    calls = []
+    pipeline = SimpleNamespace(
+        run_once=lambda **kwargs: calls.append(("pipeline", kwargs)),
+        state=SimpleNamespace(add_dead_letter=lambda *_args: None),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "process_pending_approvals",
+        lambda _config: calls.append(("approval", {})),
+    )
+    lock_path = state_db.parent / "daemon.lock"
+    lock_path.parent.mkdir(parents=True)
+    with lock_path.open("a+", encoding="ascii") as standalone_lock:
+        plugin.fcntl.flock(
+            standalone_lock.fileno(),
+            plugin.fcntl.LOCK_EX | plugin.fcntl.LOCK_NB,
+        )
+        assert plugin._run_pipeline_cycle(config, pipeline) is False
+        assert calls == []
+        plugin.fcntl.flock(standalone_lock.fileno(), plugin.fcntl.LOCK_UN)
+
+    assert plugin._run_pipeline_cycle(config, pipeline) is True
+    assert calls == [
+        ("pipeline", {"dry_run": False}),
+        ("approval", {}),
+    ]
+
+
+def test_gateway_starts_embedded_pipeline_for_plain_discussion(
+    tmp_path, monkeypatch
+):
+    _config(tmp_path, monkeypatch)
+    started = []
+    monkeypatch.setattr(
+        "hegi.gateway_plugin._ensure_pipeline_worker",
+        lambda config: started.append(config.chat_id),
+    )
+    adapter = SimpleNamespace(send=AsyncMock(return_value={"message_id": "ack"}))
+    gateway = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    source = SimpleNamespace(
+        platform=SimpleNamespace(value="telegram"),
+        chat_id="-1001",
+        user_id="42",
+    )
+    event = SimpleNamespace(
+        text="마찰의 투명성을 논의합시다.",
+        message_id="discussion",
+        reply_to_message_id=None,
+        source=source,
+    )
+
+    assert intercept_telegram_approval(
+        event=event, gateway=gateway, session_store=None
+    ) is None
+    assert started == ["-1001"]
+
+
+def test_plugin_registration_starts_worker_in_gateway_process(
+    tmp_path, monkeypatch
+):
+    _config(tmp_path, monkeypatch)
+    started = []
+    registered = []
+    monkeypatch.setattr(
+        "hegi.gateway_plugin._ensure_pipeline_worker",
+        lambda config: started.append(config.chat_id),
+    )
+    context = SimpleNamespace(
+        register_hook=lambda name, callback: registered.append((name, callback))
+    )
+
+    from hegi.gateway_plugin import register
+
+    register(context)
+
+    assert started == ["-1001"]
+    assert registered[0][0] == "pre_gateway_dispatch"
 
 
 def test_unauthorized_user_cannot_create_draft_or_job(tmp_path, monkeypatch):
@@ -429,7 +548,7 @@ async def test_gateway_requires_reply_and_accepts_telemetry_kwargs(
     _config(tmp_path, monkeypatch)
     processed = []
     monkeypatch.setattr(
-        "hegi.gateway_plugin.process_pending_approvals",
+        "hegi.gateway_plugin._process_pending_background",
         lambda config: processed.append(config.chat_id),
     )
     adapter = SimpleNamespace(send=AsyncMock(return_value={"message_id": "ack"}))

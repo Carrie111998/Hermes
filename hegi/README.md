@@ -32,6 +32,13 @@ python -m hegi status
 pre-dispatch plugin이 일반 Memory Curator 응답보다 먼저 메시지를 처리한다. 승인
 작업은 SQLite에 단계별로 영속화된다. `초안 만들어`는 pending Draft에서 멈추고,
 `기억해`는 fresh search부터 validate/audit/index/backup까지 한 번에 완료한다.
+승인은 반드시 HEGI가 보고한 회의록 메시지에 대한 reply이거나 명시적
+`meeting_id`를 포함해야 한다.
+
+Memory Curator gateway는 공진방 메시지를 처음 수신할 때 HEGI pipeline worker를
+함께 기동한다. worker는 10분 무대화 감지와 중단된 승인 작업 복구를 주기적으로
+수행하며, standalone `hegi daemon --send`와 같은 `daemon.lock`을 사용하므로 두
+실행 경로가 동일 회의를 중복 처리하지 않는다.
 
 설치와 운영은 [operations.md](docs/operations.md), 안전 경계는
 [memory_policy.md](docs/memory_policy.md)를 참고한다.

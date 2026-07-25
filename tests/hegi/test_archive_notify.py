@@ -6,7 +6,7 @@ import pytest
 
 from hegi.archive import ArchiveManager
 from hegi.models import MeetingEpisode, MeetingMinutes, MemoryEvaluation
-from hegi.notify import TelegramReporter
+from hegi.notify import TelegramReporter, telegram_parts
 from hegi.state import StateStore
 
 
@@ -86,3 +86,9 @@ def test_telegram_resume_skips_already_sent_parts(tmp_path):
     assert len(resumed_calls) == 3
     assert all(not content.startswith("1/4") for content in resumed_calls)
     assert state.delivered_parts("meeting") == {1, 2, 3, 4}
+
+
+def test_memory_approval_prompt_requires_reply_to_report():
+    final_part = telegram_parts(_minutes())[-1]
+    assert "반드시 이 메시지에 Telegram 답장으로" in final_part
+    assert "@헤기 기억해" in final_part
