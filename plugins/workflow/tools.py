@@ -39,12 +39,14 @@ def check_workflow_requirements() -> bool:
     try:
         from plugins.workflow.engine import WorkflowEngine  # noqa: F401
     except Exception as exc:
-        logger.debug("workflow_engine import failed: %s %s", type(exc).__name__, exc)
+        logger.warning("check_workflow: engine import FAILED: %s %s", type(exc).__name__, exc)
+        import traceback; traceback.print_exc()
         return False
 
     try:
         from pathlib import Path
         import os
+        workflows_dir = None
         env_path = os.environ.get("HERMES_WORKFLOW_FILES")
         if env_path:
             workflows_dir = Path(env_path)
@@ -58,8 +60,11 @@ def check_workflow_requirements() -> bool:
                 engine_mod = __import__("plugins.workflow.engine", fromlist=["WorkflowEngine"])
                 workflows_dir = Path(engine_mod.__file__).resolve().parent.parent / "docs" / "fleet-pipelines"
         if not workflows_dir.is_dir():
+            logger.warning("check_workflow: workflows_dir missing: %s", workflows_dir)
             return False
-    except Exception:
+    except Exception as exc:
+        logger.warning("check_workflow: dir check FAILED: %s %s", type(exc).__name__, exc)
+        import traceback; traceback.print_exc()
         return False
     return True
 
