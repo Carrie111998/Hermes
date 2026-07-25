@@ -2577,6 +2577,18 @@ class SessionStore:
             continuity_capsule = self._prepare_continuity_capsule(
                 renewal_predecessor.session_id
             )
+            if continuity_capsule is None and reset_had_activity:
+                logger.warning(
+                    "Continuity capsule unavailable for %s; keeping predecessor %s",
+                    session_key,
+                    renewal_predecessor.session_id,
+                )
+                with self._lock:
+                    current = self._entries.get(session_key)
+                    if current is None:
+                        self._entries[session_key] = renewal_predecessor
+                        current = renewal_predecessor
+                return current
             reset_had_activity = reset_had_activity or bool(continuity_capsule)
 
         if _needs_recover and db_end_session_id is None:

@@ -218,6 +218,26 @@ def test_missing_transactional_db_defers_renewal(tmp_path):
     assert store.get_or_create_session(source).session_id == predecessor.session_id
 
 
+def test_missing_continuity_capsule_keeps_predecessor_active_and_routed(
+    tmp_path, monkeypatch
+):
+    store = _store(tmp_path)
+    source = _source()
+    predecessor = _seed(store, source)
+    _expire(store, predecessor)
+    monkeypatch.setattr(store, "_prepare_continuity_capsule", lambda _session_id: None)
+
+    result = store.get_or_create_session(source)
+
+    assert result is predecessor
+    assert store._db is not None
+    assert store._db.get_session(predecessor.session_id)["ended_at"] is None
+    canonical = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert json.loads(canonical[predecessor.session_key])["session_id"] == (
+        predecessor.session_id
+    )
+
+
 def test_wrong_scope_cannot_advance_route(tmp_path):
     store = _store(tmp_path)
     source = _source()
