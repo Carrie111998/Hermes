@@ -14676,7 +14676,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._session_db.find_new_user_message_with_capsule(
                             session_entry.session_id,
                             _pending_continuity_capsule,
-                            after_message_id=_capsule_message_highwater,
+                            # Always prove against the successor's first durable
+                            # user row. A retry must not move acknowledgement
+                            # past an earlier unacknowledged attempt.
+                            after_message_id=0,
                         )
                     )
                     if capsule_message_id is not None:

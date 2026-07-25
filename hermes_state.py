@@ -4124,10 +4124,16 @@ class SessionDB:
 
             durable = conn.execute(
                 "SELECT api_content FROM messages "
-                "WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
-                (message_id, session_id),
+                "WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1 "
+                "AND id = (SELECT MIN(id) FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1)",
+                (message_id, session_id, session_id),
             ).fetchone()
-            if durable is None or expected_capsule not in str(durable["api_content"] or ""):
+            if durable is None:
+                raise RuntimeError(
+                    "durable user row is not the exact first successor row"
+                )
+            if expected_capsule not in str(durable["api_content"] or ""):
                 raise RuntimeError("exact durable user row does not contain the capsule")
 
             current["continuity_capsule"] = None

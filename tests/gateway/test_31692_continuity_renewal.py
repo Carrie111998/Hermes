@@ -569,7 +569,7 @@ def test_exact_row_acknowledgement_and_restart(tmp_path):
     )
     assert message_id is not None
 
-    with pytest.raises(RuntimeError, match="does not contain"):
+    with pytest.raises(RuntimeError, match="exact first successor row"):
         store._db.acknowledge_gateway_continuity_capsule(
             scope=store._routing_scope(),
             session_key=successor.session_key,
@@ -621,13 +621,14 @@ def test_capsule_ack_requires_exact_first_successor_user_row(tmp_path):
     successor = store.get_or_create_session(source)
     capsule = successor.continuity_capsule
     assert capsule
+    assert store._db is not None
 
     highwater = store._db.latest_message_id(successor.session_id)
     # The exact first successor user row does NOT carry the capsule...
     store._db.append_message(successor.session_id, "user", "unrelated first")
     # ...and a later user row happens to contain the capsule text. The later
     # match must NOT clear the capsule while an earlier successor row exists.
-    store._db.append_message(
+    later_id = store._db.append_message(
         successor.session_id,
         "user",
         "hello",
@@ -638,6 +639,14 @@ def test_capsule_ack_requires_exact_first_successor_user_row(tmp_path):
         capsule,
         after_message_id=highwater,
     ) is None
+    with pytest.raises(RuntimeError, match="not the exact first successor row"):
+        store._db.acknowledge_gateway_continuity_capsule(
+            scope=store._routing_scope(),
+            session_key=successor.session_key,
+            session_id=successor.session_id,
+            expected_capsule=capsule,
+            message_id=later_id,
+        )
 
     # When the exact first successor row after the high-water mark carries the
     # capsule, that row's id is returned.
