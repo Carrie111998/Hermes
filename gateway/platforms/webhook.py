@@ -453,9 +453,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _canonical_profile_namespace(profile: Any) -> str:
-        """Map both URL forms for the effective default profile to one key."""
+        """Map absent and explicit-default profile forms to one key."""
         profile_name = str(profile) if profile else "default"
-        if profile_name in {"default", "main"}:
+        if profile_name == "default":
             return "default"
         return profile_name
 

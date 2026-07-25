@@ -1257,6 +1257,86 @@ class TestIdempotency:
         assert len(adapter._seen_deliveries) == 1
 
     @pytest.mark.asyncio
+    async def test_named_main_profile_is_distinct_from_effective_default(
+        self, tmp_path, monkeypatch
+    ):
+        """A real ``main`` profile must not share default's delivery/session scope."""
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "profiles" / "main").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "{target}"}}
+        adapter = _make_adapter(routes=routes)
+        runner = MagicMock()
+        runner.config.multiplex_profiles = True
+        runner._profile_name_for_source.return_value = None
+        adapter.gateway_runner = runner
+
+        captured_events = []
+        both_started = asyncio.Event()
+
+        async def _capture(event):
+            captured_events.append(event)
+            if len(captured_events) == 2:
+                both_started.set()
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        headers = {"X-GitHub-Delivery": "shared-main-id"}
+
+        async with TestClient(TestServer(app)) as cli:
+            default_response, main_response = await asyncio.gather(
+                cli.post(
+                    "/webhooks/idem",
+                    json={"target": "default"},
+                    headers=headers,
+                ),
+                cli.post(
+                    "/p/main/webhooks/idem",
+                    json={"target": "main"},
+                    headers=headers,
+                ),
+            )
+            assert default_response.status == 202
+            assert main_response.status == 202
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+
+            default_retry, main_retry = await asyncio.gather(
+                cli.post(
+                    "/webhooks/idem",
+                    json={"target": "default-retry"},
+                    headers=headers,
+                ),
+                cli.post(
+                    "/p/main/webhooks/idem",
+                    json={"target": "main-retry"},
+                    headers=headers,
+                ),
+            )
+            assert (await default_retry.json())["status"] == "duplicate"
+            assert (await main_retry.json())["status"] == "duplicate"
+
+        assert set(adapter._seen_deliveries) == {
+            _delivery_key("idem", "shared-main-id", profile="default"),
+            _delivery_key("idem", "shared-main-id", profile="main"),
+        }
+        assert {
+            (event.source.profile, event.source.chat_id, event.raw_message["target"])
+            for event in captured_events
+        } == {
+            (
+                None,
+                "webhook:default:idem:x-github-delivery:shared-main-id",
+                "default",
+            ),
+            (
+                "main",
+                "webhook:main:idem:x-github-delivery:shared-main-id",
+                "main",
+            ),
+        }
+
+    @pytest.mark.asyncio
     async def test_equal_github_and_svix_ids_have_distinct_provider_namespaces(self):
         """Provider-local IDs must not suppress a valid delivery from another provider."""
         secret = "shared-provider-secret"
