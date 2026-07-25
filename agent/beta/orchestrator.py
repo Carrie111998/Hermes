@@ -36,6 +36,7 @@ class ExecutorConfirmation(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    operation_fingerprint: str
     status: str
     evidence: str
 
@@ -122,7 +123,10 @@ def _recommended_operations(request: str, response: ConsolidatedResponse) -> tup
     return tuple(operations)
 
 
-def _parse_executor_confirmation(raw: Any) -> tuple[str, str]:
+def _parse_executor_confirmation(
+    raw: Any,
+    expected_operation_fingerprint: str,
+) -> tuple[str, str]:
     """Return a fail-closed execution status and normalized evidence."""
     if raw is None:
         return "failed", "executor returned no usable execution evidence"
@@ -133,7 +137,7 @@ def _parse_executor_confirmation(raw: Any) -> tuple[str, str]:
         if not text:
             return "failed", "executor returned no usable execution evidence"
         if not text.startswith("{"):
-            return "failed", "executor must return a structured confirmation with status and evidence"
+            return "failed", "executor must return a structured confirmation with operation_fingerprint, status and evidence"
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
@@ -143,7 +147,13 @@ def _parse_executor_confirmation(raw: Any) -> tuple[str, str]:
         try:
             confirmation = ExecutorConfirmation.model_validate(payload)
         except ValidationError as exc:
-            return "failed", f"executor returned invalid structured confirmation: {exc.errors()[0]['msg']}"
+            error = exc.errors()[0]
+            field = ".".join(str(part) for part in error["loc"])
+            return "failed", (
+                f"executor returned invalid structured confirmation: {field}: {error['msg']}"
+            )
+        if confirmation.operation_fingerprint != expected_operation_fingerprint:
+            return "failed", "executor confirmation does not match the approved operation"
         status = confirmation.status.strip().lower()
         evidence = confirmation.evidence.strip()
         if not evidence:
@@ -171,7 +181,9 @@ def _execute_approved(
         if not gate.authorized(operation, receipt):
             continue
         try:
-            status, evidence = _parse_executor_confirmation(executor(operation))
+            status, evidence = _parse_executor_confirmation(
+                executor(operation), operation.fingerprint
+            )
             executed.append(ExecutedAction(
                 operation_fingerprint=operation.fingerprint,
                 action=operation.action,

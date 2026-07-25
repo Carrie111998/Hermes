@@ -225,7 +225,8 @@ def test_structured_executor_confirmation_is_preserved():
         object(),
         delegate=_delegate_from(_base_findings(), calls),
         approval_gate=gate,
-        executor=lambda _operation: {
+        executor=lambda operation: {
+            "operation_fingerprint": operation.fingerprint,
             "status": "completed",
             "evidence": "  service state changed; health check=ok  ",
         },
@@ -235,3 +236,44 @@ def test_structured_executor_confirmation_is_preserved():
     assert run.executed_actions[0].status == "completed"
     assert run.executed_actions[0].evidence == "service state changed; health check=ok"
     assert run.response.result == "Approved operations executed and validated"
+
+
+def test_executor_confirmation_without_operation_fingerprint_fails_closed():
+    calls = []
+    gate = ApprovalGate(requester=lambda _operation: {"approved": True})
+
+    run = orchestrate_request(
+        REQUEST,
+        object(),
+        delegate=_delegate_from(_base_findings(), calls),
+        approval_gate=gate,
+        executor=lambda _operation: {
+            "status": "completed",
+            "evidence": "service state changed; health check=ok",
+        },
+    )
+
+    assert run.executed_actions[0].status == "failed"
+    assert "operation_fingerprint" in run.executed_actions[0].evidence
+    assert run.response.result == "Approved execution failed validation"
+
+
+def test_executor_confirmation_for_different_operation_fails_closed():
+    calls = []
+    gate = ApprovalGate(requester=lambda _operation: {"approved": True})
+
+    run = orchestrate_request(
+        REQUEST,
+        object(),
+        delegate=_delegate_from(_base_findings(), calls),
+        approval_gate=gate,
+        executor=lambda _operation: {
+            "operation_fingerprint": "different-operation",
+            "status": "completed",
+            "evidence": "service state changed; health check=ok",
+        },
+    )
+
+    assert run.executed_actions[0].status == "failed"
+    assert "does not match the approved operation" in run.executed_actions[0].evidence
+    assert run.response.result == "Approved execution failed validation"
