@@ -464,7 +464,43 @@ class TestSendVoiceReply:
         with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
             await runner._send_voice_reply(event, "Hoi Maikel")
 
-        manager.append_speech.assert_awaited_once_with(adapter, 111, "Hoi Maikel")
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=None
+        )
+        local_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_realtime_reply_uses_tts_clean_text_and_drops_stale_generation(
+        self, runner
+    ):
+        from agent.transports.codex_realtime_voice import CodexRealtimeStaleSpeech
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(
+            guild_id=111,
+            guild=None,
+            codex_realtime_voice=True,
+            codex_realtime_generation=7,
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = True
+        manager.append_speech = AsyncMock(side_effect=CodexRealtimeStaleSpeech())
+        runner._codex_realtime_voice = manager
+
+        with patch(
+            "tools.tts_tool._strip_markdown_for_tts", return_value="Hoi Maikel"
+        ), patch("tools.tts_tool.text_to_speech_tool") as local_tts:
+            await runner._send_voice_reply(event, "**Hoi** [Maikel](https://example.com)")
+
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=7
+        )
         local_tts.assert_not_called()
 
     @pytest.mark.asyncio
@@ -488,7 +524,9 @@ class TestSendVoiceReply:
         with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
             await runner._send_voice_reply(event, "Hoi Maikel")
 
-        manager.append_speech.assert_awaited_once_with(adapter, 111, "Hoi Maikel")
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=None
+        )
         local_tts.assert_not_called()
 
     @pytest.mark.asyncio
@@ -998,6 +1036,7 @@ class TestVoiceChannelCommands:
         mock_adapter._voice_pcm_callback = None
 
         manager = MagicMock()
+        manager.prepare_for_voice_channel.return_value = True
         manager.push_discord_pcm.return_value = True
         manager.start_for_voice_channel = AsyncMock(
             return_value=SimpleNamespace(
@@ -1012,6 +1051,9 @@ class TestVoiceChannelCommands:
         runner._handle_voice_channel_input = AsyncMock()
 
         async def _join(_channel):
+            manager.prepare_for_voice_channel.assert_called_once_with(
+                mock_adapter, 111
+            )
             assert callable(mock_adapter._voice_pcm_callback)
             assert mock_adapter._voice_pcm_callback(111, 42, b"pcm") is True
             return True
@@ -1024,11 +1066,21 @@ class TestVoiceChannelCommands:
 
         assert "codex live" in result.lower()
         manager.start_for_voice_channel.assert_awaited_once()
+        manager.cancel_voice_channel_start.assert_called_once_with(mock_adapter, 111)
         kwargs = manager.start_for_voice_channel.await_args.kwargs
         assert kwargs["adapter"] is mock_adapter
         assert kwargs["guild_id"] == 111
         assert kwargs["user_id"] == 42
         assert callable(kwargs["on_transcript"])
+        await kwargs["on_transcript"](42, "realtime transcript", 8)
+        runner._handle_voice_channel_input.assert_any_await(
+            111,
+            42,
+            "realtime transcript",
+            realtime=True,
+            realtime_generation=8,
+            adapter=mock_adapter,
+        )
         assert callable(kwargs["on_runtime_failure"])
         await kwargs["on_runtime_failure"]("temporary failure", True)
         assert runner._voice_mode["discord:123"] == "all"

@@ -10,6 +10,7 @@ from agent.transports.codex_realtime_voice import (
     AiortcRealtimePeer,
     CodexRealtimeCapabilities,
     CodexRealtimeSession,
+    CodexRealtimeStaleSpeech,
     discord_pcm_to_realtime,
     safe_realtime_error,
 )
@@ -132,8 +133,11 @@ async def test_start_uses_experimental_v1_webrtc_contract_and_lists_capabilities
 
 
 @pytest.mark.asyncio
-async def test_transcript_and_remote_pcm_notifications_are_forwarded():
-    transcripts: list[str] = []
+async def test_transcript_and_remote_pcm_notifications_are_forwarded(monkeypatch):
+    import agent.transports.codex_realtime_voice as realtime_module
+
+    monkeypatch.setattr(realtime_module, "SPEECH_AUDIO_IDLE_TIMEOUT", 0.05)
+    transcripts: list[tuple[str, int]] = []
     pcm_out: list[bytes] = []
     client = FakeClient([
         {
@@ -151,7 +155,10 @@ async def test_transcript_and_remote_pcm_notifications_are_forwarded():
         client_factory=lambda **kwargs: client,
         peer_factory=lambda: peer,
         binary_checker=lambda *_args: (True, "0.145.0"),
-        on_user_transcript=transcripts.append,
+        on_user_transcript=lambda text, generation: transcripts.append((
+            text,
+            generation,
+        )),
         on_output_pcm=pcm_out.append,
     )
     await session.start()
@@ -171,25 +178,21 @@ async def test_transcript_and_remote_pcm_notifications_are_forwarded():
         },
     ])
     await asyncio.sleep(0.05)
-    assert transcripts == ["Hallo Nabu"]
+    assert transcripts == [("Hallo Nabu", 1)]
 
     assert peer.on_pcm is not None
     # Unsolicited model audio is suppressed: Hermes remains the agent.
     peer.on_pcm(b"\x01\x02")
     assert pcm_out == []
 
-    await session.append_speech("Hoi Maikel")
+    await session.append_speech("Hoi Maikel", transcript_generation=1)
     assert client.requests[-1] == (
         "thread/realtime/appendSpeech",
         {"threadId": "thread-1", "text": "Hoi Maikel"},
     )
     peer.on_pcm(b"\x01\x02")
     assert pcm_out == [b"\x01\x02"]
-    client.notifications.append({
-        "method": "thread/realtime/transcript/done",
-        "params": {"threadId": "thread-1", "role": "assistant", "text": "Hoi Maikel"},
-    })
-    await asyncio.sleep(0.35)
+    await asyncio.sleep(0.1)
     peer.on_pcm(b"\x03\x04")
     assert pcm_out == [b"\x01\x02"]
 
@@ -203,6 +206,76 @@ async def test_transcript_and_remote_pcm_notifications_are_forwarded():
     await asyncio.sleep(0.05)
     peer.on_pcm(b"\x07\x08")
     assert pcm_out == [b"\x01\x02", b"\x05\x06"]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_user_generation_suppresses_stale_hermes_speech_and_late_completion():
+    transcripts: list[tuple[str, int]] = []
+    pcm_out: list[bytes] = []
+    client = FakeClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v1"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "answer"},
+        },
+    ])
+    peer = FakePeer()
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        client_factory=lambda **kwargs: client,
+        peer_factory=lambda: peer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+        on_user_transcript=lambda text, generation: transcripts.append((
+            text,
+            generation,
+        )),
+        on_output_pcm=pcm_out.append,
+    )
+    await session.start()
+
+    client.notifications.append({
+        "method": "thread/realtime/transcript/done",
+        "params": {"threadId": "thread-1", "role": "user", "text": "A"},
+    })
+    await asyncio.sleep(0.05)
+    generation_a = transcripts[-1][1]
+    client.notifications.extend([
+        {
+            "method": "thread/realtime/transcript/delta",
+            "params": {"threadId": "thread-1", "role": "user", "delta": "B"},
+        },
+        {
+            "method": "thread/realtime/transcript/done",
+            "params": {"threadId": "thread-1", "role": "user", "text": "B"},
+        },
+    ])
+    await asyncio.sleep(0.05)
+    generation_b = transcripts[-1][1]
+
+    with pytest.raises(CodexRealtimeStaleSpeech):
+        await session.append_speech("late answer A", transcript_generation=generation_a)
+    assert not any(
+        method == "thread/realtime/appendSpeech" and params["text"] == "late answer A"
+        for method, params in client.requests
+    )
+
+    await session.append_speech("answer B", transcript_generation=generation_b)
+    client.notifications.append({
+        "method": "thread/realtime/transcript/done",
+        "params": {
+            "threadId": "thread-1",
+            "role": "assistant",
+            "text": "late completion A",
+        },
+    })
+    await asyncio.sleep(0.35)
+    assert peer.on_pcm is not None
+    peer.on_pcm(b"\x01\x02")
+    assert pcm_out == [b"\x01\x02"]
     await session.stop()
 
 

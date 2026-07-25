@@ -28,6 +28,8 @@ MIN_CODEX_REALTIME_VERSION = (0, 145, 0)
 REALTIME_SAMPLE_RATE = 24_000
 REALTIME_CHANNELS = 1
 REALTIME_FRAME_SAMPLES = 480  # 20 ms at 24 kHz
+SPEECH_FIRST_AUDIO_TIMEOUT = 5.0
+SPEECH_AUDIO_IDLE_TIMEOUT = 0.75
 
 _SPEECH_INTERFACE_PROMPT = (
     "You are a low-latency speech interface for another assistant. "
@@ -39,6 +41,10 @@ _SPEECH_INTERFACE_PROMPT = (
 
 class CodexRealtimeUnavailable(RuntimeError):
     """Raised when the optional Codex realtime route cannot be started."""
+
+
+class CodexRealtimeStaleSpeech(RuntimeError):
+    """Raised when a Hermes reply predates the latest user utterance."""
 
 
 def safe_realtime_error(message: Any) -> str:
@@ -316,7 +322,7 @@ class CodexRealtimeSession:
         client_factory: Callable[..., Any] = CodexAppServerClient,
         peer_factory: Callable[[], Any] = AiortcRealtimePeer,
         binary_checker: Callable[..., tuple[bool, str]] = check_codex_binary,
-        on_user_transcript: Optional[Callable[[str], Any]] = None,
+        on_user_transcript: Optional[Callable[[str, int], Any]] = None,
         on_output_pcm: Optional[Callable[[bytes], Any]] = None,
         on_error: Optional[Callable[[str], Any]] = None,
     ) -> None:
@@ -340,6 +346,9 @@ class CodexRealtimeSession:
         # second assistant that can answer independently of Hermes.
         self._speech_gate = False
         self._speech_generation = 0
+        self._speech_started_at: Optional[float] = None
+        self._speech_last_pcm_at: Optional[float] = None
+        self._speech_watchdog_task: Optional[asyncio.Task] = None
         self._peer_failure_reason: Optional[str] = None
         self._failure_notified = False
         self._stop_lock = asyncio.Lock()
@@ -526,20 +535,25 @@ class CodexRealtimeSession:
                     # can trigger independent remote-model audio.
                     self._speech_generation += 1
                     self._speech_gate = False
+                    self._cancel_speech_watchdog()
                     continue
                 if method == "thread/realtime/transcript/done":
                     role = params.get("role")
                     if role == "user":
                         self._speech_generation += 1
                         self._speech_gate = False
+                        self._cancel_speech_watchdog()
                         text = str(params.get("text") or "").strip()
                         if text:
-                            self._emit(self._on_user_transcript, text)
-                    elif role == "assistant":
-                        generation = self._speech_generation
-                        asyncio.create_task(
-                            self._close_speech_gate_after(generation, 0.3)
-                        )
+                            self._emit(
+                                self._on_user_transcript,
+                                text,
+                                self._speech_generation,
+                            )
+                    # Assistant transcript notifications carry no item or
+                    # appendSpeech generation identifier. They therefore cannot
+                    # safely close a newer speech gate; WebRTC audio inactivity
+                    # provides the response boundary instead.
                 elif method == "thread/realtime/outputAudio/delta":
                     # WebRTC audio arrives on the negotiated remote media
                     # track. Ignore defensive sideband copies so one response
@@ -571,6 +585,7 @@ class CodexRealtimeSession:
 
     def _handle_peer_pcm(self, pcm: bytes) -> None:
         if self._speech_gate:
+            self._speech_last_pcm_at = time.monotonic()
             self._emit_output_pcm(pcm)
 
     def _handle_peer_failure(self, reason: str) -> None:
@@ -580,18 +595,44 @@ class CodexRealtimeSession:
             self._fail(f"Codex realtime WebRTC failed: {safe_reason}")
             self._schedule_stop()
 
-    async def _close_speech_gate_after(self, generation: int, delay: float) -> None:
-        # Transcript completion can precede the last WebRTC audio packets.
-        await asyncio.sleep(delay)
-        if generation == self._speech_generation:
-            self._speech_gate = False
+    async def _watch_speech_gate(
+        self, generation: int, maximum_duration: float
+    ) -> None:
+        """Close one speech gate after output ends or never starts."""
+
+        try:
+            while self._speech_gate and generation == self._speech_generation:
+                await asyncio.sleep(0.05)
+                now = time.monotonic()
+                started_at = self._speech_started_at
+                last_pcm_at = self._speech_last_pcm_at
+                if started_at is None:
+                    return
+                if now - started_at >= maximum_duration:
+                    self._speech_gate = False
+                    return
+                if last_pcm_at is None:
+                    if now - started_at >= SPEECH_FIRST_AUDIO_TIMEOUT:
+                        self._speech_gate = False
+                        return
+                elif now - last_pcm_at >= SPEECH_AUDIO_IDLE_TIMEOUT:
+                    self._speech_gate = False
+                    return
+        finally:
+            if self._speech_watchdog_task is asyncio.current_task():
+                self._speech_watchdog_task = None
+
+    def _cancel_speech_watchdog(self) -> None:
+        task, self._speech_watchdog_task = self._speech_watchdog_task, None
+        if task is not None and not task.done():
+            task.cancel()
 
     @staticmethod
-    def _emit(callback: Optional[Callable[[Any], Any]], value: Any) -> None:
+    def _emit(callback: Optional[Callable[..., Any]], *values: Any) -> None:
         if callback is None:
             return
         try:
-            result = callback(value)
+            result = callback(*values)
             if asyncio.iscoroutine(result):
                 asyncio.create_task(result)
         except Exception:
@@ -604,6 +645,9 @@ class CodexRealtimeSession:
         self._active = False
         self._speech_generation += 1
         self._speech_gate = False
+        self._cancel_speech_watchdog()
+        self._speech_started_at = None
+        self._speech_last_pcm_at = None
         self._emit(self._on_error, safe_realtime_error(reason))
 
     def _schedule_stop(self) -> None:
@@ -622,7 +666,12 @@ class CodexRealtimeSession:
             self._schedule_stop()
             return False
 
-    async def append_speech(self, text: str) -> bool:
+    async def append_speech(
+        self,
+        text: str,
+        *,
+        transcript_generation: Optional[int] = None,
+    ) -> bool:
         cleaned = str(text or "").strip()
         if (
             not cleaned
@@ -631,12 +680,24 @@ class CodexRealtimeSession:
             or not self._thread_id
         ):
             return False
+        if (
+            transcript_generation is not None
+            and transcript_generation != self._speech_generation
+        ):
+            raise CodexRealtimeStaleSpeech(
+                "Hermes reply predates the latest realtime user utterance"
+            )
         self._speech_generation += 1
         generation = self._speech_generation
         self._speech_gate = True
-        # Fail closed if a backend revision never emits assistant completion.
+        self._speech_started_at = time.monotonic()
+        self._speech_last_pcm_at = None
+        # Fail closed if WebRTC output never starts or never becomes idle.
         gate_timeout = min(180.0, max(10.0, len(cleaned) / 8.0))
-        asyncio.create_task(self._close_speech_gate_after(generation, gate_timeout))
+        self._cancel_speech_watchdog()
+        self._speech_watchdog_task = asyncio.create_task(
+            self._watch_speech_gate(generation, gate_timeout)
+        )
         try:
             await asyncio.to_thread(
                 self._client.request,
@@ -657,6 +718,12 @@ class CodexRealtimeSession:
             self._active = False
             self._speech_generation += 1
             self._speech_gate = False
+            watchdog = self._speech_watchdog_task
+            self._cancel_speech_watchdog()
+            self._speech_started_at = None
+            self._speech_last_pcm_at = None
+            if watchdog is not None:
+                await asyncio.gather(watchdog, return_exceptions=True)
             task = self._notification_task
             self._notification_task = None
             if task is not None and task is not asyncio.current_task():

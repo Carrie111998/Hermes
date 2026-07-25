@@ -139,13 +139,27 @@ class CodexRealtimeVoiceManager:
         """Return the durable fallback policy even after a session is removed."""
         return CodexRealtimeVoiceConfig.from_adapter(adapter).fallback_to_classic
 
+    def prepare_for_voice_channel(self, adapter: Any, guild_id: int) -> bool:
+        """Reserve PCM before Discord starts its receiver during an opted-in join."""
+
+        config = CodexRealtimeVoiceConfig.from_adapter(adapter)
+        if self._closed or not config.enabled:
+            return False
+        self._starting.add(self._key(adapter, guild_id))
+        return True
+
+    def cancel_voice_channel_start(self, adapter: Any, guild_id: int) -> None:
+        """Release a pre-join PCM reservation after startup or join failure."""
+
+        self._starting.discard(self._key(adapter, guild_id))
+
     async def start_for_voice_channel(
         self,
         *,
         adapter: Any,
         guild_id: int,
         user_id: int,
-        on_transcript: Callable[[int, str], Any],
+        on_transcript: Callable[[int, str, int], Any],
         on_runtime_failure: Optional[Callable[[str, bool], Any]] = None,
     ) -> CodexRealtimeStartResult:
         config = CodexRealtimeVoiceConfig.from_adapter(adapter)
@@ -190,8 +204,8 @@ class CodexRealtimeVoiceManager:
                 if not output_ready:
                     raise RuntimeError("Discord voice mixer is unavailable")
 
-                def _on_transcript(text: str) -> Any:
-                    return on_transcript(bound_user_id, text)
+                def _on_transcript(text: str, generation: int) -> Any:
+                    return on_transcript(bound_user_id, text, generation)
 
                 def _on_output_pcm(pcm: bytes) -> Any:
                     return adapter.push_realtime_voice_pcm(guild_id, pcm)
@@ -287,25 +301,41 @@ class CodexRealtimeVoiceManager:
         if key in self._starting:
             return True
         managed = self._sessions.get(key)
-        if managed is None or not getattr(managed.session, "active", False):
-            return False
+        if managed is None:
+            config = CodexRealtimeVoiceConfig.from_adapter(adapter)
+            # With fallback explicitly disabled, PCM stays consumed for the
+            # entire failure-to-disconnect window, including after provider
+            # cleanup has removed the managed session.
+            return config.enabled and not config.fallback_to_classic
+        if not getattr(managed.session, "active", False):
+            # A no-fallback route remains fail-closed while transport cleanup
+            # runs and before Discord is disconnected.
+            return not managed.fallback_to_classic
         if managed.user_id != int(user_id):
             # An active realtime route is intentionally single-user. Consume
             # other speakers' PCM instead of leaking it into the classic STT
             # fallback and creating a second, ambiguous conversation path.
             return True
-        return bool(managed.session.push_discord_pcm(pcm))
+        consumed = bool(managed.session.push_discord_pcm(pcm))
+        return consumed or not managed.fallback_to_classic
 
     async def append_speech(
         self,
         adapter: Any,
         guild_id: int,
         text: str,
+        *,
+        transcript_generation: Optional[int] = None,
     ) -> bool:
         managed = self._sessions.get(self._key(adapter, guild_id))
         if managed is None:
             return False
-        return bool(await managed.session.append_speech(text))
+        return bool(
+            await managed.session.append_speech(
+                text,
+                transcript_generation=transcript_generation,
+            )
+        )
 
     async def stop_for_voice_channel(self, adapter: Any, guild_id: int) -> None:
         key = self._key(adapter, guild_id)
@@ -360,22 +390,25 @@ class CodexRealtimeVoiceManager:
                 logger.debug("Codex realtime failure callback failed", exc_info=True)
 
     async def _stop_locked(self, key: tuple[int, int], adapter: Any) -> None:
-        managed = self._sessions.pop(key, None)
+        managed = self._sessions.get(key)
         if managed is not None:
             try:
                 await managed.session.stop()
             finally:
+                if self._sessions.get(key) is managed:
+                    self._sessions.pop(key, None)
                 self._end_output(adapter, key[1])
 
     async def close(self) -> None:
         self._closed = True
         for key, managed in list(self._sessions.items()):
-            self._sessions.pop(key, None)
             try:
                 await managed.session.stop()
             except Exception:
                 logger.debug("Codex realtime shutdown failed", exc_info=True)
             finally:
+                if self._sessions.get(key) is managed:
+                    self._sessions.pop(key, None)
                 self._end_output(managed.adapter, key[1])
         if self._cleanup_tasks:
             await asyncio.gather(*list(self._cleanup_tasks), return_exceptions=True)

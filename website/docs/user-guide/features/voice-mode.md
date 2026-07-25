@@ -410,6 +410,7 @@ Capability boundaries are explicit:
 - WebRTC realtime protocol `v1`
 - supported voice names are discovered at startup
 - Codex app-server thread state is ephemeral for each voice session
+- decoded Discord audio and Hermes' synthesized reply text are sent to Codex/OpenAI for the session, so only enable the route where that external processing is appropriate
 - while the route is active, audio from users other than the configured `user_id` is ignored
 - realtime reasoning effort is not configurable
 - language/locale selection is not exposed

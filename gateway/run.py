@@ -15591,9 +15591,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
 
+        realtime_manager.prepare_for_voice_channel(adapter, guild_id)
         try:
             success = await adapter.join_voice_channel(voice_channel)
         except Exception as e:
+            realtime_manager.cancel_voice_channel_start(adapter, guild_id)
             logger.warning("Failed to join voice channel: %s", e)
             adapter._voice_input_callback = None
             if hasattr(adapter, "_voice_pcm_callback"):
@@ -15618,29 +15620,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 realtime_user_id = int(event.source.user_id or "0")
             except (TypeError, ValueError):
                 realtime_user_id = 0
-            realtime_result = await realtime_manager.start_for_voice_channel(
-                adapter=adapter,
-                guild_id=guild_id,
-                user_id=realtime_user_id,
-                on_transcript=lambda transcript_user_id, text: (
-                    self._handle_voice_channel_input(
-                        guild_id,
-                        transcript_user_id,
-                        text,
-                        realtime=True,
-                        adapter=adapter,
-                    )
-                ),
-                on_runtime_failure=lambda reason, fallback_to_classic: (
-                    self._handle_codex_realtime_runtime_failure(
-                        adapter,
-                        guild_id,
-                        event.source,
-                        reason,
-                        fallback_to_classic,
-                    )
-                ),
-            )
+            try:
+                realtime_result = await realtime_manager.start_for_voice_channel(
+                    adapter=adapter,
+                    guild_id=guild_id,
+                    user_id=realtime_user_id,
+                    on_transcript=lambda transcript_user_id, text, generation: (
+                        self._handle_voice_channel_input(
+                            guild_id,
+                            transcript_user_id,
+                            text,
+                            realtime=True,
+                            realtime_generation=generation,
+                            adapter=adapter,
+                        )
+                    ),
+                    on_runtime_failure=lambda reason, fallback_to_classic: (
+                        self._handle_codex_realtime_runtime_failure(
+                            adapter,
+                            guild_id,
+                            event.source,
+                            reason,
+                            fallback_to_classic,
+                        )
+                    ),
+                )
+            finally:
+                realtime_manager.cancel_voice_channel_start(adapter, guild_id)
             if realtime_result.enabled and not realtime_result.active:
                 realtime_reason = str(
                     realtime_result.reason or "Codex realtime startup failed"
@@ -15671,6 +15677,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"{realtime_line}"
             )
         # Join failed — clear callbacks
+        realtime_manager.cancel_voice_channel_start(adapter, guild_id)
         adapter._voice_input_callback = None
         if hasattr(adapter, "_voice_pcm_callback"):
             setattr(adapter, "_voice_pcm_callback", None)
@@ -15795,6 +15802,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         transcript: str,
         *,
         realtime: bool = False,
+        realtime_generation: Optional[int] = None,
         adapter=None,
     ):
         """Handle transcribed voice from a user in a voice channel.
@@ -15863,6 +15871,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 guild_id=guild_id,
                 guild=None,
                 codex_realtime_voice=realtime,
+                codex_realtime_generation=realtime_generation,
             ),
         )
 
@@ -15955,14 +15964,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 linked_voice_session
                 and realtime_manager.is_active(adapter, guild_id)
             ):
+                from agent.transports.codex_realtime_voice import (
+                    CodexRealtimeStaleSpeech,
+                )
+
                 fallback_to_classic = realtime_manager.classic_fallback_enabled(
                     adapter, guild_id
                 )
                 try:
+                    from tools.tts_tool import _strip_markdown_for_tts
+
+                    speech_text = _strip_markdown_for_tts(text[:4000])
+                    if not speech_text:
+                        return
                     if await realtime_manager.append_speech(
-                        adapter, guild_id, text[:4000]
+                        adapter,
+                        guild_id,
+                        speech_text,
+                        transcript_generation=getattr(
+                            event.raw_message,
+                            "codex_realtime_generation",
+                            None,
+                        ),
                     ):
                         return
+                except CodexRealtimeStaleSpeech:
+                    logger.debug(
+                        "Suppressing stale Codex realtime voice reply after barge-in"
+                    )
+                    return
                 except Exception:
                     logger.warning(
                         "Codex realtime speech failed (%s)",

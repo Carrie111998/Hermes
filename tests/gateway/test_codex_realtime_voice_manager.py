@@ -29,7 +29,7 @@ class FakeSession:
         self.kwargs = kwargs
         self.active = False
         self.pcm: list[bytes] = []
-        self.spoken: list[str] = []
+        self.spoken: list[tuple[str, int | None]] = []
         self.stopped = False
 
     async def start(self, *, voice=None):
@@ -43,10 +43,12 @@ class FakeSession:
         self.pcm.append(pcm)
         return True
 
-    async def append_speech(self, text: str) -> bool:
+    async def append_speech(
+        self, text: str, *, transcript_generation: int | None = None
+    ) -> bool:
         if not self.active:
             return False
-        self.spoken.append(text)
+        self.spoken.append((text, transcript_generation))
         return True
 
     async def stop(self):
@@ -134,8 +136,10 @@ async def test_enabled_route_requires_the_configured_single_user():
     session = manager.session_for(adapter, 7)
     assert session.pcm == [b"yes"]
 
-    assert await manager.append_speech(adapter, 7, "Hoi") is True
-    assert session.spoken == ["Hoi"]
+    assert (
+        await manager.append_speech(adapter, 7, "Hoi", transcript_generation=9) is True
+    )
+    assert session.spoken == [("Hoi", 9)]
 
     await manager.stop_for_voice_channel(adapter, 7)
     assert session.stopped is True
@@ -152,21 +156,25 @@ async def test_transcript_is_stamped_with_bound_user_and_output_reaches_adapter(
         dependency_ensurer=lambda: None,
     )
     adapter = FakeAdapter({"enabled": True, "user_id": 42})
-    transcripts: list[tuple[int, str]] = []
+    transcripts: list[tuple[int, str, int]] = []
 
     result = await manager.start_for_voice_channel(
         adapter=adapter,
         guild_id=7,
         user_id=42,
-        on_transcript=lambda user_id, text: transcripts.append((user_id, text)),
+        on_transcript=lambda user_id, text, generation: transcripts.append((
+            user_id,
+            text,
+            generation,
+        )),
     )
     assert result.active is True
     session = sessions[0]
 
-    session.kwargs["on_user_transcript"]("wat is de status")
+    session.kwargs["on_user_transcript"]("wat is de status", 12)
     session.kwargs["on_output_pcm"](b"pcm")
 
-    assert transcripts == [(42, "wat is de status")]
+    assert transcripts == [(42, "wat is de status", 12)]
     assert adapter.output_pcm == [(7, b"pcm")]
 
 
@@ -310,6 +318,64 @@ async def test_pcm_is_consumed_during_startup_to_avoid_parallel_classic_buffer()
     release.set()
     result = await startup
     assert result.active is True
+
+
+def test_pcm_is_reserved_before_discord_join_starts():
+    manager = CodexRealtimeVoiceManager(
+        session_factory=FakeSession,
+        dependency_ensurer=lambda: None,
+    )
+    adapter = FakeAdapter({"enabled": True, "user_id": 42})
+
+    assert manager.prepare_for_voice_channel(adapter, 7) is True
+    assert manager.push_discord_pcm(adapter, 7, 42, b"early") is True
+    manager.cancel_voice_channel_start(adapter, 7)
+    assert manager.push_discord_pcm(adapter, 7, 42, b"classic") is False
+
+
+@pytest.mark.asyncio
+async def test_no_fallback_failure_consumes_pcm_until_slow_cleanup_finishes():
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class SlowStopSession(FakeSession):
+        async def stop(self):
+            self.active = False
+            stop_entered.set()
+            await release_stop.wait()
+            self.stopped = True
+
+    sessions: list[SlowStopSession] = []
+    manager = CodexRealtimeVoiceManager(
+        session_factory=lambda **kwargs: (
+            sessions.append(SlowStopSession(**kwargs)) or sessions[-1]
+        ),
+        dependency_ensurer=lambda: None,
+    )
+    adapter = FakeAdapter({
+        "enabled": True,
+        "user_id": 42,
+        "fallback_to_classic": False,
+    })
+    result = await manager.start_for_voice_channel(
+        adapter=adapter,
+        guild_id=7,
+        user_id=42,
+        on_transcript=lambda *_: None,
+    )
+    assert result.active is True
+
+    sessions[0].push_discord_pcm = lambda _pcm: False
+    assert manager.push_discord_pcm(adapter, 7, 42, b"input-failure") is True
+    sessions[0].active = False
+    sessions[0].kwargs["on_error"]("WebRTC failed")
+    await stop_entered.wait()
+    assert manager.push_discord_pcm(adapter, 7, 42, b"during-cleanup") is True
+
+    release_stop.set()
+    await asyncio.sleep(0.05)
+    assert manager.session_for(adapter, 7) is None
+    assert manager.push_discord_pcm(adapter, 7, 42, b"before-disconnect") is True
 
 
 @pytest.mark.asyncio

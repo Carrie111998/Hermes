@@ -411,6 +411,7 @@ Requirements and limits:
 - account entitlement to Codex realtime voice; availability is checked when `/voice join` starts
 - WebRTC protocol `v1`; supported voices are queried from Codex at runtime
 - each voice session uses an ephemeral Codex app-server thread rather than a persisted Codex conversation
+- decoded Discord audio and Hermes' synthesized reply text are sent to Codex/OpenAI for the duration of the session; do not enable this route in channels where that external processing is inappropriate
 - while realtime is active, PCM from other VC users is ignored rather than routed through a parallel classic-STT path
 - no realtime reasoning-effort control, language selector, or guaranteed language-auto-detection contract
 - no extra OpenAI API key is required for the WebRTC route when the Codex account is entitled
