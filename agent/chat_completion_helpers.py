@@ -1738,20 +1738,28 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             from hermes_cli.config import load_config_readonly
 
             resolved_route = dict(fb)
-            resolved_pool = load_pool(fb_provider)
-            resolved_entry = (
-                resolved_pool.current()
-                or resolved_pool.peek()
-                or resolved_pool.select()
-            )
-            if resolved_entry is not None:
-                resolved_route["auth_type"] = resolved_entry.auth_type
-                resolved_route["source"] = resolved_entry.source
-            runtime_decision = SubscriptionRoutePolicy(load_config_readonly()).evaluate(
-                resolved_route,
-                role=RouteRole.BUILDER,
-                capability=Capability.WRITE,
-            )
+            runtime_policy = SubscriptionRoutePolicy(load_config_readonly())
+            if not runtime_policy.enabled:
+                runtime_decision = runtime_policy.evaluate(
+                    resolved_route,
+                    role=RouteRole.BUILDER,
+                    capability=Capability.WRITE,
+                )
+            else:
+                resolved_pool = load_pool(fb_provider)
+                resolved_entry = (
+                    resolved_pool.current()
+                    or resolved_pool.peek()
+                    or resolved_pool.select()
+                )
+                if resolved_entry is not None:
+                    resolved_route["auth_type"] = resolved_entry.auth_type
+                    resolved_route["source"] = resolved_entry.source
+                runtime_decision = runtime_policy.evaluate(
+                    resolved_route,
+                    role=RouteRole.BUILDER,
+                    capability=Capability.WRITE,
+                )
             if (
                 not runtime_decision.allowed
                 or runtime_decision.reason == "runtime_subscription_check_required"
