@@ -543,6 +543,30 @@ class TestSessionLifecycle:
                                model="xiaomi/mimo-v2.5-pro")
         assert db.get_session("s1")["model"] == "xiaomi/mimo-v2.5"
 
+    def test_update_session_model_clears_browser_lock_and_preserves_lineage(self, db):
+        """A later /model switch must replace, not compete with, a Browser lock."""
+        db.create_session(
+            session_id="s1",
+            source="hermes_browser",
+            model="x-ai/grok-4.5",
+            model_config={
+                "_branched_from": "parent-session",
+                "browser_model_lock": {
+                    "provider": "nous",
+                    "model": "x-ai/grok-4.5",
+                    "confirmed": True,
+                },
+            },
+        )
+
+        db.update_session_model("s1", "anthropic/claude-opus-4.8")
+
+        session = db.get_session("s1")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "anthropic/claude-opus-4.8"
+        assert "browser_model_lock" not in model_config
+        assert model_config["_branched_from"] == "parent-session"
+
     def test_update_session_billing_route_overwrites_after_switch(self, db):
         """A mid-session provider switch must overwrite the billing route.
 
@@ -4669,13 +4693,13 @@ class TestListSessionsRich:
         """
         t0 = 1709500000.0
         db.create_session("root1", "cli")
+        db.append_message("root1", "user", "old ask")
         with db._lock:
             db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
             db._conn.execute(
                 "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
                 (t0 + 100, "compression", "root1"),
             )
-        db.append_message("root1", "user", "old ask")
 
         # Continuation tip created after root ended; last activity much later.
         db.create_session("tip1", "cli", parent_session_id="root1")
