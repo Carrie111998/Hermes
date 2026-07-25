@@ -5616,12 +5616,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         changed = False
 
         try:
+            from agent.anthropic_adapter import _is_bedrock_mantle_endpoint
             from hermes_cli.model_normalize import (
                 _AGGREGATOR_PROVIDERS,
                 normalize_model_for_provider,
             )
 
-            if resolved_provider not in _AGGREGATOR_PROVIDERS:
+            is_mantle_anthropic = (
+                resolved_provider == "anthropic"
+                and _is_bedrock_mantle_endpoint(self.base_url)
+            )
+            if (
+                resolved_provider not in _AGGREGATOR_PROVIDERS
+                and not is_mantle_anthropic
+            ):
                 normalized_model = normalize_model_for_provider(current_model, resolved_provider)
                 if normalized_model and normalized_model != current_model:
                     if not self._model_is_default:

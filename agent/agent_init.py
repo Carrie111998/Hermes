@@ -674,12 +674,17 @@ def init_agent(
         pass  # Non-fatal — transport may not exist for all modes yet
 
     try:
+        from agent.anthropic_adapter import _is_bedrock_mantle_endpoint
         from hermes_cli.model_normalize import (
             _AGGREGATOR_PROVIDERS,
             normalize_model_for_provider,
         )
 
-        if agent.provider not in _AGGREGATOR_PROVIDERS:
+        is_mantle_anthropic = (
+            agent.provider == "anthropic"
+            and _is_bedrock_mantle_endpoint(agent.base_url)
+        )
+        if agent.provider not in _AGGREGATOR_PROVIDERS and not is_mantle_anthropic:
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
     except Exception:
         pass
@@ -1007,7 +1012,9 @@ def init_agent(
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
             # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
             _is_native_anthropic = agent.provider == "anthropic"
-            effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
+            effective_key = (
+                api_key or resolve_anthropic_token(base_url) or ""
+            ) if _is_native_anthropic else (api_key or "")
 
             # MiniMax OAuth issues short-lived (~15-min) access tokens. The
             # Anthropic SDK caches ``api_key`` as a static string at client

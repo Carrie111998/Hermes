@@ -4890,7 +4890,7 @@ class AIAgent:
         try:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
 
-            new_token = resolve_anthropic_token()
+            new_token = resolve_anthropic_token(_base)
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
