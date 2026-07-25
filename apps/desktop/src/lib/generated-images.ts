@@ -67,32 +67,43 @@ export function generatedImageFromResult(result: unknown): string[] {
 
   // Batch result: use the ``images`` array when present.
   const images = record['images']
+
   if (Array.isArray(images) && images.length > 0) {
     const paths: string[] = []
+
     for (const item of images) {
       if (item && typeof item === 'object') {
         const imgPaths = stringFields(item as Record<string, unknown>, DISPLAY_KEYS)
         paths.push(...imgPaths)
       }
     }
-    if (paths.length > 0) return paths
+
+    if (paths.length > 0) {
+      return paths
+    }
   }
 
   // Single-image fallback.
   const single = stringFields(record, DISPLAY_KEYS)[0]
+
   return single ? [single] : []
 }
 
 /** Every path/URL a generated image might appear as in prose, for de-duping. */
 export function generatedImageEchoSources(parts: readonly ToolLike[]): string[] {
   const sources: string[] = []
+
   for (const part of parts) {
     const record = imageResult(part)
-    if (!record) continue
+
+    if (!record) {
+      continue
+    }
     // Single image.
     sources.push(...stringFields(record, ECHO_KEYS))
     // Batch images array.
     const images = record['images']
+
     if (Array.isArray(images)) {
       for (const item of images) {
         if (item && typeof item === 'object') {
@@ -101,6 +112,7 @@ export function generatedImageEchoSources(parts: readonly ToolLike[]): string[] 
       }
     }
   }
+
   return unique(sources)
 }
 

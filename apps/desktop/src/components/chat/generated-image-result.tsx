@@ -59,7 +59,7 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
   return (
     <div className="flex flex-wrap gap-2">
       {images.map((src, i) => (
-        <SingleImage key={i} aspectRatio={aspectRatio} src={src} />
+        <SingleImage aspectRatio={aspectRatio} key={i} src={src} />
       ))}
     </div>
   )
