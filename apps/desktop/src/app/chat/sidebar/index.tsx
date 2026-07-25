@@ -27,7 +27,17 @@ import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/he
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
-import { sessionMatchesSearch } from '@/lib/session-search'
+import {
+  SEARCH_FIELD_LABEL_EN,
+  SEARCH_FIELD_LABEL_ZH,
+  stripHighlightMarkers,
+  type SearchField as SearchMatchField
+} from '@/lib/search-match'
+import { rankSession, sessionMatchesSearch } from '@/lib/session-search'
+import {
+  SessionSearchMetaContext,
+  type SessionSearchMeta
+} from './search-meta-context'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
 import { $cronJobs } from '@/store/cron'
@@ -255,9 +265,11 @@ const HEADER_NAV_BTN =
 
 // FTS results cover sessions that aren't in the loaded page; synthesize a
 // minimal SessionInfo so they render in the same row component (resume works
-// by id; the snippet stands in for the preview).
+// by id; the snippet stands in for the preview when title is missing).
 function searchResultToSession(result: SessionSearchResult): SessionInfo {
   const ts = result.session_started ?? Date.now() / 1000
+  const marked = result.snippet?.trim() || ''
+  const cleanPreview = marked ? stripHighlightMarkers(marked) : null
 
   return {
     archived: false,
@@ -271,11 +283,31 @@ function searchResultToSession(result: SessionSearchResult): SessionInfo {
     message_count: 0,
     model: result.model ?? null,
     output_tokens: 0,
-    preview: result.snippet?.trim() || null,
+    preview: cleanPreview,
     source: result.source ?? null,
     started_at: ts,
-    title: null,
+    title: result.title?.trim() || null,
     tool_call_count: 0
+  }
+}
+
+function matchFieldLabel(field: SearchMatchField, locale: string): string {
+  return (locale.startsWith('zh') ? SEARCH_FIELD_LABEL_ZH : SEARCH_FIELD_LABEL_EN)[field]
+}
+
+function matchedOnToField(matchedOn: SessionSearchResult['matched_on'] | undefined): SearchMatchField {
+  switch (matchedOn) {
+    case 'id':
+      return 'id'
+    case 'title':
+      return 'title'
+    case 'preview':
+      return 'preview'
+    case 'meta':
+      return 'title'
+    case 'message':
+    default:
+      return 'body'
   }
 }
 
@@ -309,7 +341,7 @@ export function ChatSidebar({
   onManageCronJob,
   onTriggerCronJob
 }: ChatSidebarProps) {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const s = t.sidebar
   const { pathname } = useLocation()
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
@@ -632,30 +664,78 @@ export function ChatSidebar({
     }
   }, [trimmedQuery])
 
-  const searchResults = useMemo(() => {
+  const searchBundle = useMemo(() => {
+    const empty = { sessions: [] as SessionInfo[], meta: new Map<string, SessionSearchMeta>() }
+
     if (!trimmedQuery) {
-      return []
+      return empty
     }
 
     const out = new Map<string, SessionInfo>()
+    const meta = new Map<string, SessionSearchMeta>()
 
     for (const s of sortedSessions) {
-      if (sessionMatchesSearch(s, trimmedQuery)) {
-        out.set(s.id, s)
+      const ranked = rankSession(s, trimmedQuery, { fuzzy: true, itemCount: sortedSessions.length })
+
+      if (!ranked) {
+        continue
+      }
+
+      out.set(s.id, s)
+      const best = ranked.matches[0]
+
+      if (best) {
+        meta.set(s.id, {
+          field: best.field,
+          fieldLabel: matchFieldLabel(best.field, locale),
+          titleRanges: best.field === 'title' ? best.ranges : undefined,
+          tooltip: best.value
+        })
       }
     }
 
     for (const match of serverMatches) {
+      const field = matchedOnToField(match.matched_on)
+      const fieldLabel = matchFieldLabel(field, locale)
+
       if (out.has(match.session_id)) {
+        // Keep local meta; upgrade tooltip when server has a body snippet.
+        if (match.matched_on === 'message' && match.snippet) {
+          const prev = meta.get(match.session_id)
+          meta.set(match.session_id, {
+            field: 'body',
+            fieldLabel: matchFieldLabel('body', locale),
+            titleRanges: prev?.titleRanges,
+            markedSnippet: match.snippet,
+            tooltip: match.snippet
+          })
+        }
+
         continue
       }
 
       const loaded = sessionByAnyId.get(match.session_id)
-      out.set(match.session_id, loaded ?? searchResultToSession(match))
+      const session = loaded
+        ? {
+            ...loaded,
+            title: loaded.title ?? match.title ?? null,
+            preview: loaded.preview ?? (match.snippet ? stripHighlightMarkers(match.snippet) : null)
+          }
+        : searchResultToSession(match)
+      out.set(match.session_id, session)
+      meta.set(match.session_id, {
+        field,
+        fieldLabel,
+        markedSnippet: field === 'body' ? match.snippet : undefined,
+        tooltip: match.snippet || match.title || undefined
+      })
     }
 
-    return [...out.values()]
-  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
+    return { sessions: [...out.values()], meta }
+  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId, locale])
+
+  const searchResults = searchBundle.sessions
+  const searchMetaMap = searchBundle.meta
 
   const unpinnedAgentSessions = useMemo(
     () => sortedSessions.filter(s => !isPinnedSession(s)),
@@ -1565,32 +1645,35 @@ export function ChatSidebar({
             data-sessions-project={inProject ? (enteredProjectId ?? undefined) : undefined}
           >
             {trimmedQuery && (
-              <SidebarSessionsSection
-                activeSessionId={activeSidebarSessionId}
-                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
-                emptyState={
-                  searchPending ? (
-                    <SidebarSessionSkeletons />
-                  ) : (
-                    <div className="wrap-anywhere grid min-h-24 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
-                      {s.noMatch(trimmedQuery)}
-                    </div>
-                  )
-                }
-                label={s.results}
-                onArchiveSession={onArchiveSession}
-                onBranchSession={onBranchSession}
-                onDeleteSession={onDeleteSession}
-                onResumeSession={onResumeSession}
-                onToggle={() => undefined}
-                onTogglePin={pinSession}
-                onToggleUnread={toggleUnread}
-                open
-                pinned={false}
-                rootClassName="min-h-32 flex-1 overflow-hidden p-0"
-                sessions={searchResults}
-                showProfileTags={showAllProfiles}
-              />
+              <SessionSearchMetaContext.Provider value={searchMetaMap}>
+                <SidebarSessionsSection
+                  activeSessionId={activeSidebarSessionId}
+                  contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
+                  emptyState={
+                    searchPending ? (
+                      <SidebarSessionSkeletons />
+                    ) : (
+                      <div className="wrap-anywhere grid min-h-24 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
+                        {s.noMatch(trimmedQuery)}
+                      </div>
+                    )
+                  }
+                  label={s.results}
+                  labelMeta={String(searchResults.length)}
+                  onArchiveSession={onArchiveSession}
+                  onBranchSession={onBranchSession}
+                  onDeleteSession={onDeleteSession}
+                  onResumeSession={onResumeSession}
+                  onToggle={() => undefined}
+                  onTogglePin={pinSession}
+                  onToggleUnread={toggleUnread}
+                  open
+                  pinned={false}
+                  rootClassName="min-h-32 flex-1 overflow-hidden p-0"
+                  sessions={searchResults}
+                  showProfileTags={showAllProfiles}
+                />
+              </SessionSearchMetaContext.Provider>
             )}
 
             {!trimmedQuery && (
