@@ -5350,17 +5350,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
     def _spinner_widget_height(self, width: Optional[int] = None) -> int:
-        """Return the visible height for the spinner/status text line above the status bar."""
-        spinner_line = self._render_spinner_text()
-        if not spinner_line:
-            return 0
+        """Return the visible height for the spinner/status text line above the status bar.
+
+        The height is RESERVED at 1 (when not in minimal-chrome mode) even when
+        there is no spinner text yet.  This keeps the bottom-chrome canvas a
+        constant height between idle and active states.  If the height were to
+        grow from 0 (idle) to 1 (turn started, "_spinner_text" set) the new
+        canvas would be taller than the previous one, and in prompt_toolkit's
+        non-fullscreen renderer that forces a vertical scroll ("reserve
+        vertical space") which pushes the prior chrome copy up into scrollback
+        and stacks repeated status frames mid-turn (#70031, reproduced on
+        Windows PowerShell).  Reserving the line eliminates the height change,
+        so prompt_toolkit redraws the chrome in place instead of scrolling.
+        The actual spinner glyph is still only painted when text is present;
+        the blank reserved row simply holds the layout slot open.  The
+        refresh_interval=0.0 change and the _patched_output_screen_diff hack
+        are belt-and-suspenders, but this constant-height reserve is the
+        platform-independent root-cause fix.
+        """
         if self._use_minimal_tui_chrome(width=width):
+            # Minimal chrome drops the spinner line entirely to save rows.
             return 0
-        width = width or self._get_tui_terminal_width()
-        if width and width > 10:
-            import math
-            text_width = self._status_bar_display_width(spinner_line)
-            return max(1, math.ceil(text_width / width))
+        # Reserve the slot even when empty so the canvas height never changes
+        # between idle and active (see docstring / #70031).
         return 1
 
     def _render_spinner_text(self) -> str:
@@ -15425,7 +15437,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         spinner_widget = Window(
             content=FormattedTextControl(get_spinner_text),
             height=get_spinner_height,
-            wrap_lines=True,
+            # Mirror the status bar's wrap_lines=False: the spinner line is a
+            # reserved single row (_spinner_widget_height is always 1 in
+            # non-minimal-chrome mode), so wide text must not wrap onto a
+            # second row — that would defeat the constant-height invariant that
+            # prevents the mid-turn chrome stack (#70031). Long spinner text is
+            # clipped to one row instead.
+            wrap_lines=False,
         )
 
         # Petdex mascot — right-aligned half-block sprite above the prompt,
