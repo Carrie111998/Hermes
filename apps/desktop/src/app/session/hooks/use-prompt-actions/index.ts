@@ -637,7 +637,10 @@ export function usePromptActions({
   const redirectPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
       const text = sanitizeComposerInput(rawText).trim()
-      const sessionId = activeSessionId || activeSessionIdRef.current
+      // Ref, not the closure-captured prop — see cancelRun above. A redirect
+      // reaches the live model mid-turn, so a stale target delivers the user's
+      // correction into a conversation they are no longer looking at.
+      const sessionId = activeSessionIdRef.current
 
       if (!text || !sessionId) {
         return false
@@ -729,18 +732,13 @@ export function usePromptActions({
 
       return false
     },
-    [
-      activeSessionId,
-      activeSessionIdRef,
-      appendSessionTextMessage,
-      requestGateway,
-      selectedStoredSessionIdRef,
-      updateSessionState
-    ]
+    [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
   )
 
   const reloadFromMessage = useCallback(
     async (parentId: string | null) => {
+      // Ref, not the closure-captured prop — a truncating resubmit aimed at a
+      // stale session deletes the wrong transcript.
       const sessionId = activeSessionIdRef.current
 
       if (!sessionId || $busy.get()) {
@@ -795,7 +793,9 @@ export function usePromptActions({
 
   const restoreToMessage = useCallback(
     async (messageId: string, target?: RestoreMessageTarget) => {
-      const sessionId = activeSessionId || activeSessionIdRef.current
+      // Ref, not the closure-captured prop — a rewind is destructive, so a
+      // stale target truncates a conversation the user did not ask to rewind.
+      const sessionId = activeSessionIdRef.current
 
       if (!sessionId) {
         throw new Error('No active session to restore.')
@@ -836,12 +836,14 @@ export function usePromptActions({
         throw err
       }
     },
-    [activeSessionId, activeSessionIdRef, busyRef, submitRewindPrompt, updateSessionState]
+    [activeSessionIdRef, busyRef, submitRewindPrompt, updateSessionState]
   )
 
   const editMessage = useCallback(
     async (edited: AppendMessage) => {
-      const sessionId = activeSessionId || activeSessionIdRef.current
+      // Ref, not the closure-captured prop — an edit rewinds and resubmits, so
+      // a stale target rewrites the wrong session's history.
+      const sessionId = activeSessionIdRef.current
       const messages = $messages.get()
       const plan = sessionId ? planEdit(messages, edited) : null
 
@@ -892,7 +894,7 @@ export function usePromptActions({
         notifyError(surfaced, copy.editFailed)
       }
     },
-    [activeSessionId, activeSessionIdRef, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
+    [activeSessionIdRef, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
   )
 
   const handleThreadMessagesChange = useCallback(
