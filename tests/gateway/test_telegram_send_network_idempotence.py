@@ -10,17 +10,31 @@ accepted the message. The old code fell through to a blind in-loop resend (up to
 gateway's ``_send_with_retry`` re-sent it up to 2 more times — duplicating the
 message in the chat.
 
+``retryable=False`` alone cannot stop the gateway, because
+``BasePlatformAdapter._send_with_retry`` computes
+``is_network = result.retryable or self._is_retryable_error(error_str)`` and
+``_RETRYABLE_ERROR_PATTERNS`` contains both ``"network"`` and
+``"connectionreset"`` — the OR discards the adapter's answer. The adapter
+therefore also sets the explicit ``SendResult.ambiguous_delivery`` flag, which
+the base layer honors unconditionally (before ``is_network`` is computed, and
+again inside the retry loop).
+
 These tests pin the idempotence contract:
 
 * a post-write ``NetworkError`` is NOT retried in-loop and surfaces as
-  ``retryable=False`` (so neither the adapter loop nor the gateway re-sends);
+  ``retryable=False`` **and** ``ambiguous_delivery=True`` (so neither the
+  adapter loop nor the gateway re-sends);
+* the same holds for the Bot API 10.1 ``sendRichMessage`` path;
 * a *connect-phase* failure (ConnectError / connection refused / DNS) is still
   retried and stays retryable — the request demonstrably never left the
   process, so re-sending cannot duplicate;
-* an httpx pool timeout still drains the pool and retries (unchanged).
+* an httpx pool timeout still drains the pool and retries (unchanged);
+* end-to-end through ``_send_with_retry``, an ambiguous failure produces
+  exactly ONE underlying send.
 
-The first case fails on ``main`` (3 in-loop sends + ``retryable=True``) and
-passes after the fix.
+The first case fails on ``main`` (3 in-loop sends + ``retryable=True`` + 2 more
+gateway sends) and passes after the fix.  The base-layer unit coverage for the
+flag itself lives in ``tests/gateway/test_send_retry.py``.
 """
 import sys
 import types
@@ -133,6 +147,10 @@ async def test_post_write_network_error_not_resent(exc):
     assert adapter._bot.send_message.await_count == 1
     # Non-retryable → gateway _send_with_retry() will not re-send it.
     assert result.retryable is False
+    # ...and `retryable=False` alone is not enough: _is_retryable_error()
+    # matches "network"/"connectionreset" in the error text and ORs it away.
+    # The explicit flag is what the base layer actually honors.
+    assert result.ambiguous_delivery is True
 
 
 @pytest.mark.asyncio
@@ -152,6 +170,7 @@ async def test_post_write_network_error_via_cause_chain_not_resent():
     assert result.success is False
     assert adapter._bot.send_message.await_count == 1
     assert result.retryable is False
+    assert result.ambiguous_delivery is True
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +199,9 @@ async def test_connect_phase_network_error_is_retried(exc_factory):
     assert result.success is False
     assert adapter._bot.send_message.await_count == 3
     assert result.retryable is True
+    # Nothing left the process, so delivery is NOT ambiguous — the base layer
+    # must stay free to retry.
+    assert result.ambiguous_delivery is False
 
 
 @pytest.mark.asyncio
@@ -201,6 +223,7 @@ async def test_connect_error_via_cause_chain_is_retried():
     assert result.success is False
     assert adapter._bot.send_message.await_count == 3
     assert result.retryable is True
+    assert result.ambiguous_delivery is False
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +245,10 @@ async def test_generic_timed_out_still_not_resent():
     assert result.success is False
     assert adapter._bot.send_message.await_count == 1
     assert result.retryable is False
+    # A generic read timeout is ambiguous for the same reason. Previously this
+    # was only stopped by the base layer's `_is_timeout_error` substring scan of
+    # the (redacted) error text; the flag makes it explicit and text-independent.
+    assert result.ambiguous_delivery is True
 
 
 # ---------------------------------------------------------------------------
@@ -249,3 +276,113 @@ async def test_pool_timeout_still_drains_and_retries():
     assert adapter._bot.send_message.await_count == 3
     assert adapter._drain_general_connections_after_pool_timeout.await_count == 3
     assert result.retryable is True
+    # PTB says the request was explicitly NOT sent, so delivery is unambiguous.
+    assert result.ambiguous_delivery is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-layer: the gateway retry wrapper must not re-send either
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_with_retry_does_not_resend_post_write_network_error():
+    """The bug teknium1 flagged, end-to-end.
+
+    Before the fix the adapter's ``retryable=False`` was ORed away by
+    ``_send_with_retry``'s ``self._is_retryable_error(error_str)`` (the error
+    text contains both "network" and "connection reset"), so the gateway
+    re-sent the payload twice more and then posted a delivery-failure notice —
+    up to three duplicate messages plus a bogus "delivery failed" notice for a
+    message the user had already received.
+    """
+    adapter = _make_adapter()
+    adapter._bot.send_message = _fail_with(
+        NetworkError("NetworkError: connection reset by peer")
+    )
+
+    with patch(
+        "plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()
+    ), patch("asyncio.sleep", new=AsyncMock()):
+        result = await adapter._send_with_retry("123", "hello", max_retries=2, base_delay=0)
+
+    assert result.success is False
+    assert result.ambiguous_delivery is True
+    # Exactly ONE underlying send: no gateway retry, no plain-text fallback,
+    # and no "Message delivery failed after multiple attempts" notice (which
+    # would itself be a fourth send).
+    assert adapter._bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_send_with_retry_still_retries_connect_phase_failures():
+    """Control: the flag must not turn every network failure into a no-retry.
+
+    A connect-phase failure never left the process, so the gateway still gets
+    its retries — 3 adapter-loop attempts per ``send()`` call, across the
+    initial call plus 2 gateway retries plus the delivery-failure notice.
+    """
+    adapter = _make_adapter()
+    adapter._bot.send_message = _fail_with(
+        NetworkError("Connect error: [Errno 111] Connection refused")
+    )
+
+    with patch(
+        "plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()
+    ), patch("asyncio.sleep", new=AsyncMock()):
+        result = await adapter._send_with_retry("123", "hello", max_retries=2, base_delay=0)
+
+    assert result.success is False
+    assert result.ambiguous_delivery is False
+    assert adapter._bot.send_message.await_count > 1
+
+
+# ---------------------------------------------------------------------------
+# Sibling site: the Bot API 10.1 sendRichMessage path has the same bug
+# ---------------------------------------------------------------------------
+
+def _make_rich_adapter() -> TelegramAdapter:
+    """Adapter wired for the rich-send path (``sendRichMessage``)."""
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"rich_messages": True})
+    )
+    bot = MagicMock()
+    # An AsyncMock makes inspect.iscoroutinefunction() true, which is what
+    # _bot_supports_rich() checks.
+    bot.do_api_request = AsyncMock(return_value={"message_id": 1})
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+    return adapter
+
+
+RICH_CONTENT = "## Results\n\n| Case | Status |\n|---|---|\n| rich | ok |"
+
+
+@pytest.mark.asyncio
+async def test_rich_post_write_network_error_is_ambiguous():
+    """``_send_rich_message`` had the identical ``not is_timeout`` computation:
+    a post-write NetworkError came back ``retryable=True``, so the base layer
+    re-sent it. It is now non-retryable and flagged ambiguous."""
+    adapter = _make_rich_adapter()
+    adapter._bot.do_api_request = _fail_with(NetworkError("Connection reset by peer"))
+
+    result = await adapter.send("123", RICH_CONTENT)
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.ambiguous_delivery is True
+    # And no legacy resend of the same payload.
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rich_send_with_retry_sends_exactly_once():
+    adapter = _make_rich_adapter()
+    adapter._bot.do_api_request = _fail_with(NetworkError("Connection reset by peer"))
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        result = await adapter._send_with_retry("123", RICH_CONTENT, max_retries=2, base_delay=0)
+
+    assert result.success is False
+    assert adapter._bot.do_api_request.await_count == 1
+    adapter._bot.send_message.assert_not_called()

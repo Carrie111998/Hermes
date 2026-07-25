@@ -1882,6 +1882,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None
             is_timeout = (_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(exc)
+            # Same post-write ambiguity as the legacy send() path (#64238): a
+            # non-timeout NetworkError raised after the request body was written
+            # may already have reached Telegram, so the base retry layer must
+            # not re-send it. Only a demonstrably pre-write failure
+            # (connect-phase or an httpx pool timeout, which PTB reports as
+            # explicitly "not sent to Telegram") is safe to re-send.
+            is_pool_timeout = self._looks_like_pool_timeout(exc)
+            never_left_process = (
+                is_connect_timeout
+                or is_pool_timeout
+                or self._looks_like_connect_error(exc)
+            )
+            is_post_write_network_error = (
+                self._looks_like_network_error(exc)
+                and not is_timeout
+                and not never_left_process
+            )
             # Extract server-requested retry_after for flood control so the
             # base retry layer honors Telegram's backoff instead of its own
             # short exponential schedule.
@@ -1899,8 +1916,16 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False,
                 error=safe_error,
-                retryable=(is_connect_timeout or not is_timeout),
+                retryable=(
+                    False
+                    if is_post_write_network_error
+                    else (is_connect_timeout or is_pool_timeout or not is_timeout)
+                ),
                 retry_after=_retry_after,
+                ambiguous_delivery=(
+                    not never_left_process
+                    and (is_timeout or is_post_write_network_error)
+                ),
             )
 
         message_id = None
@@ -4695,12 +4720,15 @@ class TelegramAdapter(BasePlatformAdapter):
             # gateway's _send_with_retry() re-send it and duplicate the message
             # (#64238), so treat it as non-retryable unless it demonstrably
             # never left the process (connect-phase or pool timeout).
+            never_left_process = (
+                is_connect_timeout
+                or is_pool_timeout
+                or self._looks_like_connect_error(e)
+            )
             is_post_write_network_error = (
                 self._looks_like_network_error(e)
                 and not is_timeout
-                and not is_connect_timeout
-                and not is_pool_timeout
-                and not self._looks_like_connect_error(e)
+                and not never_left_process
             )
             retryable = (
                 False
@@ -4712,6 +4740,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 error=safe_error,
                 retryable=retryable,
                 error_kind=error_kind,
+                # `retryable=False` alone does NOT stop the gateway retry:
+                # BasePlatformAdapter._send_with_retry() ORs it with
+                # _is_retryable_error(), whose patterns include "network" and
+                # "connectionreset". Set the explicit ambiguous-delivery signal
+                # the base layer honors unconditionally, for both the post-write
+                # NetworkError and the generic read timeout.
+                ambiguous_delivery=(
+                    not never_left_process
+                    and (is_timeout or is_post_write_network_error)
+                ),
             )
 
     async def send_or_update_status(
