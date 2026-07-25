@@ -1141,33 +1141,33 @@ export function testMessagingPlatform(platformId: string): Promise<MessagingPlat
 // shared JSON store the CLI/dashboard also drive. Enable mutates config and
 // best-effort restarts the gateway; subscription changes hot-reload.
 
-export function getWebhooks(): Promise<WebhooksResponse> {
+export function getWebhooks(profile?: string): Promise<WebhooksResponse> {
   return window.hermesDesktop.api<WebhooksResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/webhooks'
   })
 }
 
-export function enableWebhooks(): Promise<WebhookEnableResponse> {
+export function enableWebhooks(profile?: string): Promise<WebhookEnableResponse> {
   return window.hermesDesktop.api<WebhookEnableResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/webhooks/enable',
     method: 'POST'
   })
 }
 
-export function createWebhook(body: WebhookCreatePayload): Promise<WebhookCreateResponse> {
+export function createWebhook(body: WebhookCreatePayload, profile?: string): Promise<WebhookCreateResponse> {
   return window.hermesDesktop.api<WebhookCreateResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/webhooks',
     method: 'POST',
     body
   })
 }
 
-export function deleteWebhook(name: string): Promise<{ ok: boolean }> {
+export function deleteWebhook(name: string, profile?: string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/webhooks/${encodeURIComponent(name)}`,
     method: 'DELETE'
   })
@@ -1175,10 +1175,11 @@ export function deleteWebhook(name: string): Promise<{ ok: boolean }> {
 
 export function setWebhookEnabled(
   name: string,
-  enabled: boolean
+  enabled: boolean,
+  profile?: string
 ): Promise<{ enabled: boolean; name: string; ok: boolean }> {
   return window.hermesDesktop.api<{ enabled: boolean; name: string; ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/webhooks/${encodeURIComponent(name)}/enabled`,
     method: 'PUT',
     body: { enabled }
