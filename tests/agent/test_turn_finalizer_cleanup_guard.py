@@ -82,6 +82,7 @@ class _StubAgent:
         pass
 
     def _handle_max_iterations(self, messages, n):
+        self._last_max_iteration_api_calls = 1
         return "PARTIAL SUMMARY FROM MODEL"
 
     def _file_mutation_verifier_enabled(self):
@@ -143,6 +144,15 @@ def test_all_cleanup_steps_raise_response_still_returned():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     labels = [e.split(":")[0] for e in result["cleanup_errors"]]
     assert labels == ["save_trajectory", "cleanup_task_resources", "persist_session"]
+
+
+def test_summary_request_attempt_is_included_in_api_call_count():
+    agent = _StubAgent(raise_in=())
+
+    result = _run(agent, api_call_count=3)
+
+    assert result["api_calls"] == 4
+    assert agent._api_call_count == 4
 
 
 @pytest.mark.parametrize(

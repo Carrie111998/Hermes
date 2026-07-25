@@ -132,6 +132,22 @@ def test_pending_verify_response_is_preserved_for_cron_delivery(monkeypatch):
     assert agent._handle_max_iterations_called is False
 
 
+def test_preserved_response_does_not_reuse_stale_summary_request_count(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    agent._last_max_iteration_api_calls = 2
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="complete report",
+    )
+
+    assert result["api_calls"] == 60
+    assert agent._handle_max_iterations_called is False
+
+
 def test_pending_pre_verify_response_is_preserved_on_budget_exhaustion(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent()
