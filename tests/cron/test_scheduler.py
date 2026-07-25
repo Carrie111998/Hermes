@@ -9,9 +9,44 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import (
+    SILENT_MARKER,
+    _build_job_prompt,
+    _deliver_result,
+    _merge_mcp_into_per_job_toolsets,
+    _resolve_cron_enabled_toolsets,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    _summarize_cron_failure_for_delivery,
+    run_job,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestCronFailureSummary:
+    def test_script_failure_surfaces_terminal_traceback_diagnostic(self):
+        error = (
+            "Script exited with code 1\n"
+            "stderr:\n"
+            "\x1b[33m⚠ Deprecated .env settings detected:\x1b[0m\n"
+            "  ⚠ TERMINAL_CWD=/opt/data found in .env — this is deprecated.\n\n"
+            "Traceback (most recent call last):\n"
+            '  File "/opt/data/scripts/relationships-urgent.py", line 4, in <module>\n'
+            "    from cyber_relationships.automation_runner import main\n"
+            "ModuleNotFoundError: No module named 'cyber_relationships'"
+        )
+
+        summary = _summarize_cron_failure_for_delivery(
+            {"name": "relationship-urgent-monitor"},
+            error,
+        )
+
+        assert "ModuleNotFoundError" in summary
+        assert "cyber_relationships" in summary
+        assert "TERMINAL_CWD" not in summary
+        assert "Full details saved" in summary
 
 
 class TestPerJobToolsetMcpMerge:
@@ -1884,6 +1919,38 @@ class TestRunJobSessionPersistence:
         ) as advance, patch("cron.scheduler.run_one_job") as run_one:
             assert tick(verbose=False, sync=True, can_dispatch=lambda: False) == 0
 
+        advance.assert_not_called()
+        run_one.assert_not_called()
+
+    def test_tick_leaves_due_jobs_untouched_during_runtime_maintenance(
+        self, tmp_path
+    ):
+        """Deploy markers pause dispatch until scripts and plugins are coherent."""
+        from cron.scheduler import tick
+
+        cron_dir = tmp_path / "cron"
+        cron_dir.mkdir()
+        (cron_dir / ".maintenance").write_text(
+            "deploying runtime plugins\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "maintenance-due-job",
+            "name": "maintenance due job",
+            "schedule": {"kind": "interval", "seconds": 60},
+            "next_run_at": "2020-01-01T00:00:00+00:00",
+            "enabled": True,
+        }
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.scheduler.get_due_jobs", return_value=[job]
+        ) as get_due, patch(
+            "cron.scheduler.advance_next_run"
+        ) as advance, patch(
+            "cron.scheduler.run_one_job"
+        ) as run_one:
+            assert tick(verbose=False, sync=True) == 0
+
+        get_due.assert_not_called()
         advance.assert_not_called()
         run_one.assert_not_called()
 

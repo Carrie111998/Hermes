@@ -87,6 +87,41 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_PYTHON_EXCEPTION_LINE_RE = re.compile(
+    r"^(?:[A-Za-z_][\w.]*\.)*[A-Za-z_]\w*(?:Error|Exception):\s+.+$"
+)
+
+
+def _actionable_script_failure_line(text: str) -> str | None:
+    """Extract the terminal diagnostic from a failed script's captured output."""
+    if not text.lower().startswith("script exited with code "):
+        return None
+
+    lines = [
+        _ANSI_ESCAPE_RE.sub("", line).strip()
+        for line in text.splitlines()
+    ]
+    lines = [line for line in lines if line]
+    for line in reversed(lines):
+        if _PYTHON_EXCEPTION_LINE_RE.match(line):
+            return line
+
+    ignored_prefixes = (
+        "stderr:",
+        "stdout:",
+        "traceback (most recent call last):",
+        "file ",
+        "deprecated .env settings detected:",
+        "move to config.yaml instead:",
+        "then remove the old entries from ",
+    )
+    for line in reversed(lines[1:]):
+        if not line.lower().startswith(ignored_prefixes):
+            return line
+    return None
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -97,6 +132,19 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+
+    # Script stderr commonly begins with warnings before the actual exception.
+    # Prefer the final traceback diagnostic so chat truncation cannot hide the
+    # actionable cause while the complete output remains persisted.
+    script_diagnostic = _actionable_script_failure_line(text)
+    if script_diagnostic:
+        cleaned_diagnostic = re.sub(r"\s+", " ", script_diagnostic).strip()
+        if len(cleaned_diagnostic) > 180:
+            cleaned_diagnostic = cleaned_diagnostic[:177].rstrip() + "..."
+        return (
+            f"⚠️ Cron '{job_name}' failed: script {cleaned_diagnostic} "
+            "Full details saved in cron output."
+        )
 
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
@@ -597,6 +645,18 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+def _cron_maintenance_active(lock_dir: Path) -> bool:
+    """Return whether an operator has paused dispatch for runtime maintenance.
+
+    Deployments can create ``cron/.maintenance`` before replacing scripts or
+    plugins and remove it after their import probes pass.  The ticker leaves
+    due jobs untouched while the marker exists, so they run normally on the
+    first post-maintenance tick instead of firing against a partially updated
+    runtime.
+    """
+    return (lock_dir / ".maintenance").is_file()
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -4072,6 +4132,13 @@ def tick(
         return 0
 
     try:
+        if _cron_maintenance_active(lock_dir):
+            logger.info(
+                "Cron dispatch paused by maintenance marker: %s",
+                lock_dir / ".maintenance",
+            )
+            return 0
+
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0

@@ -5949,14 +5949,30 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
     sys.stderr.write("\n".join(lines) + "\n\n")
 
 
-def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> None:
+def warn_deprecated_cwd_env_vars(
+    config: Optional[Dict[str, Any]] = None,
+    env_values: Optional[Dict[str, str]] = None,
+) -> None:
     """Warn if MESSAGING_CWD or TERMINAL_CWD is set in .env instead of config.yaml.
 
     These env vars are deprecated — the canonical setting is terminal.cwd
-    in config.yaml.  Prints a migration hint to stderr.
+    in config.yaml.  Inspect the actual ``.env`` contents rather than
+    ``os.environ``: gateway and cron subprocesses legitimately inherit the
+    internal ``TERMINAL_CWD`` runtime bridge, which does not mean the user
+    configured that value in ``.env``.  Prints a migration hint to stderr.
+
+    ``env_values`` is an injection seam for callers that already parsed the
+    file and for deterministic tests.  When omitted, the canonical Hermes
+    ``.env`` file is loaded directly.
     """
-    messaging_cwd = os.environ.get("MESSAGING_CWD")
-    terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+    if env_values is None:
+        try:
+            env_values = load_env()
+        except Exception:
+            return
+
+    messaging_cwd = env_values.get("MESSAGING_CWD")
+    terminal_cwd_env = env_values.get("TERMINAL_CWD")
 
     if config is None:
         try:
@@ -5982,14 +5998,14 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
             f"this is deprecated."
         )
     if lines:
-        hint_path = os.environ.get("HERMES_HOME", "~/.hermes")
+        hint_path = get_env_path()
         lines.insert(0, "\033[33m⚠ Deprecated .env settings detected:\033[0m")
         lines.append(
             "  \033[2mMove to config.yaml instead:  "
             "terminal:\\n    cwd: /your/project/path\033[0m"
         )
         lines.append(
-            f"  \033[2mThen remove the old entries from {hint_path}/.env\033[0m"
+            f"  \033[2mThen remove the old entries from {hint_path}\033[0m"
         )
         sys.stderr.write("\n".join(lines) + "\n\n")
 
