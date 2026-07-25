@@ -1291,6 +1291,7 @@ class WorkflowEngine:
                 "error_count": s.error_count,
             } for nid, s in states.items()},
             "results": results,
+            "run_id": run_id or "",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         # Persist session info so hooks can create subscriptions for

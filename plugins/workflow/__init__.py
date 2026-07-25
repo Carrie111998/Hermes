@@ -463,10 +463,9 @@ def _spawn_supervisor_for_next_layer(state, state_path):
         import subprocess
         import sys
         workflow_name = state.get("workflow_name", "")
-        # run_id is in the state filename, not the state dict
-        # Format: {workflow_name}_{run_id}_state.json
-        run_id = ""
-        if state_path:
+        run_id = state.get("run_id", "")
+        # Fallback: extract from filename if not in state dict
+        if not run_id and state_path:
             sf_name = Path(state_path).stem  # remove .json
             parts = sf_name.split("_", 1)
             if len(parts) > 1:
