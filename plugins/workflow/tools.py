@@ -35,24 +35,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def check_workflow_requirements() -> bool:
-    """Return True when the workflow engine can be invoked.
-
-    Gates on:
-      * ``docs/fleet-pipelines/`` directory existing (ships with the repo)
-      * the ``WorkflowEngine`` class being importable
-
-    No external API keys, no subprocess runner — pure-Python DAG execution
-    against local kanban + filesystem state.
-    """
+    """Return True when the workflow engine can be invoked."""
     try:
         from plugins.workflow.engine import WorkflowEngine  # noqa: F401
-    except ImportError as exc:
-        logger.debug("workflow_engine import failed: %s", exc)
+    except Exception as exc:
+        logger.debug("workflow_engine import failed: %s %s", type(exc).__name__, exc)
         return False
 
-    # Check HERMES_WORKFLOW_FILES env var first, then $HERMES_HOME/workflows/,
-    # then fall back to the repo-relative path.
-    workflows_dir = None
     try:
         from pathlib import Path
         import os
