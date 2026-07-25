@@ -429,6 +429,12 @@ def test_runner_defers_for_active_async_delegation(tmp_path, monkeypatch):
 
     assert runner._renewal_should_defer("route-a", "shared") is True
 
+    monkeypatch.setattr(
+        "tools.async_delegation.has_pending_completion_for_session",
+        MagicMock(side_effect=RuntimeError("ledger unavailable")),
+    )
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
 
 def test_exact_row_acknowledgement_and_restart(tmp_path):
     store = _store(tmp_path)

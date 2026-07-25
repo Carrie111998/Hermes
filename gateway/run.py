@@ -5939,6 +5939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
         except Exception:
             logger.debug("Failed to inspect active delegations before renewal", exc_info=True)
+            return True
 
         # Proxy mode never writes a local exact api_content sidecar, so it
         # cannot prove capsule durability safely.
