@@ -20,3 +20,9 @@
 [submodule "vendor/shinka-osint"]
 	path = vendor/shinka-osint
 	url = https://github.com/zapabob/ShinkaEvolve-OSINT.git
+[submodule "vendor/buzz"]
+	path = vendor/buzz
+	url = https://github.com/block/buzz.git
+[submodule "vendor/officecli"]
+	path = vendor/officecli
+	url = https://github.com/iOfficeAI/OfficeCLI.git

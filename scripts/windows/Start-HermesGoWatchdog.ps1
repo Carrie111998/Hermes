@@ -13,7 +13,10 @@ param(
     # Bound go build so restart-hermes-stack never hangs on go mod tidy / network.
     [int]$BuildTimeoutSec = 180,
     # Default skip go test for operator start path (full test via Build-HermesGoWatchdog.ps1).
-    [switch]$RunBuildTests
+    [switch]$RunBuildTests,
+    # Watchdog-managed hermes serve port (must stay outside reserved ops: 9119/9120/8787/9920).
+    # Desktop connects via desktop-backend.json / HERMES_DESKTOP_REMOTE_*; default 9118.
+    [int]$ManagedBackendPort = 9119
 )
 
 $ErrorActionPreference = "Stop"
@@ -156,6 +159,7 @@ $argList = @(
 )
 if ($Once) { $argList += "-once" }
 if ($NoPrewarm) { $argList += "-prewarm-backend=false" }
+if ($ManagedBackendPort -gt 0) { $argList += "-managed-backend-port=$ManagedBackendPort" }
 if (-not $NoTsnet -and ($env:HERMES_WATCHDOG_TS_AUTHKEY -or $env:TS_AUTHKEY)) {
     $argList += "-tsnet"
 }
@@ -182,6 +186,7 @@ if (-not $launched) {
     )
     if ($Once) { $shellArgs += "-once" }
     if ($NoPrewarm) { $shellArgs += "-prewarm-backend=false" }
+    if ($ManagedBackendPort -gt 0) { $shellArgs += "-managed-backend-port=$ManagedBackendPort" }
     if (-not $NoTsnet -and ($env:HERMES_WATCHDOG_TS_AUTHKEY -or $env:TS_AUTHKEY)) {
         $shellArgs += "-tsnet"
     }

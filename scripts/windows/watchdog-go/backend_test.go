@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseReadyPortLine(t *testing.T) {
@@ -134,5 +135,28 @@ func TestBackendManagerWriteReadManifest(t *testing.T) {
 	}
 	if got.Port != 12345 || got.Token != "abc" || !got.Managed {
 		t.Fatalf("unexpected manifest: %+v", got)
+	}
+}
+
+
+func TestWaitManagedPortClearedEmptyPort(t *testing.T) {
+	if !waitManagedPortCleared(0, time.Second, nil) {
+		t.Fatal("port 0 should be treated as cleared")
+	}
+}
+
+func TestReadManifestToleratesNumericUpdatedAtAndURLAlias(t *testing.T) {
+	dir := t.TempDir()
+	bm := NewBackendManager(Config{DataDir: dir}, NewLogger(filepath.Join(dir, "t.log")))
+	raw := []byte(`{"url":"http://127.0.0.1:9119","token":"tok","port":9119,"updatedAt":1784904830048}`)
+	if err := os.WriteFile(bm.ManifestPath(), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bm.readManifest()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got.Token != "tok" || got.BaseURL != "http://127.0.0.1:9119" || got.Port != 9119 {
+		t.Fatalf("unexpected: %+v", got)
 	}
 }

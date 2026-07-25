@@ -17,21 +17,23 @@ import (
 
 const desktopBackendManifestName = "desktop-backend.json"
 
-// DefaultManagedBackendPort is outside reserved ops ports (9119 dashboard serve, 9120 dashboard UI, …).
-const DefaultManagedBackendPort = 9118
+// DefaultManagedBackendPort matches Desktop local serve expectation (:9119).
+// 9120 remains reserved for the operator dashboard UI.
+const DefaultManagedBackendPort = 9119
 
 var backendReadyRE = regexp.MustCompile(`^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)`)
 
 // DesktopBackendManifest is published for packaged Desktop to connect without cold-spawning serve.
 type DesktopBackendManifest struct {
-	BaseURL    string `json:"baseUrl"`
-	Token      string `json:"token"`
-	Port       int    `json:"port"`
-	PID        int    `json:"pid,omitempty"`
-	HermesRoot string `json:"hermesRoot,omitempty"`
-	HermesHome string `json:"hermesHome,omitempty"`
-	UpdatedAt  string `json:"updatedAt"`
-	Managed    bool   `json:"managed"`
+	BaseURL    string          `json:"baseUrl"`
+	URL        string          `json:"url,omitempty"` // operator/compat alias for baseUrl
+	Token      string          `json:"token"`
+	Port       int             `json:"port"`
+	PID        int             `json:"pid,omitempty"`
+	HermesRoot string          `json:"hermesRoot,omitempty"`
+	HermesHome string          `json:"hermesHome,omitempty"`
+	UpdatedAt  json.RawMessage `json:"updatedAt,omitempty"` // string or unix-ms number
+	Managed    bool            `json:"managed"`
 }
 
 // BackendManager supervises a watchdog-owned hermes serve for fast Desktop connect.
@@ -183,6 +185,9 @@ func (bm *BackendManager) readManifest() (*DesktopBackendManifest, error) {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, err
 	}
+	if manifest.BaseURL == "" && manifest.URL != "" {
+		manifest.BaseURL = manifest.URL
+	}
 	return &manifest, nil
 }
 
@@ -245,21 +250,22 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 		return nil, fmt.Errorf("hermes root not configured")
 	}
 	if existing := bm.currentHealthy(); existing != nil {
-		if bm.token == "" {
-			if manifest, err := bm.readManifest(); err == nil && manifest.Token != "" {
-				bm.token = manifest.Token
-			}
+		// Prefer published manifest token over a stale in-memory copy so we
+		// do not kill a healthy serve after an unrelated token rotation race.
+		if manifest, err := bm.readManifest(); err == nil && manifest.Token != "" {
+			bm.token = manifest.Token
 		}
 		if bm.token != "" && testBackendAuth(existing.Port, bm.token) {
 			_ = bm.publishManifestLocked(existing.Port, int(existing.PID))
 			return existing, nil
 		}
-		// In-memory backend looks healthy but token drifted — fall through to replace.
-		bm.logger.Infof("in-memory backend auth drift on port %d; replacing", existing.Port)
+		// Last chance: if the live port still accepts ANY known token from
+		// the previous in-memory value after a rematch, keep it.
+		bm.logger.Infof("in-memory backend auth mismatch on port %d; replacing only if port auth-dead", existing.Port)
 		bm.mu.Lock()
 		bm.stopLocked()
 		bm.mu.Unlock()
-		_ = stopListenersOnPort(existing.Port, bm.logger)
+		_ = waitManagedPortCleared(existing.Port, 15*time.Second, bm.logger)
 	}
 
 	bm.mu.Lock()
@@ -282,6 +288,8 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 		bm.port = port
 		if manifest, err := bm.readManifest(); err == nil && manifest.Token != "" {
 			bm.token = manifest.Token
+		} else if err != nil {
+			bm.logger.Infof("managed port %d up but manifest unreadable: %v", port, err)
 		}
 		// Only reuse when token unlocks gated APIs. Otherwise we'd publish a
 		// fresh token while the live serve still expects the old one (Desktop 401).
@@ -290,9 +298,15 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 			bm.logger.Infof("reusing healthy managed backend on port %d (auth ok)", port)
 			return &backendInfo{Port: port, Cmd: "existing serve on managed port"}, nil
 		}
-		bm.logger.Infof("managed port %d is up but session token drifted; replacing occupant", port)
-		_ = stopListenersOnPort(port, bm.logger)
-		time.Sleep(1 * time.Second)
+		if bm.token == "" {
+			bm.logger.Infof("managed port %d is up but no reusable session token; replacing occupant", port)
+		} else {
+			bm.logger.Infof("managed port %d is up but session token drifted; replacing occupant", port)
+		}
+		if !waitManagedPortCleared(port, 15*time.Second, bm.logger) {
+			bm.clearManifest()
+			return nil, fmt.Errorf("managed port %d still occupied after token-drift replace", port)
+		}
 		bm.port = 0
 		bm.token = ""
 	}
@@ -343,7 +357,7 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 	if !testBackendAuth(port, token) {
 		bm.logger.Infof("managed backend status-ready but auth failed on port %d; refusing drifted manifest", port)
 		bm.stopLocked()
-		_ = stopListenersOnPort(port, bm.logger)
+		_ = waitManagedPortCleared(port, 15*time.Second, bm.logger)
 		bm.clearManifest()
 		return nil, fmt.Errorf("managed backend on port %d failed session-token auth", port)
 	}
@@ -362,6 +376,7 @@ func (bm *BackendManager) publishManifestLocked(port, pid int) error {
 			pid = int(listeners[0])
 		}
 	}
+	updatedAt, _ := json.Marshal(time.Now().Format(time.RFC3339))
 	manifest := DesktopBackendManifest{
 		BaseURL:    fmt.Sprintf("http://127.0.0.1:%d", port),
 		Token:      bm.token,
@@ -369,7 +384,7 @@ func (bm *BackendManager) publishManifestLocked(port, pid int) error {
 		PID:        pid,
 		HermesRoot: bm.cfg.HermesRoot,
 		HermesHome: bm.cfg.HermesHome,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
+		UpdatedAt:  updatedAt,
 		Managed:    true,
 	}
 	return bm.writeManifest(manifest)
@@ -384,6 +399,9 @@ func loadManifestBackend(cfg Config) *backendInfo {
 	var manifest DesktopBackendManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil
+	}
+	if manifest.BaseURL == "" && manifest.URL != "" {
+		manifest.BaseURL = manifest.URL
 	}
 	port := manifest.Port
 	if port <= 0 && manifest.BaseURL != "" {

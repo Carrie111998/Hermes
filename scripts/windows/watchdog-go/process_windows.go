@@ -44,7 +44,7 @@ func getDesktopProcesses() ([]win32Process, error) {
 
 // reservedOpsPorts are stack-owned listeners — never treat as Desktop's ephemeral hermes serve.
 var reservedOpsPorts = map[int]struct{}{
-	8080: {}, 8081: {}, 8646: {}, 8765: {}, 8787: {}, 9119: {}, 9120: {}, 9920: {}, 18794: {},
+	8080: {}, 8081: {}, 8646: {}, 8765: {}, 8787: {}, 9120: {}, 9920: {}, 18794: {},
 }
 
 func isReservedOpsPort(port int) bool {
@@ -112,11 +112,36 @@ func getDesktopBackendCandidates() ([]win32Process, error) {
 	}
 }
 
+func netstatTCPOutput(timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	cmd := exec.Command("netstat", "-ano", "-p", "tcp")
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := cmd.CombinedOutput()
+		ch <- result{b, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.b, r.err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return nil, fmt.Errorf("netstat timed out after %s", timeout)
+	}
+}
+
 func listeningPIDsOnPort(port int) []uint32 {
 	if port <= 0 {
 		return nil
 	}
-	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
+	out, err := netstatTCPOutput(8 * time.Second)
 	if err != nil {
 		return nil
 	}
@@ -156,7 +181,7 @@ func listeningPIDsOnPort(port int) []uint32 {
 }
 
 func getListeningPorts(pid uint32) ([]int, error) {
-	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
+	out, err := netstatTCPOutput(8 * time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +250,33 @@ func testBackendAuth(port int, token string) bool {
 }
 
 // stopListenersOnPort kills process trees holding LocalPort==port.
+// waitManagedPortCleared kills listeners and waits until /api/status is gone
+// so a replacement serve is not racing a wedged occupant (token-drift loops).
+func waitManagedPortCleared(port int, timeout time.Duration, logger *Logger) bool {
+	if port <= 0 {
+		return true
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_ = stopListenersOnPort(port, logger)
+		time.Sleep(400 * time.Millisecond)
+		if testBackendStatus(port) {
+			continue
+		}
+		if len(listeningPIDsOnPort(port)) == 0 {
+			return true
+		}
+	}
+	cleared := !testBackendStatus(port) && len(listeningPIDsOnPort(port)) == 0
+	if !cleared && logger != nil {
+		logger.Infof("managed port %d still occupied after clear wait (%s)", port, timeout)
+	}
+	return cleared
+}
+
 func stopListenersOnPort(port int, logger *Logger) int {
 	if port <= 0 {
 		return 0

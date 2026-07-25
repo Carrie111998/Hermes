@@ -75,8 +75,20 @@ function Resolve-SecondaryGgufPath {
 
 function Stop-LlamaOnPort {
     param([int]$TargetPort)
-    # Avoid Get-NetTCPConnection / Get-CimInstance here — both can hang for minutes on this host.
-    # Prefer netstat + taskkill with short bounded waits.
+    # Prefer graceful unload via router API, then TerminateProcess.
+    # Avoid Get-NetTCPConnection / Get-CimInstance / blocking taskkill — they hang on this host.
+    try {
+        $tmp = Join-Path $env:TEMP "llama-unload-all.json"
+        $listed = Invoke-RestMethod -Uri "http://127.0.0.1:${TargetPort}/v1/models" -TimeoutSec 3
+        foreach ($row in @($listed.data)) {
+            $st = if ($row.status) { [string]$row.status.value } else { "" }
+            if ($st -eq "loaded") {
+                [System.IO.File]::WriteAllText($tmp, ("{`"model`":`"{0}`"}" -f $row.id))
+                curl.exe -s --max-time 60 -X POST "http://127.0.0.1:${TargetPort}/models/unload" -H "Content-Type: application/json" --data-binary "@$tmp" | Out-Null
+            }
+        }
+    } catch {}
+
     $pids = New-Object 'System.Collections.Generic.HashSet[int]'
     try {
         $net = & netstat.exe -ano -p tcp 2>$null
@@ -96,8 +108,31 @@ function Stop-LlamaOnPort {
             }
         }
     } catch {}
+
+    if (-not ("KillNativeLlama" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class KillNativeLlama {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool TerminateProcess(IntPtr handle, uint code);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool CloseHandle(IntPtr handle);
+}
+"@
+    }
     foreach ($procId in @($pids)) {
-        & taskkill.exe /F /PID $procId 2>$null | Out-Null
+        try {
+            $h = [KillNativeLlama]::OpenProcess(0x0001, $false, $procId)
+            if ($h -ne [IntPtr]::Zero) {
+                [void][KillNativeLlama]::TerminateProcess($h, 1)
+                [void][KillNativeLlama]::CloseHandle($h)
+            }
+        } catch {}
+        # Non-blocking fallback; do not wait on hung taskkill.
+        Start-Process -FilePath "taskkill.exe" -ArgumentList @("/F", "/PID", "$procId") -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
     }
     Start-Sleep -Seconds 2
 }

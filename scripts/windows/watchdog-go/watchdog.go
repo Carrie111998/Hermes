@@ -122,14 +122,26 @@ func (w *Watchdog) RunCycle() cycleResult {
 	}
 
 	desktop, derr := getDesktopProcesses()
+	managedReady := !w.cfg.PrewarmBackend
 	if w.cfg.PrewarmBackend {
 		if _, err := w.back.EnsureHealthy(); err != nil {
 			w.logger.Infof("ensure managed backend: %v", err)
+			managedReady = false
+		} else {
+			managedReady = true
 		}
 	}
 	backend := w.findAnyHealthyBackend()
 
 	if derr != nil || len(desktop) == 0 {
+		// Avoid Hermes.exe proliferation: cold Desktop without an auth-ok
+		// prewarm manifest times out at 90s and dies, then we relaunch forever.
+		if w.cfg.PrewarmBackend && !managedReady {
+			w.logger.Infof("Desktop DOWN — defer relaunch until managed backend auth-ok")
+			res := cycleResult{Desktop: "waiting_backend", Backend: "down"}
+			w.saveState(res)
+			return res
+		}
 		var skipPID uint32
 		if managed := w.back.currentHealthy(); managed != nil {
 			skipPID = managed.PID
@@ -145,7 +157,7 @@ func (w *Watchdog) RunCycle() cycleResult {
 		return res
 	}
 
-	if backend == nil {
+		if backend == nil {
 		w.logger.Infof("Desktop UP but backend DOWN — starting managed serve")
 		if _, err := w.back.EnsureHealthy(); err != nil {
 			w.logger.Infof("managed backend assist failed: %v", err)

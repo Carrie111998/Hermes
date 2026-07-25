@@ -25,6 +25,15 @@ def _has_configured_mcp_servers() -> bool:
 
 
 def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
+    # Watchdog-managed serve must stay HTTP-responsive; MCP stdio clients
+    # on this host compete for the GIL and have stalled the event loop
+    # for tens of minutes (gui.log: event loop stalled ... GIL pressure).
+    import os
+    if os.environ.get("HERMES_WATCHDOG_MANAGED") == "1":
+        logger.info(
+            "Skipping background MCP discovery for watchdog-managed backend"
+        )
+        return
     """Spawn one shared background MCP discovery thread for this process.
 
     If the first background discovery run exits without connecting any MCP
