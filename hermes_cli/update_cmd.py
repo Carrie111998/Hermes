@@ -3075,10 +3075,120 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
             text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
-            return int(result.stdout.strip())
+            count_text = result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
+            if (
+                1 <= len(count_text) <= 9
+                and count_text.isascii()
+                and count_text.isdecimal()
+            ):
+                return int(count_text)
     except Exception:
         pass
     return -1
+
+
+def _recover_diverged_update(
+    git_cmd: list[str], cwd: Path, remote_ref: str
+) -> tuple[bool, str]:
+    """Recover an ff-only failure without discarding or inventing history.
+
+    The fetched remote may have been force-pushed. Therefore ``remote..HEAD``
+    is not a safe definition of local work: it also contains commits discarded
+    by that force-push. ``--fork-point`` consults the remote-tracking reflog to
+    recover the old upstream tip and bounds the range we are allowed to carry.
+    If that evidence is unavailable, fail closed.
+
+    Safe merge topology is recreated with ``--rebase-merges``. A merge commit
+    with content absent from both parents would be silently lost when Git
+    recreates the merge, so such a range is rejected without changing HEAD.
+    """
+    fork_result = subprocess.run(
+        git_cmd + ["merge-base", "--fork-point", remote_ref, "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    fork_point = fork_result.stdout.strip() if fork_result.returncode == 0 else ""
+    if not fork_point:
+        return False, "could not determine the previous upstream fork point; refusing to rewrite HEAD"
+
+    local_commits = _count_commits_between(git_cmd, cwd, fork_point, "HEAD")
+    if local_commits < 0:
+        return False, "could not determine whether HEAD contains local commits"
+
+    if local_commits == 0:
+        result = subprocess.run(
+            git_cmd + ["reset", "--hard", remote_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        detail = (result.stderr or result.stdout or "").strip()
+        return result.returncode == 0, detail
+
+    merges = subprocess.run(
+        git_cmd + ["rev-list", "--merges", f"{fork_point}..HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if merges.returncode != 0:
+        return False, "could not inspect carried merge commits; refusing to rewrite HEAD"
+    for merge_commit in merges.stdout.splitlines():
+        merge_payload = subprocess.run(
+            git_cmd
+            + ["diff-tree", "--cc", "--no-commit-id", "--name-only", "-r", merge_commit],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if merge_payload.returncode != 0:
+            return False, "could not inspect carried merge content; refusing to rewrite HEAD"
+        if merge_payload.stdout.strip():
+            return False, (
+                "carried history contains merge-only content; refusing an automatic "
+                "rebase that could lose the merge resolution"
+            )
+
+    print(
+        f"  → Preserving {local_commits} locally carried commit(s) and merge topology "
+        f"onto {remote_ref}..."
+    )
+    result = subprocess.run(
+        git_cmd
+        + ["rebase", "--rebase-merges", "--onto", remote_ref, fork_point],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode == 0:
+        return True, ""
+
+    detail = (result.stderr or result.stdout or "").strip()
+    abort_result = subprocess.run(
+        git_cmd + ["rebase", "--abort"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if abort_result.returncode != 0:
+        abort_detail = (abort_result.stderr or abort_result.stdout or "").strip()
+        if abort_detail:
+            detail = f"{detail}\nrebase abort failed: {abort_detail}" if detail else abort_detail
+    return False, detail or "rebase conflicted"
+
 
 def _should_skip_upstream_prompt() -> bool:
     """Check if user previously declined to add upstream."""
@@ -8843,18 +8953,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged. Before
-                # assuming an upstream force-push, check WHY: a checkout on a
-                # custom branch (local commits on top of origin/<branch>) also
-                # cannot fast-forward, and `reset --hard` here would silently
-                # discard that work. Merge instead and stop cleanly on
-                # conflict — an update must never destroy local commits.
+                # A custom branch is an explicit in-place update: preserve its
+                # topology by merging the fetched target branch. On the target
+                # branch itself, distinguish a force-pushed upstream from local
+                # carried commits and rebase only the proven local range.
                 _cur_branch = (
                     subprocess.run(
                         git_cmd + ["branch", "--show-current"],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
                     ).stdout
                     or ""
                 ).strip()
@@ -8875,7 +8985,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
                     )
                     if merge_result.returncode != 0:
                         subprocess.run(
@@ -8892,87 +9004,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
                             f"git merge origin/{branch}"
                         )
-                        print(
-                            "  Then re-run the update. Local work is untouched."
-                        )
+                        print("  Then re-run the update. Local work is untouched.")
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
-                    #
-                    # Divergence here comes in two shapes: ordinary (a common
-                    # ancestor still exists — the reset below is a normal,
-                    # safe re-sync onto the remote) and orphan (no common
-                    # ancestor at all, e.g. a corrupted local HEAD or a repo
-                    # re-init — see #87694). In the orphan case `reset --hard`
-                    # would silently discard the entire local commit graph
-                    # with no way back, so park pre_pull_sha behind a rescue
-                    # ref first.
-                    merge_base_result = subprocess.run(
-                        git_cmd + ["merge-base", "HEAD", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    has_common_ancestor = bool(
-                        merge_base_result.returncode == 0
-                        and merge_base_result.stdout.strip()
-                    )
-                    if not has_common_ancestor and pre_pull_sha:
-                        from datetime import datetime as _dt, timezone
-
-                        # Suffix with the pre-pull SHA (not just a second-
-                        # resolution timestamp) so two updates racing within
-                        # the same second (e.g. a retried update) get distinct
-                        # refs instead of the second `update-ref` silently
-                        # overwriting the first backup.
-                        rescue_ref = (
-                            f"refs/hermes-update-backups/orphan-{branch}-"
-                            f"{_dt.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-                            f"-{pre_pull_sha[:12]}"
-                        )
-                        update_ref_result = subprocess.run(
-                            git_cmd + ["update-ref", rescue_ref, pre_pull_sha],
-                            cwd=_m().PROJECT_ROOT,
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                        )
-                        if update_ref_result.returncode == 0:
-                            print(
-                                "  ⚠ Local history shares no common ancestor with "
-                                f"origin/{branch} (orphan divergence) — backed up "
-                                f"current HEAD to {rescue_ref} before resetting. "
-                                f"This backup expires after "
-                                f"{_ORPHAN_RESCUE_REF_MAX_AGE_DAYS} days."
-                            )
-                        else:
-                            # update-ref's return code is intentionally not
-                            # fatal (disk full, permissions) — but don't tell
-                            # the user a backup exists when the write failed.
-                            print(
-                                "  ⚠ Local history shares no common ancestor with "
-                                f"origin/{branch} (orphan divergence) — attempted "
-                                f"to back up current HEAD to {rescue_ref} before "
-                                "resetting, but the backup write failed "
-                                f"(pre-reset SHA was {pre_pull_sha})."
-                            )
-                        _prune_orphan_rescue_refs(git_cmd, _m().PROJECT_ROOT, branch)
                     print(
-                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                        "  ⚠ Fast-forward not possible (history diverged); "
+                        "checking for locally carried commits..."
                     )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                    recovered, recovery_detail = _recover_diverged_update(
+                        git_cmd, _m().PROJECT_ROOT, f"origin/{branch}"
                     )
-                    if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
-                        if reset_result.stderr.strip():
-                            print(f"  {reset_result.stderr.strip()}")
+                    if not recovered:
+                        print("✗ Update stopped to preserve locally carried commits.")
+                        if recovery_detail:
+                            print(f"  {recovery_detail.splitlines()[0]}")
                         print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                            "  Resolve/rebase the local commits, then run `hermes update` again."
                         )
                         sys.exit(1)
 
