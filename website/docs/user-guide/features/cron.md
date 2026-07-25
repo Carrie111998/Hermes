@@ -164,8 +164,8 @@ Notes:
 - `--add-skill` appends to the existing list without replacing it
 - `--remove-skill` removes specific attached skills
 - `--clear-skills` removes all attached skills
-- `--reasoning-effort` is optional on the standalone CLI; on `create` use one of `none|minimal|low|medium|high|xhigh`
-- on `edit`, `--reasoning-effort default` clears the per-job override and falls back to `agent.reasoning_effort`
+- `--reasoning-effort` is optional on the standalone CLI; accepted values stay in sync with the levels Hermes exposes globally, plus `none`
+- on `edit`, `--reasoning-effort default` clears the per-job override and falls back to configured reasoning
 
 ## Lifecycle actions
 
@@ -532,7 +532,7 @@ Outputs are concatenated in the order listed.
 
 ## Model and reasoning overrides
 
-Cron jobs normally inherit the global model/provider and `agent.reasoning_effort` from `~/.hermes/config.yaml`, but you can override them per job through the `cronjob` tool's `model` object. You can send only `model.reasoning_effort` if you just want to change the thinking level without pinning a different model.
+Cron jobs normally inherit the global model/provider and the configured reasoning for their effective model from `~/.hermes/config.yaml`, but you can override them per job through the `cronjob` tool's `model` object. You can send only `model.reasoning_effort` if you just want to change the thinking level without pinning a different model.
 
 ```python
 cronjob(
@@ -549,8 +549,9 @@ cronjob(
 
 Notes:
 
-- omit `model.reasoning_effort` to inherit the global `agent.reasoning_effort`
+- omit `model.reasoning_effort` to inherit configured reasoning, including any per-model override
 - set `model.reasoning_effort="none"` to disable reasoning for that job
+- accepted enabled levels stay in sync with Hermes' canonical reasoning-effort list
 - on `action="update"`, set `model.reasoning_effort="default"` to clear the per-job override and fall back to config again
 - if you set `model.model` without `model.provider`, Hermes pins the current main provider when the job is created so future runs stay stable
 

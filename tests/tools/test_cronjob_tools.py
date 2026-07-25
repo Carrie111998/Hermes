@@ -4,6 +4,8 @@ import json
 import pytest
 
 from tools.cronjob_tools import (
+    CRONJOB_SCHEMA,
+    _resolve_model_override,
     _scan_cron_prompt,
     check_cronjob_requirements,
     cronjob,
@@ -336,6 +338,28 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["provider"] == "openrouter"
         assert updated["job"]["base_url"] is None
 
+    def test_reasoning_effort_can_be_set_and_cleared(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                reasoning_effort="max",
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["reasoning_effort"] == "max"
+
+        reset = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                reasoning_effort="default",
+            )
+        )
+        assert reset["success"] is True
+        assert reset["job"]["reasoning_effort"] is None
+
     @staticmethod
     def _patch_named_legit(monkeypatch):
         import hermes_cli.runtime_provider as rp
@@ -546,11 +570,11 @@ class TestResolveModelOverride:
         import hermes_cli.runtime_provider as rp_mod
 
         monkeypatch.setattr(rp_mod, "has_named_custom_provider", lambda name: True)
-        provider, model = _resolve_model_override(
+        resolved = _resolve_model_override(
             {"provider": "custom", "model": "gpt-5.4"}
         )
-        assert provider == "custom"
-        assert model == "gpt-5.4"
+        assert resolved["provider"] == "custom"
+        assert resolved["model"] == "gpt-5.4"
 
     def test_pins_main_provider_when_bare_custom_unresolvable(self, monkeypatch):
         import hermes_cli.config as cfg_mod
@@ -560,12 +584,12 @@ class TestResolveModelOverride:
         monkeypatch.setattr(
             cfg_mod, "load_config", lambda: {"model": {"provider": "openai-codex"}}
         )
-        provider, model = _resolve_model_override(
+        resolved = _resolve_model_override(
             {"provider": "custom", "model": "gpt-5.4"}
         )
         # No matching custom entry → fall back to pinning the main provider.
-        assert provider == "openai-codex"
-        assert model == "gpt-5.4"
+        assert resolved["provider"] == "openai-codex"
+        assert resolved["model"] == "gpt-5.4"
 
     def test_keeps_explicit_custom_name_unchanged(self, monkeypatch):
         import hermes_cli.runtime_provider as rp_mod
@@ -573,11 +597,28 @@ class TestResolveModelOverride:
         # Even if the resolver claims no entry, the canonical "custom:<name>"
         # form is never stripped or pinned.
         monkeypatch.setattr(rp_mod, "has_named_custom_provider", lambda name: False)
-        provider, model = _resolve_model_override(
+        resolved = _resolve_model_override(
             {"provider": "custom:cliproxy", "model": "gpt-5.4"}
         )
-        assert provider == "custom:cliproxy"
-        assert model == "gpt-5.4"
+        assert resolved["provider"] == "custom:cliproxy"
+        assert resolved["model"] == "gpt-5.4"
+
+    def test_resolves_reasoning_only_override(self):
+        resolved = _resolve_model_override({"reasoning_effort": "max"})
+
+        assert resolved["provider"] is None
+        assert resolved["model"] is None
+        assert resolved["reasoning_effort"] == "max"
+
+    def test_schema_enum_tracks_canonical_reasoning_efforts(self):
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        model_schema = CRONJOB_SCHEMA["parameters"]["properties"]["model"]
+        effort_schema = model_schema["properties"]["reasoning_effort"]
+
+        assert set(VALID_REASONING_EFFORTS).issubset(effort_schema["enum"])
+        assert {"none", "default"}.issubset(effort_schema["enum"])
+        assert "required" not in model_schema
 
 
 class TestLocalDeliveryNotice:
