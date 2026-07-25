@@ -119,7 +119,12 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
-import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './native-auth-decisions'
+import {
+  oauthGuardMayHardFail,
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveOauthRestAuth
+} from './native-auth-decisions'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -6822,7 +6827,15 @@ async function buildRemoteConnection(
     // here would reject a freshly-completed native sign-in and loop the UI back
     // into "not signed in" even though mintGatewayWsTicket would succeed with
     // the stored bearer.
-    if (!oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl))) {
+    // The early-out is an optimisation, not the source of truth: the ws-ticket
+    // mint below is. It must therefore not fire for gateways whose only auth
+    // provider is password-based — those are gated (so authModeFromStatus says
+    // 'oauth') but can never satisfy either OAuth liveness signal, which made
+    // a perfectly good password session boot-loop on "not signed in".
+    if (
+      !oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl)) &&
+      oauthGuardMayHardFail(await gatewayAuthProviders(baseUrl))
+    ) {
       const err = new Error(
         'Remote Hermes gateway uses OAuth, but you are not signed in. ' +
           'Open Settings → Gateway and click "Sign in", or switch back to Local.'
@@ -7296,6 +7309,48 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
   }
 
   return fetchJson(url, conn.token, opts)
+}
+
+// Cache of a gateway's advertised auth providers, keyed by baseUrl. The list is
+// deploy-time configuration (which providers are registered), so it is stable
+// for the life of a backend; caching keeps reconnects from re-fetching it on
+// every ws-ticket refresh.
+const _gatewayAuthProviders = new Map<string, { supportsPassword: boolean; name: string }[]>()
+
+/**
+ * Best-effort read of a gateway's registered auth providers via the public
+ * ``/api/auth/providers``. Returns an empty array when the endpoint is absent,
+ * unreachable, or malformed — callers treat "unknown" as "assume OAuth", which
+ * preserves the strict pre-flight guard for backends that predate the endpoint.
+ */
+async function gatewayAuthProviders(baseUrl: string) {
+  const cached = _gatewayAuthProviders.get(baseUrl)
+
+  if (cached) {
+    return cached
+  }
+
+  try {
+    const body = (await fetchPublicJson(`${baseUrl}/api/auth/providers`, { timeoutMs: 5_000 })) as any
+
+    if (!Array.isArray(body?.providers)) {
+      return []
+    }
+
+    const providers = body.providers
+      .filter(p => p && typeof p === 'object')
+      .map(p => ({ name: String(p.name || ''), supportsPassword: Boolean(p.supports_password) }))
+      .filter(p => p.name)
+
+    if (providers.length > 0) {
+      _gatewayAuthProviders.set(baseUrl, providers)
+    }
+
+    return providers
+  } catch {
+    // Unknown → caller keeps the strict guard.
+    return []
+  }
 }
 
 async function probeRemoteAuthMode(rawUrl) {

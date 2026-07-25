@@ -25,7 +25,18 @@ export interface HermesReadyOptions {
 export function isMissingHealthEndpointError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? '')
 
-  return /^404:/.test(message) || message.includes('endpoint is likely missing')
+  // 404 → the backend predates /api/health.
+  // 401/403 → the route exists but sits BEHIND the auth gate on this deploy,
+  // so the credential-less public probe can never satisfy it. Both mean "this
+  // probe cannot answer readiness here"; the caller must fall back to the
+  // /api/status path (public on every gateway, and sent WITH credentials).
+  // Without the 401 case a gated gateway retried the same doomed public probe
+  // until the deadline and reported "backend did not become ready" — a
+  // readiness failure for a backend that was in fact up and healthy.
+  return (
+    /^40[134]:/.test(message) ||
+    message.includes('endpoint is likely missing')
+  )
 }
 
 function supersededError() {

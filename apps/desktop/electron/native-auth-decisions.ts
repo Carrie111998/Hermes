@@ -44,6 +44,45 @@ export function oauthSessionIsLive(hasNativeToken: boolean, hasCookieSession: bo
   return hasNativeToken || hasCookieSession
 }
 
+/** Shape of one entry in a gateway's advertised provider list. */
+export type GatewayAuthProvider = { name?: string; supportsPassword?: boolean }
+
+/**
+ * True when the pre-flight sign-in guard may hard-fail the boot.
+ *
+ * `authModeFromStatus` maps the gateway's `auth_required` flag onto 'oauth'
+ * whenever the gate is on — but `auth_required` only says "this gateway is
+ * gated", NOT "this gateway speaks OAuth". A gateway running the bundled
+ * password provider is gated, reports auth_required, and is therefore driven
+ * down the 'oauth' branch, yet it never mints a native bearer and its session
+ * cookies are set by the plain /auth/password-login POST rather than the
+ * /auth/callback redirect the OAuth partition is primed for. The cookie probe
+ * then reads empty and the guard throws "uses OAuth, but you are not signed
+ * in" — even though mintGatewayWsTicket would succeed against that very
+ * partition. (BasicAuthProvider.start_login raises NotImplementedError by
+ * design, and /auth/native/authorize rejects password providers with 400, so
+ * neither OAuth liveness signal can EVER be true for such a gateway.)
+ *
+ * Password-only gateways therefore skip the pre-flight early-out and let the
+ * ws-ticket mint be the authoritative liveness check — exactly as the OAuth
+ * path's own comment already describes. A genuinely signed-out gateway still
+ * fails, just one step later at the mint, where the message is derived from a
+ * real 401 instead of a guess about cookie shape.
+ *
+ * Providers absent/empty (older backends that don't publish the list, or a
+ * fetch failure) keep the strict guard — the pre-existing behaviour.
+ */
+export function oauthGuardMayHardFail(providers: readonly GatewayAuthProvider[] | null | undefined): boolean {
+  if (!Array.isArray(providers) || providers.length === 0) {
+    return true
+  }
+
+  // Only relax when EVERY advertised provider is password-based. A gateway
+  // offering both (e.g. basic + nous) still has a real OAuth leg, so the
+  // signed-in probe remains meaningful there.
+  return !providers.every(p => p && p.supportsPassword === true)
+}
+
 export type OauthRestAuth = { kind: 'bearer'; token: string } | { kind: 'cookie' }
 
 /**

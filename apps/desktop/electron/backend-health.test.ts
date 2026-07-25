@@ -123,7 +123,7 @@ test('aborts as superseded when the bootstrap signal fires', async () => {
   )
 })
 
-test('recognizes missing-route shapes only', () => {
+test('recognizes unanswerable-probe shapes only', () => {
   assert.equal(isMissingHealthEndpointError(new Error('404: {"detail":"Not Found"}')), true)
   assert.equal(
     isMissingHealthEndpointError(
@@ -133,4 +133,19 @@ test('recognizes missing-route shapes only', () => {
   )
   assert.equal(isMissingHealthEndpointError(new Error('Timed out connecting to Hermes backend after 15000ms')), false)
   assert.equal(isMissingHealthEndpointError(new Error('500: boom')), false)
+})
+
+test('treats a gated /api/health as unanswerable so the status fallback runs', () => {
+  // On a gateway with the auth gate engaged, /api/health sits behind the
+  // middleware and the credential-less public probe gets 401 no_cookie — never
+  // a 404. Without this the readiness loop retried the same doomed probe until
+  // the deadline and reported "backend did not become ready" for a backend
+  // that was up, gated, and answering /api/status perfectly.
+  assert.equal(
+    isMissingHealthEndpointError(new Error('401: {"error":"unauthenticated","reason":"no_cookie"}')),
+    true
+  )
+  assert.equal(isMissingHealthEndpointError(new Error('403: {"detail":"Forbidden"}')), true)
+  // Still not a blanket 4xx pass — 429 is a transient throttle worth retrying.
+  assert.equal(isMissingHealthEndpointError(new Error('429: slow down')), false)
 })
