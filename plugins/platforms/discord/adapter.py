@@ -949,6 +949,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_auto_join_active: Dict[int, int] = {}
         self._voice_auto_join_locks: Dict[int, asyncio.Lock] = {}
         self._voice_auto_join_leave_tasks: Dict[int, asyncio.Task] = {}
+        self._voice_auto_join_leaving: set[int] = set()
         self._voice_manual_join_pending: set[int] = set()
         self._voice_manual_join_generation: Dict[int, int] = {}
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
@@ -1754,6 +1755,9 @@ class DiscordAdapter(BasePlatformAdapter):
         active_routes = getattr(self, "_voice_auto_join_active", None)
         if isinstance(active_routes, dict):
             active_routes.clear()
+        leaving_routes = getattr(self, "_voice_auto_join_leaving", None)
+        if isinstance(leaving_routes, set):
+            leaving_routes.clear()
         manual_pending = getattr(self, "_voice_manual_join_pending", None)
         if isinstance(manual_pending, set):
             manual_pending.clear()
@@ -3884,6 +3888,8 @@ class DiscordAdapter(BasePlatformAdapter):
         leave_tasks = getattr(self, "_voice_auto_join_leave_tasks", None)
         if not isinstance(leave_tasks, dict):
             return
+        if guild_id in getattr(self, "_voice_auto_join_leaving", set()):
+            return
         task = leave_tasks.pop(guild_id, None)
         if task and task is not asyncio.current_task():
             task.cancel()
@@ -3906,13 +3912,27 @@ class DiscordAdapter(BasePlatformAdapter):
         callback = self._voice_auto_join_callback
         if callback is None:
             logger.warning(
-                "Discord voice auto-join route matched guild %d, but the gateway "
-                "lifecycle callback is unavailable",
-                route.guild_id,
+                "Discord voice auto-join route matched, but the gateway lifecycle "
+                "callback is unavailable",
             )
             return False
         if route.guild_id in self._voice_manual_join_pending:
             return False
+        leave_task = self._voice_auto_join_leave_tasks.get(route.guild_id)
+        if (
+            route.guild_id in self._voice_auto_join_leaving
+            and leave_task is not None
+            and leave_task is not asyncio.current_task()
+        ):
+            try:
+                await asyncio.shield(leave_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Discord voice auto-leave completion failed before rejoin",
+                    exc_info=True,
+                )
         self._cancel_voice_auto_leave(route.guild_id)
         existing_client = self._voice_clients.get(route.guild_id)
         if existing_client is not None and existing_client.is_connected():
@@ -3921,16 +3941,27 @@ class DiscordAdapter(BasePlatformAdapter):
         async with self._voice_auto_join_locks.setdefault(route.guild_id, asyncio.Lock()):
             if route.guild_id in self._voice_manual_join_pending:
                 return False
-            if self._voice_auto_join_active.get(route.guild_id) == route.voice_channel_id:
+            existing_client = self._voice_clients.get(route.guild_id)
+            active_matches = (
+                self._voice_auto_join_active.get(route.guild_id)
+                == route.voice_channel_id
+            )
+            connected_matches = bool(
+                existing_client is not None
+                and existing_client.is_connected()
+                and getattr(getattr(existing_client, "channel", None), "id", None)
+                == route.voice_channel_id
+            )
+            if active_matches and connected_matches:
                 return True
+            if active_matches:
+                self._voice_auto_join_active.pop(route.guild_id, None)
             manual_generation = self._voice_manual_join_generation.get(route.guild_id, 0)
             try:
                 joined = bool(await callback("join", route, channel, member))
             except Exception:
                 logger.warning(
-                    "Discord voice auto-join failed for guild %d channel %d",
-                    route.guild_id,
-                    route.voice_channel_id,
+                    "Discord voice auto-join failed",
                     exc_info=True,
                 )
                 return False
@@ -3960,26 +3991,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 callback = self._voice_auto_join_callback
                 if callback is None:
                     return
+                self._voice_auto_join_leaving.add(route.guild_id)
                 left = bool(await callback("leave", route, channel, None))
                 if left:
                     self._voice_auto_join_active.pop(route.guild_id, None)
                 else:
                     logger.warning(
-                        "Discord voice auto-leave was not completed for guild %d "
-                        "channel %d",
-                        route.guild_id,
-                        route.voice_channel_id,
+                        "Discord voice auto-leave was not completed",
                     )
             except asyncio.CancelledError:
                 return
             except Exception:
                 logger.warning(
-                    "Discord voice auto-leave failed for guild %d channel %d",
-                    route.guild_id,
-                    route.voice_channel_id,
+                    "Discord voice auto-leave failed",
                     exc_info=True,
                 )
             finally:
+                self._voice_auto_join_leaving.discard(route.guild_id)
                 current = asyncio.current_task()
                 if self._voice_auto_join_leave_tasks.get(route.guild_id) is current:
                     self._voice_auto_join_leave_tasks.pop(route.guild_id, None)
@@ -4006,22 +4034,7 @@ class DiscordAdapter(BasePlatformAdapter):
             and before_channel != after_channel
         )
         if (joined or left or switched) and guild_id in self._voice_clients:
-            if joined:
-                state_change = f"joined {getattr(after_channel, 'name', 'unknown')}"
-            elif left:
-                state_change = f"left {getattr(before_channel, 'name', 'unknown')}"
-            else:
-                state_change = (
-                    f"moved {getattr(before_channel, 'name', 'unknown')} -> "
-                    f"{getattr(after_channel, 'name', 'unknown')}"
-                )
-            logger.info(
-                "Voice state: %s (%d) %s (guild %d)",
-                member.display_name,
-                member.id,
-                state_change,
-                guild_id,
-            )
+            logger.info("Voice state changed for a connected Discord session")
 
         if getattr(member, "bot", False):
             return
@@ -4058,22 +4071,18 @@ class DiscordAdapter(BasePlatformAdapter):
             channel = guild.get_channel(route.voice_channel_id) if guild else None
             if channel is None:
                 logger.warning(
-                    "Discord voice_auto_join route not found: guild=%d channel=%d",
-                    route.guild_id,
-                    route.voice_channel_id,
+                    "Discord voice_auto_join route target was not found",
                 )
                 continue
-            member = next(
-                (
-                    item
-                    for item in (getattr(channel, "members", None) or [])
-                    if not getattr(item, "bot", False)
-                    and getattr(item, "id", None) in route.trigger_user_ids
-                ),
-                None,
-            )
-            if member is not None:
-                await self._request_voice_auto_join(route, channel, member)
+            members = [
+                item
+                for item in (getattr(channel, "members", None) or [])
+                if not getattr(item, "bot", False)
+                and getattr(item, "id", None) in route.trigger_user_ids
+            ]
+            for member in members:
+                if await self._request_voice_auto_join(route, channel, member):
+                    break
 
     async def join_voice_channel(self, channel, *, move_existing: bool = True) -> bool:
         """Join a Discord voice channel. Returns True on success."""

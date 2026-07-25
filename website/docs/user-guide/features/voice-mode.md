@@ -395,7 +395,8 @@ When the bot is in a voice channel:
 
 - Transcripts appear in the text channel: `[Voice] @user: what you said`
 - Agent responses are sent as text in the channel AND spoken in the VC
-- The text channel is the one where `/voice join` was issued
+- Manual sessions use the text channel where `/voice join` was issued
+- Auto-joined sessions use the route's configured `text_channel_id`
 
 ### Echo Prevention
 

@@ -149,6 +149,10 @@ async def test_authorized_user_joins_exactly_once_on_duplicate_events():
     channel.members[:] = [member]
 
     await adapter._handle_voice_state_update(member, _state(None), _state(channel))
+    voice_client = MagicMock()
+    voice_client.is_connected.return_value = True
+    voice_client.channel = channel
+    adapter._voice_clients[100] = voice_client
     await adapter._handle_voice_state_update(member, _state(None), _state(channel))
 
     adapter._voice_auto_join_callback.assert_awaited_once()
@@ -170,6 +174,10 @@ async def test_concurrent_duplicate_join_events_start_one_session():
 
     async def delayed_join(*_args):
         await asyncio.sleep(0)
+        voice_client = MagicMock()
+        voice_client.is_connected.return_value = True
+        voice_client.channel = channel
+        adapter._voice_clients[100] = voice_client
         return True
 
     adapter._voice_auto_join_callback = AsyncMock(side_effect=delayed_join)
@@ -182,7 +190,7 @@ async def test_concurrent_duplicate_join_events_start_one_session():
 
 
 @pytest.mark.asyncio
-async def test_callback_error_is_contained_and_can_retry():
+async def test_callback_error_is_contained_and_can_retry(caplog):
     adapter = _adapter(_route_config())
     channel = _channel()
     member = _member(channel=channel)
@@ -192,6 +200,9 @@ async def test_callback_error_is_contained_and_can_retry():
     await adapter._handle_voice_state_update(member, _state(None), _state(channel))
 
     assert adapter._voice_auto_join_active == {}
+    assert "100" not in caplog.text
+    assert "200" not in caplog.text
+    assert "42" not in caplog.text
     adapter._voice_auto_join_callback = AsyncMock(return_value=True)
     await adapter._handle_voice_state_update(member, _state(None), _state(channel))
     adapter._voice_auto_join_callback.assert_awaited_once()
@@ -258,6 +269,52 @@ async def test_manual_join_claim_wins_over_in_flight_auto_join():
 
 
 @pytest.mark.asyncio
+async def test_reentry_waits_for_committed_auto_leave_then_reconnects():
+    adapter = _adapter(_route_config())
+    channel = _channel()
+    member = _member(channel=channel)
+    channel.members[:] = [member]
+    leave_started = asyncio.Event()
+    finish_leave = asyncio.Event()
+    join_count = 0
+
+    async def lifecycle(action, _route, actual_channel, _member):
+        nonlocal join_count
+        if action == "join":
+            join_count += 1
+            voice_client = MagicMock()
+            voice_client.is_connected.return_value = True
+            voice_client.channel = actual_channel
+            adapter._voice_clients[100] = voice_client
+            return True
+        adapter._voice_clients.pop(100, None)
+        leave_started.set()
+        await finish_leave.wait()
+        return True
+
+    adapter._voice_auto_join_callback = AsyncMock(side_effect=lifecycle)
+    await adapter._handle_voice_state_update(member, _state(None), _state(channel))
+
+    channel.members.clear()
+    await adapter._handle_voice_state_update(member, _state(channel), _state(None))
+    await leave_started.wait()
+
+    channel.members[:] = [member]
+    reentry = asyncio.create_task(
+        adapter._handle_voice_state_update(member, _state(None), _state(channel))
+    )
+    await asyncio.sleep(0)
+    assert reentry.done() is False
+
+    finish_leave.set()
+    await reentry
+
+    assert join_count == 2
+    assert adapter._voice_auto_join_active == {100: 200}
+    assert adapter._voice_clients[100].is_connected()
+
+
+@pytest.mark.asyncio
 async def test_inactivity_timeout_keeps_present_auto_join_trigger_connected(monkeypatch):
     adapter = _adapter(_route_config())
     channel = _channel()
@@ -320,13 +377,38 @@ async def test_startup_reconciliation_joins_when_trigger_is_already_present():
     member = _member(channel=channel)
     channel.members[:] = [member]
     guild = SimpleNamespace(id=100, get_channel=lambda channel_id: channel if channel_id == 200 else None)
-    adapter._client.get_guild.return_value = guild
+    client = MagicMock()
+    adapter._client = client
+    client.get_guild.return_value = guild
 
     await adapter.reconcile_voice_auto_join()
 
     adapter._voice_auto_join_callback.assert_awaited_once_with(
         "join", adapter._voice_auto_join_routes[0], channel, member
     )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_tries_later_trigger_when_first_is_rejected():
+    config = _route_config(trigger_user_ids=["42", "43"])
+    adapter = _adapter(config)
+    channel = _channel()
+    first = _member(user_id=42, channel=channel)
+    second = _member(user_id=43, channel=channel)
+    channel.members[:] = [first, second]
+    guild = SimpleNamespace(
+        id=100,
+        get_channel=lambda channel_id: channel if channel_id == 200 else None,
+    )
+    client = MagicMock()
+    adapter._client = client
+    client.get_guild.return_value = guild
+    adapter._voice_auto_join_callback = AsyncMock(side_effect=[False, True])
+
+    await adapter.reconcile_voice_auto_join()
+
+    assert adapter._voice_auto_join_callback.await_count == 2
+    assert adapter._voice_auto_join_active == {100: 200}
 
 
 @pytest.mark.asyncio

@@ -402,7 +402,8 @@ Use one route per guild. Invalid or incomplete routes are ignored rather than fa
 - Hermes detects speech boundaries
 - transcripts are posted in the associated text channel
 - Hermes responds in text and audio
-- the text channel is the one where `/voice join` was issued
+- manual sessions use the text channel where `/voice join` was issued
+- auto-joined sessions use the route's configured `text_channel_id`
 
 ### Best practices for Discord VC use
 

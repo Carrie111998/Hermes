@@ -38,6 +38,16 @@ class TestVoiceKeyHelper:
         assert key_slack == "slack:123"
         assert key_discord == "discord:123"
 
+    def test_voice_key_isolates_same_discord_chat_across_profiles(self):
+        runner = _make_runner()
+
+        default_key = runner._voice_key(Platform.DISCORD, "123")
+        profile_key = runner._voice_key(Platform.DISCORD, "123", "voice")
+
+        assert default_key == "discord:123"
+        assert profile_key == "profile:voice:discord:123"
+        assert default_key != profile_key
+
 
 class TestVoiceModePlatformIsolation:
     """Test that voice mode state is isolated by platform."""
@@ -178,6 +188,21 @@ class TestSyncVoiceModeStateToAdapter:
 
         # Old entries should be cleared
         assert mock_adapter._auto_tts_disabled_chats == {"123"}
+
+    def test_sync_secondary_profile_does_not_read_default_voice_state(self):
+        runner = _make_runner()
+        runner._voice_mode = {
+            "discord:123": "off",
+            "profile:voice:discord:456": "off",
+        }
+        mock_adapter = MagicMock()
+        mock_adapter.platform = Platform.DISCORD
+        mock_adapter._profile_name = "voice"
+        mock_adapter._auto_tts_disabled_chats = set()
+
+        runner._sync_voice_mode_state_to_adapter(mock_adapter)
+
+        assert mock_adapter._auto_tts_disabled_chats == {"456"}
 
     def test_sync_returns_early_without_platform(self):
         """_sync_voice_mode_state_to_adapter returns early if adapter has no platform."""

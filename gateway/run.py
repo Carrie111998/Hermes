@@ -3790,9 +3790,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
 
-    def _voice_key(self, platform: Platform, chat_id: str) -> str:
-        """Return a platform-namespaced key for voice mode state."""
+    def _voice_key(
+        self,
+        platform: Platform,
+        chat_id: str,
+        profile: Optional[str] = None,
+    ) -> str:
+        """Return a platform/profile-namespaced key for voice mode state."""
+        if profile:
+            return f"profile:{profile}:{platform.value}:{chat_id}"
         return f"{platform.value}:{chat_id}"
+
+    @staticmethod
+    def _adapter_profile_name(adapter) -> Optional[str]:
+        """Return a real named-profile binding, ignoring mock/foreign attributes."""
+        profile = getattr(adapter, "_profile_name", None)
+        if isinstance(profile, str) and profile.strip():
+            return profile
+        return None
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
@@ -3891,7 +3906,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hasattr(adapter, "_auto_tts_default"):
             adapter._auto_tts_default = _auto_tts_default
 
-        prefix = f"{platform.value}:"
+        profile = self._adapter_profile_name(adapter)
+        prefix = (
+            f"profile:{profile}:{platform.value}:"
+            if profile
+            else f"{platform.value}:"
+        )
         if isinstance(disabled_chats, set):
             disabled_chats.clear()
             disabled_chats.update(
@@ -10103,8 +10123,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 if success:
                     profile_map[platform] = adapter
-                    self._sync_voice_mode_state_to_adapter(adapter)
-                    await self._configure_voice_auto_join_adapter(adapter)
+                    with _profile_runtime_scope(profile_home):
+                        self._sync_voice_mode_state_to_adapter(adapter)
+                        await self._configure_voice_auto_join_adapter(adapter)
                     connected += 1
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
                 else:
@@ -10135,6 +10156,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
+        setattr(adapter, "_profile_name", profile_name)
         adapter._busy_text_mode = self._busy_text_mode
 
     async def _run_secondary_profile_reconnect(
@@ -10174,8 +10196,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         profile_map = self._profile_adapters.setdefault(profile_name, {})
                         if platform not in profile_map:
                             profile_map[platform] = adapter
-                            self._sync_voice_mode_state_to_adapter(adapter)
-                            await self._configure_voice_auto_join_adapter(adapter)
+                            with _profile_runtime_scope(profile_home):
+                                self._sync_voice_mode_state_to_adapter(adapter)
+                                await self._configure_voice_auto_join_adapter(adapter)
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,
@@ -15225,6 +15248,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _wire_discord_voice_callbacks(self, adapter) -> None:
         """Wire one Discord adapter into the shared voice pipeline."""
+        profile = self._adapter_profile_name(adapter)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = (
                 lambda guild_id, user_id, transcript: self._handle_voice_channel_input(
@@ -15232,10 +15256,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             )
         if hasattr(adapter, "_on_voice_disconnect"):
-            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+            adapter._on_voice_disconnect = lambda chat_id: self._handle_voice_timeout_cleanup(
+                chat_id, adapter=adapter
+            )
         if hasattr(adapter, "_voice_mode_getter"):
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
-                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+                self._voice_key(Platform.DISCORD, str(chat_id), profile), "off"
             )
 
     async def _join_discord_voice_channel(
@@ -15258,7 +15284,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not success:
             return False
 
-        voice_key = self._voice_key(source.platform, source.chat_id)
+        voice_key = self._voice_key(
+            source.platform, source.chat_id, source.profile
+        )
         previous_mode = self._voice_mode.get(voice_key)
         had_previous_mode = voice_key in self._voice_mode
         try:
@@ -15283,8 +15311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._save_voice_modes()
             except Exception:
                 logger.warning(
-                    "Failed to persist Discord voice-mode rollback for guild %s",
-                    guild_id,
+                    "Failed to persist Discord voice-mode rollback",
                     exc_info=True,
                 )
             try:
@@ -15293,16 +15320,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 logger.warning(
-                    "Failed to roll back Discord auto-TTS for guild %s",
-                    guild_id,
+                    "Failed to roll back Discord auto-TTS",
                     exc_info=True,
                 )
             try:
                 await adapter.leave_voice_channel(guild_id)
             except Exception:
                 logger.warning(
-                    "Failed to roll back Discord voice join for guild %s",
-                    guild_id,
+                    "Failed to roll back Discord voice join",
                     exc_info=True,
                 )
             raise
@@ -15318,12 +15343,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.leave_voice_channel(route.guild_id)
             except Exception:
                 logger.warning(
-                    "Failed to auto-leave Discord voice channel for guild %s",
-                    route.guild_id,
+                    "Failed to auto-leave Discord voice channel",
                     exc_info=True,
                 )
                 return False
-            self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
+            profile = self._adapter_profile_name(adapter)
+            self._voice_mode[
+                self._voice_key(Platform.DISCORD, chat_id, profile)
+            ] = "off"
             self._save_voice_modes()
             self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
             voice_clients = getattr(adapter, "_voice_clients", None)
@@ -15337,14 +15364,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_guild_id = getattr(getattr(text_channel, "guild", None), "id", None)
         if text_channel is None or text_guild_id != route.guild_id:
             logger.warning(
-                "Discord voice auto-join text channel not found in configured guild: "
-                "guild=%s channel=%s",
-                route.guild_id,
-                route.text_channel_id,
+                "Discord voice auto-join text channel was not found in the configured guild",
             )
             return False
 
-        profile = getattr(adapter, "_profile_name", None)
+        profile = self._adapter_profile_name(adapter)
         source = SessionSource(
             platform=Platform.DISCORD,
             chat_id=chat_id,
@@ -15357,9 +15381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if not self._is_user_authorized(source):
             logger.warning(
-                "Discord voice auto-join trigger user %s is not authorized by "
-                "the gateway access policy",
-                member.id,
+                "Discord voice auto-join trigger is not authorized by the gateway access policy",
             )
             return False
         try:
@@ -15372,8 +15394,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             logger.warning(
-                "Failed to auto-join Discord voice channel for guild %s",
-                route.guild_id,
+                "Failed to auto-join Discord voice channel",
                 exc_info=True,
             )
             return False
@@ -15384,11 +15405,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         routes = getattr(adapter, "_voice_auto_join_routes", ())
         if routes:
-            adapter._voice_auto_join_callback = (
-                lambda action, route, channel, member: self._handle_voice_auto_join(
+            async def _callback(action, route, channel, member):
+                profile = self._adapter_profile_name(adapter)
+                if profile:
+                    from hermes_cli.profiles import get_profile_dir
+
+                    with _profile_runtime_scope(get_profile_dir(profile)):
+                        return await self._handle_voice_auto_join(
+                            adapter, action, route, channel, member
+                        )
+                return await self._handle_voice_auto_join(
                     adapter, action, route, channel, member
                 )
-            )
+
+            adapter._voice_auto_join_callback = _callback
         reconcile = getattr(adapter, "reconcile_voice_auto_join", None)
         if callable(reconcile) and routes:
             try:
@@ -15466,21 +15496,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
         # Always clean up state even if leave raised an exception
-        self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
+        self._voice_mode[
+            self._voice_key(
+                event.source.platform,
+                event.source.chat_id,
+                event.source.profile,
+            )
+        ] = "off"
         self._save_voice_modes()
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
         return "Left voice channel."
 
-    def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
+    def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
         """Called by the adapter when a voice channel times out.
 
         Cleans up runner-side voice_mode state that the adapter cannot reach.
         """
-        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
+        profile = self._adapter_profile_name(adapter) if adapter is not None else None
+        self._voice_mode[
+            self._voice_key(Platform.DISCORD, chat_id, profile)
+        ] = "off"
         self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = adapter or self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
@@ -15614,7 +15653,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
+        voice_mode = self._voice_mode.get(
+            self._voice_key(
+                event.source.platform, chat_id, event.source.profile
+            ),
+            "off",
+        )
         is_voice_input = (event.message_type == MessageType.VOICE)
 
         should = (

@@ -907,6 +907,67 @@ class TestVoiceChannelCommands:
         adapter.reconcile_voice_auto_join.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_secondary_auto_join_uses_own_profile_authorization(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from gateway.config import Platform
+        from hermes_cli import profiles
+
+        profile_home = tmp_path / "profiles" / "voice"
+        profile_home.mkdir(parents=True)
+        (profile_home / ".env").write_text("DISCORD_ALLOWED_USERS=42\n")
+        monkeypatch.setenv("DISCORD_ALLOWED_USERS", "99")
+        monkeypatch.setattr(profiles, "get_profile_dir", lambda _name: profile_home)
+
+        route = SimpleNamespace(
+            guild_id=111,
+            voice_channel_id=222,
+            text_channel_id=333,
+            trigger_user_ids=frozenset({42, 99}),
+        )
+        text_channel = SimpleNamespace(
+            id=333,
+            name="general",
+            guild=SimpleNamespace(id=111),
+        )
+        adapter = MagicMock()
+        adapter.platform = Platform.DISCORD
+        adapter._voice_auto_join_routes = (route,)
+        adapter._voice_auto_join_callback = None
+        adapter.reconcile_voice_auto_join = AsyncMock()
+        adapter._client.get_channel.return_value = text_channel
+        runner._configure_profile_adapter(adapter, "voice", Platform.DISCORD)
+        from gateway.authz_mixin import GatewayAuthorizationMixin
+
+        runner._is_user_authorized = GatewayAuthorizationMixin._is_user_authorized.__get__(
+            runner, type(runner)
+        )
+        runner.pairing_store = None
+        runner.pairing_stores = {}
+        runner._multiplex_adapters = {"voice": {Platform.DISCORD: adapter}}
+        runner._join_discord_voice_channel = AsyncMock(return_value=True)
+
+        await runner._configure_voice_auto_join_adapter(adapter)
+
+        profile_member = SimpleNamespace(id=42, display_name="profile-user")
+        default_member = SimpleNamespace(id=99, display_name="default-user")
+        voice_channel = SimpleNamespace(id=222, name="Voice")
+        profile_allowed = await adapter._voice_auto_join_callback(
+            "join", route, voice_channel, profile_member
+        )
+        default_rejected = await adapter._voice_auto_join_callback(
+            "join", route, voice_channel, default_member
+        )
+
+        assert adapter._profile_name == "voice"
+        assert profile_allowed is True
+        assert default_rejected is False
+        runner._join_discord_voice_channel.assert_awaited_once()
+        source = runner._join_discord_voice_channel.await_args_list[0].args[2]
+        assert source.profile == "voice"
+        assert source.user_id == "42"
+
+    @pytest.mark.asyncio
     async def test_auto_join_uses_configured_text_channel_and_normal_voice_pipeline(self, runner):
         from gateway.config import Platform
 
@@ -1581,18 +1642,39 @@ class TestVoiceReceiverThreadSafety:
 class TestCallbackWiringOrder:
     """Verify callback is wired BEFORE join, not after."""
 
-    def test_callback_set_before_join(self):
+    @pytest.mark.asyncio
+    async def test_callback_set_before_join(self, tmp_path):
         """Shared manual/auto join path wires callback before connecting."""
-        import inspect
-        from gateway.run import GatewayRunner
+        from gateway.config import Platform
 
-        wiring = inspect.getsource(GatewayRunner._wire_discord_voice_callbacks)
-        source = inspect.getsource(GatewayRunner._join_discord_voice_channel)
-
-        assert "_voice_input_callback =" in wiring
-        assert source.index("self._wire_discord_voice_callbacks") < source.index(
-            "await adapter.join_voice_channel"
+        runner = _make_runner(tmp_path)
+        adapter = MagicMock()
+        adapter._voice_input_callback = None
+        adapter._on_voice_disconnect = None
+        adapter._voice_mode_getter = None
+        adapter._voice_text_channels = {}
+        adapter._voice_sources = {}
+        channel = SimpleNamespace(name="Voice")
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="333",
+            user_id="42",
         )
+
+        async def assert_wired_before_join(actual_channel):
+            assert actual_channel is channel
+            assert callable(adapter._voice_input_callback)
+            assert callable(adapter._on_voice_disconnect)
+            assert callable(adapter._voice_mode_getter)
+            return True
+
+        adapter.join_voice_channel = AsyncMock(side_effect=assert_wired_before_join)
+
+        joined = await runner._join_discord_voice_channel(
+            adapter, channel, source, 111
+        )
+
+        assert joined is True
 
     @pytest.mark.asyncio
     async def test_join_failure_clears_callback(self, tmp_path):
@@ -2132,6 +2214,18 @@ class TestVoiceTimeoutCleansRunnerState:
 
         assert runner._voice_mode["discord:999"] == "off", \
             "voice_mode must persist explicit off state after timeout cleanup"
+
+    def test_runner_cleanup_is_profile_scoped(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        runner._voice_mode["discord:999"] = "all"
+        runner._voice_mode["profile:voice:discord:999"] = "all"
+
+        profile_adapter = MagicMock()
+        profile_adapter._profile_name = "voice"
+        runner._handle_voice_timeout_cleanup("999", adapter=profile_adapter)
+
+        assert runner._voice_mode["discord:999"] == "all"
+        assert runner._voice_mode["profile:voice:discord:999"] == "off"
 
     @pytest.mark.asyncio
     async def test_timeout_without_callback_does_not_crash(self, adapter):

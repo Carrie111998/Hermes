@@ -2676,7 +2676,7 @@ class GatewaySlashCommandsMixin:
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
         platform = event.source.platform
-        voice_key = self._voice_key(platform, chat_id)
+        voice_key = self._voice_key(platform, chat_id, event.source.profile)
 
         adapter = self.adapters.get(platform)
 
