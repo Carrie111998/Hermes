@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
 from datetime import datetime, timedelta
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, canonicalize_hermes_path
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,11 @@ except ImportError:
 # profiles (the security boundary #4707 was filed for). Do NOT change this to
 # the default root: that re-breaks per-profile isolation. See also the dynamic
 # `_get_hermes_home()` / `_get_lock_paths()` resolution in cron/scheduler.py.
-HERMES_DIR = get_hermes_home().resolve()
+#
+# NOTE: intentionally no `.resolve()` here — get_hermes_home() already returns
+# an MSYS-unmangled path, and Path.resolve() would re-introduce the Windows
+# `C:\c\...` mangling this fix removes (see normalize_windows_msys_path).
+HERMES_DIR = get_hermes_home()
 # These constants remain the default-profile fallback and a compatibility
 # surface for existing callers/tests. Cross-profile callers must scope paths
 # with use_cron_store() instead of mutating them process-wide.
@@ -146,7 +150,12 @@ def _current_cron_store() -> _CronStorePaths:
     live_constants = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
     if live_constants != _IMPORT_STORE:
         return live_constants
-    home = get_hermes_home().resolve()
+    # Compare against HERMES_DIR the same way it was built (get_hermes_home(),
+    # no .resolve()): get_hermes_home() already returns an MSYS-unmangled path,
+    # and Path.resolve() would both re-mangle it on Windows and desync this
+    # equality check from HERMES_DIR (e.g. /var vs /private/var on macOS),
+    # spuriously recomputing the store for an unchanged home.
+    home = get_hermes_home()
     if home == HERMES_DIR:
         return live_constants
     cron_dir = home / "cron"
@@ -156,7 +165,10 @@ def _current_cron_store() -> _CronStorePaths:
 @contextlib.contextmanager
 def use_cron_store(home: Union[str, Path]):
     """Route cron storage to ``home`` without mutating process globals."""
-    cron_dir = Path(home).expanduser().resolve() / "cron"
+    # canonicalize_hermes_path (not Path.resolve()) so a raw MSYS ``/c/...``
+    # profile home is unmangled to its native tree instead of re-mangled to
+    # ``C:\c\...`` on Windows; POSIX keeps the historical resolve() behavior.
+    cron_dir = canonicalize_hermes_path(home) / "cron"
     token = _cron_store_override.set(
         _CronStorePaths(
             cron_dir=cron_dir,

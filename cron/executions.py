@@ -19,7 +19,11 @@ from typing import Any, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+# NOTE: intentionally no `.resolve()` — get_hermes_home() already returns an
+# MSYS-unmangled native path, and Path.resolve() would re-introduce the Windows
+# `C:\c\...` mangling this fix removes, splitting the execution ledger away from
+# the co-located jobs.json/suggestions.json (mirrors cron/jobs.py's HERMES_DIR).
+EXECUTIONS_FILE = get_hermes_home() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()

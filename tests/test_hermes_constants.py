@@ -1,5 +1,6 @@
 """Tests for hermes_constants module."""
 
+import ntpath
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import hermes_constants
 from hermes_constants import (
     VALID_REASONING_EFFORTS,
     agent_browser_runnable,
+    canonicalize_hermes_path,
     find_hermes_node_executable,
     find_node_executable,
     find_node_executable_on_path,
@@ -22,6 +24,7 @@ from hermes_constants import (
     iter_hermes_node_dirs,
     is_container,
     node_tool_runnable,
+    normalize_windows_msys_path,
     parse_reasoning_effort,
     reset_hermes_home_override,
     secure_parent_dir,
@@ -103,6 +106,21 @@ class TestGetDefaultHermesRoot:
 
         assert get_default_hermes_root() == home / "AppData" / "Local" / "hermes"
 
+    def test_windows_platform_simulation_preserves_posix_profile_root(self, tmp_path, monkeypatch):
+        """A POSIX fixture path must not be reinterpreted through ntpath.
+
+        Several cross-platform tests switch ``sys.platform`` to ``win32`` while
+        retaining the host's POSIX ``HERMES_HOME``. The root resolver must keep
+        that absolute path usable instead of converting it to a relative string
+        containing backslashes.
+        """
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "coder"
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        assert get_default_hermes_root() == root
+
 
 class TestGetHermesHome:
     """Tests for get_hermes_home() platform-aware fallback."""
@@ -117,6 +135,137 @@ class TestGetHermesHome:
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
 
         assert get_hermes_home() == local_appdata / "hermes"
+
+    def test_windows_hermes_home_translates_raw_msys_env(self, monkeypatch):
+        # A raw MSYS/git-bash HERMES_HOME (/c/...) is unambiguously an MSYS drive
+        # mount and is translated to the native tree.
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
+        monkeypatch.setenv("HERMES_HOME", "/c/Users/kevin/AppData/Local/hermes")
+
+        assert str(get_hermes_home()) == r"C:\Users\kevin\AppData\Local\hermes"
+
+    def test_windows_hermes_home_preserves_legit_duplicate_drive_segment(self, monkeypatch):
+        # A legitimate native ``C:\c\...`` directory is indistinguishable from a
+        # mangled path, so it must NOT be rewritten (regression for the reviewer's
+        # ``C:\c\work`` corruption case).
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
+        monkeypatch.setenv("HERMES_HOME", r"C:\c\work\hermes")
+
+        assert ntpath.normpath(str(get_hermes_home())) == r"C:\c\work\hermes"
+
+    def test_windows_default_home_translates_raw_msys_localappdata(self, monkeypatch):
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
+        monkeypatch.setenv("LOCALAPPDATA", "/c/Users/kevin/AppData/Local")
+
+        assert str(get_hermes_home()) == r"C:\Users\kevin\AppData\Local\hermes"
+
+
+class TestNormalizeWindowsMsysPath:
+    def test_preserves_legit_duplicate_drive_segment_on_windows(self, monkeypatch):
+        # ``C:\c\...`` is a valid native directory and cannot be safely
+        # distinguished from a path some API mangled, so it is preserved
+        # byte-for-byte rather than collapsed to ``C:\...`` (the corruption the
+        # reviewer flagged).
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        assert str(normalize_windows_msys_path(r"C:\c\work")) == r"C:\c\work"
+        assert (
+            str(normalize_windows_msys_path(r"C:\c\Users\kevin\AppData\Local\hermes"))
+            == r"C:\c\Users\kevin\AppData\Local\hermes"
+        )
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("/c/Users/kevin/AppData/Local/hermes", r"C:\Users\kevin\AppData\Local\hermes"),
+            ("/C/Users/kevin/AppData/Local/hermes", r"C:\Users\kevin\AppData\Local\hermes"),
+            ("/cygdrive/c/Users/kevin/AppData/Local/hermes", r"C:\Users\kevin\AppData\Local\hermes"),
+            ("/mnt/c/Users/kevin/AppData/Local/hermes", r"C:\Users\kevin\AppData\Local\hermes"),
+            ("/d/data", r"D:\data"),
+            ("/c", "C:\\"),
+        ],
+    )
+    def test_translates_raw_msys_paths_on_windows(self, raw, expected, monkeypatch):
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        result = normalize_windows_msys_path(raw)
+
+        assert str(result) == expected
+
+    def test_preserves_regular_windows_path(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        result = normalize_windows_msys_path(r"C:\cache\hermes")
+
+        assert str(result) == r"C:\cache\hermes"
+
+    def test_preserves_non_windows_path(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants.sys, "platform", "linux")
+
+        result = normalize_windows_msys_path("/c/Users/kevin/.hermes")
+
+        assert result == Path("/c/Users/kevin/.hermes")
+
+    def test_canonicalize_preserves_legit_duplicate_drive_without_resolve(self, monkeypatch):
+        # canonicalize_hermes_path must never invoke Path.resolve() on Windows
+        # (it can re-mangle) and must preserve a legitimate ``C:\c\...`` path.
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        def fail_resolve(*_args, **_kwargs):
+            raise AssertionError("Path.resolve must not run for Windows Hermes paths")
+
+        monkeypatch.setattr(Path, "resolve", fail_resolve)
+
+        assert ntpath.normpath(str(canonicalize_hermes_path(r"C:\c\work\hermes"))) == r"C:\c\work\hermes"
+        assert (
+            ntpath.normpath(str(canonicalize_hermes_path("/c/Users/kevin/.hermes")))
+            == r"C:\Users\kevin\.hermes"
+        )
+
+    def test_canonicalize_absolutizes_relative_path_against_cwd_on_windows(self, monkeypatch):
+        # The relative-path branch must absolutize against the process cwd on
+        # Windows (parity with the POSIX resolve() path). Force a drive-qualified
+        # cwd so the branch runs deterministically regardless of test host.
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setattr(hermes_constants.os, "getcwd", lambda: r"C:\work")
+
+        assert (
+            ntpath.normpath(str(canonicalize_hermes_path(r"profiles\coder")))
+            == r"C:\work\profiles\coder"
+        )
+
+    def test_default_root_preserves_native_duplicate_drive_profile(self, monkeypatch):
+        # A native ``C:\c\...`` profile path under LOCALAPPDATA: the duplicate
+        # drive segment is preserved and no Path.resolve() corruption occurs.
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\c\work\AppData\Local")
+        monkeypatch.setenv("HERMES_HOME", r"C:\c\work\AppData\Local\hermes\profiles\coder")
+
+        assert (
+            ntpath.normpath(str(get_default_hermes_root()))
+            == r"C:\c\work\AppData\Local\hermes"
+        )
+
+    def test_default_root_handles_raw_msys_profile_path(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("LOCALAPPDATA", "/c/Users/kevin/AppData/Local")
+        monkeypatch.setenv("HERMES_HOME", "/c/Users/kevin/AppData/Local/hermes/profiles/coder")
+
+        assert str(get_default_hermes_root()) == r"C:\Users\kevin\AppData\Local\hermes"
+
+    def test_default_root_strips_profiles_for_custom_windows_deploy(self, monkeypatch):
+        # Docker/custom deployment outside LOCALAPPDATA: <root>/profiles/<name>
+        # resolves to <root> via ntpath string ops, not PurePosixPath.parent
+        # (which would miss the "profiles" segment in a backslash path).
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\kevin\AppData\Local")
+        monkeypatch.setenv("HERMES_HOME", r"C:\opt\data\profiles\coder")
+
+        assert ntpath.normpath(str(get_default_hermes_root())) == r"C:\opt\data"
 
 
 class TestGetProcessHermesHome:

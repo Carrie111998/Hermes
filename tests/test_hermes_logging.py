@@ -1,6 +1,7 @@
 """Tests for hermes_logging — centralized logging setup."""
 import io
 import logging
+import ntpath
 import os
 import stat
 import sys
@@ -694,6 +695,47 @@ class TestAddRotatingHandler:
             if isinstance(h, RotatingFileHandler):
                 logger.removeHandler(h)
                 h.close()
+
+    def test_rotating_path_key_translates_raw_msys_drive_segment(self, monkeypatch):
+        monkeypatch.setattr(hermes_logging.sys, "platform", "win32")
+
+        key = hermes_logging._rotating_path_key(
+            "/c/Users/kevin/AppData/Local/hermes/logs/agent.log"
+        )
+
+        assert key == r"c:\users\kevin\appdata\local\hermes\logs\agent.log"
+
+    def test_rotating_path_key_preserves_legit_duplicate_drive_segment(self, monkeypatch):
+        # A legitimate ``C:\c\...`` log path is case-folded but NOT collapsed —
+        # regression for the reviewer's ``C:\c\work`` corruption case.
+        monkeypatch.setattr(hermes_logging.sys, "platform", "win32")
+
+        key = hermes_logging._rotating_path_key(r"C:\c\work\hermes\logs\agent.log")
+
+        assert key == ntpath.normcase(r"C:\c\work\hermes\logs\agent.log")
+
+    def test_handler_restores_requested_path_after_abspath_mangling(self, monkeypatch):
+        # RotatingFileHandler.__init__ runs os.path.abspath(), which from an MSYS
+        # launch can mangle the path to C:\c\... The handler rebuilds baseFilename
+        # from the caller's requested path rather than trusting the mangled value
+        # (the ambiguous C:\c\... form can't be safely un-mangled after the fact).
+        requested = r"C:\Users\kevin\.hermes\logs\agent.log"
+        mangled = r"C:\c\Users\kevin\.hermes\logs\agent.log"
+        monkeypatch.setattr(hermes_logging.sys, "platform", "win32")
+        monkeypatch.setattr(hermes_logging.os.path, "abspath", lambda _path: mangled)
+
+        with patch("hermes_cli.config.is_managed", return_value=False):
+            handler = hermes_logging._ManagedRotatingFileHandler(
+                requested,
+                maxBytes=1024,
+                backupCount=1,
+                encoding="utf-8",
+                delay=True,
+            )
+        try:
+            assert ntpath.normpath(handler.baseFilename) == requested
+        finally:
+            handler.close()
 
     def test_log_filter_attached(self, tmp_path):
         """Optional log_filter is attached to the handler."""

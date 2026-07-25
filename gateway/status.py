@@ -24,7 +24,12 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    _get_platform_default_hermes_home,
+    normalize_windows_msys_path,
+    canonicalize_hermes_path,
+)
 from typing import Any, Callable, NamedTuple, Optional
 from utils import atomic_json_write
 
@@ -139,13 +144,20 @@ def _get_process_hermes_home() -> Path:
     """
     val = os.environ.get("HERMES_HOME", "").strip()
     if val:
-        return Path(val)
+        # Unmangle a raw MSYS/git-bash ``/c/...`` HERMES_HOME so PID/lock/status
+        # identity files land in the same native tree the rest of Hermes uses.
+        return normalize_windows_msys_path(val)
     return _get_platform_default_hermes_home()
 
 
 def _canonical_hermes_home(path: Path | str) -> Path:
-    """Return a stable absolute HERMES_HOME path for persisted identity data."""
-    return Path(path).expanduser().resolve(strict=False)
+    """Return a stable absolute HERMES_HOME path for persisted identity data.
+
+    Delegates to :func:`canonicalize_hermes_path` so native Windows avoids
+    ``Path.resolve()`` (which can re-mangle a raw MSYS path into ``C:\\c\\...``)
+    while POSIX keeps the historical ``expanduser().resolve()`` behavior.
+    """
+    return canonicalize_hermes_path(path)
 
 
 def _same_hermes_home(left: Path | str, right: Path | str) -> bool:

@@ -7,6 +7,7 @@ HERMES_HOME so the real suggestions.json is never touched.
 
 import importlib
 import json
+import ntpath
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +26,45 @@ def store(tmp_path, monkeypatch):
     import cron.suggestions as s
     importlib.reload(s)
     return s
+
+
+def test_windows_suggestion_store_translates_raw_msys_home(monkeypatch):
+    # cron/suggestions anchors CRON_DIR on get_hermes_home(); a raw MSYS
+    # ``/c/...`` HERMES_HOME must be unmangled (and not re-mangled by resolve()).
+    import cron.suggestions as suggestions
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_HOME", "/c/Users/kevin/.hermes")
+    try:
+        reloaded = importlib.reload(suggestions)
+        assert ntpath.normpath(str(reloaded.CRON_DIR)) == r"C:\Users\kevin\.hermes\cron"
+        assert ntpath.normpath(str(reloaded.SUGGESTIONS_FILE)) == (
+            r"C:\Users\kevin\.hermes\cron\suggestions.json"
+        )
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        importlib.reload(suggestions)
+
+
+def test_windows_suggestion_store_preserves_legit_duplicate_drive_home(monkeypatch):
+    # A legitimate native ``C:\c\...`` HERMES_HOME is preserved, not collapsed
+    # (regression for the reviewer's ``C:\c\work`` corruption case).
+    import cron.suggestions as suggestions
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_HOME", r"C:\c\work\hermes")
+    try:
+        reloaded = importlib.reload(suggestions)
+        assert ntpath.normpath(str(reloaded.CRON_DIR)) == r"C:\c\work\hermes\cron"
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        importlib.reload(suggestions)
 
 
 def _add(store, key="k1", title="Test", source="catalog", schedule="0 9 * * *"):

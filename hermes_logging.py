@@ -31,6 +31,7 @@ import atexit
 import copy
 import io
 import logging
+import ntpath
 import os
 import queue
 import sys
@@ -69,7 +70,7 @@ else:
     from logging.handlers import RotatingFileHandler  # noqa: E402
 
 
-from hermes_constants import get_config_path, get_hermes_home
+from hermes_constants import get_config_path, get_hermes_home, normalize_windows_msys_path
 
 # Sentinel to track whether setup_logging() has already run.  The function
 # is idempotent — calling it twice is safe but the second call is a no-op
@@ -437,10 +438,21 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         rotating handlers.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, filename, *args, **kwargs):
         from hermes_cli.config import is_managed
         self._managed = is_managed()
-        super().__init__(*args, **kwargs)
+        requested_delay = kwargs.pop("delay", False)
+        super().__init__(filename, *args, delay=True, **kwargs)
+        if sys.platform == "win32":
+            # RotatingFileHandler.__init__ runs os.path.abspath(), which from an
+            # MSYS/git-bash launch can mangle a raw ``/c/...`` (or already-native
+            # path) into a duplicate-drive ``C:\c\...``. That form is ambiguous
+            # and cannot be safely un-mangled, so rebuild baseFilename from the
+            # caller's originally requested path (only MSYS drive forms are
+            # translated) instead of trusting the post-abspath value.
+            self.baseFilename = str(normalize_windows_msys_path(filename))
+        if not requested_delay:
+            self.stream = self._open()
         # Snapshot the inode of the currently open stream so emit() can
         # detect external rotation without an extra fstat per write.
         self._stat_dev: Optional[int] = None
@@ -737,11 +749,12 @@ def _add_rotating_handler(
         Optional filter to attach to the handler (e.g. ``_ComponentFilter``
         for gateway.log).
     """
-    resolved = path.resolve()
+    path = normalize_windows_msys_path(path)
+    resolved = _rotating_path_key(path)
     for existing in _queued_file_handlers:
         if (
             isinstance(existing, RotatingFileHandler)
-            and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
+            and _rotating_path_key(getattr(existing, "baseFilename", "")) == resolved
         ):
             return  # already attached
 
@@ -757,6 +770,14 @@ def _add_rotating_handler(
     # Route through the async queue instead of ``logger.addHandler(handler)`` so
     # the rotation-lock wait never runs on the caller's (often event-loop) thread.
     _register_queued_handler(handler)
+
+
+def _rotating_path_key(path: str | Path) -> str:
+    """Return a stable path key without invoking Windows ``Path.resolve()``."""
+    normalized = normalize_windows_msys_path(path)
+    if sys.platform == "win32":
+        return ntpath.normcase(ntpath.normpath(str(normalized)))
+    return str(Path(normalized).resolve())
 
 
 def _read_logging_config():

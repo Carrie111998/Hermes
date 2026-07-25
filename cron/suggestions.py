@@ -45,7 +45,11 @@ logger = logging.getLogger(__name__)
 # Per-profile by design (issue #4707): suggestions live alongside the active
 # profile's cron store. Anchor on get_hermes_home() (profile home), not the
 # shared default root. See cron/jobs.py for the full rationale.
-CRON_DIR = get_hermes_home().resolve() / "cron"
+#
+# NOTE: intentionally no `.resolve()` — get_hermes_home() already returns an
+# MSYS-unmangled native path, and Path.resolve() would re-introduce the Windows
+# `C:\c\...` mangling this fix removes (mirrors cron/jobs.py's HERMES_DIR).
+CRON_DIR = get_hermes_home() / "cron"
 SUGGESTIONS_FILE = CRON_DIR / "suggestions.json"
 
 # In-process lock protecting load->modify->save cycles (the background review

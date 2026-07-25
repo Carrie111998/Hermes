@@ -4,7 +4,9 @@ Import-safe module with no dependencies — can be imported from anywhere
 without risk of circular imports.
 """
 
+import ntpath
 import os
+import re
 import shutil
 import stat
 import sys
@@ -47,8 +49,86 @@ def _get_platform_default_hermes_home() -> Path:
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
         base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-        return base / "hermes"
+        return normalize_windows_msys_path(base / "hermes")
     return Path.home() / ".hermes"
+
+
+_MSYS_DRIVE_PATH_RE = re.compile(
+    r"^/(?:([A-Za-z])|(?:cygdrive|mnt)/([A-Za-z]))(?:/(.*))?$"
+)
+
+
+def normalize_windows_msys_path(path: str | Path) -> Path:
+    """Translate unambiguous MSYS/git-bash drive paths to native Windows paths.
+
+    Native CPython launched from git-bash/MSYS can receive a Hermes path as
+    ``/c/...``, ``/cygdrive/c/...``, or ``/mnt/c/...``.  These are how MSYS
+    surfaces a Windows drive, so they are translated to the ``C:\\...`` form
+    without any filesystem access.  (A bare leading ``/c/...`` is technically
+    drive-relative-root syntax on Windows, but Hermes never intends that form —
+    treating it as an MSYS mount is the correct, unambiguous default here.)
+
+    Already-native paths are preserved byte-for-byte.  In particular a
+    legitimate ``C:\\c\\work`` directory is *not* rewritten: it cannot be
+    structurally distinguished from a value some other API mangled, so guessing
+    here would corrupt a valid path.  Callers that must undo a stdlib transform
+    (e.g. ``os.path.abspath`` inserting a duplicate drive component) instead keep
+    their originally requested path and restore it — see
+    ``hermes_logging._ManagedRotatingFileHandler`` and
+    :func:`canonicalize_hermes_path`.
+    """
+    if sys.platform != "win32":
+        return Path(path)
+
+    raw = os.fspath(path)
+    match = _MSYS_DRIVE_PATH_RE.match(raw.replace("\\", "/"))
+    if not match:
+        return Path(path)
+
+    drive = (match.group(1) or match.group(2)).upper()
+    rest = (match.group(3) or "").replace("/", "\\")
+    return Path(f"{drive}:\\{rest}" if rest else f"{drive}:\\")
+
+
+def canonicalize_hermes_path(path: str | Path) -> Path:
+    """Return a stable absolute Hermes path without Windows path-mangling.
+
+    ``Path.resolve()`` / ``os.path.abspath()`` are deliberately avoided on native
+    Windows: from an MSYS/git-bash launch they can re-introduce the duplicate
+    ``C:\\c\\...`` drive component this module guards against (a raw ``/c/...``
+    fed to ``abspath`` becomes ``C:\\c\\...``).  MSYS drive forms are first
+    translated by :func:`normalize_windows_msys_path`; on Windows the result is
+    then normalized lexically with ``ntpath`` (no filesystem access), while POSIX
+    keeps the historical ``resolve()`` behavior byte-for-byte.
+    """
+    normalized = normalize_windows_msys_path(path)
+    if sys.platform != "win32":
+        return normalized.expanduser().resolve(strict=False)
+
+    raw = ntpath.expanduser(os.fspath(normalized))
+    # A simulated/foreign POSIX-rooted path (e.g. test fixtures, or a mount that
+    # is not an MSYS drive) is left lexically intact rather than being bound to
+    # the current drive. Real MSYS drive mounts were already translated above.
+    if raw.startswith("/"):
+        return Path(raw)
+    if not ntpath.isabs(raw):
+        cwd = os.fspath(normalize_windows_msys_path(os.getcwd()))
+        if ntpath.isabs(cwd):
+            raw = ntpath.join(cwd, raw)
+    return Path(ntpath.normpath(raw))
+
+
+def _is_relative_to_path(path: Path, base: Path) -> bool:
+    """Return True when *path* is inside *base* without resolving Windows paths."""
+    if sys.platform == "win32":
+        path_key = ntpath.normcase(ntpath.normpath(str(normalize_windows_msys_path(path))))
+        base_key = ntpath.normcase(ntpath.normpath(str(normalize_windows_msys_path(base))))
+        return path_key == base_key or path_key.startswith(base_key.rstrip("\\/") + "\\")
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def _hermes_home_from_env() -> Path:
@@ -59,10 +139,14 @@ def _hermes_home_from_env() -> Path:
     :func:`set_hermes_home_override`, so this reflects the process/launch
     scope rather than a per-task profile.  Shared by :func:`get_hermes_home`
     and :func:`get_process_hermes_home` so the two never drift.
+
+    On native Windows the ``HERMES_HOME`` value is passed through
+    :func:`normalize_windows_msys_path` so an MSYS-mangled ``C:\\c\\...`` value
+    resolves to the same tree as the platform default (which normalizes too).
     """
     val = os.environ.get("HERMES_HOME", "").strip()
     if val:
-        return Path(val)
+        return normalize_windows_msys_path(val)
     return _get_platform_default_hermes_home()
 
 
@@ -123,7 +207,7 @@ def get_hermes_home() -> Path:
     """
     override = get_hermes_home_override()
     if override:
-        return Path(override)
+        return normalize_windows_msys_path(override)
 
     if not os.environ.get("HERMES_HOME", "").strip():
         _warn_profile_fallback_once()
@@ -167,22 +251,44 @@ def get_default_hermes_root() -> Path:
 
     Import-safe — no dependencies beyond stdlib.
     """
-    native_home = _get_platform_default_hermes_home()
+    native_home = normalize_windows_msys_path(_get_platform_default_hermes_home())
     env_home = os.environ.get("HERMES_HOME", "")
     if not env_home:
         return native_home
-    env_path = Path(env_home)
-    try:
-        env_path.resolve().relative_to(native_home.resolve())
+    env_path = normalize_windows_msys_path(env_home)
+    if _is_relative_to_path(env_path, native_home):
         # HERMES_HOME is under ~/.hermes (normal or profile mode)
         return native_home
-    except ValueError:
-        pass
 
     # Docker / custom deployment.
     # Check if this is a profile path: <root>/profiles/<name>
     # If the immediate parent dir is named "profiles", the root is
     # the grandparent — this covers Docker profiles correctly.
+    #
+    # On native Windows use ntpath string ops rather than PurePath.parent:
+    # a native ``C:\\...\\profiles\\coder`` value is a single backslash
+    # component to PurePosixPath (the parser used off-Windows), so .parent
+    # would silently miss the "profiles" segment.
+    #
+    # Cross-platform tests may simulate ``sys.platform == "win32"`` while
+    # retaining an actual POSIX absolute HERMES_HOME. ``Path`` still has the
+    # host flavour in that process, so keep that path in its native flavour;
+    # feeding it through ntpath would turn ``/tmp/...`` into a relative
+    # ``\\tmp\\...`` path and make existing profiles disappear. On a real
+    # WindowsPath, a drive-less rooted path is not ``is_absolute()``, so this
+    # branch is naturally limited to foreign/simulated POSIX paths.
+    if sys.platform == "win32" and env_path.is_absolute() and not env_path.drive:
+        if env_path.parent.name == "profiles":
+            return env_path.parent.parent
+        return env_path
+
+    if sys.platform == "win32":
+        raw = ntpath.normpath(str(env_path))
+        parent = ntpath.dirname(raw)
+        if ntpath.basename(parent).lower() == "profiles":
+            return Path(ntpath.dirname(parent))
+        return Path(raw)
+
     if env_path.parent.name == "profiles":
         return env_path.parent.parent
 
@@ -697,7 +803,7 @@ def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
     hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
     if not hermes_home:
         return None
-    profile_home = os.path.join(hermes_home, "home")
+    profile_home = os.path.join(str(normalize_windows_msys_path(hermes_home)), "home")
     if os.path.isdir(profile_home):
         return profile_home
     return None

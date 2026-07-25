@@ -1,5 +1,7 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import importlib
+import ntpath
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,80 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
 )
+
+
+def test_cron_paths_preserve_legit_duplicate_drive_home(monkeypatch):
+    # A legitimate native ``C:\c\...`` HERMES_HOME must NOT be collapsed to
+    # ``C:\...`` (regression for the reviewer's ``C:\c\work`` corruption case).
+    import cron.jobs as jobs_mod
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_HOME", r"C:\c\work\hermes")
+
+    reloaded = importlib.reload(jobs_mod)
+    try:
+        assert ntpath.normpath(str(reloaded.HERMES_DIR)) == r"C:\c\work\hermes"
+        assert ntpath.normpath(str(reloaded.JOBS_FILE)) == (
+            r"C:\c\work\hermes\cron\jobs.json"
+        )
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        importlib.reload(jobs_mod)
+
+
+def test_use_cron_store_translates_raw_msys_profile_home(monkeypatch):
+    # use_cron_store() must MSYS-unmangle a raw ``/c/...`` profile home rather
+    # than re-mangling it via Path.resolve() on Windows.
+    import cron.jobs as jobs_mod
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    try:
+        with jobs_mod.use_cron_store("/c/Users/kevin/.hermes/profiles/coder"):
+            store = jobs_mod._current_cron_store()
+            assert ntpath.normpath(str(store.jobs_file)) == (
+                r"C:\Users\kevin\.hermes\profiles\coder\cron\jobs.json"
+            )
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+
+
+def test_use_cron_store_preserves_legit_duplicate_drive_home(monkeypatch):
+    import cron.jobs as jobs_mod
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    try:
+        with jobs_mod.use_cron_store(r"C:\c\work\hermes\profiles\coder"):
+            store = jobs_mod._current_cron_store()
+            assert ntpath.normpath(str(store.cron_dir)) == (
+                r"C:\c\work\hermes\profiles\coder\cron"
+            )
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+
+
+def test_cron_paths_translate_raw_msys_hermes_home(monkeypatch):
+    import cron.jobs as jobs_mod
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_HOME", "/c/Users/kevin/AppData/Local/hermes")
+
+    reloaded = importlib.reload(jobs_mod)
+    try:
+        assert str(reloaded.HERMES_DIR) == r"C:\Users\kevin\AppData\Local\hermes"
+        assert "/c/Users" not in str(reloaded.JOBS_FILE)
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        importlib.reload(jobs_mod)
 
 
 # =========================================================================
