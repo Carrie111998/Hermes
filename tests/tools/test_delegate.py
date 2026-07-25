@@ -1874,6 +1874,67 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         result = _resolve_child_credential_pool(None, parent)
         self.assertIs(result, mock_pool)
 
+    def test_same_provider_fixed_proxy_does_not_load_default_pool(self):
+        parent = _make_mock_parent()
+        parent.provider = "anthropic"
+        parent.base_url = "http://127.0.0.1:8080/v1"
+        parent.api_key = "proxy-key"
+        parent._client_kwargs = {
+            "base_url": parent.base_url,
+            "api_key": parent.api_key,
+        }
+        parent._credential_pool = None
+
+        provider_pool = MagicMock()
+        provider_pool.has_credentials.return_value = True
+        with patch(
+            "agent.credential_pool.load_pool", return_value=provider_pool
+        ) as load_pool:
+            result = _resolve_child_credential_pool(
+                "anthropic", parent, parent.base_url
+            )
+
+        self.assertIsNone(result)
+        load_pool.assert_not_called()
+
+    def test_build_child_agent_keeps_same_provider_fixed_proxy_bundle(self):
+        parent = _make_mock_parent()
+        parent.provider = "anthropic"
+        parent.base_url = "https://api.anthropic.com"
+        parent.api_key = None
+        parent._client_kwargs = {
+            "base_url": "http://127.0.0.1:8080/v1",
+            "api_key": "proxy-key",
+        }
+        parent._credential_pool = None
+
+        provider_pool = MagicMock(name="default_anthropic_pool")
+        provider_pool.has_credentials.return_value = True
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "agent.credential_pool.load_pool", return_value=provider_pool
+        ) as load_pool:
+            child = MagicMock()
+            child._credential_pool = None
+            MockAgent.return_value = child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Use the parent's active Anthropic proxy",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "anthropic")
+        self.assertEqual(kwargs["base_url"], "http://127.0.0.1:8080/v1")
+        self.assertEqual(kwargs["api_key"], "proxy-key")
+        self.assertIsNone(child._credential_pool)
+        load_pool.assert_not_called()
+
     def test_different_provider_loads_own_pool(self):
         parent = _make_mock_parent()
         parent._credential_pool = MagicMock()

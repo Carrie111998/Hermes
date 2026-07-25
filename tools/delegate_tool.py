@@ -3181,7 +3181,11 @@ def _resolve_child_credential_pool(
             )
         return None
 
-    if parent_pool is not None and effective_provider == parent_provider:
+    if effective_provider == parent_provider:
+        # A same-provider parent with no pool is using a fixed credential
+        # bundle (for example a local proxy base URL + proxy key). Loading the
+        # provider's default pool here would overwrite that inherited endpoint
+        # and key on the child. Keep the fixed credential by returning None.
         return parent_pool
 
     try:
