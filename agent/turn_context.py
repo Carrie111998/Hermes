@@ -329,6 +329,7 @@ class TurnContext:
     preflight_compression_blocked: bool = False
     # Retrieved semantic skills context (appended to user message dynamically per-turn).
     retrieved_skills_context: str = ""
+    preflight_compression_blocked: bool = False
 
 
 def build_turn_context(
@@ -1290,6 +1291,8 @@ def build_turn_context(
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
 
+    _preflight_compression_blocked = False
+
     return TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
@@ -1304,4 +1307,5 @@ def build_turn_context(
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
         retrieved_skills_context=retrieved_skills_context,
+        preflight_compression_blocked=_preflight_compression_blocked,
     )
