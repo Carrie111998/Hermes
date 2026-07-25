@@ -621,7 +621,13 @@ def build_package(revision: str, sender_revision: str) -> RailPackage:
     sender_python = sender_release / ".venv/bin/python"
     if not sender_python.is_file() or not os.access(sender_python, os.X_OK):
         raise DualSyncRailError("dual_sync_sender_interpreter_unavailable")
-    sender_python_sha = digest_file(sender_python)
+    try:
+        sender_python_target = sender_python.resolve(strict=True)
+    except OSError as exc:
+        raise DualSyncRailError(
+            "dual_sync_sender_interpreter_unavailable"
+        ) from exc
+    sender_python_sha = digest_file(sender_python_target)
     paths = source_paths(release)
     source_digests = {name: digest_file(path) for name, path in paths.items()}
     binary_digests = {

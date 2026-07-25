@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -138,6 +139,29 @@ def test_package_staging_is_byte_exact_and_inert(
     (staged / rail.SYNC_TIMER_UNIT).chmod(0o644)
     with pytest.raises(rail.DualSyncRailError, match="artifact_drifted"):
         rail.verify_package(package, output_root=staged)
+
+
+def test_package_hashes_final_sender_interpreter_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _release(tmp_path, monkeypatch)
+    interpreter = release / ".venv/bin/python"
+    target = release / ".venv/bin/python-real"
+    payload = b"resolved-python-placeholder\n"
+    target.write_bytes(payload)
+    target.chmod(0o755)
+    interpreter.unlink()
+    interpreter.symlink_to(target.name)
+    monkeypatch.setattr(rail, "validate_credential_metadata", lambda: None)
+    monkeypatch.setattr(rail, "host_binary_fact", lambda _path: "4" * 64)
+
+    package = rail.build_package(REVISION, REVISION)
+    manifest = json.loads(package.manifest_bytes)
+
+    assert manifest["sender_interpreter_sha256"] == hashlib.sha256(
+        payload
+    ).hexdigest()
 
 
 def test_run_all_executes_both_jobs_and_publishes_only_sanitized_fields(
