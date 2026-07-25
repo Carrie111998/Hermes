@@ -4867,7 +4867,8 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        from agent.result_normalizer import normalize_model_result
+        return normalize_model_result(run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message))
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
@@ -4881,7 +4882,7 @@ class AIAgent:
             str: Final assistant response
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
-        return result["final_response"]
+        return result.get("final_response", "")
 
     def _run_codex_app_server_turn(
         self,
