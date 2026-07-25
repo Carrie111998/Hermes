@@ -3570,6 +3570,18 @@ def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
         and str(imported.get("refresh_token", "") or "").strip()
     ):
         return None
+    # The expiry check inside _import_codex_cli_tokens only covers the ACCESS token.
+    # A consumed refresh_token sits beside a still-valid access_token, so without
+    # this chain-position guard a spent ~/.codex copy would overwrite Hermes' good
+    # credentials and re-fragment the pool (the refresh_token_reused loop).
+    if _codex_cli_import_is_superseded():
+        logger.warning(
+            "Codex CLI auth.json (%s) is an older link of the same OAuth chain than "
+            "Hermes' own copy — refusing to import a consumed refresh_token (%s). "
+            "Run `codex` to refresh the CLI, then `hermes auth` to re-authenticate.",
+            _codex_cli_auth_path(), reason,
+        )
+        return None
     logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
     _save_codex_tokens(imported)
     return dict(imported)
@@ -3753,16 +3765,66 @@ def _refresh_codex_auth_tokens(
     return updated_tokens
 
 
-def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
-    """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
-    
-    Returns tokens dict if valid and not expired, None otherwise.
-    Does NOT write to the shared file.
-    """
+def _codex_cli_auth_path() -> Path:
+    """Resolve the Codex CLI's shared auth store path (CODEX_HOME-aware)."""
     codex_home = os.getenv("CODEX_HOME", "").strip()
     if not codex_home:
         codex_home = str(Path.home() / ".codex")
-    auth_path = Path(codex_home).expanduser() / "auth.json"
+    return Path(codex_home).expanduser() / "auth.json"
+
+
+def _codex_cli_import_is_superseded() -> bool:
+    """True when ~/.codex/auth.json holds a PROVABLY spent link of the same OAuth chain.
+
+    Codex refresh_tokens are single-use and rotate on every refresh, so of all the
+    copies of one ChatGPT grant only the newest is live. ``_import_codex_cli_tokens``
+    can only reject an expired ACCESS token — it cannot tell that the REFRESH token
+    beside it was already consumed, because a consumed refresh_token sits next to an
+    access_token that stays valid for days. Adopting such a copy overwrites Hermes'
+    good refresh_token with a dead one and re-fragments the credential pool: exactly
+    the ``refresh_token_reused`` loop this recovery path exists to escape.
+
+    Chain position is comparable without a network round-trip: ``last_refresh`` is
+    stamped by whichever client last rotated the chain, so a Codex CLI copy that is
+    not strictly newer than Hermes' own copy cannot be a later link.
+
+    Deliberately fails OPEN — returns False unless BOTH timestamps parse and the CLI
+    copy is provably not newer, so a missing/unparseable stamp leaves behavior exactly
+    as it was before this guard. The residual false positive (an independent
+    ``hermes auth add`` grant that happens to carry an older stamp) degrades to the
+    original relogin-required error plus the refresh-failure sentinel — a loud,
+    actionable failure, never a silently poisoned credential store.
+    """
+    try:
+        payload = json.loads(_codex_cli_auth_path().read_text())
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    cli_epoch = _parse_iso_timestamp(payload.get("last_refresh"))
+    if cli_epoch is None:
+        return False
+    try:
+        # Lock-free read: callers may already hold the auth-store lock, and a stale
+        # snapshot can only fail open (adopt as before), never deadlock.
+        state = _load_provider_state(_load_auth_store(), "openai-codex")
+    except Exception:
+        return False
+    if not isinstance(state, dict):
+        return False
+    hermes_epoch = _parse_iso_timestamp(state.get("last_refresh"))
+    if hermes_epoch is None:
+        return False
+    return cli_epoch <= hermes_epoch
+
+
+def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
+    """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
+
+    Returns tokens dict if valid and not expired, None otherwise.
+    Does NOT write to the shared file.
+    """
+    auth_path = _codex_cli_auth_path()
     if not auth_path.is_file():
         return None
     try:

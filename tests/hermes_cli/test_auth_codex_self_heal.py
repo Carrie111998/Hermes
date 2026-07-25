@@ -206,3 +206,100 @@ def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_p
         resolve_codex_runtime_credentials()
 
     assert ei.value.code == "codex_auth_missing_access_token"
+
+
+def _write_stores(tmp_path, *, hermes_last_refresh, cli_last_refresh):
+    """Build a HERMES_HOME + CODEX_HOME pair differing only in chain position."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    hermes_home.mkdir()
+    codex_home.mkdir()
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "hermes-access",
+                    "refresh_token": "hermes-refresh",
+                },
+                "last_refresh": hermes_last_refresh,
+                "auth_mode": "chatgpt",
+            },
+        },
+    }))
+    (codex_home / "auth.json").write_text(json.dumps({
+        "auth_mode": "chatgpt",
+        "last_refresh": cli_last_refresh,
+        "tokens": {
+            "access_token": "cli-access",
+            "refresh_token": "cli-refresh",
+        },
+    }))
+    return hermes_home, codex_home
+
+
+def test_does_not_adopt_codex_cli_token_superseded_by_hermes_copy(tmp_path, monkeypatch):
+    """Latent re-fragmentation guard: a ~/.codex copy OLDER than Hermes' own copy is a
+    spent link in the same rotating chain. Its access_token can still be unexpired, so
+    the expiry check alone cannot catch it — importing it would overwrite Hermes' good
+    refresh_token with a consumed one and resurrect refresh_token_reused."""
+    hermes_home, codex_home = _write_stores(
+        tmp_path,
+        hermes_last_refresh="2026-07-25T13:56:54.335434Z",
+        cli_last_refresh="2026-07-18T09:16:52.932843800Z",  # 9-digit fraction, as Codex CLI writes
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    def _reused(*_a, **_k):
+        raise AuthError(
+            "refresh token reused",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _reused)
+
+    with pytest.raises(AuthError) as ei:
+        _refresh_codex_auth_tokens(
+            {"access_token": "hermes-access", "refresh_token": "hermes-refresh"}, 20.0
+        )
+
+    assert ei.value.code == "refresh_token_reused"
+    # Hermes' own (newer) credentials must survive untouched.
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    tokens = stored["providers"]["openai-codex"]["tokens"]
+    assert tokens["refresh_token"] == "hermes-refresh"
+    assert tokens["access_token"] == "hermes-access"
+
+
+def test_still_adopts_codex_cli_token_newer_than_hermes_copy(tmp_path, monkeypatch):
+    """The guard must not over-block: when the Codex CLI genuinely rotated the shared
+    chain AFTER Hermes' copy, self-heal must still fire (that is its whole purpose)."""
+    hermes_home, codex_home = _write_stores(
+        tmp_path,
+        hermes_last_refresh="2026-07-18T09:16:52.932843800Z",
+        cli_last_refresh="2026-07-25T13:56:54.335434Z",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    def _reused(*_a, **_k):
+        raise AuthError(
+            "refresh token reused",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _reused)
+
+    out = _refresh_codex_auth_tokens(
+        {"access_token": "hermes-access", "refresh_token": "hermes-refresh"}, 20.0
+    )
+
+    assert out["access_token"] == "cli-access"
+    assert out["refresh_token"] == "cli-refresh"
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    assert stored["providers"]["openai-codex"]["tokens"]["refresh_token"] == "cli-refresh"
