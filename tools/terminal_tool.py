@@ -1306,14 +1306,14 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
 
 
 # One-shot guard for the config-fallback bridge below.  Purely an
-# optimization: after the first attempt either TERMINAL_ENV is set (bridge
-# succeeded — merged config always carries terminal.backend) or the import
-# failed and retrying every call would be wasted work.
+# optimization: after the first attempt the bridge has either applied
+# config.yaml values (or backfilled defaults) or the import failed —
+# retrying every call would be wasted work.
 _terminal_config_bridge_attempted = False
 
 
 def _ensure_terminal_env_bridged() -> None:
-    """Backfill TERMINAL_* env vars from config.yaml when no launcher did.
+    """Bridge TERMINAL_* env vars from config.yaml for launcher-less paths.
 
     terminal_tool reads ALL terminal settings from os.environ (TERMINAL_*).
     The CLI (cli.py ``env_mappings``), the gateway (gateway/run.py
@@ -1325,21 +1325,32 @@ def _ensure_terminal_env_bridged() -> None:
     config.yaml selects ``terminal.backend: docker``, running commands on the
     host the user intended to sandbox (#63141, #54449, #61115, #65696).
 
-    Explicit env always wins: when TERMINAL_ENV is already set (a launcher's
-    bridge or the user's .env made a deliberate choice) this is a no-op.  The
-    config bridge only fills the unset case, so it changes an accidental
-    default — never an explicit selection.
+    Precedence (aligned with CLI and gateway bridges):
+    - config.yaml has a ``terminal`` section → config is authoritative and
+      overrides any existing TERMINAL_* env vars (including stale .env values
+      loaded by ``load_dotenv``).  Fixes #71137.
+    - config.yaml has NO ``terminal`` section → only backfill missing env
+      vars so explicit shell exports and .env values keep working.
     """
     global _terminal_config_bridge_attempted
-    if "TERMINAL_ENV" in os.environ or _terminal_config_bridge_attempted:
+    if _terminal_config_bridge_attempted:
         return
     _terminal_config_bridge_attempted = True
     try:
         from hermes_cli.config import apply_terminal_config_to_env
 
-        # env=None targets os.environ inside the helper; override=False keeps
-        # any already-set TERMINAL_* values (e.g. from .env) authoritative.
-        apply_terminal_config_to_env(env=None, override=False)
+        # env=None targets os.environ; override=None (default) lets the
+        # helper decide: config.yaml terminal section present → override;
+        # absent → backfill only.
+        prev = os.environ.get("TERMINAL_ENV")
+        apply_terminal_config_to_env()
+        new = os.environ.get("TERMINAL_ENV")
+        if prev and new and prev != new:
+            logger.warning(
+                "terminal backend: config.yaml '%s' overrode .env/env '%s' "
+                "(config.yaml is authoritative for behavioral settings)",
+                new, prev,
+            )
     except Exception:
         # Never let a config problem take the terminal tool down — the
         # historical local default still applies.

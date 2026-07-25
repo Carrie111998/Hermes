@@ -8,9 +8,11 @@ back silently to the local backend even when config.yaml selected
 ``terminal.backend: docker`` — commands the user intended to sandbox ran on
 the host (#63141 / #54449 / #61115 / #65696).
 
-``_ensure_terminal_env_bridged()`` closes that hole at the chokepoint: when
-TERMINAL_ENV is unset, backfill TERMINAL_* from config.yaml before the
-local default applies. An explicitly-set TERMINAL_ENV always wins.
+``_ensure_terminal_env_bridged()`` closes that hole at the chokepoint:
+when config.yaml has a ``terminal`` section, its values are authoritative
+and override any existing TERMINAL_* env vars (including stale .env values).
+When config.yaml has NO terminal section, only missing env vars are
+backfilled so explicit shell exports and .env values keep working (#71137).
 """
 
 import os
@@ -36,7 +38,7 @@ def _reset_bridge_state(monkeypatch):
 def _write_config(text: str) -> None:
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(text)
+    (home / "config.yaml").write_text(text, encoding="utf-8")
 
 
 def test_unset_terminal_env_backfills_backend_from_config():
@@ -55,20 +57,20 @@ def test_unset_terminal_env_backfills_backend_from_config():
     assert os.environ.get("TERMINAL_ENV") == "docker"
 
 
-def test_explicit_terminal_env_wins_over_config(monkeypatch):
-    """An explicit env choice (launcher bridge or .env) is never overridden —
-    honor explicit choice vs accidental fallback."""
+def test_config_terminal_section_overrides_env(monkeypatch):
+    """config.yaml terminal section is authoritative over env/.env values
+    (aligned with CLI _file_has_terminal_config and gateway bridge)."""
     _write_config("terminal:\n  backend: docker\n")
     monkeypatch.setenv("TERMINAL_ENV", "local")
 
     config = terminal_tool._get_env_config()
 
-    assert config["env_type"] == "local"
+    assert config["env_type"] == "docker"
 
 
-def test_preset_terminal_vars_survive_backfill(monkeypatch):
-    """override=False: already-set sibling TERMINAL_* values stay
-    authoritative; only missing ones are backfilled."""
+def test_config_terminal_section_overrides_sibling_vars(monkeypatch):
+    """When config.yaml has a terminal section, its values override
+    already-set sibling TERMINAL_* env vars (consistent with CLI path)."""
     _write_config(
         "terminal:\n"
         "  backend: docker\n"
@@ -79,7 +81,7 @@ def test_preset_terminal_vars_survive_backfill(monkeypatch):
     config = terminal_tool._get_env_config()
 
     assert config["env_type"] == "docker"
-    assert config["docker_image"] == "env/image:2"
+    assert config["docker_image"] == "config/image:1"
 
 
 def test_bridge_failure_falls_back_to_local(monkeypatch):
@@ -117,3 +119,26 @@ def test_bridge_only_attempted_once(monkeypatch):
     terminal_tool._get_env_config()
 
     assert len(calls) == 1
+
+
+def test_stale_env_overridden_by_config_backend(monkeypatch):
+    """#71137: .env TERMINAL_ENV=ssh must not override config.yaml
+    terminal.backend=local on the fallback bridge path."""
+    _write_config("terminal:\n  backend: local\n")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "1.2.3.4")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "local"
+
+
+def test_no_terminal_section_env_wins(monkeypatch):
+    """Without a terminal section in config.yaml, env values are kept
+    (backfill-only mode preserves explicit shell exports and .env)."""
+    _write_config("model:\n  default: some-model\n")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "ssh"
