@@ -2833,6 +2833,30 @@ class AIAgent:
             return redacted
         return content
 
+    @staticmethod
+    def _redact_tool_calls(tool_calls):
+        """Redact secrets from assistant tool-call argument strings.
+
+        ``tool_calls`` entries carry the raw ``function.arguments`` JSON string
+        sent to a tool, which can embed credentials (API keys, bearer tokens)
+        exactly like message content. Each entry is copied so the caller's live
+        message list is never mutated. Respects ``HERMES_REDACT_SECRETS`` via
+        ``redact_sensitive_text`` — a no-op when disabled.
+        """
+        if not isinstance(tool_calls, list):
+            return tool_calls
+        redacted = []
+        for call in tool_calls:
+            if isinstance(call, dict):
+                call = dict(call)
+                fn = call.get("function")
+                if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                    fn = dict(fn)
+                    fn["arguments"] = redact_sensitive_text(fn["arguments"])
+                    call["function"] = fn
+            redacted.append(call)
+        return redacted
+
     def _session_log_path(self) -> Optional[Path]:
         # Re-derive the target path each call so /branch and /compress
         # session-id changes land in the right file without any re-point
@@ -2867,6 +2891,14 @@ class AIAgent:
                 if "content" in msg:
                     msg = dict(msg)
                     msg["content"] = self._redact_message_content(msg.get("content"))
+                # Assistant tool-call arguments carry the raw JSON sent to a
+                # tool, which can embed credentials just like message content.
+                # The hook transcript writer is demand-driven (any registered
+                # pre/post hook), independent of the JSON-snapshot opt-in, so
+                # redact tool-call arguments before they reach disk too.
+                if isinstance(msg.get("tool_calls"), list):
+                    msg = dict(msg)
+                    msg["tool_calls"] = self._redact_tool_calls(msg["tool_calls"])
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.
