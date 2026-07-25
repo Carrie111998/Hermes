@@ -31,7 +31,7 @@ def test_skyai_prompt_is_principle_based_not_script_pack() -> None:
 
     assert "Hermes мисли" in prompt
     assert "не е заповед какво да кажеш" in prompt
-    assert len(prompt) < 5000
+    assert len(prompt) < 5200
     assert "SkyAI sales playbook" not in prompt
     assert "do_not_say" not in prompt
     assert "customer_facing_flow" not in prompt
@@ -70,21 +70,54 @@ def test_external_voucher_boundary_is_a_general_hermes_principle() -> None:
     cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
     principle = next(case for case in cases if case["id"] == "voucher_issuer_boundary")
 
-    assert "установи кой е издал ваучера" in prompt
+    assert "приемай неуточнения ваучер за ваучер на SkyVision" in prompt
+    assert "не питай рутинно за издателя" in prompt
+    assert "конкретна причина да се съмняваш в съвместимостта" in prompt
     assert "Само ваучерите на SkyVision важат в SkyVision профила" in prompt
-    assert "друга платформа или продавач" in prompt
-    assert "дори същото преживяване да е в SkyVision" in prompt
-    assert "при неясен произход първо го уточни" in prompt
+    assert "Ако клиентът посочи друг издател" in prompt
+    assert "ваучерът не може да се добави тук" in prompt
+    assert "при неясен произход първо го уточни" not in prompt
 
     issuer_scope = support["vouchers"]["issuer_scope"]
     assert issuer_scope["skyvision_issued_vouchers"]["profile_compatible"] is True
     assert issuer_scope["externally_issued_vouchers"]["profile_compatible"] is False
     assert issuer_scope["catalog_overlap_changes_issuer_or_compatibility"] is False
     assert issuer_scope["compatibility_is_issuer_scoped"] is True
+    assert "обичайно означава ваучер" in issuer_scope["unspecified_origin_in_skyvision_chat"]
+    addition_facts = support["vouchers"]["customer_panel"]["addition_problem_facts"]
+    assert "латиница" in addition_facts["serial_format"]
+    assert addition_facts["possible_issuer_mismatch"] is True
+    assert "особен статус" in " ".join(addition_facts["other_possible_states"])
 
-    assert principle["source_threads"] == ["1530167380133544067"]
-    assert "another platform, seller, or provider" in principle["principle"]
-    assert "If the origin is unclear" in principle["principle"]
+    assert principle["source_threads"] == ["1530167380133544067", "1530561454191673356"]
+    assert "without turning the issuer check into a routine question" in principle["principle"]
+    assert "normally be treated as SkyVision-issued" in principle["principle"]
+    assert "concrete reason to doubt compatibility" in principle["principle"]
+    assert "identifies another platform, seller, or provider" in principle["principle"]
+
+
+def test_customer_reply_contact_distinguishes_automated_sender() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    support = public_tools.handle_skyai_support_knowledge(include_contacts=True)
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    principle = next(case for case in cases if case["id"] == "customer_reply_contact")
+
+    assert "Писмен контакт с екипа: info@skyvision.bg" in prompt
+    assert "reservations@skyvision.bg е автоматичен адрес" in prompt
+    assert "не канал за клиентски отговори" in prompt
+
+    reservation_contact = support["reservation_support"]
+    assert reservation_contact["customer_contact_email"] == "info@skyvision.bg"
+    automated = reservation_contact["automated_notification_address"]
+    assert automated["email"] == "reservations@skyvision.bg"
+    assert automated["role"] == "автоматични известия за резервации"
+    assert automated["monitored"] is True
+    assert automated["accepts_customer_replies"] is False
+    assert support["official_contacts"]["email"] == "info@skyvision.bg"
+
+    assert principle["source_threads"] == ["1530546975835947061"]
+    assert "use info@skyvision.bg" in principle["principle"]
+    assert "not a customer reply channel" in principle["principle"]
 
 
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
@@ -176,6 +209,7 @@ def test_qa_feedback_is_evaluation_material_not_runtime_policy() -> None:
         "no_keyword_backend_patches",
         "session_context_concision",
         "voucher_issuer_boundary",
+        "customer_reply_contact",
     }
     assert all("principle" in case for case in cases)
     assert all("scoring" in case for case in cases)

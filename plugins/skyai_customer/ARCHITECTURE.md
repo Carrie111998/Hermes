@@ -44,6 +44,21 @@ given. Usefulness or relevance does not justify restating shared context.
 This is a prompt-and-evaluation principle, not a backend deduplication or keyword
 rule.
 
+Domain defaults are reasoning context, not pre-model routing. In a SkyVision
+conversation, an unqualified reference to a voucher normally means a SkyVision
+voucher. Hermes should continue from that context instead of asking a routine
+issuer question. It should clarify the issuer only when the conversation gives
+a concrete reason to doubt compatibility, and it should apply the external
+issuer boundary when another issuer is explicit. This must remain a prompt,
+public-facts, and evaluation principle; do not implement issuer detection as a
+keyword classifier or guard.
+
+Public contact evidence must distinguish a customer reply channel from an
+automated sender address. `info@skyvision.bg` is the written customer contact.
+`reservations@skyvision.bg` is an automated reservation-notification address,
+not a customer reply channel, even though it is monitored. This is canonical
+contact knowledge, not a response template.
+
 ## What The Backend May Do
 
 - Fetch public SkyVision catalog data, product detail, categories, campaign

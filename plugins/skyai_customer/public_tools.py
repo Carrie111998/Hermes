@@ -1271,7 +1271,13 @@ def handle_skyai_support_knowledge(
             ),
         },
         "reservation_support": {
-            "direct_email": "Екипът следи reservations@skyvision.bg за директни клиентски въпроси за резервации.",
+            "customer_contact_email": "info@skyvision.bg",
+            "automated_notification_address": {
+                "email": "reservations@skyvision.bg",
+                "role": "автоматични известия за резервации",
+                "monitored": True,
+                "accepts_customer_replies": False,
+            },
             "missing_confirmation": (
                 "При липсващ потвърдителен имейл за резервация екипът може да провери и да помогне; "
                 "SkyAI не твърди, че сам е изпратил или преиздал потвърждение."
@@ -1293,6 +1299,10 @@ def handle_skyai_support_knowledge(
                 },
                 "catalog_overlap_changes_issuer_or_compatibility": False,
                 "compatibility_is_issuer_scoped": True,
+                "unspecified_origin_in_skyvision_chat": (
+                    "Неуточнен ваучер в разговор със SkyVision обичайно означава ваучер, "
+                    "издаден от SkyVision."
+                ),
             },
             "customer_panel": {
                 "scope": "Процесът в SkyVision профила е за ваучери, издадени от SkyVision.",
@@ -1313,6 +1323,15 @@ def handle_skyai_support_knowledge(
                     "В модала въвежда серийния номер на ваучера на латиница, както е изписан на гърба му.",
                     "Натиска „Добави ваучер“ и после управлява ваучера от списъка.",
                 ],
+                "addition_problem_facts": {
+                    "serial_format": "Серийният номер се въвежда на латиница, както е изписан на ваучера.",
+                    "possible_issuer_mismatch": True,
+                    "other_possible_states": [
+                        "ваучерът вече е добавен в друг профил",
+                        "ваучерът е с особен статус",
+                        "ваучерът е подарък/бонус без сериен номер за ръчно добавяне",
+                    ],
+                },
                 "voucher_list_columns": ["Услуга", "Ваучер", "Депозит", "Статус", "Валидност", "Действия"],
                 "common_actions": [
                     "„Използвай“ за активен ваучер, когато клиентът иска да избере/резервира услуга.",
