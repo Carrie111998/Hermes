@@ -262,6 +262,49 @@ class TestHandleVoiceCommand:
         assert runner._voice_mode["telegram:999"] == "voice_only"
         assert runner._voice_mode["slack:999"] == "off"
 
+    @pytest.mark.asyncio
+    async def test_profile_voice_commands_use_source_profile_adapter(self, runner):
+        from gateway.config import Platform
+
+        default_adapter = SimpleNamespace(
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats=set(),
+            get_voice_channel_info=MagicMock(return_value=None),
+        )
+        profile_adapter = SimpleNamespace(
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats=set(),
+            get_voice_channel_info=MagicMock(return_value=None),
+        )
+        runner.adapters = {Platform.DISCORD: default_adapter}
+        runner._profile_adapters = {
+            "voice": {Platform.DISCORD: profile_adapter},
+        }
+
+        event = _make_event("/voice on")
+        event.source.platform = Platform.DISCORD
+        event.source.profile = "voice"
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+
+        await runner._handle_voice_command(event)
+        assert profile_adapter._auto_tts_enabled_chats == {"123"}
+        assert default_adapter._auto_tts_enabled_chats == set()
+
+        event.text = "/voice off"
+        await runner._handle_voice_command(event)
+        assert profile_adapter._auto_tts_disabled_chats == {"123"}
+        assert default_adapter._auto_tts_disabled_chats == set()
+
+        event.text = "/voice tts"
+        await runner._handle_voice_command(event)
+        assert profile_adapter._auto_tts_enabled_chats == {"123"}
+        assert default_adapter._auto_tts_enabled_chats == set()
+
+        event.text = "/voice status"
+        await runner._handle_voice_command(event)
+        profile_adapter.get_voice_channel_info.assert_called_once_with(111)
+        default_adapter.get_voice_channel_info.assert_not_called()
+
 
 # =====================================================================
 # Auto voice reply decision logic
@@ -1271,6 +1314,45 @@ class TestVoiceChannelCommands:
 
         mock_adapter.handle_message.assert_called_once()
         mock_channel.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_input_duplicate_suppression_is_profile_scoped(self, runner):
+        from gateway.config import Platform
+
+        default_source = SessionSource(
+            chat_id="123",
+            user_id="42",
+            platform=Platform.DISCORD,
+        )
+        profile_source = SessionSource(
+            chat_id="123",
+            user_id="42",
+            platform=Platform.DISCORD,
+            profile="voice",
+        )
+
+        default_adapter = AsyncMock()
+        default_adapter._voice_text_channels = {111: 123}
+        default_adapter._voice_sources = {111: default_source.to_dict()}
+        default_adapter._client.get_channel.return_value = AsyncMock()
+        default_adapter.handle_message = AsyncMock()
+
+        profile_adapter = AsyncMock()
+        profile_adapter._profile_name = "voice"
+        profile_adapter._voice_text_channels = {111: 123}
+        profile_adapter._voice_sources = {111: profile_source.to_dict()}
+        profile_adapter._client.get_channel.return_value = AsyncMock()
+        profile_adapter.handle_message = AsyncMock()
+
+        await runner._handle_voice_channel_input(
+            111, 42, "Hello from VC", adapter=default_adapter
+        )
+        await runner._handle_voice_channel_input(
+            111, 42, "Hello from VC", adapter=profile_adapter
+        )
+
+        default_adapter.handle_message.assert_awaited_once()
+        profile_adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_input_suppresses_near_duplicate_transcript(self, runner):

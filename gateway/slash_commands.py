@@ -2678,7 +2678,7 @@ class GatewaySlashCommandsMixin:
         platform = event.source.platform
         voice_key = self._voice_key(platform, chat_id, event.source.profile)
 
-        adapter = self.adapters.get(platform)
+        adapter = getattr(self, "_adapter_for_source")(event.source)
 
         if args in {"on", "enable"}:
             self._voice_mode[voice_key] = "voice_only"
@@ -2710,7 +2710,7 @@ class GatewaySlashCommandsMixin:
                 "all": t("gateway.voice.label_all"),
             }
             # Append voice channel info if connected
-            adapter = self.adapters.get(event.source.platform)
+            adapter = getattr(self, "_adapter_for_source")(event.source)
             guild_id = self._get_guild_id(event)
             if guild_id and hasattr(adapter, "get_voice_channel_info"):
                 info = adapter.get_voice_channel_info(guild_id)

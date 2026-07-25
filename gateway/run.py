@@ -3668,10 +3668,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
-        # Recent voice transcripts per (guild,user) for duplicate suppression.
+        # Recent voice transcripts per (profile,guild,user) for duplicate suppression.
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
-        self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
+        self._recent_voice_transcripts: Dict[
+            tuple[Optional[str], int, int], List[tuple[float, str]]
+        ] = {}
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -15522,13 +15524,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = adapter or self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
-    def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
+    def _is_duplicate_voice_transcript(
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        profile: Optional[str] = None,
+    ) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
 
         Voice capture can occasionally emit the same utterance twice a few
         seconds apart, which creates a second queued agent run and overlapping
-        spoken replies. Dedup exact and near-exact repeats per guild/user over a
-        short window while allowing genuinely new turns through.
+        spoken replies. Dedup exact and near-exact repeats per profile/guild/user
+        over a short window while allowing genuinely new turns through.
         """
         from difflib import SequenceMatcher
 
@@ -15539,7 +15548,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = time.monotonic()
         window_seconds = 12.0
-        key = (guild_id, user_id)
+        key = (profile, guild_id, user_id)
         recent_store = getattr(self, "_recent_voice_transcripts", None)
         if not isinstance(recent_store, dict):
             recent_store = {}
@@ -15600,7 +15609,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
 
-        if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
+        if self._is_duplicate_voice_transcript(
+            guild_id,
+            user_id,
+            transcript,
+            profile=self._adapter_profile_name(adapter),
+        ):
             logger.info(
                 "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
                 guild_id,
