@@ -72,21 +72,6 @@ def _estimate_cost(
     return float(result.amount_usd or 0.0), result.status
 
 
-def _safe_int(val) -> int:
-    """Cast *val* to int, returning 0 on any unparseable or None value.
-
-    Guards against corrupted DB rows that store non-numeric strings
-    (e.g. Chinese text) in numeric columns such as ``api_call_count``
-    or ``input_tokens`` — the ``or 0`` idiom alone does not help because
-    a truthy string short-circuits to itself before ``int()`` gets a
-    chance to fail cleanly.
-    """
-    try:
-        return int(val) if val is not None else 0
-    except (ValueError, TypeError):
-        return 0
-
-
 
 
 def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
@@ -638,18 +623,13 @@ class InsightsEngine:
         # double-counting already-attributed route deltas.
         for s in sessions:
             totals = usage_totals[s["id"]]
-            inp = max(
-                0, _safe_int(s.get("input_tokens")) - totals["input_tokens"]
-            )
-            out = max(
-                0, _safe_int(s.get("output_tokens")) - totals["output_tokens"]
-            )
+            inp = max(0, (s.get("input_tokens") or 0) - totals["input_tokens"])
+            out = max(0, (s.get("output_tokens") or 0) - totals["output_tokens"])
             cache_read = max(
-                0, _safe_int(s.get("cache_read_tokens")) - totals["cache_read_tokens"]
+                0, (s.get("cache_read_tokens") or 0) - totals["cache_read_tokens"]
             )
             cache_write = max(
-                0,
-                _safe_int(s.get("cache_write_tokens")) - totals["cache_write_tokens"],
+                0, (s.get("cache_write_tokens") or 0) - totals["cache_write_tokens"]
             )
             residual_cost = max(
                 0.0, float(s.get("estimated_cost_usd") or 0.0)
@@ -660,7 +640,7 @@ class InsightsEngine:
                 - totals["actual_cost_usd"],
             )
             residual_calls = max(
-                0, _safe_int(s.get("api_call_count")) - totals["api_call_count"]
+                0, (s.get("api_call_count") or 0) - totals["api_call_count"]
             )
             if not (
                 inp or out or cache_read or cache_write or residual_cost
