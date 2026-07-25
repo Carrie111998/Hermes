@@ -4059,8 +4059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task.add_done_callback(consume_detached_task_result)
             raise
         if task in done:
-            result = await task
-            return bool(result)
+            return task.result()
         task.cancel()
         task.add_done_callback(consume_detached_task_result)
         raise TimeoutError(
@@ -7765,15 +7764,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the gateway is running under a service manager that doesn't
         # capture stderr.
         try:
-            _log_dir = getattr(self.config, "log_dir", None) or os.path.join(
-                os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")),
-                "logs",
+            _log_dir = getattr(self.config, "log_dir", None) or str(
+                _hermes_home / "logs"
             )
             _faulthandler_path = os.path.join(_log_dir, "gateway_faulthandler.log")
             os.makedirs(_log_dir, exist_ok=True)
+            self._faulthandler_file = open(_faulthandler_path, "a")
             faulthandler.register(
                 signal.SIGUSR2,
-                file=open(_faulthandler_path, "a"),
+                file=self._faulthandler_file,
                 all_threads=True,
                 chain=True,
             )
@@ -8500,11 +8499,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ", ".join(p.value for p in self._failed_platforms),
             )
         # Track the reconnect watcher task so _ensure_reconnect_watcher_running
-        # can detect if it dies and respawn it (#70344).
-        self._reconnect_watcher_task = asyncio.create_task(
-            self._platform_reconnect_watcher()
+        # can detect if it dies and respawn it (#70344). Use _spawn_supervised
+        # for crash-restart supervision (backoff, crash-loop detection).
+        self._reconnect_watcher_task = self._spawn_supervised(
+            self._platform_reconnect_watcher, "platform_reconnect_watcher"
         )
-        self._background_tasks.add(self._reconnect_watcher_task)
 
         # Start background handoff watcher — picks up CLI sessions marked
         # handoff_state='pending' in state.db and re-binds them to the
@@ -9078,11 +9077,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Reconnect watcher task is dead (done=%s) — respawning",
             task.done() if task is not None else "N/A",
         )
-        self._reconnect_watcher_task = asyncio.create_task(
-            self._platform_reconnect_watcher()
+        self._reconnect_watcher_task = self._spawn_supervised(
+            self._platform_reconnect_watcher, "platform_reconnect_watcher"
         )
-        if getattr(self, "_background_tasks", None) is not None:
-            self._background_tasks.add(self._reconnect_watcher_task)
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
