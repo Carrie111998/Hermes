@@ -379,6 +379,15 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
         resolved = _resolve_base_dir(task_id, container_paths=True) / expanded
         return _normalize_without_host_deref(resolved)
 
+    # SSH backend: a leading ``~`` must reach the remote unexpanded.
+    # Expanding it here resolves against the GATEWAY process's HOME, but the
+    # path is executed on the ssh remote where that directory may not exist
+    # (#71201). Leave it intact so ShellFileOperations._expand_path() resolves
+    # it against the remote $HOME at execution time (it runs ``echo $HOME``
+    # through the live environment for every file op).
+    if filepath.startswith("~") and _terminal_env_type_for_task(task_id) == "ssh":
+        return PurePosixPath(filepath)
+
     # Host paths only — never rewrite Linux paths inside a container/WSL env.
     from tools.environments.local import _msys_to_windows_path
 
