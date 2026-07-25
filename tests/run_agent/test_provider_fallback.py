@@ -414,6 +414,31 @@ class TestExplicitFallbackTransport:
             assert resolve_client.call_args.kwargs["api_mode"] == "chat_completions"
             agent._provider_model_requires_responses_api.assert_not_called()
 
+    def test_distinct_transport_is_not_skipped_as_current_route(self):
+        """Same endpoint/model can expose a second transport fallback route."""
+        fbs = [{
+            "provider": "custom-relay",
+            "model": "relay-model",
+            "base_url": "https://relay.example/v1",
+            "api_mode": "chat_completions",
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "custom-relay"
+        agent.model = "relay-model"
+        agent.base_url = "https://relay.example/v1"
+        agent.api_mode = "codex_responses"
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://relay.example/v1"), "relay-model"),
+        ) as resolve_client, patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, provider: model,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert resolve_client.call_args.kwargs["api_mode"] == "chat_completions"
+        assert agent.api_mode == "chat_completions"
+
     def test_invalid_explicit_transport_is_skipped(self):
         fbs = [{
             "provider": "custom-relay",

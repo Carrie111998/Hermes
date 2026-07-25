@@ -1506,11 +1506,18 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
-def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
+def _fallback_entry_key(fb: dict) -> tuple[str, str, str, str]:
+    try:
+        from hermes_cli.fallback_config import resolve_entry_api_mode
+
+        api_mode = resolve_entry_api_mode(fb) or ""
+    except ValueError:
+        api_mode = str(fb.get("api_mode") or fb.get("transport") or "").strip()
     return (
         str(fb.get("provider") or "").strip().lower(),
         str(fb.get("model") or "").strip(),
         str(fb.get("base_url") or "").strip().rstrip("/"),
+        api_mode.lower(),
     )
 
 
@@ -1638,23 +1645,38 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback(reason)
 
-    # Skip entries that resolve to the current (provider, model) — falling
-    # back to the same backend that just failed loops the failure. Compare
+    # Skip entries that resolve to the current (provider, model, transport) —
+    # falling back to the same route that just failed loops the failure. Compare
     # base_url too so two distinct custom_providers entries pointing at the
     # same shim/proxy URL also dedup. See issue #22548. Do NOT treat
     # first-class providers that share a host (xai-oauth vs xai) as the same
     # backend — they use different credentials.
+    from hermes_cli.fallback_config import resolve_entry_api_mode
+
+    try:
+        configured_mode = resolve_entry_api_mode(fb)
+    except ValueError as exc:
+        logger.warning(
+            "Fallback skip: %s/%s has invalid transport (%s)",
+            fb_provider,
+            fb_model,
+            exc,
+        )
+        unavailable.add(fb_key)
+        return agent._try_activate_fallback(reason)
+    current_api_mode = (getattr(agent, "api_mode", "") or "").strip()
+    same_transport = not configured_mode or configured_mode == current_api_mode
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     current_model = (getattr(agent, "model", "") or "").strip()
     current_base_url = str(getattr(agent, "base_url", "") or "").rstrip("/").lower()
     fb_base_url_for_dedup = (fb.get("base_url") or "").strip().rstrip("/").lower()
-    if fb_provider == current_provider and fb_model == current_model:
+    if same_transport and fb_provider == current_provider and fb_model == current_model:
         logger.warning(
-            "Fallback skip: chain entry %s/%s matches current provider/model",
+            "Fallback skip: chain entry %s/%s matches current provider/model/transport",
             fb_provider, fb_model,
         )
         return agent._try_activate_fallback(reason)
-    if _fallback_entry_is_same_backend_by_base_url(
+    if same_transport and _fallback_entry_is_same_backend_by_base_url(
         current_provider=current_provider,
         fb_provider=fb_provider,
         current_base_url=current_base_url,
@@ -1689,19 +1711,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
             fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
-        from hermes_cli.fallback_config import resolve_entry_api_mode
-
-        try:
-            configured_mode = resolve_entry_api_mode(fb)
-        except ValueError as exc:
-            logger.warning(
-                "Fallback skip: %s/%s has invalid transport (%s)",
-                fb_provider,
-                fb_model,
-                exc,
-            )
-            unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
