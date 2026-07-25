@@ -1131,6 +1131,26 @@ Desktop:
 2. Mints `POST /api/auth/handoff-ticket` with `{session_id, profile}` against the local/authenticated desk backend.
 3. Builds the QR URL with `resume` + `handoff` (+ `profile` when needed).
 
+### Handoff URL lifetime, scope, and logs
+
+| Control | Value | Why it matters |
+|---------|-------|----------------|
+| Handoff ticket TTL | **120 seconds** | QR is momentary; expired tickets fail closed |
+| Handoff ticket use | **single-use** | Replay after consume fails closed |
+| Resume browser session TTL | **45 minutes** (not multi-hour admin sessions) | Limits blast radius if a phone is left unlocked |
+| Scope after consume | **`resume` only** | Denies `/api/env`, `/api/config`, session list, admin WS (`/api/ws`, `/api/console`, `/api/pub`) |
+| Logout | `/auth/logout` clears cookies and best-effort revokes provider refresh tokens | Phone end of session |
+
+**Tunnel / reverse-proxy access logs (read this before public exposure).**
+
+The first phone hit is `GET /chat?resume=…&handoff=<ticket>`. The app **strips** `handoff` on the 302 redirect, but anything sitting **in front of** the app can still log the original request line:
+
+- **cloudflared**: at `--loglevel debug` it logs the request URL and headers and **warns that this can expose sensitive information**. Keep production tunnels at `info` or higher unless you are actively debugging, and treat debug logs as secret material.
+- **nginx / Caddy / other reverse proxies**: default access logs often include the full request URI (path **and** query). Prefer logging `$uri` / path-only, or redact `handoff` / `ticket` query parameters before shipping logs to a third party.
+- **Hermes app audit logs** already redact handoff/ticket secrets; do not assume the tunnel does.
+
+Mitigations already in the product: short TTL, single-use tickets, resume-only scope, no long-lived token in the SPA bundle. Mitigations on the operator side: avoid debug tunnel logging, redact query strings in proxy access logs, and rotate/re-mint if a ticket URL was captured before consume.
+
 ## CORS
 
 The web server restricts CORS to localhost origins only:
