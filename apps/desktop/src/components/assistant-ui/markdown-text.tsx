@@ -22,12 +22,15 @@ import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import {
   filePathFromMediaPath,
   gatewayMediaDataUrl,
+  downloadGatewayMediaFile,
+  isInlineMediaSrc,
   isRemoteGateway,
   mediaExternalUrl,
   mediaKind,
   mediaName,
   mediaPathFromMarkdownHref,
-  mediaStreamUrl
+  mediaStreamUrl,
+  resolveMediaDisplaySrc
 } from '@/lib/media'
 import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
 import { cn } from '@/lib/utils'
@@ -60,27 +63,13 @@ function preprocessWithTailRepair(text: string): string {
 }
 
 async function mediaSrc(path: string): Promise<string> {
-  if (/^(?:https?|data):/i.test(path)) {
-    return path
-  }
-
   // Stream audio/video through the custom protocol: data URLs are capped and
   // load the whole file into memory, which broke playback for larger videos.
   if (window.hermesDesktop && ['audio', 'video'].includes(mediaKind(path))) {
     return mediaStreamUrl(path)
   }
 
-  // Remote gateway: the image lives on the gateway machine, so read it over the
-  // authenticated API rather than this machine's disk.
-  if (window.hermesDesktop && isRemoteGateway()) {
-    return gatewayMediaDataUrl(path)
-  }
-
-  if (!window.hermesDesktop?.readFileDataUrl) {
-    return mediaExternalUrl(path)
-  }
-
-  return window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
+  return resolveMediaDisplaySrc(path)
 }
 
 function OpenMediaFailedNote({ name }: { name: string }) {
@@ -281,6 +270,65 @@ function MarkdownImage({
   alt,
   ...props
 }: ComponentProps<'img'> & { downloadName?: string }) {
+  const rawSrc = typeof src === 'string' ? src : ''
+  const [resolvedSrc, setResolvedSrc] = useState(() => (rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : ''))
+  const [failed, setFailed] = useState(false)
+  const { open, openFailed } = useOpenMediaFile(rawSrc)
+  const name = mediaName(rawSrc || String(alt || 'image'))
+
+  useEffect(() => {
+    let cancelled = false
+
+    setFailed(false)
+    setResolvedSrc(rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : '')
+
+    if (!rawSrc || isInlineMediaSrc(rawSrc)) {
+      return () => {
+        cancelled = true
+      }
+    }
+
+    void resolveMediaDisplaySrc(rawSrc)
+      .then(value => {
+        if (!cancelled) {
+          setResolvedSrc(value)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailed(true)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [rawSrc])
+
+  if (!rawSrc) {
+    return null
+  }
+
+  if (failed) {
+    return (
+      <span className="my-2 block text-sm text-muted-foreground">
+        Couldn&apos;t load {name}.{' '}
+        <button
+          className="bg-transparent font-medium text-foreground underline underline-offset-4 decoration-current/20 hover:text-foreground"
+          onClick={open}
+          type="button"
+        >
+          Open image
+        </button>
+        {openFailed && <OpenMediaFailedNote name={name} />}
+      </span>
+    )
+  }
+
+  if (!resolvedSrc) {
+    return <span className="my-2 block text-sm text-muted-foreground">Loading {name}...</span>
+  }
+
   return (
     <ZoomableImage
       alt={alt}
@@ -291,7 +339,7 @@ function MarkdownImage({
       containerClassName="my-2 block w-fit max-w-full"
       downloadName={downloadName}
       slot="aui_markdown-image"
-      src={src}
+      src={resolvedSrc}
       {...props}
     />
   )
