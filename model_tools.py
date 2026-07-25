@@ -39,6 +39,15 @@ logger = logging.getLogger(__name__)
 _WARNED_DISABLED_BUNDLES: set = set()
 
 
+def _is_delegated_child_context() -> bool:
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return is_delegated_child_context()
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -276,6 +285,37 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _context_sensitive_check_fingerprint(
+    enabled_toolsets: Optional[List[str]],
+) -> tuple:
+    """Return request-local availability inputs for memoized tool schemas.
+
+    Context-sensitive ``check_fn`` callables bypass the registry's process-wide
+    TTL cache, but the outer tool-definition cache must distinguish their
+    outcomes too.  Today ``cronjob`` is the only such built-in.  Fingerprinting
+    its exact request-local result preserves the quiet-mode cache for ordinary
+    callers while preventing one gateway task from lending cron management to
+    another task.
+    """
+    cronjob_selected = enabled_toolsets is None or any(
+        "cronjob" in resolve_toolset(toolset_name)
+        for toolset_name in enabled_toolsets
+        if validate_toolset(toolset_name)
+    )
+    if not cronjob_selected:
+        return ()
+
+    entry = registry.get_entry("cronjob")
+    check_fn = entry.check_fn if entry is not None else None
+    if not check_fn or not getattr(check_fn, "__hermes_context_sensitive__", False):
+        return ()
+    try:
+        available = bool(check_fn())
+    except Exception:
+        available = False
+    return (("cronjob", available),)
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -308,7 +348,8 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    if quiet_mode:
+    use_memoized_definitions = quiet_mode
+    if use_memoized_definitions:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -323,6 +364,8 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            _is_delegated_child_context(),
+            _context_sensitive_check_fingerprint(enabled_toolsets),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -336,7 +379,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode:
+    if use_memoized_definitions:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -366,7 +409,11 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not _is_delegated_child_context()
+            and "kanban" not in effective_enabled_toolsets
+        ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
@@ -589,7 +636,37 @@ def _resolve_active_context_length() -> int:
         # CLI startup.  See issue #46620.
         raw_ctx = model_cfg.get("context_length")
         config_ctx = raw_ctx if isinstance(raw_ctx, int) and raw_ctx > 0 else None
-        return int(get_model_context_length(model_id, config_context_length=config_ctx) or 0)
+        # Provider-aware resolution: providers like Codex OAuth enforce a
+        # different (lower) window than the direct API for the same slug, and
+        # their resolvers key off provider/base_url/api_key. Without these,
+        # the gate sizes against generic metadata (e.g. 1.05M for gpt-5.5
+        # instead of Codex's enforced 272K). Credential resolution failing
+        # (offline, no keys) degrades to a provider+base_url-only lookup so
+        # the static provider-aware fallbacks still apply.
+        provider = str(model_cfg.get("provider") or "").strip()
+        base_url = str(model_cfg.get("base_url") or "").strip()
+        api_key = ""
+        if provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                rt = resolve_runtime_provider(
+                    requested=provider, target_model=model_id
+                ) or {}
+                base_url = str(rt.get("base_url") or base_url or "").strip()
+                api_key = str(rt.get("api_key") or "").strip()
+            except Exception as rt_exc:
+                logger.debug(
+                    "Runtime credential resolution failed for tool-search "
+                    "context gate (provider=%s): %s — using config values only",
+                    provider, rt_exc,
+                )
+        return int(get_model_context_length(
+            model_id,
+            base_url=base_url,
+            api_key=api_key,
+            config_context_length=config_ctx,
+            provider=provider,
+        ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

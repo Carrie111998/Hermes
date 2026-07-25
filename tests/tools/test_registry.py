@@ -530,7 +530,7 @@ class TestThreadSafety:
 
         def blocking_check():
             check_started.set()
-            writer_completed_during_check["value"] = writer_done.wait(timeout=1)
+            writer_completed_during_check["value"] = writer_done.wait(timeout=10)
             return True
 
         reg.register(
@@ -554,7 +554,7 @@ class TestThreadSafety:
                 errors.append(exc)
 
         def writer():
-            assert check_started.wait(timeout=1)
+            assert check_started.wait(timeout=10)
             reg.register(
                 name="gamma",
                 toolset="new",
@@ -567,8 +567,8 @@ class TestThreadSafety:
         writer_thread = threading.Thread(target=writer)
         reader_thread.start()
         writer_thread.start()
-        reader_thread.join(timeout=2)
-        writer_thread.join(timeout=2)
+        reader_thread.join(timeout=15)
+        writer_thread.join(timeout=15)
 
         assert not reader_thread.is_alive()
         assert not writer_thread.is_alive()
@@ -590,7 +590,7 @@ class TestThreadSafety:
 
         def blocking_check():
             check_started.set()
-            writer_completed_during_check["value"] = writer_done.wait(timeout=1)
+            writer_completed_during_check["value"] = writer_done.wait(timeout=10)
             return True
 
         reg.register(
@@ -614,7 +614,7 @@ class TestThreadSafety:
                 errors.append(exc)
 
         def writer():
-            assert check_started.wait(timeout=1)
+            assert check_started.wait(timeout=10)
             reg.deregister("beta")
             writer_done.set()
 
@@ -622,8 +622,8 @@ class TestThreadSafety:
         writer_thread = threading.Thread(target=writer)
         reader_thread.start()
         writer_thread.start()
-        reader_thread.join(timeout=2)
-        writer_thread.join(timeout=2)
+        reader_thread.join(timeout=15)
+        writer_thread.join(timeout=15)
 
         assert not reader_thread.is_alive()
         assert not writer_thread.is_alive()

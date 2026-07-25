@@ -30,8 +30,8 @@ Hermes Agent 采用纵深防御安全模型。本页涵盖所有安全边界—�
 
 ```yaml
 approvals:
-  mode: manual    # manual | off
-  timeout: 60     # 等待用户响应的秒数（默认：60）
+  mode: smart     # smart | manual | off
+  timeout: 300    # 等待用户响应的秒数（默认：300）
 ```
 
 | 模式 | 行为 |
@@ -106,7 +106,7 @@ YOLO 模式会禁用会话中**所有**危险命令安全检查——**但硬性
 
 ```yaml
 approvals:
-  timeout: 60  # 秒（默认：60）
+  timeout: 300  # 秒（默认：300）
 ```
 
 ### 触发审批的条件

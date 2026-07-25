@@ -168,7 +168,11 @@ class TestResolveChannelPrompts:
         assert event.channel_prompt == "Command prompt"
 
     @pytest.mark.asyncio
-    async def test_dispatch_thread_session_inherits_parent_channel_prompt(self):
+    async def test_dispatch_thread_session_inherits_parent_channel_prompt(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
         adapter = _make_adapter()
         adapter.config.extra = {"channel_prompts": {"200": "Parent prompt"}}
         adapter.build_source = MagicMock(return_value=SimpleNamespace())
@@ -180,8 +184,20 @@ class TestResolveChannelPrompts:
             channel=SimpleNamespace(id=200, parent=None),
             user=SimpleNamespace(id=1, display_name="Brenner"),
         )
+        default_role = object()
+        verified_thread = SimpleNamespace(
+            guild=SimpleNamespace(default_role=default_role),
+            type=11,
+            permissions_for=lambda role: SimpleNamespace(view_channel=True),
+        )
 
-        await adapter._dispatch_thread_session(interaction, "999", "new-thread", "hello")
+        await adapter._dispatch_thread_session(
+            interaction,
+            "999",
+            "new-thread",
+            "hello",
+            verified_thread=verified_thread,
+        )
 
         dispatched_event = adapter.handle_message.await_args.args[0]
         assert dispatched_event.channel_prompt == "Parent prompt"

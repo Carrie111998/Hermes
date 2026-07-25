@@ -1899,11 +1899,15 @@ def install_configuration_units_firewall_and_hosts(
     transaction_intent: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     try:
-        executor = json.loads(_asset(release, "executor.json").read_text("utf-8"))
-        web = json.loads(_asset(release, "web.json").read_text("utf-8"))
+        executor = json.loads(
+            _asset(release, "executor.json").read_text(encoding="utf-8")
+        )
+        web = json.loads(
+            _asset(release, "web.json").read_text(encoding="utf-8")
+        )
         cloud_attestor = json.loads(
             _asset(release, "cloud-observation-attestor.json").read_text(
-                "utf-8"
+                encoding="utf-8"
             )
         )
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:

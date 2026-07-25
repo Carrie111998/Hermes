@@ -133,6 +133,22 @@ class TestCheckFnTransientFailureSuppression:
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
         assert reg._check_fn_cached(never) is False
 
+    def test_context_sensitive_checks_are_not_shared_between_sessions(self):
+        import tools.registry as reg
+
+        state = {"allowed": False, "calls": 0}
+
+        def request_local_check():
+            state["calls"] += 1
+            return state["allowed"]
+
+        request_local_check.__hermes_context_sensitive__ = True
+
+        assert reg._check_fn_cached(request_local_check) is False
+        state["allowed"] = True
+        assert reg._check_fn_cached(request_local_check) is True
+        assert state["calls"] == 2
+
     def test_grace_expiry_lets_real_outage_through(self, monkeypatch):
         import tools.registry as reg
 

@@ -1,23 +1,33 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
-import { KeyRound, Package, Power, Server, Trash2, X, Zap } from 'lucide-react'
-import { Badge } from '@nous-research/ui/ui/components/badge'
-import { Button } from '@nous-research/ui/ui/components/button'
-import { Select, SelectOption } from '@nous-research/ui/ui/components/select'
-import { Spinner } from '@nous-research/ui/ui/components/spinner'
-import { H2 } from '@nous-research/ui/ui/components/typography/h2'
-import { api } from '@/lib/api'
-import type { McpCatalogDiagnostic, McpCatalogEntry, McpHttpAuth, McpServer, McpTestResult } from '@/lib/api'
-import { DeleteConfirmDialog } from '@/components/DeleteConfirmDialog'
-import { useToast } from '@nous-research/ui/hooks/use-toast'
-import { useConfirmDelete } from '@nous-research/ui/hooks/use-confirm-delete'
-import { useModalBehavior } from '@/hooks/useModalBehavior'
-import { Toast } from '@nous-research/ui/ui/components/toast'
-import { Card, CardContent } from '@nous-research/ui/ui/components/card'
-import { Input } from '@nous-research/ui/ui/components/input'
-import { Label } from '@nous-research/ui/ui/components/label'
-import { usePageHeader } from '@/contexts/usePageHeader'
-import { cn, themedBody } from '@/lib/utils'
-import { buildMcpServerCreate, type McpTransport } from '@/lib/mcp-server-create'
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { KeyRound, Package, Power, Server, Trash2, X, Zap } from "lucide-react";
+import { Badge } from "@nous-research/ui/ui/components/badge";
+import { Button } from "@nous-research/ui/ui/components/button";
+import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
+import { Spinner } from "@nous-research/ui/ui/components/spinner";
+import { H2 } from "@nous-research/ui/ui/components/typography/h2";
+import { api } from "@/lib/api";
+import type {
+  McpCatalogDiagnostic,
+  McpCatalogEntry,
+  McpHttpAuth,
+  McpServer,
+  McpTestResult,
+} from "@/lib/api";
+import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+import { useToast } from "@nous-research/ui/hooks/use-toast";
+import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
+import { useModalBehavior } from "@/hooks/useModalBehavior";
+import { Toast } from "@nous-research/ui/ui/components/toast";
+import { Card, CardContent } from "@nous-research/ui/ui/components/card";
+import { Input } from "@nous-research/ui/ui/components/input";
+import { Label } from "@nous-research/ui/ui/components/label";
+import { usePageHeader } from "@/contexts/usePageHeader";
+import { cn, themedBody } from "@/lib/utils";
+import {
+  buildMcpServerCreate,
+  type McpTransport,
+} from "@/lib/mcp-server-create";
+import { completeMcpDashboardOAuth } from "@/lib/mcp-dashboard-oauth";
 
 function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value.trim())
@@ -160,13 +170,17 @@ export default function McpPage() {
   const handleAuthenticate = async (server: McpServer) => {
     setAuthenticating(server.name)
     try {
-      const result = await api.authMcpServer(server.name)
-      setTestResults(prev => ({ ...prev, [server.name]: result }))
-      if (result.ok) {
-        showToast(`${server.name}: OAuth authentication complete`, 'success')
-      } else {
-        showToast(`${server.name}: ${result.error ?? 'OAuth failed'}`, 'error')
-      }
+      const result = await completeMcpDashboardOAuth({
+        serverName: server.name,
+        start: api.authMcpServer,
+        status: api.getMcpOAuthFlow,
+        open: window.open.bind(window),
+      });
+      setTestResults((prev) => ({
+        ...prev,
+        [server.name]: { ok: true, tools: result.tools ?? [] },
+      }));
+      showToast(`${server.name}: OAuth authentication complete`, "success");
     } catch (e) {
       showToast(`OAuth error: ${e}`, 'error')
     } finally {

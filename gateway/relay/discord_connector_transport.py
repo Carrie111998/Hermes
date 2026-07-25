@@ -689,6 +689,12 @@ class DiscordConnectorRelayTransport:
             }
         allowed_metadata = {
             "scope_id",
+            # RelayAdapter reattaches the authenticated inbound author as a
+            # routing fallback for generic multi-tenant connectors. This
+            # fixed-target transport validates the channel/guild below and
+            # never serializes user_id to its edge protocol, but must accept
+            # the shared adapter's read-only discriminator.
+            "user_id",
             "thread_id",
             "notify",
             "connector_idempotency_key",

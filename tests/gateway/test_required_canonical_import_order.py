@@ -208,7 +208,9 @@ def test_normal_gateway_import_preserves_dotenv_and_config_bridge(
     assert result["auxiliary_model"] is None
     assert result["vision_provider"] == "trusted-vision-provider"
     assert result["vision_model"] == "trusted-vision-model"
-    assert result["external_secret_sources_applied"] is True
+    # Disabled external sources are deliberately left unmarked so a
+    # long-running process can pick up a later config enablement.
+    assert result["external_secret_sources_applied"] is False
     assert result["gateway_marker"] == "1"
     assert result["quiet"] == "1"
     assert result["exec_ask"] == "1"
