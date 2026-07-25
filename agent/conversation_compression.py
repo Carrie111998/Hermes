@@ -1228,6 +1228,27 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def _rotation_drift_message_count(messages: list) -> int:
+    """Count rows that participate in the rotation stale-snapshot guard.
+
+    Desktop persists a typed ``model_switch`` timeline row even when that row
+    is absent from the compressor's live history projection. Treating the raw
+    durable row count as conversational growth wedges every later rotation.
+    Exclude only model-switch rows without ``api_content`` from BOTH sides of
+    the comparison; any row carrying model-facing sidecar content, and every
+    real user/assistant append, remains protected by the guard.
+    """
+    return sum(
+        1
+        for message in messages
+        if not (
+            isinstance(message, dict)
+            and message.get("display_kind") == "model_switch"
+            and not message.get("api_content")
+        )
+    )
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -1689,7 +1710,11 @@ def compress_context(
             )
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
-                if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
+                if (
+                    isinstance(durable_parent, list)
+                    and _rotation_drift_message_count(durable_parent)
+                    > _rotation_drift_message_count(messages)
+                ):
                     logger.warning(
                         "compression aborted: session=%s changed before lease "
                         "acquisition; preserving newer durable messages",

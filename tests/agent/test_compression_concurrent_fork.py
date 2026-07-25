@@ -316,6 +316,64 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     )
 
 
+def test_preexisting_model_switch_row_does_not_abort_rotation(
+    tmp_path: Path,
+) -> None:
+    """Display-only model metadata must not look like a concurrent turn."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "MODEL_SWITCH_DISPLAY_DRIFT"
+    db.create_session(parent_sid, source="desktop")
+    db.append_message(parent_sid, "user", "old durable")
+    db.append_message(
+        parent_sid,
+        "user",
+        "[System: The active model for this chat has changed to new/model.]",
+        display_kind="model_switch",
+    )
+
+    runtime_snapshot = [{"role": "user", "content": "old durable"}]
+    agent = _build_agent_with_db(db, parent_sid)
+
+    compressed, _system_prompt = agent._compress_context(
+        runtime_snapshot, "sys", approx_tokens=120_000
+    )
+
+    agent.context_compressor.compress.assert_called_once()
+    assert compressed is not runtime_snapshot
+    assert agent.session_id != parent_sid
+    child = db.find_live_compression_child(parent_sid)
+    assert child is not None
+    assert child["id"] == agent.session_id
+
+
+def test_model_switch_row_does_not_mask_real_concurrent_append(
+    tmp_path: Path,
+) -> None:
+    """The projection exception must preserve the genuine append safety gate."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "MODEL_SWITCH_PLUS_REAL_APPEND"
+    db.create_session(parent_sid, source="desktop")
+    db.append_message(parent_sid, "user", "old durable")
+    db.append_message(
+        parent_sid,
+        "user",
+        "[System: The active model for this chat has changed to new/model.]",
+        display_kind="model_switch",
+    )
+    runtime_snapshot = [{"role": "user", "content": "old durable"}]
+    db.append_message(parent_sid, "assistant", "late committed before lease")
+    agent = _build_agent_with_db(db, parent_sid)
+
+    returned, _system_prompt = agent._compress_context(
+        runtime_snapshot, "sys", approx_tokens=120_000
+    )
+
+    assert returned is runtime_snapshot
+    assert agent.session_id == parent_sid
+    assert db.find_live_compression_child(parent_sid) is None
+    agent.context_compressor.compress.assert_not_called()
+
+
 def test_durable_message_committed_before_lease_aborts_stale_snapshot(
     tmp_path: Path,
 ) -> None:
