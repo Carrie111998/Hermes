@@ -5040,6 +5040,7 @@ def get_profiles_sessions_sidebar(
     recents_profile: str = "all",
     recents_limit: int = 20,
     recents_exclude: str = None,
+    cron_profile: str = "all",
     cron_limit: int = 50,
     messaging_limit: int = 100,
     messaging_exclude: str = None,
@@ -5047,8 +5048,9 @@ def get_profiles_sessions_sidebar(
     """Batched sidebar session slices — one profile-DB open per refresh.
 
     The desktop sidebar needs three source-scoped windows per refresh: recents
-    (local chats, scoped to the active profile), cron sessions (all profiles),
-    and messaging-platform sessions (all profiles). Served as three separate
+    (local chats, scoped to the active profile), cron sessions (scoped to the
+    selected profile, or all profiles in the unified view), and
+    messaging-platform sessions (all profiles). Served as three separate
     ``/api/profiles/sessions`` calls they reopened every profile's ``state.db``
     three times and re-counted each refresh. This opens each DB once and runs
     the three filtered queries together, returning the three windows in one
@@ -5064,7 +5066,7 @@ def get_profiles_sessions_sidebar(
     from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
-    # cron + messaging are cross-profile; recents is scoped to recents_profile.
+    # messaging is cross-profile; recents and cron have independent selectors.
     # Scan every profile once regardless (each DB opened a single time).
     try:
         infos = profiles_mod.list_profiles()
@@ -5076,6 +5078,7 @@ def get_profiles_sessions_sidebar(
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
     recents_scope = (recents_profile or "all").strip() or "all"
+    cron_scope = (cron_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
 
@@ -5138,7 +5141,8 @@ def get_profiles_sessions_sidebar(
                 )
                 recents_total += rtotal
                 recents_profile_totals[name] = rtotal
-            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
+            if cron_scope == "all" or name == cron_scope:
+                cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
             messaging_rows.extend(
                 _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
             )
@@ -5154,6 +5158,7 @@ def get_profiles_sessions_sidebar(
         return win
 
     return {
+        "capabilities": {"cron_profile": True},
         "recents": {
             "sessions": _window(recents_rows, recents_cap),
             "total": recents_total,

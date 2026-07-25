@@ -425,6 +425,7 @@ export interface SidebarSessionSlice {
 }
 
 export interface SidebarSessionsResponse {
+  capabilities?: { cron_profile?: boolean }
   recents: SidebarSessionSlice
   cron: SidebarSessionSlice
   messaging: SidebarSessionSlice
@@ -435,6 +436,7 @@ export interface SidebarSessionsRequest {
   recentsProfile: 'all' | (string & {})
   recentsLimit: number
   recentsExclude: string[]
+  cronProfile?: 'all' | (string & {})
   cronLimit: number
   messagingLimit: number
   messagingExclude: string[]
@@ -478,14 +480,14 @@ function isEndpointMissingError(err: unknown): boolean {
 // Compatibility fallback: reassemble the three sidebar slices from the
 // per-slice endpoint, mirroring the batched route's semantics (min_messages=1,
 // archived excluded, recency order; recents scoped to the caller's profile,
-// cron + messaging cross-profile). Rides the same Electron remote-splice
+// cron caller-scoped + messaging cross-profile). Rides the same Electron remote-splice
 // interception as the pre-batching desktop, so remote profiles stay correct.
 async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
   const [recents, cron, messaging] = await Promise.all([
     listAllProfileSessions(req.recentsLimit, 1, 'exclude', 'recent', req.recentsProfile, {
       excludeSources: req.recentsExclude
     }),
-    listAllProfileSessions(req.cronLimit, 1, 'exclude', 'recent', 'all', { source: 'cron' }),
+    listAllProfileSessions(req.cronLimit, 1, 'exclude', 'recent', req.cronProfile ?? 'all', { source: 'cron' }),
     listAllProfileSessions(req.messagingLimit, 1, 'exclude', 'recent', 'all', {
       excludeSources: req.messagingExclude
     })
@@ -494,6 +496,7 @@ async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<S
   const errors = [...(recents.errors ?? []), ...(cron.errors ?? []), ...(messaging.errors ?? [])]
 
   return {
+    capabilities: { cron_profile: true },
     recents: { profile_totals: recents.profile_totals, sessions: recents.sessions, total: recents.total },
     cron: { sessions: cron.sessions },
     messaging: { sessions: messaging.sessions },
@@ -512,6 +515,10 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
     cron_limit: String(Math.max(1, req.cronLimit)),
     messaging_limit: String(Math.max(1, req.messagingLimit))
   })
+
+  if (req.cronProfile) {
+    params.set('cron_profile', req.cronProfile)
+  }
 
   if (req.recentsExclude.length) {
     params.set('recents_exclude', req.recentsExclude.join(','))
@@ -539,7 +546,14 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
     return listSidebarSessionsLegacy(req)
   }
 
+  // Early batched endpoints return HTTP 200 but ignore cron_profile. Concrete
+  // selectors require positive capability proof; All Profiles does not.
+  if (req.cronProfile && req.cronProfile !== 'all' && result.capabilities?.cron_profile !== true) {
+    return listSidebarSessionsLegacy(req)
+  }
+
   return {
+    capabilities: result.capabilities,
     recents: { ...result.recents, sessions: result.recents?.sessions ?? [] },
     cron: { ...result.cron, sessions: result.cron?.sessions ?? [] },
     messaging: { ...result.messaging, sessions: result.messaging?.sessions ?? [] },
@@ -1207,10 +1221,22 @@ export function getCronJob(jobId: string): Promise<CronJob> {
   })
 }
 
-export async function getCronJobRuns(jobId: string, limit = 20): Promise<SessionInfo[]> {
+function cronJobPath(jobId: string, suffix = '', profile?: null | string): string {
+  const query = new URLSearchParams()
+
+  if (profile) {
+    query.set('profile', profile)
+  }
+
+  const separator = suffix.includes('?') ? '&' : '?'
+
+  return `/api/cron/jobs/${encodeURIComponent(jobId)}${suffix}${query.size ? `${separator}${query}` : ''}`
+}
+
+export async function getCronJobRuns(jobId: string, limit = 20, profile?: null | string): Promise<SessionInfo[]> {
   const { runs } = await window.hermesDesktop.api<{ runs: SessionInfo[] }>({
-    ...profileScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}`
+    ...profileScoped(profile),
+    path: cronJobPath(jobId, `/runs?limit=${limit}`, profile)
   })
 
   return runs ?? []
@@ -1237,43 +1263,43 @@ export function createCronJob(body: CronJobCreatePayload): Promise<CronJob> {
   })
 }
 
-export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<CronJob> {
+export function updateCronJob(jobId: string, updates: CronJobUpdates, profile?: null | string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
-    ...profileScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
+    ...profileScoped(profile),
+    path: cronJobPath(jobId, '', profile),
     method: 'PUT',
     body: { updates }
   })
 }
 
-export function pauseCronJob(jobId: string): Promise<CronJob> {
+export function pauseCronJob(jobId: string, profile?: null | string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
-    ...profileScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause`,
+    ...profileScoped(profile),
+    path: cronJobPath(jobId, '/pause', profile),
     method: 'POST'
   })
 }
 
-export function resumeCronJob(jobId: string): Promise<CronJob> {
+export function resumeCronJob(jobId: string, profile?: null | string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
-    ...profileScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume`,
+    ...profileScoped(profile),
+    path: cronJobPath(jobId, '/resume', profile),
     method: 'POST'
   })
 }
 
-export function triggerCronJob(jobId: string): Promise<CronJob> {
+export function triggerCronJob(jobId: string, profile?: null | string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
-    ...profileScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger`,
+    ...profileScoped(profile),
+    path: cronJobPath(jobId, '/trigger', profile),
     method: 'POST'
   })
 }
 
-export function deleteCronJob(jobId: string): Promise<{ ok: boolean }> {
+export function deleteCronJob(jobId: string, profile?: null | string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
+    ...profileScoped(profile),
+    path: cronJobPath(jobId, '', profile),
     method: 'DELETE'
   })
 }

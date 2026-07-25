@@ -2038,6 +2038,7 @@ class TestWebServerEndpoints:
         pass, each source-scoped by the caller-supplied excludes, so the desktop
         stops reopening every profile DB three times per refresh."""
         from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
 
         db = SessionDB()
         try:
@@ -2051,6 +2052,17 @@ class TestWebServerEndpoints:
         finally:
             db.close()
 
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session(session_id="sb-worker-cron", source="cron")
+            worker_db.append_message(
+                session_id="sb-worker-cron", role="user", content="worker cron"
+            )
+        finally:
+            worker_db.close()
+
         resp = self.client.get(
             "/api/profiles/sessions/sidebar"
             "?recents_profile=all&recents_limit=20&recents_exclude=cron,telegram"
@@ -2059,6 +2071,7 @@ class TestWebServerEndpoints:
         )
         assert resp.status_code == 200
         data = resp.json()
+        assert data["capabilities"] == {"cron_profile": True}
 
         recents_ids = {s["id"] for s in data["recents"]["sessions"]}
         cron_ids = {s["id"] for s in data["cron"]["sessions"]}
@@ -2078,6 +2091,24 @@ class TestWebServerEndpoints:
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
+
+        worker_resp = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=all&cron_profile=worker&cron_limit=50"
+        )
+        assert worker_resp.status_code == 200
+        worker_cron = worker_resp.json()["cron"]["sessions"]
+        assert {row["id"] for row in worker_cron} == {"sb-worker-cron"}
+        assert {row["profile"] for row in worker_cron} == {"worker"}
+
+        all_resp = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=all&cron_profile=all&cron_limit=50"
+        )
+        assert {row["id"] for row in all_resp.json()["cron"]["sessions"]} >= {
+            "sb-cron",
+            "sb-worker-cron",
+        }
 
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget

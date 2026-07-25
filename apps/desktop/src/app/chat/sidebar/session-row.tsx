@@ -31,6 +31,7 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   isPinned: boolean
   isSelected: boolean
   isWorking: boolean
+  hideDestructiveActions?: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -60,6 +61,7 @@ export function SidebarSessionRow({
   isPinned,
   isSelected,
   isWorking,
+  hideDestructiveActions = false,
   onArchive,
   onBranch,
   onDelete,
@@ -90,6 +92,7 @@ export function SidebarSessionRow({
 
   return (
     <SessionContextMenu
+      hideDestructiveActions={hideDestructiveActions}
       onArchive={onArchive}
       onBranch={onBranch}
       onDelete={onDelete}
@@ -108,6 +111,7 @@ export function SidebarSessionRow({
               </span>
             )}
             <SessionActionsMenu
+              hideDestructiveActions={hideDestructiveActions}
               onArchive={onArchive}
               onBranch={onBranch}
               onDelete={onDelete}

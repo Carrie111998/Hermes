@@ -113,6 +113,9 @@ interface SessionActions {
   title: string
   pinned?: boolean
   profile?: string
+  /** Cron rows are readable/resumable here, but their profile-blind legacy
+   * archive/delete actions are intentionally not exposed. */
+  hideDestructiveActions?: boolean
   onPin?: () => void
   onBranch?: () => void
   onArchive?: () => void
@@ -193,6 +196,7 @@ function useSessionActions({
   title,
   pinned = false,
   profile,
+  hideDestructiveActions = false,
   onPin,
   onBranch,
   onArchive,
@@ -348,28 +352,30 @@ function useSessionActions({
       : []
 
   // DANGER — put it away / destroy it (delete stays last, destructive-red).
-  const dangerItems: ItemSpec[] = [
-    spec({
-      disabled: !onArchive,
-      icon: 'archive',
-      label: r.archive,
-      onSelect: () => {
-        triggerHaptic('selection')
-        onArchive?.()
-      }
-    }),
-    {
-      className: 'text-destructive focus:text-destructive',
-      disabled: !onDelete,
-      icon: 'trash',
-      label: t.common.delete,
-      onSelect: () => {
-        triggerHaptic('warning')
-        onDelete?.()
-      },
-      variant: 'destructive'
-    }
-  ]
+  const dangerItems: ItemSpec[] = hideDestructiveActions
+    ? []
+    : [
+        spec({
+          disabled: !onArchive,
+          icon: 'archive',
+          label: r.archive,
+          onSelect: () => {
+            triggerHaptic('selection')
+            onArchive?.()
+          }
+        }),
+        {
+          className: 'text-destructive focus:text-destructive',
+          disabled: !onDelete,
+          icon: 'trash',
+          label: t.common.delete,
+          onSelect: () => {
+            triggerHaptic('warning')
+            onDelete?.()
+          },
+          variant: 'destructive'
+        }
+      ]
 
   const renderMenuItem = (Item: MenuItem, { className, disabled, icon, label, onSelect, variant }: ItemSpec) => (
     <Item className={className} disabled={disabled} key={label} onSelect={onSelect} variant={variant}>
@@ -410,8 +416,12 @@ function useSessionActions({
           {tabCloseItems.map(item => renderMenuItem(kit.Item, item))}
         </>
       )}
-      <kit.Separator />
-      {dangerItems.map(item => renderMenuItem(kit.Item, item))}
+      {dangerItems.length > 0 && (
+        <>
+          <kit.Separator />
+          {dangerItems.map(item => renderMenuItem(kit.Item, item))}
+        </>
+      )}
       {onHideTabBar && (
         <>
           <kit.Separator />

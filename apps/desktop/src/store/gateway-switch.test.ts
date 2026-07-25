@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { $sessionsLimit, resetSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '@/store/layout'
 import {
   $cronSessions,
+  $cronSessionsTruncated,
   $freshDraftReady,
   $messagingSessions,
   $sessions,
   $sessionsLoading,
   $sessionsTotal,
   setCronSessions,
+  setCronSessionsAcquisitionTruncated,
   setFreshDraftReady,
   setMessagingSessions,
   setSessions,
@@ -29,6 +31,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     setSessions([{ id: 's1', title: 'old', profile: 'default' } as never])
     setSessionsTotal(1)
     setCronSessions([{ id: 'c1', title: 'cron', profile: 'default' } as never])
+    setCronSessionsAcquisitionTruncated(true)
     setMessagingSessions([{ id: 'm1', title: 'tg', profile: 'default' } as never])
     $stalledSessionIds.set(['s1'])
     setSessionsLoading(false)
@@ -40,6 +43,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     resetSessionsLimit()
     setSessions([])
     setCronSessions([])
+    setCronSessionsAcquisitionTruncated(false)
     setMessagingSessions([])
     $stalledSessionIds.set([])
     setSessionsLoading(true)
@@ -52,6 +56,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     expect($sessions.get()).toEqual([])
     expect($sessionsTotal.get()).toBe(0)
     expect($cronSessions.get()).toEqual([])
+    expect($cronSessionsTruncated.get()).toBe(false)
     expect($messagingSessions.get()).toEqual([])
     expect($stalledSessionIds.get()).toEqual([])
     expect($sessionsLoading.get()).toBe(true)
