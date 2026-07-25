@@ -36,7 +36,7 @@ Le pipeline complet comporte 6 étapes (skill `wmh-digital-offers`) :
 
 ### Livraison
 - Les fichiers finaux (.pptx, .xlsx) sont livrés via `kanban_complete(artifacts=[...])`.
-- Envoi direct Discord DM (gilles_43653) uniquement quand le pipeline est complet et vérifié.
+- Envoi direct Discord DM à Gilles (canal `discord:1467614563489812673` — toujours l'ID numérique, jamais le username `gilles_43653` qui est rejeté par l'API Discord) uniquement quand le pipeline est complet et vérifié.
 
 ## Contexte WMH Project
 
