@@ -473,9 +473,16 @@ def resolve_whatsapp_bridge_dir() -> Path:
     import shutil
     from pathlib import Path as _Path
 
-    # Default location in install tree (may be read-only)
+    # Package wrappers may expose bridge source outside the Python tree (Nix
+    # store, Homebrew prefix, etc.). Resolve that path centrally so the adapter,
+    # CLI setup flow, and dashboard pairing flow all use the same source.
     from hermes_constants import get_hermes_home
-    install_bridge = _Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
+    packaged_bridge = os.getenv("HERMES_WHATSAPP_BRIDGE_DIR", "").strip()
+    install_bridge = (
+        _Path(packaged_bridge).expanduser()
+        if packaged_bridge
+        else _Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
+    )
 
     # Try HERMES_HOME location first
     hermes_home = get_hermes_home()
