@@ -74,6 +74,7 @@ interface HarnessHandle {
   activeSessionIdRef: MutableRefObject<string | null>
   cancelRun: () => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
+  reloadFromMessage: (parentId: string | null) => Promise<void>
   redirectPrompt: (text: string) => Promise<boolean>
   /** @deprecated Use `redirectPrompt`. */
   steerPrompt: (text: string) => Promise<boolean>
@@ -176,6 +177,8 @@ function Harness({
         act(async () => actions.cancelRun(...args)) as Promise<void>,
       restoreToMessage: (...args: Parameters<typeof actions.restoreToMessage>) =>
         act(async () => actions.restoreToMessage(...args)) as Promise<void>,
+      reloadFromMessage: (...args: Parameters<typeof actions.reloadFromMessage>) =>
+        act(async () => actions.reloadFromMessage(...args)) as Promise<void>,
       redirectPrompt: (...args: Parameters<typeof actions.redirectPrompt>) =>
         act(async () => actions.redirectPrompt(...args)) as Promise<boolean>,
       steerPrompt: (...args: Parameters<typeof actions.steerPrompt>) =>
@@ -187,6 +190,7 @@ function Harness({
   }, [
     actions.cancelRun,
     actions.restoreToMessage,
+    actions.reloadFromMessage,
     actions.redirectPrompt,
     actions.steerPrompt,
     actions.submitText,
@@ -1626,6 +1630,89 @@ describe('usePromptActions restoreToMessage', () => {
       1_800_000
     )
     expect((lastState.messages as { id: string }[]).map(m => m.id)).toEqual(['u1'])
+  })
+})
+
+describe('usePromptActions reloadFromMessage', () => {
+  beforeEach(() => {
+    $busy.set(false)
+    $messages.set([
+      { id: 'u1', role: 'user', parts: [textPart('first prompt')] },
+      { id: 'a1', role: 'assistant', parts: [textPart('first answer')] },
+      { id: 'u2', role: 'user', parts: [textPart('second prompt')] },
+      { id: 'a2', role: 'assistant', parts: [textPart('second answer')] }
+    ])
+  })
+  afterEach(() => {
+    cleanup()
+    $busy.set(false)
+    $messages.set([])
+    vi.restoreAllMocks()
+  })
+  it('resubmits the preceding user prompt when activeSessionId is live', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+    await handle!.reloadFromMessage('a2')
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      expect.objectContaining({
+        session_id: RUNTIME_SESSION_ID,
+        text: 'second prompt'
+      }),
+      expect.any(Number)
+    )
+  })
+  it('falls back to activeSessionIdRef.current when activeSessionId is stale-null', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const staleRef = { current: RUNTIME_SESSION_ID }
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={staleRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+    await handle!.reloadFromMessage('a2')
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      expect.objectContaining({
+        session_id: RUNTIME_SESSION_ID,
+        text: 'second prompt'
+      }),
+      expect.any(Number)
+    )
+  })
+  it('silently no-ops when both activeSessionId and the ref are null', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const emptyRef = { current: null }
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={emptyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+    await handle!.reloadFromMessage('a2')
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+  it('does not call requestGateway while a turn is already busy', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+    $busy.set(true)
+    await handle!.reloadFromMessage('a2')
+    expect(requestGateway).not.toHaveBeenCalled()
   })
 })
 
