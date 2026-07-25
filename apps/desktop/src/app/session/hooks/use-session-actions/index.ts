@@ -139,7 +139,12 @@ function reconcileAuthoritativeMessages(
 ): ChatMessage[] {
   const authoritative = toChatMessages(authoritativeMessages)
   const withLiveProjection = liveProjection ? appendLiveSessionProjection(authoritative, liveProjection) : authoritative
-  const reconciled = reconcileResumeMessages(withLiveProjection, previousMessages)
+
+  return reconcileProjectedMessages(withLiveProjection, previousMessages)
+}
+
+function reconcileProjectedMessages(projectedMessages: ChatMessage[], previousMessages: ChatMessage[]): ChatMessage[] {
+  const reconciled = reconcileResumeMessages(projectedMessages, previousMessages)
   const withPendingTurn = preserveLocalPendingTurnMessages(reconciled, previousMessages)
 
   return preserveLocalAssistantErrors(withPendingTurn, previousMessages)
@@ -748,19 +753,28 @@ export function useSessionActions({
 
               const activatedState = updateSessionState(
                 cachedRuntimeId,
-                state => ({
-                  ...state,
-                  ...(runtimeInfo ?? {}),
-                  messages: activatedMessages,
-                  busy: running,
-                  awaitingResponse: running
-                }),
+                state => {
+                  // session.activate may have been pending while prompt.submit
+                  // appended a newer optimistic row to the live cache. Re-read
+                  // that cache at the atomic update boundary so this stale
+                  // activation projection cannot clobber accepted user intent.
+                  const messages = reconcileProjectedMessages(activatedMessages, state.messages)
+                  const currentRunning = Boolean(activated.running ?? state.busy)
+
+                  return {
+                    ...state,
+                    ...(runtimeInfo ?? {}),
+                    messages,
+                    busy: currentRunning,
+                    awaitingResponse: currentRunning
+                  }
+                },
                 storedSessionId
               )
 
-              busyRef.current = running
-              setBusy(running)
-              setAwaitingResponse(running)
+              busyRef.current = activatedState.busy
+              setBusy(activatedState.busy)
+              setAwaitingResponse(activatedState.awaitingResponse)
               syncSessionStateToView(cachedRuntimeId, activatedState)
 
               return
