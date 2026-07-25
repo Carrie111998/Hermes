@@ -367,6 +367,136 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
+    @pytest.mark.parametrize("background", [False, True])
+    def test_guard_uses_explicit_workdir_for_foreground_and_background(
+        self, monkeypatch, tmp_path, background
+    ):
+        import tools.terminal_tool as tt
+
+        configured = tmp_path / "configured"
+        execution = tmp_path / "execution"
+        configured.mkdir()
+        execution.mkdir()
+        (execution / "delayed_restart.sh").write_text(
+            "#!/bin/bash\nhermes gateway restart\n"
+        )
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "cwd": str(configured),
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+
+        result = json.loads(tt.terminal_tool(
+            command="./delayed_restart.sh",
+            workdir=str(execution),
+            background=background,
+        ))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    def test_guard_uses_persistent_session_cwd(self, monkeypatch, tmp_path):
+        import tools.approval as approval
+        import tools.terminal_tool as tt
+
+        configured = tmp_path / "configured"
+        execution = tmp_path / "execution"
+        configured.mkdir()
+        execution.mkdir()
+        (execution / "delayed_restart.sh").write_text(
+            "#!/bin/bash\nhermes gateway restart\n"
+        )
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "cwd": str(configured),
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+        monkeypatch.setattr(
+            tt,
+            "get_session_cwd",
+            lambda key=None: str(execution) if key == "live-session" else None,
+        )
+        monkeypatch.setattr(
+            approval,
+            "get_current_session_key",
+            lambda default="": "live-session",
+        )
+
+        result = json.loads(tt.terminal_tool(command="./delayed_restart.sh"))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    def test_nonlocal_background_guard_and_spawn_share_effective_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        import tools.process_registry as process_registry_module
+        import tools.terminal_tool as tt
+
+        configured = tmp_path / "configured"
+        execution = tmp_path / "execution"
+        configured.mkdir()
+        execution.mkdir()
+        (configured / "helper.sh").write_text(
+            "#!/bin/sh\nhermes gateway restart\n"
+        )
+        (execution / "helper.sh").write_text("#!/bin/sh\nprintf safe\\n\n")
+
+        fake_env = self._make_fake_env()
+        self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "ssh",
+                "cwd": str(configured),
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+        monkeypatch.setattr(
+            tt,
+            "_check_all_guards",
+            lambda cmd, env, **kwargs: {"approved": True},
+        )
+        spawn_calls = []
+
+        def _fake_spawn_via_env(**kwargs):
+            spawn_calls.append(kwargs)
+            return SimpleNamespace(id="proc_fake", pid=1234)
+
+        monkeypatch.setattr(
+            process_registry_module.process_registry,
+            "spawn_via_env",
+            _fake_spawn_via_env,
+        )
+
+        result = json.loads(
+            tt.terminal_tool(
+                command="./helper.sh",
+                workdir=str(execution),
+                background=True,
+            )
+        )
+
+        assert result["exit_code"] == 0
+        assert len(spawn_calls) == 1
+        assert spawn_calls[0]["cwd"] == str(execution)
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
@@ -470,6 +600,96 @@ class TestLifecycleGuardModule:
         )
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily", "restart.sh")
+
+    def test_extensionless_interpreter_helper_is_scanned(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        helper = tmp_path / "restart-helper"
+        helper.write_text("#!/bin/sh\nhermes gateway restart\n")
+
+        assert contains_gateway_lifecycle_invocation(
+            "bash restart-helper", cwd=tmp_path
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "source helper",
+            ". helper",
+            "exec ./helper",
+            "command bash helper",
+            "if ./helper; then printf safe; fi",
+            "while ./helper; do :; done",
+            "! ./helper",
+        ],
+    )
+    def test_literal_shell_wrappers_and_control_flow_helpers_are_scanned(
+        self, tmp_path, command
+    ):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        (tmp_path / "helper").write_text("#!/bin/sh\nhermes gateway restart\n")
+
+        assert contains_gateway_lifecycle_invocation(command, cwd=tmp_path)
+
+    def test_literal_nested_helpers_are_scanned_recursively(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        (tmp_path / "outer").write_text("#!/bin/sh\n./inner\n")
+        (tmp_path / "inner").write_text("#!/bin/sh\nhermes gateway restart\n")
+
+        assert contains_gateway_lifecycle_invocation("./outer", cwd=tmp_path)
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation is not reliable on Windows")
+    def test_symlink_loop_fails_closed(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        (tmp_path / "loop").symlink_to("loop")
+
+        assert contains_gateway_lifecycle_invocation("./loop", cwd=tmp_path)
+
+    def test_literal_helper_reference_collection_is_bounded(self):
+        from cron.lifecycle_guard import (
+            _MAX_HELPERS_SCANNED,
+            _collect_literal_helper_refs,
+        )
+
+        command = "; ".join(
+            f"./helper-{index}" for index in range(_MAX_HELPERS_SCANNED + 100)
+        )
+        refs, overflow = _collect_literal_helper_refs(command)
+
+        assert overflow is True
+        assert len(refs) == _MAX_HELPERS_SCANNED
+
+    def test_safe_extensionless_helper_is_allowed(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        (tmp_path / "health-helper").write_text("#!/bin/sh\nprintf ok\\n\n")
+
+        assert not contains_gateway_lifecycle_invocation(
+            "sh health-helper", cwd=tmp_path
+        )
+
+    def test_special_helper_file_fails_closed_without_reading(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        fifo = tmp_path / "blocking-helper"
+        os.mkfifo(fifo)
+
+        assert contains_gateway_lifecycle_invocation(
+            "bash blocking-helper", cwd=tmp_path
+        )
+
+    def test_oversized_helper_fails_closed(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_invocation
+
+        helper = tmp_path / "large-helper"
+        helper.write_bytes(b"#" * (257 * 1024))
+
+        assert contains_gateway_lifecycle_invocation(
+            "bash large-helper", cwd=tmp_path
+        )
 
 
 # ---------------------------------------------------------------------------

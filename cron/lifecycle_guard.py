@@ -33,7 +33,9 @@ only fail (silently) when it fires.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -66,12 +68,56 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 )
 
 
+_MAX_HELPER_SCAN_BYTES = 256 * 1024
+_MAX_HELPER_SCAN_DEPTH = 3
+_MAX_HELPERS_SCANNED = 16
+
+# Terminal execution may hide the lifecycle command in a literal helper file.
+# Keep extraction deliberately narrow: static ``*.sh`` references, literal
+# path commands (``./helper`` / ``/tmp/helper``), shell source builtins, and
+# literal script arguments to common shell interpreters. Shell control-flow
+# keywords and simple execution wrappers are accepted before those command
+# shapes. Dynamic expansion and arbitrary PATH-only executable lookup remain
+# outside this bounded inspection layer.
+_SHELL_COMMAND_START = r"(?:^|[;&|]\s*|\$\(\s*|\{\s*)"
+_SHELL_CONTROL_PREFIX = r"(?:(?:(?:if|then|elif|while|until|do|else)|!)\s+)*"
+_SHELL_WRAPPER_PREFIX = r"(?:(?:command|exec|builtin|nohup|time)\s+)*"
+_SHELL_ENV_PREFIX = r"(?:env\s+(?:(?:-\S+|[A-Za-z_]\w*=\S+)\s+)*)?"
+_LITERAL_HELPER_TOKEN = r"[A-Za-z0-9_./:@%+=,~\-]+"
 _SHELL_SCRIPT_REF_PATTERN = re.compile(
     r"(?<![\w./~-])"
     r"("
     r"(?:~|/|\./|\../)?"
     r"[A-Za-z0-9_./:@%+=,\-]+\.sh"
     r")"
+)
+_LITERAL_COMMAND_PATH_PATTERN = re.compile(
+    _SHELL_COMMAND_START
+    + _SHELL_CONTROL_PREFIX
+    + _SHELL_WRAPPER_PREFIX
+    + _SHELL_ENV_PREFIX
+    + r"[\"']?"
+    r"((?:~|/|\./|\../)[A-Za-z0-9_./:@%+=,\-]+)"
+    r"[\"']?",
+    re.MULTILINE,
+)
+_SHELL_INTERPRETER_REF_PATTERN = re.compile(
+    _SHELL_COMMAND_START
+    + _SHELL_CONTROL_PREFIX
+    + _SHELL_WRAPPER_PREFIX
+    + _SHELL_ENV_PREFIX
+    + r"(?:bash|sh|zsh|dash|ksh)\s+"
+    r"(?:-[A-Za-z]+\s+)*"
+    r"[\"']?([A-Za-z0-9_./:@%+=,~\-]+)[\"']?",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SHELL_SOURCE_REF_PATTERN = re.compile(
+    _SHELL_COMMAND_START
+    + _SHELL_CONTROL_PREFIX
+    + _SHELL_WRAPPER_PREFIX
+    + r"(?:source|\.)\s+(?:--\s+)?"
+    + rf"[\"']?({_LITERAL_HELPER_TOKEN})[\"']?",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -90,22 +136,112 @@ def _resolve_terminal_script_path(script_path: str, cwd: Optional[Path | str]) -
     return base / raw
 
 
-def _read_file_for_scanning(path: Path) -> str:
+def _read_file_for_scanning(path: Path) -> tuple[str, bool]:
+    """Return ``(text, unsafe)`` without blocking on special or huge files.
+
+    Missing literal paths are ignored because the shell will fail to execute
+    them. Existing helpers fail closed when they cannot be resolved/read as a
+    bounded regular file. Resolving first still permits normal symlinks to
+    regular files while rejecting symlinks to FIFOs/devices/directories.
+    """
     try:
-        return path.read_bytes().decode("utf-8", errors="replace")
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        return "", False
+    except (OSError, RuntimeError):
+        return "", True
+
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(resolved, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            file_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                return "", True
+            if file_stat.st_size > _MAX_HELPER_SCAN_BYTES:
+                return "", True
+            data = handle.read(_MAX_HELPER_SCAN_BYTES + 1)
     except OSError:
-        return ""
+        return "", True
+
+    if len(data) > _MAX_HELPER_SCAN_BYTES:
+        return "", True
+    return data.decode("utf-8", errors="replace"), False
 
 
-def _iter_shell_script_refs(text: str) -> list[str]:
+def _collect_literal_helper_refs(text: str) -> tuple[list[str], bool]:
+    """Collect at most the scan budget of distinct literal helper references."""
     seen: set[str] = set()
     refs: list[str] = []
-    for match in _SHELL_SCRIPT_REF_PATTERN.finditer(text or ""):
-        ref = match.group(1)
-        if ref not in seen:
+    for pattern in (
+        _SHELL_SCRIPT_REF_PATTERN,
+        _LITERAL_COMMAND_PATH_PATTERN,
+        _SHELL_INTERPRETER_REF_PATTERN,
+        _SHELL_SOURCE_REF_PATTERN,
+    ):
+        for match in pattern.finditer(text or ""):
+            ref = match.group(1)
+            if ref in seen:
+                continue
+            if len(refs) >= _MAX_HELPERS_SCANNED:
+                return refs, True
             seen.add(ref)
             refs.append(ref)
-    return refs
+    return refs, False
+
+
+def _scan_literal_helpers(
+    text: str,
+    *,
+    cwd: Optional[Path | str],
+    depth: int,
+    seen_paths: set[Path],
+    files_scanned: list[int],
+) -> bool:
+    refs, reference_overflow = _collect_literal_helper_refs(text)
+    if reference_overflow:
+        return True
+
+    for ref in refs:
+        path = _resolve_terminal_script_path(ref, cwd)
+        try:
+            path_key = path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return True
+        if path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+
+        files_scanned[0] += 1
+        if files_scanned[0] > _MAX_HELPERS_SCANNED:
+            return True
+
+        helper_text, unsafe = _read_file_for_scanning(path)
+        if unsafe:
+            return True
+        if not helper_text:
+            continue
+        if contains_gateway_lifecycle_command(helper_text):
+            return True
+
+        nested_refs, nested_reference_overflow = _collect_literal_helper_refs(helper_text)
+        if nested_reference_overflow:
+            return True
+        if not nested_refs:
+            continue
+        if depth >= _MAX_HELPER_SCAN_DEPTH:
+            return True
+        if _scan_literal_helpers(
+            helper_text,
+            cwd=cwd,
+            depth=depth + 1,
+            seen_paths=seen_paths,
+            files_scanned=files_scanned,
+        ):
+            return True
+
+    return False
 
 
 def contains_gateway_lifecycle_invocation(
@@ -113,26 +249,25 @@ def contains_gateway_lifecycle_invocation(
     *,
     cwd: Optional[Path | str] = None,
 ) -> bool:
-    """Return True if a shell command directly or indirectly targets the gateway.
+    """Return True for a direct command or bounded literal-helper invocation.
 
-    ``contains_gateway_lifecycle_command`` intentionally scans only the supplied
-    text.  Terminal execution needs one more layer: a command can invoke a
-    helper script, e.g. ``sleep 75; /tmp/restart.sh``, whose contents contain
-    the actual ``launchctl``/``hermes gateway restart`` foot-gun.  This helper
-    scans readable ``*.sh`` references as they would be resolved from the
-    command cwd.
+    Terminal commands can invoke a helper whose contents contain the actual
+    lifecycle operation. This scans a bounded set of readable regular helper
+    files as resolved from the exact execution cwd, including nested literal
+    helper references. Existing helpers that are special, unreadable, too
+    large, too deep, or too numerous fail closed rather than hanging or
+    exhausting the gateway process.
     """
     if contains_gateway_lifecycle_command(text):
         return True
 
-    for ref in _iter_shell_script_refs(text):
-        script_text = _read_file_for_scanning(
-            _resolve_terminal_script_path(ref, cwd)
-        )
-        if script_text and contains_gateway_lifecycle_command(script_text):
-            return True
-
-    return False
+    return _scan_literal_helpers(
+        text,
+        cwd=cwd,
+        depth=0,
+        seen_paths=set(),
+        files_scanned=[0],
+    )
 
 
 def _resolve_script_path(script_path: str) -> Path:
@@ -155,15 +290,19 @@ def _resolve_script_path(script_path: str) -> Path:
 
 
 def _read_script_for_scanning(script_path: str) -> str:
-    """Read a script file for lifecycle-pattern scanning.
+    """Read a bounded regular cron script for lifecycle-pattern scanning.
 
-    Decodes with ``errors="replace"`` so binary or non-UTF-8 content does not
-    silently bypass the check — a plain text-mode read raises
-    ``UnicodeDecodeError`` on such files, and swallowing that error would let
-    an attacker hide the command in binary noise.  Returns an empty string
-    only when the file cannot be read at all.
+    Decodes with ``errors="replace"`` so non-UTF-8 bytes cannot hide a plain
+    command. Existing scripts that are special, unreadable, or oversized fail
+    closed; missing scripts remain a downstream scheduler validation concern.
     """
-    return _read_file_for_scanning(_resolve_script_path(script_path))
+    script_text, unsafe = _read_file_for_scanning(_resolve_script_path(script_path))
+    if unsafe:
+        raise GatewayLifecycleBlocked(
+            "Blocked: cron script could not be safely inspected as a bounded "
+            "regular file (#30719)."
+        )
+    return script_text
 
 
 def check_gateway_lifecycle(
