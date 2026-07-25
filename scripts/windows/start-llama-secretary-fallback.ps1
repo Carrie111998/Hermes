@@ -1,4 +1,7 @@
-# Fallback llama.cpp launcher — Hermes-3 8B Q4_K_M on port 8081 by default.
+# Fallback llama.cpp launcher — local Huihui agentic Q4_K_M on port 8081 by default.
+# Do NOT default to NousResearch/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M — that HF :quant
+# id is not a usable local asset on this host (cache stub / no weights), and
+# llama-turboquant builds often lack HTTPS for -hf download.
 
 param(
     [int]$WaitSeconds = 240
@@ -13,9 +16,32 @@ function Resolve-Default {
     return $Default
 }
 
+function Resolve-FallbackGgufPath {
+    $candidates = @(
+        (Resolve-Default "HERMES_LLAMA_FALLBACK_GGUF_PATH" ""),
+        "H:\elt_data\gguf_models\mradermacher\Huihui-gemma-4-12B-agentic-fable5-abliterated-GGUF\Huihui-gemma-4-12B-agentic-fable5-abliterated.Q4_K_M.gguf",
+        "C:\Users\downl\Desktop\SO8T\gguf_models\Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ3_M.gguf"
+    )
+    $metaPath = Join-Path $env:USERPROFILE ".hermes\logs\llama-hf-download\hf-hub-huihui-latest.json"
+    if (Test-Path -LiteralPath $metaPath) {
+        try {
+            $meta = Get-Content -LiteralPath $metaPath -Raw -Encoding utf8 | ConvertFrom-Json
+            if ($meta.path) { $candidates = @([string]$meta.path) + $candidates }
+        } catch {}
+    }
+    foreach ($p in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        if ((Test-Path -LiteralPath $p) -and -not ((Get-Item -LiteralPath $p).PSIsContainer) -and ((Get-Item -LiteralPath $p).Length -gt 1GB)) {
+            return (Resolve-Path -LiteralPath $p).Path
+        }
+    }
+    return ""
+}
+
 $ServerExe = Resolve-Default "HERMES_LLAMA_SERVER_EXE" (Join-Path $env:LOCALAPPDATA "Programs\llama-turboquant\bin\llama-server.exe")
-$ModelRepo = Resolve-Default "HERMES_LLAMA_FALLBACK_MODEL" "NousResearch/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M"
-$Alias = Resolve-Default "HERMES_LLAMA_FALLBACK_ALIAS" "hermes3-8b-fallback"
+$ModelPath = Resolve-FallbackGgufPath
+$ModelRepo = Resolve-Default "HERMES_LLAMA_FALLBACK_MODEL" ""
+$Alias = Resolve-Default "HERMES_LLAMA_FALLBACK_ALIAS" "huihui-gemma-agentic-fallback"
 $HostName = Resolve-Default "HERMES_LLAMA_FALLBACK_HOST" "127.0.0.1"
 $Port = [int](Resolve-Default "HERMES_LLAMA_FALLBACK_PORT" "8081")
 $Ctx = [int](Resolve-Default "HERMES_LLAMA_FALLBACK_CTX" "65536")
@@ -26,6 +52,17 @@ if ($Ctx -lt 64000) {
 }
 if (-not (Test-Path -LiteralPath $ServerExe)) {
     throw "llama-server not found: $ServerExe"
+}
+if ([string]::IsNullOrWhiteSpace($ModelPath) -and [string]::IsNullOrWhiteSpace($ModelRepo)) {
+    throw "No fallback GGUF found. Set HERMES_LLAMA_FALLBACK_GGUF_PATH or download Huihui Q4_K_M."
+}
+# Reject the known-bad default that only leaves an empty HF cache stub.
+if ($ModelRepo -match '(?i)NousResearch/Hermes-3-Llama-3\.1-8B-GGUF') {
+    Write-Warning "Ignoring unusable HERMES_LLAMA_FALLBACK_MODEL=$ModelRepo; prefer local GGUF."
+    $ModelRepo = ""
+    if ([string]::IsNullOrWhiteSpace($ModelPath)) {
+        throw "Hermes-3 HF :Q4_K_M is not usable here. Point HERMES_LLAMA_FALLBACK_GGUF_PATH at a real .gguf."
+    }
 }
 
 function Get-LlamaHelpText {
@@ -53,16 +90,8 @@ $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $stdoutPath = Join-Path $logDir "fallback-$stamp.out.log"
 $stderrPath = Join-Path $logDir "fallback-$stamp.err.log"
 $helpText = Get-LlamaHelpText -ServerExe $ServerExe
-$supportsHfRepoLong = Test-HelpFlag $helpText '--hf-repo'
-$supportsHfRepoShort = Test-HelpFlag $helpText '(^|[\s,])-hf([\s,]|$)'
-$supportsHfRepo = $supportsHfRepoLong -or $supportsHfRepoShort
-if (-not $supportsHfRepo) {
-    throw "This llama-server build lacks -hf/--hf-repo; cannot load $ModelRepo"
-}
-$hfFlag = if ($supportsHfRepoLong) { "--hf-repo" } else { "-hf" }
 
 $serverArgs = @(
-    $hfFlag, $ModelRepo,
     "--alias", $Alias,
     "--host", $HostName,
     "--port", [string]$Port,
@@ -72,6 +101,21 @@ $serverArgs = @(
     "-ngl", [string]$GpuLayers,
     "-np", "1"
 )
+
+if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
+    $serverArgs = @("-m", $ModelPath) + $serverArgs
+    Write-Output "fallback model path=$ModelPath"
+} else {
+    $supportsHfRepoLong = Test-HelpFlag $helpText '--hf-repo'
+    $supportsHfRepoShort = Test-HelpFlag $helpText '(^|[\s,])-hf([\s,]|$)'
+    $supportsHfRepo = $supportsHfRepoLong -or $supportsHfRepoShort
+    if (-not $supportsHfRepo) {
+        throw "This llama-server build lacks -hf/--hf-repo; set HERMES_LLAMA_FALLBACK_GGUF_PATH to a local .gguf"
+    }
+    $hfFlag = if ($supportsHfRepoLong) { "--hf-repo" } else { "-hf" }
+    $serverArgs = @($hfFlag, $ModelRepo) + $serverArgs
+    Write-Output "fallback hf repo=$ModelRepo"
+}
 
 $process = Start-Process `
     -FilePath $ServerExe `
@@ -91,7 +135,7 @@ while ((Get-Date) -lt $deadline) {
     try {
         $models = Invoke-RestMethod -Uri $modelsUrl -TimeoutSec 3
         Write-Output "llama.cpp fallback ready on $modelsUrl"
-        Write-Output "pid=$($process.Id) model=$ModelRepo alias=$Alias ctx=$Ctx"
+        Write-Output "pid=$($process.Id) alias=$Alias ctx=$Ctx"
         $models | ConvertTo-Json -Depth 6
         exit 0
     } catch {

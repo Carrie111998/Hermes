@@ -16,7 +16,9 @@ param(
     [int]$WaitSeconds = 300,
     [int]$ModelsMax = 1,
     [string]$PresetPath = "",
-    [switch]$NoAutoload,
+    # HF-cache stubs (e.g. NousResearch/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M) must not
+    # appear as fake /v1/models entries. Opt in only with -AllowAutoload.
+    [switch]$AllowAutoload,
     [switch]$ForceRestart,
     [switch]$WarmSecondary
 )
@@ -276,6 +278,11 @@ if (Test-PortListening -TargetHost $HostName -TargetPort $Port) {
         $listed = Invoke-RestMethod -Uri "http://${HostName}:${Port}/v1/models" -TimeoutSec 5
         $ids = @($listed.data | ForEach-Object { $_.id })
         Write-Output ("models: {0}" -f ($ids -join ", "))
+        # HF-cache stubs look like org/repo:QUANT
+        $hfStubs = @($ids | Where-Object { $_ -match '/' -and $_ -notin @($PrimaryId, $SecondaryId) })
+        if ($hfStubs.Count -gt 0) {
+            Write-Warning ("HF-cache stubs still listed ({0}). Re-run with -ForceRestart to apply hf-cache isolation." -f ($hfStubs -join ", "))
+        }
         if ($WarmSecondary) {
             Invoke-WarmSecondary -BaseUrl "http://${HostName}:${Port}/v1" -PrimaryId $PrimaryId -SecondaryId $SecondaryId -TimeoutSec $WaitSeconds
         }
@@ -319,24 +326,55 @@ $serverArgs = @(
     "--port", [string]$Port,
     "--jinja"
 )
-if ($NoAutoload -and ($helpText -match '--no-models-autoload')) {
-    $serverArgs += @("--no-models-autoload")
+$disableAutoload = -not $AllowAutoload
+if ($disableAutoload) {
+    if ($helpText -match '--no-models-autoload') {
+        $serverArgs += @("--no-models-autoload")
+    } else {
+        Write-Warning "llama-server lacks --no-models-autoload; HF cache stubs may still appear in /v1/models"
+    }
+} else {
+    Write-Warning "models-autoload enabled (-AllowAutoload); HF cache stubs may appear in /v1/models"
 }
 
-$env:HF_HOME = if ($env:HF_HOME) { $env:HF_HOME } else { $env:HF_HUB_CACHE }
+# llama-server always registers HF hub cache GGUFs as router presets
+# ("Loaded N cached model presets"). That surfaces stubs like
+# NousResearch/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M even with --no-models-autoload.
+# Point the child at an empty hub cache so /v1/models is preset-only.
+# Do NOT delete the real HF cache — downloads stay under HF_HUB_CACHE.
+$routerHfCache = Join-Path $env:USERPROFILE ".hermes\llama\router-hf-cache-empty"
+New-Item -ItemType Directory -Path $routerHfCache -Force | Out-Null
+$hfEnvKeys = @("LLAMA_CACHE", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME")
+$hfEnvBackup = @{}
+foreach ($k in $hfEnvKeys) {
+    $hfEnvBackup[$k] = [Environment]::GetEnvironmentVariable($k, "Process")
+    Set-Item -Path "Env:$k" -Value $routerHfCache
+}
 
 Write-Output "Starting llama router hot-swap on ${HostName}:${Port}"
 Write-Output "preset=$PresetPath models-max=$ModelsMax"
 Write-Output "primary=$PrimaryId -> $PrimaryPath"
 Write-Output "secondary=$SecondaryId -> $SecondaryPath (warm-standby registered)"
+Write-Output "hf-cache-isolated=$routerHfCache (preset-only /v1/models)"
 
-$proc = Start-Process `
-    -FilePath $ServerExe `
-    -ArgumentList $serverArgs `
-    -RedirectStandardOutput $stdoutPath `
-    -RedirectStandardError $stderrPath `
-    -WindowStyle Hidden `
-    -PassThru
+try {
+    $proc = Start-Process `
+        -FilePath $ServerExe `
+        -ArgumentList $serverArgs `
+        -RedirectStandardOutput $stdoutPath `
+        -RedirectStandardError $stderrPath `
+        -WindowStyle Hidden `
+        -PassThru
+} finally {
+    foreach ($k in $hfEnvKeys) {
+        $prev = $hfEnvBackup[$k]
+        if ([string]::IsNullOrWhiteSpace($prev)) {
+            Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path "Env:$k" -Value $prev
+        }
+    }
+}
 
 $modelsUrl = "http://${HostName}:${Port}/v1/models"
 $deadline = (Get-Date).AddSeconds($WaitSeconds)

@@ -247,7 +247,7 @@ foreach ($plan in $attemptPlans) {
 }
 
 if (-not $SkipFallbackOnFailure) {
-    Write-Warning "Primary secretary model failed to start; invoking Hermes-3 fallback launcher."
+    Write-Warning "Primary secretary model failed to start; invoking local GGUF fallback launcher."
     $fallbackScript = Join-Path $PSScriptRoot "start-llama-secretary-fallback.ps1"
     if (Test-Path -LiteralPath $fallbackScript) {
         & $fallbackScript -WaitSeconds $WaitSeconds
