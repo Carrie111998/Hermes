@@ -1455,11 +1455,11 @@ def skill_manage(
         # user-directed, and those skills belong to the user (the curator must
         # not touch them). Best-effort; telemetry failures never break the tool.
         try:
-            from tools.skill_usage import bump_patch, forget, mark_agent_created
+            from tools.skill_usage import bump_patch, forget, mark_background_review_created
             from tools.skill_provenance import is_background_review
             if action == "create":
                 if is_background_review():
-                    mark_agent_created(name)
+                    mark_background_review_created(name)
             elif action in {"patch", "edit", "write_file", "remove_file"}:
                 bump_patch(name)
             elif action == "delete":

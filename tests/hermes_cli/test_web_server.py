@@ -6135,6 +6135,7 @@ class TestNewEndpoints:
 
     def test_skills_list_includes_disabled_skills(self, monkeypatch):
         import tools.skills_tool as skills_tool
+        import tools.skill_usage as skill_usage
         import hermes_cli.skills_config as skills_config
         import hermes_cli.web_server as web_server
 
@@ -6149,6 +6150,16 @@ class TestNewEndpoints:
             ]
 
         monkeypatch.setattr(skills_tool, "_find_all_skills", _fake_find_all_skills)
+        monkeypatch.setattr(
+            skill_usage,
+            "load_usage",
+            lambda: {
+                "active-skill": {
+                    "created_by": "agent",
+                    "origin": "background_review",
+                }
+            },
+        )
         monkeypatch.setattr(skills_config, "get_disabled_skills", lambda config: {"disabled-skill"})
         monkeypatch.setattr(web_server, "load_config", lambda: {"skills": {"disabled": ["disabled-skill"]}})
 
@@ -6163,6 +6174,7 @@ class TestNewEndpoints:
                 "enabled": True,
                 "usage": 0,
                 "provenance": "agent",
+                "origin": "background_review",
             },
             {
                 "name": "disabled-skill",
@@ -6171,6 +6183,7 @@ class TestNewEndpoints:
                 "enabled": False,
                 "usage": 0,
                 "provenance": "agent",
+                "origin": "local",
             },
         ]
 

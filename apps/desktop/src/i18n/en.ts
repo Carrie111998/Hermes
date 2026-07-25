@@ -983,7 +983,8 @@ export const en: Translations = {
     bulkNoChange: 'Nothing to change.',
     usageCount: count => `used ${count}×`,
     provenance: {
-      agent: 'Learned',
+      background_review: 'Learned',
+      local: 'Local',
       bundled: 'Built-in',
       hub: 'Hub'
     },

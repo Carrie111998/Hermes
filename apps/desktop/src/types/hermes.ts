@@ -852,8 +852,10 @@ export interface SkillInfo {
   name: string
   /** Total observed activity (use + view + patch). Absent on older backends. */
   usage?: number
-  /** 'agent' = learned/local (editable), 'bundled' = ships with Hermes, 'hub' = installed. */
+  /** Legacy ownership class retained for older Desktop clients. */
   provenance?: 'agent' | 'bundled' | 'hub'
+  /** Explicit human-facing provenance. Absent on older backends. */
+  origin?: 'background_review' | 'local' | 'bundled' | 'hub'
 }
 
 export interface ToolsetInfo {

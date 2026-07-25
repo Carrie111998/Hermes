@@ -1180,7 +1180,8 @@ export const zh: Translations = {
     bulkNoChange: '没有需要更改的内容。',
     usageCount: count => `已使用 ${count} 次`,
     provenance: {
-      agent: '习得',
+      background_review: '已学习',
+      local: '本地',
       bundled: '内置',
       hub: '技能中心'
     },

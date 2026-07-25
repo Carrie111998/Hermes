@@ -991,7 +991,8 @@ export const zhHant = defineLocale({
     bulkNoChange: '沒有需要變更的內容。',
     usageCount: count => `已使用 ${count} 次`,
     provenance: {
-      agent: '已學習',
+      background_review: '已學習',
+      local: '本機',
       bundled: '內建',
       hub: '技能中心'
     },
