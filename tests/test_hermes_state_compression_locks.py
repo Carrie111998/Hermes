@@ -13,6 +13,7 @@ diagnostic accessor) — not the wiring into compression.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -312,3 +313,106 @@ def test_concurrent_acquire_only_one_winner(db: SessionDB) -> None:
     assert sum(1 for r in results if r is False) == 7
     # The single winner still owns it
     assert db.get_compression_lock_holder("contended_session") is not None
+
+
+# ----------------------------------------------------------------------
+# Transient SQLite busy retry on compression-lock acquire (#71330)
+# ----------------------------------------------------------------------
+
+
+def test_acquire_retries_on_transient_busy_then_succeeds(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``try_acquire_compression_lock`` must retry on transient SQLite
+    ``database is locked`` rather than skipping compression outright.
+
+    Regression for #71330: a burst of gateway writes can exhaust the inner
+    ``_execute_write`` retry budget and surface ``OperationalError`` here.
+    Without the outer retry loop, auto-compress silently skipped with a
+    misleading ``nothing to compress``. We simulate two transient busy
+    failures from ``_execute_write`` then a success, and assert the lock is
+    acquired (not skipped) and that ``_execute_write`` was called three
+    times total.
+    """
+    calls: list[int] = []
+
+    real_execute_write = db._execute_write
+
+    def flaky_execute_write(fn):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_execute_write(fn)
+
+    monkeypatch.setattr(db, "_execute_write", flaky_execute_write)
+    # Keep the retry backoff instant so the test is fast.
+    monkeypatch.setattr(db, "_COMPRESS_LOCK_RETRY_MIN_S", 0.0)
+    monkeypatch.setattr(db, "_COMPRESS_LOCK_RETRY_MAX_S", 0.0)
+
+    got = db.try_acquire_compression_lock("sess_busy", "holder1")
+    assert got is True
+    assert len(calls) == 3
+    assert db.get_compression_lock_holder("sess_busy") == "holder1"
+
+
+def test_acquire_returns_false_after_busy_retry_exhaustion(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When transient busy persists past the retry budget, the acquire must
+    return ``False`` (fail-open skip) so the caller's
+    ``_compression_skipped_due_to_lock`` signal still fires — NOT raise.
+    The skip path then surfaces an honest ``compression skipped`` status
+    instead of the misleading ``nothing to compress`` (#71330).
+    """
+    def always_busy(fn):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "_execute_write", always_busy)
+    monkeypatch.setattr(db, "_COMPRESS_LOCK_RETRY_MIN_S", 0.0)
+    monkeypatch.setattr(db, "_COMPRESS_LOCK_RETRY_MAX_S", 0.0)
+
+    got = db.try_acquire_compression_lock("sess_busy_forever", "holder1")
+    assert got is False
+
+
+def test_acquire_does_not_retry_on_non_busy_operational_error(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-busy ``OperationalError`` (e.g. schema corruption) must NOT be
+    retried — it should fail open immediately and not burn the retry budget.
+    """
+    calls: list[int] = []
+
+    def corrupt_schema(fn):
+        calls.append(1)
+        raise sqlite3.OperationalError("no such table: compression_locks")
+
+    monkeypatch.setattr(db, "_execute_write", corrupt_schema)
+    monkeypatch.setattr(db, "_COMPRESS_LOCK_RETRY_MIN_S", 0.0)
+    monkeypatch.setattr(db, "_COMPRESS_LOCK_RETRY_MAX_S", 0.0)
+
+    got = db.try_acquire_compression_lock("sess_corrupt", "holder1")
+    assert got is False
+    assert len(calls) == 1
+
+
+def test_acquire_does_not_retry_on_clean_false_from_live_holder(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine live holder returns ``False`` cleanly (the SELECT sees the
+    foreign holder) — that path must NOT enter the busy retry loop at all.
+    """
+    calls: list[int] = []
+    real_execute_write = db._execute_write
+
+    def counting_execute_write(fn):
+        calls.append(1)
+        return real_execute_write(fn)
+
+    monkeypatch.setattr(db, "_execute_write", counting_execute_write)
+
+    assert db.try_acquire_compression_lock("sess_live", "holder1") is True
+    calls.clear()
+    # Second acquire sees the live holder and returns False — no retry.
+    assert db.try_acquire_compression_lock("sess_live", "holder2") is False
+    assert len(calls) == 1

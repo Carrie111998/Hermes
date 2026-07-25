@@ -4538,6 +4538,18 @@ class SessionDB:
             )
             return False
 
+    # Compression-lock acquisition runs through ``_execute_write`` (15 jittered
+    # retries on ``database is locked``), but contention from the gateway write
+    # queue can still exhaust that budget. The cost of a spurious skip is high
+    # for auto-compress: a silent ``nothing to compress`` leaves the agent on
+    # an oversized context (#71330). We add a small outer retry loop on top of
+    # the inner one so a transient busy storm — not a genuinely held live lock
+    # — does not skip compression. Constants deliberately track the inner
+    # ``_WRITE_*`` cadence to keep backoff uniform across the write paths.
+    _COMPRESS_LOCK_MAX_ATTEMPTS = 4
+    _COMPRESS_LOCK_RETRY_MIN_S = 0.020   # 20ms — mirrors _WRITE_RETRY_MIN_S
+    _COMPRESS_LOCK_RETRY_MAX_S = 0.150   # 150ms — mirrors _WRITE_RETRY_MAX_S
+
     def try_acquire_compression_lock(
         self,
         session_id: str,
@@ -4560,6 +4572,14 @@ class SessionDB:
         Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
         followed by a SELECT to confirm we got the row. SQLite serialises
         writes, so the whole sequence is atomic against other writers.
+
+        On transient SQLite ``database is locked`` / ``busy`` from the inner
+        ``_execute_write`` retry exhaustion (a burst of gateway writes can
+        drain its 15-attempt budget), we sleep a small jittered backoff and
+        retry up to :data:`_COMPRESS_LOCK_MAX_ATTEMPTS` times before failing
+        over to the skip path (#71330). A genuinely held live lock surfaces as
+        a clean ``False`` (the SELECT-then-INSERT sees the foreign holder) and
+        is NOT retried — only the busy/locked ``OperationalError`` class is.
         """
         if not session_id:
             return False
@@ -4617,6 +4637,32 @@ class SessionDB:
                     reclaimed_holder,
                 )
             return bool(acquired)
+        except sqlite3.OperationalError as exc:
+            # _execute_write already exhausted its 15-attempt inner retry
+            # loop, but a sustained burst of gateway/cron writes can still
+            # drain that budget and surface ``database is locked`` here.
+            # Auto-compress silently skipping on this path is the severe
+            # case in #71330: the agent stays on an oversized context and
+            # the TUI reports a misleading ``nothing to compress``. Retry a
+            # small bounded number of times with the same jittered backoff
+            # cadence the write path uses, so a transient busy storm does
+            # not skip compression.
+            #
+            # We ONLY retry the busy/locked OperationalError class — a clean
+            # ``False`` (genuine live holder seen by the SELECT) returns
+            # immediately from the inner call and never reaches here, and
+            # non-busy OperationalError (e.g. schema corruption) propagates
+            # to the generic handler below.
+            err_msg = str(exc).lower()
+            if "locked" not in err_msg and "busy" not in err_msg:
+                logger.warning(
+                    "try_acquire_compression_lock(%s) failed: %s",
+                    session_id, exc,
+                )
+                # Fail open: returning False makes the caller skip compression,
+                # which is the safe behaviour when the lock subsystem is broken.
+                return False
+            last_busy_exc = exc
         except sqlite3.Error as exc:
             logger.warning(
                 "try_acquire_compression_lock(%s) failed: %s",
@@ -4625,6 +4671,61 @@ class SessionDB:
             # Fail open: returning False makes the caller skip compression,
             # which is the safe behaviour when the lock subsystem is broken.
             return False
+
+        # Transient busy retry loop (#71330). ``now`` and ``expires_at`` are
+        # recomputed per attempt so the lease reflects the actual acquire time
+        # rather than the (possibly stale) pre-retry timestamp.
+        for attempt in range(1, self._COMPRESS_LOCK_MAX_ATTEMPTS):
+            jitter = random.uniform(
+                self._COMPRESS_LOCK_RETRY_MIN_S,
+                self._COMPRESS_LOCK_RETRY_MAX_S,
+            )
+            time.sleep(jitter)
+            now = time.time()
+            expires_at = now + ttl_seconds
+            try:
+                acquired, reclaimed_holder = self._execute_write(_do)
+                if reclaimed_holder:
+                    logger.warning(
+                        "Reclaimed stale compression lock for session=%s "
+                        "(holder=%s)",
+                        session_id,
+                        reclaimed_holder,
+                    )
+                return bool(acquired)
+            except sqlite3.OperationalError as exc:
+                err_msg = str(exc).lower()
+                if "locked" in err_msg or "busy" in err_msg:
+                    last_busy_exc = exc
+                    if attempt < self._COMPRESS_LOCK_MAX_ATTEMPTS - 1:
+                        continue
+                # Non-busy OperationalError: fall through to the generic
+                # fail-open handler below.
+                logger.warning(
+                    "try_acquire_compression_lock(%s) failed: %s",
+                    session_id, exc,
+                )
+                return False
+            except sqlite3.Error as exc:
+                logger.warning(
+                    "try_acquire_compression_lock(%s) failed: %s",
+                    session_id, exc,
+                )
+                # Fail open: returning False makes the caller skip compression,
+                # which is the safe behaviour when the lock subsystem is broken.
+                return False
+
+        # Retry budget exhausted on transient busy. Distinguish this from a
+        # genuine concurrent holder: the caller's ``_compression_skipped_due_to_lock``
+        # signal must still fire so the TUI shows "compression skipped" rather
+        # than the misleading "nothing to compress", but we log the busy-storm
+        # origin so operators can size the write contention.
+        logger.warning(
+            "try_acquire_compression_lock(%s) failed after %d busy retries: %s "
+            "— skipping compression this cycle (transient SQLite lock contention)",
+            session_id, self._COMPRESS_LOCK_MAX_ATTEMPTS, last_busy_exc,
+        )
+        return False
 
     def release_compression_lock(self, session_id: str, holder: str) -> None:
         """Release the compression lock for ``session_id`` iff we own it.
