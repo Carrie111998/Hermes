@@ -49,11 +49,25 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # reported "0 tests passed" (which reads green at a glance even though the
 # exit code is 1). Skip such a venv and keep probing instead.
 VENV=""
+VENV_PYTHON=""
 SKIPPED_VENVS=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+  # POSIX layout
   if [ -f "$candidate/bin/activate" ]; then
     if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
       VENV="$candidate"
+      VENV_PYTHON="$candidate/bin/python"
+      break
+    fi
+    SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
+    continue
+  fi
+  # Native Windows venv layout: python.exe + activate under Scripts/
+  # (no bin/). Required for Git Bash / MSYS contributors (#67385/#66496).
+  if [ -f "$candidate/Scripts/activate" ] || [ -f "$candidate/Scripts/python.exe" ]; then
+    if "$candidate/Scripts/python.exe" -c 'import pytest' 2>/dev/null; then
+      VENV="$candidate"
+      VENV_PYTHON="$candidate/Scripts/python.exe"
       break
     fi
     SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
@@ -67,7 +81,7 @@ if [ -n "$SKIPPED_VENVS" ]; then
 fi
 
 if [ -n "$VENV" ]; then
-  PYTHON="$VENV/bin/python"
+  PYTHON="$VENV_PYTHON"
 elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
     && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
   # Guard with an import check: HERMES_PYTHON may point at the RELEASE
@@ -111,6 +125,12 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# Windows (native, via Git Bash): CPython ignores HOME — Path.home() needs
+# USERPROFILE (or HOMEDRIVE+HOMEPATH); ssl/sockets need SYSTEMROOT; tempfile
+# needs TEMP/TMP; some APIs use LOCALAPPDATA/APPDATA. env -i stripped these
+# and broke collection with "Could not determine home directory" (#67385).
+# None of these carry secrets — credential isolation is preserved.
+# PYTHONUTF8=1: runner prints ✓/⚠; legacy Windows codepages crash otherwise.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
@@ -118,6 +138,15 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  PYTHONUTF8=1 \
+  ${USERPROFILE:+USERPROFILE="$USERPROFILE"} \
+  ${HOMEDRIVE:+HOMEDRIVE="$HOMEDRIVE"} \
+  ${HOMEPATH:+HOMEPATH="$HOMEPATH"} \
+  ${SYSTEMROOT:+SYSTEMROOT="$SYSTEMROOT"} \
+  ${TEMP:+TEMP="$TEMP"} \
+  ${TMP:+TMP="$TMP"} \
+  ${LOCALAPPDATA:+LOCALAPPDATA="$LOCALAPPDATA"} \
+  ${APPDATA:+APPDATA="$APPDATA"} \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
