@@ -88,13 +88,28 @@ test('oauthGuardMayHardFail is true for an OAuth-redirect gateway', () => {
   assert.equal(oauthGuardMayHardFail([{ name: 'nous', supportsPassword: false }]), true)
 })
 
-test('oauthGuardMayHardFail is true when any advertised provider is OAuth', () => {
-  // A mixed gateway still has a real OAuth leg, so the signed-in probe stays
-  // meaningful and the cheap early-out is kept.
+test('oauthGuardMayHardFail is false for a mixed gateway that offers a password leg', () => {
+  // `supports_password` is documented as password login "rather than (or in
+  // addition to) the OAuth redirect flow", so a mixed deployment can hold a
+  // session established through the password leg. That session satisfies
+  // neither OAuth liveness signal, so gating on "every provider is password"
+  // would hard-fail exactly those users before the authoritative mint.
   assert.equal(
     oauthGuardMayHardFail([
       { name: 'basic', supportsPassword: true },
       { name: 'nous', supportsPassword: false }
+    ]),
+    false
+  )
+})
+
+test('oauthGuardMayHardFail keeps the guard when no provider offers a password leg', () => {
+  // Multi-provider OAuth-only deployments are unaffected: every liveness
+  // signal remains reachable, so the cheap early-out stays.
+  assert.equal(
+    oauthGuardMayHardFail([
+      { name: 'nous', supportsPassword: false },
+      { name: 'self-hosted', supportsPassword: false }
     ]),
     true
   )

@@ -63,11 +63,25 @@ export type GatewayAuthProvider = { name?: string; supportsPassword?: boolean }
  * design, and /auth/native/authorize rejects password providers with 400, so
  * neither OAuth liveness signal can EVER be true for such a gateway.)
  *
- * Password-only gateways therefore skip the pre-flight early-out and let the
- * ws-ticket mint be the authoritative liveness check — exactly as the OAuth
- * path's own comment already describes. A genuinely signed-out gateway still
- * fails, just one step later at the mint, where the message is derived from a
- * real 401 instead of a guess about cookie shape.
+ * Gateways offering a password login therefore skip the pre-flight early-out
+ * and let the ws-ticket mint be the authoritative liveness check — exactly as
+ * the OAuth path's own comment already describes. A genuinely signed-out
+ * gateway still fails, just one step later at the mint, where the message is
+ * derived from a real 401 instead of a guess about cookie shape.
+ *
+ * ANY advertised password provider is enough to relax the guard, not only an
+ * all-password list: `supports_password` is documented as password login
+ * "rather than (or IN ADDITION TO) the OAuth redirect flow", so a mixed
+ * deployment (e.g. `basic` + `nous`) can hold a perfectly valid session that
+ * was established through the password leg — and that session satisfies
+ * neither OAuth liveness signal either. Gating on `every` would hard-fail
+ * exactly those users. This does not weaken authentication: the mint is still
+ * the check, and a genuinely signed-out client gets a real 401 from it.
+ *
+ * Identifying the provider that actually backs the current session would be
+ * more precise, but is not reachable here: `/api/auth/me` reports
+ * `provider: "basic"` yet is itself behind the auth gate (401 without a
+ * cookie), which is precisely the state this guard runs in.
  *
  * Providers absent/empty (older backends that don't publish the list, or a
  * fetch failure) keep the strict guard — the pre-existing behaviour.
@@ -77,10 +91,7 @@ export function oauthGuardMayHardFail(providers: readonly GatewayAuthProvider[] 
     return true
   }
 
-  // Only relax when EVERY advertised provider is password-based. A gateway
-  // offering both (e.g. basic + nous) still has a real OAuth leg, so the
-  // signed-in probe remains meaningful there.
-  return !providers.every(p => p && p.supportsPassword === true)
+  return !providers.some(p => p && p.supportsPassword === true)
 }
 
 export type OauthRestAuth = { kind: 'bearer'; token: string } | { kind: 'cookie' }

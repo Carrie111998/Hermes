@@ -6556,6 +6556,9 @@ function writeDesktopConnectionConfig(config) {
   writeFileAtomic(DESKTOP_CONNECTION_CONFIG_PATH, JSON.stringify(config, null, 2))
   connectionConfigCache = config
   connectionConfigCacheMtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
+  // Connection settings just changed — a re-pointed or reconfigured gateway
+  // must not inherit the previous backend's cached auth-provider policy.
+  invalidateGatewayAuthProviders()
 }
 
 // Returns the desktop's chosen profile name, or null when unset. "default" is
@@ -7312,10 +7315,29 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
 }
 
 // Cache of a gateway's advertised auth providers, keyed by baseUrl. The list is
-// deploy-time configuration (which providers are registered), so it is stable
-// for the life of a backend; caching keeps reconnects from re-fetching it on
-// every ws-ticket refresh.
-const _gatewayAuthProviders = new Map<string, { supportsPassword: boolean; name: string }[]>()
+// deploy-time configuration, so it is stable for a given backend and caching
+// keeps reconnects from re-fetching on every ws-ticket refresh — but it feeds a
+// security-boundary decision, so it must not outlive the deployment it
+// describes. A backend can restart at the SAME url with a different auth
+// configuration; an unbounded cache would keep applying the old classification
+// until the app process exits. Hence a short TTL plus explicit invalidation
+// whenever connection settings are saved (see invalidateGatewayAuthProviders).
+const GATEWAY_AUTH_PROVIDERS_TTL_MS = 5 * 60_000
+const _gatewayAuthProviders = new Map<string, { at: number; providers: { supportsPassword: boolean; name: string }[] }>()
+
+/**
+ * Drop cached provider classifications. Called when the desktop saves new
+ * connection settings, so a re-pointed or reconfigured gateway is re-probed
+ * instead of inheriting the previous backend's auth policy. Omit `baseUrl` to
+ * clear every entry.
+ */
+function invalidateGatewayAuthProviders(baseUrl?: string) {
+  if (baseUrl) {
+    _gatewayAuthProviders.delete(baseUrl)
+  } else {
+    _gatewayAuthProviders.clear()
+  }
+}
 
 /**
  * Best-effort read of a gateway's registered auth providers via the public
@@ -7326,8 +7348,8 @@ const _gatewayAuthProviders = new Map<string, { supportsPassword: boolean; name:
 async function gatewayAuthProviders(baseUrl: string) {
   const cached = _gatewayAuthProviders.get(baseUrl)
 
-  if (cached) {
-    return cached
+  if (cached && Date.now() - cached.at < GATEWAY_AUTH_PROVIDERS_TTL_MS) {
+    return cached.providers
   }
 
   try {
@@ -7343,7 +7365,7 @@ async function gatewayAuthProviders(baseUrl: string) {
       .filter(p => p.name)
 
     if (providers.length > 0) {
-      _gatewayAuthProviders.set(baseUrl, providers)
+      _gatewayAuthProviders.set(baseUrl, { at: Date.now(), providers })
     }
 
     return providers
