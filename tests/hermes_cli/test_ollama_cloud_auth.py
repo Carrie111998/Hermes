@@ -338,6 +338,129 @@ class TestSwitchModelDirectAliasOverride:
         assert result.api_key == "no-key-required"
         assert result.base_url == "http://localhost:11434/v1"
 
+    def test_switch_model_alias_does_not_reuse_foreign_api_key(self, monkeypatch):
+        """Alias base_url must not keep the previous provider's API key."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        foreign = "sk-or-v1-FOREIGN-OPENROUTER-KEY"
+        alias_url = "https://ollama.com/v1"
+        test_aliases = {
+            "qwen": DirectAlias("qwen3.5:397b", "custom", alias_url),
+        }
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", test_aliases)
+        monkeypatch.setattr(
+            ms, "resolve_alias",
+            lambda raw, prov: ("custom", "qwen3.5:397b", "qwen"),
+        )
+
+        resolve_calls = []
+
+        def fake_resolve(**kwargs):
+            resolve_calls.append(kwargs)
+            # Host-gated resolution: empty key for non-openrouter hosts.
+            return {
+                "api_key": "",
+                "base_url": (kwargs.get("explicit_base_url") or "").strip(),
+                "api_mode": "chat_completions",
+                "provider": "custom",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **kw: {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.opencode_model_api_mode",
+            lambda *a, **kw: "chat_completions",
+        )
+
+        result = ms.switch_model(
+            "qwen",
+            "openrouter",
+            "old-model",
+            current_api_key=foreign,
+            current_base_url="https://openrouter.ai/api/v1",
+        )
+        assert result.success
+        assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+        assert result.api_key != foreign
+        assert result.api_key == "no-key-required"
+        assert any(
+            (c.get("explicit_base_url") or "").rstrip("/") == alias_url.rstrip("/")
+            for c in resolve_calls
+        )
+
+    def test_switch_model_alias_uses_host_resolved_key(self, monkeypatch):
+        """Alias re-resolve should adopt the key selected for the alias host."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        alias_url = "https://ollama.com/v1"
+        host_key = "ollama-host-key"
+        test_aliases = {
+            "qwen": DirectAlias("qwen3.5:397b", "custom", alias_url),
+        }
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", test_aliases)
+        monkeypatch.setattr(
+            ms, "resolve_alias",
+            lambda raw, prov: ("custom", "qwen3.5:397b", "qwen"),
+        )
+
+        def fake_resolve(**kwargs):
+            explicit = (kwargs.get("explicit_base_url") or "").strip().rstrip("/")
+            if explicit == alias_url.rstrip("/"):
+                return {
+                    "api_key": host_key,
+                    "base_url": alias_url,
+                    "api_mode": "chat_completions",
+                    "provider": "custom",
+                }
+            return {
+                "api_key": "sk-or-v1-OTHER",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+                "provider": "openrouter",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **kw: {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.opencode_model_api_mode",
+            lambda *a, **kw: "chat_completions",
+        )
+
+        result = ms.switch_model(
+            "qwen",
+            "openrouter",
+            "old-model",
+            current_api_key="sk-or-v1-FOREIGN-OPENROUTER-KEY",
+            current_base_url="https://openrouter.ai/api/v1",
+        )
+        assert result.success
+        assert result.api_key == host_key
+        assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+
 
 # ---------------------------------------------------------------------------
 # CLI state update: requested_provider persistence
