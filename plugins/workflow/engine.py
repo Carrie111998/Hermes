@@ -438,16 +438,21 @@ class WorkflowEngine:
                 return nid
         return None
 
-    def _fire_completion_notification(self, workflow_name, workflow, states, layers, layer_idx, context=None):
+    def _fire_completion_notification(self, workflow_name, workflow, states, layers, layer_idx, context=None, session_info=None):
         """Fire completion notification after all layers complete."""
-        print(f"   🔔 _fire_completion_notification called: context_has_session={bool((context or {}).get('_session_info'))}")
+        import os as _os
+        _dbg = _os.path.join(_os.environ.get("HERMES_HOME", "/tmp"), "workflows", "workflow-debug.log")
+        _os.makedirs(_os.path.dirname(_dbg), exist_ok=True)
+        _session = session_info or (context or {}).get("_session_info", {})
+        with open(_dbg, "a") as _f:
+            _f.write(f"[{_os.getpid()}] _fire_completion_notification: ctx_keys={list((context or {}).keys())} session={bool(_session)} platform={_session.get('platform', 'NONE')} chat={_session.get('chat_id', 'NONE')}\n")
         try:
             from plugins.workflow import _notify_workflow_complete
             _notif_state = {
                 "workflow_name": workflow_name,
                 "kanban_board": self.kanban_board,
                 "run_id": workflow.run_id,
-                "session_info": (context or {}).get("_session_info", {}),
+                "session_info": session_info or (context or {}).get("_session_info", {}),
                 "states": {nid: {"status": s.status, "kanban_card_id": s.kanban_card_id} for nid, s in states.items()},
                 "layers": layers,
                 "current_layer": layer_idx,
@@ -2341,7 +2346,7 @@ class WorkflowEngine:
                                       current_layer=len(layers) - 1)
 
                 # Fire completion notification for simple (no-loop) workflows
-                self._fire_completion_notification(workflow_name, workflow, states, layers, len(layers) - 1, context)
+                self._fire_completion_notification(workflow_name, workflow, states, layers, len(layers) - 1, context, session_info=_session_info)
 
                 return results
 
@@ -2679,7 +2684,7 @@ class WorkflowEngine:
 
         # Fire completion notification BEFORE clearing state
         if final_status == "completed":
-            self._fire_completion_notification(workflow_name, workflow, states, layers, layer_idx, context)
+            self._fire_completion_notification(workflow_name, workflow, states, layers, layer_idx, context, session_info=(context or {}).get("_session_info"))
 
         self._clear_state(workflow_name, run_id=workflow.run_id)
 
