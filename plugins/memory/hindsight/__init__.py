@@ -63,6 +63,10 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+# Providers in this set can operate without an LLM API key.
+# HindsightEmbedded raises ValueError if given an empty key, so we supply a
+# placeholder "not-needed" key for these providers when none is configured.
+_NO_API_KEY_PROVIDERS = {"ollama", "lmstudio", "openai_compatible"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -529,6 +533,11 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         "HINDSIGHT_API_LLM_MODEL": str(current_model),
         "HINDSIGHT_API_LOG_LEVEL": "info",
     }
+    # If the LLM API key is empty and the provider doesn't require one,
+    # supply a placeholder to prevent HindsightEmbedded from raising
+    # ValueError("LLM API key is required").
+    if not current_key and current_provider in _NO_API_KEY_PROVIDERS:
+        env_values["HINDSIGHT_API_LLM_API_KEY"] = "not-needed"
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
 
@@ -1039,10 +1048,21 @@ class HindsightMemoryProvider(MemoryProvider):
                     llm_provider = "openai"
                 logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
                              self._config.get("profile", "hermes"), llm_provider)
+                llm_api_key = (
+                    self._config.get("llmApiKey")
+                    or self._config.get("llm_api_key")
+                    or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
+                )
+                # Local-only providers (ollama, lmstudio, openai_compatible)
+                # may not have an API key configured. HindsightEmbedded
+                # raises ValueError("LLM API key is required") for an empty
+                # key, so supply a placeholder for these providers.
+                if not llm_api_key and self._config.get("llm_provider", "") in _NO_API_KEY_PROVIDERS:
+                    llm_api_key = "not-needed"
                 kwargs = dict(
                     profile=self._config.get("profile", "hermes"),
                     llm_provider=llm_provider,
-                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", ""),
+                    llm_api_key=llm_api_key,
                     llm_model=self._config.get("llm_model", ""),
                 )
                 if self._llm_base_url:
