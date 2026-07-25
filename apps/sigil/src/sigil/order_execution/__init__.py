@@ -10,6 +10,14 @@ from .audit import (
     deterministic_identifier,
 )
 from .comparison import compare_execution_packages
+from .certification import (
+    PaperAdapterCertificationResult,
+    certify_paper_execution_adapter,
+)
+from .paper_adapter import (
+    GovernedPaperExecutionAdapter,
+    PaperExecutionPolicy,
+)
 from .engine import (
     SubmissionResult,
     build_submission_requests,
@@ -64,6 +72,9 @@ __all__ = [
     "ExecutionPolicy",
     "FillReconciliationStatus",
     "GovernedExecutionPackage",
+    "PaperExecutionPolicy",
+    "PaperAdapterCertificationResult",
+    "GovernedPaperExecutionAdapter",
     "OrderReconciliation",
     "ReconciliationDiscrepancy",
     "SubmissionAcknowledgement",
@@ -75,6 +86,7 @@ __all__ = [
     "build_audit_event",
     "build_submission_requests",
     "canonical_json",
+    "certify_paper_execution_adapter",
     "compare_execution_packages",
     "deterministic_identifier",
     "evaluate_execution_input",
