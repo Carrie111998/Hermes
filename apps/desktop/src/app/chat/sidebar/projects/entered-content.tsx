@@ -24,6 +24,7 @@ import { SidebarRowStack } from '../chrome'
 import { useWorkspaceNodeOpen } from './model'
 import { SidebarWorkspaceGroup } from './workspace-group'
 import {
+  isFlatHomeLane,
   mergeRepoWorktreeGroups,
   overlayRepoLanes,
   type SidebarProjectTree,
@@ -32,10 +33,14 @@ import {
 } from './workspace-groups'
 import { WorkspaceAddButton, WorkspaceHeader } from './workspace-header'
 
-// The entered project's body. Main-checkout sessions render directly — no
-// redundant repo/branch header (the breadcrumb already names the project). Only
-// linked worktrees nest, shown by branch. Multi-folder projects keep per-repo
-// headers so the folders stay distinguishable.
+// The entered project's body. When the repo's ONLY lane is its main checkout,
+// those sessions render directly — the breadcrumb already names the project, so
+// a lone branch header is chrome the user has to click through (and a collapse
+// they can accidentally persist, leaving a body of nothing but `main (N)`).
+// As soon as a second lane exists the branch label is load-bearing — it's the
+// only thing telling the lanes apart — so every lane keeps its header. Linked
+// worktrees nest, shown by branch. Multi-folder projects keep per-repo headers
+// so the folders stay distinguishable.
 export function EnteredProjectContent({
   project,
   renderRows,
@@ -160,10 +165,17 @@ function RepoFlatSection({
     }
   }
 
+  // A repo whose only lane is its main checkout renders that lane headerless —
+  // the project breadcrumb already names it and there's no sibling lane to tell
+  // apart. Any second lane (worktree, another branch, kanban) restores headers
+  // on all of them, branch labels included.
+  const flatHome = isFlatHomeLane(ordered)
+
   const body = (
     <>
       {ordered.map(group => (
         <SidebarWorkspaceGroup
+          flat={flatHome}
           group={group}
           key={group.id}
           // The kanban bucket is read-only: it aggregates many task worktrees, so

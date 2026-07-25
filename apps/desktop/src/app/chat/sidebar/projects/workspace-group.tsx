@@ -23,9 +23,22 @@ interface SidebarWorkspaceGroupProps {
   // When set (linked worktree rows), shows a remove affordance that runs a real
   // `git worktree remove`.
   onRemove?: () => void
+  // Headerless mode: render the lane's rows directly, always expanded. Used by
+  // the entered project when the repo's only lane is its main checkout, where a
+  // lone branch header adds no information and can persist a collapse that hides
+  // every session. Paging and the empty placeholder are unchanged — only the
+  // header (and with it the toggle and the lane-level "+") goes away; the
+  // project header already owns "new session" there.
+  flat?: boolean
 }
 
-export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemove }: SidebarWorkspaceGroupProps) {
+export function SidebarWorkspaceGroup({
+  group,
+  renderRows,
+  onNewSession,
+  onRemove,
+  flat = false
+}: SidebarWorkspaceGroupProps) {
   const { t } = useI18n()
   const s = t.sidebar
   const isProfileGroup = group.mode === 'profile'
@@ -33,7 +46,11 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   // yet" placeholder, so defaulting them open just adds noise. Profile lanes and
   // lanes that already hold sessions default open.
   const defaultOpen = isProfileGroup || group.sessions.length > 0
-  const [open, toggleOpen] = useWorkspaceNodeOpen(group.id, defaultOpen)
+  const [storedOpen, toggleOpen] = useWorkspaceNodeOpen(group.id, defaultOpen)
+  // A headerless lane has no toggle, so it must never read as collapsed —
+  // otherwise a collapse persisted while the lane still had a header would leave
+  // the body permanently empty with nothing to click.
+  const open = flat || storedOpen
   const [visibleCount, setVisibleCount] = useState(SIDEBAR_GROUP_PAGE)
 
   const loadedCount = group.sessions.length
@@ -102,30 +119,32 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
 
   return (
     <SidebarRowStack>
-      <WorkspaceHeader
-        action={
-          (onNewSession || isProfileGroup || onRemove) && (
-            <div className="flex items-center">
-              {(onNewSession || isProfileGroup) && (
-                <WorkspaceAddButton
-                  label={s.newSessionIn(group.label)}
-                  // Profile groups start a fresh session in that profile but keep
-                  // the all-profiles browse view; workspace groups seed the new
-                  // session's cwd. Main checkout lanes are branch-targeted.
-                  onClick={() => void handleNewSession()}
-                />
-              )}
-              {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
-            </div>
-          )
-        }
-        count={isProfileGroup ? countLabel(visibleSessions.length, totalCount) : group.sessions.length}
-        icon={leadingIcon}
-        label={group.label}
-        onToggle={toggleOpen}
-        open={open}
-        title={group.path ?? undefined}
-      />
+      {!flat && (
+        <WorkspaceHeader
+          action={
+            (onNewSession || isProfileGroup || onRemove) && (
+              <div className="flex items-center">
+                {(onNewSession || isProfileGroup) && (
+                  <WorkspaceAddButton
+                    label={s.newSessionIn(group.label)}
+                    // Profile groups start a fresh session in that profile but keep
+                    // the all-profiles browse view; workspace groups seed the new
+                    // session's cwd. Main checkout lanes are branch-targeted.
+                    onClick={() => void handleNewSession()}
+                  />
+                )}
+                {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
+              </div>
+            )
+          }
+          count={isProfileGroup ? countLabel(visibleSessions.length, totalCount) : group.sessions.length}
+          icon={leadingIcon}
+          label={group.label}
+          onToggle={toggleOpen}
+          open={storedOpen}
+          title={group.path ?? undefined}
+        />
+      )}
       {open && (
         <>
           {visibleSessions.length === 0 ? (

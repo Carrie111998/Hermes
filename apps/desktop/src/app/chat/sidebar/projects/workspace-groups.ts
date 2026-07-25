@@ -154,6 +154,22 @@ export function sortWorktreeGroups(groups: SidebarSessionGroup[]): SidebarSessio
 }
 
 /**
+ * True when a repo's lane set is JUST its main checkout, so the entered-project
+ * body can render those sessions directly instead of behind a lone branch
+ * header. The breadcrumb already names the project and there is no sibling lane
+ * to tell apart, so the header carries no information — and being collapsible,
+ * it can persist a collapse that leaves the project looking empty except for a
+ * `main (N)` row (the reported symptom).
+ *
+ * Deliberately narrow: with two or more lanes every branch label is the only
+ * thing distinguishing them, so all lanes keep their headers. A kanban bucket
+ * counts as a lane — it is never the flattened one.
+ */
+export function isFlatHomeLane(groups: SidebarSessionGroup[]): boolean {
+  return groups.length === 1 && Boolean(groups[0].isMain) && !groups[0].isKanban
+}
+
+/**
  * VISUAL enhancer only: inject empty lanes from a live `git worktree list` so a
  * repo shows its branches/worktrees even when they have no Hermes sessions yet.
  * The repo's real session lanes already come fully built from the backend

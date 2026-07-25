@@ -114,8 +114,10 @@ interface SidebarSessionsSectionProps {
   // True while the backend project tree is loading (overview skeleton).
   projectsLoading?: boolean
   onEnterProject?: (id: string) => void
-  // The entered project's flattened content: main-checkout sessions render
-  // directly (no redundant repo/branch header); only linked worktrees nest.
+  // The entered project's content. A repo whose only lane is its main checkout
+  // renders those sessions directly (no redundant branch header); once a second
+  // lane exists — linked worktrees, another branch, kanban — every lane nests
+  // under its own header so the labels stay distinguishable.
   projectContent?: SidebarProjectTree
   // Live git lanes (`git worktree list`) for repos in the entered project —
   // a VISUAL enhancer only (empty lanes), never session membership.

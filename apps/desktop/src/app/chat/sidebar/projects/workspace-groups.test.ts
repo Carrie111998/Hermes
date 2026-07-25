@@ -5,6 +5,7 @@ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
 
 import {
   baseName,
+  isFlatHomeLane,
   kanbanWorktreeDir,
   liveSessionProjectId,
   mergeRepoWorktreeGroups,
@@ -101,6 +102,30 @@ describe('sortWorktreeGroups', () => {
     const groups = [lane({ id: 'b', label: 'beta', isMain: false }), lane({ id: 'a', label: 'alpha', isMain: false })]
 
     expect(sortWorktreeGroups(groups).map(g => g.label)).toEqual(['alpha', 'beta'])
+  })
+})
+
+describe('isFlatHomeLane', () => {
+  it('flattens a repo whose only lane is its main checkout', () => {
+    expect(isFlatHomeLane([lane({ id: 'home', label: 'main', isMain: true, isHome: true })])).toBe(true)
+  })
+
+  it('keeps headers as soon as a second lane exists — the labels are what tell them apart', () => {
+    const groups = [
+      lane({ id: 'home', label: 'main', isMain: true, isHome: true }),
+      lane({ id: '/repo-wt-feature', label: 'feature', isMain: false, path: '/repo-wt-feature' })
+    ]
+
+    expect(isFlatHomeLane(groups)).toBe(false)
+  })
+
+  it('keeps the header for a lone linked-worktree or kanban lane (not the main checkout)', () => {
+    expect(isFlatHomeLane([lane({ id: 'wt', label: 'feature', isMain: false })])).toBe(false)
+    expect(isFlatHomeLane([lane({ id: 'k', label: 'kanban', isMain: true, isKanban: true })])).toBe(false)
+  })
+
+  it('is false for an empty lane set (nothing to flatten)', () => {
+    expect(isFlatHomeLane([])).toBe(false)
   })
 })
 
