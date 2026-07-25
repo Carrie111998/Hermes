@@ -25,6 +25,7 @@ const MAX_PER_SESSION = 4
 
 export const $previewStatusBySession = atom<Record<string, PreviewArtifact[]>>({})
 export const $previewClearGenerationBySession = atom<Record<string, number>>({})
+export const $previewDismissGenerationBySession = atom<Record<string, Record<string, number>>>({})
 
 const writePreviews = (sid: string, items: PreviewArtifact[]) => {
   const current = $previewStatusBySession.get()
@@ -83,10 +84,20 @@ export function dismissPreviewArtifact(sid: string, id: string) {
   const list = $previewStatusBySession.get()[sid]
 
   if (list) {
-    writePreviews(
-      sid,
-      list.filter(item => item.id !== id)
-    )
+    const next = list.filter(item => item.id !== id)
+
+    if (next.length === list.length) {
+      return
+    }
+
+    const generations = $previewDismissGenerationBySession.get()
+    const sessionGenerations = generations[sid] ?? {}
+
+    $previewDismissGenerationBySession.set({
+      ...generations,
+      [sid]: { ...sessionGenerations, [id]: (sessionGenerations[id] ?? 0) + 1 }
+    })
+    writePreviews(sid, next)
   }
 }
 

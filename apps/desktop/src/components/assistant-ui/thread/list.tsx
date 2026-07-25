@@ -17,7 +17,11 @@ import { useStickToBottom } from 'use-stick-to-bottom'
 
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import { $previewClearGenerationBySession, recordPreviewArtifacts } from '@/store/preview-status'
+import {
+  $previewClearGenerationBySession,
+  $previewDismissGenerationBySession,
+  recordPreviewArtifacts
+} from '@/store/preview-status'
 import {
   onScrollToBottomRequest,
   onThreadEditClose,
@@ -172,7 +176,10 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
       string,
       {
         clearGeneration: number
+        dismissGenerations: Record<string, number>
+        dismissedOccurrenceKeys: Set<string>
         occurrenceKeys: Set<string>
+        occurrenceTargets: Map<string, string>
         targetsSignature: string
         timelineSignature: string
       }
@@ -203,6 +210,8 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
 
   const clearGenerationBySession = useStore($previewClearGenerationBySession)
   const clearGeneration = sessionId ? (clearGenerationBySession[sessionId] ?? 0) : 0
+  const dismissGenerationBySession = useStore($previewDismissGenerationBySession)
+  const dismissGenerationSignature = JSON.stringify(sessionId ? (dismissGenerationBySession[sessionId] ?? {}) : {})
 
   const targetsSignature = useAuiState(s =>
     JSON.stringify(
@@ -240,25 +249,46 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
       return
     }
 
+    const dismissGenerations = JSON.parse(dismissGenerationSignature) as Record<string, number>
     const previous = registrationBySessionRef.current.get(sessionId)
     const timelineChanged = previous?.timelineSignature !== timelineSignature
+    const dismissedOccurrenceKeys = new Set(previous?.dismissedOccurrenceKeys)
+
+    // Dismissal belongs to the exact occurrences mounted when the user acted,
+    // not to the normalized target forever. Preserve those tombstones across a
+    // clear/truncate/rollback sequence, while allowing a later occurrence with
+    // a different message/tool-call key to reproduce the same target.
+    if (previous) {
+      for (const [target, generation] of Object.entries(dismissGenerations)) {
+        if (generation <= (previous.dismissGenerations[target] ?? 0)) {
+          continue
+        }
+
+        for (const [key, occurrenceTarget] of previous.occurrenceTargets) {
+          if (occurrenceTarget === target) {
+            dismissedOccurrenceKeys.add(key)
+          }
+        }
+      }
+    }
 
     // A clear invalidates the abandoned timeline, but must not immediately
     // replay that same timeline before restore/edit publishes its optimistic
     // rewind. Keep the old generation until an authoritative timeline change
     // arrives; that change may leave the preview inventory itself unchanged.
     if (previous && previous.clearGeneration !== clearGeneration && !timelineChanged) {
+      previous.dismissGenerations = dismissGenerations
+      previous.dismissedOccurrenceKeys = dismissedOccurrenceKeys
+
       return
     }
 
     // Ordinary non-preview streaming/tail updates do not need inventory work.
     // Remember the latest timeline identity so a later clear can distinguish
     // the actual rewind from the generation-only notification.
-    if (
-      previous &&
-      previous.clearGeneration === clearGeneration &&
-      previous.targetsSignature === targetsSignature
-    ) {
+    if (previous && previous.clearGeneration === clearGeneration && previous.targetsSignature === targetsSignature) {
+      previous.dismissGenerations = dismissGenerations
+      previous.dismissedOccurrenceKeys = dismissedOccurrenceKeys
       previous.timelineSignature = timelineSignature
 
       return
@@ -267,12 +297,18 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
     const entries = JSON.parse(targetsSignature) as Array<{ key: string; target: string }>
     const occurrenceKeys = new Set(entries.map(entry => entry.key))
     const priorKeys = previous?.clearGeneration === clearGeneration ? previous.occurrenceKeys : new Set<string>()
-    const newTargets = entries.filter(entry => !priorKeys.has(entry.key)).map(entry => entry.target)
+
+    const newTargets = entries
+      .filter(entry => !priorKeys.has(entry.key) && !dismissedOccurrenceKeys.has(entry.key))
+      .map(entry => entry.target)
 
     registrationBySessionRef.current.delete(sessionId)
     registrationBySessionRef.current.set(sessionId, {
       clearGeneration,
+      dismissGenerations,
+      dismissedOccurrenceKeys,
       occurrenceKeys,
+      occurrenceTargets: new Map(entries.map(entry => [entry.key, entry.target])),
       targetsSignature,
       timelineSignature
     })
@@ -288,7 +324,7 @@ const ToolPreviewRegistrar: FC<{ cwd: string | null; sessionId: string | null | 
     }
 
     recordPreviewArtifacts(sessionId, newTargets, cwd || '')
-  }, [clearGeneration, cwd, sessionId, targetsSignature, timelineSignature])
+  }, [clearGeneration, cwd, dismissGenerationSignature, sessionId, targetsSignature, timelineSignature])
 
   return null
 }

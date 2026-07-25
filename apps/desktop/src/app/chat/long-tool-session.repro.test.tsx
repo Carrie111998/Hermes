@@ -562,6 +562,56 @@ describe('representative long tool-heavy session contract (#68467)', () => {
     unsubscribe()
   })
 
+  it('does not resurrect a dismissed tail preview when a failed rewind restores the timeline', async () => {
+    clearPreviewArtifacts('runtime-fixture')
+    const messages = makeMinimalTurns(2)
+    messages[3].parts = [
+      {
+        type: 'tool-call',
+        toolCallId: 'dismissed-rollback-preview',
+        toolName: 'write_file',
+        args: { path: '/workspace/dismissed-rollback.html' },
+        argsText: JSON.stringify({ path: '/workspace/dismissed-rollback.html' }),
+        result: { output: 'created' },
+        isError: false
+      }
+    ]
+    const view = render(<Harness messages={messages} onSubmit={() => true} />)
+
+    await waitFor(() =>
+      expect($previewStatusBySession.get()['runtime-fixture']?.map(item => item.target)).toEqual([
+        '/workspace/dismissed-rollback.html'
+      ])
+    )
+
+    act(() => dismissPreviewArtifact('runtime-fixture', '/workspace/dismissed-rollback.html'))
+    expect($previewStatusBySession.get()['runtime-fixture']).toBeUndefined()
+
+    act(() => clearPreviewArtifacts('runtime-fixture'))
+    view.rerender(<Harness messages={messages.slice(0, -2)} onSubmit={() => true} />)
+    expect($previewStatusBySession.get()['runtime-fixture']).toBeUndefined()
+
+    view.rerender(<Harness messages={messages} onSubmit={() => true} />)
+    await waitFor(() => expect(screen.getByText('Question 1')).toBeTruthy())
+    expect($previewStatusBySession.get()['runtime-fixture']).toBeUndefined()
+
+    const reproduced = structuredClone(messages)
+    const reproducedPart = reproduced[3].parts[0]
+
+    if (reproducedPart.type !== 'tool-call') {
+      throw new Error('expected the reproduced dismissed preview tool call')
+    }
+
+    reproduced[3].parts = [{ ...reproducedPart, toolCallId: 'reproduced-after-dismissed-rollback' }]
+    view.rerender(<Harness messages={reproduced} onSubmit={() => true} />)
+
+    await waitFor(() =>
+      expect($previewStatusBySession.get()['runtime-fixture']?.map(item => item.target)).toEqual([
+        '/workspace/dismissed-rollback.html'
+      ])
+    )
+  })
+
   it('re-registers the same preview target after a restored timeline produces it again', async () => {
     clearPreviewArtifacts('runtime-fixture')
     const withPreview = makeMinimalTurns(25)

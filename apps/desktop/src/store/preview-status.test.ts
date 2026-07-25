@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
   $previewClearGenerationBySession,
+  $previewDismissGenerationBySession,
   $previewStatusBySession,
   clearPreviewArtifacts,
   dismissPreviewArtifact,
@@ -12,6 +13,7 @@ import {
 
 beforeEach(() => {
   $previewClearGenerationBySession.set({})
+  $previewDismissGenerationBySession.set({})
   $previewStatusBySession.set({})
 })
 
