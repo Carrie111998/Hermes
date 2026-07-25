@@ -1710,6 +1710,7 @@ def list_authenticated_providers(
     refresh: bool = False,
     probe_custom_providers: bool = True,
     probe_current_custom_provider: bool = False,
+    probe_cloud_credentials: bool = False,
     for_picker: bool = False,
     excluded_providers: list | None = None,
 ) -> List[dict]:
@@ -1748,6 +1749,10 @@ def list_authenticated_providers(
     opens: probe only the currently-selected custom endpoint so its model list
     matches the active provider without blocking on every saved/offline custom
     endpoint.
+
+    ``probe_cloud_credentials`` opts into the full cloud SDK credential chain
+    for setup surfaces. Keep it false for routine picker opens so machines
+    without cloud credentials do not block on metadata-service probes.
     """
     import os
     from agent.models_dev import (
@@ -1850,7 +1855,7 @@ def list_authenticated_providers(
         current_norm = str(current_provider or "").strip().lower()
         if _has_fast_aws_sdk_signal():
             return True
-        if slug_norm != current_norm:
+        if slug_norm != current_norm and not probe_cloud_credentials:
             return False
         try:
             from agent.bedrock_adapter import has_aws_credentials

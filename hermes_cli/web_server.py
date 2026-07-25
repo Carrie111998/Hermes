@@ -6696,6 +6696,7 @@ async def get_model_options(
     refresh: bool = False,
     include_unconfigured: bool = False,
     explicit_only: bool = False,
+    probe_cloud_credentials: bool = False,
 ):
     """Return authenticated providers + their curated model lists.
 
@@ -6711,6 +6712,10 @@ async def get_model_options(
     ``refresh`` busts the per-provider model-id disk cache so every row
     re-fetches its live catalog — used by the picker's explicit "Refresh
     Models" control. Normal opens leave it false to stay on the 1h cache.
+
+    ``probe_cloud_credentials`` allows user-triggered setup surfaces to check
+    SDK credential chains such as an EC2 instance role. Routine picker opens
+    leave it false to avoid metadata-service delays on non-cloud machines.
     """
     try:
         from hermes_cli.inventory import build_model_options_payload, load_picker_context
@@ -6725,6 +6730,7 @@ async def get_model_options(
                     explicit_only=bool(explicit_only),
                     include_unconfigured=bool(include_unconfigured),
                     refresh=bool(refresh),
+                    probe_cloud_credentials=bool(probe_cloud_credentials),
                 )
 
         return await run_in_threadpool(_build_payload_scoped)
