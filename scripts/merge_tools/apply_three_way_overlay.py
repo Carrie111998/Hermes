@@ -72,11 +72,14 @@ def three_way_merge(
         (tmp_path / "base").write_text(base_text, encoding="utf-8", newline="\n")
         (tmp_path / "up").write_text(up_text, encoding="utf-8", newline="\n")
         (tmp_path / "fork").write_text(fork_text, encoding="utf-8", newline="\n")
+        # Prefer official (first file / --ours) on conflicting hunks while still
+        # keeping non-conflicting fork advantages from the third file.
         proc = run(
             [
                 "git",
                 "merge-file",
                 "-p",
+                "--ours",
                 str(tmp_path / "up"),
                 str(tmp_path / "base"),
                 str(tmp_path / "fork"),

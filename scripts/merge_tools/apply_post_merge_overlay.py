@@ -29,21 +29,40 @@ def run(cmd: list[str], *, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess
 
 
 def overlay_path(path: str, upstream_ref: str, base_sha: str, old_head: str, *, sanitizers: dict) -> tuple[str, str]:
-    from apply_three_way_overlay import three_way_merge
+    from apply_three_way_overlay import three_way_merge, git_show
 
     code, merged = three_way_merge(path, base_sha, upstream_ref, old_head, sanitizers=sanitizers)
     if code == 2:
+        # Prefer whichever side still exists (official-first when both missing → no-op).
+        up_text = git_show(upstream_ref, path)
+        fork_text = git_show(old_head, path)
+        if up_text is not None:
+            target = REPO_ROOT / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(up_text, encoding="utf-8", newline="\n")
+            run(["git", "add", "--", path])
+            return path, "applied-upstream-fallback"
+        if fork_text is not None:
+            target = REPO_ROOT / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(fork_text, encoding="utf-8", newline="\n")
+            run(["git", "add", "--", path])
+            return path, "applied-fork-fallback"
         return path, f"failed: missing version for {path}"
     if "<<<<<<<" in merged:
-        target = REPO_ROOT / path
-        target.write_text(merged, encoding="utf-8", newline="\n")
-        run(["git", "add", "--", path])
-        return path, "conflict-markers"
+        # Official-first: keep upstream when favor-ours still leaves markers.
+        up_text = git_show(upstream_ref, path)
+        if up_text is None:
+            return path, "conflict-markers"
+        merged = up_text
+        status = "applied-upstream-fallback"
+    else:
+        status = "applied"
 
     target = REPO_ROOT / path
     target.write_text(merged, encoding="utf-8", newline="\n")
     run(["git", "add", "--", path])
-    return path, "applied"
+    return path, status
 
 
 def load_overlay_paths(strategy_file: Path) -> list[str]:
