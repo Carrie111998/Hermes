@@ -270,7 +270,8 @@ class WorkflowEngine:
         WorkflowEngine.STATE_DIR = self.workflows_dir / ".engine-state"
         self.STATE_DIR.mkdir(parents=True, exist_ok=True)
         # Job log DB at ~/.hermes/workflows/executions.db
-        self._exec_db_path = Path.home() / ".hermes" / "workflows" / "executions.db"
+        from hermes_cli.kanban_db import kanban_home
+        self._exec_db_path = kanban_home() / "workflows" / "executions.db"
         self._exec_db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_exec_db()
 

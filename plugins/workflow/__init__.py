@@ -173,8 +173,10 @@ def _update_node_card_db(card_id: str, status: str):
     """Update a node card's status and check if the run is complete."""
     try:
         import sqlite3
+        import os
         from pathlib import Path
-        db_path = Path.home() / ".hermes" / "workflows" / "executions.db"
+        from hermes_cli.kanban_db import kanban_home
+        db_path = kanban_home() / "workflows" / "executions.db"
         if not db_path.exists():
             return
         with sqlite3.connect(str(db_path)) as conn:
@@ -517,6 +519,7 @@ def _spawn_supervisor_for_next_layer(state, state_path):
 
 
 def _notify_workflow_complete(task_id: str, state=None):
+    print(f"   📨 _notify_workflow_complete called: task_id={task_id}, state={bool(state)}")
     """Write a completion marker to /tmp for the watcher thread to inject.
 
     When a final-layer card completes, reads the state file for session info
