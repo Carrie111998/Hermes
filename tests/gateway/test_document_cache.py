@@ -211,6 +211,17 @@ class TestCacheMediaBytes:
         assert result.kind == "video"
         assert result.media_type == "video/mp4"
 
+    def test_m2a_with_generic_mime_routes_to_audio(self):
+        from gateway.platforms.base import cache_media_bytes
+
+        result = cache_media_bytes(
+            b"mpeg-audio", filename="clip.m2a", mime_type="application/octet-stream"
+        )
+
+        assert result is not None
+        assert result.kind == "audio"
+        assert result.media_type == "audio/mpeg"
+
     def test_mime_only_resolves_extension(self):
         from gateway.platforms.base import cache_media_bytes
         result = cache_media_bytes(b"col1,col2\n1,2", filename="", mime_type="text/csv")
