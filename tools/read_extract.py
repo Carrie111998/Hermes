@@ -1,21 +1,22 @@
 """Stdlib document-to-text extraction for ``read_file``.
 
-Supports Jupyter notebooks, DOCX, and XLSX without adding hard dependencies.
-Malformed documents raise :class:`ExtractionError`; callers can then fall back to
-normal text/binary handling.
+Supports Jupyter notebooks, DOCX, XLSX, and PPTX without adding hard
+dependencies. Malformed documents raise :class:`ExtractionError`; callers can
+then fall back to normal text/binary handling.
 """
 
 from __future__ import annotations
 
 import json
 import posixpath
+import re
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 __all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
 
-EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
+EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx", ".pptx"})
 MAX_XLSX_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
@@ -24,6 +25,11 @@ _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_NS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+_SLIDE_RE = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
 
 
 class ExtractionError(Exception):
@@ -47,6 +53,8 @@ def extract_document_text(path: str) -> str:
         return _extract_docx(path)
     if ext == ".xlsx":
         return _extract_xlsx(path)
+    if ext == ".pptx":
+        return _extract_pptx(path)
     raise ExtractionError(f"Unsupported document type: {path!r}")
 
 
@@ -246,3 +254,110 @@ def _cell_value(cell: ET.Element, shared: list[str], s: str) -> str:
     if typ == "e":
         return value or "#ERROR"
     return value
+
+
+# ---------------------------------------------------------------------------
+# PowerPoint (.pptx)
+# ---------------------------------------------------------------------------
+
+def _extract_pptx(path: str) -> str:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            parts = _pptx_slide_parts(zf, names)
+            out: list[str] = []
+            for index, part in enumerate(parts, 1):
+                try:
+                    lines = _slide_text(zf.read(part))
+                except ET.ParseError:
+                    continue
+                out.append(f"# ── Slide {index} ──")
+                out.extend(lines)
+                if not any(line.strip() for line in lines):
+                    out.append("(no text)")
+                out.append("")
+    except zipfile.BadZipFile as exc:
+        raise ExtractionError(f"Not a valid PPTX: {exc}") from exc
+    except OSError as exc:
+        raise ExtractionError(str(exc)) from exc
+
+    if not out:
+        raise ExtractionError("PPTX has no slides with content")
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _pptx_slide_parts(zf: zipfile.ZipFile, names: set[str]) -> list[str]:
+    """Ordered slide part names.
+
+    Preferred order comes from ``ppt/presentation.xml`` (``<p:sldId r:id=...>``)
+    resolved through its ``.rels`` — this respects slide reordering, which the
+    ``slideN.xml`` filenames do not. Falls back to numeric filename order when
+    the presentation part or its rels are missing/malformed.
+    """
+    p, r = f"{{{_NS_P}}}", f"{{{_NS_REL}}}"
+    try:
+        root = ET.fromstring(zf.read("ppt/presentation.xml"))
+        rids = [sld.get(f"{r}id") for sld in root.iter(f"{p}sldId")]
+    except (KeyError, ET.ParseError):
+        rids = []
+
+    rels = _pptx_rels(zf, names)
+    ordered = [_pptx_part(rels[rid]) for rid in rids if rid and rid in rels]
+    ordered = [part for part in ordered if part in names]
+    if ordered:
+        return ordered
+
+    # Fallback: every ppt/slides/slideN.xml, in numeric (not lexical) order so
+    # slide10 sorts after slide2.
+    slides = [n for n in names if _SLIDE_RE.match(n)]
+    return sorted(slides, key=lambda n: int(_SLIDE_RE.match(n).group(1)))
+
+
+def _pptx_rels(zf: zipfile.ZipFile, names: set[str]) -> dict[str, str]:
+    rels_path = "ppt/_rels/presentation.xml.rels"
+    if rels_path not in names:
+        return {}
+    try:
+        root = ET.fromstring(zf.read(rels_path))
+    except ET.ParseError:
+        return {}
+    rel_tag = f"{{{_NS_PKG_REL}}}Relationship"
+    return {rel.get("Id", ""): rel.get("Target", "") for rel in root.iter(rel_tag) if rel.get("Id")}
+
+
+def _pptx_part(target: str) -> str:
+    target = target.lstrip("/")
+    return posixpath.normpath(target if target.startswith("ppt/") else f"ppt/{target}")
+
+
+def _slide_text(xml_bytes: bytes) -> list[str]:
+    root = ET.fromstring(xml_bytes)
+    a = f"{{{_NS_A}}}"
+    lines: list[str] = []
+    # Shapes that use markup-compatibility extensions (WordArt, a14/a16 text
+    # effects, …) are wrapped in <mc:AlternateContent> with the *same* text
+    # repeated in both the <mc:Choice> and <mc:Fallback> branches. root.iter()
+    # walks both, so counting every <a:p> would emit each such run twice. Drop
+    # the paragraphs under any <mc:Fallback> and keep the <mc:Choice> copy (the
+    # higher-fidelity representation, always present per the MCE spec). Elements
+    # are tracked by identity — a duplicated *value* in two independent shapes
+    # is still kept.
+    fallback_paras = {
+        para
+        for fb in root.iter(f"{{{_NS_MC}}}Fallback")
+        for para in fb.iter(f"{a}p")
+    }
+    # Each DrawingML paragraph (<a:p>) — including those inside text boxes,
+    # tables and placeholders — is one logical line. <a:t> holds the runs;
+    # <a:br> is a soft line break within a paragraph.
+    for para in root.iter(f"{a}p"):
+        if para in fallback_paras:
+            continue
+        buf: list[str] = []
+        for node in para.iter():
+            if node.tag == f"{a}t":
+                buf.append(node.text or "")
+            elif node.tag == f"{a}br":
+                buf.append("\n")
+        lines.extend("".join(buf).split("\n"))
+    return lines
