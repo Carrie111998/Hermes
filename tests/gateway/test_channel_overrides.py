@@ -10,8 +10,70 @@ from gateway.config import (
     Platform,
     PlatformConfig,
 )
-from gateway.run import _get_channel_override, GatewayRunner
+from gateway.run import (
+    _get_channel_override,
+    _resolve_runtime_agent_kwargs_for_provider,
+    GatewayRunner,
+)
 from gateway.session import SessionSource
+
+
+class TestRuntimeMaxTokensResolution:
+    """Regression for #59763: provider-pinned routes must forward max_tokens."""
+
+    def test_provider_resolver_includes_max_tokens_from_model_config(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": "openrouter",
+                "api_key": "k",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+                "max_output_tokens": 8000,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_model_config",
+            lambda: {"max_tokens": 4096},
+        )
+
+        result = _resolve_runtime_agent_kwargs_for_provider("openrouter")
+        assert result["max_tokens"] == 4096
+
+    def test_provider_resolver_falls_back_to_max_output_tokens(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": "openrouter",
+                "api_key": "k",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+                "max_output_tokens": 8000,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_model_config", lambda: {}
+        )
+
+        result = _resolve_runtime_agent_kwargs_for_provider("openrouter")
+        assert result["max_tokens"] == 8000
+
+    def test_provider_resolver_returns_none_when_unconfigured(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": "openrouter",
+                "api_key": "k",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_model_config", lambda: {}
+        )
+
+        result = _resolve_runtime_agent_kwargs_for_provider("openrouter")
+        assert result["max_tokens"] is None
 
 
 class TestGetChannelOverride:
