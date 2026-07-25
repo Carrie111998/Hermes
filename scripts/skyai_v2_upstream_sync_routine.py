@@ -46,7 +46,6 @@ SKYAI_TEST_FILES = (
     "tests/scripts/test_skyai_v2_upstream_sync_check.py",
     "tests/scripts/test_skyai_v2_upstream_sync_daily_report.py",
     "tests/scripts/test_skyai_v2_upstream_sync_routine.py",
-    "tests/scripts/test_skyai_v2_upstream_sync_scheduler.py",
 )
 
 

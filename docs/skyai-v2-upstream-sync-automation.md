@@ -97,21 +97,16 @@ deploy, change runtime state, or retry failed delivery.
 
 ## Scheduler Contract
 
-On the canonical macOS host, `launchd` runs the deterministic wrapper every
-three hours:
+The scheduler runs on the always-on Muncho operational host, independently of
+an operator workstation. Every three hours it invokes this exact deterministic
+candidate rail. A separate daily reporting service reads only sanitized
+structured results and sends one bounded report through the existing Hermes
+transport to the configured internal Discord channel.
 
-```bash
-python3 scripts/skyai_v2_upstream_sync_scheduler.py --job sync
-```
-
-The wrapper invokes the same candidate rail and sends exactly one bounded
-result through `hermes send` to the configured internal Discord channel. A
-separate `launchd` calendar job runs the same wrapper with `--job daily` at
-09:00 Europe/Sofia. These jobs do not invoke Codex or an LLM and therefore do
-not create Codex tasks/threads.
-
-Delivery is attempted once. A delivery failure is logged and is not retried in
-a loop. The next normal scheduled execution remains eligible to run.
+The sync service has no model/provider or Discord credential access. The
+reporting service has no GitHub credential access. Neither service creates
+Codex tasks/threads. Delivery is attempted once; a failed delivery is recorded
+without a retry loop, and the next normal daily run remains eligible.
 
 The scheduler is not authority for:
 
