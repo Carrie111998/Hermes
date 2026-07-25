@@ -728,6 +728,7 @@ async def test_gateway_acknowledges_capsule_after_agent_session_rotation(
         gateway_run._CONTINUITY_CAPSULE_CAPABLE_METADATA,
         True,
     )
+    runner.session_store._renewal_defer_fn = lambda _key, _entry: False
     _expire(runner.session_store, predecessor)
     successor = await runner.async_session_store.get_or_create_session(source)
     successor_id = successor.session_id
