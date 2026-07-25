@@ -2,6 +2,8 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
+
 import { $terminalTakeover } from '../store'
 
 import { ensureTerminal } from './terminals'
@@ -59,6 +61,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
   const terminalTakeover = useStore($terminalTakeover)
   const [rect, setRect] = useState<Rect | null>(null)
   const [ready, setReady] = useState(false)
+  const [slotVisible, setSlotVisible] = useState(false)
 
   // VS Code parity: once the pane has ever been opened, keep the terminals
   // mounted — and their shells alive — even while hidden. Hiding the pane just
@@ -86,6 +89,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
 
     const tick = () => {
       const r = slot.getBoundingClientRect()
+      setSlotVisible(!slot.closest(`[${PANE_HIDDEN_ATTR}]`))
       // floor top/left + ceil right/bottom: overlay always covers the slot's
       // full pixel footprint, so half-pixel rects can't leak page bg through.
       const top = Math.floor(r.top)
@@ -109,7 +113,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
     return () => cancelAnimationFrame(frame)
   }, [slot])
 
-  const visible = Boolean(rect && rect.width > 0 && rect.height > 0)
+  const visible = Boolean(slotVisible && rect && rect.width > 0 && rect.height > 0)
 
   const style: CSSProperties = {
     position: 'fixed',
