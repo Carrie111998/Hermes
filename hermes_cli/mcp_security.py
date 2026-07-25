@@ -30,6 +30,10 @@ import re
 import shlex
 from typing import Any
 
+# Basenames without a trailing ``.exe``. Windows Git-Bash / MSYS / Cygwin
+# launchers are ``bash.exe`` / ``sh.exe`` / etc.; membership strips that suffix
+# so POSIX and Windows spellings share one set (previously only cmd/powershell/
+# pwsh listed ``.exe`` forms, which let ``bash.exe`` skip egress/persistence).
 _SHELL_INTERPRETERS = frozenset({
     "bash",
     "sh",
@@ -37,11 +41,8 @@ _SHELL_INTERPRETERS = frozenset({
     "dash",
     "fish",
     "cmd",
-    "cmd.exe",
     "powershell",
-    "powershell.exe",
     "pwsh",
-    "pwsh.exe",
 })
 
 _EGRESS_PATTERN = re.compile(
@@ -148,6 +149,8 @@ def validate_mcp_server_entry(name: str, entry: dict[str, Any]) -> list[str]:
 
     command = entry.get("command")
     basename = _command_basename(command)
+    if basename.endswith(".exe"):
+        basename = basename[:-4]
     if basename not in _SHELL_INTERPRETERS:
         return issues
 
