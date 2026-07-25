@@ -399,33 +399,21 @@ _CACHE_DIRS: list[tuple[str, str]] = [
 
 
 def register_cache_dir(new_subpath: str, old_name: Optional[str] = None) -> None:
-    """Register an additional cache subdirectory for remote-backend mirroring.
+    """Register an extra ``HERMES_HOME`` cache subdir for remote-backend mirroring.
 
-    Out-of-tree plugins (installed via ``~/.hermes/plugins/`` or a pip entry
-    point) that persist files under ``HERMES_HOME/<new_subpath>`` and hand the
-    model a path to read them back need those files to exist on whatever backend
-    the agent runs on. Registering the subdir makes it participate in the same
-    machinery core cache dirs already use:
-
-    - Docker bind mounts (:func:`get_cache_directory_mounts`),
-    - host→container/remote path translation
-      (:func:`map_cache_path_to_container`),
-    - per-file remote upload/sync (:func:`iter_cache_files`).
-
-    Without this a plugin's cache lives only on the host, so a recovery path it
-    emits is unreadable on Docker/Modal/SSH backends. Idempotent; safe to call
-    at plugin registration time. ``old_name`` is an optional legacy location for
-    backward-compat (defaults to ``new_subpath`` when the plugin has no legacy
-    layout, so :func:`hermes_constants.get_hermes_dir` never sees ``None``).
+    Lets an out-of-tree plugin persist files under ``HERMES_HOME/<new_subpath>``
+    and have them participate in the same machinery core cache dirs use: Docker
+    mounts, host→container/remote path translation, and per-file sync. Without it
+    the plugin's cache lives only on the host, so a recovery path it hands the
+    model is unreadable on Docker/Modal/SSH. Idempotent. ``old_name`` is an
+    optional legacy dir name (defaults to ``new_subpath``).
     """
     subpath = (new_subpath or "").strip().strip("/")
     if not subpath:
         raise ValueError("register_cache_dir: new_subpath must be non-empty")
-    legacy = old_name.strip().strip("/") if old_name else subpath
-    for existing_new, _existing_old in _CACHE_DIRS:
-        if existing_new == subpath:
-            return
-    _CACHE_DIRS.append((subpath, legacy))
+    if any(existing == subpath for existing, _ in _CACHE_DIRS):
+        return
+    _CACHE_DIRS.append((subpath, old_name.strip().strip("/") if old_name else subpath))
 
 
 def get_cache_directory_mounts(

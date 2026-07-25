@@ -172,10 +172,9 @@ class FileSyncManager:
         On failure, state rolls back so the next cycle retries everything.
 
         By default a transport failure is logged and swallowed (best-effort
-        background sync). Pass ``raise_on_error=True`` when a caller must know
-        the sync actually landed (e.g. a cache write that hands the model a
-        recovery path pointing at the just-uploaded file); the transport error
-        is then re-raised after rollback instead of being swallowed.
+        background sync). Pass ``raise_on_error=True`` when the caller must know
+        the upload landed (e.g. a cache write handing the model a recovery path);
+        the error is then re-raised after rollback.
         """
         if not force and not os.environ.get(_FORCE_SYNC_ENV):
             now = _monotonic()
