@@ -2,7 +2,12 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { DEFAULT_HEALTH_PROBE_TIMEOUT_MS, isMissingHealthEndpointError, waitForHermesReady } from './backend-health'
+import {
+  DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+  isMissingHealthEndpointError,
+  isUnauthenticatedHealthError,
+  waitForHermesReady
+} from './backend-health'
 
 test('uses lightweight /api/health for current backends', async () => {
   const calls: string[][] = []
@@ -133,4 +138,42 @@ test('recognizes missing-route shapes only', () => {
   )
   assert.equal(isMissingHealthEndpointError(new Error('Timed out connecting to Hermes backend after 15000ms')), false)
   assert.equal(isMissingHealthEndpointError(new Error('500: boom')), false)
+})
+
+test('recognizes an unauthenticated /api/health response', () => {
+  assert.equal(
+    isUnauthenticatedHealthError(
+      new Error('401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}')
+    ),
+    true
+  )
+  assert.equal(isUnauthenticatedHealthError(new Error('404: {"detail":"Not Found"}')), false)
+  assert.equal(isUnauthenticatedHealthError(new Error('500: boom')), false)
+  assert.equal(isUnauthenticatedHealthError(new Error('Timed out connecting to Hermes backend after 15000ms')), false)
+})
+
+test('falls back to /api/status when the public health probe requires auth', async () => {
+  const calls: string[][] = []
+
+  await waitForHermesReady('http://127.0.0.1:9000', {
+    token: 'secret-token',
+    fetchPublicJson: async url => {
+      calls.push(['public', url])
+
+      throw new Error('401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}')
+    },
+    fetchJson: async (url, token) => {
+      calls.push(['token', url, token ?? ''])
+
+      return { ok: true }
+    },
+    sleep: async () => {},
+    timeoutMs: 100,
+    pollMs: 1
+  })
+
+  assert.deepEqual(calls, [
+    ['public', 'http://127.0.0.1:9000/api/health'],
+    ['token', 'http://127.0.0.1:9000/api/status', 'secret-token']
+  ])
 })

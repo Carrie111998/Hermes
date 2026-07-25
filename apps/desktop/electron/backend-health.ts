@@ -28,6 +28,16 @@ export function isMissingHealthEndpointError(error: unknown): boolean {
   return /^404:/.test(message) || message.includes('endpoint is likely missing')
 }
 
+// Some hardened self-hosted gateways require auth on every route, including
+// the otherwise-public /api/health probe. The remedy is the same as a
+// missing route: stop probing unauthenticated and fall back to the
+// already-authenticated /api/status check.
+export function isUnauthenticatedHealthError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return /^401:/.test(message)
+}
+
 function supersededError() {
   const error: any = new Error('SSH bootstrap was superseded by newer connection settings.')
   error.kind = 'superseded'
@@ -78,9 +88,10 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
     } catch (error) {
       lastError = error
 
-      // Only an explicitly missing route means the backend predates
-      // /api/health; timeouts and server errors keep polling health.
-      if (!useStatusFallback && isMissingHealthEndpointError(error)) {
+      // Only an explicitly missing route (or a route that demands auth we
+      // deliberately don't send here) means the public health probe can't
+      // work on this backend; timeouts and server errors keep polling health.
+      if (!useStatusFallback && (isMissingHealthEndpointError(error) || isUnauthenticatedHealthError(error))) {
         useStatusFallback = true
 
         continue
