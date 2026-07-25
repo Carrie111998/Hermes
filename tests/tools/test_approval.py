@@ -722,6 +722,363 @@ class TestHermesConfigWriteProtection:
         assert dangerous is False
 
 
+class TestInterpreterExecFlagForms:
+    """Invocation shapes raised in review of #57666.
+
+    These ride the shared interpreter/flag tokenizer rather than a regex, so
+    ordinary option-argument and long-option forms before the evaluation flag
+    resolve the same way a bare flag does.
+    """
+
+    def test_option_argument_before_the_eval_flag(self):
+        for command in (
+            "python3 -W ignore -c 'import os'",
+            "perl -I /tmp -e 'print 1'",
+            "ruby -r json -e 'puts 1'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_long_option_before_the_eval_flag(self):
+        for command in (
+            "python3 --check-hash-based-pycs always -c 'import os'",
+            "node --max-old-space-size=4096 -e '1'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_node_print_eval_forms(self):
+        for command in (
+            "node -p \"require('fs').readFileSync('/etc/passwd')\"",
+            "node --print \"require('fs').readFileSync('/etc/passwd')\"",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_versioned_php_runs_inline_code(self):
+        # php8.x is the default binary name on Debian and Ubuntu; an
+        # unversioned-only spelling let the whole family through unscanned.
+        dangerous, _key, _desc = detect_dangerous_command("php8.2 -r 'system(\"id\");'")
+        assert dangerous is True
+
+
+class TestHermesPolicyFileExecution:
+    """~/.hermes/config.yaml holds approvals.mode and the permanent allowlist.
+
+    An inline script writing there is the agent editing its own guardrails, so
+    it is named explicitly instead of being reported as ordinary inline code.
+    """
+
+    def test_inline_script_touching_config_is_named(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "python3 -c \"open('~/.hermes/config.yaml','a').write('yolo: true')\""
+        )
+        assert dangerous is True
+        assert "hermes config/env" in desc.lower()
+
+    def test_named_through_an_option_argument_form(self):
+        # The blind spot a parallel regex would have reproduced.
+        dangerous, _key, desc = detect_dangerous_command(
+            "python3 -W ignore -c \"open('~/.hermes/config.yaml','a')\""
+        )
+        assert dangerous is True
+        assert "hermes config/env" in desc.lower()
+
+    def test_named_for_node_print_eval(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "node -p \"require('fs').readFileSync('~/.hermes/.env')\""
+        )
+        assert dangerous is True
+        assert "hermes config/env" in desc.lower()
+
+    def test_named_for_a_versioned_interpreter(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "perl5.36 -e 'print' ~/.hermes/config.yaml"
+        )
+        assert dangerous is True
+        assert "hermes config/env" in desc.lower()
+
+    def test_named_for_the_hermes_home_spelling(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "php8.2 -r 'file_put_contents(\"$HERMES_HOME/config.yaml\",\"x\");'"
+        )
+        assert dangerous is True
+        assert "hermes config/env" in desc.lower()
+
+    def test_someone_elses_config_yaml_stays_generic(self):
+        _dangerous, _key, desc = detect_dangerous_command(
+            "python3 -c 'import os' /srv/app/config.yaml"
+        )
+        assert desc == "script execution via -e/-c flag"
+
+    def test_plain_inline_script_stays_generic(self):
+        _dangerous, _key, desc = detect_dangerous_command(
+            "python3 -c 'print(1)' /tmp/scratch.py"
+        )
+        assert desc == "script execution via -e/-c flag"
+
+    def test_key_is_not_aliased_to_the_generic_one(self):
+        # Deliberate: a standing grant for ordinary inline execution must not
+        # silently extend to the file that defines the approval policy.
+        _dangerous, _key, desc = detect_dangerous_command(
+            "python3 -c \"open('~/.hermes/config.yaml','a')\""
+        )
+        assert approval_module._approval_key_aliases(desc) == {desc}
+        assert desc not in approval_module._approval_key_aliases(
+            "script execution via -e/-c flag"
+        )
+
+
+class TestVersionedInPlaceEdit:
+    """perl5.36/ruby3.2 mutate files exactly as perl/ruby do."""
+
+    def test_versioned_perl_in_place_config(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "perl5.36 -i -pe 's/on/off/' ~/.hermes/config.yaml"
+        )
+        assert dangerous is True
+        assert "in-place" in desc.lower()
+
+    def test_versioned_ruby_in_place_env(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "ruby3.2 -i -pe 'gsub(/a/,\"b\")' ~/.hermes/.env"
+        )
+        assert dangerous is True
+        assert "in-place" in desc.lower()
+
+    def test_versioned_perl_in_place_sensitive_path(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "perl5.36 -i -pe 's/a/b/' ~/.ssh/authorized_keys"
+        )
+        assert dangerous is True
+        assert "in-place" in desc.lower()
+
+    def test_unversioned_spelling_still_matches(self):
+        dangerous, _key, desc = detect_dangerous_command(
+            "perl -i -pe 's/on/off/' ~/.hermes/config.yaml"
+        )
+        assert dangerous is True
+        assert "in-place" in desc.lower()
+
+
+class TestLauncherWrapperOptionGrammars:
+    """Wrappers whose options own a separate value.
+
+    Reported in review: the scan used sudo's option-argument set for every
+    wrapper, so an option that owns a value was skipped while its value was
+    not, and that value was then mistaken for the executable.
+    """
+
+    def test_env_options_that_own_a_value(self):
+        for command in (
+            "env --chdir /tmp python3 -c 'import os'",
+            "env -C /tmp python3 -c 'import os'",
+            "env --unset PATH /usr/bin/python3 -c 'import os'",
+            "env -u PATH python3 -c 'import os'",
+            "env --chdir=/tmp python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_env_options_without_a_value(self):
+        for command in (
+            "env -i python3 -c 'import os'",
+            "env FOO=1 python3 -c 'import os'",
+            "env --block-signal python3 -c 'import os'",
+        ):
+            # --block-signal takes an optional argument, which getopt_long
+            # accepts only as --opt=VALUE, so the next word is the command.
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_env_split_string_hides_the_interpreter_inside_the_value(self):
+        for command in (
+            'env -S "python3 -c import os"',
+            "env -S 'python3 -c import os'",
+            'env --split-string="python3 -c import os"',
+            'env --split-string "python3 -c import os"',
+            'env -i -S "python3 -c import os"',
+            'env FOO=1 -S "python3 -c import os"',
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_split_string_expansion_is_anchored_to_env(self):
+        # Unrelated -S options must not be rewritten.
+        for command in (
+            "ssh -S /tmp/control-socket example.com",
+            "grep -S python3 notes.txt",
+            'env -S "node server.js"',
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is False, command
+
+    def test_exec_argv0_spoofing(self):
+        dangerous, _key, _desc = detect_dangerous_command(
+            "exec -a innocent python3 -c 'import os'"
+        )
+        assert dangerous is True
+
+    def test_exec_flag_without_a_value(self):
+        dangerous, _key, _desc = detect_dangerous_command(
+            "exec -c python3 -c 'import os'"
+        )
+        assert dangerous is True
+
+    def test_time_options_that_own_a_value(self):
+        for command in (
+            "time -f %U python3 -c 'import os'",
+            "time --format=%U python3 -c 'import os'",
+            "time -o timing.txt python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_time_flag_without_a_value(self):
+        dangerous, _key, _desc = detect_dangerous_command(
+            "time -p python3 -c 'import os'"
+        )
+        assert dangerous is True
+
+    def test_sudo_grammar_is_unchanged(self):
+        for command in (
+            "sudo -u root python3 -c 'import os'",
+            "sudo --preserve-env python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_stacked_wrappers(self):
+        dangerous, _key, _desc = detect_dangerous_command(
+            "nohup setsid env --chdir /tmp python3 -c 'import os'"
+        )
+        assert dangerous is True
+
+
+class TestWrapperArgv0AndSudoOperands:
+    """Options documented after the original tables were written.
+
+    env -a/--argv0 landed in coreutils 9.5; sudo's long-standing set omits
+    four options that own a value. Each stops the scan on the operand, so the
+    interpreter behind the wrapper is never reached.
+    """
+
+    def test_env_argv0_spoofing(self):
+        for command in (
+            "env --argv0 innocent python3 -c 'import os'",
+            "env -a innocent python3 -c 'import os'",
+            "env --argv0=innocent python3 -c 'import os'",
+            "env -i -a innocent python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_sudo_options_that_own_a_value(self):
+        for command in (
+            "sudo -D /tmp python3 -c 'import os'",
+            "sudo --chdir /tmp python3 -c 'import os'",
+            "sudo -R / python3 -c 'import os'",
+            "sudo --chroot / python3 -c 'import os'",
+            "sudo -r sysadm_r python3 -c 'import os'",
+            "sudo -t sysadm_t python3 -c 'import os'",
+            "sudo -U root python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_sudo_flags_without_a_value_still_work(self):
+        for command in (
+            "sudo -u root python3 -c 'import os'",
+            "sudo --preserve-env python3 -c 'import os'",
+            "sudo -n python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_benign_commands_behind_these_options_stay_clean(self):
+        for command in (
+            "env --argv0 innocent node server.js",
+            "sudo -D /tmp node server.js",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is False, command
+
+
+class TestTransparentLauncherCoverage:
+    """Launchers that run the following program unchanged.
+
+    These were absent from the wrapper set entirely, so the scan stopped on
+    the launcher itself and the exec-flag rule never fired for the
+    interpreter behind it. su and runuser are deliberately still absent:
+    they take the command as a string via -c, which is a shell invocation
+    rather than a pass-through, and belong with the interpreter families.
+    """
+
+    def test_launchers_without_options(self):
+        for command in (
+            "nice python3 -c 'import os'",
+            "doas python3 -c 'import os'",
+            "unshare python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_launcher_options_that_own_a_value(self):
+        for command in (
+            "nice -n 5 python3 -c 'import os'",
+            "nice --adjustment 5 python3 -c 'import os'",
+            "stdbuf -o 0 python3 -c 'import os'",
+            "doas -u root python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_launcher_options_with_attached_values(self):
+        for command in (
+            "stdbuf -o0 python3 -c 'import os'",
+            "nice -n5 python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_flags_that_look_like_value_taking_options(self):
+        # unshare -r is --map-root-user, a flag, even though -R/--root takes
+        # a value; the ambiguous pair must not swallow the command.
+        dangerous, _key, _desc = detect_dangerous_command(
+            "unshare -r python3 -c 'import os'"
+        )
+        assert dangerous is True
+
+    def test_launchers_with_a_positional_operand(self):
+        for command in (
+            "timeout 10 python3 -c 'import os'",
+            "timeout 1.5s python3 -c 'import os'",
+            "timeout -k 5 10 python3 -c 'import os'",
+            "chroot /jail python3 -c 'import os'",
+            "chroot --userspec=root:root /jail python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_launchers_stacked_on_each_other(self):
+        for command in (
+            "nice timeout 10 python3 -c 'import os'",
+            "nohup nice -n 5 python3 -c 'import os'",
+            "sudo -u root timeout 10 python3 -c 'import os'",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_benign_programs_behind_these_launchers_stay_clean(self):
+        for command in (
+            "nice node server.js",
+            "timeout 10 node server.js",
+            "stdbuf -o0 cat access.log",
+        ):
+            dangerous, _key, _desc = detect_dangerous_command(command)
+            assert dangerous is False, command
+
+
 class TestFindExecFullPathRm:
     """Detect find -exec with full-path rm bypasses."""
 

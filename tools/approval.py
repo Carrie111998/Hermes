@@ -273,6 +273,18 @@ _HERMES_CONFIG_PATH = (
     r'(?:\$hermes_home|\$\{hermes_home\})/)'
     r'config\.yaml\b'
 )
+# The token-path counterpart of the regex rules above: once an interpreter's
+# execution flag is identified structurally, the payload and any trailing file
+# operands are checked for the Hermes policy files. Riding the tokenizer means
+# this inherits its coverage of option-argument, long-option and glued flag
+# forms instead of restating them as a second, weaker regex.
+_HERMES_POLICY_FILE_RE = re.compile(
+    rf'(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', re.IGNORECASE
+)
+_HERMES_POLICY_EXEC_DESCRIPTION = (
+    "script execution via -e/-c flag targeting Hermes config/env"
+)
+
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = (
@@ -734,7 +746,7 @@ DANGEROUS_PATTERNS = [
     # ~/.ssh/authorized_keys` cannot silently plant login commands or keys.
     (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
     (rf'\bsed\s+--in-place\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (long flag)"),
-    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)"),
+    (rf'\b(?:perl[0-9]*(?:\.\d+)*|ruby[0-9]*(?:\.\d+)*)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)"),
     (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
     (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
     # In-place edit of a Hermes-managed security file (~/.hermes/config.yaml or
@@ -751,7 +763,7 @@ DANGEROUS_PATTERNS = [
     # backup suffix (`perl -i.bak`). Match any flag token containing `i`
     # anywhere in the args, not just the first token — `perl -e '...'` (code
     # eval, no -i) does not trip because it has no `-...i` flag token.
-    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (perl/ruby)"),
+    (rf'\b(?:perl[0-9]*(?:\.\d+)*|ruby[0-9]*(?:\.\d+)*)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (perl/ruby)"),
     # Interpreter heredocs are handled by _execution_flag_findings() alongside
     # inline-exec flags; keep only shell heredocs regex-based here.
     # Shell execution via heredoc — `bash <<'EOF' ... EOF` runs arbitrary
@@ -863,6 +875,31 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 # Detection
 # =========================================================================
 
+# `env -S "cmd args"` is not an option with an operand: env splits the value
+# itself and executes it, so the command hides inside a single quoted word that
+# nothing downstream can see into. Unwrap it before detection. Anchored on env
+# so unrelated -S options (ssh -S socket, grep -S) are untouched.
+_ENV_SPLIT_STRING_RE = re.compile(
+    r'\benv\b((?:\s+(?:-[^\s=]+|[A-Za-z_][A-Za-z0-9_]*=\S*))*)'
+    r'\s+(?:-S|--split-string)(?:\s+|=)'
+    r'(?:"([^"]*)"|\'([^\']*)\'|(\S+))'
+)
+
+
+def _expand_env_split_string(command: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        leading = match.group(1) or ""
+        payload = match.group(2) or match.group(3) or match.group(4) or ""
+        return f"env{leading} {payload}"
+
+    for _ in range(4):
+        expanded = _ENV_SPLIT_STRING_RE.sub(_replace, command)
+        if expanded == command:
+            break
+        command = expanded
+    return command
+
+
 def _normalize_command_for_detection(command: str) -> str:
     """Normalize a command string before dangerous-pattern matching.
 
@@ -878,6 +915,8 @@ def _normalize_command_for_detection(command: str) -> str:
     command = command.replace('\x00', '')
     # Normalize Unicode (fullwidth Latin, halfwidth Katakana, etc.)
     command = unicodedata.normalize('NFKC', command)
+    # Unwrap `env -S "cmd args"` so the interpreter inside is visible below.
+    command = _expand_env_split_string(command)
     # Collapse shell line continuations (backslash-newline). The shell removes
     # BOTH characters and joins the tokens, so `rm -rf \<newline>/` executes as
     # `rm -rf /`. This must run BEFORE the generic backslash-escape strip below,
@@ -1045,6 +1084,16 @@ _COMMAND_WRAPPER_WORDS = {
     "time",
     "command",
     "builtin",
+    # Transparent launchers: each runs the following program unchanged, so an
+    # interpreter behind one is the same execution the scan exists to see.
+    # su and runuser are deliberately absent -- they take the command as a
+    # string via -c, which is a shell invocation rather than a pass-through.
+    "nice",
+    "stdbuf",
+    "doas",
+    "unshare",
+    "timeout",
+    "chroot",
 }
 _SUDO_OPTIONS_WITH_ARG = {
     "-c", "--close-from",
@@ -1053,6 +1102,128 @@ _SUDO_OPTIONS_WITH_ARG = {
     "-p", "--prompt",
     "-u", "--user",
 }
+
+def unwrap_launcher_argv(argv):
+    """Strip launcher wrappers from a structured argv, returning the real command.
+
+    Mirrors the wrapper handling in _iter_shell_command_word_spans for callers
+    that already hold an argv list (MCP stdio entries) and must not re-join it
+    into a shell string, which would introduce quoting artifacts of its own.
+    """
+    words = [str(word) for word in argv if word is not None]
+    wrapper_name = ""
+    pending_operands = 0
+    skip_next_wrapper_arg = False
+    index = 0
+    for _ in range(12):
+        if index >= len(words):
+            break
+        raw_word = words[index].lower()
+        # basename() only for the wrapper-name test: applying it to an option
+        # would cut `--chdir=/tmp` down to `tmp` and lose the option entirely.
+        lower_word = raw_word if raw_word.startswith("-") else os.path.basename(raw_word)
+        if skip_next_wrapper_arg:
+            skip_next_wrapper_arg = False
+            index += 1
+            continue
+        if wrapper_name and lower_word.startswith("-"):
+            option_name = lower_word.split("=", 1)[0]
+            if option_name in _ENV_SPLIT_STRING_OPTIONS and wrapper_name == "env":
+                # env splits the value itself and executes it, so the real
+                # command lives inside; splice it in rather than skipping it.
+                if "=" in lower_word:
+                    payload = words[index].split("=", 1)[1]
+                    consumed = 1
+                else:
+                    payload = words[index + 1] if index + 1 < len(words) else ""
+                    consumed = 2
+                try:
+                    inner = shlex.split(payload)
+                except ValueError:
+                    inner = payload.split()
+                words = inner + words[index + consumed:]
+                index = 0
+                wrapper_name = ""
+                continue
+            skip_next_wrapper_arg = (
+                "=" not in lower_word
+                and option_name in _WRAPPER_OPTIONS_WITH_ARG[wrapper_name]
+            )
+            index += 1
+            continue
+        if pending_operands:
+            pending_operands -= 1
+            index += 1
+            continue
+        if lower_word in _COMMAND_WRAPPER_WORDS:
+            wrapper_name = lower_word if lower_word in _WRAPPER_OPTIONS_WITH_ARG else ""
+            pending_operands = _WRAPPER_POSITIONAL_OPERANDS.get(lower_word, 0)
+            index += 1
+            continue
+        if _ENV_ASSIGNMENT_RE.fullmatch(words[index]):
+            wrapper_name = ""
+            index += 1
+            continue
+        break
+    return words[index:]
+
+
+# GNU env has its own option grammar. Options with an optional argument
+# (--block-signal, --default-signal, --ignore-signal) are deliberately absent:
+# getopt_long only accepts those as --opt=VALUE, so a bare spelling must not
+# swallow the following word, which is the command itself.
+# Spelled lower-case: the caller compares against a case-folded word. env has
+# no lower-case -c/-s of its own, so folding cannot collide with another option.
+_ENV_OPTIONS_WITH_ARG = frozenset({
+    "-u", "--unset",
+    "-c", "--chdir",
+    "-s", "--split-string",
+    "-a", "--argv0",  # coreutils >= 9.5; spoofs argv[0] of the real command
+})
+# exec -a NAME spoofs argv[0]; /usr/bin/time -f/-o take a format or a file.
+# Both consume the following word, so without them the scan stops on the
+# option's operand and never reaches the interpreter behind the wrapper.
+_EXEC_OPTIONS_WITH_ARG = frozenset({"-a"})
+_TIME_OPTIONS_WITH_ARG = frozenset({"-f", "--format", "-o", "--output"})
+# sudo's own table predates this scan and omits four options that own a
+# value, each of which stops the scan on the operand instead of the command:
+# -D/--chdir, -R/--chroot, -r/--role, -t/--type. (-U/--other-user only works
+# by folding onto --user.) Kept separate so the legacy constant keeps its
+# original meaning for its other callers.
+_SUDO_EXTRA_OPTIONS_WITH_ARG = frozenset({
+    "-d", "--chdir",
+    "-r", "--chroot", "--role",
+    "-t", "--type",
+})
+_NICE_OPTIONS_WITH_ARG = frozenset({"-n", "--adjustment"})
+_STDBUF_OPTIONS_WITH_ARG = frozenset({
+    "-i", "--input", "-o", "--output", "-e", "--error",
+})
+_DOAS_OPTIONS_WITH_ARG = frozenset({"-a", "-c", "-u"})
+_UNSHARE_OPTIONS_WITH_ARG = frozenset({
+    "--setuid", "--setgid", "--root", "-w", "--wd",
+    "--map-user", "--map-group", "--propagation",
+})
+_TIMEOUT_OPTIONS_WITH_ARG = frozenset({"-k", "--kill-after", "-s", "--signal"})
+_CHROOT_OPTIONS_WITH_ARG = frozenset({"--groups", "--userspec"})
+# timeout takes a DURATION and chroot a NEWROOT before the command, so the
+# first non-option word after them is an operand, not the executable.
+_WRAPPER_POSITIONAL_OPERANDS = {"timeout": 1, "chroot": 1}
+_WRAPPER_OPTIONS_WITH_ARG = {
+    "sudo": _SUDO_OPTIONS_WITH_ARG | _SUDO_EXTRA_OPTIONS_WITH_ARG,
+    "env": _ENV_OPTIONS_WITH_ARG,
+    "exec": _EXEC_OPTIONS_WITH_ARG,
+    "time": _TIME_OPTIONS_WITH_ARG,
+    "nice": _NICE_OPTIONS_WITH_ARG,
+    "stdbuf": _STDBUF_OPTIONS_WITH_ARG,
+    "doas": _DOAS_OPTIONS_WITH_ARG,
+    "unshare": _UNSHARE_OPTIONS_WITH_ARG,
+    "timeout": _TIMEOUT_OPTIONS_WITH_ARG,
+    "chroot": _CHROOT_OPTIONS_WITH_ARG,
+}
+# `env -S "python3 -c ..."` is not an option with an operand: env splits the
+# string itself and executes it, so the real command lives inside the value.
+_ENV_SPLIT_STRING_OPTIONS = frozenset({"-s", "--split-string"})
 
 _INTERPRETER_EXEC_FLAGS = {
     "python": {"-c"},
@@ -1322,7 +1493,7 @@ def _interpreter_family(executable: str) -> str | None:
         return "perl"
     if re.fullmatch(r"ruby[0-9.]*(?:\.exe)?", name):
         return "ruby"
-    if re.fullmatch(r"php(?:\.exe)?", name):
+    if re.fullmatch(r"php[0-9]*(?:\.\d+)*(?:\.exe)?", name):
         return "php"
     if re.fullmatch(r"powershell(?:\.exe)?|pwsh(?:\.exe)?", name):
         return "powershell"
@@ -1522,7 +1693,12 @@ def _execution_flag_findings(command: str):
             if family:
                 flag = _interpreter_exec_flag(family, tokens[1:])
                 if flag:
-                    yield ("script execution via -e/-c flag", None)
+                    if any(
+                        _HERMES_POLICY_FILE_RE.search(token) for token in tokens[1:]
+                    ):
+                        yield (_HERMES_POLICY_EXEC_DESCRIPTION, None)
+                    else:
+                        yield ("script execution via -e/-c flag", None)
                     continue
                 if any(token.startswith("<<") for token in tokens[1:]):
                     yield ("script execution via heredoc", None)
@@ -1873,7 +2049,8 @@ def _iter_shell_command_word_spans(command: str):
     for command_start in _iter_shell_command_starts(command):
         pos = command_start
         prefix_words = 0
-        skip_wrapper_options = False
+        wrapper_name = ""
+        pending_operands = 0
         skip_next_wrapper_arg = False
         while prefix_words < 12:
             word_start, word_end, word = _read_shell_word(command, pos)
@@ -1886,11 +2063,11 @@ def _iter_shell_command_word_spans(command: str):
                 pos = word_end
                 prefix_words += 1
                 continue
-            if skip_wrapper_options and lower_word.startswith("-"):
+            if wrapper_name and lower_word.startswith("-"):
                 option_name = lower_word.split("=", 1)[0]
                 skip_next_wrapper_arg = (
                     "=" not in lower_word
-                    and option_name in _SUDO_OPTIONS_WITH_ARG
+                    and option_name in _WRAPPER_OPTIONS_WITH_ARG[wrapper_name]
                 )
                 pos = word_end
                 prefix_words += 1
@@ -1899,12 +2076,18 @@ def _iter_shell_command_word_spans(command: str):
             yield (word_start, word_end, word)
             prefix_words += 1
 
+            if pending_operands:
+                pending_operands -= 1
+                pos = word_end
+                prefix_words += 1
+                continue
             if lower_word in _COMMAND_WRAPPER_WORDS:
-                skip_wrapper_options = lower_word in {"sudo", "env"}
+                wrapper_name = lower_word if lower_word in _WRAPPER_OPTIONS_WITH_ARG else ""
+                pending_operands = _WRAPPER_POSITIONAL_OPERANDS.get(lower_word, 0)
                 pos = word_end
                 continue
             if _ENV_ASSIGNMENT_RE.fullmatch(deobfuscated):
-                skip_wrapper_options = False
+                wrapper_name = ""
                 pos = word_end
                 continue
             break
