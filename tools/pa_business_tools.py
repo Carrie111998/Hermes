@@ -16,9 +16,11 @@ import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 from tools.registry import registry, tool_error, tool_result
 
@@ -1786,6 +1788,142 @@ def _coerce_observed_at_epoch(value: Any) -> Any:
     return int(parsed.timestamp())
 
 
+_SGT = ZoneInfo("Asia/Singapore")
+_MONTH_NUMBERS = {
+    name: month
+    for month, names in enumerate(
+        (
+            (),
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        )
+    )
+    for name in names
+}
+_ENGLISH_DATE_ONLY_RE = re.compile(
+    r"^(?:receipt\s*date\s*:?\s*)?"
+    r"(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+)\s+(?P<year>\d{4})$",
+    re.IGNORECASE,
+)
+_ISO_DATE_ONLY_RE = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})$"
+)
+_SEPARATED_DATE_ONLY_RE = re.compile(
+    r"^(?:receipt\s*date\s*:?\s*)?"
+    r"(?P<day>\d{1,2})[-/](?P<month>[A-Za-z]+|\d{1,2})[-/](?P<year>\d{4})$",
+    re.IGNORECASE,
+)
+_MONTH_FIRST_DATE_ONLY_RE = re.compile(
+    r"^(?:receipt\s*date\s*:?\s*)?"
+    r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})$",
+    re.IGNORECASE,
+)
+
+
+def _date_only_sgt_epoch(value: Any) -> int | None:
+    """Return midnight-SGT epoch for a supported date-only string."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    match = _ISO_DATE_ONLY_RE.fullmatch(text)
+    if match:
+        raw_month = match.group("month")
+    else:
+        match = (
+            _ENGLISH_DATE_ONLY_RE.fullmatch(text)
+            or _SEPARATED_DATE_ONLY_RE.fullmatch(text)
+            or _MONTH_FIRST_DATE_ONLY_RE.fullmatch(text)
+        )
+        if not match:
+            return None
+        raw_month = match.group("month").lower()
+    month = int(raw_month) if raw_month.isdigit() else _MONTH_NUMBERS.get(raw_month)
+    if month is None:
+        return None
+    try:
+        parsed = datetime(
+            int(match.group("year")),
+            month,
+            int(match.group("day")),
+            tzinfo=_SGT,
+        )
+    except ValueError:
+        return None
+    return int(parsed.timestamp())
+
+
+def _case_receipt_source_values(payload: Mapping[str, Any]) -> Iterable[Any]:
+    """Yield explicit receipt sources before considering receivedAt."""
+    for key in ("receiptDate", "receipt_date"):
+        if payload.get(key) not in (None, ""):
+            yield payload[key]
+    evidence = payload.get("evidence")
+    if isinstance(evidence, Mapping):
+        for key in ("receiptDate", "receipt_date", "job_receipt_date"):
+            if evidence.get(key) not in (None, ""):
+                yield evidence[key]
+
+
+def _normalise_case_receipt_epoch(payload: Mapping[str, Any]) -> Any:
+    """Resolve the receipt epoch without model-side timezone arithmetic."""
+    supplied = payload.get("receivedAt")
+    if supplied in (None, ""):
+        supplied = payload.get("received_at")
+    supplied_epoch = _coerce_observed_at_epoch(supplied)
+
+    source_epochs: list[int] = []
+    for source_value in _case_receipt_source_values(payload):
+        normalised = _date_only_sgt_epoch(source_value)
+        if normalised is None:
+            raise ValueError(
+                "receiptDate must be a date only, for example "
+                "'20 July 2026', '20-Jul-2026', '20/07/2026', "
+                "'Jul 20, 2026', or '2026-07-20'"
+            )
+        source_epochs.append(normalised)
+    if len(set(source_epochs)) > 1:
+        raise ValueError(
+            "conflicting receiptDate values were supplied; retry with the "
+            "single exact date from the cited job sheet"
+        )
+    if source_epochs:
+        return source_epochs[0]
+    if isinstance(supplied, str):
+        date_only_epoch = _date_only_sgt_epoch(supplied)
+        if date_only_epoch is not None:
+            return date_only_epoch
+    return supplied_epoch
+
+
+def _prepare_case_create_receipt(payload: Mapping[str, Any]) -> dict[str, Any] | str:
+    """Bind receivedAt and dueAt mechanically on every case-create path."""
+    prepared = dict(payload)
+    try:
+        receipt_timestamp = _normalise_case_receipt_epoch(prepared)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    if not isinstance(receipt_timestamp, int):
+        return tool_error(
+            "tgg_case_create requires receivedAt as the job-sheet receipt epoch "
+            "seconds or receiptDate as a date-only source string."
+        )
+    prepared["receivedAt"] = receipt_timestamp
+    prepared["dueAt"] = receipt_timestamp + 30 * 86400
+    for key in ("received_at", "receiptDate", "receipt_date"):
+        prepared.pop(key, None)
+    return prepared
+
+
 def _handle_tgg_case_update_state(args: Mapping[str, Any], **_kwargs: Any) -> str:
     job_no = str(args.get("job_no") or args.get("jobNo") or "").strip()
     if not job_no:
@@ -1920,6 +2058,10 @@ def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
             "operator instruction."
         )
     payload.pop("confirmNoJobNo", None)
+    prepared = _prepare_case_create_receipt(payload)
+    if isinstance(prepared, str):
+        return prepared
+    payload = prepared
     return _handle_tgg_write("tgg_case_create", payload)
 
 
@@ -1959,6 +2101,10 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
                 if current_refs:
                     payload["evidenceMessageRefs"] = current_refs
                     payload.setdefault("confidence", "high")
+            prepared = _prepare_case_create_receipt(payload)
+            if isinstance(prepared, str):
+                return prepared
+            payload = prepared
         # Recover only declared path params accidentally placed beside the
         # generic payload object; arbitrary top-level args never cross over.
         if configured is not None:
@@ -2546,6 +2692,21 @@ TGG_CASE_CREATE_SCHEMA = {
             "problem": {"type": "string", "description": "Problem or work description."},
             "source": {"type": "string", "description": "Source, e.g. whatsapp."},
             "observedAt": {"type": "string", "description": "Observed time in SGT or ISO format."},
+            "receivedAt": {
+                "type": "integer",
+                "description": (
+                    "Job-sheet receipt timestamp as epoch seconds. Optional "
+                    "when receiptDate carries the exact date-only source."
+                ),
+            },
+            "receiptDate": {
+                "type": "string",
+                "description": (
+                    "Exact receipt date string from the job sheet when it "
+                    "states a date without a time. Hermes normalizes this "
+                    "source to midnight Asia/Singapore and computes dueAt."
+                ),
+            },
             "evidence": {"type": "object", "description": "Evidence used to decide this is new.", "additionalProperties": True},
         },
         "required": ["zone", "address", "problem", "source"],
