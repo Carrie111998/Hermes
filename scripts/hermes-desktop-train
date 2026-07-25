@@ -199,7 +199,10 @@ sync_train() {
   while IFS=$'\t' read -r number sha branch title url; do
     [[ "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || { invalidate_train; die "invalid PR response"; }
     say "▸ merging PR #$number: $title"
-    if ! git --git-dir="$MIRROR" fetch origin "pull/$number/head:refs/train/pr/$number"; then
+    # Leading + force-updates refs/train/pr/* when GitHub force-pushed the PR
+    # head (non-fast-forward). Without +, fetch fails and rebuild dies even
+    # though pull/<n>/head itself may already have been force-updated.
+    if ! git --git-dir="$MIRROR" fetch origin "+pull/$number/head:refs/train/pr/$number"; then
       rm -f "$pr_file"
       invalidate_train
       die "could not fetch PR #$number"
@@ -225,7 +228,7 @@ sync_train() {
     [[ -n "$ref" ]] || continue
     safe_ref="${ref//\//_}"
     say "▸ merging local follow-up: $ref"
-    if ! git --git-dir="$MIRROR" fetch "$SOURCE_REPO" "$ref:refs/train/local/$safe_ref"; then
+    if ! git --git-dir="$MIRROR" fetch "$SOURCE_REPO" "+$ref:refs/train/local/$safe_ref"; then
       invalidate_train
       die "could not fetch local ref: $ref"
     fi
