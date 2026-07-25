@@ -10,8 +10,10 @@ import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
+import yaml
 
 
 @pytest.fixture()
@@ -49,6 +51,8 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             default_assignee="default",
+            default_assignee_dispatcher_profile="default",
+            default_assignee_routing_rule="kanban.default_assignee_boards:default",
         )
     assert res.auto_assigned_default == [task_id]
     assert not res.skipped_unassigned
@@ -70,6 +74,8 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     payload = json.loads(evs[0][1])
     assert payload["assignee"] == "default"
     assert payload["source"] == "kanban.default_assignee"
+    assert payload["dispatcher_profile"] == "default"
+    assert payload["routing_rule"] == "kanban.default_assignee_boards:default"
 
 
 
@@ -92,4 +98,55 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     assert task_id not in res.auto_assigned_default
     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
 
+
+@pytest.mark.parametrize(
+    ("board", "configured_boards", "expected"),
+    [
+        ("default", None, "kanban.default_assignee_boards:default"),
+        ("project-a", None, None),
+        ("default", [], None),
+        ("project-a", ["project-a"], "kanban.default_assignee_boards:project-a"),
+        ("project-a", ["PROJECT-A"], "kanban.default_assignee_boards:project-a"),
+        ("project-a", ["*"], "kanban.default_assignee_boards:*"),
+        ("project-a", "project-a", None),
+        ("none", [None], None),
+        ("123", [123], None),
+        ("project-a", ["../project-a"], None),
+    ],
+)
+def test_default_assignee_board_routing_contract(
+    isolated_kanban_home,
+    board,
+    configured_boards,
+    expected,
+):
+    """Fallback routing is explicit, with a narrow legacy-default migration."""
+    kb, _home = isolated_kanban_home
+    assert kb.default_assignee_routing_rule(board, configured_boards) == expected
+
+
+def test_default_config_preserves_legacy_default_board_only(isolated_kanban_home):
+    """Missing user config keeps #27145 on default without authorizing names."""
+    _kb, home = isolated_kanban_home
+    from hermes_cli.config import load_config
+
+    config_path = Path(home) / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"kanban": {"default_assignee": "default"}}),
+        encoding="utf-8",
+    )
+    assert load_config()["kanban"]["default_assignee_boards"] == ["default"]
+
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "kanban": {
+                    "default_assignee": "default",
+                    "default_assignee_boards": [],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_config()["kanban"]["default_assignee_boards"] == []
 

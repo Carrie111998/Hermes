@@ -391,6 +391,47 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
     return s
 
 
+def default_assignee_routing_rule(
+    board: Optional[str],
+    configured_boards: object | None,
+) -> Optional[str]:
+    """Return the config rule authorizing fallback assignment on ``board``.
+
+    ``kanban.default_assignee`` belongs to the profile hosting the singleton
+    dispatcher, while boards are shared across profiles.  The fallback must
+    therefore be explicitly board-scoped before it may mutate an unassigned
+    card.  A missing setting keeps the original single-board behavior by
+    authorizing only ``default``; an explicit empty list disables fallback
+    assignment everywhere; and ``["*"]`` deliberately restores the historical
+    all-board behavior.
+
+    Invalid values fail closed.  The returned string is suitable for the
+    assignment event audit trail; ``None`` means the fallback is not
+    authorized for this board.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    entries = [DEFAULT_BOARD] if configured_boards is None else configured_boards
+    if not isinstance(entries, (list, tuple, set, frozenset)):
+        return None
+
+    normalized: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        value = entry.strip().lower()
+        if value == "*":
+            return "kanban.default_assignee_boards:*"
+        try:
+            routed_slug = _normalize_board_slug(value)
+        except ValueError:
+            continue
+        if routed_slug:
+            normalized.add(routed_slug)
+    if slug in normalized:
+        return f"kanban.default_assignee_boards:{slug}"
+    return None
+
+
 def kanban_home() -> Path:
     """Return the shared Hermes root that anchors the kanban board.
 
@@ -8066,6 +8107,8 @@ def dispatch_once(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
+    default_assignee_dispatcher_profile: Optional[str] = None,
+    default_assignee_routing_rule: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -8100,6 +8143,8 @@ def dispatch_once(
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
+            default_assignee_dispatcher_profile=default_assignee_dispatcher_profile,
+            default_assignee_routing_rule=default_assignee_routing_rule,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     with _dispatch_tick_lock(db_path) as held:
@@ -8116,6 +8161,8 @@ def dispatch_once(
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
+            default_assignee_dispatcher_profile=default_assignee_dispatcher_profile,
+            default_assignee_routing_rule=default_assignee_routing_rule,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
@@ -8136,6 +8183,8 @@ def _dispatch_once_locked(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
+    default_assignee_dispatcher_profile: Optional[str] = None,
+    default_assignee_routing_rule: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -8293,12 +8342,23 @@ def _dispatch_once_locked(
                                 "AND (assignee IS NULL OR assignee = '')",
                                 (_default_assignee, row["id"]),
                             )
+                            assignment_payload = {
+                                "assignee": _default_assignee,
+                                "source": "kanban.default_assignee",
+                            }
+                            if default_assignee_dispatcher_profile:
+                                assignment_payload["dispatcher_profile"] = (
+                                    default_assignee_dispatcher_profile
+                                )
+                            if default_assignee_routing_rule:
+                                assignment_payload["routing_rule"] = (
+                                    default_assignee_routing_rule
+                                )
                             _append_event(
-                                conn, row["id"], "assigned",
-                                {
-                                    "assignee": _default_assignee,
-                                    "source": "kanban.default_assignee",
-                                },
+                                conn,
+                                row["id"],
+                                "assigned",
+                                assignment_payload,
                             )
                     except Exception:
                         _log.debug(
