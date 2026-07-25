@@ -683,6 +683,34 @@ class TestSendTelegramMediaDelivery:
         bot.send_audio.assert_awaited_once()
         bot.send_voice.assert_not_awaited()
 
+    def test_sends_video_for_webm(self, tmp_path, monkeypatch):
+        """`.webm` must route via send_video, not document (parity with gateway _VIDEO_EXTS)."""
+        video_path = tmp_path / "clip.webm"
+        video_path.write_bytes(b"\x1aE\xdf\xa3" + b"\x00" * 32)  # EBML/WebM header
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock(return_value=SimpleNamespace(message_id=9))
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                "",
+                media_files=[(str(video_path), False)],
+            )
+        )
+
+        assert result["success"] is True
+        assert result["message_id"] == "9"
+        bot.send_video.assert_awaited_once()
+        bot.send_document.assert_not_awaited()
+
     def test_missing_media_returns_error_without_leaking_raw_tag(self, monkeypatch):
         bot = MagicMock()
         bot.send_message = AsyncMock()
