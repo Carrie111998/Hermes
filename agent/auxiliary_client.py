@@ -2697,6 +2697,61 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
     return CodexAuxiliaryClient(real_client, model), model
 
 
+def _build_minimax_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Build an AnthropicAuxiliaryClient for a MiniMax OAuth-authenticated session.
+
+    MiniMax's inference endpoint at https://api.minimax.io/anthropic speaks
+    the Anthropic Messages API. We resolve the bearer token via the
+    MiniMax-specific credential resolver (``resolve_minimax_oauth_runtime_credentials``)
+    and wrap the underlying Anthropic client so ``chat.completions.create()``
+    calls are translated into ``messages.stream()`` calls — matching the
+    AnthropicAuxiliaryClient pattern used for ``anthropic``/``minimax``/``minimax-cn``.
+
+    Added so the fallback chain can route xai-oauth → minimax-oauth when the
+    primary provider runs out of credits; without this branch the chain
+    aborts with "provider not configured". See patch context: the upstream
+    ``resolve_provider_client`` only special-cases ``nous`` / ``openai-codex`` /
+    ``xai-oauth`` under ``oauth_device_code``/``oauth_external`` and silently
+    rejects the newer ``oauth_minimax`` auth type — this builder closes the
+    gap until upstream is updated.
+
+    Returns ``(None, None)`` when no MiniMax OAuth token is available.
+    """
+    if not model:
+        logger.warning(
+            "Auxiliary client: minimax-oauth requested without a model; "
+            "pass model explicitly (auxiliary.<task>.model in config.yaml)."
+        )
+        return None, None
+    try:
+        from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+        rt = resolve_minimax_oauth_runtime_credentials()
+    except Exception as exc:  # noqa: BLE001 — surfaced as (None, None) so fallback can advance
+        logger.warning(
+            "Auxiliary client: minimax-oauth credential resolution failed (%s)", exc,
+        )
+        return None, None
+    api_key = (rt.get("api_key") or "").strip() if isinstance(rt, dict) else ""
+    base_url = (rt.get("base_url") or "").strip() if isinstance(rt, dict) else ""
+    if not api_key or not base_url:
+        logger.warning(
+            "Auxiliary client: minimax-oauth missing api_key or base_url in resolved runtime"
+        )
+        return None, None
+    try:
+        from agent.anthropic_adapter import build_anthropic_client
+        real_client = build_anthropic_client(api_key, base_url)
+    except Exception as exc:  # noqa: BLE001 — surfaced as (None, None) so fallback can advance
+        logger.warning(
+            "Auxiliary client: minimax-oauth Anthropic client build failed (%s)", exc,
+        )
+        return None, None
+    if real_client is None:
+        return None, None
+    logger.debug("Auxiliary client: MiniMax OAuth (%s via Anthropic Messages API)", model)
+    return AnthropicAuxiliaryClient(real_client, model, api_key, base_url, is_oauth=True), model
+
+
 def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an explicitly-requested model.
 
@@ -5012,6 +5067,26 @@ def resolve_provider_client(
             logger.warning(
                 "resolve_provider_client: xai-oauth requested but no xAI "
                 "OAuth token found (run: hermes model -> xAI Grok OAuth — SuperGrok / Premium+)"
+            )
+            return None, None
+        final_model = _normalize_resolved_model(model or default, provider)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
+    # MiniMax OAuth (Coding Plan, minimax.io). Uses the Anthropic Messages
+    # protocol; the agent_init.py primary path already builds a dedicated
+    # Anthropic client for it, but the auxiliary fallback chain (used when
+    # the primary provider fails mid-session) routes through here. Without
+    # this branch the fallback aborts with "Fallback to minimax-oauth
+    # failed: provider not configured" because the upstream oauth switch
+    # below only special-cases nous/openai-codex/xai-oauth under the older
+    # oauth_device_code / oauth_external types.
+    if provider == "minimax-oauth":
+        client, default = _build_minimax_oauth_aux_client(model)
+        if client is None:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth requested but no "
+                "MiniMax OAuth token found (run: hermes model -> MiniMax (OAuth))."
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
