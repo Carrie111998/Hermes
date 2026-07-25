@@ -439,6 +439,45 @@ class TestExplicitFallbackTransport:
         assert resolve_client.call_args.kwargs["api_mode"] == "chat_completions"
         assert agent.api_mode == "chat_completions"
 
+    def test_sequential_distinct_transports_with_same_backend_are_activated(self):
+        """A later transport for the same endpoint remains a distinct fallback."""
+        fbs = [
+            {
+                "provider": "custom-relay",
+                "model": "relay-model",
+                "base_url": "https://relay.example/v1",
+                "api_mode": "codex_responses",
+            },
+            {
+                "provider": "custom-relay",
+                "model": "relay-model",
+                "base_url": "https://relay.example/v1",
+                "api_mode": "chat_completions",
+            },
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "custom-relay"
+        agent.model = "relay-model"
+        agent.base_url = "https://relay.example/v1"
+        agent.api_mode = "chat_completions"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://relay.example/v1"), "relay-model"),
+        ) as resolve_client, patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, provider: model,
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.api_mode == "codex_responses"
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "chat_completions"
+        assert [call.kwargs["api_mode"] for call in resolve_client.call_args_list] == [
+            "codex_responses",
+            "chat_completions",
+        ]
+
     def test_invalid_explicit_transport_is_skipped(self):
         fbs = [{
             "provider": "custom-relay",
