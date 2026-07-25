@@ -27,4 +27,9 @@ def test_hermes_launcher_wrapper_clears_python_env_before_exec() -> None:
     assert 'cat > "$command_link_dir/hermes" <<EOF' in text
     assert 'unset PYTHONPATH' in text
     assert 'unset PYTHONHOME' in text
-    assert 'exec "$HERMES_BIN" "\\$@"' in text
+    # For venv installs, the shim bypasses the uv-generated entrypoint (which
+    # depends on realpath, absent on stock macOS) and launches through the
+    # venv interpreter directly. (#71320)
+    assert 'exec "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/hermes"' in text
+    # Non-venv installs still exec the hermes binary directly.
+    assert 'exec "$HERMES_BIN"' in text
