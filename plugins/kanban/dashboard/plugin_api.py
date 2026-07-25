@@ -395,8 +395,16 @@ def get_board(
     ``board`` selects which board to read from. Omitting it falls
     through to the active board (``HERMES_KANBAN_BOARD`` env → on-disk
     ``current`` pointer → ``default``).
+
+    The resolved slug is echoed back as ``board`` so the caller can tell
+    which board these columns actually came from. Without it the payload
+    is board-anonymous and a response that arrives after the user has
+    switched boards is indistinguishable from a fresh one — the grid then
+    renders one board's cards under another board's label. ``/boards``
+    already publishes the active slug as ``current``; this mirrors that
+    contract for the endpoint that returns the cards themselves.
     """
-    board = _resolve_board(board)
+    board = _resolve_board(board) or kanban_db.get_current_board()
     conn = _conn(board=board)
     try:
         tasks = kanban_db.list_tasks(
@@ -498,6 +506,7 @@ def get_board(
         ]
 
         return {
+            "board": board,
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
             ],

@@ -2545,3 +2545,69 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+def test_board_response_echoes_the_board_it_read(client):
+    """``GET /board`` must identify which board its columns came from.
+
+    Without it the payload is board-anonymous: a response that resolves after
+    the user has switched boards is indistinguishable from a fresh one, so the
+    grid renders one board's cards under another board's label while the
+    replacement fetch is still in flight. ``/boards`` already publishes the
+    active slug as ``current``; this is the same contract for the endpoint that
+    returns the cards.
+    """
+    kb.create_board("other")
+
+    # Explicit slug is echoed verbatim.
+    for slug in ("default", "other"):
+        data = client.get(f"/api/plugins/kanban/board?board={slug}").json()
+        assert data["board"] == slug, slug
+
+    # Omitted param resolves concretely rather than reporting None, so the
+    # client can still compare it against its own selection.
+    kb.set_current_board("other")
+    assert client.get("/api/plugins/kanban/board").json()["board"] == "other"
+    kb.set_current_board("default")
+    assert client.get("/api/plugins/kanban/board").json()["board"] == "default"
+
+
+def test_board_echo_matches_the_cards_actually_returned(client):
+    """The echoed slug must agree with the payload, not just the request."""
+    default_task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "default-only"},
+    ).json()["task"]
+
+    kb.create_board("other")
+    other_conn = kb.connect(board="other")
+    try:
+        other_task = kb.create_task(other_conn, title="other-only")
+    finally:
+        other_conn.close()
+
+    for slug, expected_id in (("default", default_task["id"]),
+                              ("other", getattr(other_task, "id", other_task))):
+        data = client.get(f"/api/plugins/kanban/board?board={slug}").json()
+        ids = {t["id"] for c in data["columns"] for t in c["tasks"]}
+        assert data["board"] == slug
+        assert ids == {expected_id}, (slug, ids)
+
+
+def test_client_drops_board_responses_for_a_stale_selection():
+    """The grid must never accept a /board response for a board that is no
+    longer selected, and the deleted-board reset must clear the grid like
+    switchBoard() does."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+    # request-scoped capture + both guards
+    assert "const requestedBoard = board;" in bundle
+    assert "if (requestedBoard !== boardRef.current) return;" in bundle
+    assert "data.board !== requestedBoard) return;" in bundle
+    # the ref the guard reads must exist and track `board`
+    assert "const boardRef = useRef(board);" in bundle
+    assert "boardRef.current = board;" in bundle
+    # the reset branch must clear the grid rather than leave stale cards
+    reset = bundle.split('writeSelectedBoard("default");')[1][:400]
+    assert "setBoardData(null);" in reset

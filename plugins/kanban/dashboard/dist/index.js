@@ -545,6 +545,11 @@
     const [taskEventTick, setTaskEventTick] = useState({});
 
     const cursorRef = useRef(0);
+    // Mirrors the `board` state so an in-flight /board response can be checked
+    // against the CURRENT selection at the moment it resolves, not against the
+    // selection captured when the closure was created.
+    const boardRef = useRef(board);
+    useEffect(function () { boardRef.current = board; }, [board]);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
@@ -571,8 +576,19 @@
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
+      // Capture the selection this request was issued for. The response can
+      // land after the user has switched boards (nothing aborts it), and the
+      // payload used to be board-anonymous, so a slow response for the PREVIOUS
+      // board would overwrite the new board's grid and leave one board's cards
+      // rendered under another board's label. The server now echoes the slug it
+      // actually read, so drop anything that no longer matches.
+      const requestedBoard = board;
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
+          if (requestedBoard !== boardRef.current) return;
+          // Only meaningful once a board is explicitly selected; before that
+          // `requestedBoard` is null and the server resolves the active board.
+          if (requestedBoard && data && data.board && data.board !== requestedBoard) return;
           setBoardData(data);
           cursorRef.current = data.latest_event_id || 0;
           setError(null);
@@ -600,6 +616,11 @@
           if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
             setBoard("default");
             writeSelectedBoard("default");
+            // Same contract switchBoard() honours: never leave the previous
+            // board's cards on screen under the new board's label while the
+            // replacement fetch is still in flight.
+            setBoardData(null);
+            setLoading(true);
           }
         })
         .catch(function () { /* non-fatal */ });
