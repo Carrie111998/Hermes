@@ -194,6 +194,53 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
         return backend
 
 
+def release_computer_use_session(session_id: str) -> bool:
+    """Release one session-owned computer-use backend.
+
+    This is the production lifecycle seam for hosts and policy plugins. It
+    removes the exact session backend and its call lock before stopping the
+    backend, so new lookups cannot retain the stale target/ref namespace.
+    Approval state is cleared even when no backend was started.
+
+    Returns ``True`` when a backend was found and released, ``False`` when the
+    session was already absent. Safe to call repeatedly.
+    """
+    global _backend
+    sid = str(session_id or "")
+    with _backend_lock:
+        backend = _backends.pop(sid, None)
+        call_lock = _backend_call_locks.pop(sid, None)
+        # Preserve the backward-compatible empty-session injection hook:
+        # older callers/tests may populate only `_backend`.
+        if sid == "" and backend is None:
+            backend = _backend
+        if sid == "" and _backend is backend:
+            _backend = None
+
+    with _approval_lock:
+        _session_auto_approve.pop(sid, None)
+        _always_allow.pop(sid, None)
+
+    if backend is None:
+        return False
+    try:
+        # Let an in-flight action finish before ending the driver session and
+        # dropping its target/ref state. Do not hold the global cache lock
+        # while waiting: unrelated Hermes sessions remain independent.
+        if call_lock is not None:
+            with call_lock:
+                backend.stop()
+        else:
+            backend.stop()
+    except Exception:
+        logger.debug(
+            "computer_use backend release failed for session %s",
+            sid,
+            exc_info=True,
+        )
+    return True
+
+
 def reset_backend_for_tests() -> None:  # pragma: no cover
     """Test helper — tear down the cached backend and per-session state."""
     global _backend
@@ -201,14 +248,14 @@ def reset_backend_for_tests() -> None:  # pragma: no cover
         unique = {id(item): item for item in _backends.values()}
         if _backend is not None:
             unique[id(_backend)] = _backend
-        for backend in unique.values():
-            try:
-                backend.stop()
-            except Exception:
-                pass
         _backend = None
         _backends.clear()
         _backend_call_locks.clear()
+    for backend in unique.values():
+        try:
+            backend.stop()
+        except Exception:
+            pass
     _AUX_VISION_ROUTE_CACHE.clear()
     with _approval_lock:
         _session_auto_approve.clear()

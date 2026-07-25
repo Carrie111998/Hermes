@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -243,6 +243,79 @@ def test_backends_are_isolated_by_hermes_session_and_reused_within_it():
     assert first is first_again
     assert first is not second
     assert created == [first, second]
+
+
+def test_release_seam_stops_exact_backend_and_clears_session_state():
+    from tools.computer_use import tool as computer_use
+
+    first = MagicMock()
+    second = MagicMock()
+    computer_use._backends.update({
+        "conversation-a": first,
+        "conversation-b": second,
+    })
+    computer_use._backend_call_locks.update({
+        "conversation-a": computer_use.threading.RLock(),
+        "conversation-b": computer_use.threading.RLock(),
+    })
+    computer_use._session_auto_approve["conversation-a"] = True
+    computer_use._always_allow["conversation-a"] = {
+        ("click", "background"),
+    }
+
+    assert computer_use.release_computer_use_session("conversation-a") is True
+    assert computer_use.release_computer_use_session("conversation-a") is False
+
+    first.stop.assert_called_once_with()
+    second.stop.assert_not_called()
+    assert "conversation-a" not in computer_use._backends
+    assert "conversation-a" not in computer_use._backend_call_locks
+    assert "conversation-a" not in computer_use._session_auto_approve
+    assert "conversation-a" not in computer_use._always_allow
+    assert computer_use._backends["conversation-b"] is second
+
+
+def test_release_seam_evicts_state_even_when_backend_stop_fails():
+    from tools.computer_use import tool as computer_use
+
+    backend = MagicMock()
+    backend.stop.side_effect = RuntimeError("driver teardown failed")
+    computer_use._backends["failed-run"] = backend
+    computer_use._backend_call_locks["failed-run"] = computer_use.threading.RLock()
+    computer_use._session_auto_approve["failed-run"] = True
+
+    assert computer_use.release_computer_use_session("failed-run") is True
+    assert "failed-run" not in computer_use._backends
+    assert "failed-run" not in computer_use._backend_call_locks
+    assert "failed-run" not in computer_use._session_auto_approve
+
+
+def test_release_seam_waits_for_in_flight_action_before_stopping_backend():
+    from tools.computer_use import tool as computer_use
+
+    backend = MagicMock()
+    call_lock = computer_use.threading.RLock()
+    computer_use._backends["cancelled-run"] = backend
+    computer_use._backend_call_locks["cancelled-run"] = call_lock
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        call_lock.acquire()
+        try:
+            released = pool.submit(
+                computer_use.release_computer_use_session,
+                "cancelled-run",
+            )
+            with pytest.raises(FutureTimeoutError):
+                released.result(timeout=0.05)
+            backend.stop.assert_not_called()
+        finally:
+            call_lock.release()
+
+        assert released.result(timeout=1) is True
+    finally:
+        pool.shutdown(wait=True)
+    backend.stop.assert_called_once_with()
 
 
 def test_concurrent_hermes_sessions_do_not_share_backend_state():
