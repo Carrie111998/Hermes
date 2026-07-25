@@ -7,8 +7,8 @@ on whatever branch was there, letting sibling workers run concurrently in
 one directory on one branch (cross-task provenance corruption, no lock).
 
 Two-part fix under test:
-- ``decompose_triage_task`` leaves worktree children's ``workspace_path``
-  unset so each child materializes its own ``<repo>/.worktrees/<child-id>``.
+- ``decompose_triage_task`` persists a distinct task-specific
+  ``<repo>/.worktrees/<child-id>`` target for every inherited worktree child.
 - ``_resolve_worktree_workspace`` falls back to a fresh per-task worktree
   when the requested path is occupied by another task's branch (heals
   pre-existing rows that still carry a shared path).
@@ -17,6 +17,7 @@ Two-part fix under test:
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -66,13 +67,16 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
-def test_decompose_worktree_children_get_own_workspace(kanban_home):
+def test_decompose_worktree_children_get_own_workspace(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    root_path = repo / ".worktrees" / "root"
+    kb.write_board_metadata("default", default_workdir=str(repo))
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', "
-            "workspace_path='/repo/.worktrees/root' WHERE id = ?",
-            (root,),
+            "workspace_path=? WHERE id = ?",
+            (str(root_path), root),
         )
         conn.commit()
 
@@ -94,9 +98,156 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
                 (cid,),
             ).fetchone()
             assert row["workspace_kind"] == "worktree"
-            # Each child resolves its own <repo>/.worktrees/<child-id> at
-            # dispatch; the root's literal path must never be shared.
-            assert row["workspace_path"] is None
+            # Each child has its own concrete target; the root's literal path
+            # must never be shared even before dispatch resolves it.
+            assert row["workspace_path"] == str(repo / ".worktrees" / cid)
+
+
+def test_decompose_external_linked_root_never_shares_sibling_checkout(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    external_root = _add_worktree(repo, tmp_path / "external-root", "wt/root")
+
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn,
+            title="external linked root",
+            workspace_kind="worktree",
+            workspace_path=str(external_root),
+            triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": "one"}, {"title": "two"}],
+            author="decomposer",
+        )
+        assert child_ids is not None and len(child_ids) == 2
+        children = [kb.get_task(conn, child_id) for child_id in child_ids]
+
+    stored = []
+    resolved = []
+    for child in children:
+        assert child is not None
+        assert child.workspace_path is not None
+        stored.append(Path(child.workspace_path))
+        resolved.append(kb.resolve_workspace(child))
+    assert stored[0] != stored[1]
+    assert external_root.resolve() not in {path.resolve() for path in stored}
+    assert resolved[0] != resolved[1]
+    assert external_root.resolve() not in {path.resolve() for path in resolved}
+
+
+def test_decompose_linked_root_from_bare_repo_uses_bare_anchor(
+    kanban_home, tmp_path
+):
+    source = _make_repo(tmp_path)
+    bare = tmp_path / "repo.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(source), str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    external_root = _add_worktree(bare, tmp_path / "bare-root", "wt/bare-root")
+
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn,
+            title="bare common-dir root",
+            workspace_kind="worktree",
+            workspace_path=str(external_root),
+            triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": "one"}, {"title": "two"}],
+            author="decomposer",
+        )
+        assert child_ids is not None and len(child_ids) == 2
+        children = [kb.get_task(conn, child_id) for child_id in child_ids]
+
+    resolved = []
+    for child_id, child in zip(child_ids, children):
+        assert child is not None
+        assert child.workspace_path == str(bare / ".worktrees" / child_id)
+        resolved.append(kb.resolve_workspace(child))
+    assert resolved[0] != resolved[1]
+    assert external_root.resolve() not in {path.resolve() for path in resolved}
+
+
+def test_decompose_git_validation_does_not_hold_board_write_lock(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn,
+            title="slow validation",
+            workspace_kind="worktree",
+            triage=True,
+        )
+
+    validator_entered = threading.Event()
+    release_validator = threading.Event()
+    writer_done = threading.Event()
+    errors: list[BaseException] = []
+    original = kb._repo_root_for_worktree_target
+
+    def slow_validator(path):
+        if not validator_entered.is_set():
+            validator_entered.set()
+            if not release_validator.wait(timeout=5):
+                raise TimeoutError("test did not release Git validator")
+        return original(path)
+
+    monkeypatch.setattr(kb, "_repo_root_for_worktree_target", slow_validator)
+
+    def decompose():
+        try:
+            with kb.connect() as conn:
+                kb.decompose_triage_task(
+                    conn,
+                    root,
+                    root_assignee="orchestrator",
+                    children=[{"title": "child"}],
+                    author="decomposer",
+                )
+        except BaseException as exc:  # surfaced on the main test thread below
+            errors.append(exc)
+
+    def write_unrelated_root_field():
+        try:
+            with kb.connect() as conn:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET title = ? WHERE id = ?",
+                        ("writer was not blocked", root),
+                    )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    decomposer = threading.Thread(target=decompose, daemon=True)
+    writer = threading.Thread(target=write_unrelated_root_field, daemon=True)
+    decomposer.start()
+    assert validator_entered.wait(timeout=5)
+    writer.start()
+    try:
+        assert writer_done.wait(timeout=2), "Git validation held BEGIN IMMEDIATE"
+    finally:
+        release_validator.set()
+    writer.join(timeout=5)
+    decomposer.join(timeout=10)
+    assert not writer.is_alive()
+    assert not decomposer.is_alive()
+    assert errors == []
 
 
 def test_decompose_dir_children_still_inherit_path(kanban_home):

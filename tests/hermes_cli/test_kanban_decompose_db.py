@@ -5,6 +5,7 @@ from the triage column. LLM-free by design.
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -206,6 +207,163 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
     assert t.workspace_path is None
 
 
+def test_decompose_falls_back_to_scratch_when_worktree_has_no_anchor(kanban_home):
+    """An unanchored worktree root must not fan out unspawnable children."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="unanchored worktree root",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=None,
+            triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "part A"}, {"title": "part B", "parents": [0]}],
+            author="decomposer",
+        )
+
+    assert child_ids and len(child_ids) == 2
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        children = [kb.get_task(conn, child_id) for child_id in child_ids]
+
+    assert root is not None
+    assert all(child is not None for child in children)
+    assert root.workspace_kind == "scratch"
+    assert root.workspace_path is None
+    assert all(child is not None and child.workspace_kind == "scratch" for child in children)
+    assert all(child is not None and child.workspace_path is None for child in children)
+
+
+def test_decompose_falls_back_to_scratch_for_unanchored_child_override(kanban_home):
+    """A child worktree override is validated independently of its root."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="scratch root",
+            assignee="worker",
+            workspace_kind="scratch",
+            triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "worktree child", "workspace_kind": "worktree"}],
+            author="decomposer",
+        )
+
+    assert child_ids and len(child_ids) == 1
+    with kb.connect() as conn:
+        child = kb.get_task(conn, child_ids[0])
+    assert child is not None
+    assert child.workspace_kind == "scratch"
+    assert child.workspace_path is None
+
+
+def test_decompose_falls_back_to_scratch_for_invalid_child_worktree_path(
+    kanban_home, tmp_path
+):
+    """A non-repository child path must not survive as a worktree workspace."""
+    invalid_anchor = tmp_path / "not-a-repository"
+    invalid_anchor.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="root", workspace_kind="scratch", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "invalid worktree child",
+                    "workspace_kind": "worktree",
+                    "workspace_path": str(invalid_anchor),
+                }
+            ],
+            author="decomposer",
+        )
+
+    assert child_ids and len(child_ids) == 1
+    with kb.connect() as conn:
+        child = kb.get_task(conn, child_ids[0])
+    assert child is not None
+    assert child.workspace_kind == "scratch"
+    assert child.workspace_path is None
+
+
+def test_decompose_falls_back_for_relative_child_worktree_path(kanban_home):
+    """Relative paths must not resolve against the dispatcher's incidental CWD."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="root", workspace_kind="scratch", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "relative override",
+                    "workspace_kind": "worktree",
+                    "workspace_path": "relative-worktree",
+                }
+            ],
+            author="decomposer",
+        )
+
+    assert child_ids and len(child_ids) == 1
+    with kb.connect() as conn:
+        child = kb.get_task(conn, child_ids[0])
+    assert child is not None
+    assert child.workspace_kind == "scratch"
+    assert child.workspace_path is None
+
+
+def test_decompose_preserves_worktrees_with_resolvable_board_default(
+    kanban_home, tmp_path
+):
+    """A real board default keeps root and child worktrees independently resolvable."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+    )
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+
+    kb.create_board("anchored-worktrees", default_workdir=str(repo))
+    with kb.connect(board="anchored-worktrees") as conn:
+        tid = kb.create_task(conn, title="root", workspace_kind="worktree", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "child"}],
+            author="decomposer",
+        )
+        assert child_ids and len(child_ids) == 1
+        root = kb.get_task(conn, tid)
+        child = kb.get_task(conn, child_ids[0])
+
+    assert root is not None
+    assert child is not None
+    assert root.workspace_kind == "worktree"
+    assert child.workspace_kind == "worktree"
+    root_workspace = kb.resolve_workspace(root, board="anchored-worktrees")
+    child_workspace = kb.resolve_workspace(child, board="anchored-worktrees")
+    assert root_workspace.is_dir()
+    assert child_workspace.is_dir()
+    assert root_workspace != child_workspace
+
+
 def test_decompose_per_child_workspace_override(kanban_home):
     """An explicit per-child workspace beats inheritance."""
     proj = "/home/teknium/myproject"
@@ -228,3 +386,12 @@ def test_decompose_per_child_workspace_override(kanban_home):
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+def test_task_runs_has_task_sequence_index_for_bounded_streak_queries(kanban_home):
+    with kb.connect() as conn:
+        columns = [
+            row[2]
+            for row in conn.execute("PRAGMA index_info(idx_runs_task_sequence)")
+        ]
+    assert columns == ["task_id", "id"]

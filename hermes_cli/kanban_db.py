@@ -1315,6 +1315,7 @@ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_task_sequence    ON task_runs(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
@@ -5821,6 +5822,147 @@ def specify_triage_task(
     return True
 
 
+def _board_default_workdir_for_connection(
+    conn: sqlite3.Connection,
+) -> Optional[str]:
+    """Return the connected board's configured worktree anchor, if any.
+
+    The caller may have opened a board explicitly instead of through the
+    process-wide current-board context, so derive the slug from SQLite's
+    actual main-database path rather than from environment/current metadata.
+    Unknown/custom database paths deliberately have no implicit anchor.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main_row = next((row for row in rows if row[1] == "main"), None)
+        if main_row is None or not main_row[2]:
+            return None
+        db_path = Path(main_row[2]).resolve(strict=False)
+        default_db = (kanban_home() / "kanban.db").resolve(strict=False)
+        if db_path == default_db:
+            board = DEFAULT_BOARD
+        elif (
+            db_path.name == "kanban.db"
+            and db_path.parent.parent.resolve(strict=False)
+            == boards_root().resolve(strict=False)
+        ):
+            board = db_path.parent.name
+        else:
+            return None
+        raw = read_board_metadata(board).get("default_workdir")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        return raw.strip()
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def _planned_worktree_path(anchor: Path, task_id: str) -> str:
+    """Return a task-specific target beneath a validated repository anchor."""
+    return str((anchor / ".worktrees" / task_id).resolve(strict=False))
+
+
+def _plan_decomposition_workspaces(
+    conn: sqlite3.Connection,
+    root_row: sqlite3.Row,
+    children: list[dict],
+    child_ids: list[str],
+) -> tuple[str, Optional[str], list[tuple[str, Optional[str]]]]:
+    """Validate and normalize root/child workspaces without holding a DB write lock.
+
+    Git discovery can touch a slow filesystem or wait up to the subprocess
+    timeout.  Keep it outside ``write_txn`` and return a complete immutable plan;
+    the caller compares the root workspace fields again after acquiring the
+    write lock before applying the plan atomically.
+    """
+    root_ws_kind = root_row["workspace_kind"] or "scratch"
+    root_ws_path = root_row["workspace_path"]
+    board_default_workdir = _board_default_workdir_for_connection(conn)
+    board_worktree_anchor: Optional[Path] = None
+    if board_default_workdir:
+        board_default_path = Path(board_default_workdir).expanduser()
+        # Mirror _resolve_worktree_workspace exactly: a board default must be
+        # an absolute existing path inside a Git repository. Treating a missing
+        # path's nearest parent as sufficient would only defer the same failure
+        # until dispatch.
+        if board_default_path.is_absolute() and board_default_path.exists():
+            board_worktree_anchor = _repo_root_for_worktree_target(
+                board_default_path
+            )
+
+    root_worktree_anchor: Optional[Path] = None
+    if root_ws_kind == "worktree":
+        if root_ws_path:
+            root_path = Path(root_ws_path).expanduser()
+            if root_path.is_absolute():
+                root_worktree_anchor = _repo_root_for_worktree_target(root_path)
+        else:
+            root_worktree_anchor = board_worktree_anchor
+        if root_worktree_anchor is None:
+            root_ws_kind = "scratch"
+            root_ws_path = None
+        elif not root_ws_path:
+            # Persist a concrete task-specific target.  The card remains
+            # spawnable even if board metadata changes after decomposition.
+            root_ws_path = _planned_worktree_path(
+                root_worktree_anchor, str(root_row["id"])
+            )
+
+    planned_children: list[tuple[str, Optional[str]]] = []
+    used_concrete_targets: set[Path] = set()
+    for child, child_id in zip(children, child_ids):
+        child_ws_kind = child.get("workspace_kind") or root_ws_kind
+        requested_child_path = child.get("workspace_path")
+        child_ws_path: Optional[str]
+        if child_ws_kind == "worktree":
+            if requested_child_path:
+                requested_path = Path(requested_child_path).expanduser()
+                child_worktree_anchor = (
+                    _repo_root_for_worktree_target(requested_path)
+                    if requested_path.is_absolute()
+                    else None
+                )
+                if child_worktree_anchor is None:
+                    child_ws_kind = "scratch"
+                    child_ws_path = None
+                else:
+                    requested_resolved = requested_path.resolve(strict=False)
+                    anchor_resolved = child_worktree_anchor.resolve(strict=False)
+                    if (
+                        requested_resolved == anchor_resolved
+                        or requested_resolved in used_concrete_targets
+                    ):
+                        # A repository root is an anchor, not a checkout to
+                        # share. Duplicate concrete targets are also split into
+                        # task-specific worktrees.
+                        child_ws_path = _planned_worktree_path(
+                            child_worktree_anchor, child_id
+                        )
+                    else:
+                        child_ws_path = requested_child_path
+                        used_concrete_targets.add(requested_resolved)
+            else:
+                child_worktree_anchor = (
+                    board_worktree_anchor or root_worktree_anchor
+                )
+                if child_worktree_anchor is None:
+                    child_ws_kind = "scratch"
+                    child_ws_path = None
+                else:
+                    child_ws_path = _planned_worktree_path(
+                        child_worktree_anchor, child_id
+                    )
+        elif requested_child_path:
+            child_ws_path = requested_child_path
+        elif child_ws_kind == root_ws_kind:
+            child_ws_path = root_ws_path
+        else:
+            child_ws_path = None
+        planned_children.append((child_ws_kind, child_ws_path))
+
+    return root_ws_kind, root_ws_path, planned_children
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5911,55 +6053,55 @@ def decompose_triage_task(
     # write_txn pitfalls. Instead we inline the INSERTs and
     # _append_event calls.
     now = int(time.time())
-    child_ids: list[str] = []
+    child_ids = [_new_task_id() for _ in children]
+    root_snapshot = conn.execute(
+        "SELECT id, status, tenant, workspace_kind, workspace_path "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if root_snapshot is None or root_snapshot["status"] != "triage":
+        return None
+    planned_root_kind, planned_root_path, planned_children = (
+        _plan_decomposition_workspaces(
+            conn, root_snapshot, children, child_ids
+        )
+    )
+    snapshot_workspace = (
+        root_snapshot["workspace_kind"],
+        root_snapshot["workspace_path"],
+    )
+
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if root_row is None:
+        if root_row is None or root_row["status"] != "triage":
             return None
-        if root_row["status"] != "triage":
-            return None
+        if (root_row["workspace_kind"], root_row["workspace_path"]) != snapshot_workspace:
+            raise RuntimeError(
+                f"task {task_id} workspace changed while decomposition was validating; retry"
+            )
         tenant = root_row["tenant"]
-        # Children inherit the root's workspace by default so a fan-out
-        # of a code-gen task lands in the parent's project dir/worktree
-        # rather than throwaway scratch tmp dirs. A child dict can still
-        # override with its own 'workspace_kind' / 'workspace_path'.
-        root_ws_kind = root_row["workspace_kind"] or "scratch"
-        root_ws_path = root_row["workspace_path"]
+        root_ws_kind = planned_root_kind
+        root_ws_path = planned_root_path
+        if (root_ws_kind, root_ws_path) != snapshot_workspace:
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
+                (root_ws_kind, root_ws_path, task_id),
+            )
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
         # promotes parent-free children to 'ready'.
         for idx, child in enumerate(children):
-            new_id = _new_task_id()
+            new_id = child_ids[idx]
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
-            # Per-child override wins; otherwise inherit the root's
-            # workspace. A child that sets workspace_kind without a path
-            # falls back to the root path only when kinds match (so a
-            # child can't accidentally point a 'dir' at the root's
-            # worktree path or vice versa).
-            child_ws_kind = child.get("workspace_kind") or root_ws_kind
-            if child.get("workspace_path"):
-                child_ws_path = child.get("workspace_path")
-            elif child_ws_kind == "worktree":
-                # Never share one worktree checkout between siblings: the
-                # root's literal path would put every child in the same
-                # directory on the first-dispatched sibling's branch, with
-                # no lock — siblings can be promoted and dispatched
-                # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
-                child_ws_path = None
-            elif child_ws_kind == root_ws_kind:
-                child_ws_path = root_ws_path
-            else:
-                child_ws_path = None
+            child_ws_kind, child_ws_path = planned_children[idx]
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
@@ -5981,7 +6123,6 @@ def decompose_triage_task(
                 conn, new_id, "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
-            child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
         for idx, child in enumerate(children):
@@ -6239,12 +6380,71 @@ def _nearest_existing_path(path: Path) -> Path:
     return current
 
 
+def _git_is_bare(path: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-bare-repository"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and (result.stdout or "").strip() == "true"
+
+
+def _canonical_worktree_anchor(repo_root: Path) -> Path:
+    """Map a linked checkout to its primary checkout or bare common repository."""
+    git_dir = _git_dir(repo_root)
+    common_dir = _git_common_dir(repo_root)
+    if git_dir is None or common_dir is None or git_dir == common_dir:
+        return repo_root
+
+    # Conventional non-bare repository: <primary>/.git is the common dir.
+    if common_dir.name == ".git":
+        primary = common_dir.parent.resolve(strict=False)
+        if _git_toplevel(primary) == primary:
+            return primary
+
+    # Worktrees can also hang off a bare repository (the canonical deployment
+    # layout does this). ``git -C <bare> worktree add`` is a valid anchor.
+    if _git_is_bare(common_dir):
+        return common_dir.resolve(strict=False)
+
+    # Separate-git-dir layouts do not have a predictable parent relation.
+    # Find the primary checkout whose git-dir equals the common dir.
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain", "-z"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return repo_root
+    if result.returncode == 0:
+        for record in (result.stdout or b"").split(b"\0\0"):
+            fields = record.split(b"\0")
+            first = fields[0] if fields else b""
+            if not first.startswith(b"worktree ") or b"bare" in fields[1:]:
+                continue
+            candidate = Path(
+                first[len(b"worktree "):].decode("utf-8", errors="surrogateescape")
+            ).resolve(strict=False)
+            if _git_dir(candidate) == common_dir:
+                return candidate
+    return repo_root
+
+
 def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
     current = _nearest_existing_path(path).resolve(strict=False)
     while True:
         repo_root = _git_toplevel(current)
         if repo_root is not None:
-            return repo_root
+            return _canonical_worktree_anchor(repo_root)
+        if _git_is_bare(current):
+            return current
         if current == current.parent:
             return None
         current = current.parent
