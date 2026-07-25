@@ -1249,6 +1249,51 @@ class PluginContext:
         )
 
 
+async def _invoke_sync_hook_off_thread(
+    callback: Callable[..., Any], kwargs: Dict[str, Any]
+) -> Any:
+    """Run a synchronous hook in a disposable daemon thread.
+
+    Cancellation observers are advisory and may be third-party code. A daemon
+    thread keeps a stuck callback from blocking the event loop, consuming the
+    shared asyncio executor indefinitely, or preventing process shutdown. The
+    callback cannot be forcibly stopped; caller cancellation merely abandons
+    its result after the host boundary has proceeded.
+    """
+
+    loop = asyncio.get_running_loop()
+    result_future = loop.create_future()
+
+    def publish_result(result: Any = None, error: BaseException | None = None) -> None:
+        if result_future.done():
+            return
+        if error is not None:
+            result_future.set_exception(error)
+        else:
+            result_future.set_result(result)
+
+    def run() -> None:
+        try:
+            result = callback(**kwargs)
+        except BaseException as exc:
+            try:
+                loop.call_soon_threadsafe(publish_result, None, exc)
+            except RuntimeError:
+                return
+        else:
+            try:
+                loop.call_soon_threadsafe(publish_result, result, None)
+            except RuntimeError:
+                return
+
+    threading.Thread(
+        target=run,
+        name="hermes-plugin-hook",
+        daemon=True,
+    ).start()
+    return await result_future
+
+
 # ---------------------------------------------------------------------------
 # PluginManager
 # ---------------------------------------------------------------------------
@@ -1940,6 +1985,7 @@ class PluginManager:
         *,
         raise_exceptions: bool = False,
         stop_when: Optional[Callable[[Any], bool]] = None,
+        offload_sync: bool = False,
         **kwargs: Any,
     ) -> List[Any]:
         """Await sync or async callbacks registered for *hook_name*.
@@ -1952,7 +1998,11 @@ class PluginManager:
         results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
+                ret = (
+                    await _invoke_sync_hook_off_thread(cb, kwargs)
+                    if offload_sync and not inspect.iscoroutinefunction(cb)
+                    else cb(**kwargs)
+                )
                 if inspect.isawaitable(ret):
                     ret = await ret
                 if ret is not None:
@@ -2105,6 +2155,7 @@ async def invoke_hook_async(
     *,
     raise_exceptions: bool = False,
     stop_when: Optional[Callable[[Any], bool]] = None,
+    offload_sync: bool = False,
     **kwargs: Any,
 ) -> List[Any]:
     """Invoke sync or async lifecycle-hook callbacks and await completion."""
@@ -2112,6 +2163,7 @@ async def invoke_hook_async(
         hook_name,
         raise_exceptions=raise_exceptions,
         stop_when=stop_when,
+        offload_sync=offload_sync,
         **kwargs,
     )
 

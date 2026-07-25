@@ -15,7 +15,7 @@ from gateway.message_hooks import (
     GatewayMessageEvent,
     GatewayMessageRoute,
 )
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 
@@ -131,13 +131,13 @@ async def test_route_delivery_returns_truthful_normalized_receipts(native_result
 
 
 @pytest.mark.asyncio
-async def test_route_delivery_reports_raised_send_as_failed_without_native_details():
+async def test_route_delivery_reports_raised_send_as_unknown_without_native_details():
     async def send_native(_content: str):
         raise RuntimeError("transport down")
 
     receipt = await GatewayDelivery(send_native).send("hello")
 
-    assert receipt.status == "failed"
+    assert receipt.status == "unknown"
     assert receipt.message_id is None
     assert not hasattr(receipt, "error")
 
@@ -246,6 +246,58 @@ async def test_continue_hook_decisions_reach_cold_agent_dispatch(monkeypatch, de
     await runner._handle_message(_event())
 
     runner._handle_message_with_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_real_base_adapter_busy_ingress_reaches_gateway_message_hook_once(monkeypatch):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, _chat_id, _content, **_kwargs):
+        return SendResult(success=True, message_id="busy-out")
+
+    Adapter = type(
+        "BusyHookAdapter",
+        (BasePlatformAdapter,),
+        {"connect": connect, "disconnect": disconnect, "send": send},
+    )
+    Adapter.__abstractmethods__ = frozenset()
+
+    runner, _old_adapter = _runner_for_dispatch()
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.DISCORD)
+    adapter._message_handler = AsyncMock()
+    adapter._busy_session_handler = runner._handle_active_session_busy_message
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter}}
+    runner._busy_ack_ts = {}
+
+    event = MessageEvent(
+        text="busy follow-up",
+        message_type=MessageType.TEXT,
+        source=_source(),
+        message_id="busy-in",
+    )
+    session_key = build_session_key(event.source)
+    running_agent = MagicMock()
+    running_agent.get_activity_summary.return_value = {}
+    runner._running_agents[session_key] = running_agent
+    adapter._active_sessions[session_key] = asyncio.Event()
+    calls = []
+
+    async def hook(name, **kwargs):
+        calls.append((name, kwargs["route"].session_key))
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook)
+
+    await adapter.handle_message(event)
+
+    assert calls == [("gateway_message", session_key)]
+    running_agent.interrupt.assert_not_called()
+    assert session_key not in adapter._pending_messages
 
 
 @pytest.mark.asyncio
@@ -569,7 +621,8 @@ async def test_gateway_session_cancel_hook_receives_only_route_and_reason(monkey
     await runner._notify_gateway_session_cancel(session_key, source, reason="stop")
 
     assert captured["name"] == "gateway_session_cancel"
-    assert set(captured["kwargs"]) == {"route", "reason"}
+    assert set(captured["kwargs"]) == {"route", "reason", "offload_sync"}
+    assert captured["kwargs"]["offload_sync"] is True
     assert captured["kwargs"]["reason"] == "stop"
     assert captured["kwargs"]["route"] == GatewayMessageRoute.from_source(
         source, session_key=session_key
@@ -596,3 +649,33 @@ async def test_gateway_session_cancel_hook_timeout_does_not_block_stop(monkeypat
     )
 
     assert entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_gateway_session_cancel_timeout_bounds_blocking_sync_observer(monkeypatch):
+    from gateway import run as run_module
+    from hermes_cli.plugins import get_plugin_manager
+
+    runner, _adapter = _runner_for_dispatch()
+    manager = get_plugin_manager()
+    original = list(manager._hooks.get("gateway_session_cancel", []))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_observer(**_kwargs):
+        entered.set()
+        release.wait(1)
+
+    manager._hooks["gateway_session_cancel"] = [blocking_observer]
+    monkeypatch.setattr(run_module, "GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS", 0.01)
+    source = _source()
+    session_key = build_session_key(source)
+    started = asyncio.get_running_loop().time()
+    try:
+        await runner._notify_gateway_session_cancel(session_key, source, reason="stop")
+        elapsed = asyncio.get_running_loop().time() - started
+        assert entered.is_set()
+        assert elapsed < 0.1
+    finally:
+        release.set()
+        manager._hooks["gateway_session_cancel"] = original

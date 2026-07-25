@@ -6222,6 +6222,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        # Real busy-session ingress returns from BasePlatformAdapter after this
+        # handler. Invoke the post-authorization participant seam before any
+        # host queue, steer, redirect, or interrupt effect so ordinary live
+        # follow-ups are neither invisible nor duplicated.
+        if await self._run_gateway_message_hook(event, event.source, session_key):
+            return True
+
         running_agent = self._running_agents.get(session_key)
 
         effective_mode = self._busy_input_mode
@@ -13024,6 +13031,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key=session_key,
                     ),
                     reason=str(reason),
+                    offload_sync=True,
                 ),
                 timeout=GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS,
             )

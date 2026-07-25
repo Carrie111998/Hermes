@@ -128,7 +128,7 @@ class GatewayDelivery:
             if inspect.isawaitable(native_result):
                 native_result = await native_result
         except Exception:
-            return GatewayDeliveryReceipt(status="failed")
+            return GatewayDeliveryReceipt(status="unknown")
 
         if not isinstance(native_result, SendResult):
             return GatewayDeliveryReceipt(status="unknown")

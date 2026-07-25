@@ -1,6 +1,8 @@
 """Behavior tests for asynchronous plugin hook invocation."""
 
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -27,6 +29,33 @@ async def test_async_hook_invocation_supports_sync_and_async_callbacks():
 
     assert calls == [("sync", "hello"), ("async", "hello")]
     assert results == [{"decision": "pass"}, {"decision": "handled"}]
+
+
+@pytest.mark.asyncio
+async def test_async_hook_can_offload_blocking_sync_callback_for_host_timeout():
+    manager = PluginManager()
+    finished = False
+    daemon = None
+
+    def blocking_callback(**_kwargs):
+        nonlocal daemon, finished
+        daemon = threading.current_thread().daemon
+        time.sleep(0.2)
+        finished = True
+
+    manager._hooks["gateway_session_cancel"] = [blocking_callback]
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            manager.invoke_hook_async(
+                "gateway_session_cancel",
+                offload_sync=True,
+            ),
+            timeout=0.01,
+        )
+
+    assert daemon is True
+    assert finished is False
 
 
 @pytest.mark.asyncio
