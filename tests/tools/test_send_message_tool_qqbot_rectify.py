@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 
 
 def _run(async_fn):
@@ -481,6 +481,11 @@ class TestForceDocumentAndFallback:
             )
             mr = MagicMock()
             mr.adapters = {Platform.QQBOT: adapter}
+            # Explicitly model a same-loop / no-gateway-loop context: a bare
+            # MagicMock would auto-create a fake _gateway_loop attribute and
+            # send _send_via_adapter into the cross-loop run_coroutine_threadsafe
+            # path, which never resolves against a MagicMock loop.
+            mr._gateway_loop = None
             monkeypatch.setattr('gateway.run._gateway_runner_ref', lambda: mr)
 
             from gateway.platform_registry import PlatformEntry, platform_registry
@@ -498,18 +503,56 @@ class TestForceDocumentAndFallback:
 
         _run(_body())
 
-    def test_dispatch_is_voice_true_uses_send_voice(self, monkeypatch):
+    def test_live_media_routes_voice_when_flagged(self, monkeypatch):
+        """With the [[audio_as_voice]] flag, the generic live media helper
+        (``_send_live_adapter_media``) routes an .ogg file to the adapter's
+        native ``send_voice`` method."""
         async def _body():
-            from tools.send_message_tool import _dispatch_live_media
-            adapter = MagicMock()
-            adapter.send = AsyncMock(return_value=MagicMock(success=True, message_id='t'))
-            adapter.send_voice = AsyncMock(return_value=MagicMock(success=True, message_id='v'))
+            from tools.send_message_tool import _send_live_adapter_media
+            from gateway.platforms.base import BasePlatformAdapter, SendResult
 
-            await _dispatch_live_media(
-                adapter, 'c2c:t', 'hi',
-                media_files=[('/tmp/x.ogg', True)],
-                force_document=False,
+            class _VoiceCapableAdapter(BasePlatformAdapter):
+                name = "voice-test"
+
+                async def connect(self, *, is_reconnect: bool = False):
+                    return True
+
+                async def disconnect(self):
+                    return None
+
+                def get_chat_info(self, chat_id):
+                    return {"id": chat_id, "type": "dm"}
+
+                async def send(self, chat_id, content, reply_to=None, metadata=None):
+                    return SendResult(success=True, message_id="t")
+
+                async def send_voice(self, chat_id, audio_path, caption=None,
+                                     reply_to=None, metadata=None, **kwargs):
+                    return SendResult(success=True, message_id="v")
+
+            adapter = _VoiceCapableAdapter(
+                PlatformConfig(enabled=True, extra={}), Platform.QQBOT
             )
+            adapter.send = AsyncMock(
+                return_value=SendResult(success=True, message_id="t")
+            )
+            adapter.send_voice = AsyncMock(
+                return_value=SendResult(success=True, message_id="v")
+            )
+
+            with tempfile.TemporaryDirectory() as td:
+                ogg_path = os.path.join(td, "x.ogg")
+                open(ogg_path, "wb").close()
+                result = await _send_live_adapter_media(
+                    adapter,
+                    "c2c:t",
+                    "hi",
+                    [(ogg_path, True)],
+                    force_document=False,
+                )
+
             adapter.send_voice.assert_called_once()
+            assert result.get("success") is True
+            assert result.get("media_delivered") is True
 
         _run(_body())

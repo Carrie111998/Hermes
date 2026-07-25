@@ -75,6 +75,9 @@ from gateway.platforms.media_cache import ext_for_mime
 
 logger = logging.getLogger(__name__)
 
+# Extensions QQ's voice endpoint actually accepts (mirrors outbound._VOICE_EXTS).
+_VOICE_FORMAT_EXTS = frozenset({".silk", ".wav", ".mp3", ".flac", ".ogg", ".opus"})
+
 
 class QQCloseError(Exception):
     """Raised when QQ WebSocket closes with a specific code.
@@ -2843,8 +2846,23 @@ class QQAdapter(BasePlatformAdapter):
             reply_to: Optional[str] = None,
             **kwargs,
     ) -> SendResult:
-        """Send a voice message natively."""
-        del kwargs
+        """Send a voice message natively.
+
+        QQ's voice endpoint only accepts actual voice formats (silk / wav /
+        mp3 / flac / ogg / opus).  The generic send_message media router
+        dispatches every audio extension here, so reclassify anything else
+        (e.g. .m4a) as a file upload instead of letting the API reject it.
+        """
+        ext = os.path.splitext(audio_path)[1].lower()
+        if ext not in _VOICE_FORMAT_EXTS:
+            logger.warning(
+                "[%s] send_voice: %s is not a QQ voice format; sending as document",
+                self._log_tag,
+                ext or "<none>",
+            )
+            return await self.send_document(
+                chat_id, audio_path, caption=caption, reply_to=reply_to
+            )
         return await self._send_media(
             chat_id, audio_path, MEDIA_TYPE_VOICE, "voice", caption, reply_to
         )

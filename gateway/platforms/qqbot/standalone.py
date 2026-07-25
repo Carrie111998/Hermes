@@ -52,10 +52,19 @@ async def _standalone_send(
         UploadFileTooLargeError,
     )
 
+    # Credential resolution mirrors the legacy tool-layer direct send that
+    # this standalone sender replaces: explicit config first, then the
+    # active profile secret scope (via ``gateway.config._getenv``), then
+    # plain ``os.environ``.  Keeps multiplex-profile sends from borrowing
+    # another profile's QQ credentials (see tests/gateway/test_qqbot_scope_paths.py).
     extra = getattr(pconfig, "extra", None) or {}
-    app_id = str(extra.get("app_id") or "").strip()
+    from gateway.config import _getenv
+
+    app_id = str(extra.get("app_id") or _getenv("QQ_APP_ID", "")).strip()
     secret = (
-        extra.get("client_secret") or getattr(pconfig, "token", None)
+        extra.get("client_secret")
+        or getattr(pconfig, "token", None)
+        or _getenv("QQ_CLIENT_SECRET", "")
         or ""
     ).strip()
 
