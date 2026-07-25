@@ -771,6 +771,13 @@ class TestResolveReasoningConfig:
         cfg = self._cfg(effort="medium", overrides={"gpt-5": "turbo-max"})
         assert resolve_reasoning_config(cfg, "gpt-5") == {"enabled": True, "effort": "medium"}
 
+    def test_dict_reasoning_effort_map(self):
+        """A dictionary reasoning_effort map resolves per model/agent."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = {"agent": {"reasoning_effort": {"chatgpt_codex": "xhigh", "grok": "high"}}}
+        assert resolve_reasoning_config(cfg, "gpt-5.6-sol") == {"enabled": True, "effort": "xhigh"}
+        assert resolve_reasoning_config(cfg, "grok-4.5") == {"enabled": True, "effort": "high"}
+
 
 class TestReasoningOverridesDefaultConfig:
     """Tests for the agent.reasoning_overrides default config key (Task 2)."""

@@ -1013,6 +1013,13 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     # YAML boolean False into "", silently re-enabling thinking for users
     # who explicitly disabled it.
     effort = agent_cfg.get("reasoning_effort", "")
+    if isinstance(effort, dict):
+        try:
+            from gateway.fleet_safety.selector import resolve_effort_from_map
+            effort = resolve_effort_from_map(effort, model=model)
+        except Exception:
+            m_lower = str(model).strip().lower()
+            effort = effort.get(m_lower) or effort.get("default") or "medium"
     result = parse_reasoning_effort(effort)
     if effort and str(effort).strip() and result is None:
         import logging
