@@ -3696,5 +3696,106 @@ class TestCredentialPoolQueryLocking:
             )
         finally:
             inner.release()
-
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+def _write_codex_preflight_pool(tmp_path, entries):
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {"openai-codex": entries},
+        },
+    )
+
+
+def _codex_preflight_entry(entry_id, token, priority):
+    return {
+        "id": entry_id,
+        "label": entry_id,
+        "auth_type": "oauth",
+        "priority": priority,
+        "source": "manual:device_code",
+        "access_token": token,
+        "refresh_token": f"refresh-{entry_id}",
+    }
+
+
+def test_assignment_preflight_health_checks_every_codex_credential(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_codex_preflight_pool(
+        tmp_path,
+        [
+            _codex_preflight_entry("capped", "token-capped", 0),
+            _codex_preflight_entry("healthy", "token-healthy", 1),
+        ],
+    )
+    from agent.credential_pool import load_pool
+
+    seen = []
+
+    def probe(entry):
+        seen.append(entry.id)
+        if entry.id == "capped":
+            return {"status_code": 429, "reason": "usage_limit_reached", "reset_at": time.time() + 60}
+        return 200
+
+    pool = load_pool("openai-codex")
+    selected = pool.select_health_checked(probe)
+
+    assert seen == ["capped", "healthy"]
+    assert selected is not None and selected.id == "healthy"
+    capped = next(item for item in pool.entries() if item.id == "capped")
+    assert capped.last_status == "exhausted"
+    assert capped.last_error_code == 429
+
+
+def test_assignment_preflight_401_reloads_disk_then_retries_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_codex_preflight_pool(
+        tmp_path,
+        [_codex_preflight_entry("codex", "stale-token", 0)],
+    )
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    # Simulate another client rotating the token after this pool instance was
+    # loaded but before its assignment preflight.
+    _write_codex_preflight_pool(
+        tmp_path,
+        [_codex_preflight_entry("codex", "fresh-token", 0)],
+    )
+    calls = []
+
+    def probe(entry):
+        calls.append(entry.access_token)
+        return 401 if entry.access_token == "stale-token" else 200
+
+    selected = pool.select_health_checked(probe)
+
+    assert calls == ["stale-token", "fresh-token"]
+    assert selected is not None and selected.access_token == "fresh-token"
+    assert selected.last_status in {None, "ok"}
+
+
+def test_assignment_preflight_never_retries_known_broken_credential_twice(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_codex_preflight_pool(
+        tmp_path,
+        [
+            _codex_preflight_entry("broken", "broken-token", 0),
+            _codex_preflight_entry("healthy", "healthy-token", 1),
+        ],
+    )
+    from agent.credential_pool import load_pool
+
+    calls = []
+
+    def probe(entry):
+        calls.append(entry.id)
+        return {"status_code": 401, "reason": "invalid_token"} if entry.id == "broken" else 200
+
+    selected = load_pool("openai-codex").select_health_checked(probe)
+
+    assert calls.count("broken") == 2  # initial ping + exactly one post-reload retry
+    assert selected is not None and selected.id == "healthy"

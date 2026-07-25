@@ -161,7 +161,7 @@ def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     return str(auth_type or AUTH_TYPE_API_KEY)
 
 
-@dataclass
+@dataclass(repr=False)
 class PooledCredential:
     provider: str
     id: str
@@ -194,6 +194,15 @@ class PooledCredential:
             self.provider,
             self.access_token,
             self.auth_type,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            "PooledCredential("
+            f"provider={self.provider!r}, id={self.id!r}, label={self.label!r}, "
+            f"auth_type={self.auth_type!r}, priority={self.priority!r}, "
+            f"source={self.source!r}, last_status={self.last_status!r}, "
+            f"base_url={self.base_url!r})"
         )
 
     def __getattr__(self, name: str):
@@ -1599,6 +1608,100 @@ class CredentialPool:
                 # failure trip the #70401 bound early next time.
                 self._unmatched_rotation_streak = 0
             return entry
+
+    def select_health_checked(self, probe=None) -> Optional[PooledCredential]:
+        """Health-check every available credential, then select one healthy row.
+
+        This is the assignment-time gate for autonomous workers. The probe may
+        return ``True``/200, ``False``/429, an HTTP status integer, or a dict
+        containing ``status_code`` plus optional ``reason``/``message``/
+        ``reset_at``. A 401 always reloads persisted/source state and is pinged
+        exactly once more before it is parked; a 429 is parked until its reset.
+        Indeterminate transport failures are skipped for this assignment but
+        are not persisted as credential failures.
+        """
+        with self._lock:
+            candidates = self._available_entries(clear_expired=True, refresh=True)
+            healthy: List[PooledCredential] = []
+
+            def _run_ping(candidate: PooledCredential):
+                if probe is not None:
+                    return probe(candidate)
+                if self.provider == "openai-codex":
+                    return auth_mod.probe_codex_credential_health(
+                        candidate.access_token,
+                        base_url=candidate.base_url,
+                    )
+                # Non-Codex providers do not yet expose a safe no-inference
+                # health endpoint here. Their proactive expiry/refresh checks
+                # above are the authoritative local preflight.
+                return True
+
+            def _decode(result: Any) -> tuple[Optional[int], Dict[str, Any]]:
+                if result is True:
+                    return 200, {}
+                if result is False:
+                    return 429, {"reason": "usage_limit_reached"}
+                if isinstance(result, int):
+                    return result, {}
+                if isinstance(result, dict):
+                    raw_status = result.get("status_code", result.get("status"))
+                    try:
+                        status = int(raw_status) if raw_status is not None else None
+                    except (TypeError, ValueError):
+                        status = None
+                    return status, result
+                return None, {}
+
+            for original in candidates:
+                entry = original
+                status, context = _decode(_run_ping(entry))
+                if status == 401:
+                    # Flush the in-memory view and reload both persisted pool
+                    # state and the singleton/source token before one retry.
+                    persisted = next(
+                        (
+                            payload
+                            for payload in read_credential_pool(self.provider)
+                            if isinstance(payload, dict) and payload.get("id") == entry.id
+                        ),
+                        None,
+                    )
+                    if isinstance(persisted, dict):
+                        disk_entry = PooledCredential.from_dict(self.provider, persisted)
+                        if (
+                            disk_entry.access_token != entry.access_token
+                            or disk_entry.refresh_token != entry.refresh_token
+                        ):
+                            self._replace_entry(entry, disk_entry)
+                            entry = disk_entry
+                    if self.provider == "openai-codex":
+                        entry = self._sync_codex_entry_from_auth_store(entry)
+                    elif self.provider == "anthropic":
+                        entry = self._sync_anthropic_entry_from_credentials_file(entry)
+                    status, context = _decode(_run_ping(entry))
+
+                if status is not None and 200 <= status < 300:
+                    healthy.append(entry)
+                    continue
+                if status in {401, 429}:
+                    self._mark_exhausted(entry, status, context)
+                    continue
+                logger.info(
+                    "credential pool: preflight for %s/%s was indeterminate; skipping this assignment",
+                    self.provider,
+                    entry.id,
+                )
+
+            if not healthy:
+                self._current_id = None
+                return None
+            # Selection is intentionally deterministic after the all-entry
+            # health sweep. Existing priority order still governs fill-first;
+            # failed rows have already been removed from this assignment.
+            chosen = min(healthy, key=lambda item: item.priority)
+            self._current_id = chosen.id
+            return chosen
 
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
         """Return entries not currently in exhaustion cooldown.

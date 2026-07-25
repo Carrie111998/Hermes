@@ -86,6 +86,49 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_subscription_orchestrator_health_checks_pool_before_codex_assignment(monkeypatch):
+    entry = SimpleNamespace(
+        access_token="healthy-pool-token",
+        source="manual:device_code",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+    class _Pool:
+        def __init__(self):
+            self.health_checked = 0
+            self.plain_selected = 0
+
+        def has_credentials(self):
+            return True
+
+        def select_health_checked(self):
+            self.health_checked += 1
+            return entry
+
+        def select(self):
+            self.plain_selected += 1
+            return entry
+
+    pool = _Pool()
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: pool)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "orchestrator": {
+                "enabled": True,
+                "billing_policy": "subscription_only",
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_key"] == "healthy-pool-token"
+    assert pool.health_checked == 1
+    assert pool.plain_selected == 0
+
+
 def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypatch):
     entry = SimpleNamespace(
         provider="nous",

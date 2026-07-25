@@ -89,4 +89,17 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             seen.add(identity)
             chain.append(entry)
 
-    return chain
+    try:
+        from agent.provider_route_policy import (
+            Capability,
+            RouteRole,
+            SubscriptionRoutePolicy,
+        )
+
+        return SubscriptionRoutePolicy(config).filter_routes(
+            chain,
+            role=RouteRole.BUILDER,
+            capability=Capability.WRITE,
+        )
+    except Exception:
+        return chain
