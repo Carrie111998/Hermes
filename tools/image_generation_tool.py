@@ -26,6 +26,7 @@ import os
 import datetime
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Optional
 
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
@@ -1179,7 +1180,8 @@ IMAGE_GENERATE_SCHEMA = {
         "type": "object",
         "properties": {
             "prompt": {
-                "type": "string",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
                 "description": (
                     "The text prompt describing the desired image (text-to-"
                     "image) or the edit to apply (image-to-image). Be detailed "
@@ -1498,8 +1500,120 @@ def _maybe_route_managed_krea(
     return json.dumps(result)
 
 
+# ---------------------------------------------------------------------------
+# Tool handler
+# ---------------------------------------------------------------------------
+
+
+def _read_max_parallel() -> int:
+    """Configurable concurrency cap for parallel image generation."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        img = cfg.get("image_gen") if isinstance(cfg, dict) else {}
+        return max(1, min(int(img.get("max_parallel", 5)), 20))
+    except Exception:
+        return 5
+
+
+def _generate_single_image(
+    prompt: str,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    image_url: Optional[str] = None,
+    reference_image_urls: Optional[list] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Generate one image — used by both single and array prompt paths."""
+    dispatched = _dispatch_to_plugin_provider(
+        prompt, aspect_ratio,
+        image_url=image_url,
+        reference_image_urls=reference_image_urls,
+    )
+    if dispatched is not None:
+        return _postprocess_image_generate_result(dispatched, task_id=task_id)
+
+    krea_routed = _maybe_route_managed_krea(
+        prompt, aspect_ratio,
+        image_url=image_url,
+        reference_image_urls=reference_image_urls,
+    )
+    if krea_routed is not None:
+        return _postprocess_image_generate_result(krea_routed, task_id=task_id)
+
+    return _postprocess_image_generate_result(
+        image_generate_tool(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_url=image_url,
+            reference_image_urls=reference_image_urls,
+        ),
+        task_id=task_id,
+    )
+
+
 def _handle_image_generate(args, **kw):
     prompt = args.get("prompt", "")
+
+    if not prompt:
+        return tool_error("prompt is required for image generation")
+
+    # ── Array prompt → parallel mode ───────────────────────────────────
+    if isinstance(prompt, list) and len(prompt) > 0:
+        max_workers = min(len(prompt), _read_max_parallel())
+        ordered: list = [None] * len(prompt)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {}
+            for idx, p in enumerate(prompt):
+                if not isinstance(p, str) or not p.strip():
+                    continue
+                future = executor.submit(
+                    _generate_single_image,
+                    p.strip(),
+                    args.get("aspect_ratio", DEFAULT_ASPECT_RATIO),
+                    args.get("image_url"),
+                    args.get("reference_image_urls"),
+                    kw.get("task_id"),
+                )
+                future_to_idx[future] = idx
+
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    ordered[idx] = future.result()
+                except Exception as exc:
+                    ordered[idx] = tool_error(str(exc))
+
+        # Build batched response
+        images_list = []
+        first_img = None
+        all_ok = True
+        errors = []
+        for data in ordered:
+            if data is None:
+                continue
+            try:
+                parsed = json.loads(data) if isinstance(data, str) else data
+            except Exception:
+                continue
+            if parsed.get("success"):
+                img = parsed.get("image")
+                if img and first_img is None:
+                    first_img = img
+                images_list.append(parsed)
+            else:
+                all_ok = False
+                errors.append(parsed.get("error", "未知错误"))
+
+        return json.dumps({
+            "success": all_ok,
+            "image": first_img,
+            "images": images_list,
+            **({"errors": errors} if errors else {}),
+        }, ensure_ascii=False)
+
+    # ── Single prompt (original path) ───────────────────────────────────
+    prompt = str(prompt).strip()
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
@@ -1665,4 +1779,13 @@ registry.register(
     is_async=False,   # sync fal_client API to avoid "Event loop is closed" in gateway
     emoji="🎨",
     dynamic_schema_overrides=_build_dynamic_image_schema,
+)
+
+# Bump generation to refresh the cached tool definition after schema changes.
+registry.register(
+    name="image_generate",
+    toolset="image_gen",
+    schema=IMAGE_GENERATE_SCHEMA,
+    handler=_handle_image_generate,
+    override=True,
 )
