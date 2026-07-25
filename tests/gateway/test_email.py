@@ -863,6 +863,61 @@ class TestThreadContext(unittest.TestCase):
         sent_msg = mock_server.send_message.call_args[0][0]
         self.assertEqual(sent_msg["Cc"], "teammate@test.com")
 
+    def test_reply_delivers_cc_to_smtp_envelope(self):
+        """CC recipients must reach the SMTP envelope, not just the header.
+
+        The whole point of #38512 is that CC'd parties actually receive the
+        reply. Setting ``msg["Cc"]`` only delivers because ``send_message``
+        derives its recipient list from To+Cc. This drives the real
+        ``smtplib.SMTP.send_message`` extraction (network stubbed) and asserts
+        the CC address lands in the envelope handed to ``sendmail`` — guarding
+        against a refactor to an explicit ``sendmail(from, [to_addr], ...)``
+        that would keep the header cosmetic while silently dropping delivery.
+        """
+        import smtplib
+
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Project question",
+            "message_id": "<original@test.com>",
+            "cc": ["teammate@test.com", "hermes@test.com", "user@test.com"],
+        }
+
+        captured = {}
+
+        class _CapturingSMTP(smtplib.SMTP):
+            def __init__(self):
+                self.local_hostname = "localhost"
+                self.esmtp_features = {}
+
+            def login(self, *args, **kwargs):
+                pass
+
+            def ehlo_or_helo_if_needed(self):
+                pass
+
+            def has_extn(self, opt):
+                return False
+
+            def sendmail(self, from_addr, to_addrs, msg, *args, **kwargs):
+                captured["from"] = from_addr
+                captured["to"] = list(to_addrs)
+
+            def quit(self):
+                pass
+
+            def close(self):
+                pass
+
+        with patch.object(adapter, "_connect_smtp", return_value=_CapturingSMTP()):
+            adapter._send_email("user@test.com", "Here is the answer.", None)
+
+        # send_message() combines To + Cc into the envelope recipient list.
+        self.assertIn("teammate@test.com", captured["to"])  # CC'd party is delivered to
+        self.assertIn("user@test.com", captured["to"])       # primary recipient too
+        self.assertNotIn("hermes@test.com", captured["to"])  # agent excludes itself
+        self.assertEqual(captured["from"], "hermes@test.com")
+
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
         adapter = self._make_adapter()
