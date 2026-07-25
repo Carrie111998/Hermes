@@ -24,6 +24,7 @@ import {
   $currentCwd,
   $selectedStoredSessionId,
   $workspaceCwdOwner,
+  releaseWorkspaceCwdOwner,
   setSelectedStoredSessionId,
   setWorkspaceCwdOwner,
   workspaceCwdBelongsToSelectedSession
@@ -137,13 +138,15 @@ describe('wipeSessionListsForGatewaySwitch workspace ownership', () => {
   })
 
   it('does not strand ownership when the wipe runs from an unowned workspace', () => {
-    // Resuming a detached conversation marks the workspace with a private
-    // unowned sentinel. A wipe from THAT state must also land owned, otherwise
-    // the mismatch survives the switch just as it did when the owner named a
-    // conversation.
+    // Resuming a detached conversation releases the workspace to the private
+    // unowned marker, reached through the same call the resume path uses so this
+    // runs on the real marker rather than a hand-copied literal. A wipe from THAT
+    // state must also land owned, otherwise the mismatch survives the switch just
+    // as it did when the owner named a conversation.
     $currentCwd.set('/repo-a')
     setSelectedStoredSessionId('session-detached')
-    setWorkspaceCwdOwner('workspace-cwd-unowned')
+    releaseWorkspaceCwdOwner()
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
 
     wipeSessionListsForGatewaySwitch()
 

@@ -394,7 +394,17 @@ export const $sessionProfilesTruncated = atom<Record<string, boolean>>({})
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
-// Which conversation the live `$currentCwd` is known to describe.
+// Which conversation the live `$currentCwd` is known to describe. Three
+// inhabitants, and the difference between the last two is load-bearing:
+// a stored-session id (that conversation owns the path), `null` (the fresh-draft
+// state, which MATCHES a null selection and therefore reads as OWNED — a draft's
+// workspace is immediately usable), and the released marker
+// `WORKSPACE_CWD_UNOWNED` below, which matches no selection and so reads as owned
+// by nobody. `null` cannot double as the release value precisely because it
+// matches: releasing to `null` while a draft is selected would hand the leftover
+// path to the draft as its own workspace. Release goes exclusively through
+// `releaseWorkspaceCwdOwner`, which is why the marker stays module-private —
+// nothing outside can mistake it for a session id.
 //
 // A conversation switch publishes the new stored id immediately, but the new
 // workspace only arrives when the resume settles, so for that whole window
@@ -405,9 +415,7 @@ export const $selectedStoredSessionId = atom<string | null>(null)
 //
 // Ownership, not emptiness, is what makes the switch atomic: clearing the path
 // would collapse the workspace panes and drop file-tree state on every switch,
-// so the path stays put and is simply marked as not-yet-owned. `null` means
-// "no conversation owns it" — which is exactly right for a fresh draft, where
-// the selected id is also `null` and the workspace is immediately usable.
+// so the path stays put and is simply marked as not-yet-owned.
 export const $workspaceCwdOwner = atom<string | null>(null)
 export interface ActiveSessionStoredIdRotation {
   nextStoredSessionId: string
