@@ -13852,7 +13852,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
                 )
-                if _message_timestamps_enabled(_load_gateway_config()):
+                _timestamps_enabled = _message_timestamps_enabled(_load_gateway_config())
+                if _timestamps_enabled:
+                    if persist_user_timestamp is None:
+                        # Some adapters strip event metadata. Preserve the
+                        # temporal-context contract with processing time, and
+                        # make the loss of send-time provenance observable.
+                        persist_user_timestamp = time.time()
+                        logger.warning(
+                            "Message timestamp unavailable for platform=%s; "
+                            "falling back to processing time",
+                            source,
+                        )
                     message_text = _render_msg_ts(
                         _clean_message_text,
                         persist_user_timestamp,

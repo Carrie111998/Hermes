@@ -34,6 +34,10 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
+# The identity is a cache-stable prompt block. Keep the same conservative byte
+# contract in runtime assembly and in ``hermes prompt-size`` diagnostics.
+IDENTITY_MAX_BYTES = 1800
+
 # ---------------------------------------------------------------------------
 # Context file scanning — detect prompt injection / promptware in AGENTS.md,
 # .cursorrules, SOUL.md before they get injected into the system prompt.
@@ -1885,6 +1889,21 @@ def _truncate_content(
     return head + marker + tail
 
 
+def _truncate_identity_bytes(content: str, max_bytes: int = IDENTITY_MAX_BYTES) -> str:
+    """Bound identity bytes while retaining both the opening and closing role."""
+    encoded = content.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return content
+    marker = "\n\n[...identity truncated to the shared byte budget; read SOUL.md for the full identity]\n\n"
+    marker_bytes = len(marker.encode("utf-8"))
+    available = max(1, max_bytes - marker_bytes)
+    head_bytes = int(available * 0.7)
+    tail_bytes = available - head_bytes
+    head = encoded[:head_bytes].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
+    return head + marker + tail
+
+
 def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
@@ -1910,6 +1929,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
             content, "SOUL.md", context_length=context_length,
             read_path=str(soul_path),
         )
+        content = _truncate_identity_bytes(content)
         return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)

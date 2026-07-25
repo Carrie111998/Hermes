@@ -65,6 +65,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     of (label, chars, bytes) for the three prompt tiers).
     """
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+    from agent.prompt_builder import DEFAULT_AGENT_IDENTITY, IDENTITY_MAX_BYTES, load_soul_md
 
     agent = _build_inspection_agent(platform)
 
@@ -98,6 +99,8 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     # Tool-schema JSON — the other half of the fixed per-call payload.
     tools = getattr(agent, "tools", None) or []
     tools_json = json.dumps(tools, ensure_ascii=False)
+    identity = load_soul_md() or DEFAULT_AGENT_IDENTITY
+    identity_bytes = _bytes(identity)
 
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
@@ -109,6 +112,13 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "platform": platform,
         "model": getattr(agent, "model", "") or "",
         "system_prompt": {"chars": len(full), "bytes": _bytes(full)},
+        "identity": {
+            "chars": len(identity),
+            "bytes": identity_bytes,
+            "budget_bytes": IDENTITY_MAX_BYTES,
+            "estimated_tokens": (identity_bytes + 2) // 3,
+            "estimate_contract": "UTF-8 bytes divided by 3; conservative estimate, not an exact tokenizer count",
+        },
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
