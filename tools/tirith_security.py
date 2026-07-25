@@ -744,13 +744,21 @@ def check_command_security(command: str) -> dict:
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
 
+    fail_open = cfg["tirith_fail_open"]
+
     # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row,
     # stop trying for the rest of the process.  Without this, a corrupted
     # or missing binary causes every tool call to hit the same spawn failure
     # → fail-open → agent retry loop, hanging the user for 20+ minutes
     # (issue #41400).
     if _circuit_open:
-        return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        if fail_open:
+            return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        return {
+            "action": "block",
+            "findings": [],
+            "summary": "tirith disabled (circuit breaker; fail-closed)",
+        }
 
     # Unsupported platform (Windows etc.) — tirith has no binary here and
     # never will. Skip the resolver entirely so we don't even try to spawn.
@@ -760,7 +768,6 @@ def check_command_security(command: str) -> dict:
 
     tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     timeout = cfg["tirith_timeout"]
-    fail_open = cfg["tirith_fail_open"]
 
     if tirith_path is None:
         _warn_once(
@@ -806,10 +813,12 @@ def check_command_security(command: str) -> dict:
 
     # Map exit code to action
     exit_code = result.returncode
+    if exit_code in (0, 1, 2):
+        # All documented verdict exits mean the scanner ran successfully.
+        _crash_count = 0
+
     if exit_code == 0:
         action = "allow"
-        # Successful execution — reset circuit breaker
-        _crash_count = 0
     elif exit_code == 1:
         action = "block"
     elif exit_code == 2:
