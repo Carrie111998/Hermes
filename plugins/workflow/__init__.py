@@ -463,7 +463,14 @@ def _spawn_supervisor_for_next_layer(state, state_path):
         import subprocess
         import sys
         workflow_name = state.get("workflow_name", "")
-        run_id = state.get("run_id", "")
+        # run_id is in the state filename, not the state dict
+        # Format: {workflow_name}_{run_id}_state.json
+        run_id = ""
+        if state_path:
+            sf_name = Path(state_path).stem  # remove .json
+            parts = sf_name.split("_", 1)
+            if len(parts) > 1:
+                run_id = parts[1]  # {run_id}_state → {run_id}
         board = state.get("kanban_board")
         if not board:
             return
@@ -475,7 +482,7 @@ def _spawn_supervisor_for_next_layer(state, state_path):
             return
 
         # Check if a supervisor is already running for this workflow
-        if run_id:
+        if run_id and run_id != "NONE":
             existing = subprocess.run(
                 ["pgrep", "-f", f"workflow_engine.*{workflow_name}.*{run_id}"],
                 capture_output=True, text=True
