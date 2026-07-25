@@ -51,6 +51,26 @@ def test_buffer_status_accumulates_then_flushes(capsys):
     assert agent._retry_status_buffer == []
 
 
+def test_compression_progress_keeps_structured_type_through_buffer(capsys):
+    agent = _make_bare_agent()
+    events = []
+    agent._vprint = lambda *_args, **_kwargs: None
+    agent.status_callback = lambda event_type, message: events.append(
+        (event_type, message)
+    )
+
+    agent._buffer_compression_progress("🗜️ Compacting context")
+    assert events == []
+    assert agent._retry_status_buffer == [
+        ("compression_progress", "🗜️ Compacting context")
+    ]
+
+    agent._flush_status_buffer()
+    assert events == [
+        ("compression_progress", "🗜️ Compacting context")
+    ]
+
+
 def test_clear_drops_buffered_messages_silently():
     agent = _make_bare_agent()
     emitted = []

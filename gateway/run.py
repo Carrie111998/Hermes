@@ -79,16 +79,6 @@ def render_account_usage_lines(*args: Any, **kwargs: Any) -> Any:
 
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
-from agent.conversation_compression import (
-    COMPACTION_STATUS,
-    COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
-    IDLE_COMPACTION_STATUS_TEMPLATE,
-    PRE_API_COMPRESSION_STATUS_TEMPLATE,
-    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-)
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import (
@@ -146,46 +136,6 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     r")",
     re.IGNORECASE | re.DOTALL,
-)
-
-
-def _status_template_to_regex(template: str) -> str:
-    """Compile a compression status template constant into a regex source.
-
-    Literal text is escaped verbatim (so wording drift in
-    agent/conversation_compression.py cannot silently diverge from this
-    matcher — the constants ARE the wording) and each ``{field}`` format
-    placeholder is replaced with a numeric-ish pattern covering every value
-    the emit sites format in (ints, ``{:,}`` thousands separators).
-    """
-    parts = re.split(r"\{[^{}]*\}", template)
-    return r"[\d,]+".join(re.escape(part) for part in parts)
-
-
-# ROUTINE compression progress statuses, derived from the SAME template
-# constants the emit sites format (agent/conversation_compression.py, #69550)
-# — never re-inlined wording. Used ONLY by the opt-in
-# ``compression.progress_notices`` gate below (#52995) to decide which of the
-# noisy statuses matched by _TELEGRAM_NOISY_STATUS_RE are compression
-# progress (deliverable when the user opted in) versus unrelated aux/retry
-# chatter (always suppressed on chat surfaces). Failure notices and manual
-# /compress feedback never match _TELEGRAM_NOISY_STATUS_RE in the first
-# place, so they are unaffected by this gate.
-_COMPRESSION_PROGRESS_STATUS_RE = re.compile(
-    "|".join(
-        _status_template_to_regex(_template)
-        for _template in (
-            COMPACTION_STATUS,
-            PRE_API_COMPRESSION_STATUS_TEMPLATE,
-            PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-            IDLE_COMPACTION_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
-        )
-    ),
-    re.IGNORECASE,
 )
 
 
@@ -957,13 +907,22 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 def _prepare_gateway_status_message(
     platform: Any, event_type: str, message: str
 ) -> Optional[str]:
-    """Redact status callbacks without classifying their authored wording."""
-    del event_type
+    """Apply structured delivery policy, then redact user-facing statuses.
+
+    Routine automatic-compression progress is the sole opt-in class here and
+    is identified by its exact event type. Provider/model-authored wording is
+    never inspected as routing authority.
+    """
     text = str(message or "").strip()
     if not text:
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text
+    if (
+        event_type == "compression_progress"
+        and not _gateway_compression_progress_notices_enabled()
+    ):
+        return None
 
     return _redact_gateway_user_facing_secrets(text)
 

@@ -1,16 +1,12 @@
 """Opt-in compression progress notices on chat gateways (#52995).
 
 Routine automatic compression is silent-by-design on human-facing chat
-platforms: the gateway noise filter (`_TELEGRAM_NOISY_STATUS_RE` via
-`_prepare_gateway_status_message`) swallows every ROUTINE compression status.
+platforms. Emit sites tag those notices with the structured
+``compression_progress`` event type.
 `compression.progress_notices: true` (default: false) opens an opt-in gate
-that lets those ROUTINE compression statuses through — scoped strictly to
-the #69550 compression status template constants, so unrelated operational
-noise (auxiliary failures, provider retry/rate-limit chatter) stays
-suppressed even when the gate is enabled.
-
-The default-OFF path must stay byte-identical to silent-by-design main:
-tests/gateway/test_telegram_noise_filter.py pins that suite unchanged.
+that lets those tagged notices through. Authored message wording is never a
+routing authority: unrelated lifecycle/warning text remains visible and is
+subject only to the secret-redaction boundary.
 """
 
 import pytest
@@ -26,8 +22,8 @@ from gateway.run import _prepare_gateway_status_message
 # suite's CHAT_PLATFORMS; telegram + discord are the required anchors).
 CHAT_PLATFORMS = ["telegram", "discord", "slack", "whatsapp"]
 
-# Noisy statuses that are NOT routine compression progress — they must stay
-# suppressed on chat platforms even when progress_notices is enabled.
+# Statuses that are NOT routine compression progress. Their wording must not
+# be used to suppress or reroute them.
 NON_COMPRESSION_NOISE = [
     "⚠ Auxiliary title generation failed: HTTP 400: Operation contains cybersecurity risk",
     "⏳ Retrying in 4.2s (attempt 1/3)...",
@@ -71,11 +67,13 @@ def test_enabled_delivers_routine_compression_statuses(
 ):
     """Opt-in ON: every ROUTINE compression status reaches chat platforms.
 
-    Iterates the sample strings formatted from the SAME template constants
-    the emit sites use, so wording drift at an emit site cannot silently
-    detach the opt-in gate from the real messages.
+    Iterates the sample strings formatted from the same template constants
+    the emit sites use while keeping delivery bound to the structured type.
     """
-    assert _prepare_gateway_status_message(platform, "lifecycle", message) == message
+    assert (
+        _prepare_gateway_status_message(platform, "compression_progress", message)
+        == message
+    )
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
@@ -84,7 +82,10 @@ def test_enabled_delivers_routine_compression_statuses(
 )
 def test_default_stays_silent(progress_notices_default, platform, message):
     """Default (key absent): routine compression statuses stay suppressed."""
-    assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+    assert (
+        _prepare_gateway_status_message(platform, "compression_progress", message)
+        is None
+    )
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
@@ -96,21 +97,21 @@ def test_explicit_false_stays_silent(monkeypatch, platform):
         lambda: {"compression": {"progress_notices": False}},
     )
     for message in ROUTINE_COMPRESSION_STATUS_SAMPLES:
-        assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+        assert (
+            _prepare_gateway_status_message(
+                platform, "compression_progress", message
+            )
+            is None
+        )
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
 @pytest.mark.parametrize("message", NON_COMPRESSION_NOISE, ids=lambda m: m[:32])
-def test_enabled_still_suppresses_non_compression_noise(
+def test_enabled_preserves_non_compression_status_meaning(
     progress_notices_enabled, platform, message
 ):
-    """The gate is scoped to compression progress statuses ONLY.
-
-    Aux-model failures, provider retry/rate-limit chatter, and other noisy
-    statuses that are not #69550 compression progress templates must stay
-    suppressed on chat surfaces even when progress_notices is enabled.
-    """
-    assert _prepare_gateway_status_message(platform, "warn", message) is None
+    """The gate is scoped to the structured compression event type only."""
+    assert _prepare_gateway_status_message(platform, "warn", message) == message
 
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "default"])
@@ -141,7 +142,12 @@ def test_config_read_errors_fail_closed(monkeypatch):
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", _boom)
     message = ROUTINE_COMPRESSION_STATUS_SAMPLES[0]
-    assert _prepare_gateway_status_message("telegram", "lifecycle", message) is None
+    assert (
+        _prepare_gateway_status_message(
+            "telegram", "compression_progress", message
+        )
+        is None
+    )
 
 
 def test_enabled_gate_does_not_leak_to_raw_platforms(progress_notices_enabled):
@@ -149,7 +155,10 @@ def test_enabled_gate_does_not_leak_to_raw_platforms(progress_notices_enabled):
     message = ROUTINE_COMPRESSION_STATUS_SAMPLES[0]
     for platform in ("local", "api_server", "webhook", "msgraph_webhook"):
         assert (
-            _prepare_gateway_status_message(platform, "lifecycle", message) == message
+            _prepare_gateway_status_message(
+                platform, "compression_progress", message
+            )
+            == message
         )
 
 
@@ -159,14 +168,10 @@ def test_progress_notices_is_a_hot_reload_cache_busting_key():
     assert ("compression", "progress_notices") in gateway_run.GatewayRunner._CACHE_BUSTING_CONFIG_KEYS
 
 
-def test_progress_regex_covers_every_routine_sample():
-    """The template-derived membership regex matches every ROUTINE sample.
-
-    Guards the coupling: a new #69550 template constant added to
-    ROUTINE_COMPRESSION_STATUS_SAMPLES without being added to the gateway's
-    _COMPRESSION_PROGRESS_STATUS_RE alternatives fails here.
-    """
+def test_message_wording_is_not_delivery_authority(progress_notices_default):
+    """Routine-looking text under another event type remains authored data."""
     for message in ROUTINE_COMPRESSION_STATUS_SAMPLES:
-        assert gateway_run._COMPRESSION_PROGRESS_STATUS_RE.search(message), (
-            f"routine compression sample not covered by the opt-in gate: {message!r}"
+        assert (
+            _prepare_gateway_status_message("discord", "lifecycle", message)
+            == message
         )

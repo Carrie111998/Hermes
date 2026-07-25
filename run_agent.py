@@ -924,6 +924,15 @@ class AIAgent:
         """
         self._emit_status_event("lifecycle", message)
 
+    def _emit_compression_progress(self, message: str) -> None:
+        """Emit routine automatic-compression progress with a typed contract.
+
+        Human-facing gateways may hide these routine notices unless the
+        operator opts in.  The decision is bound to this event type, never to
+        keywords in model- or provider-authored text.
+        """
+        self._emit_status_event("compression_progress", message)
+
     def _emit_terminal_status(self, message: str) -> None:
         """Emit a status that may exactly mirror this turn's final response.
 
@@ -1069,6 +1078,17 @@ class AIAgent:
             # Never break the retry loop on a buffer hiccup.
             pass
 
+    def _buffer_compression_progress(self, message: str) -> None:
+        """Buffer typed automatic-compression progress until terminal failure."""
+        try:
+            buf = getattr(self, "_retry_status_buffer", None)
+            if buf is None:
+                buf = []
+                self._retry_status_buffer = buf
+            buf.append(("compression_progress", message))
+        except Exception:
+            pass
+
     def _buffer_vprint(self, message: str) -> None:
         """Buffer a vprint(force=True) retry/fallback line."""
         try:
@@ -1133,6 +1153,8 @@ class AIAgent:
                 try:
                     if kind == "status":
                         self._emit_status(msg)
+                    elif kind == "compression_progress":
+                        self._emit_compression_progress(msg)
                     elif kind == "warn":
                         self._emit_warning(msg)
                     else:

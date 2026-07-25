@@ -285,17 +285,35 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
-def _toolsets_have_context_sensitive_checks(
+def _context_sensitive_check_fingerprint(
     enabled_toolsets: Optional[List[str]],
-) -> bool:
-    """Return whether tool availability can vary between request contexts."""
-    if enabled_toolsets is None:
-        return True
-    return any(
+) -> tuple:
+    """Return request-local availability inputs for memoized tool schemas.
+
+    Context-sensitive ``check_fn`` callables bypass the registry's process-wide
+    TTL cache, but the outer tool-definition cache must distinguish their
+    outcomes too.  Today ``cronjob`` is the only such built-in.  Fingerprinting
+    its exact request-local result preserves the quiet-mode cache for ordinary
+    callers while preventing one gateway task from lending cron management to
+    another task.
+    """
+    cronjob_selected = enabled_toolsets is None or any(
         "cronjob" in resolve_toolset(toolset_name)
         for toolset_name in enabled_toolsets
         if validate_toolset(toolset_name)
     )
+    if not cronjob_selected:
+        return ()
+
+    entry = registry.get_entry("cronjob")
+    check_fn = entry.check_fn if entry is not None else None
+    if not check_fn or not getattr(check_fn, "__hermes_context_sensitive__", False):
+        return ()
+    try:
+        available = bool(check_fn())
+    except Exception:
+        available = False
+    return (("cronjob", available),)
 
 
 def get_tool_definitions(
@@ -330,10 +348,7 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    use_memoized_definitions = (
-        quiet_mode
-        and not _toolsets_have_context_sensitive_checks(enabled_toolsets)
-    )
+    use_memoized_definitions = quiet_mode
     if use_memoized_definitions:
         try:
             from hermes_cli.config import get_config_path
@@ -350,6 +365,7 @@ def get_tool_definitions(
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),
+            _context_sensitive_check_fingerprint(enabled_toolsets),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:

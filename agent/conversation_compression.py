@@ -64,6 +64,29 @@ COMPACTION_STATUS = (
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
+def emit_routine_compression_progress(agent: Any, message: str) -> None:
+    """Emit automatic-compression progress with a structured event type.
+
+    Full ``AIAgent`` instances expose the typed helper.  The fallback keeps
+    lightweight test doubles and third-party embeddings compatible without
+    turning message wording into delivery policy.
+    """
+    emit_typed = getattr(agent, "_emit_compression_progress", None)
+    if callable(emit_typed):
+        emit_typed(message)
+        return
+    agent._emit_status(message)
+
+
+def buffer_routine_compression_progress(agent: Any, message: str) -> None:
+    """Buffer typed compression progress, with a legacy-agent fallback."""
+    buffer_typed = getattr(agent, "_buffer_compression_progress", None)
+    if callable(buffer_typed):
+        buffer_typed(message)
+        return
+    agent._buffer_status(message)
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
@@ -77,11 +100,9 @@ def _emit_compaction_done(agent: Any) -> None:
 
 # ── Routine compression status templates ────────────────────────────────────
 # Every ROUTINE (non-failure, non-manual-/compress) compression status line the
-# agent emits lives here so the gateway noise filter and its tests can couple
-# to the real emitted wording instead of hand-copied literals. These are
-# suppressed on human-facing chat platforms by _TELEGRAM_NOISY_STATUS_RE
-# (gateway/run.py) — when rewording ANY of them, update that regex and the
-# pinned data in tests/gateway/test_telegram_noise_filter.py in the same PR.
+# agent emits lives here for consistent UI copy and behavioral coverage. These
+# are tagged as ``compression_progress`` at their emit sites; human-facing
+# gateway delivery is controlled by that structured type, not these strings.
 # Failure notices (⚠ Compression aborted / empty transcript / codex compaction
 # failed) and manual /compress feedback (manual_compression_feedback.py) are
 # deliberate carve-outs from silence and must NOT be added here.
@@ -114,9 +135,8 @@ COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE = (
 # silence (#16775 class): the context is over the compression threshold but
 # compression is blocked (summary-LLM cooldown / anti-thrash breaker), so the
 # session will keep growing until the hard provider token limit kills it.
-# This MUST stay visible on chat gateways. Do NOT add it to
-# ROUTINE_COMPRESSION_STATUS_SAMPLES or the gateway noise regex
-# (_TELEGRAM_NOISY_STATUS_RE); it is pinned un-swallowed in
+# This MUST stay visible on chat gateways. Do NOT emit it with the
+# ``compression_progress`` event type; it is pinned un-swallowed in
 # tests/gateway/test_telegram_noise_filter.py::VISIBLE_COMPRESSION_MESSAGES.
 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "⚠ Context is over the compression threshold "
@@ -128,7 +148,8 @@ CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
 
 # Sample-formatted instances of every routine compression status line, for
 # behavioral tests that iterate the ACTUAL emitted wording (formatted from the
-# same constants the emission sites use) through the gateway noise filter.
+# same constants the emission sites use). Delivery policy is carried by the
+# structured ``compression_progress`` event type, never inferred from wording.
 ROUTINE_COMPRESSION_STATUS_SAMPLES = (
     COMPACTION_STATUS,
     PRE_API_COMPRESSION_STATUS_TEMPLATE.format(tokens=123456),
@@ -1726,7 +1747,7 @@ def compress_context(
         )
     _compaction_status_emitted = bool(_compaction_status)
     if _compaction_status:
-        agent._emit_status(_compaction_status)
+        emit_routine_compression_progress(agent, _compaction_status)
     _compaction_done_emitted = False
 
     def _complete_compaction_lifecycle() -> None:
@@ -2675,7 +2696,7 @@ def _compress_context_via_codex_app_server(
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
     try:
-        agent._emit_status(COMPACTION_STATUS)
+        emit_routine_compression_progress(agent, COMPACTION_STATUS)
     except Exception:
         pass
 

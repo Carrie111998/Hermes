@@ -36,6 +36,7 @@ from agent.conversation_compression import (
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    emit_routine_compression_progress,
     recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
@@ -797,7 +798,7 @@ def build_turn_context(
                     model=agent.model,
                 )
                 if _idle_status:
-                    agent._emit_status(_idle_status)
+                    emit_routine_compression_progress(agent, _idle_status)
                 _idle_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_idle_tokens,
@@ -962,7 +963,7 @@ def build_turn_context(
                 model=agent.model,
             )
             if _preflight_status:
-                agent._emit_status(_preflight_status)
+                emit_routine_compression_progress(agent, _preflight_status)
             # Preflight passes honor the same configured per-turn cap
             # (compression.max_attempts) as the loop's compression sites;
             # default 3 preserves the prior hardcoded behavior.

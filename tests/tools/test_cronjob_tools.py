@@ -86,6 +86,39 @@ class TestCronjobRequirements:
             invalidate_check_fn_cache()
             _clear_tool_defs_cache()
 
+    def test_default_tool_schema_cache_tracks_task_local_gateway_session(
+        self, monkeypatch
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        for name in (
+            "HERMES_INTERACTIVE",
+            "HERMES_GATEWAY_SESSION",
+            "HERMES_EXEC_ASK",
+            "HERMES_CRON_SESSION",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+
+        unavailable = get_tool_definitions(quiet_mode=True)
+        assert "cronjob" not in {
+            tool["function"]["name"] for tool in unavailable
+        }
+
+        tokens = set_session_vars(platform="discord")
+        try:
+            available = get_tool_definitions(quiet_mode=True)
+            assert "cronjob" in {
+                tool["function"]["name"] for tool in available
+            }
+        finally:
+            clear_session_vars(tokens)
+            invalidate_check_fn_cache()
+            _clear_tool_defs_cache()
+
     def test_cron_session_never_inherits_gateway_management(self, monkeypatch):
         from gateway.session_context import clear_session_vars, set_session_vars
 
