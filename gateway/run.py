@@ -23534,7 +23534,7 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, runner=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -23556,6 +23556,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
     AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
+    DEADLOOP_GUARD_EVERY = 1 # ticks — every tick (~60s): fleet-safety runaway/wallet guard
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
@@ -23604,6 +23605,20 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     )
             except Exception as e:
                 logger.debug("Paste sweep error: %s", e)
+
+        # Dead-loop kill & report — fleet-safety runaway guard. Samples every
+        # running agent and hard-stops (interrupt + lease release + report) any
+        # session that crosses a runaway threshold (call/token rate, wall-clock
+        # cap, repeated non-retryable error, or huge context with no progress).
+        # Self-contained and defensive: run_guard_tick never raises. Gated by
+        # config (fleet_safety.deadloop_guard.enabled). Needs the runner for
+        # _running_agents; a no-runner caller (legacy shim) simply skips it.
+        if runner is not None and tick_count % DEADLOOP_GUARD_EVERY == 0:
+            try:
+                from gateway.fleet_safety.integration import run_guard_tick
+                run_guard_tick(runner, loop=loop)
+            except Exception as e:
+                logger.debug("Dead-loop guard tick error: %s", e)
 
         # Curator — piggy-back on the housekeeping loop so long-running
         # gateways get weekly skill maintenance without needing restarts.
@@ -24242,7 +24257,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "runner": runner},
         daemon=True,
         name="gateway-housekeeping",
     )
