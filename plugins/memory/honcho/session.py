@@ -7,6 +7,7 @@ import queue
 import re
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
@@ -22,6 +23,26 @@ logger = logging.getLogger(__name__)
 _ASYNC_SHUTDOWN = object()
 _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
+
+# HonchoSession.messages is a local cache of a session Honcho already
+# persists durably -- get_or_create() re-hydrates it from Honcho on a
+# cache miss (see `existing_messages` below). Nothing here is the sole
+# copy of anything, so both of these bounds are safe to enforce:
+#
+# - _SESSION_MESSAGE_RETENTION caps how many already-synced messages a
+#   live HonchoSession keeps locally.  get_history() only ever reads a
+#   small recent window (default 50), so retaining unbounded history
+#   past that serves no purpose and grows without limit for any
+#   session that outlives a handful of turns.
+# - _SESSION_IDLE_TTL_SECONDS / _SESSION_SWEEP_INTERVAL_SECONDS bound how
+#   long an idle session (and its peer/session/context cache entries) is
+#   kept in HonchoSessionManager's process-lifetime dicts, which
+#   otherwise have no eviction path short of an explicit /new reset.
+#   Eviction just costs one extra Honcho round-trip next time that key
+#   is used.
+_SESSION_MESSAGE_RETENTION = 200
+_SESSION_IDLE_TTL_SECONDS = 3600
+_SESSION_SWEEP_INTERVAL_SECONDS = 300
 
 
 @dataclass
@@ -104,6 +125,7 @@ class HonchoSessionManager:
         self._cache_lock = threading.RLock()
         self._peers_cache: dict[str, Any] = {}
         self._sessions_cache: dict[str, Any] = {}
+        self._last_idle_sweep_ts: float = 0.0
 
         # Write frequency state
         write_frequency = (config.write_frequency if config else "async")
@@ -360,6 +382,44 @@ class HonchoSessionManager:
 
         return self._session_key_fallback_peer_id(key)
 
+    def _sweep_idle_sessions_locked(self) -> int:
+        """Evict local cache entries idle beyond ``_SESSION_IDLE_TTL_SECONDS``.
+
+        Honcho is the source of truth for message history -- ``get_or_create``
+        re-fetches from Honcho on a cache miss -- so dropping an idle local
+        entry never loses data, it only costs one extra Honcho round-trip the
+        next time that session key is used. Must be called with
+        ``_cache_lock`` held.
+        """
+        cutoff = time.time() - _SESSION_IDLE_TTL_SECONDS
+        evicted = 0
+        for key, session in list(self._cache.items()):
+            if session.updated_at.timestamp() >= cutoff:
+                continue
+            del self._cache[key]
+            self._sessions_cache.pop(session.honcho_session_id, None)
+            self._context_cache.pop(key, None)
+            evicted += 1
+        return evicted
+
+    def _maybe_sweep_idle_sessions(self) -> None:
+        """Rate-limited idle-session sweep, triggered opportunistically.
+
+        Called from ``get_or_create`` on every lookup rather than from a
+        dedicated background task, so this manager stays usable from both
+        the gateway's event loop and the plain-CLI path without any watcher
+        wiring. ``_SESSION_SWEEP_INTERVAL_SECONDS`` keeps the actual sweep
+        (an O(len(_cache)) scan) rare relative to lookup volume.
+        """
+        now = time.time()
+        with self._cache_lock:
+            if now - self._last_idle_sweep_ts < _SESSION_SWEEP_INTERVAL_SECONDS:
+                return
+            self._last_idle_sweep_ts = now
+            evicted = self._sweep_idle_sessions_locked()
+        if evicted:
+            logger.info("Honcho session cache idle sweep: evicted %d session(s)", evicted)
+
     def get_or_create(self, key: str) -> HonchoSession:
         """
         Get an existing session or create a new one.
@@ -370,6 +430,8 @@ class HonchoSessionManager:
         Returns:
             The session.
         """
+        self._maybe_sweep_idle_sessions()
+
         with self._cache_lock:
             if key in self._cache:
                 logger.debug("Local session cache hit: %s", key)
@@ -419,6 +481,23 @@ class HonchoSessionManager:
             self._cache[key] = session
         return session
 
+    @staticmethod
+    def _trim_synced_messages(session: HonchoSession) -> None:
+        """Drop already-synced messages beyond ``_SESSION_MESSAGE_RETENTION``.
+
+        ``session.messages`` is chronologically ordered and only ever
+        appended to, so synced entries are always the oldest ones; trimming
+        from the front until back within the cap (or hitting an unsynced
+        message) preserves order and never touches a message that hasn't
+        made it to Honcho yet. Called right after a successful flush, so the
+        excess trimmed per call is small -- the O(n) ``pop(0)`` cost stays
+        negligible in practice.
+        """
+        excess = len(session.messages) - _SESSION_MESSAGE_RETENTION
+        while excess > 0 and session.messages and session.messages[0].get("_synced"):
+            session.messages.pop(0)
+            excess -= 1
+
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
         if not session.messages:
@@ -447,6 +526,7 @@ class HonchoSessionManager:
             for msg in new_messages:
                 msg["_synced"] = True
             logger.debug("Synced %d messages to Honcho for %s", len(honcho_messages), session.key)
+            self._trim_synced_messages(session)
             with self._cache_lock:
                 self._cache[session.key] = session
             return True
