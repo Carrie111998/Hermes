@@ -216,6 +216,19 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
     assert session_db.get_session(source_id)["end_reason"] == "branched"
 
+    stored_fork = session_db.get_session(fork["id"])
+    model_config = stored_fork.get("model_config")
+    if isinstance(model_config, str):
+        import json
+
+        model_config = json.loads(model_config)
+    assert model_config["_branched_from"] == source_id
+    assert fork["id"] in [s["id"] for s in session_db.list_sessions_rich()]
+
+    session_db.reopen_session(source_id)
+    session_db.end_session(source_id, "tui_shutdown")
+    assert fork["id"] in [s["id"] for s in session_db.list_sessions_rich()]
+
 
 @pytest.mark.asyncio
 async def test_session_chat_loads_history_and_preserves_session_headers(auth_adapter, session_db):
