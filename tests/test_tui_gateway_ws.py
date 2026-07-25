@@ -44,6 +44,83 @@ def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
     assert calls == [{"logger": ws_mod._log, "thread_name": "tui-ws-mcp-discovery"}]
 
 
+def test_ws_sends_ready_frame_before_starting_mcp_discovery(monkeypatch):
+    """gateway.ready must hit the wire before MCP discovery starts.
+
+    Discovery's import/connect work holds the GIL hard enough on MCP-heavy
+    configs to starve the event loop for 10s+; when it ran before the ready
+    frame, desktop clients timed out waiting for gateway.ready and dropped the
+    socket ("ws ready frame send failed", boot-failure overlay -- #62771,
+    #71226). The agent build is unaffected by the later start: _make_agent
+    waits on the discovery thread via wait_for_mcp_discovery regardless of
+    when it was spawned (#38945).
+    """
+    events = []
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **kw: events.append("discovery_started"),
+    )
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            frame = json.loads(line)
+            events.append(frame.get("params", {}).get("type"))
+
+        async def receive_text(self):
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    server._sessions.clear()
+    try:
+        asyncio.run(ws_mod.handle_ws(FakeWS()))
+    finally:
+        server._sessions.clear()
+
+    assert "gateway.ready" in events
+    assert "discovery_started" in events
+    assert events.index("gateway.ready") < events.index("discovery_started")
+
+
+def test_ws_skips_mcp_discovery_when_ready_send_fails(monkeypatch):
+    """A client that died before gateway.ready could be delivered should not
+    spawn discovery from this connection -- handle_ws returns on the failed
+    ready send, and the next (live) connection starts discovery instead
+    (start_background_mcp_discovery is idempotent per process)."""
+    events = []
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **kw: events.append("discovery_started"),
+    )
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            raise ws_mod._WebSocketDisconnect()
+
+        async def receive_text(self):
+            raise AssertionError("receive loop must not be reached")
+
+        async def close(self):
+            pass
+
+    server._sessions.clear()
+    try:
+        asyncio.run(ws_mod.handle_ws(FakeWS()))
+    finally:
+        server._sessions.clear()
+
+    assert events == []
+
+
 def _run_disconnect(monkeypatch, seed):
     """Drive handle_ws to its disconnect `finally`, seeding sessions against the
     live WSTransport the moment it exists. Returns nothing; inspect _sessions."""
