@@ -10,12 +10,30 @@ import { coalesceToolOnlyAssistants, createToolMergeCache, toRuntimeMessage } fr
  * tool-only assistant turns into their neighbour). Shared by the main chat's
  * runtime boundary and session tiles — one transcript pipeline, N surfaces.
  */
-export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMessageRepository {
+export function useRuntimeMessageRepository(
+  messages: ChatMessage[],
+  repositoryScopeKey: string
+): ExportedMessageRepository {
   const cacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
   const toolMergeCacheRef = useRef(createToolMergeCache())
+
   // Source-id occurrence slots survive clone-based rerenders. Once a slot has a
   // renderer id, it keeps it so a later source id cannot steal that identity.
-  const repositoryIdsBySourceRef = useRef(new Map<string, string[]>())
+  // Reservations belong to one durable transcript lineage, not to this hook's
+  // lifetime: ChatRuntimeBoundary survives navigation between sessions.
+  const repositoryIdStateRef = useRef({
+    scopeKey: repositoryScopeKey,
+    idsBySource: new Map<string, string[]>()
+  })
+
+  if (repositoryIdStateRef.current.scopeKey !== repositoryScopeKey) {
+    repositoryIdStateRef.current = {
+      scopeKey: repositoryScopeKey,
+      idsBySource: new Map<string, string[]>()
+    }
+  }
+
+  const repositoryIdsBySource = repositoryIdStateRef.current.idsBySource
 
   return useMemo(() => {
     const items: { message: ThreadMessage; parentId: string | null }[] = []
@@ -30,13 +48,13 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
 
       return {
         occurrence,
-        previousRepositoryId: repositoryIdsBySourceRef.current.get(message.id)?.[occurrence]
+        previousRepositoryId: repositoryIdsBySource.get(message.id)?.[occurrence]
       }
     })
 
     // Historical projected identities stay reserved even while their source slot
     // is absent, so a new source id cannot steal an identity that may return.
-    const repositoryIds = new Set([...repositoryIdsBySourceRef.current.values()].flat())
+    const repositoryIds = new Set([...repositoryIdsBySource.values()].flat())
 
     let visibleParentId: string | null = null
     let headId: string | null = null
@@ -57,9 +75,9 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
       repositoryIds.add(repositoryId)
 
       if (!slot?.previousRepositoryId) {
-        const assignments = repositoryIdsBySourceRef.current.get(message.id) ?? []
+        const assignments = repositoryIdsBySource.get(message.id) ?? []
         assignments[slot?.occurrence ?? 0] = repositoryId
-        repositoryIdsBySourceRef.current.set(message.id, assignments)
+        repositoryIdsBySource.set(message.id, assignments)
       }
 
       let parentId = visibleParentId
@@ -91,5 +109,5 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
     }
 
     return ExportedMessageRepository.fromBranchableArray(items, { headId })
-  }, [messages])
+  }, [messages, repositoryIdsBySource])
 }
