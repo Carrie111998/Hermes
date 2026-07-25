@@ -50,6 +50,22 @@ from .models import (
     SubmissionRequest,
 )
 from .policy import ExecutionPolicy
+from .session_lifecycle import (
+    PaperTradingSession,
+    PaperTradingSessionEvent,
+    PaperTradingSessionEventType,
+    PaperTradingSessionPolicy,
+    PaperTradingSessionStatus,
+    PaperTradingSessionTransitionError,
+    certify_paper_trading_session,
+    fail_paper_trading_session,
+    pause_paper_trading_session,
+    prepare_paper_trading_session,
+    record_paper_trading_activity,
+    request_paper_trading_session_close,
+    resume_paper_trading_session,
+    start_paper_trading_session,
+)
 from .reconciliation import reconcile_order
 
 __all__ = [
@@ -92,4 +108,18 @@ __all__ = [
     "evaluate_execution_input",
     "execute_admitted_orders",
     "reconcile_order",
+    "PaperTradingSession",
+    "PaperTradingSessionEvent",
+    "PaperTradingSessionEventType",
+    "PaperTradingSessionPolicy",
+    "PaperTradingSessionStatus",
+    "PaperTradingSessionTransitionError",
+    "certify_paper_trading_session",
+    "fail_paper_trading_session",
+    "pause_paper_trading_session",
+    "prepare_paper_trading_session",
+    "record_paper_trading_activity",
+    "request_paper_trading_session_close",
+    "resume_paper_trading_session",
+    "start_paper_trading_session",
 ]
