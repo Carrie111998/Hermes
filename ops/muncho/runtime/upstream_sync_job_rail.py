@@ -58,6 +58,8 @@ GH_PATH = Path("/usr/bin/gh")
 GIT_PATH = Path("/usr/bin/git")
 RELEASES_ROOT = Path("/opt/adventico-ai-platform/hermes-agent-releases")
 HERMES_HOME = Path("/opt/adventico-ai-platform/hermes-home")
+SYSTEMD_STUB_RESOLV_CONF = Path("/run/systemd/resolve/stub-resolv.conf")
+SYSTEMD_UPLINK_RESOLV_CONF = Path("/run/systemd/resolve/resolv.conf")
 SOURCE_MARKER_RELATIVE = Path(".codex-source-commit")
 RAIL_RELATIVE = Path("ops/muncho/runtime/upstream_sync_job_rail.py")
 MUNCHO_ROUTINE_RELATIVE = Path(
@@ -289,6 +291,7 @@ def render_sync_service(
         f"AssertPathExists={release / HARDENING_RELATIVE}",
         f"AssertPathExists={release / SKYAI_ROUTINE_RELATIVE}",
         f"AssertPathExists={CREDENTIAL_SOURCE}",
+        f"AssertPathExists={SYSTEMD_STUB_RESOLV_CONF}",
         "",
         "[Service]",
         "Type=oneshot",
@@ -342,6 +345,10 @@ def render_sync_service(
         "RestrictSUIDSGID=yes",
         "SystemCallArchitectures=native",
         "IPAddressDeny=169.254.169.254/32",
+        (
+            f"BindReadOnlyPaths={SYSTEMD_STUB_RESOLV_CONF}:"
+            f"{SYSTEMD_UPLINK_RESOLV_CONF}"
+        ),
         f"ReadOnlyPaths={release}",
         "ReadOnlyPaths=/usr/bin/git",
         "ReadOnlyPaths=/usr/bin/gh",
@@ -405,6 +412,7 @@ def render_report_service(
         f"AssertPathExists={reporter}",
         f"AssertPathExists={sender_python}",
         f"AssertPathExists={PUBLIC_REPORT_ROOT}",
+        f"AssertPathExists={SYSTEMD_STUB_RESOLV_CONF}",
         "",
         "[Service]",
         "Type=oneshot",
@@ -454,6 +462,11 @@ def render_report_service(
         "RestrictRealtime=yes",
         "RestrictSUIDSGID=yes",
         "SystemCallArchitectures=native",
+        "IPAddressDeny=169.254.169.254/32",
+        (
+            f"BindReadOnlyPaths={SYSTEMD_STUB_RESOLV_CONF}:"
+            f"{SYSTEMD_UPLINK_RESOLV_CONF}"
+        ),
         f"ReadOnlyPaths={release}",
         f"ReadOnlyPaths={sender_release}",
         f"ReadOnlyPaths={HERMES_HOME}",
@@ -508,6 +521,11 @@ def validate_sync_service(value: bytes, *, revision: str, release: Path) -> None
         f"LogsDirectory={LOGS_DIRECTORY_NAME}\n",
         "NoNewPrivileges=yes\n",
         "ProtectSystem=strict\n",
+        "IPAddressDeny=169.254.169.254/32\n",
+        (
+            f"BindReadOnlyPaths={SYSTEMD_STUB_RESOLV_CONF}:"
+            f"{SYSTEMD_UPLINK_RESOLV_CONF}\n"
+        ),
         "StandardOutput=null\n",
         f"{release / RAIL_RELATIVE} run-all ",
     )
@@ -560,6 +578,11 @@ def validate_report_service(
         f"--sender-python {sender_release / '.venv/bin/python'} ",
         f"--sender-python-sha256 {sender_python_sha256} ",
         "NoNewPrivileges=yes\n",
+        "IPAddressDeny=169.254.169.254/32\n",
+        (
+            f"BindReadOnlyPaths={SYSTEMD_STUB_RESOLV_CONF}:"
+            f"{SYSTEMD_UPLINK_RESOLV_CONF}\n"
+        ),
     )
     forbidden = (
         "LoadCredential=",

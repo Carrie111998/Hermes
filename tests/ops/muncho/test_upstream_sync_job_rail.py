@@ -99,6 +99,12 @@ def test_package_has_exact_two_jobs_and_split_credentials(
     assert "Environment=HERMES_HOME=" not in sync_service
     assert "AUTO_MERGE_DEPLOY_APPROVED" not in sync_service
     assert "muncho-auto-deploy-release" not in sync_service
+    assert "IPAddressDeny=169.254.169.254/32" in sync_service
+    assert (
+        f"BindReadOnlyPaths={rail.SYSTEMD_STUB_RESOLV_CONF}:"
+        f"{rail.SYSTEMD_UPLINK_RESOLV_CONF}"
+        in sync_service
+    )
 
     assert f"User={rail.REPORT_USER}" in report_service
     assert "LoadCredential=" not in report_service
@@ -109,6 +115,12 @@ def test_package_has_exact_two_jobs_and_split_credentials(
     assert str(release / rail.REPORTER_RELATIVE) in report_service
     assert (
         f"--sender-python-sha256 {manifest['sender_interpreter_sha256']}"
+        in report_service
+    )
+    assert "IPAddressDeny=169.254.169.254/32" in report_service
+    assert (
+        f"BindReadOnlyPaths={rail.SYSTEMD_STUB_RESOLV_CONF}:"
+        f"{rail.SYSTEMD_UPLINK_RESOLV_CONF}"
         in report_service
     )
 
