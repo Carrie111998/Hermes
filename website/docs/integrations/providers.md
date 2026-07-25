@@ -1132,7 +1132,7 @@ Set `model.max_tokens` only when you need to limit how long individual responses
 Hermes uses a multi-source resolution chain to detect the correct context window for your model and provider:
 
 1. **Config override** — `model.context_length` in config.yaml (highest priority)
-2. **Custom provider per-model** — `custom_providers[].models.<id>.context_length`
+2. **Custom provider per-model** — `providers[].models.<id>.context_length`
 3. **Persistent cache** — previously discovered values (survives restarts)
 4. **Endpoint `/models`** — queries your server's API (local/custom endpoints)
 5. **Anthropic `/v1/models`** — queries Anthropic's API for `max_input_tokens` (API-key users only)
@@ -1155,7 +1155,7 @@ model:
 For custom endpoints, you can also set context length per model:
 
 ```yaml
-custom_providers:
+providers:
   - name: "My Local LLM"
     base_url: "http://localhost:11434/v1"
     models:
@@ -1180,7 +1180,7 @@ custom_providers:
 If you work with multiple custom endpoints (e.g., a local dev server and a remote GPU server), you can define them as named custom providers in `config.yaml`:
 
 ```yaml
-custom_providers:
+providers:
   - name: local
     base_url: http://localhost:8080/v1
     # api_key omitted — Hermes uses "no-key-required" for keyless local servers
@@ -1197,7 +1197,7 @@ custom_providers:
 Some OpenAI-compatible endpoints need provider-specific request body fields. Add an `extra_body` map to the matching custom provider and Hermes will merge it into each chat-completions request for that endpoint:
 
 ```yaml
-custom_providers:
+providers:
   - name: gemma-local
     base_url: http://localhost:8080/v1
     model: google/gemma-4-31b-it
@@ -1234,7 +1234,7 @@ model:
   supports_vision: true   # send images natively; otherwise vision_analyze pre-describes them
 ```
 
-The same key is honored on per-named-provider models (`custom_providers[*].models[*].supports_vision`) and accepts standard YAML booleans (`true/false/yes/no/on/off/1/0`).
+The same key is honored on per-named-provider models (`providers[*].models[*].supports_vision`) and accepts standard YAML booleans (`true/false/yes/no/on/off/1/0`).
 
 Switch between them mid-session with the triple syntax:
 
@@ -1250,7 +1250,7 @@ You can also select named custom providers from the interactive `hermes model` m
 
 ### Cookbook: Together AI, Groq, Perplexity
 
-The cloud providers listed in [Other Compatible Providers](#other-compatible-providers) all speak OpenAI's REST dialect, so they wire up the same way under `custom_providers:`. Three worked recipes follow. Each drops into `~/.hermes/config.yaml` and the matching API key goes in `~/.hermes/.env`.
+The cloud providers listed in [Other Compatible Providers](#other-compatible-providers) all speak OpenAI's REST dialect, so they wire up the same way under `providers:`. Three worked recipes follow. Each drops into `~/.hermes/config.yaml` and the matching API key goes in `~/.hermes/.env`.
 
 #### Together AI
 
@@ -1258,7 +1258,7 @@ Hosts open-weight models (Llama, MiniMax, Gemma, DeepSeek, Qwen) at prices signi
 
 ```yaml
 # ~/.hermes/config.yaml
-custom_providers:
+providers:
   - name: together
     base_url: https://api.together.xyz/v1
     key_env: TOGETHER_API_KEY
@@ -1290,7 +1290,7 @@ Ultra-fast inference (~500 tok/s on Llama-3.3-70B). Small catalog but strong for
 
 ```yaml
 # ~/.hermes/config.yaml
-custom_providers:
+providers:
   - name: groq
     base_url: https://api.groq.com/openai/v1
     key_env: GROQ_API_KEY
@@ -1311,7 +1311,7 @@ Useful when you want a model that does live web search and citation automaticall
 
 ```yaml
 # ~/.hermes/config.yaml
-custom_providers:
+providers:
   - name: perplexity
     base_url: https://api.perplexity.ai
     key_env: PERPLEXITY_API_KEY
@@ -1331,7 +1331,7 @@ PERPLEXITY_API_KEY=your-perplexity-key
 The three recipes compose — use all of them together and switch per turn with `/model custom:<name>:<model>`:
 
 ```yaml
-custom_providers:
+providers:
   - name: together
     base_url: https://api.together.xyz/v1
     key_env: TOGETHER_API_KEY
@@ -1350,7 +1350,7 @@ model:
 :::tip Troubleshooting
 - `hermes doctor` should print no `Unknown provider` warnings for any of these names after the CLI validator fixes in #15083.
 - If a provider's `/v1/models` endpoint is unreachable (Perplexity is the common one), `hermes model` will persist the model with a warning rather than hard-reject — see #15136.
-- To skip `custom_providers:` entirely and use bare `provider: custom` with `CUSTOM_BASE_URL` env var, see #15103.
+- To skip `providers:` entirely and use bare `provider: custom` with `CUSTOM_BASE_URL` env var, see #15103.
 :::
 
 ---
