@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from gateway.message_timestamps import (
     coerce_message_timestamp,
     render_user_content_with_timestamp,
+    strip_discord_triggering_note,
     strip_leading_message_timestamps,
 )
 from run_agent import AIAgent
@@ -135,3 +136,32 @@ def test_build_history_injects_only_when_enabled():
     assert agent_history[0]["content"].endswith("hello")
     # Assistant message is never timestamped.
     assert agent_history[1]["content"] == "hi"
+
+
+def test_strip_discord_triggering_note_removes_leading_routing_metadata():
+    """Regression test for #71304.
+
+    The Discord adapter prepends an internal routing note (containing the
+    synthetic triggering message id) to the model-facing user message so the
+    agent can address reply/react/pin tool calls at the right message. That
+    note is gateway-generated metadata, not something the user said, and
+    must be stripped before persistence.
+    """
+    augmented = (
+        "[Triggering message id: `1234567890123456789` — use as "
+        "`message_id` for reply/react/pin via the discord tools.]\n\n"
+        "hey can you check the #general channel"
+    )
+
+    cleaned = strip_discord_triggering_note(augmented)
+
+    assert cleaned == "hey can you check the #general channel"
+    assert "Triggering message id" not in cleaned
+    assert "1234567890123456789" not in cleaned
+
+
+def test_strip_discord_triggering_note_is_noop_without_the_note():
+    plain = "just a normal message with no routing note"
+    assert strip_discord_triggering_note(plain) == plain
+    assert strip_discord_triggering_note("") == ""
+    assert strip_discord_triggering_note(None) is None

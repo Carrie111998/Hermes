@@ -189,6 +189,18 @@ def set_session_vars(
     # "ContextVar-authoritative, strip on _UNSET" — see session_context_engaged.
     global _session_context_engaged
     _session_context_engaged = True
+
+    # Chat/display names originate from untrusted platform metadata (e.g. a
+    # Matrix room name or member display name) and are later bridged into
+    # subprocess environments (HERMES_SESSION_CHAT_NAME / _USER_NAME) that
+    # get snapshotted via `export -p` and re-sourced by the terminal tool.
+    # Embedded newlines let an attacker smuggle extra shell commands into
+    # that snapshot (see #71296). Strip CR/LF here, at the single point
+    # where this untrusted text enters the session context, so no
+    # downstream consumer can be tricked by a multi-line value.
+    chat_name = chat_name.replace("\r", " ").replace("\n", " ") if chat_name else chat_name
+    user_name = user_name.replace("\r", " ").replace("\n", " ") if user_name else user_name
+
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
