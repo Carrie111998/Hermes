@@ -13,6 +13,7 @@ import { cn } from '@/lib/utils'
 
 import {
   DisconnectedHermesEngine,
+  LocalHermesEngine,
   type HermesAnalysisResult,
   type HermesSystemStatus,
   type SigilHermesEngine
@@ -459,7 +460,7 @@ function AuditTable({ events }: { events: AuditEvent[] }) {
   )
 }
 
-const disconnectedHermesEngine = new DisconnectedHermesEngine()
+const localHermesEngine = new LocalHermesEngine()
 
 interface SigilOperatorViewProps {
   adapter?: SigilOperatorAdapter
@@ -468,7 +469,7 @@ interface SigilOperatorViewProps {
 
 export function SigilOperatorView({
   adapter = sigilOperatorAdapter,
-  engine = disconnectedHermesEngine
+  engine = localHermesEngine
 }: SigilOperatorViewProps) {
   const [section, setSection] = useState<Section>('overview')
   const [snapshot, setSnapshot] = useState<SigilSnapshot | null>(null)
@@ -821,7 +822,12 @@ export function SigilOperatorView({
               {[
                 ['Product theme', 'Dark institutional'],
                 ['Execution mode', 'Paper and simulation only'],
-                ['Analysis assistance', 'Local disconnected adapter'],
+                [
+                  'Analysis assistance',
+                  hermesStatus?.status === 'connected'
+                    ? 'Governed Python bridge'
+                    : 'Local safety fallback'
+                ],
                 ['First-launch cap', snapshot.firstLaunchLimit],
                 ['Account display', 'Masked identifiers only']
               ].map(([label, value]) => (

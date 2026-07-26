@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { DisconnectedHermesEngine, type HermesProposalContext, type SigilHermesEngine } from './hermes-engine'
+import { DisconnectedHermesEngine, LocalHermesEngine, type HermesProposalContext, type SigilHermesEngine } from './hermes-engine'
 
 const proposal: HermesProposalContext = {
   proposalId: 'PRP-STEP36-0001',
@@ -91,5 +91,70 @@ describe('DisconnectedHermesEngine', () => {
     expect(keys).not.toContain('executeorder')
     expect(keys).not.toContain('connectbroker')
     expect(keys).not.toContain('increasecap')
+  })
+})
+
+describe('LocalHermesEngine', () => {
+  it('maps a verified Python bridge response into connected status', async () => {
+    const originalBridge = window.sigilDesktop
+
+    window.sigilDesktop = {
+      productName: 'Sigil',
+      persistenceNamespace: 'com.firecattechnology.sigil',
+      brokerSubmissionAvailable: false,
+      getBackendStatus: async () => ({
+        ok: true,
+        result: {
+          bridge_version: '1',
+          status: 'ok',
+          mode: 'local-read-only',
+          environment: 'paper',
+          simulation: true,
+          execution_authorized: false,
+          broker_submission_available: false,
+          supported_commands: ['health']
+        }
+      })
+    }
+
+    try {
+      const engine = new LocalHermesEngine()
+      const status = await engine.getSystemStatus()
+
+      expect(status.status).toBe('connected')
+      expect(status.source).toBe('local')
+      expect(status.modelRoute).toBe('python-bridge-v1')
+      expect(status.executionAuthorized).toBe(false)
+      expect(status.brokerSubmissionAvailable).toBe(false)
+    } finally {
+      window.sigilDesktop = originalBridge
+    }
+  })
+
+  it('fails safely when the Python bridge reports an error', async () => {
+    const originalBridge = window.sigilDesktop
+
+    window.sigilDesktop = {
+      productName: 'Sigil',
+      persistenceNamespace: 'com.firecattechnology.sigil',
+      brokerSubmissionAvailable: false,
+      getBackendStatus: async () => ({
+        ok: false,
+        error: 'backend_unavailable',
+        message: 'Backend unavailable.'
+      })
+    }
+
+    try {
+      const engine = new LocalHermesEngine()
+      const status = await engine.getSystemStatus()
+
+      expect(status.status).toBe('degraded')
+      expect(status.modelRoute).toBe('local-backend-unavailable')
+      expect(status.executionAuthorized).toBe(false)
+      expect(status.brokerSubmissionAvailable).toBe(false)
+    } finally {
+      window.sigilDesktop = originalBridge
+    }
   })
 })

@@ -133,7 +133,7 @@ function localResult(
 }
 
 export class DisconnectedHermesEngine implements SigilHermesEngine {
-  readonly status = 'disconnected' as const
+  readonly status: HermesEngineStatus = 'disconnected'
 
   async analyze(request: HermesAnalysisRequest): Promise<HermesAnalysisResult> {
     return localResult(
@@ -241,6 +241,117 @@ export class DisconnectedHermesEngine implements SigilHermesEngine {
       generatedAt: now(),
       executionAuthorized: false,
       brokerSubmissionAvailable: false
+    }
+  }
+}
+
+/**
+ * Reads governed local status through Electron's narrow preload bridge.
+ *
+ * All analytical methods currently retain the deterministic local fallback.
+ * Only system status crosses the IPC boundary in this phase.
+ */
+export class LocalHermesEngine extends DisconnectedHermesEngine {
+  override readonly status: HermesEngineStatus = 'connected'
+
+  override async explainProposal(
+    context: HermesProposalContext
+  ): Promise<HermesAnalysisResult> {
+    const bridge = window.sigilDesktop
+
+    if (!bridge) {
+      return super.explainProposal(context)
+    }
+
+    try {
+      const response = await bridge.explainProposal({
+        proposal_id: context.proposalId,
+        symbol: context.symbol,
+        side: context.side,
+        estimated_notional: context.estimatedNotional,
+        strategy: context.strategy,
+        evidence_references: context.evidenceReferences.map(reference => ({
+          id: reference.id,
+          ...(reference.label ? { label: reference.label } : {}),
+          ...(reference.source ? { source: reference.source } : {})
+        }))
+      })
+
+      if (!response.ok) {
+        throw new Error(response.message)
+      }
+
+      const result = response.result
+
+      return {
+        kind: result.kind,
+        summary: result.summary,
+        explanation: result.explanation,
+        modelRoute: result.model_route,
+        source: result.source,
+        confidence: result.confidence,
+        evidenceReferences: result.evidence_references,
+        generatedAt: result.generated_at,
+        executionAuthorized: false,
+        brokerSubmissionAvailable: false
+      }
+    } catch {
+      return super.explainProposal(context)
+    }
+  }
+
+  override async getSystemStatus(): Promise<HermesSystemStatus> {
+    const bridge = window.sigilDesktop
+
+    if (!bridge) {
+      return super.getSystemStatus()
+    }
+
+    try {
+      const response = await bridge.getBackendStatus()
+
+      if (!response.ok) {
+        return {
+          kind: 'system-status',
+          status: 'degraded',
+          source: 'local',
+          modelRoute: 'local-backend-unavailable',
+          message: response.message,
+          generatedAt: now(),
+          executionAuthorized: false,
+          brokerSubmissionAvailable: false
+        }
+      }
+
+      const backend = response.result
+
+      return {
+        kind: 'system-status',
+        status: backend.status === 'ok' ? 'connected' : 'degraded',
+        source: 'local',
+        modelRoute: `python-bridge-v${backend.bridge_version}`,
+        message:
+          `Sigil local backend is verified in ${backend.mode} mode. ` +
+          `Environment: ${backend.environment}. ` +
+          'Execution authorization and broker submission remain disabled.',
+        generatedAt: now(),
+        executionAuthorized: false,
+        brokerSubmissionAvailable: false
+      }
+    } catch (reason) {
+      return {
+        kind: 'system-status',
+        status: 'degraded',
+        source: 'local',
+        modelRoute: 'local-backend-error',
+        message:
+          reason instanceof Error
+            ? reason.message
+            : 'The local Sigil backend status could not be verified.',
+        generatedAt: now(),
+        executionAuthorized: false,
+        brokerSubmissionAvailable: false
+      }
     }
   }
 }
