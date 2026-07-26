@@ -675,7 +675,9 @@ def test_readonly_resolver_env_var_no_writes(monkeypatch):
     def spy_write_creds(*args, **kwargs):
         write_creds_calls.append((args, kwargs))
 
-    monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)
+    # Spy on BOTH the definition module binding AND the re-export binding
+    monkeypatch.setattr(credential_pool, "write_credential_pool", spy_write_pool)  # Definition module (catches direct calls)
+    monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)  # Re-export binding
     monkeypatch.setattr(credential_pool.CredentialPool, "_persist", spy_persist)
     monkeypatch.setattr(anthropic_adapter, "_write_claude_code_credentials", spy_write_creds)
 
@@ -730,7 +732,9 @@ def test_readonly_resolver_no_refresh_on_claude_code_creds(monkeypatch):
         write_creds_calls.append((args, kwargs))
 
     monkeypatch.setattr(anthropic_adapter, "_refresh_oauth_token", spy_refresh)
-    monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)
+    # Spy on BOTH the definition module binding AND the re-export binding
+    monkeypatch.setattr(credential_pool, "write_credential_pool", spy_write_pool)  # Definition module (catches direct calls)
+    monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)  # Re-export binding
     monkeypatch.setattr(credential_pool.CredentialPool, "_persist", spy_persist)
     monkeypatch.setattr(anthropic_adapter, "_write_claude_code_credentials", spy_write_creds)
 
@@ -791,7 +795,9 @@ def test_readonly_resolver_expired_token_mutation_sensitive(monkeypatch):
         raise AssertionError("_write_claude_code_credentials must not be called")
 
     monkeypatch.setattr(anthropic_adapter, "_refresh_oauth_token", spy_refresh)
-    monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)
+    # Spy on BOTH the definition module binding AND the re-export binding
+    monkeypatch.setattr(credential_pool, "write_credential_pool", spy_write_pool)  # Definition module (catches direct calls)
+    monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)  # Re-export binding
     monkeypatch.setattr(credential_pool.CredentialPool, "_persist", spy_persist)
     monkeypatch.setattr(anthropic_adapter, "_write_claude_code_credentials", spy_write_creds)
 
