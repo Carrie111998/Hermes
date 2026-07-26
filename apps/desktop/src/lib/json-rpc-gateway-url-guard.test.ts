@@ -4,6 +4,8 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { HermesGateway } from '@/hermes'
+
 class FakeSocket {
   static OPEN = 1
   readyState = 0
@@ -20,6 +22,22 @@ class FakeSocket {
   send = vi.fn()
 }
 
+class SlowFakeSocket {
+  static OPEN = 1
+  readyState = 0
+  addEventListener = vi.fn((type: string, handler: () => void) => {
+    if (type === 'open') {
+      setTimeout(() => {
+        this.readyState = SlowFakeSocket.OPEN
+        handler()
+      }, 20_000)
+    }
+  })
+  removeEventListener = vi.fn()
+  close = vi.fn()
+  send = vi.fn()
+}
+
 describe('JsonRpcGatewayClient connect() URL guard', () => {
   beforeEach(() => {
     vi.stubGlobal('WebSocket', FakeSocket) // jsdom has none; class reads WebSocket.OPEN
@@ -27,6 +45,7 @@ describe('JsonRpcGatewayClient connect() URL guard', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.useRealTimers()
   })
 
   it('rejects a non-string IPC result object', async () => {
@@ -61,5 +80,17 @@ describe('JsonRpcGatewayClient connect() URL guard', () => {
       await client.connect(url)
       expect(client.connectionState).toBe('open')
     }
+  })
+
+  it('allows Desktop to survive a slow local backend boot', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('WebSocket', SlowFakeSocket)
+
+    const client = new HermesGateway()
+    const connected = client.connect('ws://127.0.0.1:1234/api/ws?token=t')
+
+    await vi.advanceTimersByTimeAsync(20_000)
+    await expect(connected).resolves.toBeUndefined()
+    expect(client.connectionState).toBe('open')
   })
 })

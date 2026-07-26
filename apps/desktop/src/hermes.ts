@@ -223,6 +223,10 @@ export class HermesGateway extends JsonRpcGatewayClient {
   constructor() {
     super({
       closedErrorMessage: 'Hermes gateway connection closed',
+      // Local backend startup can briefly hold the Python GIL while Desktop
+      // initializes plugins and scheduled work. Keep the shared/web default
+      // strict, but allow this native client to survive a slow local boot.
+      connectTimeoutMs: 60_000,
       connectErrorMessage: 'Could not connect to Hermes gateway',
       createRequestId: nextId => nextId,
       notConnectedErrorMessage: 'Hermes gateway is not connected',
