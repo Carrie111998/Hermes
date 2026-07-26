@@ -1,12 +1,12 @@
 ---
 sidebar_position: 1
 title: "Nous Portal"
-description: "One subscription, 300+ frontier models, the Tool Gateway, and Nous Chat — the recommended way to run Hermes Agent"
+description: "One subscription, 300+ frontier models, the Tool Gateway, and Nous Chat — the recommended way to run IYARI"
 ---
 
 # Nous Portal
 
-[Nous Portal](https://portal.nousresearch.com) is Nous Research's unified subscription gateway and **the recommended way to run Hermes Agent**. One OAuth login replaces the juggling act of separate accounts, API keys, and billing relationships across every model lab, search API, image generator, and browser provider you'd otherwise need to wire up by hand.
+[Nous Portal](https://portal.nousresearch.com) is Nous Research's unified subscription gateway and **the recommended way to run IYARI**. One OAuth login replaces the juggling act of separate accounts, API keys, and billing relationships across every model lab, search API, image generator, and browser provider you'd otherwise need to wire up by hand.
 
 If you only have time to set up one thing, set up this. The fastest path:
 
@@ -46,7 +46,7 @@ Routing happens through OpenRouter under the hood, so model availability and fai
 
 ### The Nous Tool Gateway
 
-The same subscription unlocks the [Tool Gateway](/user-guide/features/tool-gateway), which routes Hermes Agent's tool calls through Nous-managed infrastructure. Five backends, one login:
+The same subscription unlocks the [Tool Gateway](/user-guide/features/tool-gateway), which routes IYARI's tool calls through Nous-managed infrastructure. Five backends, one login:
 
 | Tool | Partner | What it does |
 |------|---------|--------------|
@@ -66,7 +66,7 @@ Your Portal account also covers [chat.nousresearch.com](https://chat.nousresearc
 
 ### No credentials in your dotfiles
 
-Because everything routes through one OAuth-authenticated Portal session, you don't accumulate a `.env` file with a dozen long-lived API keys. The refresh token at `~/.hermes/auth.json` is the only credential on disk, and Hermes mints short-lived JWTs from it per request — see [Token handling](#token-handling) below.
+Because everything routes through one OAuth-authenticated Portal session, you don't accumulate a `.env` file with a dozen long-lived API keys. The refresh token at `~/.hermes/auth.json` is the only credential on disk, and IYARI mints short-lived JWTs from it per request — see [Token handling](#token-handling) below.
 
 ### Cross-platform parity
 
@@ -76,7 +76,7 @@ Because everything routes through one OAuth-authenticated Portal session, you do
 
 Nous Research's own **Hermes 4** family (Hermes-4-70B, Hermes-4-405B) is available through the Portal at heavily discounted rates. These are **frontier hybrid-reasoning chat models** — strong at math, science, instruction following, schema adherence, roleplay, and long-form writing.
 
-They are **not recommended for use inside Hermes Agent**, however. Hermes 4 is tuned for chat and reasoning, not the rapid-fire tool-calling loop the agent relies on. Use them for [Nous Chat](https://chat.nousresearch.com), for research workflows, or via the [subscription proxy](/user-guide/features/subscription-proxy) from other tooling — but for agent work, pick a frontier agentic model from the catalog instead:
+They are **not recommended for use inside IYARI**, however. Hermes 4 is tuned for chat and reasoning, not the rapid-fire tool-calling loop the agent relies on. Use them for [Nous Chat](https://chat.nousresearch.com), for research workflows, or via the [subscription proxy](/user-guide/features/subscription-proxy) from other tooling — but for agent work, pick a frontier agentic model from the catalog instead:
 
 ```bash
 /model anthropic/claude-sonnet-4.6     # best general-purpose agentic model
@@ -85,7 +85,7 @@ They are **not recommended for use inside Hermes Agent**, however. Hermes 4 is t
 /model deepseek/deepseek-v4-pro        # cost-effective coder
 ```
 
-The Portal's own [model info page](https://portal.nousresearch.com/info) carries the same warning, so this isn't a Hermes-side opinion — it's the official guidance from Nous Research.
+The Portal's own [model info page](https://portal.nousresearch.com/info) carries the same warning, so this isn't a IYARI-side opinion — it's the official guidance from Nous Research.
 
 ## Setup
 
@@ -108,7 +108,7 @@ If you don't have a subscription yet, sign up at [portal.nousresearch.com/manage
 
 ### Existing install — add Portal alongside other providers
 
-If you already have Hermes configured with OpenRouter, Anthropic, or any other provider and you want to add the Portal alongside them:
+If you already have IYARI configured with OpenRouter, Anthropic, or any other provider and you want to add the Portal alongside them:
 
 ```bash
 hermes model
@@ -120,11 +120,11 @@ Your existing providers stay configured. You can switch between them with `/mode
 
 ### Headless / SSH / remote setup
 
-OAuth needs a browser, but the loopback callback runs on the machine where Hermes is running. For remote hosts, see [OAuth over SSH / Remote Hosts](/guides/oauth-over-ssh) — the same patterns work for the Portal as for any other OAuth-based provider (`ssh -L` port forwarding).
+OAuth needs a browser, but the loopback callback runs on the machine where IYARI is running. For remote hosts, see [OAuth over SSH / Remote Hosts](/guides/oauth-over-ssh) — the same patterns work for the Portal as for any other OAuth-based provider (`ssh -L` port forwarding).
 
 ### Profile setup
 
-If you use [Hermes profiles](/user-guide/profiles), the Portal refresh token is automatically shared across all profiles via a shared token store. Sign in once on any profile, and the rest pick it up automatically — no need to repeat the OAuth flow per profile.
+If you use [IYARI profiles](/user-guide/profiles), the Portal refresh token is automatically shared across all profiles via a shared token store. Sign in once on any profile, and the rest pick it up automatically — no need to repeat the OAuth flow per profile.
 
 ## Using the Portal day-to-day
 
@@ -193,7 +193,7 @@ hermes tools
 # → TTS              → "Nous Subscription"
 ```
 
-The Tool Gateway is opt-in per tool, not all-or-nothing. The managed backends show up in `hermes tools` whether or not you're logged into Nous Portal — if you pick "Nous Subscription" before authenticating, Hermes runs the Portal login inline (it won't change your inference provider or touch your other tools). See the [Tool Gateway docs](/user-guide/features/tool-gateway) for the full per-tool configuration matrix.
+The Tool Gateway is opt-in per tool, not all-or-nothing. The managed backends show up in `hermes tools` whether or not you're logged into Nous Portal — if you pick "Nous Subscription" before authenticating, IYARI runs the Portal login inline (it won't change your inference provider or touch your other tools). See the [Tool Gateway docs](/user-guide/features/tool-gateway) for the full per-tool configuration matrix.
 
 ### Subscription management
 
@@ -233,9 +233,9 @@ The OAuth refresh token is stored separately at `~/.hermes/auth.json` (not in `c
 
 ## Token handling
 
-Hermes mints a short-lived JWT from your stored Portal refresh token on each inference call rather than reusing a long-lived API key. The token lifecycle is fully automatic — refresh, mint, retry on transient 401 — and you never see it.
+IYARI mints a short-lived JWT from your stored Portal refresh token on each inference call rather than reusing a long-lived API key. The token lifecycle is fully automatic — refresh, mint, retry on transient 401 — and you never see it.
 
-If the Portal invalidates the refresh token (password change, manual revoke, session expiry), the invalid refresh token is **quarantined locally** so Hermes stops replaying it and you don't see a stream of identical 401s. The next call surfaces a clear "re-authentication required" message. Run `hermes auth add nous` to log in again; the quarantine clears on the next successful login.
+If the Portal invalidates the refresh token (password change, manual revoke, session expiry), the invalid refresh token is **quarantined locally** so IYARI stops replaying it and you don't see a stream of identical 401s. The next call surfaces a clear "re-authentication required" message. Run `hermes auth add nous` to log in again; the quarantine clears on the next successful login.
 
 ## Troubleshooting
 
@@ -261,7 +261,7 @@ The Portal proxies through OpenRouter, so any model that OpenRouter supports is 
 /model anthropic/claude-opus-4.6
 ```
 
-If a model is genuinely missing, [open an issue](https://github.com/NousResearch/hermes-agent/issues) — we surface the Portal's catalog to Hermes and gaps usually mean a routing config we can update.
+If a model is genuinely missing, [open an issue](https://github.com/digital-services-llc/iyari/issues) — we surface the Portal's catalog to IYARI and gaps usually mean a routing config we can update.
 
 ### Bills not appearing on my Portal account
 
@@ -270,8 +270,8 @@ Check `hermes portal info` first — if it shows you're using a different provid
 ## See also
 
 - **[Tool Gateway](/user-guide/features/tool-gateway)** — Full details on every gateway tool, per-tool config, and pricing
-- **[Subscription proxy](/user-guide/features/subscription-proxy)** — Use your Portal subscription from non-Hermes tools (other agents, scripts, third-party clients)
+- **[Subscription proxy](/user-guide/features/subscription-proxy)** — Use your Portal subscription from non-IYARI tools (other agents, scripts, third-party clients)
 - **[Voice mode](/user-guide/features/voice-mode)** — Voice conversations using the Portal's OpenAI TTS
 - **[AI Providers](/integrations/providers)** — Full provider catalog if you want to compare alternatives
 - **[OAuth over SSH](/guides/oauth-over-ssh)** — Login from remote hosts or browser-only environments
-- **[Profiles](/user-guide/profiles)** — Multiple Hermes configurations sharing one Portal login
+- **[Profiles](/user-guide/profiles)** — Multiple IYARI configurations sharing one Portal login

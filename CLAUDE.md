@@ -117,6 +117,15 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   `NousResearch/hermes-example-plugins` (⚠️ FLAG: preservado; repointar solo si existe fork).
   Identity strings de prompt-assembly → "You are IYARI ... created by Digital Services LLC".
   2 refs a Discord de Nous → repo propio (precedente faq:844).
-- Pendiente GRUPO 5: `integrations/`, `docs/` sueltos, `userStories.json`.
+- Lote 14 (este commit): `integrations/` (3: index, nous-portal, providers). Página del
+  servicio de terceros Nous Portal → `--skip-nous-research`: las 5 `Nous Research` son
+  atribución factual de Nous Portal/Chat/modelo Hermes-4 a su dueño (precedente faq:20 =
+  dejar). **Falsos positivos de familia de modelos preservados a mano** (bare "Hermes" que
+  el lookahead no cubre): `**Hermes**` (fila tabla de familias), `Hermes 2/3` (×2, parsers/
+  tool-calling), `Mistral, Hermes)` (lista de modelos). Ancla interna `#a-note-on-hermes-4`
+  intacta (heading "A note on Hermes 4" = modelo, no cambia). NOTA CLAVE: revisar SIEMPRE
+  bare "Hermes" en contexto de familia de modelos LLM (tablas, listas de parsers/tool-calling)
+  porque el lookahead solo protege "Hermes-3/4" y "Hermes 3/4" directos.
+- Pendiente GRUPO 5: `docs/` sueltos (raíz website/docs), `userStories.json`.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
