@@ -457,20 +457,21 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
-def _get_cdp_override() -> str:
-    """Return a normalized CDP URL override, or empty string.
+def _raw_cdp_override() -> str:
+    """Return the *unresolved* configured CDP override, or empty string.
 
     Precedence is:
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
     2. ``browser.cdp_url`` in config.yaml (persistent config)
 
-    When either is set, we skip both Browserbase and the local headless
-    launcher and connect directly to the supplied Chrome DevTools Protocol
-    endpoint.
+    This performs **no network I/O** — it only reports what the user configured.
+    Use it (or ``_has_cdp_override``) whenever only the presence/value of the
+    override matters; call ``_get_cdp_override`` when a concrete connectable
+    websocket URL is actually needed.
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
-        return _resolve_cdp_override(env_override)
+        return env_override
 
     try:
         from hermes_cli.config import read_raw_config
@@ -478,11 +479,34 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+def _has_cdp_override() -> bool:
+    """Whether a CDP override endpoint is *configured*, without resolving it.
+
+    Unlike ``_get_cdp_override`` this does no network request, so it is safe to
+    call on hot/startup paths (e.g. tool-schema assembly) that only need to know
+    whether an override is present.
+    """
+    return bool(_raw_cdp_override())
+
+
+def _get_cdp_override() -> str:
+    """Return a normalized, connectable CDP URL override, or empty string.
+
+    When an override is configured (see ``_raw_cdp_override``) we skip both
+    Browserbase and the local headless launcher and connect directly to the
+    supplied Chrome DevTools Protocol endpoint. Discovery-style endpoints are
+    resolved to a concrete ``webSocketDebuggerUrl`` via a blocking HTTP request,
+    so avoid calling this on startup paths — use ``_has_cdp_override`` there.
+    """
+    raw = _raw_cdp_override()
+    return _resolve_cdp_override(raw) if raw else ""
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -4739,8 +4763,13 @@ def check_browser_requirements() -> bool:
         return True
 
     # CDP override mode can connect to an existing remote/local browser endpoint
-    # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    # without requiring the local agent-browser binary on PATH. Only check that
+    # an override is *configured* here — resolving it issues a blocking
+    # ``/json/version`` request, and this runs during startup tool-schema
+    # assembly for every browser tool, so an unreachable endpoint would stall
+    # startup for the full request timeout (#71817). Resolution stays deferred
+    # to the browser-command paths that actually need the websocket URL.
+    if _has_cdp_override():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.

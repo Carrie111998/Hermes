@@ -187,6 +187,56 @@ class TestGetCdpOverride:
         with patch("hermes_cli.config.read_raw_config", return_value={}):
             assert bc.is_camofox_mode() is False
 
+
+class TestHasCdpOverride:
+    """``_has_cdp_override`` / ``_raw_cdp_override`` must report presence without
+    ever resolving the endpoint (no network I/O). See #71817."""
+
+    def test_reports_configured_override_without_network(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        with patch("hermes_cli.config.read_raw_config",
+                   return_value={"browser": {"cdp_url": HTTP_URL}}), \
+             patch("tools.browser_tool.requests.get") as mock_get:
+            assert browser_tool._raw_cdp_override() == HTTP_URL
+            assert browser_tool._has_cdp_override() is True
+
+        mock_get.assert_not_called()
+
+    def test_false_when_no_override_configured(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        with patch("hermes_cli.config.read_raw_config", return_value={}), \
+             patch("tools.browser_tool.requests.get") as mock_get:
+            assert browser_tool._raw_cdp_override() == ""
+            assert browser_tool._has_cdp_override() is False
+
+        mock_get.assert_not_called()
+
+    def test_check_browser_requirements_does_not_resolve_cdp(self, monkeypatch):
+        """Startup tool-schema assembly must not block resolving an unreachable
+        CDP endpoint: ``check_browser_requirements`` should short-circuit on a
+        configured override without issuing the ``/json/version`` request
+        (regression for the 10s+ startup stall in #71817)."""
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        def _boom(*args, **kwargs):  # pragma: no cover - must never run
+            raise AssertionError("check_browser_requirements resolved CDP at startup")
+
+        with patch("hermes_cli.config.read_raw_config",
+                   return_value={"browser": {"cdp_url": HTTP_URL}}), \
+             patch("tools.browser_tool.requests.get", side_effect=_boom) as mock_get:
+            assert browser_tool.check_browser_requirements() is True
+
+        mock_get.assert_not_called()
+
+
 class TestCreateCdpSession:
     """_create_cdp_session() must sanitize the CDP URL before logging.
 
