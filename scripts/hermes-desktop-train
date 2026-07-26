@@ -31,6 +31,8 @@ Commands:
   init     Create the local train configuration.
   status   Show live PR candidates and the last verified package manifest.
   sync     Recreate the isolated train worktree from current upstream main.
+           Composes without packaging, so it doubles as a preflight: it
+           reports every ref that conflicts, not just the first one.
   build    Sync, typecheck, run Desktop regressions, package, and record hash.
   launch   Launch only the last verified, hash-matching package.
   rebuild  Build, then launch the verified package.
@@ -109,6 +111,45 @@ list_open_prs() {
   gh pr list --repo "$REMOTE_REPO" --author "$PR_AUTHOR" --state open --limit 100 \
     --json number,headRefOid,headRefName,title,url \
     --jq '.[] | [.number, .headRefOid, .headRefName, .title, .url] | @tsv'
+}
+
+# How far upstream main has moved since a ref's merge-base. This is the number
+# that explains a conflict: a PR only rots because main advanced underneath it.
+pr_base_lag() {
+  local ref="$1" base
+  base="$(git --git-dir="$MIRROR" merge-base refs/heads/main "$ref" 2>/dev/null)" || { printf '?'; return 0; }
+  [[ -n "$base" ]] || { printf '?'; return 0; }
+  git --git-dir="$MIRROR" rev-list --count "$base..refs/heads/main" 2>/dev/null || printf '?'
+}
+
+# Print every conflicting entry recorded during one compose pass, with the
+# repair procedure. Entries are "label,branch,lag,url;" records.
+report_conflicts() {
+  local entries="$1" entry label branch lag url
+  say ""
+  say "✗ these refs conflict with current upstream main:"
+  local IFS=';'
+  for entry in $entries; do
+    [[ -n "$entry" ]] || continue
+    IFS=',' read -r label branch lag url <<<"$entry"
+    say ""
+    say "    $label — $lag upstream commit(s) landed since its base"
+    say "      branch: $branch"
+    [[ -n "$url" ]] && say "      $url"
+  done
+  unset IFS
+  say ""
+  say "  Repair each against current upstream in its own worktree, then rebuild:"
+  say "    git worktree add --detach <path> <pr-head>"
+  say "    cd <path> && git rebase refs/remotes/upstream/main"
+  say "    # compose both sides, run tests/typecheck/lint, then push with an exact lease:"
+  say "    git push --force-with-lease=refs/heads/<branch>:<recorded-old-sha> \\"
+  say "      origin HEAD:refs/heads/<branch>"
+  say ""
+  say "  This is one compose pass: refs are merged in sequence, so repairing"
+  say "  these can still uncover further conflicts on the next run."
+  say ""
+  return 0
 }
 
 remove_train_worktree() {
@@ -195,7 +236,7 @@ sync_train() {
   upstream_head="$(git --git-dir="$MIRROR" rev-parse refs/heads/main)"
   git --git-dir="$MIRROR" worktree add --detach "$TRAIN_WORKTREE" "$upstream_head"
 
-  local open_prs="" local_refs="" number sha branch title url
+  local open_prs="" local_refs="" conflicted="" number sha branch title url
   while IFS=$'\t' read -r number sha branch title url; do
     [[ "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || { invalidate_train; die "invalid PR response"; }
     say "▸ merging PR #$number: $title"
@@ -215,9 +256,16 @@ sync_train() {
       die "PR #$number changed during train sync; retry"
     fi
     if ! git -C "$TRAIN_WORKTREE" merge --no-edit --no-ff "refs/train/pr/$number"; then
-      rm -f "$pr_file"
-      invalidate_train
-      die "merge conflict on PR #$number; train invalidated"
+      # Do not stop at the first conflict. Abort this one and keep composing so
+      # a single run names every stale ref: discovering them one rebuild at a
+      # time turns one upstream advance into days of serialized repairs. The
+      # train is still invalidated below — a conflicting PR is never dropped.
+      git -C "$TRAIN_WORKTREE" merge --abort 2>/dev/null \
+        || git -C "$TRAIN_WORKTREE" reset --hard HEAD >/dev/null 2>&1 \
+        || true
+      say "  ✗ conflict on PR #$number — recorded, continuing to check the rest"
+      conflicted+="PR #$number,$branch,$(pr_base_lag "refs/train/pr/$number"),$url;"
+      continue
     fi
     open_prs+="$number,$sha,$branch,$url;"
   done <"$pr_file"
@@ -233,11 +281,23 @@ sync_train() {
       die "could not fetch local ref: $ref"
     fi
     if ! git -C "$TRAIN_WORKTREE" merge --no-edit --no-ff "refs/train/local/$safe_ref"; then
-      invalidate_train
-      die "merge conflict on local ref $ref; train invalidated"
+      git -C "$TRAIN_WORKTREE" merge --abort 2>/dev/null \
+        || git -C "$TRAIN_WORKTREE" reset --hard HEAD >/dev/null 2>&1 \
+        || true
+      say "  ✗ conflict on local ref $ref — recorded, continuing to check the rest"
+      conflicted+="local ref $ref,$ref,$(pr_base_lag "refs/train/local/$safe_ref"),;"
+      continue
     fi
     local_refs+="$ref;"
   done < <(read_local_refs)
+
+  # Fail closed: any conflict recorded above invalidates the whole train. The
+  # composed worktree is missing those refs, so it must never be packaged.
+  if [[ -n "$conflicted" ]]; then
+    invalidate_train
+    report_conflicts "$conflicted"
+    die "train invalidated by merge conflicts against upstream main"
+  fi
 
   manifest_write "$(git -C "$TRAIN_WORKTREE" rev-parse HEAD)" "$upstream_head" "$open_prs" "$local_refs"
   say "✓ train synchronized: $(git -C "$TRAIN_WORKTREE" rev-parse --short HEAD)"

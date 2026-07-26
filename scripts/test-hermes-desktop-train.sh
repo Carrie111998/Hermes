@@ -110,12 +110,19 @@ fi
 rm "$STATE/local-refs.txt"
 printf 'local/follow-up\n' >"$STATE/local-refs.txt"; chmod 600 "$STATE/local-refs.txt"
 
-# Failed merge invalidates the partial worktree and manifest.
-if FAKE_MERGE_FAIL=1 HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" FAKE_CALLS="$CALLS" "$TRAIN" sync >/dev/null 2>&1; then
+# Failed merge invalidates the partial worktree and manifest, and one pass
+# names every conflicting ref rather than stopping at the first — discovering
+# them one rebuild at a time is what turns an upstream advance into days of
+# serialized repairs.
+CONFLICT_OUT="$TMP/conflicts.txt"
+if FAKE_MERGE_FAIL=1 HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" FAKE_CALLS="$CALLS" "$TRAIN" sync >"$CONFLICT_OUT" 2>&1; then
   echo 'FAIL: merge failure was accepted' >&2; exit 1
 fi
 test ! -e "$WORKTREE"
 test ! -e "$STATE/manifest.tsv"
+grep -Fq 'PR #101' "$CONFLICT_OUT" || { echo 'FAIL: first conflicting PR not reported' >&2; exit 1; }
+grep -Fq 'PR #102' "$CONFLICT_OUT" || { echo 'FAIL: stopped at the first conflict; PR #102 unreported' >&2; exit 1; }
+grep -Fq 'local ref local/follow-up' "$CONFLICT_OUT" || { echo 'FAIL: conflicting local ref not reported' >&2; exit 1; }
 
 # Recreate the worktree, then prove a hash-mismatched manifest refuses launch.
 run_train sync >/dev/null
