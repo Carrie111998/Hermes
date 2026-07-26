@@ -5802,12 +5802,6 @@ def run_conversation(
                     final_response = agent._terminal_tool_result_error
                     messages.append({"role": "assistant", "content": final_response})
                     agent._emit_status(f"⚠️ {final_response}")
-                    if agent.stream_delta_callback:
-                        try:
-                            agent.stream_delta_callback(final_response)
-                            agent.stream_delta_callback(None)
-                        except Exception:
-                            pass
                     break
 
                 if agent._terminal_tool_result is not None:
@@ -5819,7 +5813,6 @@ def run_conversation(
                         if agent.stream_delta_callback:
                             try:
                                 agent.stream_delta_callback(final_response)
-                                agent.stream_delta_callback(None)
                             except Exception:
                                 pass
                     break

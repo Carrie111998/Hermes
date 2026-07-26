@@ -4374,6 +4374,8 @@ class TestRunConversation:
             "is_terminal_result_tool",
             lambda name: name == "web_search",
         )
+        streamed: list[str | None] = []
+        agent.stream_delta_callback = streamed.append
         with (
             patch("run_agent.handle_function_call", return_value=terminal_result),
             patch.object(agent, "_persist_session"),
@@ -4387,6 +4389,9 @@ class TestRunConversation:
         assert result["turn_exit_reason"] == "terminal_tool_result"
         assert result["api_calls"] == 1
         assert agent.client.chat.completions.create.call_count == 1
+        # Existing tool-boundary break first; the terminal answer must not add
+        # a trailing break because the gateway's normal finish finalizes it.
+        assert streamed == [None, answer]
 
     def test_invalid_terminal_tool_result_fails_without_model_rewrite(
         self,
@@ -4408,6 +4413,8 @@ class TestRunConversation:
             "is_terminal_result_tool",
             lambda name: name == "web_search",
         )
+        streamed: list[str | None] = []
+        agent.stream_delta_callback = streamed.append
         with (
             patch(
                 "run_agent.handle_function_call",
@@ -4432,6 +4439,9 @@ class TestRunConversation:
         assert result["turn_exit_reason"] == "invalid_terminal_tool_result"
         assert "does not match answer" in result["final_response"]
         assert agent.client.chat.completions.create.call_count == 1
+        # The ordinary pre-tool segment break remains, but invalid terminal
+        # content is never streamed to the participant.
+        assert streamed == [None]
 
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
