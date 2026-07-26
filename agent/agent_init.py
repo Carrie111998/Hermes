@@ -780,6 +780,12 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Acceptance is a turn-scoped lease, not merely a writable mailbox. The
+    # generation fences a cached AIAgent reused for a later run; the open bit
+    # closes atomically with the final drain so steer() cannot report success
+    # after the last delivery checkpoint.
+    agent._steer_run_generation = 0
+    agent._steer_checkpoint_open = False
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn

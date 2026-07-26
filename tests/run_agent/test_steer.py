@@ -7,6 +7,7 @@ and prompt-cache integrity.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import threading
 
 import pytest
@@ -40,6 +41,9 @@ def _bare_agent() -> AIAgent:
     agent._strip_think_blocks = lambda content: content
     agent.quiet_mode = True
     agent.api_mode = "chat_completions"
+
+    agent._steer_run_generation = 1
+    agent._steer_checkpoint_open = True
     return agent
 
 
@@ -98,6 +102,77 @@ class TestActiveTurnRedirect:
 
         assert agent.redirect("too late") is False
         assert agent._pending_redirect is None
+
+    def test_rejects_after_checkpoint_is_closed(self):
+        agent = _bare_agent()
+        generation = agent._steer_run_generation
+
+        assert agent._close_steer_checkpoint(generation) is None
+        assert agent.steer("too late", run_generation=generation) is False
+        assert agent._pending_steer is None
+
+    def test_cached_agent_rejects_stale_generation_after_next_run_opens(self):
+        agent = _bare_agent()
+        generation_n = agent._steer_run_generation
+        agent._close_steer_checkpoint(generation_n)
+
+        generation_n_plus_one = agent._open_steer_checkpoint()
+
+        assert generation_n_plus_one > generation_n
+        assert agent.steer("stale result", run_generation=generation_n) is False
+        assert agent._pending_steer is None
+        assert agent.steer("current result", run_generation=generation_n_plus_one) is True
+
+    def test_checkpoint_close_race_never_returns_false_receipt(self):
+        """A concurrent close either owns the text or makes steer reject it."""
+        for _ in range(100):
+            agent = _bare_agent()
+            generation = agent._steer_run_generation
+            barrier = threading.Barrier(3)
+
+            def close_checkpoint():
+                barrier.wait()
+                return agent._close_steer_checkpoint(generation)
+
+            def steer_at_boundary():
+                barrier.wait()
+                return agent.steer("boundary update", run_generation=generation)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                close_future = executor.submit(close_checkpoint)
+                steer_future = executor.submit(steer_at_boundary)
+                barrier.wait()
+                leftover = close_future.result(timeout=2)
+                accepted = steer_future.result(timeout=2)
+
+            assert (accepted, leftover) in {
+                (False, None),
+                (True, "boundary update"),
+            }
+            assert agent._pending_steer is None
+
+    def test_run_wrapper_closes_checkpoint_and_returns_late_steer(self, monkeypatch):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            generation = live_agent._steer_run_generation
+            assert live_agent.steer("accepted before close", run_generation=generation)
+            return {"final_response": "done"}
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        result = agent.run_conversation("prompt")
+
+        assert result["pending_steer"] == "accepted before close"
+        assert agent.steer("after close") is False
+
 
     def test_reasoning_deltas_are_display_only(self):
         """Streamed reasoning must never accumulate into replayable transcript

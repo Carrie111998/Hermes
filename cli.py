@@ -39,6 +39,7 @@ import tempfile
 import time
 import uuid
 import textwrap
+from dataclasses import dataclass
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
@@ -47,6 +48,25 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SmartCliTurnSnapshot:
+    """Immutable ownership token for one active classic-CLI turn."""
+
+    generation: int
+    prompt: str
+    agent: Any
+
+
+@dataclass(frozen=True)
+class SmartCliRouteContext:
+    """Turn and steer lease captured when busy input is admitted."""
+
+    turn_snapshot: Optional[SmartCliTurnSnapshot]
+    agent: Any
+    steer_generation: Optional[int]
+    supports_generation: bool
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -4289,6 +4309,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._smart_cli_input_queue = queue.Queue()
         self._smart_cli_worker_lock = threading.Lock()
         self._smart_cli_worker = None
+        self._smart_cli_turn_lock = threading.Lock()
+        self._smart_cli_turn_generation = 0
+        self._smart_cli_active_snapshot: Optional[SmartCliTurnSnapshot] = None
 
         # self.verbose ONLY controls global DEBUG logging (root logger level).
         # display.tool_progress="verbose" controls tool-call rendering (full args,
@@ -7215,7 +7238,66 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def _route_smart_cli_input(self, text: str) -> str:
+    @property
+    def _smart_cli_active_turn(self) -> Optional[SmartCliTurnSnapshot]:
+        """Compatibility alias for early SMART snapshots used by extensions."""
+
+        return self._smart_cli_active_snapshot
+
+    @_smart_cli_active_turn.setter
+    def _smart_cli_active_turn(self, value: Any) -> None:
+        if value is None or isinstance(value, SmartCliTurnSnapshot):
+            self._smart_cli_active_snapshot = value
+            return
+        generation, prompt, agent = value
+        self._smart_cli_active_snapshot = SmartCliTurnSnapshot(
+            int(generation), str(prompt), agent
+        )
+
+    def _begin_smart_cli_turn(self, prompt: Any) -> SmartCliTurnSnapshot:
+        """Publish one immutable active-turn snapshot and mark the CLI busy."""
+        with self._smart_cli_turn_lock:
+            generation = int(self._smart_cli_turn_generation) + 1
+            snapshot = SmartCliTurnSnapshot(generation, str(prompt), self.agent)
+            self._smart_cli_turn_generation = generation
+            self._smart_cli_active_snapshot = snapshot
+            self._agent_running = True
+            return snapshot
+
+    def _finish_smart_cli_turn(self, snapshot: SmartCliTurnSnapshot) -> None:
+        """Close only the active-turn generation owned by ``snapshot``."""
+        with self._smart_cli_turn_lock:
+            if self._smart_cli_active_snapshot is snapshot:
+                self._smart_cli_active_snapshot = None
+                self._agent_running = False
+
+    def _capture_smart_cli_route_context(self) -> SmartCliRouteContext:
+        """Snapshot CLI turn and agent steering ownership for one input."""
+        with self._smart_cli_turn_lock:
+            snapshot = self._smart_cli_active_snapshot
+        agent = snapshot.agent if snapshot is not None else getattr(self, "agent", None)
+        generation_reader = getattr(type(agent), "get_steer_generation", None)
+        supports_steer_generation = callable(generation_reader)
+        steer_generation = None
+        if supports_steer_generation:
+            try:
+                candidate = agent.get_steer_generation()
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    steer_generation = candidate
+            except Exception:
+                logger.debug("Could not snapshot CLI steer generation", exc_info=True)
+        return SmartCliRouteContext(
+            turn_snapshot=snapshot,
+            agent=agent,
+            steer_generation=steer_generation,
+            supports_generation=supports_steer_generation,
+        )
+
+    def _route_smart_cli_input(
+        self,
+        text: str,
+        route_context: Optional[SmartCliRouteContext] = None,
+    ) -> str:
         """Classify and route one CLI follow-up without using interrupt."""
         from hermes_cli.smart_orchestrator import (
             ROUTE_AMBIGUOUS,
@@ -7239,18 +7321,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except (TypeError, ValueError):
             timeout = 12.0
 
-        agent = getattr(self, "agent", None)
-        active_goal = ""
-        if agent is not None:
-            try:
-                for message in reversed(getattr(agent, "messages", []) or []):
-                    if isinstance(message, dict) and message.get("role") == "user":
-                        content = message.get("content")
-                        if isinstance(content, str):
-                            active_goal = content
-                            break
-            except Exception:
-                active_goal = ""
+        if route_context is None:
+            route_context = self._capture_smart_cli_route_context()
+        turn_snapshot = route_context.turn_snapshot
+        agent = route_context.agent
+        supports_steer_generation = route_context.supports_generation
+        steer_generation = route_context.steer_generation
+        if turn_snapshot is not None:
+            active_goal = turn_snapshot.prompt
+        else:
+            active_goal = ""
         activity = {}
         if agent is not None:
             try:
@@ -7290,10 +7370,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             main_runtime=main_runtime or None,
         )
 
+        with self._smart_cli_turn_lock:
+            same_active_turn = (
+                turn_snapshot is not None
+                and self._smart_cli_active_snapshot is turn_snapshot
+                and self._agent_running
+                and agent is getattr(self, "agent", None)
+            )
+
         steered = False
         if (
-            getattr(self, "_agent_running", False)
-            and agent is getattr(self, "agent", None)
+            same_active_turn
+            and (not supports_steer_generation or steer_generation is not None)
             and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}
         ):
             steer_payload = payload
@@ -7301,9 +7389,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 steer_payload = build_parallel_steer_payload(payload)
             if steer_payload and hasattr(agent, "steer"):
                 try:
-                    steered = bool(agent.steer(steer_payload))
+                    if supports_steer_generation:
+                        steered = bool(
+                            agent.steer(
+                                steer_payload,
+                                run_generation=steer_generation,
+                            )
+                        )
+                    else:
+                        steered = bool(agent.steer(steer_payload))
                 except Exception:
                     steered = False
+
+        if steered and decision.route == ROUTE_INDEPENDENT:
+            # This is an instruction delivered to the active agent, not a
+            # receipt from a parallel worker. Keep the acknowledgment truthful.
+            decision = SmartRouteDecision(
+                route=ROUTE_RELATED,
+                confidence=decision.confidence,
+                reason="Parallel orchestration requested inside the active run.",
+                source="delivery",
+            )
 
         if not steered:
             self._pending_input.put(text)
@@ -7323,7 +7429,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Drain SMART follow-ups in FIFO order on one classifier worker."""
         while True:
             try:
-                text = self._smart_cli_input_queue.get_nowait()
+                item = self._smart_cli_input_queue.get_nowait()
             except queue.Empty:
                 with self._smart_cli_worker_lock:
                     if self._smart_cli_input_queue.empty():
@@ -7331,13 +7437,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         return
                 continue
             try:
-                self._route_smart_cli_input(text)
+                if item is None:
+                    return
+                text, route_context = item
+                self._route_smart_cli_input(text, route_context=route_context)
             finally:
                 self._smart_cli_input_queue.task_done()
 
     def _enqueue_smart_cli_input(self, text: str) -> None:
         """Submit a SMART follow-up without blocking prompt_toolkit's UI thread."""
-        self._smart_cli_input_queue.put(text)
+        route_context = self._capture_smart_cli_route_context()
+        self._smart_cli_input_queue.put((text, route_context))
         with self._smart_cli_worker_lock:
             worker = getattr(self, "_smart_cli_worker", None)
             if worker is not None and worker.is_alive():
@@ -13941,7 +14051,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         print(flush=True)
-        
+
+        smart_turn_snapshot = self._begin_smart_cli_turn(message)
+        text_queue = None
+        tts_thread = None
+        stop_event = None
+
         try:
             # Run the conversation with interrupt monitoring
             result = None
@@ -14607,6 +14722,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     stop_thinking_sound()
                 except Exception:
                     pass
+            self._finish_smart_cli_turn(smart_turn_snapshot)
             # Ensure streaming TTS resources are cleaned up even on error.
             # Normal path sends the sentinel at line ~3568; this is a safety
             # net for exception paths that skip it.  Duplicate sentinels are

@@ -7650,6 +7650,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             lock = asyncio.Lock()
             locks[session_key] = lock
 
+        # Capture ownership at admission, before waiting behind another SMART
+        # message.  Object identity alone is not a fence because GatewayRunner
+        # caches and reuses AIAgent instances across top-level turns.
+        generations = getattr(self, "_session_run_generation", {}) or {}
+        admitted_run_generation = generations.get(session_key)
+        generation_reader = getattr(type(running_agent), "get_steer_generation", None)
+        supports_steer_generation = callable(generation_reader)
+        admitted_steer_generation = None
+        if supports_steer_generation:
+            try:
+                candidate = running_agent.get_steer_generation()
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    admitted_steer_generation = candidate
+            except Exception:
+                logger.debug(
+                    "Unable to read steer generation for SMART session %s",
+                    session_key,
+                    exc_info=True,
+                )
+
         async with lock:
             if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
                 decision = SmartRouteDecision(
@@ -7673,8 +7693,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._queue_or_replace_pending_event(session_key, event)
                 await self._send_smart_busy_ack(event, session_key, adapter, decision)
-                if session_key not in self._running_agents:
-                    locks.pop(session_key, None)
                 return True
 
             try:
@@ -7695,10 +7713,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The active turn may finish while classification is in flight.  An
             # old result must never steer a replacement turn.
             current_agent = self._running_agents.get(session_key)
+            current_generations = getattr(self, "_session_run_generation", {}) or {}
+            same_gateway_generation = (
+                admitted_run_generation is None
+                or current_generations.get(session_key) == admitted_run_generation
+            )
             same_active_run = (
                 current_agent is running_agent
                 and current_agent is not None
                 and current_agent is not _AGENT_PENDING_SENTINEL
+                and same_gateway_generation
+                and (
+                    not supports_steer_generation
+                    or admitted_steer_generation is not None
+                )
             )
 
             steered = False
@@ -7708,13 +7736,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     steer_payload = build_parallel_steer_payload(payload)
                 if steer_payload and hasattr(running_agent, "steer"):
                     try:
-                        steered = bool(running_agent.steer(steer_payload))
+                        if supports_steer_generation:
+                            steered = bool(
+                                running_agent.steer(
+                                    steer_payload,
+                                    run_generation=admitted_steer_generation,
+                                )
+                            )
+                        else:
+                            steered = bool(running_agent.steer(steer_payload))
                     except Exception as exc:
                         logger.warning(
                             "SMART steer failed for session %s: %s",
                             session_key,
                             exc,
                         )
+
+            if steered and decision.route == ROUTE_INDEPENDENT:
+                # We delivered an orchestration instruction to the active run;
+                # no parallel worker has accepted ownership yet.  Do not emit
+                # the independent/parallel receipt until such a receipt exists.
+                decision = SmartRouteDecision(
+                    route=ROUTE_RELATED,
+                    confidence=decision.confidence,
+                    reason="Parallel orchestration requested inside the active run.",
+                    source="delivery",
+                )
 
             if not steered:
                 self._queue_or_replace_pending_event(session_key, event)
@@ -7727,8 +7774,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             await self._send_smart_busy_ack(event, session_key, adapter, decision)
-            if session_key not in self._running_agents:
-                locks.pop(session_key, None)
             return True
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
@@ -14399,6 +14444,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # approval replies and internal-event guards remain identical to
             # the non-priority path. Never fall through to legacy interrupt.
             if self._busy_input_mode == "smart":
+                if getattr(event, "internal", False):
+                    self._queue_or_replace_pending_event(_quick_key, event)
+                    return None
                 if await self._handle_active_session_busy_message(event, _quick_key):
                     return None
 

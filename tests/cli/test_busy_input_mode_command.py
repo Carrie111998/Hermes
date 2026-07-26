@@ -111,3 +111,15 @@ class TestBusyCommandRegistry(unittest.TestCase):
         busy = next(c for c in COMMAND_REGISTRY if c.name == "busy")
         assert busy.args_hint == "[smart|queue|steer|interrupt|status]"
         assert busy.category == "Configuration"
+
+    def test_busy_remains_cli_only_until_gateway_handler_exists(self):
+        from hermes_cli.commands import (
+            COMMAND_REGISTRY,
+            GATEWAY_KNOWN_COMMANDS,
+            gateway_help_lines,
+        )
+
+        busy = next(c for c in COMMAND_REGISTRY if c.name == "busy")
+        assert busy.cli_only is True
+        assert "busy" not in GATEWAY_KNOWN_COMMANDS
+        assert not any(line.startswith("`/busy") for line in gateway_help_lines())

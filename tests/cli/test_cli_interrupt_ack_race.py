@@ -156,6 +156,33 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
 
 
 
+def test_chat_opens_and_closes_smart_turn_snapshot_on_real_turn_path():
+    """The actual chat path, not only helper tests, owns SMART turn lifecycle."""
+    cli = _make_cli()
+    agent = _StubAgent(cli.session_id, turn_seconds=0)
+    cli.agent = agent
+    real_begin = cli._begin_smart_cli_turn
+    real_finish = cli._finish_smart_cli_turn
+
+    with patch.object(cli, "_begin_smart_cli_turn", wraps=real_begin) as begin, \
+         patch.object(cli, "_finish_smart_cli_turn", wraps=real_finish) as finish, \
+         patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("original")
+
+    begin.assert_called_once()
+    finish.assert_called_once()
+    turn_snapshot = finish.call_args.args[0]
+    assert turn_snapshot.generation == 1
+    assert turn_snapshot.prompt == "original"
+    assert turn_snapshot.agent is agent
+    assert cli._smart_cli_active_snapshot is None
+
+
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
     """Queued notes remain API-local and preserve close-handoff marker identity."""
     cli = _make_cli()

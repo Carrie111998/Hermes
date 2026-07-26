@@ -36,21 +36,23 @@ PROFILE_BUILD_FLAG = "profile_build_offered"
 def busy_input_hint_gateway(mode: str) -> str:
     """Hint shown the first time a user messages while the agent is busy.
 
-    ``mode`` is the effective busy_input_mode that was just applied, so the
-    message matches reality ("I just interrupted…" vs "I just queued…").
+    Gateway chats do not implement the CLI-only ``/busy`` command. The hint
+    therefore describes the effective managed policy without advertising a
+    control surface that would be rejected in chat.
     """
     if mode == "queue":
         return (
             "💡 First-time tip — I queued your message instead of interrupting. "
-            "Send `/busy interrupt` to make new messages stop the current task "
-            "immediately, or `/busy status` to check. This notice won't appear again."
+            "The gateway owner manages this policy with display.busy_input_mode. "
+            "This notice "
+            "won't appear again."
         )
     if mode == "steer":
         return (
             "💡 First-time tip — I steered your message into the current run; "
             "it will arrive after the next tool call instead of interrupting. "
-            "Send `/busy interrupt` or `/busy queue` to change this, or "
-            "`/busy status` to check. This notice won't appear again."
+            "The gateway owner manages display.busy_input_mode. This notice won't "
+            "appear again."
         )
     if mode == "redirect":
         return (
@@ -61,16 +63,15 @@ def busy_input_hint_gateway(mode: str) -> str:
         )
     if mode == "smart":
         return (
-            "💡 First-time tip — I classified your message and safely steered, "
-            "parallelized, or queued it without interrupting the active mission. "
-            "Send `/busy interrupt` to force legacy interrupt behavior, or "
-            "`/busy status` to check. This notice won't appear again."
+            "💡 First-time tip — I classified your message and safely steered or "
+            "queued it without interrupting the active mission. The gateway owner "
+            "manages display.busy_input_mode. This notice won't appear again."
         )
     return (
         "💡 First-time tip — I just interrupted my current task to answer you. "
-        "Send `/busy queue` to queue follow-ups for after the current task instead, "
-        "`/busy steer` to inject them mid-run without interrupting, or "
-        "`/busy status` to check. This notice won't appear again."
+        "The gateway owner can configure display.busy_input_mode to queue or steer "
+        "instead. "
+        "This notice won't appear again."
     )
 
 

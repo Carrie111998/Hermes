@@ -147,6 +147,18 @@ class TestBusyInputMode:
         assert cli._pending_input.empty()
 
 
+class TestSmartBusyStateInit:
+    def test_constructor_initializes_smart_turn_lifecycle_state(self):
+        """A real CLI instance must not depend on test-only/manual attributes."""
+        cli = _make_cli()
+
+        assert cli._smart_cli_turn_generation == 0
+        assert cli._smart_cli_active_snapshot is None
+        assert cli._smart_cli_worker is None
+        assert cli._smart_cli_input_queue.empty()
+        assert cli._smart_cli_turn_lock is not None
+
+
 class TestPromptToolkitTerminalCompatibility:
     def test_lf_enter_binds_to_submit_handler_posix(self):
         """Some thin PTYs deliver Enter as LF/c-j instead of CR/enter.

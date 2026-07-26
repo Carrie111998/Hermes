@@ -98,7 +98,7 @@ async def test_smart_related_steers_and_never_interrupts():
 
 
 @pytest.mark.asyncio
-async def test_smart_independent_steers_parallel_directive_not_raw_scope_switch():
+async def test_smart_independent_steers_parallel_directive_without_false_parallel_ack():
     runner, agent = _runner_and_agent()
     event = _event("research another market")
     sk = build_session_key(event.source)
@@ -117,6 +117,9 @@ async def test_smart_independent_steers_parallel_directive_not_raw_scope_switch(
     assert "delegate_task" in injected
     agent.interrupt.assert_not_called()
     runner._queue_or_replace_pending_event.assert_not_called()
+    # A steering instruction is not a parallel-worker receipt. Until a real
+    # worker accepts ownership, acknowledge only active-run delivery.
+    assert runner._send_smart_busy_ack.await_args.args[3].route == ROUTE_RELATED
 
 
 @pytest.mark.asyncio
@@ -225,6 +228,32 @@ async def test_smart_rechecks_active_agent_after_classification_race():
 
 
 @pytest.mark.asyncio
+async def test_smart_rejects_classifier_result_from_reused_agent_next_generation():
+    """Object identity is insufficient when the cached agent runs turn N+1."""
+    runner, agent = _runner_and_agent()
+    event = _event("update for turn N")
+    sk = build_session_key(event.source)
+    runner._running_agents[sk] = agent
+    runner._session_run_generation = {sk: 10}
+    runner._send_smart_busy_ack = AsyncMock()
+    runner._queue_or_replace_pending_event = MagicMock()
+
+    async def classify(*_args, **_kwargs):
+        # Same cached AIAgent object, but a new top-level turn owns it now.
+        runner._session_run_generation[sk] = 11
+        return await _decision(ROUTE_RELATED, event.text)
+
+    runner._classify_smart_busy_message = AsyncMock(side_effect=classify)
+
+    await runner._handle_smart_busy_message(event, sk, agent, MagicMock())
+
+    agent.steer.assert_not_called()
+    agent.interrupt.assert_not_called()
+    runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
+    assert runner._send_smart_busy_ack.await_args.args[3].route == ROUTE_AMBIGUOUS
+
+
+@pytest.mark.asyncio
 async def test_smart_per_session_lock_serializes_classification_order():
     runner, agent = _runner_and_agent()
     first = _event("first")
@@ -259,6 +288,73 @@ async def test_smart_per_session_lock_serializes_classification_order():
     await asyncio.gather(t1, t2)
     assert entered == ["first", "second"]
     assert [call.args[0] for call in agent.steer.call_args_list] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_smart_route_lock_remains_stable_with_waiter_and_third_arrival():
+    """A released handler cannot orphan a waiter behind a replacement lock."""
+    runner, agent = _runner_and_agent()
+    first = _event("first")
+    second = _event("second")
+    third = _event("third")
+    sk = build_session_key(first.source)
+    runner._running_agents[sk] = agent
+    runner._send_smart_busy_ack = AsyncMock()
+    runner._queue_or_replace_pending_event = MagicMock()
+
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_entered = asyncio.Event()
+    third_entered = asyncio.Event()
+    release_waiters = asyncio.Event()
+
+    async def classify(event, *_args, **_kwargs):
+        if event.text == "first":
+            # Force the current cleanup branch to consider the session idle.
+            # The second call is already waiting on this call's lock.
+            runner._running_agents.pop(sk, None)
+            first_entered.set()
+            await release_first.wait()
+        elif event.text == "second":
+            second_entered.set()
+            await release_waiters.wait()
+        else:
+            third_entered.set()
+            await release_waiters.wait()
+        return await _decision(ROUTE_DEPENDENT, event.text)
+
+    runner._classify_smart_busy_message = AsyncMock(side_effect=classify)
+    adapter = MagicMock()
+
+    first_task = asyncio.create_task(
+        runner._handle_smart_busy_message(first, sk, agent, adapter)
+    )
+    await first_entered.wait()
+    second_task = asyncio.create_task(
+        runner._handle_smart_busy_message(second, sk, agent, adapter)
+    )
+    # Let the second task register as a waiter before releasing the holder.
+    await asyncio.sleep(0)
+    release_first.set()
+    await first_task
+    await second_entered.wait()
+
+    # A new run may install the same cached object while the old waiter owns
+    # the routing lock. The third arrival must queue behind that waiter, not
+    # create a second lock and classify concurrently.
+    runner._running_agents[sk] = agent
+    third_task = asyncio.create_task(
+        runner._handle_smart_busy_message(third, sk, agent, adapter)
+    )
+    scheduler_probe = asyncio.Event()
+    asyncio.get_running_loop().call_soon(scheduler_probe.set)
+    await scheduler_probe.wait()
+    serialized = not third_entered.is_set()
+
+    release_waiters.set()
+    await asyncio.gather(second_task, third_task)
+
+    assert serialized, "third arrival bypassed a waiter via a replacement lock"
 
 
 @pytest.mark.asyncio

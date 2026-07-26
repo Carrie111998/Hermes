@@ -147,3 +147,50 @@ async def test_priority_path_does_not_interrupt_when_compression_in_flight():
     assert queued is not None and queued.text == "still there?"
 
 
+@pytest.mark.asyncio
+async def test_priority_path_still_interrupts_without_compression_lock():
+    """Sanity control: without a compression lock, the PRIORITY path's
+    default interrupt behavior is unchanged."""
+    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+
+    await runner._handle_message(_make_event("still there?"))
+
+    agent_mock.interrupt.assert_called_once_with("still there?")
+
+
+@pytest.mark.asyncio
+async def test_priority_dispatch_delegates_smart_mode_without_legacy_interrupt():
+    """The inline PRIORITY path must not reinterpret SMART as interrupt."""
+    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+    runner._busy_input_mode = "smart"
+    runner._handle_smart_busy_message = AsyncMock(return_value=True)
+    event = _make_event("normal SMART follow-up")
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    runner._handle_smart_busy_message.assert_awaited_once()
+    assert runner._handle_smart_busy_message.await_args.args[:3] == (
+        event,
+        sk,
+        agent_mock,
+    )
+    agent_mock.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_priority_smart_internal_event_queues_without_legacy_interrupt():
+    """Synthetic/internal follow-ups skip classification but remain fail-closed."""
+    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+    runner._busy_input_mode = "smart"
+    runner._handle_smart_busy_message = AsyncMock(return_value=True)
+    event = _make_event("internal SMART follow-up")
+    event.internal = True
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    runner._handle_smart_busy_message.assert_not_awaited()
+    agent_mock.interrupt.assert_not_called()
+    queued = runner.adapters[Platform.TELEGRAM]._pending_messages.get(sk)
+    assert queued is not None and queued.text == event.text

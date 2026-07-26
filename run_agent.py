@@ -3132,36 +3132,72 @@ class AIAgent:
                 self._pending_steer = None
         return True
 
-    def steer(self, text: str) -> bool:
-        """
-        Inject a user message into the next tool result without interrupting.
+    def get_steer_generation(self) -> Optional[int]:
+        """Return the active steering generation, or ``None`` when closed."""
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            if not getattr(self, "_steer_checkpoint_open", False):
+                return None
+            generation = getattr(self, "_steer_run_generation", None)
+            return generation if isinstance(generation, int) else None
 
-        Unlike interrupt(), this does NOT stop the current tool call. The
-        text is stashed and the agent loop appends it to the LAST tool
-        result's content once the current tool batch finishes. The model
-        sees the steer as part of the tool output on its next iteration.
+    def _open_steer_checkpoint(self) -> int:
+        """Atomically open a fresh turn-scoped steering generation."""
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            raise RuntimeError("steering state is not initialized")
+        with lock:
+            if getattr(self, "_steer_checkpoint_open", False):
+                raise RuntimeError("an AIAgent cannot run two steering turns concurrently")
+            if getattr(self, "_pending_steer", None):
+                raise RuntimeError("closed steering checkpoint retained an undelivered message")
+            generation = int(getattr(self, "_steer_run_generation", 0)) + 1
+            self._steer_run_generation = generation
+            self._steer_checkpoint_open = True
+            return generation
 
-        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
-        before the drain point concatenate with newlines.
+    def _close_steer_checkpoint(
+        self,
+        run_generation: Optional[int] = None,
+    ) -> Optional[str]:
+        """Close one generation and atomically take its final pending text."""
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            current = getattr(self, "_steer_run_generation", None)
+            if run_generation is not None and run_generation != current:
+                return None
+            if not getattr(self, "_steer_checkpoint_open", False):
+                return None
+            self._steer_checkpoint_open = False
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            return text
 
-        Args:
-            text: The user text to inject. Empty strings are ignored.
+    def steer(self, text: str, *, run_generation: Optional[int] = None) -> bool:
+        """Inject text into an open, turn-scoped delivery checkpoint.
 
-        Returns:
-            True if the steer was accepted, False if the text was empty.
+        Returns True only when the text was accepted by an open checkpoint for
+        the requested generation. Empty text, a closed checkpoint, or a stale
+        generation is rejected so callers can fall back to their queue path.
         """
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            return True
-        with _lock:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            # A receipt without atomic ownership is worse than falling back to
+            # the caller's queue path.
+            return False
+        with lock:
+            if not getattr(self, "_steer_checkpoint_open", False):
+                return False
+            current = getattr(self, "_steer_run_generation", None)
+            if run_generation is not None and run_generation != current:
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
@@ -7202,6 +7238,8 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        result: Optional[Dict[str, Any]] = None
+        steer_generation = self._open_steer_checkpoint()
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -7285,6 +7323,17 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            # Linearization point for the final checkpoint: either steer()
+            # acquired the same lock first and its text is returned with this
+            # turn, or it observes the closed lease and returns False so the
+            # caller can queue it. A cached agent's next run gets a different
+            # generation and rejects stale classifier decisions.
+            final_steer = self._close_steer_checkpoint(steer_generation)
+            if final_steer and result is not None:
+                existing = result.get("pending_steer")
+                result["pending_steer"] = (
+                    f"{existing}\n{final_steer}" if existing else final_steer
+                )
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(
