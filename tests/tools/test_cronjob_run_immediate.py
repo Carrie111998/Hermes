@@ -110,6 +110,22 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         m_run.assert_not_called()
 
+    def test_execute_job_now_handles_oneshot_removal(self):
+        """A one-shot job removed by mark_job_run should report success (#71760).
+
+        For finite one-shot jobs (repeat.times=1), mark_job_run removes the
+        job from the store when completed >= times.  get_job returns None in
+        that case, which previously caused execution_success=False even though
+        the job ran to completion.
+        """
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=True), \
+             patch("tools.cronjob_tools.get_job", return_value=None):
+            res = _execute_job_now(dict(_JOB))
+        assert res["claimed"] is True
+        assert res["success"] is True
+        assert res["error"] is None
+
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
