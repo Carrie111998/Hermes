@@ -162,7 +162,8 @@ def _resolve_system_dns() -> set[str]:
     try:
         results = socket.getaddrinfo(_TELEGRAM_API_HOST, 443, socket.AF_INET)
         return {addr[4][0] for addr in results}
-    except Exception:
+    except Exception as exc:
+        logger.debug("System DNS resolution for %s failed: %s", _TELEGRAM_API_HOST, exc)
         return set()
 
 
@@ -241,8 +242,11 @@ async def discover_fallback_ips() -> list[str]:
         logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
         return validated
 
-    logger.info(
-        "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
+    logger.warning(
+        "Telegram DoH discovery exhausted: no usable IPs from providers %s within %.0fs "
+        "(system DNS: %s); engaging seed-IP fallback %s",
+        ", ".join(p["url"] for p in _DOH_PROVIDERS),
+        _DOH_TIMEOUT,
         ", ".join(system_ips) or "unknown",
         ", ".join(_SEED_FALLBACK_IPS),
     )

@@ -756,3 +756,55 @@ class TestDiscoverFallbackIps:
 
         assert ips == tnet._SEED_FALLBACK_IPS
         assert elapsed < 1.4, f"seed fallback gated on hung system DNS ({elapsed:.2f}s)"
+
+
+# ---------------------------------------------------------------------------
+# Fallback-IP discovery diagnosability
+#
+# Seed-IP fallback means every DoH provider AND the system resolver failed to
+# produce a usable address — a degraded state that decides how every later
+# request is routed, so it must surface at WARNING with the providers and
+# timeout actually tried. The system-resolver failure feeding that line was
+# swallowed by a bare ``except Exception: return set()``.
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackDiscoveryDiagnostics:
+
+    @staticmethod
+    def _record_logger(monkeypatch, level):
+        records = []
+
+        def _capture(msg, *args, **kwargs):
+            records.append(msg % args if args else msg)
+
+        monkeypatch.setattr(tnet.logger, level, _capture)
+        return records
+
+    def test_resolve_system_dns_logs_the_reason_it_failed(self, monkeypatch):
+        def _boom(*args, **kwargs):
+            raise OSError("Temporary failure in name resolution")
+
+        monkeypatch.setattr(tnet.socket, "getaddrinfo", _boom)
+        debugs = self._record_logger(monkeypatch, "debug")
+
+        assert tnet._resolve_system_dns() == set()
+        assert any("Temporary failure in name resolution" in d for d in debugs), debugs
+
+    @pytest.mark.asyncio
+    async def test_seed_fallback_warns_with_providers_and_timeout(self, monkeypatch):
+        async def _no_ips(client, provider):
+            return []
+
+        monkeypatch.setattr(tnet, "_query_doh_provider", _no_ips)
+        monkeypatch.setattr(tnet, "_resolve_system_dns", lambda: set())
+        warnings = self._record_logger(monkeypatch, "warning")
+
+        ips = await tnet.discover_fallback_ips()
+
+        assert ips == tnet._SEED_FALLBACK_IPS
+        assert warnings, "seed-IP fallback must not be logged below WARNING"
+        message = warnings[-1]
+        assert "DoH discovery exhausted" in message
+        for provider in tnet._DOH_PROVIDERS:
+            assert provider["url"] in message
