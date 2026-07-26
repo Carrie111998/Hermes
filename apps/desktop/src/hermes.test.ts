@@ -7,6 +7,7 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  deleteSession,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -19,6 +20,7 @@ import {
   listSessions,
   listSidebarSessions,
   resetSidebarBatchCapability,
+  setSessionArchived,
   speakText,
   transcribeAudio
 } from './hermes'
@@ -402,6 +404,47 @@ describe('Hermes REST helpers', () => {
     expect(api).toHaveBeenCalledWith(
       expect.objectContaining({
         path: '/api/model/options?refresh=1&include_unconfigured=1'
+      })
+    )
+  })
+
+  // The owning profile must reach the SERVER as ?profile=, not just Electron's
+  // backend router: the serving process can be scoped to a different profile
+  // than the desktop believes (sticky active_profile honored on a legacy
+  // launch), so without it the delete 404s against the wrong state.db (#44117).
+  it('passes the owning profile to the server when deleting a session', async () => {
+    await deleteSession('sess-1', 'default')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'DELETE',
+        path: '/api/sessions/sess-1?profile=default',
+        profile: 'default'
+      })
+    )
+  })
+
+  it('omits the profile param when deleting without an owning profile', async () => {
+    await deleteSession('sess-1')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'DELETE',
+        path: '/api/sessions/sess-1'
+      })
+    )
+    expect(api.mock.calls[0][0]).not.toHaveProperty('profile')
+  })
+
+  it('passes the owning profile in the body when archiving a session', async () => {
+    await setSessionArchived('sess-1', true, 'default')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: { archived: true, profile: 'default' },
+        method: 'PATCH',
+        path: '/api/sessions/sess-1',
+        profile: 'default'
       })
     )
   })
