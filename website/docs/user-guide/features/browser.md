@@ -377,7 +377,7 @@ For that setup, prefer `chrome-devtools-mcp` through IYARI MCP support.
 
 See the MCP guide for the practical setup:
 
-- [Use MCP with IYARI](../../guides/use-mcp-with-hermes.md#wsl2-bridge-hermes-in-wsl-to-windows-chrome)
+- [Use MCP with IYARI](../../guides/use-mcp-with-hermes.md#wsl2-bridge-iyari-in-wsl-to-windows-chrome)
 
 ### Local browser mode
 

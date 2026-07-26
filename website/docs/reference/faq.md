@@ -46,7 +46,7 @@ This is more reliable than trying to force Hermes core browser transport to atta
 
 See:
 
-- [Use MCP with Hermes](../guides/use-mcp-with-hermes.md#wsl2-bridge-hermes-in-wsl-to-windows-chrome)
+- [Use MCP with Hermes](../guides/use-mcp-with-hermes.md#wsl2-bridge-iyari-in-wsl-to-windows-chrome)
 - [Browser Automation](../user-guide/features/browser.md#wsl2--windows-chrome-prefer-mcp-over-browser-connect)
 
 ### Is my data sent anywhere?
