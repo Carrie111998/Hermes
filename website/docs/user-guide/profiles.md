@@ -10,6 +10,8 @@ Run multiple independent Hermes agents on the same machine — each with its own
 
 A profile is a separate Hermes home directory. Each profile gets its own directory containing its own `config.yaml`, `.env`, `SOUL.md`, memories, sessions, skills, cron jobs, and state database. Profiles let you run separate agents for different purposes — a coding assistant, a personal bot, a research agent — without mixing up Hermes state.
 
+Because a profile is its own Hermes home directory, its `SOUL.md` is the one Hermes loads while that profile is active. See [Context Files](/user-guide/features/context-files) for the full list of what gets loaded into a session and where each file is read from.
+
 When you create a profile, it automatically becomes its own command. Create a profile called `coder` and you immediately have `coder chat`, `coder setup`, `coder gateway start`, etc.
 
 ## Quick start
