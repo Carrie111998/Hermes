@@ -109,6 +109,8 @@ What happens:
 Installed skills take effect in new sessions. If you want it available in the current session, use `/reset` to start fresh, or add `--now` to invalidate the prompt cache immediately (costs more tokens on the next turn).
 :::
 
+If you rely on custom providers or a local OpenAI-compatible endpoint, run `hermes doctor` before you start a long session. The doctor now checks custom provider reachability too, so a broken base URL or invalid API key shows up before the first skill load.
+
 ### Verifying Installation
 
 ```bash
