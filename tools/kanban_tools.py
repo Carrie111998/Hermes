@@ -151,6 +151,19 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_run_identity_error(task_id: str) -> Optional[str]:
+    """A task-scoped worker must carry the dispatcher-issued run token."""
+    if (
+        os.environ.get("HERMES_KANBAN_TASK") == task_id
+        and _worker_run_id(task_id) is None
+    ):
+        return tool_error(
+            "worker run identity is missing or invalid; refusing lifecycle "
+            "mutation without HERMES_KANBAN_RUN_ID"
+        )
+    return None
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -549,6 +562,9 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    identity_err = _worker_run_identity_error(tid)
+    if identity_err:
+        return identity_err
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -728,6 +744,9 @@ def _handle_block(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    identity_err = _worker_run_identity_error(tid)
+    if identity_err:
+        return identity_err
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
@@ -817,7 +836,15 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    identity_err = _worker_run_identity_error(tid)
+    if identity_err:
+        return identity_err
     note = args.get("note")
+    remaining_defects = args.get("remaining_defects")
+    if remaining_defects is not None and not isinstance(
+        remaining_defects, (list, tuple)
+    ):
+        return tool_error("remaining_defects must be a list of strings")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -834,6 +861,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 conn,
                 tid,
                 note=note,
+                remaining_defects=remaining_defects,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1651,8 +1679,9 @@ KANBAN_HEARTBEAT_SCHEMA = {
     "description": (
         "Signal that you're still alive during a long operation "
         "(training, encoding, large crawls). Call every few minutes so "
-        "humans see liveness separately from PID checks. Pure side "
-        "effect — no work changes."
+        "humans see liveness separately from PID checks. A heartbeat alone "
+        "is not semantic progress; report changed remaining defects when "
+        "the acceptance state actually changes."
     ),
     "parameters": {
         "type": "object",
@@ -1666,6 +1695,16 @@ KANBAN_HEARTBEAT_SCHEMA = {
                 "description": (
                     "Optional short note describing current progress. "
                     "Shown in the event log."
+                ),
+            },
+            "remaining_defects": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional current list of unmet acceptance defects. "
+                    "Stored as structured recovery state so a later "
+                    "checkpoint can distinguish semantic progress from "
+                    "heartbeat-only liveness."
                 ),
             },
             "board": _board_schema_prop(),

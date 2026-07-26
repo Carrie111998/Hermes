@@ -406,6 +406,26 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+def test_run_slash_classify_recovery_cause(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="classify retry",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path="/tmp/hermes-classify-recovery",
+        )
+
+    out = kc.run_slash(
+        f"classify-recovery {tid} dependency_state_was_stale"
+    )
+    assert "Classified recovery cause" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).recovery_cause == (
+            "dependency_state_was_stale"
+        )
+
+
 def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     import re
     import time

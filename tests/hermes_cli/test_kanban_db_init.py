@@ -20,6 +20,9 @@ def _make_legacy_db(path: Path) -> None:
         DROP TABLE task_comments;
         DROP TABLE task_runs;
         DROP TABLE kanban_notify_subs;
+        DROP TRIGGER recovery_checkpoints_no_update;
+        DROP TRIGGER recovery_checkpoints_no_delete;
+        DROP TABLE recovery_checkpoints;
         CREATE TABLE task_comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
             author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE task_events (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
@@ -128,6 +131,21 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         for name in ("idx_events_task", "idx_events_run", "idx_comments_task",
                      "idx_runs_task", "idx_runs_status", "idx_notify_task"):
             assert name in indexes
+
+        run_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        assert {
+            "canonical_worktree",
+            "dispatch_key",
+            "run_role",
+            "owner_task_id",
+            "checkpoint_id",
+        } <= run_columns
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='recovery_checkpoints'"
+        ).fetchone()
 
         # AUTOINCREMENT actually works after the rebuild.
         conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('task-1', 'completed', 3000)")

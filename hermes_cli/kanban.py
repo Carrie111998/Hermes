@@ -506,6 +506,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
     )
+    p_classify_recovery = sub.add_parser(
+        "classify-recovery",
+        help="Record the causal classification required for another retry",
+    )
+    p_classify_recovery.add_argument("task_id")
+    p_classify_recovery.add_argument(
+        "classification",
+        help="Concrete cause discovered since the unchanged retry",
+    )
 
     p_reassign = sub.add_parser(
         "reassign",
@@ -1051,6 +1060,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
+            "classify-recovery": _cmd_classify_recovery,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1836,6 +1846,22 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"Reclaimed {args.task_id}")
+    return 0
+
+
+def _cmd_classify_recovery(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok = kb.classify_recovery_cause(
+            conn, args.task_id, args.classification
+        )
+    if not ok:
+        print(
+            f"cannot classify recovery for {args.task_id} "
+            "(unknown or terminal task)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Classified recovery cause for {args.task_id}")
     return 0
 
 

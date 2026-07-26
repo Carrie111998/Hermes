@@ -949,6 +949,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Operator-supplied causal classification after an unchanged recovery
+    # retry is exhausted. Folded into subsequent checkpoint fingerprints.
+    recovery_cause: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1037,6 +1040,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            recovery_cause=(
+                row["recovery_cause"] if "recovery_cause" in keys else None
             ),
         )
 
@@ -1220,7 +1226,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Recovery classifications are explicit operator/dispatcher state, not
+    -- inferred from heartbeats. They participate in semantic-progress gates.
+    recovery_cause       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2403,6 +2412,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "recovery_cause" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "recovery_cause", "recovery_cause TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -4342,6 +4356,8 @@ def release_stale_claims(
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
+        if not termination.get("descendants_stopped", True):
+            continue
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
@@ -4627,6 +4643,28 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _run_can_finalize_owner(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: int
+) -> bool:
+    """Only the current, live owner run may complete or block its card."""
+    row = conn.execute(
+        "SELECT r.task_id, r.run_role, r.owner_task_id, r.ended_at, "
+        "       t.current_run_id, t.status "
+        "FROM task_runs r JOIN tasks t ON t.id=? "
+        "WHERE r.id=?",
+        (task_id, int(expected_run_id)),
+    ).fetchone()
+    return bool(
+        row
+        and row["task_id"] == task_id
+        and row["run_role"] == "owner"
+        and (row["owner_task_id"] is None or row["owner_task_id"] == task_id)
+        and row["ended_at"] is None
+        and row["current_run_id"] == int(expected_run_id)
+        and row["status"] not in ("done", "archived")
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4698,6 +4736,21 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if expected_run_id is not None and not _run_can_finalize_owner(
+            conn, task_id, int(expected_run_id)
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "finalization_rejected",
+                {
+                    "action": "complete",
+                    "run_id": int(expected_run_id),
+                    "reason": "current_owner_run_required",
+                },
+                run_id=int(expected_run_id),
+            )
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5451,6 +5504,21 @@ def block_task(
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
+        if expected_run_id is not None and not _run_can_finalize_owner(
+            conn, task_id, int(expected_run_id)
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "finalization_rejected",
+                {
+                    "action": "block",
+                    "run_id": int(expected_run_id),
+                    "reason": "current_owner_run_required",
+                },
+                run_id=int(expected_run_id),
+            )
+            return False
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -6810,11 +6878,89 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _descendant_pids(pid: int) -> Optional[list[int]]:
+    """Return descendants leaf-first so reclaim can stop children first."""
+    if pid <= 0:
+        return []
+    try:
+        import psutil  # type: ignore
+
+        descendants = psutil.Process(pid).children(recursive=True)
+        parent_of = {proc.pid: proc.ppid() for proc in descendants}
+
+        def _depth(child_pid: int) -> int:
+            depth = 0
+            seen: set[int] = set()
+            current = child_pid
+            while current in parent_of and current not in seen:
+                seen.add(current)
+                depth += 1
+                current = parent_of[current]
+            return depth
+
+        return sorted(
+            parent_of,
+            key=lambda child_pid: (-_depth(child_pid), child_pid),
+        )
+    except ImportError:
+        pass
+    except Exception as exc:
+        try:
+            import psutil  # type: ignore
+
+            if isinstance(exc, psutil.NoSuchProcess):
+                return []
+        except ImportError:
+            pass
+        if _IS_WINDOWS:
+            return None
+    if _IS_WINDOWS:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    children: dict[int, list[int]] = {}
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            child_pid, parent_pid = (int(fields[0]), int(fields[1]))
+        except ValueError:
+            continue
+        children.setdefault(parent_pid, []).append(child_pid)
+
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def _walk(parent: int) -> None:
+        for child in sorted(children.get(parent, ())):
+            if child in seen:
+                continue
+            seen.add(child)
+            _walk(child)
+            ordered.append(child)
+
+    _walk(int(pid))
+    return ordered
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    signal_dead_owner: bool = True,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
@@ -6825,6 +6971,8 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "descendant_pids": [],
+        "descendants_stopped": True,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -6838,15 +6986,61 @@ def _terminate_reclaimed_worker(
         os.kill if hasattr(os, "kill") else None
     )
     if kill is None:
+        info["descendants_stopped"] = False
         return info
 
     info["termination_attempted"] = True
+    descendants = _descendant_pids(int(pid))
+    if descendants is None:
+        info["descendants_stopped"] = False
+        info["descendant_enumeration_failed"] = True
+        return info
+    info["descendant_pids"] = descendants
+    for child_pid in descendants:
+        if not _pid_alive(child_pid):
+            continue
+        try:
+            kill(child_pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+
+    for _ in range(10):
+        if not any(_pid_alive(child_pid) for child_pid in descendants):
+            break
+        time.sleep(0.1)
+
+    survivors = [
+        child_pid for child_pid in descendants if _pid_alive(child_pid)
+    ]
+    if survivors:
+        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for child_pid in survivors:
+            try:
+                kill(child_pid, _sigkill)
+                info["sigkill"] = True
+            except (ProcessLookupError, OSError):
+                pass
+        for _ in range(10):
+            if not any(_pid_alive(child_pid) for child_pid in survivors):
+                break
+            time.sleep(0.1)
+    survivors = [
+        child_pid for child_pid in descendants if _pid_alive(child_pid)
+    ]
+    info["descendants_stopped"] = not survivors
+    if survivors:
+        info["descendant_survivors"] = survivors
+        # Never terminate/reclaim the owner while a descendant is still
+        # confirmed alive: doing so can orphan the real workload.
+        return info
+
+    if not signal_dead_owner and not _pid_alive(pid):
+        info["terminated"] = True
+        return info
+
     try:
         kill(int(pid), signal.SIGTERM)
     except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
         return info
     except OSError:
@@ -6856,7 +7050,7 @@ def _terminate_reclaimed_worker(
         if not _pid_alive(pid):
             info["terminated"] = True
             return info
-        time.sleep(0.5)
+        time.sleep(0.1)
 
     if _pid_alive(pid):
         try:
@@ -7167,6 +7361,8 @@ def detect_stale_running(
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
         )
+        if not termination.get("descendants_stopped", True):
+            continue
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.

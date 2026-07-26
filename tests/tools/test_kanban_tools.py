@@ -168,9 +168,11 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        run_id = kb.latest_run(conn, tid).id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -870,6 +872,21 @@ def test_heartbeat_without_note(worker_env):
     out = kt._handle_heartbeat({})
     d = json.loads(out)
     assert d["ok"] is True
+
+
+def test_heartbeat_records_remaining_acceptance_defects(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_heartbeat({
+        "remaining_defects": ["alias ownership regression still fails"],
+    })
+    assert json.loads(out)["ok"] is True
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata["remaining_acceptance_defects"] == [
+            "alias ownership regression still fails"
+        ]
 
 
 def test_heartbeat_extends_claim_expires(worker_env):
@@ -1959,6 +1976,17 @@ def test_worker_complete_own_task_still_works(worker_env):
     assert d.get("ok") is True and d.get("task_id") == worker_env
 
 
+def test_worker_finalization_requires_dispatcher_run_identity(
+    worker_env, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    out = kt._handle_block({"reason": "must not use an anonymous run"})
+    error = json.loads(out).get("error", "")
+    assert "worker run identity is missing" in error
+
+
 def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     """A retried worker cannot complete the task using an old run token."""
     from hermes_cli import kanban_db as kb
@@ -2281,7 +2309,9 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
     with kb.connect(board="alt") as conn:
         tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
         kb.claim_task(conn, tid)
+        run_id = kb.latest_run(conn, tid).id
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     from tools import kanban_tools as kt
     out = kt._handle_heartbeat({"note": "alive on alt", "board": "alt"})
