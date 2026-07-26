@@ -15,28 +15,17 @@
  *   node geo-cli.js test
  */
 
-const { chromium } = require('playwright');
 const path = require('path');
+let chromium = null; // lazy-loaded after config check
 
 // ========== 配置 ==========
 
-// 自动获取网页端地址：优先读环境变量 GEO_URL，没有则调 geo-client.py 获取
+// 网页端地址：直接读 GEO_URL 环境变量。首次使用时引导用户输入并写入 .env。
 function resolveGeoUrl() {
-  if (process.env.GEO_URL) return process.env.GEO_URL;
-  try {
-    const { execSync } = require('child_process');
-    const pyExe = process.env.GEO_PYTHON || 'python3';
-    const scriptDir = __dirname;
-    const result = execSync(`${pyExe} "${path.join(scriptDir, 'geo-client.py')}" get-web-url`, {
-      timeout: 15000,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-    if (result && result.startsWith('http')) return result;
-  } catch (e) {
-    // 自动获取失败，用默认值
-  }
-  return 'https://geo.heikexia.cc';
+  const url = (process.env.GEO_URL || '').trim();
+  if (url) return url.replace(/\/+$/, ''); // 去掉尾部斜杠
+  console.error('ERROR: GEO_URL 未设置。请在 ~/.hermes/.env 中配置 GEO_URL=你的GEO服务端网址');
+  process.exit(1);
 }
 
 const CONFIG = {
@@ -102,6 +91,7 @@ function findBundledChromium() {
 }
 
 async function createBrowser() {
+  if (!chromium) chromium = require('playwright').chromium;
   const launchOpts = { headless: CONFIG.headless };
   const exe = findBundledChromium();
   if (exe) launchOpts.executablePath = exe;

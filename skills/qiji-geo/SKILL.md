@@ -36,16 +36,16 @@ version: 2.0.0
 
 ## 凭证配置（Agent 自动处理）
 
-**用户只需做一件事：告诉 Agent 自己的奇计账号、密码和授权码。** 其余全部由 Agent 自动完成。
+**用户只需做一件事：告诉 Agent 自己的 GEO 服务端网址、奇计账号、密码和授权码。** 其余全部由 Agent 自动完成。
 
 Agent 首次执行 GEO 命令时，自动检测凭证：
 
-1. 检查 `~/.hermes/.env` 是否有 `GEO_USERNAME`、`GEO_PASSWORD`、`GEO_UDID`
-2. 如果缺失，向用户要这三个值（一次性），写入 `~/.hermes/.env` 永久保存
+1. 检查 `~/.hermes/.env` 是否有 `GEO_URL`、`GEO_USERNAME`、`GEO_PASSWORD`、`GEO_UDID`
+2. 如果缺失，向用户要这些值（一次性），写入 `~/.hermes/.env` 永久保存
 3. GEO_UID 不需要用户提供——Agent 自动调远程 API 获取并缓存
-4. GEO_URL（网页端地址）不需要用户提供——geo-cli.js 启动时自动调 geo-client.py 的 `get-web-url` 命令，从远程 API 的 `/api/zhushou/index` 返回的 `api_url` 获取。用户只需提供账号密码和授权码，Agent 能自动推导出网页端地址。
 
 需要用户提供的信息：
+- **GEO 服务端网址**：不同 OEM 贴牌商有不同的网址（如 geo.heikexia.cc），首次使用时必须提供
 - **账号**：奇计网页端登录手机号
 - **密码**：奇计网页端登录密码
 - **授权码**：打开桌面客户端登录界面，上面显示的那串数字
@@ -519,6 +519,7 @@ python3 scripts/geo-client.py platforms  # 支持的平台
 
 环境变量（Agent 自动设置，用户不需要手动配）：
 ```bash
+GEO_URL=https://geo.heikexia.cc  # GEO服务端网址，不同贴牌商不同，向用户获取
 GEO_USERNAME=账号       # 一次性向用户获取，写入 .env
 GEO_PASSWORD=密码       # 一次性向用户获取，写入 .env
 GEO_UDID=授权码         # 一次性向用户获取，写入 .env

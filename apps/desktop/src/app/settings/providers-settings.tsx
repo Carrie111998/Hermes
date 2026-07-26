@@ -143,8 +143,10 @@ function OAuthPicker({
   const select = (p: OAuthProvider) => {
     if (p.id === 'nous') {
       window.hermesDesktop?.openExternal?.('https://www.aicps.vip/')
+
       return
     }
+
     startManualProviderOAuth(p.id)
   }
 
@@ -306,7 +308,7 @@ function NoProviderKeys() {
 function CustomEndpointCard() {
   const { t } = useI18n()
   const p = t.settings.providers
-  const [modelInfo, setModelInfo] = useState<{ baseUrl: null | string; model: null | string; provider: null | string } | null>(null)
+  const [modelInfo, setModelInfo] = useState<{ baseUrl: null | string; model: null | string; provider: null | string; hasApiKey?: boolean } | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -322,6 +324,7 @@ function CustomEndpointCard() {
         // The /api/model/info response doesn't include base_url; read the
         // config record to get it for display.
         let baseUrl: null | string = null
+        let hasApiKey = false
 
         try {
           const cfg = await getHermesConfigRecord()
@@ -333,14 +336,36 @@ function CustomEndpointCard() {
           // If model_base_url is empty, the provider may be a named custom
           // provider (e.g. providers.aicps) whose base_url lives under the
           // top-level providers: block.
+          let providerSlug = ''
+
           if (!baseUrl) {
-            const providerSlug = String((cfg as Record<string, unknown>)?.model_provider ?? '').trim()
+            providerSlug = String((cfg as Record<string, unknown>)?.model_provider ?? '').trim()
+
             if (providerSlug) {
               const providersCfg = (cfg as Record<string, unknown>)?.providers as Record<string, unknown> | undefined
               const providerCfg = providersCfg?.[providerSlug] as Record<string, unknown> | undefined
+
               if (providerCfg && typeof providerCfg === 'object') {
                 baseUrl = String(providerCfg.base_url ?? '') || null
               }
+            }
+          }
+
+          // Check if api_key exists for the configured provider.
+          // Without an api_key the endpoint is useless — don't show it as
+          // configured. The default config ships with a base_url but no key,
+          // which previously caused a false "custom endpoint configured" card.
+          if (!providerSlug) {
+            providerSlug = String((cfg as Record<string, unknown>)?.model_provider ?? '').trim()
+          }
+
+          if (providerSlug) {
+            const providersCfg = (cfg as Record<string, unknown>)?.providers as Record<string, unknown> | undefined
+            const providerCfg = providersCfg?.[providerSlug] as Record<string, unknown> | undefined
+
+            if (providerCfg && typeof providerCfg === 'object') {
+              const key = providerCfg.api_key
+              hasApiKey = Boolean(key && String(key).trim())
             }
           }
           /* config read is best-effort */
@@ -349,7 +374,7 @@ function CustomEndpointCard() {
         }
 
         if (!cancelled) {
-          setModelInfo({ baseUrl, model: info.model || null, provider: info.provider || null })
+          setModelInfo({ baseUrl, model: info.model || null, provider: info.provider || null, hasApiKey })
         }
       } catch {
         if (!cancelled) {
@@ -365,7 +390,7 @@ function CustomEndpointCard() {
   // providers can be stored as "custom", "custom:<name>", or the bare name
   // of a custom_providers entry. The reliable signal is base_url being set.
   const baseUrl = modelInfo?.baseUrl
-  const hasEndpoint = Boolean(baseUrl)
+  const hasEndpoint = Boolean(baseUrl) && Boolean(modelInfo?.hasApiKey)
   const model = modelInfo?.model
 
   return (
@@ -503,6 +528,7 @@ export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSett
 
   if (showApiKeys) {
     const q = keyQuery.trim().toLowerCase()
+
     const visibleGroups = q
       ? keyGroups.filter(group => {
           const haystack = [

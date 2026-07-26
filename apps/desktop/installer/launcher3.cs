@@ -14,6 +14,19 @@ class Launcher
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool FreeConsole();
 
+    // --- Native methods for WM_SETTINGCHANGE broadcast ---
+    static class NativeMethods
+    {
+        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+        public const int WM_SETTINGCHANGE = 0x001A;
+        public const int SMTO_ABORTIFHUNG = 0x0002;
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd, uint Msg, IntPtr wParam, string lParam,
+            uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    }
+
     [STAThread]
     static void Main()
     {
@@ -184,6 +197,45 @@ class Launcher
             key.SetValue("Publisher", "奇计");
             key.SetValue("NoModify", 1, RegistryValueKind.DWord);
             key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+        }
+
+        // ---- Initialize Qiji data directory ----
+        Console.WriteLine("初始化数据目录...");
+        string qijiHome = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "qiji");
+        Directory.CreateDirectory(qijiHome);
+
+        // Set QIJI_HOME (User scope) so Qiji finds its data dir
+        Registry.SetValue(@"HKEY_CURRENT_USER\Environment", "QIJI_HOME", qijiHome);
+
+        // Remove stale HERMES_HOME (User scope) — leftover from old Hermes installs
+        // that pointed to %LOCALAPPDATA%\hermes, causing config confusion
+        try
+        {
+            using (var envKey = Registry.CurrentUser.OpenSubKey(@"Environment", true))
+            {
+                if (envKey != null && envKey.GetValue("HERMES_HOME") != null)
+                {
+                    envKey.DeleteValue("HERMES_HOME", false);
+                    Console.WriteLine("已清除旧的 HERMES_HOME 环境变量");
+                }
+            }
+        }
+        catch { /* non-fatal */ }
+
+        // Broadcast WM_SETTINGCHANGE so other processes pick up the env change
+        NativeMethods.SendMessageTimeout(
+            NativeMethods.HWND_BROADCAST, NativeMethods.WM_SETTINGCHANGE,
+            IntPtr.Zero, "Environment",
+            NativeMethods.SMTO_ABORTIFHUNG, 5000, out _);
+
+        // Create default config.yaml with Chinese locale if missing
+        string configPath = Path.Combine(qijiHome, "config.yaml");
+        if (!File.Exists(configPath))
+        {
+            File.WriteAllText(configPath, "display:\n  language: zh\n",
+                System.Text.Encoding.UTF8);
+            Console.WriteLine("已创建默认配置 (language=zh)");
         }
 
         // ---- Done ----

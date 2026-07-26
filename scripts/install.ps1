@@ -23,8 +23,8 @@ param(
     # exact ref.  Precedence: Commit > Tag > Branch.
     [string]$Commit = "",
     [string]$Tag = "",
-    [string]$HermesHome = $(if ($env:QIJI_HOME) { $env:QIJI_HOME } elseif ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\qiji" }),
-    [string]$InstallDir = $(if ($env:QIJI_HOME) { "$env:QIJI_HOME\hermes-agent" } elseif ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\qiji\hermes-agent" }),
+    [string]$HermesHome = $(if ($env:QIJI_HOME) { $env:QIJI_HOME } else { "$env:LOCALAPPDATA\qiji" }),
+    [string]$InstallDir = $(if ($env:QIJI_HOME) { "$env:QIJI_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\qiji\hermes-agent" }),
 
     # --- Stage protocol (additive; default invocation behaves as before) ----
     # See the "Stage protocol" section near the bottom of the file for the
@@ -245,16 +245,43 @@ function Stage-VendorFiles {
         # overwrites the working tree with the real remote content; this
         # stub commit is discarded and never seen again.
         Push-Location $InstallDir
+        $gitInitOk = $true
         try {
-            git -c windows.appendAtomically=false init 2>$null
-            git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
-            git -c windows.appendAtomically=false config core.autocrlf false 2>$null
-            git -c windows.appendAtomically=false config user.name "Qiji Installer" 2>$null
-            git -c windows.appendAtomically=false config user.email "installer@local" 2>$null
-            git remote add origin "https://gitee.com/wintao-storm/QIJI-agent.git" 2>$null
-            git -c windows.appendAtomically=false add pyproject.toml hermes_cli/__init__.py AGENTS.md README.md 2>$null
-            git -c windows.appendAtomically=false commit -m "vendor snapshot (offline install)" 2>$null
-        } catch {}
+            $gitStep = "init"
+            git -c windows.appendAtomically=false init 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git init failed (exit $LASTEXITCODE)" }
+
+            git -c windows.appendAtomically=false config windows.appendAtomically false 2>&1 | Out-Null
+            git -c windows.appendAtomically=false config core.autocrlf false 2>&1 | Out-Null
+            git -c windows.appendAtomically=false config user.name "Qiji Installer" 2>&1 | Out-Null
+            git -c windows.appendAtomically=false config user.email "installer@local" 2>&1 | Out-Null
+            git -c windows.appendAtomically=false init.defaultBranch main 2>&1 | Out-Null
+
+            # Rename master -> main if init created master (old git default)
+            $curBranch = git -c windows.appendAtomically=false symbolic-ref --short HEAD 2>&1
+            if ($LASTEXITCODE -eq 0 -and $curBranch -ne "main") {
+                git -c windows.appendAtomically=false branch -m main 2>&1 | Out-Null
+            }
+
+            $gitStep = "remote"
+            git remote add origin "https://gitee.com/wintao-storm/QIJI-agent.git" 2>&1 | Out-Null
+            # remote add fails if already exists; that's fine
+            if ($LASTEXITCODE -ne 0) {
+                git remote set-url origin "https://gitee.com/wintao-storm/QIJI-agent.git" 2>&1 | Out-Null
+            }
+
+            $gitStep = "add+commit"
+            git -c windows.appendAtomically=false add pyproject.toml hermes_cli/__init__.py AGENTS.md README.md 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git add failed (exit $LASTEXITCODE)" }
+            git -c windows.appendAtomically=false commit -m "vendor snapshot (offline install)" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
+
+            Write-Host "[vendor] Git initialized: $(git rev-parse --short HEAD) on branch $(git rev-parse --abbrev-ref HEAD)" -ForegroundColor Green
+        } catch {
+            $gitInitOk = $false
+            Write-Host "[vendor] WARNING: Git init failed at step '$gitStep': $_" -ForegroundColor Yellow
+            Write-Host "[vendor] Updates will use HTTP fallback instead of git." -ForegroundColor Yellow
+        }
         Pop-Location
         Write-Host "[vendor] Staged hermes-agent repository" -ForegroundColor Cyan
     }
@@ -2434,9 +2461,27 @@ function Set-PathVariable {
         [Environment]::SetEnvironmentVariable("QIJI_HOME", $HermesHome, "User")
         Write-Success "Set QIJI_HOME=$HermesHome"
     }
-    # Also set HERMES_HOME for backwards compat (hermes CLI still reads it)
+    # Remove stale HERMES_HOME from User registry so Qiji.exe doesn't inherit
+    # the old hermes data dir. The Python CLI still reads HERMES_HOME as fallback,
+    # so we set it at process level ($env:) below — but NOT in the registry.
+    $staleHermesHome = [Environment]::GetEnvironmentVariable("HERMES_HOME", "User")
+    if ($staleHermesHome -and $staleHermesHome -ne $HermesHome) {
+        [Environment]::SetEnvironmentVariable("HERMES_HOME", $null, "User")
+        Write-Success "Removed stale HERMES_HOME from registry (was: $staleHermesHome)"
+    }
+    # Set HERMES_HOME for current session (Python CLI backwards compat)
     $env:HERMES_HOME = $HermesHome
     $env:QIJI_HOME = $HermesHome
+    
+    # Create default config.yaml with Chinese locale if missing
+    $configYaml = Join-Path $HermesHome "config.yaml"
+    if (-not (Test-Path $configYaml)) {
+        @"
+display:
+  language: zh
+"@ | Set-Content -Path $configYaml -Encoding UTF8
+        Write-Success "Created default config.yaml (language=zh)"
+    }
     
     # Update current session
     $env:Path = "$hermesBin;$env:Path"
