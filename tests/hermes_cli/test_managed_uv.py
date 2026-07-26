@@ -7,6 +7,8 @@ import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import sys
+
 import pytest
 
 
@@ -49,6 +51,8 @@ class TestResolveUv:
             from hermes_cli.managed_uv import resolve_uv
             assert resolve_uv() is None
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="assumes POSIX uv layout (bin/uv, exec bit, shell installer); Windows uses uv.exe + install.ps1")
+
     def test_existing_executable(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
@@ -72,12 +76,15 @@ class TestResolveUv:
 # ---------------------------------------------------------------------------
 
 class TestEnsureUv:
+    @pytest.mark.skipif(sys.platform == "win32", reason="assumes POSIX uv layout (bin/uv, exec bit, shell installer); Windows uses uv.exe + install.ps1")
     def test_already_installed_no_bootstrap(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
             from hermes_cli.managed_uv import ensure_uv
             path = ensure_uv()
             assert path == str(tmp_path / "bin" / "uv")
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="assumes POSIX uv layout (bin/uv, exec bit, shell installer); Windows uses uv.exe + install.ps1")
 
     def test_installs_if_missing(self, tmp_path):
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
@@ -206,6 +213,8 @@ class TestUpdateManagedUv:
             from hermes_cli.managed_uv import update_managed_uv
             assert update_managed_uv() is None
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="assumes POSIX uv layout (bin/uv, exec bit, shell installer); Windows uses uv.exe + install.ps1")
+
     def test_self_update_success(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
@@ -218,6 +227,8 @@ class TestUpdateManagedUv:
             # First call is self update, second is --version
             assert mock_run.call_count == 2
             assert mock_run.call_args_list[0][0][0] == [str(tmp_path / "bin" / "uv"), "self", "update"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="assumes POSIX uv layout (bin/uv, exec bit, shell installer); Windows uses uv.exe + install.ps1")
 
     def test_self_update_failure_non_fatal(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
@@ -235,6 +246,7 @@ class TestUpdateManagedUv:
 # ---------------------------------------------------------------------------
 
 class TestInstallUvInternals:
+    @pytest.mark.skipif(sys.platform == "win32", reason="assumes POSIX uv layout (bin/uv, exec bit, shell installer); Windows uses uv.exe + install.ps1")
     def test_posix_sets_uv_unmanaged_install(self, tmp_path):
         target = tmp_path / "bin" / "uv"
         with patch("hermes_cli.managed_uv._install_uv_posix") as mock_posix:

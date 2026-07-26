@@ -2925,7 +2925,18 @@ def run_slash(rest: str) -> str:
     import io
     import contextlib
 
-    tokens = shlex.split(rest) if rest and rest.strip() else []
+    if rest and rest.strip():
+        if os.name == "nt":
+            # POSIX shlex parsing strips backslashes, mangling Windows paths
+            # like C:\Users\... — parse non-POSIX and unquote manually.
+            tokens = [
+                t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t
+                for t in shlex.split(rest, posix=False)
+            ]
+        else:
+            tokens = shlex.split(rest)
+    else:
+        tokens = []
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

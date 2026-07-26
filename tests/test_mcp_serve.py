@@ -33,6 +33,14 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
     except (ImportError, AttributeError):
         pass
+    try:
+        # DEFAULT_DB_PATH is bound at hermes_state import time, so redirecting
+        # HERMES_HOME alone still leaves SessionDB() pointed at the real
+        # ~/.hermes/state.db — its rows would shadow the test's sessions.json.
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    except (ImportError, AttributeError):
+        pass
     return tmp_path
 
 

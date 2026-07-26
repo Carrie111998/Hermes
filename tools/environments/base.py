@@ -247,7 +247,7 @@ def _popen_bash(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         **kwargs,
     )
     if stdin_data is not None:
@@ -259,7 +259,7 @@ def _load_json_store(path: Path) -> dict:
     """Load a JSON file as a dict, returning ``{}`` on any error."""
     if path.exists():
         try:
-            return orjson.loads(path.read_text(encoding="utf-8"))
+            return orjson.loads(path.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             pass
     return {}

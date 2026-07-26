@@ -10,9 +10,12 @@ Run with:  python -m pytest tests/tools/test_file_read_guards.py -v
 import orjson
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
+
+import pytest
 from unittest.mock import patch, MagicMock
 
 from tools.file_tools import (
@@ -64,6 +67,7 @@ def _make_safe_tempdir(prefix: str) -> str:
 # Device path blocking
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: `/dev/`, `/proc/` are Unix-specific")
 class TestDevicePathBlocking(unittest.TestCase):
     """Paths like /dev/zero should be rejected before any I/O."""
 
@@ -154,7 +158,7 @@ class TestDevicePathBlocking(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             target_path = os.path.join(tmpdir, "regular.txt")
             link_path = os.path.join(tmpdir, "regular-link")
-            with open(target_path, "w", encoding="utf-8") as handle:
+            with open(target_path, "w", encoding="utf-8", errors="replace") as handle:
                 handle.write("safe\n")
             try:
                 os.symlink(target_path, link_path)

@@ -126,6 +126,13 @@ def test_cached_sudo_password_isolated_by_session_key(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
 
+    # The cache scope resolves HERMES_SESSION_KEY through the session-context
+    # contextvars FIRST; drop any identity leaked into this context by earlier
+    # tests so the monkeypatched env vars below actually take effect.
+    from gateway import session_context
+    session_context.reset_session_vars()
+    terminal_tool._reset_cached_sudo_passwords()
+
     monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
     terminal_tool._set_cached_sudo_password("alpha-pass")
 

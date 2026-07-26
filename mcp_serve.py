@@ -75,10 +75,20 @@ def _get_sessions_dir() -> Path:
 
 
 def _get_session_db():
-    """Get a SessionDB instance for reading message transcripts."""
+    """Get a SessionDB instance for reading message transcripts.
+
+    Read-only attach: this poller only SELECTs, and opening the DB
+    read-write would run schema init / WAL checkpoint on every tick,
+    bumping state.db's mtime and defeating the EventBridge's own
+    mtime-based change detection (plus taking a write lock against the
+    live gateway backend).  ``read_only`` requires an existing,
+    initialised DB, so guard on existence first.
+    """
     try:
-        from hermes_state import SessionDB
-        return SessionDB()
+        from hermes_state import SessionDB, DEFAULT_DB_PATH
+        if not DEFAULT_DB_PATH.exists():
+            return None
+        return SessionDB(read_only=True)
     except Exception as e:
         logger.debug("SessionDB unavailable: %s", e)
         return None
@@ -183,7 +193,7 @@ def _load_sessions_index_from_json() -> dict:
     if not sessions_file.exists():
         return {}
     try:
-        with open(sessions_file, "r", encoding="utf-8") as f:
+        with open(sessions_file, "r", encoding="utf-8", errors="replace") as f:
             data = orjson.loads(f.read())
         # Drop documentation/metadata sentinels (keys starting with "_", e.g.
         # the "_README" note the gateway writes into the index). They are not
@@ -208,7 +218,7 @@ def _load_channel_directory() -> dict:
     if not directory_file.exists():
         return {}
     try:
-        with open(directory_file, "r", encoding="utf-8") as f:
+        with open(directory_file, "r", encoding="utf-8", errors="replace") as f:
             return orjson.loads(f.read())
     except Exception as e:
         logger.debug("Failed to load channel_directory.json: %s", e)

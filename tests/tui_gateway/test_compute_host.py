@@ -45,7 +45,12 @@ def test_compute_host_line_json_seed_turn_interrupt():
     try:
         hello = _read_json_line(out)
         assert hello["type"] == "hello"
-        assert hello["host_pid"] == proc.pid
+        if sys.platform == "win32":
+            # uv-venv python.exe is a shim that spawns the real interpreter
+            # as a child on Windows, so Popen.pid != the host's getpid().
+            assert isinstance(hello["host_pid"], int) and hello["host_pid"] > 0
+        else:
+            assert hello["host_pid"] == proc.pid
 
         proc.stdin.write(json.dumps({"type": "session.seed", "sid": "s1", "request_id": "seed"}) + "\n")
         proc.stdin.flush()

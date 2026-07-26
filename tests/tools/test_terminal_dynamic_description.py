@@ -232,4 +232,9 @@ def test_static_description_contains_phrases_the_powershell_path_rewrites():
 def test_terminal_registered_with_dynamic_override():
     entry = registry.get_entry("terminal")
     assert entry is not None
-    assert entry.dynamic_schema_overrides is _build_dynamic_terminal_description
+    # Compare against the function on the CURRENT module object, not the one
+    # imported at this file's collection time: an earlier test may have
+    # reloaded tools.terminal_tool (importlib.reload), which re-registers the
+    # entry with the reloaded function and orphans our stale reference.
+    import tools.terminal_tool as live_terminal_tool
+    assert entry.dynamic_schema_overrides is live_terminal_tool._build_dynamic_terminal_description

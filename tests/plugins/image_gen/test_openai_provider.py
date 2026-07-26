@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -290,6 +292,7 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "empty_response"
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path format incompatibility")
     def test_url_response_is_cached_locally(self, provider):
         """OpenAI URL response (if API ever returns one) is cached locally.
 

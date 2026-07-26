@@ -67,3 +67,45 @@ def disable_lazy_stt_install():
     """
     with patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
         yield
+
+
+
+@pytest.fixture(autouse=True)
+def _unpin_skills_hub_dynamic_paths():
+    """Undo leaked ``tools.skills_hub`` path pins after every test.
+
+    ``tools.skills_hub`` exposes SKILLS_DIR / HUB_DIR / LOCK_FILE & friends
+    via PEP 562 ``__getattr__`` — they are NOT real module attributes.
+    ``monkeypatch.setattr(hub, "SKILLS_DIR", ...)`` snapshots the dynamically
+    resolved value and restores it as a REAL attribute, permanently freezing
+    the dynamic profile-aware resolution for every later test in the shard
+    (installs then silently land in some earlier test's deleted tmp dir).
+    Snapshot the pre-test module ``__dict__`` exactly and restore it.
+    """
+    import tools.skills_hub as hub
+
+    yield
+    # NOTE: cannot snapshot/restore around the test — monkeypatch's undo runs
+    # AFTER this fixture's teardown and re-sets the pinned values as real
+    # attributes. Instead, drop anything that is not part of the genuine
+    # import-time baseline recorded below.
+    for n, v in _SKILLS_HUB_PATH_BASELINE.items():
+        if v is _MISSING:
+            hub.__dict__.pop(n, None)
+        else:
+            hub.__dict__[n] = v
+
+
+_MISSING = object()
+
+
+def _skills_hub_path_baseline():
+    """Which dynamic path names are genuine real attributes at import time."""
+    import tools.skills_hub as hub
+
+    names = ("HERMES_HOME", "SKILLS_DIR", "HUB_DIR", "LOCK_FILE",
+             "QUARANTINE_DIR", "AUDIT_LOG", "TAPS_FILE", "INDEX_CACHE_DIR")
+    return {n: hub.__dict__.get(n, _MISSING) for n in names}
+
+
+_SKILLS_HUB_PATH_BASELINE = _skills_hub_path_baseline()

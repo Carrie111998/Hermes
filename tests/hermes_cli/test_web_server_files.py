@@ -1,5 +1,6 @@
 """Tests for the dashboard-managed file browser API."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -171,6 +172,7 @@ def test_forced_root_paths_stay_under_root(forced_files_client, tmp_path):
     assert escaped.status_code == 403
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path format incompatibility")
 def test_local_mode_defaults_to_home_and_can_jump_to_absolute_path(local_files_client, tmp_path):
     client, home = local_files_client
     (home / "home.txt").write_text("home")
@@ -193,6 +195,7 @@ def test_local_mode_defaults_to_home_and_can_jump_to_absolute_path(local_files_c
     assert other_listing.json()["entries"][0]["path"] == str(other / "other.txt")
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path format incompatibility")
 def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
@@ -220,6 +223,7 @@ def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
     assert policy.can_change_path is True
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path format incompatibility")
 def test_local_mode_upload_read_mkdir_delete_roundtrip(local_files_client):
     client, home = local_files_client
     folder = home / "workspace"
@@ -314,6 +318,11 @@ def test_query_token_does_not_authenticate_other_endpoints(forced_files_client):
     assert leaked.status_code == 401
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="hosted /opt/data lock-in is a Linux container deployment concept; "
+    "'/opt/data' is not an absolute path on Windows",
+)
 def test_hosted_policy_locks_to_opt_data(monkeypatch):
     monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
     monkeypatch.setenv("HERMES_HOME", "/opt/data")

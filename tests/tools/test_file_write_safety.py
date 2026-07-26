@@ -4,9 +4,12 @@ Based on PR #1085 by ismoilh (salvaged).
 """
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
+
+_win32 = pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: Unix path assumptions")
 
 from tools.file_operations import _is_write_denied
 
@@ -269,6 +272,7 @@ class TestSafeRootDenialMessageIntegration:
         assert inside.read_text() == "content"
 
 
+@_win32
 class TestCheckSensitivePathMacOSBypass:
     """Verify _check_sensitive_path blocks /private/etc paths (issue #8734)."""
 
@@ -329,6 +333,7 @@ class TestAtomicWrite:
         assert target.read_text() == "v2 content"
         assert os.stat(target).st_ino != ino_before
 
+    @_win32
     def test_overwrite_preserves_mode(self, ops, tmp_path: Path):
         target = tmp_path / "perms.txt"
         target.write_text("old")
@@ -337,6 +342,7 @@ class TestAtomicWrite:
         assert res.error is None, res.error
         assert (os.stat(target).st_mode & 0o777) == 0o640
 
+    @_win32
     def test_failed_write_leaves_original_intact(self, ops, tmp_path: Path):
         # A read-only parent directory means the temp file can't be created,
         # so the write fails BEFORE any rename. The original must survive
@@ -366,7 +372,7 @@ class TestAtomicWrite:
         tricky = "q 'single' \"double\" $VAR `cmd` \\back\nünïcödé 日本語\n"
         res = ops.write_file(str(target), tricky)
         assert res.error is None, res.error
-        assert target.read_text(encoding="utf-8") == tricky
+        assert target.read_text(encoding="utf-8", errors="replace") == tricky
 
     def test_patch_routes_through_atomic_write(self, ops, tmp_path: Path):
         target = tmp_path / "edit.py"
@@ -375,7 +381,9 @@ class TestAtomicWrite:
         res = ops.patch_replace(str(target), "b = 2", "b = 22")
         assert res.success, res.error
         assert target.read_text() == "a = 1\nb = 22\nc = 3\n"
-        assert (os.stat(target).st_mode & 0o777) == 0o600
+        if sys.platform != 'win32':
+            # POSIX mode bits only; Windows chmod can't express 0o600.
+            assert (os.stat(target).st_mode & 0o777) == 0o600
 
 
 class TestBomHandling:

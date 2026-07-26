@@ -58,6 +58,9 @@ def _read_message_body(
         if file_path == "-":
             return sys.stdin.read()
         try:
+            # Strict decode on purpose: a binary file must fall into the
+            # UnicodeDecodeError branch below, which tells the user to use
+            # MEDIA: instead. errors="replace" would silently send mojibake.
             return Path(file_path).read_text(encoding="utf-8")
         except UnicodeDecodeError:
             print(
@@ -265,7 +268,7 @@ def _load_hermes_env() -> None:
         return
 
     try:
-        with open(config_path, "r", encoding="utf-8") as fh:
+        with open(config_path, "r", encoding="utf-8", errors="replace") as fh:
             raw = yaml.safe_load(fh) or {}
     except Exception:
         return

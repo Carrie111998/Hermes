@@ -7,7 +7,9 @@ host systemd/launchd/windows code path.
 """
 from __future__ import annotations
 
+import sys
 
+import pytest
 import pytest
 
 
@@ -463,6 +465,9 @@ def test_redirect_falls_back_when_sleep_missing(
     assert block_calls == [True]
     err = capsys.readouterr().err
     assert "`sleep` is unavailable" in err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signal.pause is POSIX-only")
 
 
 def test_block_until_terminated_installs_sigterm_handler_and_blocks(

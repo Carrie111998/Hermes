@@ -44,3 +44,50 @@ def _fast_retry_backoff(monkeypatch):
         monkeypatch.setattr(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0)
     except ImportError:
         pass
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_real_file_logging():
+    """Keep tests in this directory off the real on-disk log pipeline.
+
+    Every ``AIAgent()`` construction calls ``hermes_logging.setup_logging()``,
+    which spawns a background ``QueueListener`` thread whose rotating file
+    handlers open/write/lock the REAL user-home ``agent.log``/``errors.log``
+    for the lifetime of the pytest process.  On Windows, that listener
+    thread's concurrent file-handle churn (portalocker-locked rotation on a
+    log file shared with any other running Hermes process) races pytest's
+    fd-level output capture (``os.dup2`` on fds 1/2 at test boundaries) and
+    intermittently makes the terminal writer's ``flush()`` fail with
+    ``OSError: [Errno 9] Bad file descriptor`` — pytest then dies with an
+    INTERNALERROR after the last test (observed repeatedly as
+    "1480 passed, 26 skipped" followed by INTERNALERROR).
+
+    No test in this directory asserts on hermes_logging behavior, so stub
+    the two setup entry points to no-ops for the whole session.  Tests for
+    hermes_logging itself live outside tests/run_agent and are unaffected.
+    Also stop any listener that was already started before this fixture ran
+    (e.g. by an import-time agent construction).
+    """
+    try:
+        import hermes_logging as hl
+    except ImportError:
+        yield
+        return
+
+    real_setup = hl.setup_logging
+    real_verbose = hl.setup_verbose_logging
+    hl.setup_logging = lambda *a, **k: None
+    hl.setup_verbose_logging = lambda *a, **k: None
+    try:
+        hl._stop_queue_listener()
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        hl.setup_logging = real_setup
+        hl.setup_verbose_logging = real_verbose
+        try:
+            hl._stop_queue_listener()
+        except Exception:
+            pass

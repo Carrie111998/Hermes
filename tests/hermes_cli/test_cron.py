@@ -10,6 +10,24 @@ from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
 
 
+@pytest.fixture(autouse=True)
+def _reset_session_context_vars():
+    """Cron run paths bind gateway session ContextVars (HERMES_SESSION_*).
+
+    A bound ContextVar suppresses the os.environ fallback in
+    get_session_env() for the rest of the process, which breaks later tests
+    that set HERMES_SESSION_PLATFORM etc. via monkeypatch (cross-test
+    pollution).  Reset them to the _UNSET sentinel after each test.
+    """
+    yield
+    try:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+    except Exception:
+        pass
+
+
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")

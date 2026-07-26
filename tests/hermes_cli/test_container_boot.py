@@ -10,6 +10,7 @@ tests/docker/test_container_restart.py.
 from __future__ import annotations
 
 import orjson
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,12 @@ import pytest
 from hermes_cli.container_boot import (
     ReconcileAction,
     reconcile_profile_gateways,
+)
+
+
+_posix_only = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="s6 service registration is POSIX-only (os.mkfifo/chown in service_manager)",
 )
 
 
@@ -105,6 +112,7 @@ def _named_actions(actions: list[ReconcileAction]) -> list[ReconcileAction]:
 # ---------------------------------------------------------------------------
 
 
+@_posix_only
 def test_running_profile_is_registered_and_autostarted(tmp_path: Path) -> None:
     scandir = tmp_path / "run-service"; scandir.mkdir()
     _make_profile(tmp_path, "coder", state="running")
@@ -124,6 +132,7 @@ def test_running_profile_is_registered_and_autostarted(tmp_path: Path) -> None:
     assert not (svc / "down").exists()
 
 
+@_posix_only
 def test_registered_profile_has_finish_script(tmp_path: Path) -> None:
     """The finish script must be written so s6 stops restarting on
     fatal config errors (exit 78 → exit 125).  See #51228."""
@@ -142,6 +151,7 @@ def test_registered_profile_has_finish_script(tmp_path: Path) -> None:
     assert "125" in text
 
 
+@_posix_only
 def test_stopped_profile_is_registered_but_not_started(tmp_path: Path) -> None:
     scandir = tmp_path / "run-service"; scandir.mkdir()
     _make_profile(tmp_path, "writer", state="stopped")
@@ -157,6 +167,7 @@ def test_stopped_profile_is_registered_but_not_started(tmp_path: Path) -> None:
     assert (scandir / "gateway-writer" / "down").exists()
 
 
+@_posix_only
 def test_startup_failed_does_not_autostart(tmp_path: Path) -> None:
     """Avoid crash-loop on restart when the gateway was failing to boot."""
     scandir = tmp_path / "run-service"; scandir.mkdir()
@@ -171,6 +182,7 @@ def test_startup_failed_does_not_autostart(tmp_path: Path) -> None:
     assert (scandir / "gateway-broken" / "down").exists()
 
 
+@_posix_only
 def test_desired_state_running_autostarts_even_if_runtime_failed(tmp_path: Path) -> None:
     """Persisted operator intent wins over transient runtime failures."""
     scandir = tmp_path / "run-service"; scandir.mkdir()
@@ -191,6 +203,7 @@ def test_desired_state_running_autostarts_even_if_runtime_failed(tmp_path: Path)
     assert not (scandir / "gateway-resilient" / "down").exists()
 
 
+@_posix_only
 def test_multiplex_boot_keeps_named_running_profile_registered_down(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,6 +237,7 @@ def test_multiplex_boot_keeps_named_running_profile_registered_down(
     assert (profile / "gateway_state.json").read_text() == persisted_state
 
 
+@_posix_only
 def test_desired_state_stopped_blocks_legacy_running_runtime(tmp_path: Path) -> None:
     """Explicit stop must survive a stale legacy runtime state of running."""
     scandir = tmp_path / "run-service"; scandir.mkdir()
@@ -244,6 +258,7 @@ def test_desired_state_stopped_blocks_legacy_running_runtime(tmp_path: Path) -> 
     assert (scandir / "gateway-quiet" / "down").exists()
 
 
+@_posix_only
 def test_starting_state_does_not_autostart(tmp_path: Path) -> None:
     """`starting` means the gateway died mid-boot last time; treat as
     failed, not as a candidate for auto-restart."""
@@ -258,6 +273,7 @@ def test_starting_state_does_not_autostart(tmp_path: Path) -> None:
     assert named[0].action == "registered"
 
 
+@_posix_only
 def test_draining_runtime_state_autostarts(tmp_path: Path) -> None:
     """A gateway hard-killed mid-drain leaves `gateway_state=draining` as its
     last persisted value (the recreate SIGTERMs it before `_stop_impl` can
@@ -280,6 +296,7 @@ def test_draining_runtime_state_autostarts(tmp_path: Path) -> None:
     assert not (scandir / "gateway-drained" / "down").exists()
 
 
+@_posix_only
 def test_degraded_runtime_state_autostarts(tmp_path: Path) -> None:
     """`degraded` is the same wedge class as `draining`: the gateway came up
     with some platforms queued for retry, then fell through to the normal
@@ -301,6 +318,7 @@ def test_degraded_runtime_state_autostarts(tmp_path: Path) -> None:
     assert not (scandir / "gateway-degraded-box" / "down").exists()
 
 
+@_posix_only
 def test_draining_default_root_autostarts(tmp_path: Path) -> None:
     """The hosted-agent path: the default (root) profile, not a named one.
     A managed Fly instance runs the root profile; a stranded `draining` there
@@ -319,6 +337,7 @@ def test_draining_default_root_autostarts(tmp_path: Path) -> None:
     assert not (scandir / "gateway-default" / "down").exists()
 
 
+@_posix_only
 def test_desired_state_stopped_overrides_draining_runtime(tmp_path: Path) -> None:
     """An explicit operator stop must survive even when the transient runtime
     state is `draining`. The `desired_state` is the durable intent and is
@@ -345,6 +364,7 @@ def test_desired_state_stopped_overrides_draining_runtime(tmp_path: Path) -> Non
     assert (scandir / "gateway-stopped-while-draining" / "down").exists()
 
 
+@_posix_only
 def test_stale_runtime_files_are_removed(tmp_path: Path) -> None:
     scandir = tmp_path / "run-service"; scandir.mkdir()
     profile = _make_profile(tmp_path, "coder", state="running", with_pid=True)
@@ -359,6 +379,7 @@ def test_stale_runtime_files_are_removed(tmp_path: Path) -> None:
     assert not (profile / "processes.json").exists()
 
 
+@_posix_only
 def test_profile_without_state_file_is_registered_but_not_started(
     tmp_path: Path,
 ) -> None:
@@ -377,6 +398,7 @@ def test_profile_without_state_file_is_registered_but_not_started(
     assert (scandir / "gateway-fresh" / "down").exists()
 
 
+@_posix_only
 def test_directory_without_marker_file_is_skipped(tmp_path: Path) -> None:
     """A stray dir under profiles/ that isn't actually a profile (no
     SOUL.md — the marker the reconciler keys on) should be skipped."""
@@ -392,6 +414,7 @@ def test_directory_without_marker_file_is_skipped(tmp_path: Path) -> None:
     assert not (scandir / "gateway-stray").exists()
 
 
+@_posix_only
 def test_corrupt_state_file_treated_as_no_prior_state(tmp_path: Path) -> None:
     """If gateway_state.json is malformed JSON, don't blow up the whole
     reconciliation — register the slot in the down state."""
@@ -408,6 +431,7 @@ def test_corrupt_state_file_treated_as_no_prior_state(tmp_path: Path) -> None:
     assert (scandir / "gateway-junk" / "down").exists()
 
 
+@_posix_only
 def test_reconcile_log_is_written(tmp_path: Path) -> None:
     scandir = tmp_path / "run-service"; scandir.mkdir()
     _make_profile(tmp_path, "a", state="running")
@@ -424,6 +448,7 @@ def test_reconcile_log_is_written(tmp_path: Path) -> None:
     assert "action=registered" in log
 
 
+@_posix_only
 def test_reconcile_log_rotates_when_size_exceeded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -455,6 +480,7 @@ def test_reconcile_log_rotates_when_size_exceeded(
     assert "profile=coder" in new_contents
 
 
+@_posix_only
 def test_reconcile_log_does_not_rotate_below_threshold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -480,6 +506,7 @@ def test_reconcile_log_does_not_rotate_below_threshold(
     assert "profile=coder" in contents
 
 
+@_posix_only
 def test_reconcile_log_rotation_overwrites_existing_dot1(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -524,6 +551,7 @@ def test_dry_run_makes_no_filesystem_changes(tmp_path: Path) -> None:
     assert not (tmp_path / "logs" / "container-boot.log").exists()
 
 
+@_posix_only
 def test_missing_profiles_root_still_registers_default_slot(
     tmp_path: Path,
 ) -> None:
@@ -543,6 +571,7 @@ def test_missing_profiles_root_still_registers_default_slot(
     assert (scandir / "gateway-default" / "down").exists()
 
 
+@_posix_only
 def test_invalid_profile_name_in_directory_raises(tmp_path: Path) -> None:
     """A profile dir whose name doesn't match validate_profile_name's
     rules (uppercase, etc.) must surface as a hard error rather than
@@ -555,6 +584,7 @@ def test_invalid_profile_name_in_directory_raises(tmp_path: Path) -> None:
         )
 
 
+@_posix_only
 def test_register_service_publishes_atomically(tmp_path: Path) -> None:
     """The reconciler should build the new service dir in a sibling
     tmp directory and rename it into place — never leaving a half-
@@ -583,6 +613,7 @@ def test_register_service_publishes_atomically(tmp_path: Path) -> None:
     assert (svc / "log" / "run").exists()
 
 
+@_posix_only
 def test_register_service_overwrites_existing_slot(tmp_path: Path) -> None:
     """A second reconciliation pass cleanly replaces an existing
     slot (the tmp+rename publication overwrites the previous one)."""
@@ -614,6 +645,7 @@ def test_register_service_overwrites_existing_slot(tmp_path: Path) -> None:
     assert (scandir / "gateway-coder" / "down").exists()
 
 
+@_posix_only
 def test_register_service_cleans_up_stale_tmp_dir(tmp_path: Path) -> None:
     """If a previous interrupted run left a staging sibling directory,
     a fresh reconcile must clean it up rather than failing on mkdir.
@@ -642,6 +674,7 @@ def test_register_service_cleans_up_stale_tmp_dir(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@_posix_only
 def test_default_slot_always_registered_on_empty_home(tmp_path: Path) -> None:
     """Bare HERMES_HOME with nothing under it still produces a
     gateway-default slot (down state)."""
@@ -660,6 +693,7 @@ def test_default_slot_always_registered_on_empty_home(tmp_path: Path) -> None:
     assert (svc / "down").exists()
 
 
+@_posix_only
 def test_default_slot_run_script_omits_profile_flag(tmp_path: Path) -> None:
     """The default slot's run script must NOT pass `-p default` —
     that would resolve to $HERMES_HOME/profiles/default/ instead of
@@ -676,6 +710,7 @@ def test_default_slot_run_script_omits_profile_flag(tmp_path: Path) -> None:
     assert "-p 'default'" not in run
 
 
+@_posix_only
 def test_default_slot_autostarts_when_root_state_running(tmp_path: Path) -> None:
     """gateway_state.json at the HERMES_HOME root with state=running
     means the default slot auto-starts on container boot."""
@@ -699,6 +734,7 @@ def test_default_slot_autostarts_when_root_state_running(tmp_path: Path) -> None
         ("/init", "/opt/hermes/docker/main-wrapper.sh", "gateway", "run"),
     ],
 )
+@_posix_only
 def test_legacy_gateway_run_cmd_seeds_default_running_state(
     tmp_path: Path,
     container_argv: tuple[str, ...],
@@ -732,6 +768,7 @@ def test_legacy_gateway_run_cmd_seeds_default_running_state(
         ("/init", "/opt/hermes/docker/main-wrapper.sh", "gateway", "run", "--no-supervise"),
     ],
 )
+@_posix_only
 def test_legacy_gateway_run_no_supervise_does_not_seed_s6_state(
     tmp_path: Path,
     container_argv: tuple[str, ...],
@@ -753,6 +790,7 @@ def test_legacy_gateway_run_no_supervise_does_not_seed_s6_state(
     assert not (tmp_path / "gateway_state.json").exists()
 
 
+@_posix_only
 def test_legacy_gateway_run_env_no_supervise_does_not_seed_s6_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -775,6 +813,7 @@ def test_legacy_gateway_run_env_no_supervise_does_not_seed_s6_state(
     assert not (tmp_path / "gateway_state.json").exists()
 
 
+@_posix_only
 def test_default_slot_does_not_autostart_when_root_state_stopped(
     tmp_path: Path,
 ) -> None:
@@ -795,6 +834,7 @@ def test_default_slot_does_not_autostart_when_root_state_stopped(
     assert state["gateway_state"] == "stopped"
 
 
+@_posix_only
 def test_default_slot_does_not_autostart_when_root_state_startup_failed(
     tmp_path: Path,
 ) -> None:
@@ -810,6 +850,7 @@ def test_default_slot_does_not_autostart_when_root_state_startup_failed(
     assert default_action.action == "registered"
 
 
+@_posix_only
 def test_default_slot_cleans_up_stale_runtime_files_at_root(
     tmp_path: Path,
 ) -> None:
@@ -828,6 +869,7 @@ def test_default_slot_cleans_up_stale_runtime_files_at_root(
     assert not (tmp_path / "processes.json").exists()
 
 
+@_posix_only
 def test_default_slot_appears_before_named_profiles(tmp_path: Path) -> None:
     """The action list is ordered: default first, then named profiles
     in directory order. Operators and the boot-log reader rely on
@@ -847,6 +889,7 @@ def test_default_slot_appears_before_named_profiles(tmp_path: Path) -> None:
     ]
 
 
+@_posix_only
 def test_profiles_default_subdir_is_skipped_with_warning(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -1039,6 +1082,7 @@ def test_main_skips_reconcile_in_dashboard_container_s6v3(
     assert "skipping (dashboard container" in capsys.readouterr().out
 
 
+@_posix_only
 def test_main_reconciles_in_gateway_container(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1065,6 +1109,7 @@ def test_main_reconciles_in_gateway_container(
     assert not (scandir / "gateway-worker" / "down").exists()
 
 
+@_posix_only
 def test_main_ignores_removed_skip_reconcile_env_var(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

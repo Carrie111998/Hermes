@@ -114,7 +114,7 @@ def summarize(log: Path, since_ts_ms: int) -> dict[str, Any]:
     frame_events: list[dict[str, Any]] = []
     if not log.exists():
         return {"error": f"no log at {log}", "react": [], "frame": []}
-    for line in log.read_text(encoding="utf-8").splitlines():
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -572,7 +572,7 @@ def loop_mode(args: argparse.Namespace) -> int:
                     ["npm", "run", "build"],
                     cwd=tui_dir,
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                 )
                 if result.returncode != 0:
                     print("✗ build failed:")

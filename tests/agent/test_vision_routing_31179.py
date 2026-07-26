@@ -60,6 +60,19 @@ def _write_config(home: str, text: str) -> None:
         fp.write(text)
 
 
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    """_fresh_modules() evicts agent.*/tools.*/hermes_cli.config modules so
+    they re-import against the test's isolated HERMES_HOME. Restore the module
+    registry after each test so later files don't patch stale module objects."""
+    snapshot = dict(sys.modules)
+    try:
+        yield
+    finally:
+        sys.modules.clear()
+        sys.modules.update(snapshot)
+
+
 def _fresh_modules():
     """Drop cached hermes modules so each test reloads against current env."""
     for mod in list(sys.modules.keys()):

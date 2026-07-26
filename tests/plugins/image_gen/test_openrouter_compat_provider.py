@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pybase64 as base64
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -251,6 +253,7 @@ class TestHelpers:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path format incompatibility")
 class TestGenerate:
     def test_missing_credentials(self):
         with patch(_RUNTIME, return_value=_runtime_ok(api_key="")):

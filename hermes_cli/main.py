@@ -248,7 +248,7 @@ def _config_default_interface_early() -> str:
         if os.path.exists(cfg_path):
             import yaml as _yaml_iface
 
-            with open(cfg_path, encoding="utf-8") as _f:
+            with open(cfg_path, encoding="utf-8", errors="replace") as _f:
                 raw = _yaml_iface.load(
                     _f, Loader=getattr(_yaml_iface, "CSafeLoader", None) or _yaml_iface.SafeLoader
                 ) or {}
@@ -347,7 +347,7 @@ def _read_openai_version_fast() -> str | None:
             base = os.getcwd()
         version_file = os.path.join(base, "openai", "_version.py")
         try:
-            with open(version_file, encoding="utf-8") as handle:
+            with open(version_file, encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     stripped = line.strip()
                     if not stripped.startswith("__version__"):
@@ -668,7 +668,7 @@ try:
 
     _cfg_path = get_hermes_home() / "config.yaml"
     if _cfg_path.exists():
-        with open(_cfg_path, encoding="utf-8") as _f:
+        with open(_cfg_path, encoding="utf-8", errors="replace") as _f:
             _early_cfg_raw = _yaml_early.load(
                 _f, Loader=getattr(_yaml_early, "CSafeLoader", None) or _yaml_early.SafeLoader
             ) or {}
@@ -859,7 +859,7 @@ def _termux_bundled_skills_sync_needed() -> bool:
         return True
     try:
         stamp = _termux_bundled_skills_stamp_path()
-        return stamp.read_text(encoding="utf-8").strip() != _termux_bundled_skills_fingerprint()
+        return stamp.read_text(encoding="utf-8", errors="replace").strip() != _termux_bundled_skills_fingerprint()
     except OSError:
         return True
 
@@ -961,7 +961,7 @@ def _has_any_provider_configured() -> bool:
     env_file = get_env_path()
     if env_file.exists():
         try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
+            for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
                 line = line.strip()
                 if line.startswith("#") or "=" not in line:
                     continue
@@ -1304,7 +1304,7 @@ def _probe_container(cmd: list, backend: str, via_sudo: bool = False):
         if sys.platform == "win32":
             from hermes_cli._subprocess_compat import windows_hide_flags
             _subprocess_kwargs["creationflags"] = windows_hide_flags()
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15, **_subprocess_kwargs)  # windows-footgun: ok — creationflags in _subprocess_kwargs
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, **_subprocess_kwargs)  # windows-footgun: ok — creationflags in _subprocess_kwargs
     except subprocess.TimeoutExpired:
         label = f"sudo {backend}" if via_sudo else backend
         print(
@@ -1452,7 +1452,7 @@ def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
     try:
-        data = orjson.loads(Path(path).read_text(encoding="utf-8"))
+        data = orjson.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
         sid = str(data.get("session_id") or "").strip()
         return sid or None
     except Exception:
@@ -1638,8 +1638,8 @@ def _tui_need_npm_install(root: Path) -> bool:
     # can bump the root lockfile timestamp even when installed deps already
     # match. Fall back to mtime when either file is unparseable.
     try:
-        wanted = orjson.loads(lock.read_text(encoding="utf-8")).get("packages") or {}
-        installed = orjson.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
+        wanted = orjson.loads(lock.read_text(encoding="utf-8", errors="replace")).get("packages") or {}
+        installed = orjson.loads(marker.read_text(encoding="utf-8", errors="replace")).get("packages") or {}
     except (OSError, UnicodeDecodeError, orjson.JSONDecodeError):
         return lock.stat().st_mtime > marker.stat().st_mtime
 
@@ -1826,7 +1826,7 @@ def _restore_tui_workspace(tui_dir: Path) -> bool:
             [git, "restore", "--", tui_dir.name],
             cwd=str(tui_dir.parent),
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             check=False,
             **_subprocess_kwargs,
         )
@@ -2099,7 +2099,7 @@ def _read_cgroup_memory_limit() -> Optional[int]:
     )
     for path in candidates:
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 raw = f.read().strip()
         except (OSError, ValueError):
             continue
@@ -4753,7 +4753,7 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
             git_cmd + ["rev-parse", "HEAD"],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             check=True,
         )
         return result.stdout.strip() or None
@@ -5014,7 +5014,7 @@ def _nixos_build_env() -> dict[str, str] | None:
     """
     from agent.re_compat import re
     try:
-        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     if not re.search(r"^ID=nixos$", os_release, re.M):
@@ -5038,7 +5038,7 @@ def _nixos_build_env() -> dict[str, str] | None:
     try:
         result = subprocess.run(
             ["nix-shell", "-p", "python3", "--run", "which python3"],
-            capture_output=True, text=True, check=False, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=15,
         )
         if result.returncode == 0:
             python3_path = result.stdout.strip()
@@ -5301,7 +5301,7 @@ def _compute_desktop_content_hash(project_root: Path) -> str:
     gitignore = project_root / ".gitignore"
     lines: list[str] = []
     if gitignore.is_file():
-        lines = gitignore.read_text(encoding="utf-8").splitlines()
+        lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
     spec = PathSpec.from_lines("gitignore", lines)
 
     # Root workspace config
@@ -5356,7 +5356,7 @@ def _desktop_build_needed(desktop_dir: Path, project_root: Path, *, source_mode:
         return True
 
     try:
-        stamp_data = orjson.loads(stamp_file.read_text(encoding="utf-8"))
+        stamp_data = orjson.loads(stamp_file.read_text(encoding="utf-8", errors="replace"))
     except (OSError, orjson.JSONDecodeError, KeyError):
         return True
 
@@ -5779,7 +5779,7 @@ def _desktop_linux_needs_no_sandbox() -> bool:
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return False
     try:
-        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8") as f:
+        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8", errors="replace") as f:
             return f.read().strip() == "1"
     except OSError:
         return False
@@ -6196,7 +6196,7 @@ def _find_stale_dashboard_pids(
             result = subprocess.run(
                 ["ps", "-A", "-o", "pid=,command="],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
             if result.returncode == 0:
@@ -6406,7 +6406,7 @@ def _kill_stale_dashboard_processes(
                 result = subprocess.run(
                     ["taskkill", "/PID", str(pid), "/F"],
                     capture_output=True,
-                    text=True,
+                    text=True, errors="replace",
                     timeout=10,
                 )
                 if result.returncode == 0:
@@ -6729,7 +6729,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         check=True,
     )
     if not status.stdout.strip():
@@ -6743,7 +6743,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         git_cmd + ["ls-files", "--unmerged"],
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     if unmerged.stdout.strip():
         print("→ Clearing unmerged index entries from a previous conflict...")
@@ -6768,7 +6768,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         git_cmd + ["rev-parse", "--verify", "refs/stash"],
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         check=True,
     ).stdout.strip()
     return stash_ref
@@ -6781,7 +6781,7 @@ def _resolve_stash_selector(
         git_cmd + ["stash", "list", "--format=%gd %H"],
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         check=True,
     )
     for line in stash_list.stdout.splitlines():
@@ -6836,7 +6836,7 @@ def _restore_stashed_changes(
         git_cmd + ["stash", "apply", stash_ref],
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
 
     # Check for unmerged (conflicted) files — can happen even when returncode is 0
@@ -6844,7 +6844,7 @@ def _restore_stashed_changes(
         git_cmd + ["diff", "--name-only", "--diff-filter=U"],
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     has_conflicts = bool(unmerged.stdout.strip())
 
@@ -6894,7 +6894,7 @@ def _restore_stashed_changes(
             git_cmd + ["stash", "drop", stash_selector],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if drop.returncode != 0:
             print(
@@ -6946,7 +6946,7 @@ def _discard_stashed_changes(
         git_cmd + ["stash", "drop", stash_selector],
         cwd=cwd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     if drop.returncode != 0:
         print(
@@ -6983,7 +6983,7 @@ def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
             git_cmd + ["remote", "get-url", "origin"],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -7016,7 +7016,7 @@ def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
             git_cmd + ["remote", "get-url", "upstream"],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         return result.returncode == 0
     except Exception:
@@ -7030,7 +7030,7 @@ def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
             git_cmd + ["remote", "add", "upstream", OFFICIAL_REPO_URL],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         return result.returncode == 0
     except Exception:
@@ -7044,7 +7044,7 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
             git_cmd + ["rev-list", "--count", f"{base}..{head}"],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             return int(result.stdout.strip())
@@ -7080,7 +7080,7 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
             git_cmd + ["push", "origin", "main", "--force-with-lease"],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         return result.returncode == 0
     except Exception:
@@ -8211,7 +8211,7 @@ def _verify_core_dependencies_installed(
             result = subprocess.run(
                 [str(venv_python), "-c", check_script, *applicable],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 check=False,
                 env=env,
             )
@@ -8424,7 +8424,7 @@ def _npm_manifest_paths() -> tuple[Path, ...]:
     root_pkg = PROJECT_ROOT / "package.json"
     paths = [PROJECT_ROOT / "package-lock.json", root_pkg]
     try:
-        workspaces = json.loads(root_pkg.read_text(encoding="utf-8")).get(
+        workspaces = json.loads(root_pkg.read_text(encoding="utf-8", errors="replace")).get(
             "workspaces", []
         )
         if isinstance(workspaces, dict):  # legacy {"packages": [...]} form
@@ -8470,7 +8470,7 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
         cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
         if not cache_file.exists():
             return True
-        return cache_file.read_text(encoding="utf-8").strip() != current
+        return cache_file.read_text(encoding="utf-8", errors="replace").strip() != current
     except OSError:
         return True
 
@@ -8951,7 +8951,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             git_cmd + ["rev-parse", "--is-shallow-repository"],
             cwd=PROJECT_ROOT,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         ).stdout.strip()
         == "true"
     )
@@ -8963,7 +8963,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             git_cmd + ["fetch"] + depth_args + ["upstream", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if fetch_result.returncode != 0:
             # Fallback to origin if upstream doesn't exist
@@ -8972,7 +8972,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
                 git_cmd + ["fetch"] + depth_args + ["origin", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
             )
             upstream_exists = False
             compare_branch = f"origin/{branch}"
@@ -8986,7 +8986,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             git_cmd + ["fetch"] + depth_args + ["origin", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         upstream_exists = False
         compare_branch = f"origin/{branch}"
@@ -9011,7 +9011,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         git_cmd + ["rev-parse", "--verify", "--quiet", compare_branch],
         cwd=PROJECT_ROOT,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     if verify_result.returncode != 0:
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
@@ -9022,11 +9022,11 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # report presence-only (mirrors the banner's _check_via_local_git).
         head_sha = subprocess.run(
             git_cmd + ["rev-parse", "HEAD"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
+            cwd=PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout.strip()
         target_sha = subprocess.run(
             git_cmd + ["rev-parse", compare_branch],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
+            cwd=PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout.strip()
         if head_sha and target_sha and head_sha == target_sha:
             print("✓ Already up to date.")
@@ -9041,7 +9041,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
         cwd=PROJECT_ROOT,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         check=True,
     )
     behind = int(rev_result.stdout.strip())
@@ -9102,7 +9102,7 @@ def _ensure_fhs_path_guard() -> None:
                 "command -v hermes",
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -9134,7 +9134,7 @@ def _ensure_fhs_path_guard() -> None:
         if already_guarded:
             continue
         try:
-            with cfg.open("a", encoding="utf-8") as f:
+            with cfg.open("a", encoding="utf-8", errors="replace") as f:
                 f.write("\n" + path_comment + "\n" + path_line + "\n")
         except OSError as e:
             print(f"  ⚠ Could not update {cfg}: {e}")
@@ -9426,7 +9426,7 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         result = subprocess.run(
             [str(venv_python), "-c", check],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=60,
             cwd=PROJECT_ROOT,
         )
@@ -9815,7 +9815,7 @@ def _discard_lockfile_churn(git_cmd, repo_root):
             git_cmd + ["diff", "--name-only"],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if diff.returncode != 0:
             return
@@ -9836,7 +9836,7 @@ def _discard_lockfile_churn(git_cmd, repo_root):
             git_cmd + ["checkout", "--", *dirty],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             check=False,
         )
         print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
@@ -10132,7 +10132,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             git_cmd + ["fetch", "origin", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
@@ -10156,7 +10156,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=PROJECT_ROOT,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             check=True,
         )
         current_branch = result.stdout.strip()
@@ -10179,7 +10179,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 git_cmd + ["checkout", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
             )
             if checkout_result.returncode != 0:
                 # Local checkout doesn't have this branch yet. Try to set
@@ -10190,7 +10190,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                 )
                 if track_result.returncode != 0:
                     # Restore the user's prior branch + stash before bailing
@@ -10221,7 +10221,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             check=True,
         )
         commit_count = int(result.stdout.strip())
@@ -10247,7 +10247,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     git_cmd + ["checkout", current_branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     check=False,
                 )
 
@@ -10319,7 +10319,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 git_cmd + ["pull", "--ff-only", "origin", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged (e.g. upstream
@@ -10332,7 +10332,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     git_cmd + ["reset", "--hard", f"origin/{branch}"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                 )
                 if reset_result.returncode != 0:
                     print(f"✗ Failed to reset to origin/{branch}.")
@@ -10368,7 +10368,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         git_cmd + ["reset", "--hard", pre_pull_sha],
                         cwd=PROJECT_ROOT,
                         capture_output=True,
-                        text=True,
+                        text=True, encoding="utf-8", errors="replace",
                     )
                     if rollback_result.returncode == 0:
                         print("  ✓ Rollback complete — your install is unchanged.")
@@ -10933,7 +10933,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _verify = subprocess.run(
                             scope_cmd_ + ["is-active", svc_name_],
                             capture_output=True,
-                            text=True,
+                            text=True, encoding="utf-8", errors="replace",
                             timeout=5,
                         )
                         if _verify.stdout.strip() == "active":
@@ -10967,7 +10967,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             "--value",
                         ],
                         capture_output=True,
-                        text=True,
+                        text=True, encoding="utf-8", errors="replace",
                         timeout=5,
                     )
                 except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -11115,7 +11115,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 "--no-pager",
                             ],
                             capture_output=True,
-                            text=True,
+                            text=True, encoding="utf-8", errors="replace",
                             timeout=10,
                         )
                         for line in result.stdout.strip().splitlines():
@@ -11132,7 +11132,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             check = subprocess.run(
                                 scope_cmd + ["is-active", svc_name],
                                 capture_output=True,
-                                text=True,
+                                text=True, encoding="utf-8", errors="replace",
                                 timeout=5,
                             )
                             if check.stdout.strip() != "active":
@@ -11165,7 +11165,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                         "--value",
                                     ],
                                     capture_output=True,
-                                    text=True,
+                                    text=True, encoding="utf-8", errors="replace",
                                     timeout=5,
                                 )
                                 _main_pid = int((_show.stdout or "").strip() or 0)
@@ -11218,13 +11218,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                     subprocess.run(
                                         _manage_cmd + ["reset-failed", svc_name],
                                         capture_output=True,
-                                        text=True,
+                                        text=True, encoding="utf-8", errors="replace",
                                         timeout=10,
                                     )
                                     subprocess.run(
                                         _manage_cmd + ["start", svc_name],
                                         capture_output=True,
-                                        text=True,
+                                        text=True, encoding="utf-8", errors="replace",
                                         timeout=15,
                                     )
                                     # Short poll: the gateway should be up
@@ -11307,13 +11307,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             subprocess.run(
                                 _manage_cmd + ["reset-failed", svc_name],
                                 capture_output=True,
-                                text=True,
+                                text=True, encoding="utf-8", errors="replace",
                                 timeout=10,
                             )
                             restart = subprocess.run(
                                 _manage_cmd + ["restart", svc_name],
                                 capture_output=True,
-                                text=True,
+                                text=True, encoding="utf-8", errors="replace",
                                 timeout=15,
                             )
                             if restart.returncode == 0:
@@ -11339,13 +11339,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                     subprocess.run(
                                         _manage_cmd + ["reset-failed", svc_name],
                                         capture_output=True,
-                                        text=True,
+                                        text=True, encoding="utf-8", errors="replace",
                                         timeout=10,
                                     )
                                     subprocess.run(
                                         _manage_cmd + ["restart", svc_name],
                                         capture_output=True,
-                                        text=True,
+                                        text=True, encoding="utf-8", errors="replace",
                                         timeout=15,
                                     )
                                     if _wait_for_service_active(
@@ -11395,7 +11395,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         check = subprocess.run(
                             ["launchctl", "list", get_launchd_label()],
                             capture_output=True,
-                            text=True,
+                            text=True, encoding="utf-8", errors="replace",
                             timeout=5,
                         )
                         if check.returncode == 0:
@@ -12547,6 +12547,31 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     print()
 
 
+def _compute_well_known_ports(dashboard_port: int) -> list[int]:
+    """Return the full port set to claim for a given dashboard port.
+
+    The dashboard port plus two satellite ports (webhook, proxy) are claimed
+    as an atomic set.  Satellite ports are offset from the dashboard port so
+    that multiple Hermes instances can coexist without colliding:
+
+        dashboard=9120 → [9120, 8644, 8645]
+        dashboard=9121 → [9121, 8646, 8647]
+        dashboard=9122 → [9122, 8648, 8649]
+        ...
+
+    Must be kept in sync with the Rust ``ports_to_claim`` in
+    ``Hermes-CN-Desktop/src/process/dashboard.rs``.
+    """
+    _SATELLITE_BASE: tuple[int, int] = (8644, 8645)
+    _DEFAULT_DASHBOARD_PORT: int = 9120
+    if dashboard_port <= 0:
+        return [dashboard_port] if dashboard_port else []
+    offset = (dashboard_port - _DEFAULT_DASHBOARD_PORT) * 2
+    webhook_port = _SATELLITE_BASE[0] + offset
+    proxy_port = _SATELLITE_BASE[1] + offset
+    return [dashboard_port, webhook_port, proxy_port]
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     # --status: report running dashboards and exit, no deps needed.
@@ -12867,18 +12892,25 @@ def cmd_dashboard(args):
     from hermes_cli.port_lock import claim_port_set
 
     _dashboard_port = int(args.port)
-    _well_known_ports = [8644, 8645]
-    if _dashboard_port > 0:
-        _well_known_ports.insert(0, _dashboard_port)
-    _port_locks = claim_port_set(_well_known_ports)
-    if _port_locks is None:
-        print(
-            f"Error: port {_dashboard_port} (or associated webhook/proxy ports) "
-            f"is already claimed by another Hermes instance.\n"
-            f"Stop the other instance, or use `--port 0` to let the OS assign a free port.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+
+    # When the desktop spawns this backend, it _already_ holds the OS-level
+    # port locks (see try_claim_dashboard_ports in the Rust desktop).  Claiming
+    # them again from the child process would fail because the parent's locks
+    # are still held.  Desktop-managed backends skip the claim and trust the
+    # parent's coordination.
+    if os.environ.get("HERMES_DESKTOP_MANAGED") == "1":
+        _port_locks = []
+    else:
+        _well_known_ports = _compute_well_known_ports(_dashboard_port)
+        _port_locks = claim_port_set(_well_known_ports)
+        if _port_locks is None:
+            print(
+                f"Error: port {_dashboard_port} (or associated webhook/proxy ports) "
+                f"is already claimed by another Hermes instance.\n"
+                f"Stop the other instance, or use `--port 0` to let the OS assign a free port.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     try:
         start_server(
@@ -14115,7 +14147,7 @@ def main():
                     from hermes_cli.tools_config import _cua_driver_env
                     version = subprocess.run(
                         [path, "--version"],
-                        capture_output=True, text=True, timeout=5,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
                         env=_cua_driver_env(),
                     ).stdout.strip()
                 except Exception:

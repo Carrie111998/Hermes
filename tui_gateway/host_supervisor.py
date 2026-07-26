@@ -48,17 +48,27 @@ _RESPAWN_WINDOW_SECS = 300.0
 _SHUTDOWN_TIMEOUT_SECS = 10.0
 
 
+_APPEND_LOCK = threading.Lock()
+
+
 def append_log_record(path: str | Path, record: str) -> None:
-    """Append one log record using O_APPEND and exactly one os.write call."""
+    """Append one log record using O_APPEND and exactly one os.write call.
+
+    On POSIX, O_APPEND makes the seek-to-end + write atomic. On Windows the
+    CRT emulates O_APPEND as a separate seek, so concurrent writers can
+    overwrite each other — serialize appends within this process to keep one
+    record == one contiguous line everywhere.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     text = record if record.endswith("\n") else f"{record}\n"
     data = text.encode("utf-8", errors="replace")
-    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
+    with _APPEND_LOCK:
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
 
 
 def _repo_root() -> Path:
@@ -71,6 +81,8 @@ def _build_sha() -> str:
             ["git", "rev-parse", "HEAD"],
             cwd=str(_repo_root()),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stderr=subprocess.DEVNULL,
             timeout=2,
         ).strip()
@@ -111,6 +123,7 @@ def _pid_command(pid: int) -> str:
         return subprocess.check_output(
             ["ps", "-p", str(pid), "-o", "command="],
             text=True,
+            errors="replace",
             stderr=subprocess.DEVNULL,
             timeout=2,
         ).strip()
@@ -207,7 +220,7 @@ class HostSupervisor:
     def reconcile_startup_orphan(self) -> str:
         """Terminate a stale registered host, guarding against PID reuse."""
         try:
-            data = json.loads(self.registry_path.read_text(encoding="utf-8"))
+            data = json.loads(self.registry_path.read_text(encoding="utf-8", errors="replace"))
         except FileNotFoundError:
             return "none"
         except Exception:
@@ -326,6 +339,8 @@ class HostSupervisor:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             start_new_session=True,
         )

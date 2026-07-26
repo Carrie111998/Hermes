@@ -40,7 +40,7 @@ def load_timing_data(raw_dir: Path) -> List[Dict]:
 
     for f in sorted(raw_dir.glob("*.json")):
         try:
-            data = orjson.loads(f.read_text(encoding="utf-8"))
+            data = orjson.loads(f.read_text(encoding="utf-8", errors="replace"))
             data_files.append({
                 "path": f,
                 "name": f.stem,
@@ -62,7 +62,7 @@ def load_baseline(baseline_dir: Path) -> Dict:
         return {}
 
     try:
-        return orjson.loads(baselines[-1].read_text(encoding="utf-8"))
+        return orjson.loads(baselines[-1].read_text(encoding="utf-8", errors="replace"))
     except Exception:
         return {}
 
@@ -237,13 +237,13 @@ def generate_report(args) -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
         if result.returncode == 0:
             git_branch = result.stdout.strip()
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
         if result.returncode == 0:
             git_sha = result.stdout.strip()

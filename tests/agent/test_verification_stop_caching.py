@@ -19,9 +19,30 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    """_fresh_run_agent() evicts run_agent/agent.*/tools.*/hermes_* from
+    sys.modules so it re-imports against the test's HERMES_HOME. Without a
+    restore, later test files patch (unittest.mock) the freshly re-imported
+    module objects while exercising the stale ones from collection time —
+    cross-test pollution. Snapshot and restore the registry around each test."""
+    snapshot = dict(sys.modules)
+    try:
+        yield
+    finally:
+        sys.modules.clear()
+        sys.modules.update(snapshot)
+
+
 def _fresh_run_agent(hermes_home):
+    # NOTE: the root packages ("agent", "tools") must be evicted too —
+    # otherwise the fresh import registers the fresh submodules as attributes
+    # on the ORIGINAL package objects, leaving pkg.attr and
+    # sys.modules["pkg.mod"] pointing at different module generations after
+    # the autouse restore fixture puts the originals back.
     for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
+        if (mod == "run_agent" or mod == "agent" or mod == "tools"
+                or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_")):
             del sys.modules[mod]
     import run_agent  # noqa: F401
     return sys.modules["run_agent"]
@@ -115,7 +136,7 @@ def test_json_log_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
 
     log_file = agent.logs_dir / "session_sess_json.json"
     assert log_file.exists()
-    data = orjson.loads(log_file.read_text(encoding="utf-8"))
+    data = orjson.loads(log_file.read_text(encoding="utf-8", errors="replace"))
     contents = [m.get("content") for m in data["messages"]]
     # The assistant candidate persists — it is real content.
     assert "premature done" in contents

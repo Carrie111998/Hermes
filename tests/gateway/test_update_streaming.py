@@ -7,6 +7,8 @@ Tests the new --gateway mode for hermes update, including:
 - _restore_stashed_changes() with input_fn parameter
 """
 
+import sys
+
 import orjson
 import os
 import time
@@ -209,6 +211,7 @@ class TestRestoreStashWithInputFn:
 class TestUpdateCommandGatewayFlag:
     """Verify the gateway spawns hermes update --gateway."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX bash command string; Windows implementation spawns a python -c detach helper instead")
     @pytest.mark.asyncio
     async def test_spawns_with_gateway_flag(self, tmp_path):
         """The spawned update command includes --gateway and PYTHONUNBUFFERED."""

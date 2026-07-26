@@ -15,8 +15,22 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 """
 
 import hashlib
+import os
 import orjson
 from unittest.mock import MagicMock
+
+
+def _bump_mtime(path):
+    """Force a distinct st_mtime_ns after rewriting a config file.
+
+    The gateway memoizes Honcho cache-busting values keyed by
+    (path, st_mtime_ns). On Windows the mtime tick is coarse enough that two
+    writes within one test can share a timestamp, leaving the memo
+    un-busted. Bump the mtime explicitly so the test asserts the memoization
+    contract instead of relying on timing luck.
+    """
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
 
 
 from plugins.memory.honcho.client import HonchoClientConfig
@@ -748,6 +762,7 @@ class TestPinTransition:
         sig_pinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         cfg_path.write_text(orjson.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": False}).decode('utf-8'))
+        _bump_mtime(cfg_path)
         sig_unpinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_pinned["honcho.pin_peer_name"] != sig_unpinned["honcho.pin_peer_name"]
@@ -766,6 +781,7 @@ class TestPinTransition:
             "peerName": "Igor",
             "userPeerAliases": {"7654321": "Igor"},
         }).decode('utf-8'))
+        _bump_mtime(cfg_path)
         sig_with_aliases = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_no_aliases["honcho.user_peer_aliases"] != sig_with_aliases["honcho.user_peer_aliases"]
@@ -784,6 +800,7 @@ class TestPinTransition:
             "peerName": "Igor",
             "runtimePeerPrefix": "telegram_",
         }).decode('utf-8'))
+        _bump_mtime(cfg_path)
         sig_with_prefix = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_no_prefix["honcho.runtime_peer_prefix"] != sig_with_prefix["honcho.runtime_peer_prefix"]
@@ -812,6 +829,7 @@ class TestPinTransition:
             "peerName": "Igor",
             "aiPeer": "hermetika",
         }).decode('utf-8'))
+        _bump_mtime(cfg_path)
         sig_after = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_before["honcho.ai_peer"] != sig_after["honcho.ai_peer"]

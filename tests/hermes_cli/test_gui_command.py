@@ -159,7 +159,7 @@ def test_gui_exits_when_npm_missing(tmp_path, monkeypatch, capsys):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
 
-    with patch("hermes_cli.main.shutil.which", return_value=None), \
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value=None), \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns())
 
@@ -312,7 +312,7 @@ def test_gui_source_mode_uses_renderer_build_and_electron(tmp_path, monkeypatch)
     build_ok = subprocess.CompletedProcess(["npm", "run", "build"], 0)
     launch_ok = subprocess.CompletedProcess(["npm", "exec", "--", "electron", "."], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
@@ -351,7 +351,8 @@ def test_desktop_build_stamp_skips_build_when_up_to_date(tmp_path, monkeypatch):
 
     launch_ok = subprocess.CompletedProcess([], 0)
 
-    with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=False), \
          patch("hermes_cli.main._run_npm_install_deterministic") as mock_install, \
          patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \

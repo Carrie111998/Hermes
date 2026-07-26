@@ -144,7 +144,11 @@ class TestFindSessionId:
             }
         })
 
-        with patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+        # Force the sessions.json fallback: without this, _find_session_id
+        # queries the ambient state.db first and an unrelated real session
+        # row can shadow the fixture data.
+        with patch("hermes_state.SessionDB", side_effect=Exception("no db")), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
             result = _find_session_id("telegram", "123")
 
         assert result == "sess_1"

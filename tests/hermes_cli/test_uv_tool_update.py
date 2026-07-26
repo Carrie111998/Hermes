@@ -14,6 +14,7 @@ that also has ``uv tool install hermes-agent`` does not get misclassified.
 from __future__ import annotations
 
 import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -178,6 +179,7 @@ class TestRecommendedUpdateCommandForUvTool:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: subprocess uv/pip commands fail")
 class TestCmdUpdatePipUsesUvTool:
     @patch("subprocess.run")
     def test_runs_uv_tool_upgrade_when_uv_tool_install(self, mock_run):
@@ -262,6 +264,11 @@ class TestCmdUpdatePipInstallLayouts:
     - pipx-managed                   -> ``pipx upgrade``
     """
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="pipx-layout detection splits sys.prefix on os.sep; the test "
+        "simulates a POSIX layout ('/home/u/.local/pipx/venvs/...')",
+    )
     @patch("subprocess.run")
     def test_pipx_managed_uses_pipx_upgrade(self, mock_run, monkeypatch):
         from hermes_cli import main as hm

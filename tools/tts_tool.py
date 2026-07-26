@@ -781,6 +781,8 @@ def _run_command_tts(command: str, timeout: float) -> subprocess.CompletedProces
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1657,7 +1659,7 @@ def _read_gemini_persona_prompt(gemini_config: Dict[str, Any]) -> str:
     if path is None:
         return ""
     try:
-        return path.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8", errors="replace").strip()
     except (OSError, UnicodeDecodeError) as exc:
         logger.warning(
             "Gemini TTS persona prompt file unavailable at %s: %s",
@@ -2013,7 +2015,7 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
         "--device", device,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())  # windows-footgun: ok
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())  # windows-footgun: ok
     if result.returncode != 0:
         stderr = result.stderr.strip()
         # Filter out the "OK:" line from stderr
@@ -2095,7 +2097,7 @@ def _resolve_piper_voice_path(voice: str, download_dir: Path) -> str:
         result = subprocess.run(
             [_sys.executable, "-m", "piper.download_voices", voice,
              "--download-dir", str(download_dir)],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as exc:

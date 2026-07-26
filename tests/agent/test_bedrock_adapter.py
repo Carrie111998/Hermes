@@ -17,6 +17,23 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_bedrock_client_caches():
+    """Several tests inject fake boto3/botocore modules via patch.dict and then
+    build clients.  patch.dict reverts sys.modules, but the fabricated clients
+    stay in bedrock_adapter's module-level per-region caches — and a later,
+    unrelated test (e.g. test_model_metadata's Bedrock static-table cases) then
+    'probes' through a MagicMock client and gets a bogus 1.3M window instead
+    of the table value.  Clear the caches around each test."""
+    from agent.bedrock_adapter import reset_client_cache
+
+    reset_client_cache()
+    try:
+        yield
+    finally:
+        reset_client_cache()
+
+
 @contextmanager
 def _mock_botocore_session(*, return_value=None, side_effect=None):
     """Patch botocore.session even when botocore is not installed."""

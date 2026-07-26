@@ -1916,7 +1916,7 @@ class TestQuarantineBundleBinaryAssets:
 
             q_path = quarantine_bundle(bundle)
 
-        assert (q_path / "SKILL.md").read_text(encoding="utf-8").startswith("---")
+        assert (q_path / "SKILL.md").read_text(encoding="utf-8", errors="replace").startswith("---")
         assert (q_path / "assets" / "neutts-cli" / "samples" / "jo.wav").read_bytes() == b"RIFF\x00\x01fakewav"
 
     def test_quarantine_bundle_rejects_traversal_file_paths(self, tmp_path):
@@ -2139,10 +2139,20 @@ class TestInstallPathSafety:
 
     @pytest.fixture
     def isolated_skills_dir(self, tmp_path, monkeypatch):
+        import tools.skills_hub as hub
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
-        monkeypatch.setattr("tools.skills_hub.SKILLS_DIR", skills_dir)
-        return skills_dir
+        # SKILLS_DIR is exposed via PEP 562 __getattr__, not a real module
+        # attribute; monkeypatch.setattr would restore it as a REAL attribute
+        # and permanently freeze the dynamic resolution for later tests.
+        _MISSING = object()
+        _saved = hub.__dict__.get("SKILLS_DIR", _MISSING)
+        hub.__dict__["SKILLS_DIR"] = skills_dir
+        yield skills_dir
+        if _saved is _MISSING:
+            hub.__dict__.pop("SKILLS_DIR", None)
+        else:
+            hub.__dict__["SKILLS_DIR"] = _saved
 
     @pytest.fixture
     def patch_lock_file(self, monkeypatch):

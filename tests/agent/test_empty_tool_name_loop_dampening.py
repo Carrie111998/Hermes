@@ -135,10 +135,17 @@ def agent_env():
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
     # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
+    # module was imported earlier in the same worker.  Snapshot the evicted
+    # modules and restore them on teardown — otherwise later imports create
+    # NEW module objects for agent.* / run_agent, and unittest.mock.patch
+    # targets in other test files (e.g. agent.image_routing, agent.models_dev)
+    # silently patch the fresh module while the tests exercise the stale one
+    # imported at collection time (cross-test pollution).
+    _evicted = {}
     for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+        if (mod == "run_agent" or mod == "agent" or mod == "tools"
+                or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_")):
+            _evicted[mod] = sys.modules.pop(mod)
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -159,6 +166,14 @@ def agent_env():
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
+        # Drop any freshly-imported replacements and restore the original
+        # module objects so the rest of the suite sees a consistent registry.
+        for mod in list(sys.modules):
+            if mod not in _evicted and (
+                    mod == "run_agent" or mod == "agent" or mod == "tools"
+                    or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_")):
+                del sys.modules[mod]
+        sys.modules.update(_evicted)
 
 
 def _tool_results(handler) -> list[str]:

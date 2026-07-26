@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import uuid
 
 import pytest
 
@@ -271,9 +272,15 @@ def test_discover_repos_from_full_history(tmp_path):
     plain.mkdir()
 
     db = server._get_db()
-    db.create_session("s1", "cli", cwd=str(repo))
-    db.create_session("s2", "cli", cwd=str(repo / "src"))
-    db.create_session("s3", "cli", cwd=str(plain))  # not a git repo → excluded
+    # Unique session ids: the db is the ambient state.db, and fixed ids would
+    # collide with stale rows from previous runs (create_session does not
+    # rewrite an existing row's cwd, so a deleted tmp cwd would shadow this
+    # fixture's repo).
+    uniq = uuid.uuid4().hex[:8]
+    s1, s2, s3 = f"s1-{uniq}", f"s2-{uniq}", f"s3-{uniq}"
+    db.create_session(s1, "cli", cwd=str(repo))
+    db.create_session(s2, "cli", cwd=str(repo / "src"))
+    db.create_session(s3, "cli", cwd=str(plain))  # not a git repo → excluded
 
     repos = _call("projects.discover_repos")["repos"]
     by_label = {r["label"]: r for r in repos}
@@ -283,4 +290,4 @@ def test_discover_repos_from_full_history(tmp_path):
     assert "plain" not in by_label  # non-git dir never promoted
 
     # The probe is persisted back onto the session rows (membership at the source).
-    assert os.path.realpath(db.get_session("s1")["git_repo_root"]) == os.path.realpath(str(repo))
+    assert os.path.realpath(db.get_session(s1)["git_repo_root"]) == os.path.realpath(str(repo))

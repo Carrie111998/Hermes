@@ -218,7 +218,7 @@ def _save_mem0_json(hermes_home: str, data: dict) -> None:
     existing = {}
     if config_path.exists():
         try:
-            existing = orjson.loads(config_path.read_text(encoding="utf-8"))
+            existing = orjson.loads(config_path.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             pass
     existing.update(data)
@@ -526,7 +526,7 @@ def _ensure_pgvector(host: str = "localhost", port: int = 5432) -> dict | None:
         try:
             result = subprocess.run(
                 ["docker", "inspect", _PGVECTOR_CONTAINER, "--format", "{{.State.Status}}"],
-                capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, stdin=subprocess.DEVNULL,
             )
             if result.returncode == 0 and "exited" in result.stdout:
                 print(f"  Found stopped container '{_PGVECTOR_CONTAINER}', restarting...")

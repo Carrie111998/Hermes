@@ -23,10 +23,20 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+    saved = {}
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+            saved[mod] = sys.modules.pop(mod)
+    try:
+        yield test_home
+    finally:
+        # Restore the original module registry so later tests that imported
+        # hermes_cli modules at collection time keep patching/exercising the
+        # same module objects (fresh re-imports would split module identity).
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+                del sys.modules[mod]
+        sys.modules.update(saved)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

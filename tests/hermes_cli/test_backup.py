@@ -2200,6 +2200,8 @@ class TestRunPreUpdateBackup:
 
     @pytest.fixture
     def hermes_home(self, tmp_path, monkeypatch):
+        import sys as _sys
+
         root = tmp_path / ".hermes"
         root.mkdir()
         _make_hermes_tree(root)
@@ -2207,11 +2209,53 @@ class TestRunPreUpdateBackup:
         monkeypatch.setenv("HERMES_HOME", str(root))
         # Make Path.home() point at tmp_path for anything that uses it
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        # Bust caches for hermes_cli.config + hermes_constants so they pick up HERMES_HOME
-        for mod in list(__import__("sys").modules.keys()):
-            if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
-                del __import__("sys").modules[mod]
-        return root
+        # Bust caches for hermes_cli.config + hermes_constants so they pick up HERMES_HOME.
+        # Snapshot the evicted module objects and restore them at teardown:
+        # leaving them evicted (or leaving the freshly re-imported replacements
+        # bound to this test's temp HERMES_HOME) splits module identity for
+        # later tests — cross-test pollution.
+        def _evict():
+            for mod in list(_sys.modules.keys()):
+                if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
+                    del _sys.modules[mod]
+
+        saved = {
+            mod: _sys.modules[mod]
+            for mod in list(_sys.modules.keys())
+            if mod.startswith("hermes_cli.config") or mod == "hermes_constants"
+        }
+        keys_before = set(_sys.modules.keys())
+        _evict()
+        yield root
+        # Modules first imported during this test may have bound the
+        # temp-HERMES_HOME config module (imported while the originals were
+        # evicted).  Evict those newcomers too so later tests re-import them
+        # against the restored originals instead of reading stale temp-home
+        # state through them.
+        for mod in list(_sys.modules.keys()):
+            if mod not in keys_before and mod.split(".")[0] in (
+                "hermes_cli",
+                "hermes_constants",
+                "hermes_state",
+                "agent",
+                "tools",
+                "gateway",
+                "utils",
+            ):
+                del _sys.modules[mod]
+        _evict()
+        _sys.modules.update(saved)
+        # Re-imports during the test also re-bound the submodule attributes
+        # on the parent packages (e.g. ``hermes_cli.config`` on the
+        # ``hermes_cli`` package object) to the temp-home copies.  Restore
+        # those attributes too or ``import hermes_cli.config`` keeps
+        # resolving to the stale module object.
+        for _name, _module in saved.items():
+            _parent_name, _, _attr = _name.rpartition(".")
+            if _parent_name:
+                _parent = _sys.modules.get(_parent_name)
+                if _parent is not None:
+                    setattr(_parent, _attr, _module)
 
     @staticmethod
     def _set_mode(hermes_home, value):

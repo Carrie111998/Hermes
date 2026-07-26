@@ -13,6 +13,7 @@ and the gateway 404'd at ``send_photo`` time.
 from __future__ import annotations
 
 import http.server
+import os
 import socketserver
 import threading
 
@@ -73,6 +74,22 @@ class _TinyImageHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
+import sys as _sys
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    """http_server pops hermes_constants / agent.image_gen_provider modules so
+    they re-read HERMES_HOME. Restore the registry after each test so later
+    test files don't patch stale module objects (cross-test pollution)."""
+    snapshot = dict(_sys.modules)
+    try:
+        yield
+    finally:
+        _sys.modules.clear()
+        _sys.modules.update(snapshot)
+
+
 @pytest.fixture
 def http_server(tmp_path, monkeypatch):
     """Spin up a localhost HTTP server and isolate HERMES_HOME under tmp_path."""
@@ -104,7 +121,7 @@ class TestSaveUrlImage:
         assert path.read_bytes() == PNG_1PX
         # The cache directory must be under HERMES_HOME — gateway cleanup
         # relies on this being the canonical location.
-        assert "cache/images" in str(path)
+        assert "cache" + os.sep + "images" in str(path)
         assert path.suffix == ".png"
 
     def test_extension_inferred_from_content_type(self, http_server):

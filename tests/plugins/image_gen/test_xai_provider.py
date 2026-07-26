@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import orjson
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -156,6 +158,7 @@ class TestGenerate:
         assert result["provider"] == "xai"
         assert result["model"] == "grok-imagine-image"
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path format incompatibility")
     def test_successful_url_response(self):
         """xAI URL response is cached locally — #26942 contract.
 

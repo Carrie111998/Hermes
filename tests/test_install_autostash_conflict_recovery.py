@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import subprocess
 from pathlib import Path
 
@@ -71,7 +72,7 @@ def _assert_conflict_was_recovered(repo: Path, output: str) -> None:
     assert "Restore your changes later with: git stash apply stash@{0}" in output
     assert _git(repo, "status", "--porcelain").stdout.strip() == ""
     assert _git(repo, "stash", "list").stdout.strip(), "stash must be preserved"
-    content = (repo / "tracked.txt").read_text(encoding="utf-8")
+    content = (repo / "tracked.txt").read_text(encoding="utf-8", errors="replace")
     assert content == "upstream edit\n", content
     # No conflict markers must be left in tracked source — they would crash
     # the backend on import (SyntaxError on the <<<<<<< line).
@@ -79,6 +80,10 @@ def _assert_conflict_was_recovered(repo: Path, output: str) -> None:
 
 
 @pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="install.sh is the POSIX installer; on Windows 'bash' is WSL and cannot consume D:\\ paths (install.ps1 is covered by the sibling tests)",
+)
 @pytest.mark.skipif(
     shutil.which("git") is None or shutil.which("bash") is None,
     reason="needs git and bash",
@@ -138,6 +143,10 @@ def test_install_ps1_repository_stage_recovers_from_autostash_conflict(
 
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="install.sh is the POSIX installer; on Windows 'bash' is WSL and cannot consume D:\\ paths (install.ps1 is covered by the sibling tests)",
+)
+@pytest.mark.skipif(
     shutil.which("git") is None or shutil.which("bash") is None,
     reason="needs git and bash",
 )
@@ -191,5 +200,5 @@ def test_install_sh_repository_stage_clean_apply_drops_stash(
     # Stash must be dropped on a clean apply — not preserved.
     assert _git(managed, "stash", "list").stdout.strip() == "", "stash must be dropped on clean apply"
     # Local changes must be present in the working tree.
-    assert (managed / "local-only.txt").read_text(encoding="utf-8") == "local edit\n"
-    assert (managed / "tracked.txt").read_text(encoding="utf-8") == "upstream edit\n"
+    assert (managed / "local-only.txt").read_text(encoding="utf-8", errors="replace") == "local edit\n"
+    assert (managed / "tracked.txt").read_text(encoding="utf-8", errors="replace") == "upstream edit\n"

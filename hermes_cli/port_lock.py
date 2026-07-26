@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -67,25 +68,65 @@ def _lock_file_path(port: int, hermes_home: str | Path | None = None) -> Path:
 
 
 def _read_lock_owner(path: Path) -> Optional[int]:
-    """Read the PID written into a lock file, if any."""
+    """Read the PID written into a lock file, if any.
+
+    The lock file format is ``PID:START_TIME_EPOCH_MS`` on one line.
+    Old-format files (just ``PID`` alone) are also accepted for
+    backward compatibility.
+    """
     try:
-        text = path.read_text(encoding="utf-8").strip()
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
         if not text:
             return None
         first = text.splitlines()[0].strip()
         if not first:
             return None
-        return int(first)
+        pid = int(first.split(":")[0].strip())
+        return pid
+    except Exception:
+        return None
+
+
+def _read_lock_owner_with_start_time(path: Path) -> Optional[tuple[int, int]]:
+    """Read ``(PID, start_time_epoch_ms)`` from the lock file.
+
+    Old-format files (no ``:`` separator) return ``(pid, 0)``.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            return None
+        first = text.splitlines()[0].strip()
+        if not first:
+            return None
+        if ":" in first:
+            parts = first.split(":", 1)
+            pid = int(parts[0].strip())
+            start_time = int(parts[1].strip())
+            return pid, start_time
+        else:
+            pid = int(first)
+            return pid, 0  # old format — no start time available
     except Exception:
         return None
 
 
 def _write_lock_owner(path: Path, pid: int) -> None:
-    """Write the current owner PID into the lock file."""
+    """Write the current owner PID and start time into the lock file.
+
+    Format: ``PID:START_TIME_EPOCH_MS`` where START_TIME is the process
+    creation time (used to detect PID reuse — see Bug 5).
+    """
     try:
-        path.write_text(f"{pid}\n", encoding="utf-8")
+        start_time = _get_my_start_time() or int(time.time() * 1000)
+        path.write_text(f"{pid}:{start_time}\n", encoding="utf-8")
     except Exception:
         pass
+
+
+def _get_my_start_time() -> Optional[int]:
+    """Return the current process's creation time as epoch ms, or ``None``."""
+    return _get_process_start_time(os.getpid())
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -125,7 +166,7 @@ def _pid_is_running(pid: int) -> bool:
             output = subprocess.check_output(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 stderr=subprocess.DEVNULL,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=5,
             )
             return str(pid) in output
@@ -139,6 +180,109 @@ def _pid_is_running(pid: int) -> bool:
             return False
         except PermissionError:
             return True
+
+
+def _get_process_start_time(pid: int) -> Optional[int]:
+    """Return the creation time of *pid* as epoch milliseconds, or ``None``.
+
+    Used to detect PID reuse: if a lock file records ``pid:old_start_time``
+    but the process with that PID today has a different creation time, the
+    original lock holder is gone and the lock can be broken.
+    """
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_t = wintypes.FILETIME()
+                kernel_t = wintypes.FILETIME()
+                user_t = wintypes.FILETIME()
+                if kernel.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_t),
+                    ctypes.byref(kernel_t),
+                    ctypes.byref(user_t),
+                ):
+                    # Convert FILETIME (100-ns intervals since 1601-01-01) to
+                    # epoch milliseconds.
+                    ft = (creation.dwHighDateTime << 32) + creation.dwLowDateTime
+                    # 11644473600 = seconds from 1601-01-01 to 1970-01-01
+                    epoch_ms = (ft // 10_000) - 11644473600_000
+                    return epoch_ms
+                return None
+            finally:
+                kernel.CloseHandle(handle)
+        except Exception:
+            return None
+    else:
+        # Unix: read /proc/<pid>/stat field 22 (start_time in jiffies since
+        # boot).  We convert to epoch ms by adding boot time.
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
+                fields = f.read().split()
+            # Field 22 (0-indexed: 21) is start_time in jiffies since boot.
+            if len(fields) < 22:
+                return None
+            # Get boot time from /proc/stat "btime" field.
+            with open("/proc/stat", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("btime "):
+                        btime_secs = int(line.split()[1])
+                        break
+                else:
+                    return None
+            try:
+                import os as _os
+
+                # CLK_TCK is typically 100 on Linux.
+                clk_tck = _os.sysconf(_os.sysconf_names["SC_CLK_TCK"])
+            except (AttributeError, ValueError, KeyError):
+                clk_tck = 100
+            start_jiffies = int(fields[21])
+            start_secs = btime_secs + (start_jiffies // clk_tck)
+            return start_secs * 1000
+        except Exception:
+            return None
+
+
+def _stale_lock_owner(path: Path) -> bool:
+    """Check if the lock at *path* is held by a stale (dead or PID-reused) owner.
+
+    Returns ``True`` when the lock should be broken.
+    """
+    owner = _read_lock_owner_with_start_time(path)
+    if owner is None:
+        return False  # no owner recorded — not ours to break
+    pid, stored_start_time = owner
+
+    # PID 0 is never valid.
+    if pid <= 0:
+        return True
+
+    # If PID is not running, the lock is definitely stale.
+    if not _pid_is_running(pid):
+        return True
+
+    # PID is running.  Check if the start time matches (PID reuse guard).
+    if stored_start_time > 0:
+        actual_start_time = _get_process_start_time(pid)
+        if actual_start_time is not None and actual_start_time != stored_start_time:
+            # The process with this PID today is a *different* process than
+            # the one that originally acquired the lock.  Break the stale lock.
+            return True
+
+    # All signs point to the original lock-holder still being alive.
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +380,8 @@ def try_claim_port(
             return PortLock(port, path, handle)
 
         # Lock is held. Check whether the owner is still alive (stale lock).
-        stale_owner = _read_lock_owner(path)
-        if stale_owner is not None and not _pid_is_running(stale_owner):
+        # We also check for PID reuse via start_time mismatch.
+        if _stale_lock_owner(path):
             # Break stale lock by re-acquiring after closing the failed handle.
             try:
                 handle.close()

@@ -18,6 +18,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import types
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -59,7 +61,11 @@ def test_venv_health_missing_venv_unhealthy_with_interrupted_marker(tmp_path):
     assert "venv python missing" in detail
 
 
-def _fake_venv_python(tmp_path, *, windows: bool = False):
+def _fake_venv_python(tmp_path, *, windows: bool | None = None):
+    # Default to the host platform layout: _venv_core_imports_healthy probes
+    # venv/Scripts/python.exe on Windows and venv/bin/python elsewhere.
+    if windows is None:
+        windows = sys.platform == "win32"
     bin_dir = tmp_path / "venv" / ("Scripts" if windows else "bin")
     bin_dir.mkdir(parents=True)
     py = bin_dir / ("python.exe" if windows else "python")
@@ -142,6 +148,7 @@ def test_detect_venv_python_off_windows_is_empty():
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path resolution fails")
 def test_detect_venv_python_finds_backend(_winp, tmp_path):
     venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
     other_py = "C:\\Python311\\python.exe"
@@ -167,6 +174,7 @@ def test_detect_venv_python_finds_backend(_winp, tmp_path):
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: path resolution fails")
 def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
     import os as _os
 

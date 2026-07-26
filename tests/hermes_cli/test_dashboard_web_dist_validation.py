@@ -122,6 +122,8 @@ def test_env_dist_tilde_expanded_for_web_server(main_mod, monkeypatch, tmp_path)
     dist.mkdir(parents=True)
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    # os.path.expanduser('~') keys off USERPROFILE on Windows.
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HERMES_WEB_DIST", "~/mydist")
 
     monkeypatch.setitem(

@@ -76,7 +76,7 @@ def _load_filter_file_values(path_value: Any) -> list[Any]:
     if path is None:
         return []
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         logger.warning("[webhook] filter in_file read failed for %s: %s", path, exc)
         return []
@@ -252,7 +252,7 @@ class WebhookRouteProcessor:
                 argv,
                 input=json.dumps(payload),
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=self.script_timeout_seconds,
                 cwd=str(path.parent),
                 env=_sanitize_subprocess_env(os.environ.copy()),

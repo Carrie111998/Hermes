@@ -116,7 +116,7 @@ def _approximately_count_tests(
     results = {}
 
     for path in files:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             contents = f.read()
         results[path] = contents.count("def test_")
 
@@ -314,8 +314,9 @@ def _run_one_file_once(
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        env=os.environ,
+        text=True, encoding="utf-8", errors="replace",
+        # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
+        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;

@@ -87,7 +87,7 @@ def git(*args, cwd=None):
     result = subprocess.run(
         ["git"] + list(args),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         cwd=cwd or str(REPO_ROOT),
     )
     if result.returncode != 0:
@@ -112,7 +112,7 @@ def gh_pr_list():
                 "--limit", "300",
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=60,
         )
         if result.returncode != 0:
@@ -301,7 +301,7 @@ def check_release_file(release_file, all_contributors):
         missing: set of handles NOT found in the file
     """
     try:
-        content = Path(release_file).read_text(encoding="utf-8")
+        content = Path(release_file).read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         print(f"  [error] Release file not found: {release_file}", file=sys.stderr)
         return set(), set(all_contributors)

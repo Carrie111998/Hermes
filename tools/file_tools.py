@@ -44,7 +44,7 @@ def _expand_tilde(path: str) -> str:
     except Exception:
         home = None
     if home and (path == "~" or path.startswith("~/")):
-        return home if path == "~" else os.path.join(home, path[2:])
+        return home if path == "~" else posixpath.join(home, path[2:])
     return os.path.expanduser(path)
 
 
@@ -429,8 +429,8 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
             return None  # Inside the workspace — expected.
         except ValueError:
             return (
-                f"Relative path {filepath!r} resolved to {str(resolved)!r}, which is "
-                f"OUTSIDE the active workspace ({str(root)!r}). The edit will land in "
+                f"Relative path '{filepath}' resolved to '{resolved}', which is "
+                f"OUTSIDE the active workspace ('{root}'). The edit will land in "
                 f"a different directory than the terminal's cwd. If this is not "
                 f"intended (e.g. a git-worktree session writing into the main "
                 f"checkout), pass an absolute path under the workspace instead."

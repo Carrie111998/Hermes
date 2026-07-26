@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 
+import sys
+
 import pytest
 
 from hermes_cli import projects_db as pdb
@@ -16,6 +18,9 @@ def conn(tmp_path):
         yield c
     finally:
         c.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX absolute paths; on Windows '/www/alpha' legitimately normalizes to 'D:\\www\\alpha'")
 
 
 def test_record_and_list_discovered_repos(conn):
@@ -37,12 +42,18 @@ def test_record_discovered_repos_upserts(conn):
     assert rows[0]["label"] == "new"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX absolute paths; on Windows '/www/alpha' legitimately normalizes to 'D:\\www\\alpha'")
+
+
 def test_record_discovered_repos_replace_drops_stale_rows(conn):
     pdb.record_discovered_repos(conn, [("/www/alpha", "alpha"), ("/www/beta", "beta")])
     pdb.record_discovered_repos(conn, [("/www/alpha", "fresh")], replace=True)
 
     rows = {r["root"]: r["label"] for r in pdb.list_discovered_repos(conn)}
     assert rows == {"/www/alpha": "fresh"}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX absolute paths; on Windows '/www/alpha' legitimately normalizes to 'D:\\www\\alpha'")
 
 
 def test_create_get_list(conn):
@@ -75,6 +86,9 @@ def test_empty_name_rejected(conn):
         pdb.create_project(conn, name="   ")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX absolute paths; on Windows '/www/alpha' legitimately normalizes to 'D:\\www\\alpha'")
+
+
 def test_add_remove_folder_and_primary_repoint(conn):
     pid = pdb.create_project(conn, name="P", folders=["/a"])
     pdb.add_folder(conn, pid, "/b")
@@ -101,6 +115,9 @@ def test_set_primary_requires_existing_folder(conn):
     pid = pdb.create_project(conn, name="P", folders=["/a"])
     assert pdb.set_primary(conn, pid, "/nope") is False
     assert pdb.set_primary(conn, pid, "/a") is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX absolute paths; on Windows '/www/alpha' legitimately normalizes to 'D:\\www\\alpha'")
 
 
 def test_paths_normalized(conn):

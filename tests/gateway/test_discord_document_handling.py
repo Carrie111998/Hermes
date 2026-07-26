@@ -93,6 +93,21 @@ def _redirect_cache(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _bypass_ssrf_gate(monkeypatch):
+    """Bypass the SSRF URL gate for the aiohttp fallback download path.
+
+    ``is_safe_url`` performs live DNS resolution; in some test environments
+    (e.g. fake-ip DNS proxies) ``cdn.discordapp.com`` resolves to a
+    private-range address and the gate blocks the mocked download. The SSRF
+    contract itself is covered by test_discord_attachment_download.py — these
+    tests exercise document caching/injection, not URL safety.
+    """
+    monkeypatch.setattr(
+        "plugins.platforms.discord.adapter.is_safe_url", lambda url: True
+    )
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)

@@ -477,7 +477,7 @@ class WebhookAdapter(BasePlatformAdapter):
             mtime = subs_path.stat().st_mtime
             if mtime <= self._dynamic_routes_mtime:
                 return  # No change
-            data = orjson.loads(subs_path.read_text(encoding="utf-8"))
+            data = orjson.loads(subs_path.read_text(encoding="utf-8", errors="replace"))
             if not isinstance(data, dict):
                 return
             # Merge: static routes take precedence over dynamic ones.
@@ -1284,7 +1284,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     content,
                 ],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=30,
             )
             if result.returncode == 0:

@@ -20,31 +20,14 @@ import pytest
 from gateway.config import PlatformConfig
 
 
-def _ensure_telegram_mock():
-    telegram_mod = MagicMock()
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-
-    # Register telegram.constants as a separate module mock so that
-    # ``from telegram.constants import ChatType`` resolves to our mock
-    # with string-valued members (not auto-generated MagicMocks).
-    constants_mod = MagicMock()
-    constants_mod.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    constants_mod.ChatType.GROUP = "group"
-    constants_mod.ChatType.SUPERGROUP = "supergroup"
-    constants_mod.ChatType.CHANNEL = "channel"
-    constants_mod.ChatType.PRIVATE = "private"
-
-    sys.modules["telegram"] = telegram_mod
-    sys.modules["telegram.ext"] = telegram_mod.ext
-    sys.modules["telegram.constants"] = constants_mod
-    sys.modules["telegram.request"] = telegram_mod.request
-
-    # Force reimport so the adapter picks up the mock ChatType.
-    sys.modules.pop("plugins.platforms.telegram.adapter", None)
-
-
-_ensure_telegram_mock()
-
+# NOTE: this module intentionally does NOT install its own telegram mock in
+# sys.modules. tests/gateway/conftest.py already guarantees a comprehensive
+# telegram mock (or the real library) before collection, and overwriting
+# sys.modules["telegram*"] here leaks into later-collected telegram test
+# modules, which re-import the adapter bound to whatever mock is present.
+# Production code compares chat.type against the plain strings
+# "group"/"supergroup"/"channel" (PTB ChatType is a str enum), so tests use
+# those string literals directly.
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
@@ -412,8 +395,8 @@ def test_persist_dm_topic_thread_id_preserves_config_on_write_failure(tmp_path):
          patch("yaml.dump", side_effect=fail_dump):
         adapter._persist_dm_topic_thread_id(111, "General", 999)
 
-    assert config_file.read_text(encoding="utf-8") == original_text
-    result = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    assert config_file.read_text(encoding="utf-8", errors="replace") == original_text
+    result = yaml.safe_load(config_file.read_text(encoding="utf-8", errors="replace"))
     topics = result["platforms"]["telegram"]["extra"]["dm_topics"][0]["topics"]
     assert "thread_id" not in topics[0]
 
@@ -667,11 +650,11 @@ def test_build_message_event_preserves_true_dm_topic_thread_id():
 
 # ── _build_message_event: group_topics skill binding ──
 
-# The telegram mock sets sys.modules["telegram.constants"] = telegram_mod (root mock),
-# so `from telegram.constants import ChatType` in telegram.py resolves to
-# telegram_mod.ChatType — not telegram_mod.constants.ChatType.  We must use
-# the same ChatType object the production code sees so equality checks work.
-from telegram.constants import ChatType as _ChatType  # noqa: E402
+# chat.type values: PTB ChatType is a str enum; production compares against
+# the plain strings "group"/"supergroup", so use string literals here (see
+# note at the top of this module).
+_CHAT_TYPE_SUPERGROUP = "supergroup"
+_CHAT_TYPE_GROUP = "group"
 
 
 def test_group_topic_skill_binding():
@@ -690,7 +673,7 @@ def test_group_topic_skill_binding():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=5,
         text="hello",
         is_topic_message=True,
@@ -718,7 +701,7 @@ def test_group_topic_skill_binding_second_topic():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=12,
         text="deal update",
         is_topic_message=True,
@@ -745,7 +728,7 @@ def test_group_topic_no_skill_binding():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=1,
         text="hey",
         is_topic_message=True,
@@ -772,7 +755,7 @@ def test_group_topic_unmapped_thread_id():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=999,
         text="random",
         is_topic_message=True,
@@ -799,7 +782,7 @@ def test_group_topic_unmapped_chat_id():
 
     msg = _make_mock_message(
         chat_id=-1009999999999,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=5,
         text="wrong group",
         is_topic_message=True,
@@ -818,7 +801,7 @@ def test_group_topic_no_config():
     adapter = _make_adapter()  # no group_topics_config
 
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.GROUP, thread_id=5, text="hi"
+        chat_id=-1001234567890, chat_type=_CHAT_TYPE_GROUP, thread_id=5, text="hi"
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
@@ -841,7 +824,7 @@ def test_group_topic_chat_id_int_string_coercion():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=7,
         text="test",
         is_topic_message=True,
@@ -867,7 +850,7 @@ def test_group_topic_mapping_shape_config():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=12,
         text="deal update",
         is_topic_message=True,
@@ -893,7 +876,7 @@ def test_group_topic_malformed_config_does_not_crash():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=5,
         text="hi",
         is_topic_message=True,
@@ -915,7 +898,7 @@ def test_group_topic_non_list_topics_does_not_crash():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=5,
         text="hi",
         is_topic_message=True,
@@ -935,7 +918,7 @@ def test_group_topic_scalar_config_falls_through():
 
     msg = _make_mock_message(
         chat_id=-1001234567890,
-        chat_type=_ChatType.SUPERGROUP,
+        chat_type=_CHAT_TYPE_SUPERGROUP,
         thread_id=5,
         text="hi",
         is_topic_message=True,
@@ -972,7 +955,7 @@ def test_build_message_event_group_from_user_none_stays_none():
 
     adapter = _make_adapter()
     msg = _make_mock_message(
-        chat_id=-1001234567890, chat_type=_ChatType.SUPERGROUP,
+        chat_id=-1001234567890, chat_type=_CHAT_TYPE_SUPERGROUP,
         user_id=42, user_name="Alice"
     )
     msg.from_user = None

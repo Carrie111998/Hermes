@@ -120,7 +120,7 @@ def _get_service_pids() -> set:
                         "--no-pager",
                     ],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     timeout=5,
                 )
                 for line in result.stdout.strip().splitlines():
@@ -132,7 +132,7 @@ def _get_service_pids() -> set:
                         show = subprocess.run(
                             scope_args + ["show", svc, "--property=MainPID", "--value"],
                             capture_output=True,
-                            text=True,
+                            text=True, encoding="utf-8", errors="replace",
                             timeout=5,
                         )
                         pid = int(show.stdout.strip())
@@ -150,7 +150,7 @@ def _get_service_pids() -> set:
             result = subprocess.run(
                 ["launchctl", "list", label],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=5,
             )
             if result.returncode == 0:
@@ -206,7 +206,7 @@ def _get_parent_pid(pid: int) -> int | None:
         result = subprocess.run(
             ["ps", "-o", "ppid=", "-p", str(pid)],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=5,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -509,7 +509,7 @@ def _scan_gateway_pids(
                 result = subprocess.run(
                     ["ps", "-A", "eww", "-o", "pid=,command="],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     timeout=10,
                 )
                 if result.returncode != 0:
@@ -917,6 +917,8 @@ def _probe_systemd_service_running(system: bool = False) -> tuple[bool, bool]:
             system=selected_system,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
     except (RuntimeError, subprocess.TimeoutExpired):
@@ -975,7 +977,7 @@ def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
     if not unit_path.exists():
         return None
     try:
-        text = unit_path.read_text(encoding="utf-8")
+        text = unit_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     for line in text.splitlines():
@@ -1293,7 +1295,7 @@ def _probe_launchd_service_running() -> bool:
         result = subprocess.run(
             ["launchctl", "list", get_launchd_label()],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
     except subprocess.TimeoutExpired:
@@ -1652,6 +1654,8 @@ def _systemd_operational(system: bool = False) -> bool:
             system=system,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
         # "running", "degraded", "starting" all mean systemd is PID 1
@@ -1960,7 +1964,7 @@ def _preflight_user_systemd(*, auto_enable_linger: bool = True) -> None:
             result = subprocess.run(
                 ["loginctl", "enable-linger", username],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 check=False,
                 timeout=30,
             )
@@ -2325,7 +2329,7 @@ def _read_systemd_user_from_unit(unit_path: Path) -> str | None:
     if not unit_path.exists():
         return None
 
-    for line in unit_path.read_text(encoding="utf-8").splitlines():
+    for line in unit_path.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith("User="):
             value = line.split("=", 1)[1].strip()
             return value or None
@@ -2437,7 +2441,7 @@ def get_systemd_linger_status() -> tuple[bool | None, str]:
         result = subprocess.run(
             ["loginctl", "show-user", username, "--property=Linger", "--value"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             check=False,
             timeout=10,
         )
@@ -2953,7 +2957,7 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     if not unit_path.exists():
         return False
 
-    installed = unit_path.read_text(encoding="utf-8")
+    installed = unit_path.read_text(encoding="utf-8", errors="replace")
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
     # Normalize out directives that older systemd versions silently drop
@@ -3119,7 +3123,7 @@ def _ensure_linger_enabled() -> None:
         result = subprocess.run(
             ["loginctl", "enable-linger", username],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             check=False,
             timeout=30,
         )
@@ -3503,6 +3507,8 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
         system=system,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=10,
     )
 
@@ -3650,7 +3656,7 @@ def _launchd_domain() -> str:
         result = subprocess.run(
             ["launchctl", "managername"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=5,
         )
         if "Aqua" in (result.stdout or ""):
@@ -3762,7 +3768,7 @@ def _append_launchd_reload_log(message: str) -> None:
         from datetime import datetime as _dt
 
         stamp = _dt.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
-        with path.open("a", encoding="utf-8") as fh:
+        with path.open("a", encoding="utf-8", errors="replace") as fh:
             fh.write(f"[{stamp}] {message}\n")
     except OSError:
         pass
@@ -4064,7 +4070,7 @@ def launchd_plist_is_current() -> bool:
     if not plist_path.exists():
         return False
 
-    installed = plist_path.read_text(encoding="utf-8")
+    installed = plist_path.read_text(encoding="utf-8", errors="replace")
     expected = generate_launchd_plist()
     return _normalize_launchd_plist_for_comparison(
         installed
@@ -4483,7 +4489,7 @@ def launchd_status(deep: bool = False):
         result = subprocess.run(
             ["launchctl", "list", label],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
         service_listed = result.returncode == 0
@@ -4654,7 +4660,7 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
             cfg_path = default_root / "config.yaml"
             if not cfg_path.exists():
                 return
-            with open(cfg_path, encoding="utf-8") as f:
+            with open(cfg_path, encoding="utf-8", errors="replace") as f:
                 cfg = _yaml.safe_load(f) or {}
             multiplex = bool(
                 cfg.get("multiplex_profiles")
@@ -5616,6 +5622,8 @@ def _is_service_running() -> bool:
                     system=False,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
                 )
                 if result.stdout.strip() == "active":
@@ -5630,6 +5638,8 @@ def _is_service_running() -> bool:
                     system=True,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
                 )
                 if result.stdout.strip() == "active":
@@ -5643,7 +5653,7 @@ def _is_service_running() -> bool:
             result = subprocess.run(
                 ["launchctl", "list", get_launchd_label()],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
             return result.returncode == 0
