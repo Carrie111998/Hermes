@@ -457,12 +457,18 @@ def list_custom_pool_providers() -> List[str]:
 
 
 def _get_custom_provider_config(pool_key: str) -> Optional[Dict[str, Any]]:
-    """Return the custom_providers config entry matching a pool key like 'custom:together.ai'."""
+    """Return the custom_providers config entry matching a pool key like 'custom:together.ai'.
+
+    The pool key suffix can be supplied either raw (``Moonshot Kimi (international)``)
+    or already-normalized (``moonshot-kimi-(international)``); we match on both
+    forms so callers don't have to know the normalization rules.
+    """
     if not pool_key.startswith(CUSTOM_POOL_PREFIX):
         return None
-    suffix = pool_key[len(CUSTOM_POOL_PREFIX):]
+    raw_suffix = pool_key[len(CUSTOM_POOL_PREFIX):]
+    norm_suffix = _normalize_custom_pool_name(raw_suffix)
     for norm_name, entry in _iter_custom_providers():
-        if norm_name == suffix:
+        if norm_name == raw_suffix or norm_name == norm_suffix:
             return entry
     return None
 

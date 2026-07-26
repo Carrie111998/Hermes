@@ -6438,6 +6438,44 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
             return {"logged_in": has_aws_credentials(), "provider": target}
         except ImportError:
             return {"logged_in": False, "provider": target, "error": "boto3 not installed"}
+    # Custom-pool providers (custom:<name>) registered under
+    # ``custom_providers`` in config.yaml. They are intentionally
+    # excluded from PROVIDER_REGISTRY auto-extension (see comment at
+    # the registry build site) and therefore need their own
+    # resolved-status path here — otherwise we silently fall through
+    # to ``{"logged_in": False}`` even when the configured
+    # ``api_key: ${ENV_VAR}`` resolves to a working credential.
+    if target.startswith("custom:"):
+        from agent.credential_pool import _get_custom_provider_config, _normalize_custom_pool_name
+        cp_config = _get_custom_provider_config(target)
+        if cp_config is None:
+            # Caller may have used the raw name (``Moonshot Kimi (international)``)
+            # while the registry stores the normalized form (``moonshot-kimi-(international)``).
+            # Try the normalized key before giving up.
+            cp_config = _get_custom_provider_config(
+                f"custom:{_normalize_custom_pool_name(target[len('custom:'):])}"
+            )
+        if cp_config:
+            # ``cp_config`` is the post-expansion config dict: ``load_config_readonly``
+            # already resolves ``${VAR}`` references against ``os.environ`` when the
+            # var is set, and leaves the literal ``${VAR}`` placeholder intact when
+            # the var is missing. Treat an unresolved placeholder as "not logged in"
+            # so a missing env var can't be silently reported as a working key.
+            api_key = str(cp_config.get("api_key") or "").strip()
+            placeholder_unresolved = (
+                api_key.startswith("${")
+                and api_key.endswith("}")
+            )
+            if placeholder_unresolved:
+                api_key = ""
+            base_url = str(cp_config.get("base_url") or "").strip()
+            return {
+                "logged_in": bool(api_key),
+                "configured": bool(api_key),
+                "provider": target,
+                "name": str(cp_config.get("name") or target),
+                "base_url": base_url,
+            }
     return {"logged_in": False}
 
 
