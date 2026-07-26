@@ -36,6 +36,7 @@
     "typescript": "^6.0.3"
   },
   "overrides": {
+    "brace-expansion": "5.0.8",
     "serialize-javascript": "^7.0.5",
     "uuid": "^14.0.0"
   },
