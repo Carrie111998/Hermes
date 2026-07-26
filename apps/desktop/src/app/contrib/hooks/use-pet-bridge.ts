@@ -4,7 +4,12 @@ import { requestGatewayForProfile } from '@/store/gateway'
 import { notify } from '@/store/notifications'
 import { petProfile } from '@/store/pet'
 import { setPetScale } from '@/store/pet-gallery'
-import { setProfileManualAwaitingInput } from '@/store/pet-multi'
+import {
+  $profilePets,
+  clearProfilePetReplyText,
+  clearProfilePetUnread,
+  setProfileManualAwaitingInput
+} from '@/store/pet-multi'
 import { setPetOverlayOpenAppHandler, setPetOverlayScaleHandler, setPetOverlaySubmitHandler } from '@/store/pet-overlay'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $sessions } from '@/store/session'
@@ -69,14 +74,29 @@ export function usePetBridge({ requestGateway, resumeSession, submitText }: PetB
     // Alt+wheel resize from the popped-out pet — persist through the profile's
     // own gateway (the overlay has none) so it survives restart.
     setPetOverlayScaleHandler((profile, scale) => setPetScale(profileRequest(profile), scale))
-    // Mail icon: $sessions is most-recent-first; the pet is global, so "most
-    // recent" is the right target.
-    setPetOverlayOpenAppHandler(() => {
-      const recent = $sessions.get()[0]
+    // Mail icon: open the overlay's OWN profile session. Prefer its durable
+    // source (survives compression/rehoming); until that is wired (Layer 6c) the
+    // active profile falls back to the most-recent thread ($sessions is
+    // most-recent-first) — the legacy single-pet target, so follow-active is
+    // unchanged. Clear that profile's unread/reply (source-session scoped so a
+    // different session's unread in the same profile survives).
+    setPetOverlayOpenAppHandler(profile => {
+      const key = normalizeProfileKey(profile)
+      const state = $profilePets.get().get(key)
+      const durableId = state?.sourceDurableSessionId
 
-      if (recent?.id) {
-        void resumeSessionRef.current(recent.id)
+      if (durableId) {
+        void resumeSessionRef.current(durableId)
+      } else if (key === normalizeProfileKey($activeGatewayProfile.get())) {
+        const recent = $sessions.get()[0]
+
+        if (recent?.id) {
+          void resumeSessionRef.current(recent.id)
+        }
       }
+
+      clearProfilePetUnread(key, state?.sourceSessionId)
+      clearProfilePetReplyText(key, state?.sourceSessionId)
     })
 
     return () => {

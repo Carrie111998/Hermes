@@ -12,6 +12,7 @@ import {
   type PetInfo,
   petProfile
 } from '@/store/pet'
+import { normalizeProfileKey } from '@/store/profile'
 import { $awaitingResponse, $busy } from '@/store/session'
 
 /**
@@ -152,10 +153,15 @@ let submitHandler: ((profile: string, text: string) => void) | null = null
 let openAppHandler: ((profile: string) => void) | null = null
 let scaleHandler: ((profile: string, scale: number) => void) | null = null
 
-// The profile whose pet the popped-out overlay currently shows. The single-pet
-// path mirrors the active profile's global atoms, so this is the active profile
-// captured at pop-out time; main addresses the overlay window by it.
-let overlayProfile = 'default'
+// The profiles whose pets this controller has popped out, keyed by normalized
+// profile (one overlay per profile, so the key is unique). Replaces a single
+// module-level `overlayProfile` so a second concurrent pop-out can't clobber the
+// first's push/close target. Main addresses each overlay window by profile and
+// stamps the profile onto control payloads (profileForSender); this set is the
+// renderer-side state-push target and the fallback when a control payload arrives
+// without one. The mirrored payload is the active profile's (follow-active);
+// per-overlay state for concurrent pinned overlays is a PR4 concern.
+const overlayProfiles = new Map<string, string>()
 
 function currentPayload(): PetOverlayStatePayload {
   return {
@@ -170,7 +176,17 @@ function currentPayload(): PetOverlayStatePayload {
 }
 
 function pushNow(): void {
-  window.hermesDesktop?.petOverlay?.pushState(overlayProfile, currentPayload())
+  const api = window.hermesDesktop?.petOverlay
+
+  if (!api || overlayProfiles.size === 0) {
+    return
+  }
+
+  const payload = currentPayload()
+
+  for (const key of overlayProfiles.keys()) {
+    api.pushState(key, payload)
+  }
 }
 
 /**
@@ -185,9 +201,10 @@ function openOverlay(profile: string, request: PetOverlayOpenRequest): void {
     return
   }
 
-  overlayProfile = profile
+  const key = normalizeProfileKey(profile)
+  overlayProfiles.set(key, key)
   $petOverlayActive.set(true)
-  void api.open(profile, request).then(res => {
+  void api.open(key, request).then(res => {
     if (res?.bounds) {
       saveBounds(res.bounds)
     }
@@ -258,15 +275,27 @@ export function restorePetOverlay(): void {
   openOverlay(petProfile(), { bounds: saved, screen: true })
 }
 
-/** Pop the pet back into the window (closes the overlay window). */
-export function popInPet(): void {
-  for (const off of stateUnsubs) {
-    off()
+/**
+ * Pop a pet back into the window (closes its overlay window). Without a profile,
+ * closes the only/oldest tracked overlay (the follow-active single-pet path).
+ * The shared state mirror tears down only when the last overlay closes.
+ */
+export function popInPet(profile?: string): void {
+  const key = profile ? normalizeProfileKey(profile) : overlayProfiles.keys().next().value
+
+  if (key) {
+    overlayProfiles.delete(key)
+    void window.hermesDesktop?.petOverlay?.close(key)
   }
 
-  stateUnsubs = []
-  $petOverlayActive.set(false)
-  void window.hermesDesktop?.petOverlay?.close(overlayProfile)
+  if (overlayProfiles.size === 0) {
+    for (const off of stateUnsubs) {
+      off()
+    }
+
+    stateUnsubs = []
+    $petOverlayActive.set(false)
+  }
 }
 
 /** Register the handler that turns an overlay composer submit into a real send.
@@ -298,11 +327,12 @@ export function initPetOverlayBridge(): () => void {
 
   controlUnsub = api.onControl(payload => {
     // main derives the profile from the overlay's webContents.id and attaches it
-    // before forwarding; fall back to the profile this controller popped out.
-    const profile = payload?.profile ?? overlayProfile
+    // before forwarding; fall back to the (single) profile this controller popped
+    // out when a payload arrives without one.
+    const profile = payload?.profile ?? overlayProfiles.keys().next().value ?? 'default'
 
     if (payload?.type === 'pop-in') {
-      popInPet()
+      popInPet(profile)
     } else if (payload?.type === 'ready') {
       // The overlay just mounted — hand it the current frame.
       pushNow()
