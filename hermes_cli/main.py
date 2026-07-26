@@ -3626,13 +3626,16 @@ def _aux_config_menu() -> None:
 def _aux_select_for_task(task: str) -> None:
     """Pick a provider + model for a single auxiliary task and persist it.
 
-    Uses ``list_authenticated_providers()`` to only show providers the user
-    has already configured. This avoids re-running OAuth/credential flows
-    inside the aux picker — users set up new providers through the normal
-    ``hermes model`` flow, then route aux tasks to them here.
+    Provider rows come from ``build_aux_picker_rows()`` — the shared aux-picker
+    substrate — so this surface shows exactly what every other aux picker
+    shows: authenticated built-ins, the user's own ``providers:`` /
+    ``custom_providers:`` endpoints, and providers whose credential pool is
+    temporarily exhausted. Only already-configured providers appear; users set
+    up new ones through the normal ``hermes model`` flow, then route aux tasks
+    to them here.
     """
     from hermes_cli.config import load_config
-    from hermes_cli.model_switch import list_authenticated_providers
+    from hermes_cli.inventory import build_aux_picker_rows, format_aux_picker_entries
 
     cfg = load_config()
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
@@ -3645,7 +3648,7 @@ def _aux_select_for_task(task: str) -> None:
 
     # Gather authenticated providers (has credentials + curated model list)
     try:
-        providers = list_authenticated_providers(
+        providers = build_aux_picker_rows(
             current_provider=current_provider,
             current_model=current_model,
             current_base_url=current_base_url,
@@ -3661,16 +3664,13 @@ def _aux_select_for_task(task: str) -> None:
     )
     entries.append(("__auto__", f"auto (recommended){auto_marker}", []))
 
-    for p in providers:
-        slug = p.get("slug", "")
-        name = p.get("name") or slug
-        total = p.get("total_models", 0)
-        models = p.get("models") or []
-        model_hint = f" — {total} models" if total else ""
-        marker = (
-            "  ← current" if slug == current_provider and not current_base_url else ""
+    entries.extend(
+        format_aux_picker_entries(
+            providers,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
         )
-        entries.append((slug, f"{name}{model_hint}{marker}", list(models)))
+    )
 
     # Custom endpoint (raw base_url)
     custom_marker = "  ← current" if current_base_url else ""
@@ -5556,6 +5556,86 @@ _PE_MACHINE_NAMES = {
     _PE_MACHINE_ARM64: "ARM64",
 }
 
+_PE_MACHINE_TO_NAME = {
+    _PE_MACHINE_ARM64: "ARM64",
+    _PE_MACHINE_AMD64: "AMD64",
+    _PE_MACHINE_I386: "X86",
+}
+
+# MACHINE_ATTRIBUTES bits (processthreadsapi.h). UserEnabled means the host
+# can run user-mode code of that machine type — natively or under emulation.
+_MACHINE_ATTRIBUTE_USER_ENABLED = 0x00000001
+
+
+def _windows_native_machine_from_iswow64() -> Optional[str]:
+    """Ask IsWow64Process2 for the OS-native machine (None if unavailable/fail).
+
+    ctypes defaults ``GetCurrentProcess``'s restype to ``c_int``, so the
+    current-process pseudo-handle ``(HANDLE)-1`` is truncated to
+    ``0xFFFFFFFF`` and zero-extended into a 64-bit invalid handle. On Win64
+    that makes ``IsWow64Process2`` fail with ``ERROR_INVALID_HANDLE`` (6),
+    which is exactly the residual Windows-on-ARM failure after #71218: the
+    gate fell through to ``PROCESSOR_ARCHITECTURE=AMD64`` (the emulated
+    process arch) and rejected a correctly-built ARM64 ``Hermes.exe``.
+    Binding ``restype``/``argtypes`` to ``wintypes.HANDLE`` keeps the full
+    ``0xFFFFFFFFFFFFFFFF`` pseudo-handle.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.IsWow64Process2.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.USHORT),
+        ctypes.POINTER(wintypes.USHORT),
+    ]
+    kernel32.IsWow64Process2.restype = wintypes.BOOL
+
+    process_machine = wintypes.USHORT(0)
+    native_machine = wintypes.USHORT(0)
+    if not kernel32.IsWow64Process2(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(process_machine),
+        ctypes.byref(native_machine),
+    ):
+        return None
+    return _PE_MACHINE_TO_NAME.get(native_machine.value)
+
+
+def _windows_user_runnable_pe_machines() -> Optional[set]:
+    """PE machines this host can run in user mode, via GetMachineTypeAttributes.
+
+    This asks the question the integrity gate actually cares about — "can this
+    Windows host load a PE of machine X?" — instead of inferring it from a
+    host-architecture name. It is also the only documented API that reports
+    AMD64-on-ARM64 emulation support; ``IsWow64GuestMachineSupported`` only
+    answers for 32-bit guests.
+
+    Returns None when the API is unavailable (pre-Windows-11 build 22000) or
+    reports nothing runnable, so callers fall back to name-based detection.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetMachineTypeAttributes.argtypes = [
+        wintypes.USHORT,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    kernel32.GetMachineTypeAttributes.restype = ctypes.c_long
+
+    runnable = set()
+    for machine in (_PE_MACHINE_ARM64, _PE_MACHINE_AMD64, _PE_MACHINE_I386):
+        attributes = ctypes.c_int(0)
+        # HRESULT: zero is success, any nonzero value is a failure.
+        if kernel32.GetMachineTypeAttributes(machine, ctypes.byref(attributes)):
+            continue
+        if attributes.value & _MACHINE_ATTRIBUTE_USER_ENABLED:
+            runnable.add(machine)
+    return runnable or None
+
 
 def _windows_native_machine() -> str:
     """The Windows host OS's NATIVE machine architecture, normalized upper.
@@ -5565,35 +5645,29 @@ def _windows_native_machine() -> str:
     x64 Python) on Windows-on-ARM devices, where ``platform.machine()``
     returns ``AMD64`` even though the OS is ARM64. The #71119 integrity gate
     then rejected the CORRECT ARM64 rebuild as an "architecture mismatch"
-    (#69179 follow-up report). ``IsWow64Process2`` asks the OS for the true
-    native machine and works from emulated processes; the classic
-    ``PROCESSOR_ARCHITEW6432`` fallback only covers WOW64 (32-bit processes)
-    and is NOT set under x64-on-ARM64 emulation, so it cannot replace the API
-    probe — it is kept only for pre-1511 Windows 10 hosts without the API.
+    (#69179 follow-up report). Probe order:
+
+    1. ``IsWow64Process2`` with a correctly-typed current-process HANDLE
+       (#71218 + HANDLE-truncation fix). This is the only API that tells the
+       truth from an x64 process emulated on ARM64.
+    2. ``PROCESSOR_ARCHITEW6432`` / ``PROCESSOR_ARCHITECTURE`` — WOW64
+       (32-bit) hosts and pre-1511 Windows 10 without the newer API.
+    3. ``platform.machine()``.
+
+    Note ``GetNativeSystemInfo`` is deliberately NOT used: Microsoft documents
+    that it "also returns emulated processor details when run from an app
+    under emulation", so on the very WoA hosts this function exists to serve
+    it reports AMD64 — no better than the env-var rung below it.
     """
     if sys.platform == "win32":
         try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            process_machine = ctypes.c_ushort(0)
-            native_machine = ctypes.c_ushort(0)
-            if kernel32.IsWow64Process2(
-                kernel32.GetCurrentProcess(),
-                ctypes.byref(process_machine),
-                ctypes.byref(native_machine),
-            ):
-                name = {
-                    _PE_MACHINE_ARM64: "ARM64",
-                    _PE_MACHINE_AMD64: "AMD64",
-                    _PE_MACHINE_I386: "X86",
-                }.get(native_machine.value)
-                if name:
-                    return name
-        except (OSError, AttributeError):
-            # No IsWow64Process2 (pre-1511 Windows 10) — fall through to the
-            # documented WOW64 env vars, then the process architecture.
-            pass
+            name = _windows_native_machine_from_iswow64()
+        except (OSError, AttributeError, TypeError, ValueError):
+            # API missing (pre-1511), DLL load failure in tests, or a
+            # mistyped ctypes binding — fall through to the env vars.
+            name = None
+        if name:
+            return name
         env_arch = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get(
             "PROCESSOR_ARCHITECTURE"
         )
@@ -5607,12 +5681,23 @@ def _windows_native_machine() -> str:
 def _expected_windows_pe_machines() -> set:
     """PE machine values the current Windows host can natively load.
 
-    AMD64 hosts run x64 and (via WOW64) x86. ARM64 hosts run ARM64 and
-    (Windows 11 emulation) x64. 32-bit x86 hosts run only x86. Unknown
-    machines return the permissive full set so the integrity gate can never
-    brick launch on exotic hosts. Host detection uses the OS-native machine
-    (see ``_windows_native_machine``), not the process architecture.
+    Preferred source is ``GetMachineTypeAttributes``, which answers this
+    question directly (including AMD64-on-ARM64 emulation) instead of
+    inferring it from an architecture name.
+
+    Fallback is name-based: AMD64 hosts run x64 and (via WOW64) x86. ARM64
+    hosts run ARM64 and (Windows 11 emulation) x64. 32-bit x86 hosts run only
+    x86. Unknown machines return the permissive full set so the integrity gate
+    can never brick launch on exotic hosts. Host detection uses the OS-native
+    machine (see ``_windows_native_machine``), not the process architecture.
     """
+    if sys.platform == "win32":
+        try:
+            runnable = _windows_user_runnable_pe_machines()
+        except (OSError, AttributeError, TypeError, ValueError):
+            runnable = None
+        if runnable:
+            return runnable
     machine = _windows_native_machine().upper()
     if machine in ("AMD64", "X86_64", "X64"):
         return {_PE_MACHINE_AMD64, _PE_MACHINE_I386}
@@ -6956,12 +7041,205 @@ def _restart_managed_dashboard_service(
     return True
 
 
+def _get_systemd_service_for_pid(pid: int) -> str | None:
+    """If *pid* belongs to a systemd service unit, return the unit name.
+
+    Reads ``/proc/<pid>/cgroup`` and extracts the service name (e.g.
+    ``hermes-serve.service``).  Returns ``None`` when the PID is not
+    part of a systemd service, when the file is unreadable, or on
+    non-Linux platforms.
+    """
+    try:
+        cgroup_path = Path(f"/proc/{pid}/cgroup")
+        if not cgroup_path.is_file():
+            return None
+        text = cgroup_path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            # Format: 0::/system.slice/hermes-serve.service
+            #         0::/user.slice/user-1000.slice/session-42.scope
+            parts = line.split("::", 1)
+            if len(parts) != 2:
+                continue
+            cg_path = parts[1]
+            if cg_path.endswith(".service"):
+                svc_name = cg_path.rsplit("/", 1)[-1]
+                if svc_name:
+                    return svc_name
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def _extract_scope_from_cgroup(cgroup_entry: str) -> str | None:
+    """Extract the systemd scope (``user`` or ``system``) from a cgroup path.
+
+    The cgroup path format is ``/system.slice/<name>.service`` for system
+    services and ``/user.slice/user-<uid>.slice/<name>.service`` for user
+    services.  Returns ``None`` when the scope cannot be determined.
+    """
+    if "/system.slice/" in cgroup_entry:
+        return "system"
+    if "/user.slice/" in cgroup_entry:
+        return "user"
+    return None
+
+
+def _get_pid_cgroup_path(pid: int) -> str | None:
+    """Return the cgroup path from ``/proc/<pid>/cgroup``, or ``None``.
+
+    Only the unified (``0::``) hierarchy cgroup entry is examined.
+    """
+    try:
+        cgroup_path = Path(f"/proc/{pid}/cgroup")
+        if not cgroup_path.is_file():
+            return None
+        text = cgroup_path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            parts = line.split("::", 1)
+            if len(parts) == 2:
+                return parts[1]
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def _try_restart_systemd_service(svc_name: str, cgroup_path: str | None = None) -> bool:
+    """Attempt to restart *svc_name* via systemctl.
+
+    Uses ``systemctl --user`` for user-scope services and ``systemctl``
+    for system-scope services.  Returns ``True`` on success.
+    """
+    scope = _extract_scope_from_cgroup(cgroup_path) if cgroup_path else None
+    if scope == "user":
+        cmd = ["systemctl", "--user", "restart", svc_name]
+    elif scope == "system":
+        cmd = ["systemctl", "restart", svc_name]
+    else:
+        # Unknown scope — try system first, then user
+        cmd = None
+        for candidate in (
+            ["systemctl", "restart", svc_name],
+            ["systemctl", "--user", "restart", svc_name],
+        ):
+            try:
+                r = subprocess.run(
+                    candidate,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=15,
+                )
+                if r.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                continue
+        return False
+
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
+    """Return the exact argv of a running process, when recoverable.
+
+    Linux: reads ``/proc/<pid>/cmdline`` (NUL-separated, lossless).
+    macOS: falls back to ``ps -o command=`` + shlex (best effort — quoting
+    is reconstructed, but hermes launch commands don't embed exotic args).
+    Windows: returns ``None``; taskkill /F gives no graceful window and the
+    desktop app manages its own backend there.
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        cmdline_path = f"/proc/{pid}/cmdline"
+        if os.path.exists(cmdline_path):
+            with open(cmdline_path, "rb") as f:
+                raw = f.read()
+            argv = [
+                part.decode("utf-8", errors="replace")
+                for part in raw.split(b"\x00")
+                if part
+            ]
+            return argv or None
+        # macOS (no /proc): best-effort via ps.
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        command = (result.stdout or "").strip()
+        if not command:
+            return None
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+        return argv or None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
+    """Best-effort respawn of manually-started dashboards after ``hermes update``.
+
+    Spawns each recovered argv detached (new session, output to the profile's
+    ``logs/dashboard-restart.log``).  Returns the commands that failed to
+    spawn; the caller prints the manual hint for those.
+    """
+    from hermes_constants import get_hermes_home
+
+    respawned: list[list[str]] = []
+    failed: list[tuple[list[str], str]] = []
+    log_path = get_hermes_home() / "logs" / "dashboard-restart.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    for command in commands:
+        try:
+            # Keep restarted dashboards headless; reopening a browser after a
+            # background update is noisy and fails in SSH/headless sessions.
+            if "dashboard" in command and "--no-open" not in command:
+                command = [*command, "--no-open"]
+            with open(log_path, "ab") as log_f:
+                subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            respawned.append(command)
+        except (OSError, ValueError) as exc:
+            failed.append((command, str(exc)))
+
+    for command in respawned:
+        print(f"    ✓ restarted: {shlex.join(command)}")
+    for command, err_msg in failed:
+        print(f"    ✗ failed to restart ({shlex.join(command)}): {err_msg}")
+    return [command for command, _ in failed]
+
+
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
     *,
     restart_managed: bool = False,
 ) -> None:
-    """Kill running ``hermes dashboard`` processes.
+    """Kill running ``hermes dashboard`` / ``hermes serve`` processes.
 
     Called at the end of ``hermes update`` (default ``reason``) and also
     from ``hermes dashboard --stop`` (which overrides ``reason``).  The
@@ -6978,8 +7256,11 @@ def _kill_stale_dashboard_processes(
     Manually-started dashboards are not auto-restarted because we don't know
     the original launch args (--host, --port, --insecure, --tui, --no-open).
     When ``restart_managed`` is true (the ``hermes update`` path), a detected
-    ``hermes-dashboard.service`` is restarted through systemd instead of
-    raw-killing its main PID.
+    ``hermes-dashboard.service`` is restarted through systemd; any OTHER
+    killed PID that was supervised by a systemd unit (custom unit names —
+    e.g. a remote backend's ``hermes-serve.service``) has its owning unit
+    restarted after the kill, because systemd treats our SIGTERM as a clean
+    stop and ``Restart=on-failure`` would never fire (#68934).
     """
     if restart_managed and _restart_managed_dashboard_service(reason):
         return
@@ -7010,6 +7291,26 @@ def _kill_stale_dashboard_processes(
 
     print()
     print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
+
+    # Before killing, snapshot systemd cgroup info for each PID so we can
+    # restart supervised services after the kill (the cgroup disappears
+    # along with the process).  Only meaningful on Linux, and only when the
+    # caller asked for restarts (the `hermes update` path) — `--stop` must
+    # stay a stop, not a restart.
+    pid_cgroup: dict[int, str | None] = {}
+    pid_service: dict[int, str | None] = {}
+    pid_cmdline: dict[int, list[str]] = {}
+    if restart_managed and sys.platform != "win32":
+        for pid in pids:
+            cg_path = _get_pid_cgroup_path(pid)
+            pid_cgroup[pid] = cg_path
+            pid_service[pid] = _get_systemd_service_for_pid(pid)
+            if not pid_service[pid]:
+                # Manually-started process: preserve its exact argv so we
+                # can respawn it after the update (#40449, #68934).
+                cmdline = _dashboard_cmdline_for_pid(pid)
+                if cmdline:
+                    pid_cmdline[pid] = cmdline
 
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
@@ -7077,7 +7378,47 @@ def _kill_stale_dashboard_processes(
     for pid, err_msg in failed:
         print(f"    ✗ failed to stop PID {pid}: {err_msg}")
 
-    if killed:
+    # Restart what we just killed (update path only).  Two categories:
+    #  - systemd-supervised PIDs: restart the owning unit.  Without this, a
+    #    remote backend (hermes serve) under Restart=on-failure never comes
+    #    back after our clean SIGTERM, and the Desktop can't reconnect (#68934).
+    #  - manually-started PIDs: respawn the argv captured before the kill
+    #    (#40449) — detached, headless, logged to logs/dashboard-restart.log.
+    restarted_services: list[str] = []
+    unrecovered: list[int] = []
+    if killed and restart_managed:
+        failed_restarts: list[tuple[str, str]] = []
+        seen_services: set[str] = set()
+        respawn_cmds: list[list[str]] = []
+        for pid in killed:
+            svc_name = pid_service.get(pid)
+            if svc_name:
+                if svc_name in seen_services:
+                    continue
+                seen_services.add(svc_name)
+                if _try_restart_systemd_service(svc_name, pid_cgroup.get(pid)):
+                    restarted_services.append(svc_name)
+                else:
+                    failed_restarts.append((svc_name, "systemctl restart returned non-zero"))
+            elif pid in pid_cmdline:
+                respawn_cmds.append(pid_cmdline[pid])
+            else:
+                unrecovered.append(pid)
+
+        for svc in restarted_services:
+            print(f"    ✓ restarted systemd service {svc}")
+        for svc, err in failed_restarts:
+            print(f"    ⚠ {svc}: {err}")
+
+        if respawn_cmds:
+            failed_cmds = _respawn_dashboard_processes(respawn_cmds)
+            if failed_cmds:
+                unrecovered.extend(p for p in killed if pid_cmdline.get(p) in failed_cmds)
+
+        if failed_restarts or unrecovered:
+            print("  Restart anything not auto-restarted when you're ready:")
+            print("    hermes dashboard --port <port>")
+    elif killed:
         print("  Restart the dashboard when you're ready:")
         print("    hermes dashboard --port <port>")
 
@@ -12191,7 +12532,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 from hermes_cli.tools_config import install_cua_driver
 
                 print()
-                install_cua_driver(upgrade=True)
+                print("→ Refreshing cua-driver (Computer Use)...")
+                # require_confirmed_update: only run the (multi-minute,
+                # silent) upstream installer when the driver's native
+                # check-update verb positively reports a newer release.
+                # An indeterminate check (offline, rate-limited, old
+                # driver) keeps the installed version — `hermes update`
+                # must stay fast; `hermes computer-use install --upgrade`
+                # remains the force path.
+                install_cua_driver(
+                    upgrade=True,
+                    require_confirmed_update=True,
+                    show_installer_progress=False,
+                )
         except Exception as e:
             logger.debug("cua-driver refresh failed: %s", e)
 
@@ -15926,6 +16279,58 @@ def main():
         help="Skip the timestamped backup copy (not recommended)",
     )
 
+    sessions_recover = sessions_subparsers.add_parser(
+        "recover",
+        help="Rebuild canonical session data into a separate clean database",
+        description=(
+            "Offline, non-destructive recovery for a damaged state.db. The "
+            "source database and its WAL/SHM/rollback-journal sidecars are "
+            "copied before SQLite opens anything. Canonical rows are rebuilt "
+            "into a new output database; derived search indexes are recreated "
+            "and the active database is never replaced automatically."
+        ),
+    )
+    sessions_recover.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="Source state.db or preserved backup to inspect/recover",
+    )
+    sessions_recover.add_argument(
+        "--output",
+        type=Path,
+        help="New recovery database path (required unless --inspect-only)",
+    )
+    sessions_recover.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="Only report canonical table readability; do not create an output database",
+    )
+    sessions_recover.add_argument(
+        "--work-dir",
+        type=Path,
+        help="Existing directory for the disposable source copy (defaults beside the output)",
+    )
+    sessions_recover.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1000,
+        help="Rows committed per recovery batch (default: 1000)",
+    )
+    sessions_recover.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=(
+            "Best-effort salvage across damaged row ranges; the output remains "
+            "separate and every skipped range is recorded"
+        ),
+    )
+    sessions_recover.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path (defaults to <output>.recovery.json)",
+    )
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(
@@ -15933,6 +16338,29 @@ def main():
     )
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
+
+    sessions_retitle = sessions_subparsers.add_parser(
+        "retitle-skills",
+        help="Re-title sessions whose auto-title came from a /skill's own text",
+        description=(
+            "Sessions opened with a /skill were auto-titled from the expanded "
+            "message, which embeds the whole skill body — so the title "
+            "describes the SKILL, not the request. This regenerates those "
+            "titles from what the user actually typed. Lists what it would "
+            "change unless --apply is passed."
+        ),
+    )
+    sessions_retitle.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the new titles (default: dry run)",
+    )
+    sessions_retitle.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum sessions to examine (default: 200)",
+    )
 
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
@@ -15957,9 +16385,10 @@ def main():
 
         action = args.sessions_action
 
-        # 'repair' must run BEFORE opening SessionDB(): a malformed schema is
-        # exactly the case where SessionDB() can't open, so it operates on the
-        # raw file path instead.
+        # 'repair' and 'recover' must run BEFORE opening SessionDB(): a
+        # malformed schema is exactly the case where SessionDB() can't open.
+        # Recovery additionally promises never to open the supplied source
+        # directly, so it operates through its own disposable source copy.
         if action == "repair":
             from hermes_state import (
                 DEFAULT_DB_PATH,
@@ -16000,7 +16429,125 @@ def main():
                 if report.get("backup_path"):
                     print(f"  A backup is preserved at: {report['backup_path']}")
                 print("  Keep state.db and the backup; do not delete them.")
+                # Without this pointer the user is at a dead end: in-place
+                # repair has failed and nothing tells them the non-destructive
+                # offline recovery path exists. Lead with --inspect-only so
+                # they confirm the data is readable before writing anything.
+                print("")
+                print("  Next step — offline recovery (never modifies the source):")
+                source_hint = report.get("backup_path") or db_path
+                print(f"    hermes sessions recover --source {source_hint} \\")
+                print("        --inspect-only")
+                print("  If that reports the data is recoverable, rebuild it into")
+                print("  a NEW database (the active one is left untouched):")
+                print(f"    hermes sessions recover --source {source_hint} \\")
+                print("        --output recovered-state.db")
             return
+
+        if action == "recover":
+            import sqlite3 as _sqlite3
+
+            from hermes_cli.session_recovery import (
+                SessionRecoveryError,
+                inspect_session_database,
+                recover_session_database,
+                write_recovery_report,
+            )
+
+            source = args.source
+            output = getattr(args, "output", None)
+            inspect_only = bool(getattr(args, "inspect_only", False))
+            allow_partial = bool(getattr(args, "allow_partial", False))
+            report_path = getattr(args, "report", None)
+            if inspect_only and output is not None:
+                print("Error: --output cannot be used with --inspect-only.")
+                return 2
+            if inspect_only and allow_partial:
+                print("Error: --allow-partial cannot be used with --inspect-only.")
+                return 2
+            if not inspect_only and output is None:
+                print("Error: --output is required unless --inspect-only is used.")
+                return 2
+            if not inspect_only and report_path is None:
+                report_path = output.with_name(output.name + ".recovery.json")
+            if (
+                report_path is not None
+                and os.path.lexists(report_path.expanduser())
+            ):
+                print(f"Error: refusing to overwrite existing report: {report_path}")
+                return 2
+
+            try:
+                if inspect_only:
+                    report = inspect_session_database(
+                        source,
+                        work_dir=getattr(args, "work_dir", None),
+                    )
+                else:
+                    last_progress = {"table": None}
+
+                    def _recovery_progress(info):
+                        table = info.get("table")
+                        copied = int(info.get("copied_rows") or 0)
+                        total = info.get("source_rows")
+                        if table != last_progress["table"]:
+                            if last_progress["table"] is not None:
+                                print()
+                            print(f"  {table}: ", end="", flush=True)
+                            last_progress["table"] = table
+                        suffix = f"/{int(total):,}" if total is not None else ""
+                        print(f"\r  {table}: {copied:,}{suffix}", end="", flush=True)
+
+                    print("Recovering canonical session data into a new database…")
+                    report = recover_session_database(
+                        source,
+                        output,
+                        work_dir=getattr(args, "work_dir", None),
+                        chunk_size=getattr(args, "chunk_size", 1000),
+                        progress_cb=_recovery_progress,
+                        allow_partial=allow_partial,
+                    )
+                    if last_progress["table"] is not None:
+                        print()
+            except (SessionRecoveryError, OSError, _sqlite3.DatabaseError) as exc:
+                print(f"Error: session recovery failed: {exc}")
+                print("The supplied source database was not replaced or deleted.")
+                return 1
+
+            if report_path is not None:
+                try:
+                    written_report = write_recovery_report(report_path, report)
+                except (FileExistsError, OSError) as exc:
+                    print(f"Error: could not write recovery report: {exc}")
+                    return 1
+                print(f"Recovery report: {written_report}")
+            else:
+                print(_json.dumps(report, indent=2, sort_keys=True))
+
+            if inspect_only:
+                return 0 if report.get("recoverable") else 1
+            if report.get("complete"):
+                print(f"✓ Recovered database verified at: {output}")
+                print("  The active session database was not changed.")
+                print("  Review the JSON report before installing this database.")
+                return 0
+            if allow_partial and report.get("verified"):
+                counts = report.get("verification", {}).get("table_counts", {})
+                print(f"✓ Partial recovery output verified at: {output}")
+                print(
+                    "  Recovered "
+                    f"{int(counts.get('sessions') or 0):,} sessions and "
+                    f"{int(counts.get('messages') or 0):,} messages."
+                )
+                print("  The active session database was not changed.")
+                print(
+                    "  This output is incomplete. Review every skipped range "
+                    "and orphan count in the JSON report before installing it."
+                )
+                return 0
+            print("✗ Recovery output did not pass every verification check.")
+            print("  Do not install it. Review the JSON report for partial data or errors.")
+            return 1
 
         try:
             from hermes_state import SessionDB
@@ -16694,6 +17241,67 @@ def main():
                     print(f"Session '{args.session_id}' not found.")
             except ValueError as e:
                 print(f"Error: {e}")
+
+        elif action == "retitle-skills":
+            from agent.skill_commands import describe_skill_invocation
+            from agent.title_generator import generate_title
+
+            limit = max(1, int(getattr(args, "limit", 200) or 200))
+            apply_changes = bool(getattr(args, "apply", False))
+
+            def _is_titlelike(candidate: str) -> bool:
+                """Reject a candidate that isn't a title at all.
+
+                An auxiliary model occasionally answers the prompt instead of
+                titling it and echoes the assistant's output ('$ df -h /'). The
+                live path has no alternative and takes what it gets, but this is
+                a REPAIR — replacing a serviceable title with command output
+                would make things worse, so keep the old one.
+                """
+                return bool(candidate) and candidate[0].isalnum()
+
+            candidates = db.list_skill_scaffolded_sessions(limit=limit)
+            if not candidates:
+                print("No sessions were titled from a /skill invocation.")
+                return
+
+            print(
+                f"{len(candidates)} session(s) opened with a /skill"
+                f"{'' if apply_changes else ' (dry run — pass --apply to write)'}:"
+            )
+            changed = 0
+            for row in candidates:
+                session_id = row["id"]
+                typed = describe_skill_invocation(row["content"]) or ""
+                first_reply = db.get_first_assistant_text(session_id) or ""
+                new_title = generate_title(typed, first_reply)
+                if not new_title or new_title == row["title"]:
+                    continue
+                if not _is_titlelike(new_title):
+                    print(f"  {session_id}\n    kept {row['title']!r} — got {new_title!r}")
+                    continue
+                print(f"  {session_id}\n    {row['title']!r}\n    → {new_title!r}")
+                changed += 1
+                if not apply_changes:
+                    continue
+                try:
+                    db.set_session_title(session_id, new_title)
+                except ValueError:
+                    # Unique-title collision. Dedupe the same way the live
+                    # auto-titler does (base #2, base #3, ...) rather than
+                    # leaving the leaked title in place.
+                    deduped = db.get_next_title_in_lineage(new_title)
+                    try:
+                        db.set_session_title(session_id, deduped)
+                        print(f"    (renamed to {deduped!r} — title was taken)")
+                    except ValueError as e:
+                        print(f"    skipped: {e}")
+                        changed -= 1
+
+            if not changed:
+                print("  every title already reflects the user's request.")
+            elif apply_changes:
+                print(f"✓ Re-titled {changed} session(s).")
 
         elif action == "browse":
             limit = getattr(args, "limit", 500) or 500

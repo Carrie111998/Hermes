@@ -38,6 +38,7 @@ For captures / actions with `capture_after=True`:
 
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import logging
@@ -241,21 +242,58 @@ def release_computer_use_session(session_id: str) -> bool:
     return True
 
 
-def reset_backend_for_tests() -> None:  # pragma: no cover
-    """Test helper — tear down the cached backend and per-session state."""
+def _shutdown_backend_atexit() -> None:
+    """Stop all cached backends so cua-driver children don't outlive us.
+
+    Each session backend holds a long-lived ``cua-driver`` subprocess, so
+    without this a driver can survive the Hermes process that spawned it
+    (#28152 item 3). #69903 kept the orphan from burning a core by disabling
+    the cursor overlay; the process itself still lingered.
+
+    Mirrors ``browser_tool``'s ``atexit.register(_emergency_cleanup_all_sessions)``
+    — same spawn-and-drive-a-subprocess shape. atexit only, no signal handlers:
+    a ``SystemExit`` raised from a prompt_toolkit key binding corrupts its
+    coroutine state and makes the process unkillable. Never raises, since an
+    exception escaping atexit prints a traceback on every exit.
+    """
     global _backend
+    # Drop the global lock before stop() — teardown budgets 5s and shouldn't
+    # block an unrelated caller waiting to spawn.
     with _backend_lock:
-        unique = {id(item): item for item in _backends.values()}
+        unique = {
+            id(backend): (backend, _backend_call_locks.get(sid))
+            for sid, backend in _backends.items()
+        }
         if _backend is not None:
-            unique[id(_backend)] = _backend
+            unique.setdefault(
+                id(_backend),
+                (_backend, _backend_call_locks.get("")),
+            )
         _backend = None
         _backends.clear()
         _backend_call_locks.clear()
-    for backend in unique.values():
+
+    with _approval_lock:
+        _session_auto_approve.clear()
+        _always_allow.clear()
+
+    for backend, call_lock in unique.values():
         try:
-            backend.stop()
-        except Exception:
-            pass
+            if call_lock is not None:
+                with call_lock:
+                    backend.stop()
+            else:
+                backend.stop()
+        except Exception as e:
+            logger.debug("cua-driver atexit teardown failed: %s", e)
+
+
+atexit.register(_shutdown_backend_atexit)
+
+
+def reset_backend_for_tests() -> None:  # pragma: no cover
+    """Test helper — tear down the cached backend and per-session state."""
+    _shutdown_backend_atexit()
     _AUX_VISION_ROUTE_CACHE.clear()
     with _approval_lock:
         _session_auto_approve.clear()
