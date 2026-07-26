@@ -1,7 +1,10 @@
-import { atom } from 'nanostores'
+import { atom, computed } from 'nanostores'
 
 import { normalize } from '@/lib/text'
 import { $petInfo, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
+import { setProfilePetInfo } from '@/store/pet-multi'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { petRequestFor, type PetGatewayRequest } from '@/store/pet-transport'
 
 /**
  * Feature store for the petdex gallery picker (Cmd+K "Pets…" + Settings).
@@ -17,8 +20,12 @@ import { $petInfo, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
  *  - Thumbnails are deduped in a process-global cache (the backend disk-caches
  *    too, so a slug is fetched at most once per session).
  *
- * Consumers just `useStore($petGallery)` and call the actions; no component
- * owns gallery state anymore.
+ * Layer 7: state is per-profile (one gallery slice per normalized profile key)
+ * so pinned mode can manage several profiles' pets concurrently. The legacy
+ * singular atoms ($petGallery et al) remain as computed views over the ACTIVE
+ * profile's slice, so every existing consumer (follow-active) is unchanged. A
+ * non-active profile's calls route through petRequestFor(profile) — never the
+ * active gateway; the active profile keeps the hook's recovering requester.
  */
 
 export interface GalleryPet {
@@ -42,18 +49,7 @@ export type PetGalleryStatus = 'idle' | 'loading' | 'ready' | 'stale' | 'error'
 
 /** The recovering `requestGateway` from `useGatewayRequest` — passed in so the
  *  store reuses the hook's reconnect/reauth handling instead of duplicating it. */
-export type GatewayRequest = <T>(
-  method: string,
-  params?: Record<string, unknown>,
-  timeoutMs?: number,
-  signal?: AbortSignal
-) => Promise<T>
-
-/** Profile-scoped pet RPC. Pets are per-profile, so every call carries the active
- *  profile (the gateway no-ops it for the launch profile). One chokepoint so no
- *  call site can forget it. */
-const petRpc = <T>(request: GatewayRequest, method: string, params: Record<string, unknown> = {}): Promise<T> =>
-  request<T>(method, { ...params, profile: petProfile() })
+export type GatewayRequest = PetGatewayRequest
 
 /** A JSON-RPC "method not found" — the backend predates the pet RPCs. */
 function isMissingMethod(error: unknown): boolean {
@@ -62,65 +58,176 @@ function isMissingMethod(error: unknown): boolean {
   return /method not found|-32601|unknown method|no such method/i.test(message)
 }
 
-export const $petGallery = atom<PetGallery | null>(null)
-export const $petGalleryStatus = atom<PetGalleryStatus>('idle')
-export const $petGalleryError = atom<string | null>(null)
+// ── Per-profile state (Layer 7) ────────────────────────────────────────────
+// One slice per normalized profile key. Copy-on-write Maps so computeds re-fire.
+
+export const $petGalleries = atom<ReadonlyMap<string, PetGallery>>(new Map())
+export const $petGalleryStatuses = atom<ReadonlyMap<string, PetGalleryStatus>>(new Map())
+export const $petGalleryErrors = atom<ReadonlyMap<string, string | null>>(new Map())
+export const $petBusyProfiles = atom<ReadonlyMap<string, string | null>>(new Map())
+
+function activeKey(): string {
+  return normalizeProfileKey($activeGatewayProfile.get())
+}
+
+function slice<T>(map: ReadonlyMap<string, T>, key: string): T | undefined {
+  return map.get(key)
+}
+
+// Backwards-compat singular views over the ACTIVE profile's slice. Existing
+// consumers (follow-active) read these and see exactly what they did before.
+export const $petGallery = computed($petGalleries, m => slice(m, activeKey()) ?? null)
+export const $petGalleryStatus = computed($petGalleryStatuses, m => slice(m, activeKey()) ?? 'idle')
+export const $petGalleryError = computed($petGalleryErrors, m => slice(m, activeKey()) ?? null)
+export const $petBusy = computed($petBusyProfiles, m => slice(m, activeKey()) ?? null)
 
 // Which action is in flight, so rows/buttons can show a spinner. A slug for a
 // per-pet mutation; the `TOGGLE_*` sentinels for the on/off switch.
 export const TOGGLE_ON = '\u0000on'
 export const TOGGLE_OFF = '\u0000off'
-export const $petBusy = atom<string | null>(null)
 
-// Process-global caches (survive component unmount → instant reopen).
+// Process-global caches (survive component unmount → instant reopen). Thumb cache
+// is keyed `${profile}::${slug}` so two profiles' same-named pets don't collide.
 const thumbCache = new Map<string, Promise<string | null>>()
-let galleryLoad: Promise<void> | null = null
+// One in-flight gallery load per profile — concurrent profile loads must not
+// cancel each other (test 27).
+const galleryLoads = new Map<string, Promise<void>>()
+// One scale-persist debounce timer per profile (test 47).
+const scalePersists = new Map<string, ReturnType<typeof setTimeout>>()
 
-/**
- * Drop the cached gallery, thumbnails, and in-flight load so the next open
- * refetches against the now-active profile's backend. Called on a profile switch
- * (pets are per-profile) — the floating pet's own `pet.info` poll repaints the
- * new profile's mascot, and the picker reloads its gallery on next mount.
- */
-export function resetPetGallery(): void {
-  galleryLoad = null
-  thumbCache.clear()
-  $petGallery.set(null)
-  $petGalleryStatus.set('idle')
-  $petGalleryError.set(null)
-  $petBusy.set(null)
+function thumbKey(profile: string, slug: string): string {
+  return `${normalizeProfileKey(profile)}::${slug}`
 }
 
-export function loadPetThumb(request: GatewayRequest, slug: string, url?: string): Promise<string | null> {
-  let pending = thumbCache.get(slug)
+function setGallerySlice(profile: string, gallery: PetGallery | null): void {
+  const key = normalizeProfileKey(profile)
+  const next = new Map($petGalleries.get())
+
+  if (gallery) {
+    next.set(key, gallery)
+  } else {
+    next.delete(key)
+  }
+
+  $petGalleries.set(next)
+}
+
+function setStatusSlice(profile: string, status: PetGalleryStatus): void {
+  const key = normalizeProfileKey(profile)
+  const next = new Map($petGalleryStatuses.get())
+  next.set(key, status)
+  $petGalleryStatuses.set(next)
+}
+
+function setErrorSlice(profile: string, error: string | null): void {
+  const key = normalizeProfileKey(profile)
+  const next = new Map($petGalleryErrors.get())
+  next.set(key, error)
+  $petGalleryErrors.set(next)
+}
+
+function setBusySlice(profile: string, busy: string | null): void {
+  const key = normalizeProfileKey(profile)
+  const next = new Map($petBusyProfiles.get())
+  next.set(key, busy)
+  $petBusyProfiles.set(next)
+}
+
+/** Pick the requester for a profile: the active profile keeps the hook's
+ *  recovering requester; any other profile routes through its OWN socket via
+ *  petRequestFor (never the active gateway). */
+function requestFor(profile: string, activeRequest: GatewayRequest): GatewayRequest {
+  return normalizeProfileKey(profile) === activeKey() ? activeRequest : petRequestFor(profile)
+}
+
+/** Profile-scoped pet RPC. Pets are per-profile, so every call carries the
+ *  profile (the gateway no-ops it for the launch profile). */
+function petRpc<T>(
+  request: GatewayRequest,
+  profile: string,
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<T> {
+  const key = normalizeProfileKey(profile)
+
+  return request<T>(method, { ...params, profile: key })
+}
+
+/** Write a profile's mascot info: the active profile mirrors into the global
+ *  `$petInfo` (the floating pet + overlay render from it); a background profile
+ *  updates only its own `$profilePets` slice. */
+function applyPetInfo(profile: string, info: PetInfo): void {
+  if (normalizeProfileKey(profile) === activeKey()) {
+    setPetInfo(info)
+  } else {
+    setProfilePetInfo(profile, info)
+  }
+}
+
+function currentInfo(profile: string): PetInfo {
+  return normalizeProfileKey(profile) === activeKey() ? $petInfo.get() : { enabled: false }
+}
+
+/**
+ * Drop the cached gallery, thumbnails, and in-flight loads so the next open
+ * refetches. Called on a profile switch (pets are per-profile). Clears every
+ * profile's slice — the picker reloads against the now-active backend.
+ */
+export function resetPetGallery(): void {
+  galleryLoads.clear()
+  thumbCache.clear()
+  $petGalleries.set(new Map())
+  $petGalleryStatuses.set(new Map())
+  $petGalleryErrors.set(new Map())
+  $petBusyProfiles.set(new Map())
+}
+
+export function loadPetThumb(
+  request: GatewayRequest,
+  slug: string,
+  url?: string,
+  profile: string = petProfile()
+): Promise<string | null> {
+  const key = thumbKey(profile, slug)
+  let pending = thumbCache.get(key)
 
   if (!pending) {
-    pending = petRpc<{ ok: boolean; dataUri?: string }>(request, 'pet.thumb', { slug, url: url ?? '' })
+    const rpc = requestFor(profile, request)
+    pending = petRpc<{ ok: boolean; dataUri?: string }>(rpc, profile, 'pet.thumb', { slug, url: url ?? '' })
       .then(result => (result?.ok && result.dataUri ? result.dataUri : null))
       .catch(() => null)
-    thumbCache.set(slug, pending)
+    thumbCache.set(key, pending)
   }
 
   return pending
 }
 
 /**
- * Fetch the gallery once and cache it. Subsequent calls are no-ops while a
- * ready snapshot is held; pass `{ force: true }` to bypass the cache (e.g. a
- * manual refresh). Concurrent callers share a single in-flight request.
+ * Fetch one profile's gallery once and cache it. Subsequent calls are no-ops
+ * while a ready snapshot is held; pass `{ force: true }` to bypass the cache.
+ * Concurrent callers for the SAME profile share a single in-flight request;
+ * different profiles load independently (never cancel each other).
  */
-export function loadPetGallery(request: GatewayRequest, options: { force?: boolean } = {}): Promise<void> {
-  if (!options.force && $petGallery.get() && $petGalleryStatus.get() === 'ready') {
+export function loadPetGallery(
+  request: GatewayRequest,
+  options: { force?: boolean; profile?: string } = {}
+): Promise<void> {
+  const profile = normalizeProfileKey(options.profile ?? petProfile())
+  const rpc = requestFor(profile, request)
+
+  if (!options.force && slice($petGalleries.get(), profile) && $petGalleryStatuses.get().get(profile) === 'ready') {
     return Promise.resolve()
   }
 
-  if (galleryLoad) {
-    return galleryLoad
+  const existing = galleryLoads.get(profile)
+
+  if (existing) {
+    return existing
   }
 
-  galleryLoad = (async () => {
-    if (!$petGallery.get()) {
-      $petGalleryStatus.set('loading')
+  const load = (async () => {
+    if (!slice($petGalleries.get(), profile)) {
+      setStatusSlice(profile, 'loading')
     }
 
     let localOk = false
@@ -129,42 +236,42 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
       // Phase 1: local pets only — instant, never blocks on the remote petdex
       // manifest. The user's own/generated pets render right away.
       const [local, info] = await Promise.all([
-        petRpc<PetGallery>(request, 'pet.gallery', { localOnly: true }),
-        petRpc<PetInfo>(request, 'pet.info')
+        petRpc<PetGallery>(rpc, profile, 'pet.gallery', { localOnly: true }),
+        petRpc<PetInfo>(rpc, profile, 'pet.info')
       ])
 
       if (local) {
-        $petGallery.set(local)
-        $petGalleryStatus.set('ready')
-        $petGalleryError.set(null)
+        setGallerySlice(profile, local)
+        setStatusSlice(profile, 'ready')
+        setErrorSlice(profile, null)
         localOk = true
       }
 
       if (info) {
-        setPetInfo(info)
+        applyPetInfo(profile, info)
       }
     } catch (e) {
       if (isMissingMethod(e)) {
-        $petGalleryStatus.set('stale')
-      } else if (!$petGallery.get()) {
+        setStatusSlice(profile, 'stale')
+      } else if (!slice($petGalleries.get(), profile)) {
         // Only surface a hard error when we have nothing to show; a transient
         // hiccup mid-session leaves the cached gallery intact.
-        $petGalleryStatus.set('error')
-        $petGalleryError.set(e instanceof Error ? e.message : 'Could not reach the petdex gallery.')
+        setStatusSlice(profile, 'error')
+        setErrorSlice(profile, e instanceof Error ? e.message : 'Could not reach the petdex gallery.')
       }
     } finally {
-      galleryLoad = null
+      galleryLoads.delete(profile)
     }
 
     // Phase 2: merge in the full petdex catalog in the background. A slow/failed
     // manifest fetch never hides the local pets shown in phase 1.
     if (localOk) {
       try {
-        const full = await petRpc<PetGallery>(request, 'pet.gallery')
+        const full = await petRpc<PetGallery>(rpc, profile, 'pet.gallery')
 
         if (full) {
-          $petGallery.set(full)
-          $petGalleryStatus.set('ready')
+          setGallerySlice(profile, full)
+          setStatusSlice(profile, 'ready')
         }
       } catch {
         // Keep the local-only gallery; the petdex catalog just stays unmerged.
@@ -172,17 +279,20 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
     }
   })()
 
-  return galleryLoad
+  galleryLoads.set(profile, load)
+
+  return load
 }
 
 // Push the live mascot state (cheap, local config read) without re-pulling the
 // network gallery — the floating pet repaints, the picker keeps its cache.
-async function syncInfo(request: GatewayRequest): Promise<void> {
+async function syncInfo(request: GatewayRequest, profile: string): Promise<void> {
   try {
-    const info = await petRpc<PetInfo>(request, 'pet.info')
+    const rpc = requestFor(profile, request)
+    const info = await petRpc<PetInfo>(rpc, profile, 'pet.info')
 
     if (info) {
-      setPetInfo(info)
+      applyPetInfo(profile, info)
     }
   } catch {
     // The mutation already succeeded; a stale mascot self-heals on its poll.
@@ -195,8 +305,13 @@ async function syncInfo(request: GatewayRequest): Promise<void> {
  * local `pet.info`. Adopting a generated pet is a disk+config op — it must never
  * wait on `pet.gallery`'s remote petdex manifest fetch.
  */
-export async function applyAdoptedPet(request: GatewayRequest, slug: string, displayName: string): Promise<void> {
-  patchGallery(gallery => ({
+export async function applyAdoptedPet(
+  request: GatewayRequest,
+  slug: string,
+  displayName: string,
+  profile: string = petProfile()
+): Promise<void> {
+  patchGallery(profile, gallery => ({
     ...gallery,
     enabled: true,
     active: slug,
@@ -204,7 +319,7 @@ export async function applyAdoptedPet(request: GatewayRequest, slug: string, dis
       ? gallery.pets.map(p => (p.slug === slug ? { ...p, installed: true, displayName } : p))
       : [...gallery.pets, { slug, displayName, installed: true, spritesheetUrl: '' }]
   }))
-  await syncInfo(request)
+  await syncInfo(request, profile)
 }
 
 /**
@@ -240,47 +355,55 @@ export function rankedGalleryPets(gallery: PetGallery | null, query = ''): Galle
     .sort((a, b) => rank(b) - rank(a))
 }
 
-function patchGallery(fn: (gallery: PetGallery) => PetGallery): void {
-  const current = $petGallery.get()
+function patchGallery(profile: string, fn: (gallery: PetGallery) => PetGallery): void {
+  const key = normalizeProfileKey(profile)
+  const current = $petGalleries.get().get(key)
 
   if (current) {
-    $petGallery.set(fn(current))
+    setGallerySlice(key, fn(current))
   }
 }
 
 /** Shared mutation wrapper: spin, fire, patch on success, surface failures. */
 async function mutate(
+  profile: string,
   busyKey: string,
   fallback: string,
   request: GatewayRequest,
   run: () => Promise<void>
 ): Promise<boolean> {
-  $petBusy.set(busyKey)
-  $petGalleryError.set(null)
+  setBusySlice(profile, busyKey)
+  setErrorSlice(profile, null)
 
   try {
     await run()
-    await syncInfo(request)
+    await syncInfo(request, profile)
 
     return true
   } catch (e) {
     if (isMissingMethod(e)) {
-      $petGalleryStatus.set('stale')
+      setStatusSlice(profile, 'stale')
     } else {
-      $petGalleryError.set(e instanceof Error ? e.message : fallback)
+      setErrorSlice(profile, e instanceof Error ? e.message : fallback)
     }
 
     return false
   } finally {
-    $petBusy.set(null)
+    setBusySlice(profile, null)
   }
 }
 
 /** Install (if needed) + activate a pet. Optimistically marks it active. */
-export function adoptPet(request: GatewayRequest, slug: string, fallback: string): Promise<boolean> {
-  return mutate(slug, fallback, request, async () => {
-    await petRpc(request, 'pet.select', { slug })
-    patchGallery(g => ({
+export function adoptPet(
+  request: GatewayRequest,
+  slug: string,
+  fallback: string,
+  profile: string = petProfile()
+): Promise<boolean> {
+  return mutate(profile, slug, fallback, request, async () => {
+    const rpc = requestFor(profile, request)
+    await petRpc(rpc, profile, 'pet.select', { slug })
+    patchGallery(profile, g => ({
       ...g,
       enabled: true,
       active: slug,
@@ -296,9 +419,10 @@ export function adoptPet(request: GatewayRequest, slug: string, fallback: string
 export function setPetEnabled(
   request: GatewayRequest,
   on: boolean,
-  copy: { noneAvailable: string; fallback: string }
+  copy: { noneAvailable: string; fallback: string },
+  profile: string = petProfile()
 ): Promise<boolean> {
-  const gallery = $petGallery.get()
+  const gallery = $petGalleries.get().get(normalizeProfileKey(profile))
 
   if (!on && !(gallery?.enabled ?? false)) {
     return Promise.resolve(true)
@@ -310,20 +434,22 @@ export function setPetEnabled(
     slug = slug || gallery?.pets.find(p => p.installed)?.slug || ''
 
     if (!slug) {
-      $petGalleryError.set(copy.noneAvailable)
+      setErrorSlice(profile, copy.noneAvailable)
 
       return Promise.resolve(false)
     }
   }
 
-  return mutate(on ? TOGGLE_ON : TOGGLE_OFF, copy.fallback, request, async () => {
+  return mutate(profile, on ? TOGGLE_ON : TOGGLE_OFF, copy.fallback, request, async () => {
+    const rpc = requestFor(profile, request)
+
     if (on) {
-      await petRpc(request, 'pet.select', { slug })
+      await petRpc(rpc, profile, 'pet.select', { slug })
     } else {
-      await petRpc(request, 'pet.disable')
+      await petRpc(rpc, profile, 'pet.disable')
     }
 
-    patchGallery(g => ({ ...g, enabled: on, active: on ? slug : g.active }))
+    patchGallery(profile, g => ({ ...g, enabled: on, active: on ? slug : g.active }))
   })
 }
 
@@ -349,41 +475,58 @@ export function nextScaleFromWheel(current: number | undefined, deltaY: number):
   return clampPetScale(base * Math.exp(-deltaY * WHEEL_SCALE_K))
 }
 
-let scalePersist: ReturnType<typeof setTimeout> | undefined
-
 /**
- * Resize the floating pet. Updates `$petInfo` synchronously so the on-screen pet
- * (and the slider) react on the same frame, then debounce-persists to
- * `display.pet.scale` so a slider drag fires one RPC, not one per pixel. No poll
- * or event needed — the pet already renders from `$petInfo.scale`.
+ * Resize the floating pet. Updates the mascot info synchronously so the on-screen
+ * pet (and the slider) react on the same frame, then debounce-persists to
+ * `display.pet.scale` (per profile) so a slider drag fires one RPC, not one per
+ * pixel. The active profile mirrors into `$petInfo`; a background profile updates
+ * only its `$profilePets` slice.
  */
-export function setPetScale(request: GatewayRequest, scale: number): void {
+export function setPetScale(request: GatewayRequest, scale: number, profile: string = petProfile()): void {
+  const key = normalizeProfileKey(profile)
   const next = clampPetScale(scale)
 
-  setPetInfo({ ...$petInfo.get(), scale: next })
+  applyPetInfo(key, { ...currentInfo(key), scale: next })
 
-  clearTimeout(scalePersist)
-  scalePersist = setTimeout(() => {
-    petRpc<{ ok: boolean; scale?: number }>(request, 'pet.scale', { scale: next })
-      .then(result => {
-        // Reconcile with the server's clamp (cheap; only matters at the bounds).
-        if (typeof result?.scale === 'number' && result.scale !== $petInfo.get().scale) {
-          setPetInfo({ ...$petInfo.get(), scale: result.scale })
-        }
-      })
-      .catch(() => {
-        // Cosmetic — the pet already resized; persistence self-heals next write.
-      })
-  }, 200)
+  const existing = scalePersists.get(key)
+
+  if (existing) {
+    clearTimeout(existing)
+  }
+
+  const rpc = requestFor(key, request)
+
+  scalePersists.set(
+    key,
+    setTimeout(() => {
+      scalePersists.delete(key)
+      petRpc<{ ok: boolean; scale?: number }>(rpc, key, 'pet.scale', { scale: next })
+        .then(result => {
+          // Reconcile with the server's clamp (cheap; only matters at the bounds).
+          if (typeof result?.scale === 'number' && result.scale !== currentInfo(key).scale) {
+            applyPetInfo(key, { ...currentInfo(key), scale: result.scale })
+          }
+        })
+        .catch(() => {
+          // Cosmetic — the pet already resized; persistence self-heals next write.
+        })
+    }, 200)
+  )
 }
 
 /** Export a pet as a `.zip` (pet.json + spritesheet) and save it via the browser. */
-export async function exportPet(request: GatewayRequest, slug: string, fallback: string): Promise<boolean> {
-  $petBusy.set(slug)
-  $petGalleryError.set(null)
+export async function exportPet(
+  request: GatewayRequest,
+  slug: string,
+  fallback: string,
+  profile: string = petProfile()
+): Promise<boolean> {
+  setBusySlice(profile, slug)
+  setErrorSlice(profile, null)
 
   try {
-    const res = await petRpc<{ ok: boolean; filename: string; zipBase64: string }>(request, 'pet.export', { slug })
+    const rpc = requestFor(profile, request)
+    const res = await petRpc<{ ok: boolean; filename: string; zipBase64: string }>(rpc, profile, 'pet.export', { slug })
 
     if (!res?.ok || !res.zipBase64) {
       throw new Error(fallback)
@@ -399,11 +542,11 @@ export async function exportPet(request: GatewayRequest, slug: string, fallback:
 
     return true
   } catch (e) {
-    $petGalleryError.set(e instanceof Error ? e.message : fallback)
+    setErrorSlice(profile, e instanceof Error ? e.message : fallback)
 
     return false
   } finally {
-    $petBusy.set(null)
+    setBusySlice(profile, null)
   }
 }
 
@@ -413,25 +556,33 @@ export async function exportPet(request: GatewayRequest, slug: string, fallback:
  * realigns the slug/dir, so we reconcile the slug + thumb cache when it returns,
  * and roll the name back if it fails.
  */
-export function renamePet(request: GatewayRequest, slug: string, name: string, fallback: string): Promise<boolean> {
+export function renamePet(
+  request: GatewayRequest,
+  slug: string,
+  name: string,
+  fallback: string,
+  profile: string = petProfile()
+): Promise<boolean> {
   const trimmed = name.trim()
 
   if (!trimmed) {
     return Promise.resolve(false)
   }
 
-  const prev = $petGallery.get()?.pets.find(p => p.slug === slug)?.displayName ?? ''
+  const key = normalizeProfileKey(profile)
+  const prev = $petGalleries.get().get(key)?.pets.find(p => p.slug === slug)?.displayName ?? ''
 
   // Optimistic: paint the new name now (slug reconciles when the RPC returns).
-  patchGallery(g => ({
+  patchGallery(key, g => ({
     ...g,
     pets: g.pets.map(p => (p.slug === slug ? { ...p, displayName: trimmed } : p))
   }))
-  $petGalleryError.set(null)
+  setErrorSlice(key, null)
 
   return (async () => {
     try {
-      const res = await petRpc<{ ok: boolean; slug: string; displayName: string }>(request, 'pet.rename', {
+      const rpc = requestFor(key, request)
+      const res = await petRpc<{ ok: boolean; slug: string; displayName: string }>(rpc, key, 'pet.rename', {
         slug,
         name: trimmed
       })
@@ -443,8 +594,8 @@ export function renamePet(request: GatewayRequest, slug: string, name: string, f
       const newSlug = res.slug || slug
 
       if (newSlug !== slug) {
-        thumbCache.delete(slug)
-        patchGallery(g => ({
+        thumbCache.delete(thumbKey(key, slug))
+        patchGallery(key, g => ({
           ...g,
           active: g.active === slug ? newSlug : g.active,
           pets: g.pets
@@ -456,11 +607,11 @@ export function renamePet(request: GatewayRequest, slug: string, name: string, f
       return true
     } catch (e) {
       // Roll the optimistic name back so the list reflects on-disk truth.
-      patchGallery(g => ({
+      patchGallery(key, g => ({
         ...g,
         pets: g.pets.map(p => (p.slug === slug ? { ...p, displayName: prev } : p))
       }))
-      $petGalleryError.set(e instanceof Error ? e.message : fallback)
+      setErrorSlice(key, e instanceof Error ? e.message : fallback)
 
       return false
     }
@@ -468,13 +619,19 @@ export function renamePet(request: GatewayRequest, slug: string, name: string, f
 }
 
 /** Uninstall a pet; turns the mascot off if it was the active one. */
-export function removePet(request: GatewayRequest, slug: string, fallback: string): Promise<boolean> {
-  return mutate(slug, fallback, request, async () => {
-    await petRpc(request, 'pet.remove', { slug })
+export function removePet(
+  request: GatewayRequest,
+  slug: string,
+  fallback: string,
+  profile: string = petProfile()
+): Promise<boolean> {
+  return mutate(profile, slug, fallback, request, async () => {
+    const rpc = requestFor(profile, request)
+    await petRpc(rpc, profile, 'pet.remove', { slug })
     // Evict the by-slug thumb cache so a reused slug doesn't render this pet's
     // stale thumbnail (the backend drops its disk thumb in parallel).
-    thumbCache.delete(slug)
-    patchGallery(g => ({
+    thumbCache.delete(thumbKey(profile, slug))
+    patchGallery(profile, g => ({
       ...g,
       enabled: g.active === slug ? false : g.enabled,
       active: g.active === slug ? '' : g.active,

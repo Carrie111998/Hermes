@@ -21,6 +21,7 @@ import { NotificationStack } from '@/components/notifications'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
 import { $newSessionTabAction } from '@/components/pane-shell/tree/store'
 import { FloatingPet } from '@/components/pet/floating-pet'
+import { usePetRosterReconciliation } from '@/components/pet/use-pet-roster-reconciliation'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
@@ -585,6 +586,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   // The popped-out pet overlay's bridge back into the app.
   usePetBridge({ requestGateway, resumeSession, submitText })
+
+  // Keep the pinned pet roster reconciled with the live profile catalog
+  // (marks deleted/renamed profiles unavailable, releases their leases).
+  usePetRosterReconciliation()
 
   // Clear a failed turn's red error banner. Errors are renderer-local (never
   // persisted): a bare error placeholder is dropped entirely; a partial-output

@@ -34,6 +34,11 @@ export const $activeProfile = atom<string>('default')
 // re-fetches on open so a profile created elsewhere shows up.
 export const $profiles = atom<ProfileInfo[]>([])
 
+// False until refreshProfiles() succeeds at least once. Roster reconciliation
+// gates on this so the initial empty `$profiles` (before the first catalog load)
+// is never mistaken for "every pinned profile was deleted".
+export const $profilesLoaded = atom(false)
+
 export function setActiveProfile(name: string): void {
   $activeProfile.set(name || 'default')
 }
@@ -41,6 +46,7 @@ export function setActiveProfile(name: string): void {
 export async function refreshProfiles(): Promise<ProfileInfo[]> {
   const { profiles } = await getProfiles()
   $profiles.set(profiles)
+  $profilesLoaded.set(true)
 
   return profiles
 }

@@ -1,7 +1,9 @@
 import { atom, computed } from 'nanostores'
 
 import { readJson, writeJson } from '@/lib/storage'
+import { releaseProfileGateway } from '@/store/gateway'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import type { ProfileInfo } from '@/types/hermes'
 
 /**
  * Device-scoped multi-pet visibility roster.
@@ -248,3 +250,62 @@ export const $observedPetProfiles = computed(
 )
 
 export const observedPetProfiles = (): ReadonlySet<string> => $observedPetProfiles.get()
+
+/**
+ * Reconcile the pinned roster against a freshly loaded profile catalog (Layer 7
+ * orphan reconciliation). Pure: callers gate on `$profilesLoaded` so the initial
+ * empty catalog is never treated as "everything was deleted".
+ *
+ * - A pinned entry whose profile is gone from the catalog is marked
+ *   `unavailable` + disabled (and releases its leased socket — once; the entry is
+ *   disabled thereafter so repeat refreshes don't re-release). It stays visible
+ *   as a disabled "not found" row (rename = deletion: the catalog exposes no
+ *   stable id, so a rename looks like delete + a fresh disabled row).
+ * - A previously unavailable entry that reappears clears `unavailable` but is NOT
+ *   auto-enabled (the user opted it out; restoration shouldn't silently re-pin).
+ *
+ * follow-active mode ignores entries entirely, so this is a no-op there.
+ */
+export function reconcilePetRoster(profiles: readonly ProfileInfo[]): void {
+  const roster = $petRoster.get()
+
+  if (roster.mode !== 'pinned') {
+    return
+  }
+
+  const known = new Set(profiles.map(p => normalizeProfileKey(p.name)))
+
+  let changed = false
+
+  const updated = roster.entries.map(entry => {
+    const exists = known.has(normalizeProfileKey(entry.profile))
+
+    if (!exists) {
+      // Release the socket only while it was actively held (enabled + available);
+      // disabling/unavailable-ing it first means a repeat refresh releases once.
+      if (entry.enabled && !entry.unavailable) {
+        releaseProfileGateway(entry.profile)
+      }
+
+      if (!entry.unavailable || entry.enabled) {
+        changed = true
+
+        return { ...entry, enabled: false, unavailable: true }
+      }
+
+      return entry
+    }
+
+    if (entry.unavailable) {
+      changed = true
+
+      return { ...entry, unavailable: false }
+    }
+
+    return entry
+  })
+
+  if (changed) {
+    commit({ ...roster, entries: updated })
+  }
+}
