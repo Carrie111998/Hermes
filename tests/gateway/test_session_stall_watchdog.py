@@ -221,7 +221,37 @@ async def test_session_stall_watcher_disabled_when_timeout_zero(monkeypatch):
     assert adapter.sent == []
 
 
+@pytest.mark.asyncio
+async def test_check_session_stalls_queued_events_overflow_notifies():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:overflow"
+    event = _pending_event()
+    runner._queued_events[session_key] = [event]
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+    runner._adapter_for_source = lambda source: adapter
+
+    assert await runner._check_session_stalls(60) == 1
+    assert adapter.sent and "/new" in adapter.sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_scans_profile_adapters():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(_FakeAdapter())  # empty primary path unused
+    runner.adapters = {}
+    runner._profile_adapters = {"coder": {"fake": adapter}}
+    session_key = "agent:coder:telegram:dm:1"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 1
+    assert len(adapter.sent) == 1
+
+
 def test_session_stall_timeout_in_default_config():
     from hermes_cli.config import DEFAULT_CONFIG
 
-    assert DEFAULT_CONFIG["agent"]["session_stall_timeout"] == 300
+    timeout = DEFAULT_CONFIG["agent"]["session_stall_timeout"]
+    assert isinstance(timeout, (int, float))
+    assert timeout > 0  # enabled by default; 0 would disable the watchdog

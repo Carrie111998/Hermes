@@ -9182,17 +9182,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 seen.add(aid)
                 yield adapter
 
-    def _pending_inbound_for_session(self, session_key: str, adapter: Any):
-        """Return the head pending MessageEvent for ``session_key``, if any."""
-        pending_slot = getattr(adapter, "_pending_messages", None) or {}
-        event = pending_slot.get(session_key)
-        if event is not None:
-            return event
-        overflow = (getattr(self, "_queued_events", None) or {}).get(session_key) or []
-        if overflow:
-            return overflow[0]
-        return None
-
     def _session_idle_seconds_for_stall(
         self, session_key: str, pending_event: Any, *, now: Optional[float] = None
     ) -> Optional[float]:
