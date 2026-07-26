@@ -3617,17 +3617,6 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
-            "model": {
-                "type": "string",
-                "description": (
-                    "Optional. Model identifier to run the subagent on, e.g. "
-                    "'anthropic/claude-fable-5'. Omit to use the configured "
-                    "delegation default. The model must be available on the "
-                    "configured delegation provider -- if the user names a "
-                    "model, verify it exists on that provider before "
-                    "dispatching rather than silently falling back."
-                ),
-            },
             "background": {
                 "type": "boolean",
                 "description": (
@@ -3699,7 +3688,6 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
-        model=args.get("model"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
