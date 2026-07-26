@@ -22,6 +22,7 @@ from .postgres import create_database
 from .storage import create_storage
 from .agent_service import AgentRunService, StubRunExecutor
 from .chat_bridge import ChatBridge
+from .scheduler import DailyDigestScheduler
 from .lead_research import LeadResearchService
 from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, oauth, research_campaigns, sales_intelligence, unsubscribe
 
@@ -37,10 +38,21 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     run_service = AgentRunService(database, run_executor)
     chat_service = (ChatBridge(database, settings, run_service, agent_factory=chat_agent_factory)
                     if settings.chat_enabled else None)
+    # Always constructed so tests and the CLI can drive tick() directly; only
+    # the background thread is gated on the setting.
+    digest_scheduler = DailyDigestScheduler(
+        database,
+        plan_hour=settings.digest_plan_hour,
+        report_hour=settings.digest_report_hour,
+        interval_seconds=settings.scheduler_interval_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        if settings.scheduler_enabled:
+            digest_scheduler.start()
         yield
+        digest_scheduler.shutdown()
         if chat_service:
             chat_service.shutdown()
         run_service.pool.shutdown(wait=False, cancel_futures=True)
@@ -59,6 +71,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.state.auth = service
     app.state.runs = run_service
     app.state.chat = chat_service
+    app.state.scheduler = digest_scheduler
     app.state.cipher = CredentialCipher(settings.credential_key)
     app.state.outreach = OutreachService(
         database, app.state.cipher,

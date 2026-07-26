@@ -2,7 +2,6 @@
 
 import {
   el, pageHead, emptyState, button, toast, isApprovalActionable, QA_LABELS,
-  markMessageSuperseded,
 } from '../ui.js';
 import { call } from '../api.js';
 import { db } from '../mocks/db.js';
@@ -489,9 +488,8 @@ export async function mount(root, ctx) {
         }
         replacementId = completed.output_ref || message.id;
       }
-      if (replacementId !== message.id) {
-        markMessageSuperseded(message.id);
-      }
+      // The server retires the original as part of the rewrite run, so simply
+      // refetching gives the queue the correct state.
       await call('messages.list');
       busy = false;
       editing = false;

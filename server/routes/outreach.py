@@ -162,7 +162,8 @@ def delete_campaign(campaign_id: str, request: Request,
 
 
 def _generation_run(company_id: str, request: Request, *, lead_id: str, contact_id: str,
-                    campaign_id: str | None = None, channel: str = "email", language: str = "en"):
+                    campaign_id: str | None = None, channel: str = "email", language: str = "en",
+                    supersedes_message_id: str | None = None):
     lead = request.app.state.db.one("SELECT * FROM leads WHERE id=? AND company_id=?", (lead_id, company_id))
     contact = request.app.state.db.one("SELECT * FROM contacts WHERE id=? AND company_id=?", (contact_id, company_id))
     if not lead or not contact:
@@ -182,6 +183,8 @@ def _generation_run(company_id: str, request: Request, *, lead_id: str, contact_
         "draft_content": {"to": to, "cc": cc, "language": language,
                           "subject": subject, "body": body},
     }
+    if supersedes_message_id:
+        payload["supersedes_message_id"] = supersedes_message_id
     run = request.app.state.runs.create(company_id, "outreach_generation", payload)
     return request.app.state.runs.start(company_id, run["id"])
 
@@ -356,9 +359,13 @@ def regenerate_message(message_id: str, request: Request,
                        x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
     message = get_message(message_id, request, principal, x_company_id)
+    # Record which message this rewrite replaces so the run can retire the
+    # original once the replacement exists. Without this the queue would show
+    # both, and the frontend would have to guess which one is current.
     return _generation_run(company_id, request, lead_id=message["lead_id"], contact_id=message["contact_id"],
                            campaign_id=message["campaign_id"], channel=message["channel"],
-                           language=message["content"].get("language", "en"))
+                           language=message["content"].get("language", "en"),
+                           supersedes_message_id=message_id)
 
 
 @router.post("/outreach/messages/{message_id}/approve")

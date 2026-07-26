@@ -1085,14 +1085,31 @@ export const handlers = {
     const m = findOr404(db.messages, params.messageId, 'Message');
     const lead = db.leads.find(l => l.id === m.lead_id);
     const contact = db.contacts.find(c => c.id === m.contact_id);
-    if (lead) {
-      const email = generateEmail({ lead, contact, product: db.products[Math.floor(Math.random() * db.products.length)], language: m.language });
-      m.subject = email.subject;
-      m.body = email.body;
-      m.status = 'draft_generated';
+    if (!lead) {
+      emit('messages', m);
+      return m;
     }
-    emit('messages', m);
-    return m;
+    // Mirror the real contract: a rewrite creates a replacement and retires the
+    // original via superseded_by, rather than editing the message in place.
+    const email = generateEmail({
+      lead,
+      contact,
+      product: db.products[Math.floor(Math.random() * db.products.length)],
+      language: m.language,
+    });
+    const replacement = {
+      ...m,
+      id: id('msg'),
+      subject: email.subject,
+      body: email.body,
+      status: 'draft_generated',
+      superseded_by: null,
+      created_at: new Date().toISOString(),
+    };
+    m.superseded_by = replacement.id;
+    db.messages.push(replacement);
+    emit('messages', replacement);
+    return replacement;
   },
   'messages.approve': ({ params }) => {
     const m = findOr404(db.messages, params.messageId, 'Message');
@@ -1386,7 +1403,20 @@ export const handlers = {
   'dataSources.disable': ({ params }) => setSourceState(params.sourceId, { enabled: false }),
 
   /* ---------- activity ---------- */
-  'activity.list': ({ query }) => listOf(db.activity.slice(0, query.limit ? Number(query.limit) : 50)),
+  'activity.list': ({ query }) => {
+    let items = db.activity;
+    if (query.since) items = items.filter(a => new Date(a.at || a.created_at || 0).getTime() / 1000 >= Number(query.since));
+    return listOf(items.slice(0, query.limit ? Number(query.limit) : 50));
+  },
+  // Mock mode has no scheduler, so no digest was ever assembled. Returning empty
+  // digests is the honest answer: Today falls back to its retrospective picture
+  // rather than claiming overnight work happened.
+  'activity.digest': ({ query }) => ({
+    date: query.date || new Date().toISOString().slice(0, 10),
+    scheduled: false,
+    plan: null,
+    report: null,
+  }),
   'activity.get': ({ params }) => findOr404(db.activity, params.activityId, 'Activity'),
   'activity.forLead': ({ params }) => listOf(collectLeadActivity(params.leadId)),
   'activity.forContact': ({ params }) => {

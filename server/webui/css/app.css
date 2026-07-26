@@ -2914,6 +2914,14 @@ h1, h2, h3, h4, p { margin: 0; }
   font-size: var(--fs-xs);
   line-height: 1.5;
 }
+/* Start sits beside Stop while work is in flight; alone otherwise. */
+.ifz-today-action-buttons {
+  display: flex;
+  gap: var(--space-2);
+}
+.ifz-today-action-buttons .ifz-btn {
+  flex: 1 1 auto;
+}
 .ifz-today-next {
   display: grid;
   grid-template-columns: minmax(90px, .22fr) minmax(0, 1fr);
@@ -2929,6 +2937,16 @@ h1, h2, h3, h4, p { margin: 0; }
   max-width: 70ch;
   color: var(--text-strong);
   font-size: var(--fs-md);
+}
+/* A run that failed or was stopped keeps its recovery action in the same column
+   as the sentence it belongs to. */
+.ifz-today-next > .ifz-btn {
+  grid-column: 2;
+  justify-self: start;
+  margin-top: var(--space-1);
+}
+.ifz-today-next.needs-attention p {
+  color: var(--warning);
 }
 .ifz-today-summary {
   display: flex;
@@ -3136,6 +3154,9 @@ h1, h2, h3, h4, p { margin: 0; }
   .ifz-today-next {
     grid-template-columns: 1fr;
     gap: 7px;
+  }
+  .ifz-today-next > .ifz-btn {
+    grid-column: 1;
   }
   .ifz-today-summary {
     align-items: flex-start;

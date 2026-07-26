@@ -1,8 +1,7 @@
 /* App chrome: sidebar + topbar. Mounted once; pages render into shell.pageRoot. */
 
 import {
-  el, icon, button, input, isApprovalActionable, MESSAGE_SUPERSESSION_EVENT,
-  runSentence,
+  el, icon, button, input, isApprovalActionable, runSentence,
 } from './ui.js';
 import { navigate } from './router.js';
 import { call, config } from './api.js';
@@ -174,7 +173,6 @@ export function mountShell(root) {
     setApprovalBadge(event.detail?.count);
   };
   document.addEventListener('ifz:approval-count', onApprovalCount);
-  document.addEventListener(MESSAGE_SUPERSESSION_EVENT, refreshApprovalBadge);
   refreshApprovalBadge();
   if (!isAdmin || session?.company?.id) {
     Promise.allSettled([
@@ -557,7 +555,6 @@ export function mountShell(root) {
       unsubscribeApprovalBadges.forEach(unsubscribe => unsubscribe());
       unsubscribeCompany();
       document.removeEventListener('ifz:approval-count', onApprovalCount);
-      document.removeEventListener(MESSAGE_SUPERSESSION_EVENT, refreshApprovalBadge);
       document.removeEventListener('keydown', onShellKeydown);
       mq.removeEventListener?.('change', onMq);
       closeAsk({ restoreFocus: false });

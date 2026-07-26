@@ -76,6 +76,43 @@ function activitySentence(activity) {
   return 'The workspace was updated.';
 }
 
+/* The daily-rhythm briefing, used only when the scheduler actually assembled
+   one. Without it the copy would claim work happened overnight that never did,
+   so the retrospective picture below stays the honest default. */
+function digestBriefing(digest, waiting) {
+  const report = digest?.report;
+  const plan = digest?.plan;
+  if (!report && !plan) return '';
+
+  if (report) {
+    const found = Number(report.buyers_found) || 0;
+    const written = Number(report.emails_written) || 0;
+    const replies = Number(report.replies) || 0;
+    const done = [];
+    if (found) done.push(`found ${plural(found, 'company')} worth approaching`);
+    if (written) done.push(`wrote ${plural(written, 'email')}`);
+    if (replies) done.push(`recorded ${plural(replies, 'reply', 'replies')}`);
+    const opening = done.length
+      ? `Since yesterday I ${listPhrase(done)}.`
+      : 'Since yesterday there was nothing new to report.';
+    const unfinished = Number(report.unfinished) || 0;
+    const tail = unfinished
+      ? ` ${unfinished === 1 ? 'One piece of work' : `${fmt.num(unfinished)} pieces of work`} didn't finish.`
+      : '';
+    const needs = waiting
+      ? ` ${plural(waiting, 'email')} ${waiting === 1 ? 'is' : 'are'} waiting for you.`
+      : '';
+    return `${opening}${tail}${needs}`;
+  }
+
+  const markets = (plan.markets || []).map(code => COUNTRY_NAMES[code] || code);
+  const scope = markets.length ? ` through ${listPhrase(markets)}` : '';
+  const needs = waiting
+    ? ` ${plural(waiting, 'email')} ${waiting === 1 ? 'is' : 'are'} waiting for you first.`
+    : '';
+  return `Today I plan to look${scope} for new buyers.${needs}`;
+}
+
 function currentPicture(summary, waiting) {
   const sales = summary?.sales || {};
   const buyers = Number(sales.leads_found) || 0;
@@ -123,12 +160,16 @@ export async function mount(root, ctx) {
   let summary = null;
   let activities = [];
   let health = null;
+  let digest = null;
   let mailboxConnected = false;
   let mailboxKnown = false;
   let work = {
     busy: false,
     sentence: '',
     tone: 'info',
+    runId: null,      // the run a Stop press should cancel
+    stopping: false,  // Stop pressed, cancellation in flight
+    stopped: false,   // the chain must unwind at its next checkpoint
   };
 
   async function refreshData() {
@@ -143,6 +184,9 @@ export async function mount(root, ctx) {
       call('onboarding.status'),
       call('emailIntegrations.list').catch(() => null),
       hermesApi('/health').catch(() => null),
+      // Only read what the scheduler already wrote — never refresh=true here,
+      // or the page would manufacture a briefing about work that never ran.
+      call('activity.digest').catch(() => null),
     ]);
     if (disposed) return;
     summary = results[0];
@@ -155,6 +199,7 @@ export async function mount(root, ctx) {
     mailboxConnected = Boolean(integrations?.items?.some(integration =>
       ['active', 'connected', 'verified'].includes(integration.status)));
     health = results[9];
+    digest = results[10];
   }
 
   function updateWork(run) {
@@ -166,13 +211,39 @@ export async function mount(root, ctx) {
   }
 
   async function finishRun(run) {
-    const completed = await waitForRun(run, {
-      timeoutMs: 120000,
-      intervalMs: 800,
-      onUpdate: updateWork,
-    });
-    if (!TERMINAL_OK.has(completed?.status)) throw new Error('work_failed');
-    return completed;
+    // Remember which run is in flight so Stop has something to cancel.
+    work.runId = typeof run === 'string' ? run : run?.run_id || run?.id || null;
+    try {
+      const completed = await waitForRun(run, {
+        timeoutMs: 120000,
+        intervalMs: 800,
+        onUpdate: updateWork,
+      });
+      if (completed?.status === 'cancelled' || work.stopped) throw new Error('work_stopped');
+      if (!TERMINAL_OK.has(completed?.status)) throw new Error('work_failed');
+      return completed;
+    } finally {
+      work.runId = null;
+    }
+  }
+
+  /* Stop is a control, not a log: cancel the run that is actually in flight and
+     let the chain unwind at its next checkpoint. Nothing is ever sent by this
+     work, so stopping is always safe. */
+  async function stopTodayWork() {
+    if (!work.busy || work.stopping) return;
+    const runId = work.runId;
+    work = { ...work, stopping: true, stopped: true, sentence: 'Stopping…', tone: 'warning' };
+    render();
+    try {
+      if (runId) await call('agentRuns.cancel', { params: { runId } });
+    } catch {
+      // Already finished or not cancellable — the chain still unwinds below.
+    }
+  }
+
+  function checkStopped() {
+    if (work.stopped) throw new Error('work_stopped');
   }
 
   async function startTodayWork() {
@@ -188,6 +259,9 @@ export async function mount(root, ctx) {
       busy: true,
       tone: 'info',
       sentence: 'Getting the buyer search ready.',
+      runId: null,
+      stopping: false,
+      stopped: false,
     };
     render();
 
@@ -224,8 +298,10 @@ export async function mount(root, ctx) {
         return;
       }
 
+      checkStopped();
       const shortlist = buyers.slice(0, MAX_EMAILS_PER_SEARCH);
       work = {
+        ...work,
         busy: true,
         tone: 'info',
         sentence: `Learning enough about ${plural(shortlist.length, 'buyer')} to write useful emails.`,
@@ -236,7 +312,9 @@ export async function mount(root, ctx) {
         await finishRun(run);
       }));
 
+      checkStopped();
       work = {
+        ...work,
         busy: true,
         tone: 'info',
         sentence: 'Looking for the right person at each company.',
@@ -268,7 +346,9 @@ export async function mount(root, ctx) {
         return;
       }
 
+      checkStopped();
       work = {
+        ...work,
         busy: true,
         tone: 'info',
         sentence: `Writing ${plural(reachable.length, 'email')} for your review.`,
@@ -301,6 +381,9 @@ export async function mount(root, ctx) {
       const waiting = reviewCount();
       work = {
         busy: false,
+        runId: null,
+        stopping: false,
+        stopped: false,
         tone: waiting ? 'success' : 'warning',
         sentence: waiting
           ? `${plural(waiting, 'email')} ${waiting === 1 ? 'is' : 'are'} ready for your review. Nothing was sent.`
@@ -310,12 +393,18 @@ export async function mount(root, ctx) {
     } catch (error) {
       if (disposed) return;
       await refreshData().catch(() => {});
+      const wasStopped = work.stopped || error?.message === 'work_stopped';
       work = {
         busy: false,
-        tone: 'error',
-        sentence: error?.status === 409
-          ? 'This work is blocked by one of your Setup rules. Review your target markets and try again.'
-          : "I couldn't finish this work. Anything already completed is still saved, and nothing was sent.",
+        runId: null,
+        stopping: false,
+        stopped: false,
+        tone: wasStopped ? 'warning' : 'error',
+        sentence: wasStopped
+          ? 'Stopped. Anything already found is saved, and nothing was sent.'
+          : error?.status === 409
+            ? 'This work is blocked by one of your Setup rules. Review your target markets and try again.'
+            : "I couldn't finish this work. Anything already completed is still saved, and nothing was sent.",
       };
       render();
     }
@@ -348,12 +437,37 @@ export async function mount(root, ctx) {
       title: canRun ? null : 'Buyer search is not available in this workspace yet',
     });
     action.setAttribute('aria-busy', work.busy ? 'true' : 'false');
+    // While work is in flight the user keeps control: stopping is always safe
+    // because this chain never sends anything.
+    const stop = work.busy
+      ? button(work.stopping ? 'Stopping…' : 'Stop', {
+          icon: work.stopping ? null : 'ban',
+          disabled: work.stopping,
+          onClick: stopTodayWork,
+        })
+      : null;
     return el('div', { class: 'ifz-today-action-control' },
-      action,
+      el('div', { class: 'ifz-today-action-buttons' }, action, stop),
       el('span', {}, countries.length ? listPhrase(countries) : 'Choose target markets in Setup'),
       el('small', {}, canRun
         ? 'I will find buyers, research the strongest matches, and write up to six emails for review. Nothing will be sent.'
         : 'Buyer search is not available in this workspace yet. Your existing buyers and drafts are still available.'));
+  }
+
+  /* The durable answer to "is it working?". In-page state wins while the user is
+     here; otherwise fall back to what the server recorded, so live work and a
+     failed or stopped run are both still visible after a reload. */
+  function lastOutcome() {
+    if (work.sentence) return { sentence: '', retry: false };
+    const runs = (db.agentRuns || []).slice().sort((a, b) =>
+      new Date(b.finished_at || b.created_at || 0) - new Date(a.finished_at || a.created_at || 0));
+    const live = runs.find(run => run.status === 'running' || run.status === 'queued');
+    if (live) return { sentence: runSentence(live), retry: false, live: true };
+    const latest = runs[0];
+    if (latest && ['failed', 'cancelled'].includes(latest.status)) {
+      return { sentence: runSentence(latest), retry: true, live: false };
+    }
+    return { sentence: '', retry: false, live: false };
   }
 
   function render() {
@@ -371,12 +485,11 @@ export async function mount(root, ctx) {
       return;
     }
 
-    const running = (db.agentRuns || []).find(run => run.status === 'running');
-    const nextSentence = running
-      ? runSentence(running)
-      : workCapability(health)
+    const outcome = lastOutcome();
+    const nextSentence = outcome.sentence
+      || (workCapability(health)
         ? 'Nothing runs automatically yet. Start the next buyer search when you are ready.'
-        : 'Nothing runs automatically in this workspace. Existing buyers and drafts remain available.';
+        : 'Nothing runs automatically in this workspace. Existing buyers and drafts remain available.');
 
     const mapHost = el('div', {
       class: 'ifz-today-map ifz-minimap',
@@ -443,7 +556,7 @@ export async function mount(root, ctx) {
       el('header', { class: 'ifz-today-hero' },
         el('span', { class: 'ifz-today-kicker' }, 'Today'),
         el('h1', {}, greeting()),
-        el('p', {}, currentPicture(summary, waiting))),
+        el('p', {}, digestBriefing(digest, waiting) || currentPicture(summary, waiting))),
       reviewPrompt,
       workNotice,
       el('div', { class: 'ifz-today-grid' },
@@ -464,9 +577,18 @@ export async function mount(root, ctx) {
                 onClick: () => ctx.navigate('/app/setup?section=markets'),
               }),
           countries.length ? mapHost : null)),
-      el('section', { class: 'ifz-today-next' },
-        el('span', { class: 'ifz-today-kicker' }, 'Next'),
-        el('p', {}, nextSentence)),
+      el('section', { class: `ifz-today-next${outcome.retry ? ' needs-attention' : ''}` },
+        el('span', { class: 'ifz-today-kicker' }, outcome.live ? 'Happening now' : 'Next'),
+        el('p', { role: outcome.retry ? 'status' : null }, nextSentence),
+        // A run that failed or was stopped stays visible after a reload, with the
+        // one action that resolves it.
+        outcome.retry
+          ? button('Try again', {
+              icon: 'refresh',
+              disabled: work.busy || !workCapability(health),
+              onClick: startTodayWork,
+            })
+          : null),
       el('footer', { class: 'ifz-today-summary' },
         el('span', {}, summaryLine),
         button('See the numbers', {

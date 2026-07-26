@@ -56,6 +56,14 @@ class Settings:
     microsoft_oauth_client_id: str = ""
     microsoft_oauth_client_secret: str = ""
     microsoft_oauth_tenant: str = "common"
+    # Daily rhythm. The agent assembles a plan each morning and a report each
+    # evening so the operator opens the app to a briefing rather than a control
+    # panel (company-packs/silverline/business-rules.md:17-19). Off by default:
+    # a background loop that writes tenant rows must be switched on knowingly.
+    scheduler_enabled: bool = False
+    digest_plan_hour: int = 8
+    digest_report_hour: int = 18
+    scheduler_interval_seconds: int = 300
 
     @classmethod
     def load(cls) -> "Settings":
@@ -97,4 +105,8 @@ class Settings:
             microsoft_oauth_client_id=os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", ""),
             microsoft_oauth_client_secret=os.environ.get("MICROSOFT_OAUTH_CLIENT_SECRET", ""),
             microsoft_oauth_tenant=os.environ.get("MICROSOFT_OAUTH_TENANT", "common"),
+            scheduler_enabled=bool(cfg.get("scheduler_enabled")),
+            digest_plan_hour=min(23, max(0, int(cfg.get("digest_plan_hour", 8)))),
+            digest_report_hour=min(23, max(0, int(cfg.get("digest_report_hour", 18)))),
+            scheduler_interval_seconds=max(30, int(cfg.get("scheduler_interval_seconds", 300))),
         )

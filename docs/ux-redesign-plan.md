@@ -1,8 +1,8 @@
 # interfaze-agent — UX collapse: 15 destinations → 4
 
 **Applies to:** `server/webui`
-**Status:** frontend complete — Phases 0–5 implemented and verified. Only the
-backend scheduler track remains.
+**Status:** complete — Phases 0–6 implemented and verified. The daily rhythm ships
+switched off; enable `scheduler_enabled` to activate it.
 **Companion document:** [`ux-redesign-proposal.html`](./ux-redesign-proposal.html) — open in a browser
 **Related:** [`research-page-UI-guidelines.md`](./research-page-UI-guidelines.md)
 
@@ -10,9 +10,10 @@ backend scheduler track remains.
 
 ## 0. Implementation status — 26 July 2026
 
-Phases 0–5 are implemented in `server/webui`. The work preserved the vanilla-ES-module
-stack and the existing `api.js` → `adapters.js` → `real-state.js` boundary. The customer
-navigation is now the four destinations the plan called for.
+Phases 0–6 are implemented. Phases 0–5 preserved the vanilla-ES-module stack and the
+existing `api.js` → `adapters.js` → `real-state.js` boundary, and left the customer
+navigation at the four destinations this plan called for. Phase 6 closed the control
+gap that the cutover exposed and delivered the backend daily-rhythm track.
 
 ### Completed
 
@@ -119,6 +120,39 @@ navigation is now the four destinations the plan called for.
     menu, the Approvals mailbox prompts, and the Analytics map link. Removed the
     Analytics "Watch" toast that navigated into the run-log viewer.
 
+- **Phase 6 control, supersession and the daily rhythm**
+  - **Stop.** Moving the run viewer to admin had taken away the customer's only
+    cancel control. Today now has a **Stop** button while work is in flight: it
+    cancels the run actually running and unwinds the chain at its next
+    checkpoint, reporting *"Stopped. Anything already found is saved, and nothing
+    was sent."* Stopping is always safe because this chain never delivers.
+  - **Failures survive a reload.** Today previously only looked for *running*
+    runs, so a failed run fell through to "Nothing runs automatically yet" — the
+    user pressed a button, it failed, and the page said nothing happened. The
+    status now falls back to the last recorded outcome and offers **Try again**.
+  - **Message supersession is server-side.** `outreach_messages.superseded_by`
+    (SQLite + supabase migration `006`) records what replaced a rewritten
+    message. Only `pending_approval`/`qa_failed` messages are retired, and only
+    once the replacement exists, so a failed rewrite leaves the original
+    reviewable and delivered history is never rewritten. The browser-storage
+    workaround is deleted — the queue no longer disagrees across devices.
+  - **`since` on the activity feed** (`GET /activity?since=`), plus an index on
+    `activity_log(company_id, created_at DESC)`.
+  - **Daily digests.** `daily_digests` stores one plan and one report per tenant
+    per day; `GET /activity/digest` serves them. Digests are stored rather than
+    recomputed so a briefing cannot change under the reader, and writes are
+    idempotent on `UNIQUE(company_id, digest_date, kind)`.
+  - **Scheduler.** `server/scheduler.py` runs one daemon thread that writes any
+    digest whose hour has passed. Deliberately dependency-free: `pyproject.toml`
+    pins every dependency exactly and argues for a small blast radius, which a
+    single idempotent timer does not justify overriding. Off by default
+    (`scheduler_enabled`), and it only ever writes digests — it never starts runs
+    and never sends anything.
+  - **Today reads the digest but never manufactures one.** It calls
+    `activity.digest` without `refresh`, so daily-rhythm copy appears only when
+    the scheduler genuinely assembled a briefing; otherwise the honest
+    retrospective picture stays.
+
 ### Verified
 
 - Playwright CLI against real Chrome and the seeded local API:
@@ -155,17 +189,29 @@ navigation is now the four destinations the plan called for.
   `test_run_harness.py::test_stub_dispatch_and_events`, is a pre-existing race in the
   stub executor's event recording — it passes 3/3 in isolation and is unrelated to this
   work.
+- Phase 6 is covered by `tests/server/test_daily_rhythm.py` (8 checks): a digest is
+  written once and never rewritten; a report counts business facts and leaks no run id,
+  run type, progress or log text; the scheduler writes only what is due and is
+  idempotent across ticks; the endpoint reports `scheduled: false` and empty digests
+  rather than inventing a briefing; `since` bounds the feed and rejects a negative;
+  a rewrite supersedes its original server-side; and a **sent** message is never
+  retired by a rewrite.
+- Full `tests/server` suite: `100` passed, 0 failed.
 - All `35` WebUI JavaScript modules pass `node --check`; no surviving module links to a
   removed route.
 - `git diff --check` passes.
 
 ### Still pending
 
-Only the backend track. There is still no scheduler and no message-supersession
-contract, so daily-rhythm copy remains disabled — Today ships the honest retrospective
-briefing with a manual "Find buyers and write to them" action — and regenerated
-originals are suppressed by the frontend until the backend can persist that
-relationship. See the parallel track in §5.
+Nothing in this plan. Two deliberate follow-ups remain:
+
+- **Turn the scheduler on.** It ships off (`scheduler_enabled: false`) because a
+  background loop that writes tenant rows should be switched on knowingly. Set
+  it, with `digest_plan_hour` / `digest_report_hour`, and Today's daily-rhythm
+  copy activates on its own.
+- **Email the digest.** The plan and report exist and are served over the API,
+  but nothing mails them yet, so "the operator gets a notification each morning"
+  is still only true inside the app.
 
 ---
 

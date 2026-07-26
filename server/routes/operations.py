@@ -4,12 +4,13 @@ import csv
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal, require_admin
 from ..db import json_dump, json_load, new_id, now
+from ..digest import KINDS, day_bounds, day_key, get_digest, write_digest
 
 
 router = APIRouter(tags=["operations"])
@@ -581,8 +582,44 @@ def _activities(request: Request, company_id: str, clause: str = "", params: tup
 
 @router.get("/activity")
 def activity(request: Request, principal: Principal = Depends(current_principal),
-             x_company_id: str | None = Header(default=None)):
-    return _activities(request, _scope(principal, x_company_id))
+             x_company_id: str | None = Header(default=None),
+             since: float | None = Query(default=None, ge=0)):
+    """`since` is an epoch seconds lower bound, so a briefing can ask for
+    "what changed since yesterday" instead of pulling 500 rows and filtering
+    client-side."""
+    company_id = _scope(principal, x_company_id)
+    if since is None:
+        return _activities(request, company_id)
+    return _activities(request, company_id, "AND created_at>=?", (float(since),))
+
+
+# Declared before /activity/{activity_id}: FastAPI matches in declaration order,
+# so a literal path registered after the parameterised one would never be hit.
+@router.get("/activity/digest")
+def activity_digest(request: Request, principal: Principal = Depends(current_principal),
+                    x_company_id: str | None = Header(default=None),
+                    date: str | None = Query(default=None),
+                    refresh: bool = Query(default=False)):
+    """The day's plan and report.
+
+    Returns whatever the scheduler has written. `refresh=true` assembles a
+    missing digest on demand so a workspace with the scheduler switched off can
+    still show a briefing — it never overwrites one already written.
+    """
+    company_id = _scope(principal, x_company_id)
+    day = date or day_key()
+    try:
+        day_bounds(day)
+    except ValueError:
+        raise HTTPException(422, "date must be YYYY-MM-DD")
+    db = request.app.state.db
+    result = {"date": day, "scheduled": bool(request.app.state.settings.scheduler_enabled)}
+    for kind in KINDS:
+        digest = get_digest(db, company_id, day, kind)
+        if digest is None and refresh:
+            digest = write_digest(db, company_id, day, kind)
+        result[kind] = digest
+    return result
 
 
 @router.get("/activity/{activity_id}")

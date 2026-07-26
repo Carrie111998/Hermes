@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS outreach_messages (
     content_hash TEXT NOT NULL, content TEXT NOT NULL, approval_hash TEXT, approved_by TEXT REFERENCES users(id),
     approved_at REAL, provider_message_id TEXT, sent_at REAL, replied_at REAL, bounced_at REAL,
     idempotency_key TEXT, data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    -- Set when a rewrite replaces this message: points at the message that took
+    -- its place, so the approval queue can hide the original without guessing.
+    superseded_by TEXT REFERENCES outreach_messages(id),
     UNIQUE(company_id, idempotency_key)
 );
 CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -142,6 +145,17 @@ CREATE TABLE IF NOT EXISTS exports (
 CREATE TABLE IF NOT EXISTS activity_log (
     id TEXT PRIMARY KEY, company_id TEXT, actor_id TEXT, action TEXT NOT NULL,
     entity_type TEXT, entity_id TEXT, data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS activity_log_company_time_idx ON activity_log(company_id, created_at DESC);
+-- Daily rhythm: a plan each morning, a report each evening. Stored rather than
+-- recomputed so the briefing an operator read is exactly the one that was
+-- assembled at the time, and so a late read still shows the whole day.
+CREATE TABLE IF NOT EXISTS daily_digests (
+    id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+    digest_date TEXT NOT NULL,  -- YYYY-MM-DD, the tenant's day
+    kind TEXT NOT NULL,         -- 'plan' (morning) | 'report' (evening)
+    data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL,
+    UNIQUE(company_id, digest_date, kind)
 );
 CREATE TABLE IF NOT EXISTS agent_runs (
     id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), run_type TEXT NOT NULL,
@@ -180,6 +194,14 @@ from .lead_research.schema import SCHEMA as LEAD_RESEARCH_SCHEMA
 SCHEMA = SCHEMA + "\n" + LEAD_RESEARCH_SCHEMA
 
 
+# (table, column, declaration) applied on boot when the column is absent.
+# SQLite requires an added column to be nullable with no UNIQUE/PRIMARY KEY, so
+# every entry here must default to NULL.
+COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("outreach_messages", "superseded_by", "TEXT REFERENCES outreach_messages(id)"),
+)
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:20]}"
 
@@ -216,6 +238,14 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            # SCHEMA uses CREATE TABLE IF NOT EXISTS, so an existing database never
+            # picks up a new column. These additive migrations close that gap.
+            # Additive only, never destructive, and safe to re-run on every boot.
+            for table, column, decl in COLUMN_MIGRATIONS:
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            conn.commit()
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

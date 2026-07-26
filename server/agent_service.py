@@ -589,6 +589,18 @@ class AgentRunService:
                  content_hash(content), json_dump(content), json_dump({"qa_verdict": verdict}), stamp, stamp),
             )
             self.db.execute("UPDATE agent_runs SET output_ref=? WHERE id=?", (message_id, run["id"]))
+            # A rewrite retires the message it replaced, but only once the
+            # replacement exists — a failed rewrite must leave the original
+            # reviewable. Scoped by company_id, and only for messages that have
+            # not been approved or delivered, so history is never rewritten.
+            superseded = payload.get("supersedes_message_id")
+            if superseded and superseded != message_id:
+                self.db.execute(
+                    "UPDATE outreach_messages SET superseded_by=?,updated_at=? "
+                    "WHERE id=? AND company_id=? AND superseded_by IS NULL "
+                    "AND status IN ('pending_approval','qa_failed')",
+                    (message_id, stamp, superseded, company_id),
+                )
         elif run_type == "linkedin_note_generation":
             action_id = new_id("li")
             self.db.execute(

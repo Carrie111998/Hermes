@@ -191,69 +191,15 @@ export const APPROVAL_STATUSES = Object.freeze([
   'approved',
 ]);
 
-export const MESSAGE_SUPERSESSION_EVENT = 'ifz:message-superseded';
-const SUPERSEDED_MESSAGES_KEY = 'ifz.approvals.superseded-message-ids.v1';
-let supersededMessageIds = null;
-
-function messageIdOf(messageOrId) {
-  const value = typeof messageOrId === 'object' ? messageOrId?.id : messageOrId;
-  return value == null || value === '' ? null : String(value);
+/* A rewrite retires the message it replaced. The backend owns that relationship
+   on outreach_messages.superseded_by (see supabase migration 006), so the queue
+   agrees with itself across devices and survives a cleared browser store —
+   which the previous localStorage workaround could not. */
+export function isMessageSuperseded(message) {
+  if (!message || typeof message !== 'object') return false;
+  const replacement = message.superseded_by;
+  return replacement != null && replacement !== '';
 }
-
-function loadSupersededMessageIds() {
-  if (supersededMessageIds) return supersededMessageIds;
-  supersededMessageIds = new Set();
-  try {
-    const raw = globalThis.localStorage?.getItem(SUPERSEDED_MESSAGES_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) {
-      supersededMessageIds = new Set(parsed
-        .filter(value => value != null && value !== '')
-        .map(String));
-    }
-  } catch { /* storage may be unavailable or contain invalid legacy data */ }
-  return supersededMessageIds;
-}
-
-function emitMessageSupersession(messageId = null) {
-  const target = globalThis.document;
-  const EventCtor = globalThis.CustomEvent;
-  if (!target?.dispatchEvent || typeof EventCtor !== 'function') return;
-  target.dispatchEvent(new EventCtor(MESSAGE_SUPERSESSION_EVENT, {
-    detail: {
-      messageId,
-      ids: [...loadSupersededMessageIds()],
-    },
-  }));
-}
-
-export function readSupersededMessageIds() {
-  return new Set(loadSupersededMessageIds());
-}
-
-export function markMessageSuperseded(messageOrId) {
-  const messageId = messageIdOf(messageOrId);
-  if (!messageId) return false;
-  const ids = loadSupersededMessageIds();
-  const changed = !ids.has(messageId);
-  ids.add(messageId);
-  try {
-    globalThis.localStorage?.setItem(SUPERSEDED_MESSAGES_KEY, JSON.stringify([...ids]));
-  } catch { /* the in-memory set still keeps this browser view coherent */ }
-  if (changed) emitMessageSupersession(messageId);
-  return changed;
-}
-
-export function isMessageSuperseded(messageOrId) {
-  const messageId = messageIdOf(messageOrId);
-  return Boolean(messageId && loadSupersededMessageIds().has(messageId));
-}
-
-globalThis.addEventListener?.('storage', event => {
-  if (event.key !== SUPERSEDED_MESSAGES_KEY) return;
-  supersededMessageIds = null;
-  emitMessageSupersession();
-});
 
 export function isApprovalActionable(message, { lead, contact } = {}) {
   if (!message || !APPROVAL_STATUSES.includes(message.status)) return false;

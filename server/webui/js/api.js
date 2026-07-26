@@ -335,6 +335,7 @@ export const routes = {
 
   // 7.28 Activity
   'activity.list':              ['GET',    '/activity'],
+  'activity.digest':            ['GET',    '/activity/digest'],
   'activity.get':               ['GET',    '/activity/:activityId'],
   'activity.forLead':           ['GET',    '/leads/:leadId/activity'],
   'activity.forContact':        ['GET',    '/contacts/:contactId/activity'],

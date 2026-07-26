@@ -34,8 +34,19 @@ def message_dict(row) -> dict:
         "approved_at": row["approved_at"], "provider_message_id": row["provider_message_id"],
         "sent_at": row["sent_at"], "replied_at": row["replied_at"],
         "bounced_at": row["bounced_at"], "data": json_load(row["data"], {}),
+        # Set when a rewrite replaced this message; the approval queue hides
+        # superseded originals instead of showing both versions.
+        "superseded_by": _optional_column(row, "superseded_by"),
         "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
+
+
+def _optional_column(row, name: str):
+    """Read a column that may be absent on rows from older ad-hoc SELECTs."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
 
 
 class OutreachService:
