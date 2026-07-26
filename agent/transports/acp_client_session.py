@@ -1089,6 +1089,7 @@ class ACPClientSession:
             decision = self._approval_callback(
                 command_label, description, allow_permanent=False,
                 kind=kind,
+                tool_call=tool_call,
             )
         except Exception:
             logger.warning(

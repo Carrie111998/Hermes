@@ -16,17 +16,19 @@ channel:
 3. **Neither** — return a fail-closed callback that always returns ``"deny"``.
 
 **Execute routing.**  One kind gets special treatment on every channel:
-``kind="execute"`` requests whose ``command_label`` carries a non-empty
-command (for ACP the ``toolCall.title`` is the raw shell command) are routed
+``kind="execute"`` requests carrying a non-empty command are routed
 through ``tools.approval.check_all_command_guards()`` — the exact pipeline
 the native terminal tool uses (hardline blocks, user deny rules, yolo /
 mode=off, permanent allowlist, tirith + dangerous-pattern detection, smart
-approval, and interactive prompting when a channel is available).  The guard
-decision is authoritative (approved → ``"once"``, otherwise ``"deny"``); the
-underlying channel is not consulted for those requests, so the user is
-prompted at most once.  All other kinds (read/edit/write/…) keep the channel
-behavior above: CLI passthrough, gateway ``request_tool_approval``, or
-fail-closed deny.
+approval, and interactive prompting when a channel is available).  The
+command is taken from the ``command`` kwarg when supplied (the plugin-side
+format adapter unwraps the ACP ``toolCall.title`` from ``Tool(command)``
+form); otherwise ``command_label`` is used as a fallback (older plugins may
+still pass the title verbatim).  The guard decision is authoritative
+(approved → ``"once"``, otherwise ``"deny"``); the underlying channel is
+not consulted for those requests, so the user is prompted at most once.
+All other kinds (read/edit/write/…) keep the channel behavior above: CLI
+passthrough, gateway ``request_tool_approval``, or fail-closed deny.
 
 **Dynamic approval-bypass wrapper.**  Whichever channel is resolved above,
 ``make_acp_approval_callback()`` wraps the returned callback in a bypass-aware
@@ -236,12 +238,16 @@ def _wrap_with_execute_command_guards(
 ) -> Callable[..., str]:
     """Route ``kind="execute"`` through the native command-guard pipeline.
 
-    For execute requests whose ``command_label`` carries a non-empty command
-    (the ACP ``toolCall.title`` is the raw shell command), run
+    For execute requests carrying a non-empty command, run
     ``tools.approval.check_all_command_guards()`` — the same pipeline the
     native terminal tool uses (hardline blocks, user deny rules, yolo /
     mode=off, permanent allowlist, tirith + dangerous-pattern detection,
     smart approval, and interactive prompting when a channel is available).
+
+    The command is taken from the ``command`` kwarg when supplied (the
+    plugin-side format adapter unwraps the ACP ``toolCall.title`` from
+    ``Tool(command)`` form); otherwise ``command_label`` is used as a
+    fallback for plugins that still pass the title verbatim.
 
     The guard decision is authoritative: approved → ``"once"``, otherwise
     ``"deny"``.  ``inner`` is NOT consulted for those requests, so the user
@@ -251,7 +257,8 @@ def _wrap_with_execute_command_guards(
 
     * non-execute kinds (read / edit / write / …) keep the channel behavior
       (CLI passthrough, gateway ``request_tool_approval``, fail-closed deny);
-    * execute requests with an empty ``command_label`` (nothing to guard);
+    * execute requests with neither a ``command`` kwarg nor a non-empty
+      ``command_label`` (nothing to guard);
     * unexpected guard failures (logged; the resolved channel still gets to
       decide, preserving fail-closed semantics on fail-closed channels).
     """
@@ -264,7 +271,9 @@ def _wrap_with_execute_command_guards(
         kind: str = "",
         **kwargs,
     ) -> str:
-        if (kind or "").lower() == "execute" and command_label and command_label.strip():
+        cmd_kwarg = kwargs.get("command")
+        has_command = bool((cmd_kwarg and cmd_kwarg.strip()) or (command_label and command_label.strip()))
+        if (kind or "").lower() == "execute" and has_command:
             try:
                 from tools.approval import (
                     check_all_command_guards,
@@ -281,8 +290,13 @@ def _wrap_with_execute_command_guards(
                 except Exception:
                     approval_cb = None
 
+                # Prefer an explicitly-unwrapped ``command`` kwarg (supplied
+                # by the plugin's format adapter) over ``command_label``;
+                # the label may still be in ``Tool(command)`` form when no
+                # adapter is wired in, in which case we fall back to it.
+                cmd = kwargs.get("command") or command_label.strip()
                 result = check_all_command_guards(
-                    command_label.strip(),
+                    cmd,
                     os.getenv("TERMINAL_ENV", "local"),
                     approval_callback=approval_cb,
                 )
