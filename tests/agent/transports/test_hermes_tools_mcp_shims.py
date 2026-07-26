@@ -148,9 +148,13 @@ class TestSessionSearchShim:
         db_path = tmp_hermes_home / "state.db"
         self._seed_db(db_path)
         monkeypatch.setenv("HERMES_MCP_STATE_DB", str(db_path))
-        out = dispatch_session_search({"query": "auth refactor"})
-        assert "auth refactor" in out
-        assert "sess-hist-1" in out
+        out = json.loads(dispatch_session_search({"query": "auth refactor"}))
+        # HIT-side fields only: the discover payload echoes the query string,
+        # so a substring assertion on the raw output passes even on zero hits.
+        assert out.get("count", 0) >= 1
+        hit = out["results"][0]
+        assert hit["session_id"] == "sess-hist-1"
+        assert "refactor" in hit["snippet"]
 
     def test_missing_db_yields_explicit_error(self, tmp_hermes_home, monkeypatch):
         # RED-first: a missing state DB must surface as an explicit error,
