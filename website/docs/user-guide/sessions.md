@@ -525,9 +525,9 @@ For deeper analytics — token usage, cost estimates, tool breakdown, and activi
 
 ## Session Search Tool
 
-The agent has a built-in `session_search` tool that performs full-text search across all past conversations using SQLite's FTS5 engine — and lets the agent scroll through any session it finds. No LLM calls, no summarization, no truncation. Every shape returns actual messages from the DB.
+The agent has a built-in `session_search` tool that performs full-text search across all past conversations using SQLite's FTS5 engine — and lets the agent scroll through any session it finds. No LLM calls or summarization. Every shape returns actual messages from the DB; large Read results are bounded to a head-and-tail view.
 
-### Three calling shapes
+### Four calling shapes
 
 The tool infers what you want from which arguments you set. There's no `mode` parameter.
 
@@ -563,13 +563,21 @@ Returns a window of ±`window` messages centered on the anchor. No FTS5, no book
 
 Typical wall time: 1–2ms per scroll call.
 
-**3. Browse — no args:**
+**3. Read — pass `session_id` without an anchor:**
+
+```python
+session_search(session_id="20260510_174648_805cc2")
+```
+
+Returns that session's transcript. Large sessions return the first 20 and last 10 messages; use the message IDs with the scroll shape to inspect the middle.
+
+**4. Browse — no args:**
 
 ```python
 session_search()
 ```
 
-Returns recent sessions chronologically (titles, previews, timestamps). Useful when the user asks "what was I working on" without naming a topic.
+Returns recent sessions with interactive sources before automation (titles, previews, timestamps). Within each group, sessions remain ordered by recent activity. Useful when the user asks "what was I working on" without naming a topic.
 
 ### FTS5 query syntax
 

@@ -15,11 +15,15 @@ mode parameter):
      scroll forward / backward, re-anchor on the last / first message id of
      the returned window.
 
-  3. BROWSE — no args. Returns recent sessions chronologically (titles,
-     previews, timestamps).
+  3. READ — pass ``session_id`` without an anchor. Returns the session's
+     transcript (head + tail when large).
 
-All three modes operate on the SQLite session DB via the FTS5 index and
-the get_anchored_view / get_messages_around primitives in hermes_state.
+  4. BROWSE — no args. Returns recent sessions with interactive sources ahead
+     of automation (titles, previews, timestamps).
+
+All four shapes operate on the SQLite session DB. Discovery uses FTS5;
+anchored reads use the get_anchored_view / get_messages_around primitives in
+hermes_state.
 No LLM calls anywhere — every shape returns actual messages from the DB.
 
 History: PR #20238 (JabberELF) seeded a fast/summary dual-mode split; the
@@ -408,13 +412,29 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
-    """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+    """Return recent metadata, prioritizing interactive sources over automation."""
     try:
-        sessions = db.list_sessions_rich(
-            limit=limit + 5,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+        fetch_limit = limit + 5  # enough to skip the active lineage
+        interactive_sessions = db.list_sessions_rich(
+            limit=fetch_limit,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES + _DEMOTED_SESSION_SOURCES),
             order_by_last_active=True,
-        )  # fetch extra so we can skip current
+            compact_rows=True,
+        )
+        demoted_sessions = []
+        for source in _DEMOTED_SESSION_SOURCES:
+            if source not in _HIDDEN_SESSION_SOURCES:
+                demoted_sessions.extend(db.list_sessions_rich(
+                    source=source,
+                    limit=fetch_limit,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                ))
+        demoted_sessions.sort(
+            key=lambda session: session.get("last_active") or session.get("started_at") or 0,
+            reverse=True,
+        )
+        sessions = _order_for_recall(interactive_sessions + demoted_sessions)
 
         current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
 
@@ -989,7 +1009,7 @@ SESSION_SEARCH_SCHEMA = {
         "and call session_search(session_id=id, profile=profile).\n\n"
         "  4) BROWSE — no args:\n"
         "     session_search()\n"
-        "     Returns recent sessions chronologically: titles, previews, timestamps. "
+        "     Returns recent sessions with interactive sources before automation: titles, previews, timestamps. "
         "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
         "LINKING THE USER TO A SESSION\n\n"
         "  When you refer the user to a session, write its `link` value inline in "
@@ -1029,8 +1049,8 @@ SESSION_SEARCH_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": (
-                    "Discovery shape only. Max sessions to return (default 3, max 10). "
-                    "Bump to 5–10 when the topic likely spans several sessions and you "
+                    "Discovery and browse shapes. Max sessions to return (default 3; clamped "
+                    "to 1–10). For discovery, use 5–10 when the topic likely spans several sessions and you "
                     "want to pick the right one to scroll into."
                 ),
                 "default": 3,
@@ -1050,9 +1070,9 @@ SESSION_SEARCH_SCHEMA = {
             "session_id": {
                 "type": "string",
                 "description": (
-                    "Scroll shape. Session to read inside. Use the session_id returned "
-                    "from a prior discovery call. Must be paired with "
-                    "around_message_id."
+                    "Read or scroll shape. Use a session_id returned from discovery. "
+                    "With around_message_id, returns a window centered on that message; "
+                    "without it, reads the session (head + tail when large)."
                 ),
             },
             "around_message_id": {

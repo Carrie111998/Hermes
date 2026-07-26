@@ -1,9 +1,10 @@
 """Tests for the single-shape session_search tool.
 
-Three calling shapes:
+Four calling shapes:
   1. DISCOVERY — pass query → FTS5 + anchored window + bookends per hit
   2. SCROLL    — pass session_id + around_message_id → just the window
-  3. BROWSE    — no args → recent sessions chronologically
+  3. READ      — pass session_id → the session transcript
+  4. BROWSE    — no args → recent sessions, interactive sources first
 
 All run zero LLM calls.
 """
@@ -97,6 +98,12 @@ class TestSchema:
         # Must explain how to scroll
         assert "scroll FORWARD" in desc or "messages[-1]" in desc
 
+    def test_session_id_schema_teaches_read_and_scroll(self):
+        desc = SESSION_SEARCH_SCHEMA["parameters"]["properties"]["session_id"]["description"]
+        assert "around_message_id" in desc
+        assert "without it" in desc
+        assert "reads the session" in desc
+
     def test_no_llm_promise_in_description(self):
         # The new design never calls an LLM
         desc = SESSION_SEARCH_SCHEMA["description"].lower()
@@ -152,6 +159,73 @@ class TestBrowseShape:
         result = json.loads(session_search(db=db))
         titles = [r.get("title") for r in result["results"]]
         assert any("Modpack" in (t or "") for t in titles)
+
+
+class TestBrowseDemotion:
+    def _seed_newer_automation(self, db, count=12):
+        now = time.time()
+        db.create_session("interactive", source="cli")
+        db.append_message(
+            "interactive", role="user", content="interactive project work", timestamp=now - 10_000
+        )
+        for index in range(count):
+            session_id = f"cron_{index}"
+            db.create_session(session_id, source="cron")
+            db.append_message(
+                session_id,
+                role="user",
+                content="automated project status",
+                timestamp=now - index,
+            )
+        db._conn.commit()
+
+    def test_browse_prefers_interactive_sessions_over_newer_automation(self, db):
+        self._seed_newer_automation(db)
+
+        result = json.loads(session_search(db=db, limit=1))
+
+        assert [row["session_id"] for row in result["results"]] == ["interactive"]
+
+    def test_browse_finds_interactive_session_beyond_300_newer_automation_rows(self, db):
+        self._seed_newer_automation(db, count=301)
+
+        result = json.loads(session_search(db=db, limit=1))
+
+        assert [row["session_id"] for row in result["results"]] == ["interactive"]
+
+    def test_browse_backfills_with_automation_after_interactive_sessions(self, db):
+        self._seed_newer_automation(db)
+
+        result = json.loads(session_search(db=db, limit=3))
+
+        assert [row["source"] for row in result["results"]] == ["cli", "cron", "cron"]
+
+    def test_browse_returns_automation_when_it_is_all_that_exists(self, db):
+        self._seed_newer_automation(db, count=3)
+        db.delete_session("interactive")
+
+        result = json.loads(session_search(db=db, limit=3))
+
+        assert result["count"] == 3
+        assert {row["source"] for row in result["results"]} == {"cron"}
+
+    def test_browse_keeps_hidden_current_and_child_sessions_excluded(self, db):
+        now = time.time()
+        db.create_session("visible", source="cli")
+        db.append_message("visible", role="user", content="visible", timestamp=now - 4)
+        db.create_session("current", source="cli")
+        db.append_message("current", role="user", content="current", timestamp=now - 3)
+        db.create_session("child", source="cli", parent_session_id="visible")
+        db.append_message("child", role="user", content="child", timestamp=now - 2)
+        for source in _HIDDEN_SESSION_SOURCES:
+            db.create_session(source, source=source)
+            db.append_message(source, role="user", content=source, timestamp=now - 1)
+        db._conn.commit()
+
+        result = json.loads(session_search(db=db, current_session_id="current", limit=10))
+        session_ids = {row["session_id"] for row in result["results"]}
+
+        assert session_ids == {"visible"}
 
 
 # =========================================================================
@@ -677,7 +751,7 @@ class TestCronDemotion:
         assert result["results"][0]["source"] == "telegram"
         assert result["results"][0]["session_id"] == "s_user"
 
-    def test_cron_still_reachable_when_only_match(self, db):
+    def test_discovery_still_finds_demoted_automation_when_it_is_the_only_match(self, db):
         """Demotion must not exclude cron — when only cron matches, it still
         comes back."""
         now = int(time.time())
