@@ -13,6 +13,7 @@ export const SELECTORS = {
   composer: '[data-slot="composer-rich-input"]',
   threadViewport: '[data-slot="aui_thread-viewport"]',
   threadContent: '[data-slot="aui_thread-content"]',
+  threadGroup: '[data-slot="aui_thread-group"]',
   assistantMessage: '[data-slot="aui_assistant-message-root"]',
   turnPair: '[data-slot="aui_turn-pair"]',
   profileRail: '[data-slot="profile-rail"]',

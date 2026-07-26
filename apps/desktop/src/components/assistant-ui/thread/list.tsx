@@ -113,27 +113,6 @@ export function firstVisibleGroupIndex(groups: readonly MessageGroup[], budget: 
   return firstVisible
 }
 
-// content-visibility:auto skips off-screen turns for perf, but with
-// contain-intrinsic-size:auto the browser only remembers a turn's size AFTER
-// it has rendered. A turn that finishes streaming near the bottom may have had
-// its (smaller) mid-stream size remembered; when it scrolls just off the top
-// edge and gets skipped, it snaps back to that stale height, shifting content
-// down. With overflow-anchor:none (the viewport can't self-correct) the
-// stick-to-bottom lock drifts and the view creeps up over older turns — the
-// "long session eventually shows old responses" glitch.
-//
-// Keep the newest N turns always-rendered so a turn is only ever virtualized
-// once its layout has settled at its final size (remembered == real → skipping
-// it changes no height). Off-screen OLDER turns still skip, so the dialog/popover
-// recalc win on long transcripts is preserved (that scales with the hundreds of
-// old turns, not this small live tail).
-export const LIVE_TAIL_GROUPS = 6
-
-/** True when a visible group is old enough to virtualize (outside the live tail). */
-export function isVirtualizedGroup(indexInVisible: number, visibleCount: number, liveTail = LIVE_TAIL_GROUPS): boolean {
-  return indexInVisible < visibleCount - liveTail
-}
-
 const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   clampToComposer,
   components,
@@ -380,28 +359,15 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
                 {t.assistant.thread.showEarlier}
               </button>
             )}
-            {visibleGroups.map((group, indexInVisible) => (
-              // content-visibility:auto — off-screen turns skip style recalc,
-              // layout, and paint. On a long transcript this is what keeps
-              // UNRELATED UI fast: any dialog/popover mount (Radix Presence
-              // reads getComputedStyle) forces a whole-document style recalc,
-              // measured ~650-730ms per open on a 1300-message session and
-              // ~100-200ms with this on. contain-intrinsic-size keeps a
-              // placeholder height for never-rendered turns (auto: remembered
-              // real size once rendered), so scrollbar/anchoring stay stable.
-              // Sticky human bubbles are unaffected — their turn is rendered
-              // whenever any part of it intersects the viewport.
-              //
-              // The live tail (newest turns) is exempt: virtualizing a turn
-              // whose final size hasn't been remembered yet snaps it to a stale
-              // height when it scrolls off, drifting stick-to-bottom up over old
-              // turns. See isVirtualizedGroup.
+            {visibleGroups.map(group => (
+              // Keep every budgeted group in normal Chromium layout.
+              // content-visibility:auto can trigger unbounded native renderer memory
+              // growth on long transcripts (#69180); exempting only the live tail
+              // still leaves older groups on that path. The part budget above limits initial
+              // DOM work without relying on Chromium's content-visibility machinery.
               <div
-                className={cn(
-                  'flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap)',
-                  isVirtualizedGroup(indexInVisible, visibleGroups.length) &&
-                    '[contain-intrinsic-size:auto_37.5rem] [content-visibility:auto]'
-                )}
+                className="flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap)"
+                data-slot="aui_thread-group"
                 key={group.id}
               >
                 <MessageRenderBoundary resetKey={messageSignature}>
