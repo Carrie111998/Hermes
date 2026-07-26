@@ -305,6 +305,350 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         ]
         self.assertEqual(message_ids, ["evt_menu_1", "evt_menu_2"])
 
+    def test_newchat_command_creates_topic_and_dispatches_task_in_topic_session(self):
+        from gateway.platforms.base import MessageType
+
+        adapter, _send_mock, handle_message_mock = self._bot_menu_adapter()
+        adapter._create_feishu_thread_seed = AsyncMock(
+            return_value=("omt_task_topic", "om_topic_seed")
+        )
+        adapter._extract_message_content = AsyncMock(
+            return_value=(
+                "/newchat 帮我整理电脑上的下载文件",
+                MessageType.TEXT,
+                [],
+                [],
+                [],
+            )
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Task DM", "chat_type": "p2p"})
+        adapter._fetch_message_text = AsyncMock(return_value="Hermes 任务：整理下载文件")
+        adapter._dispatch_inbound_event = AsyncMock()
+        message = SimpleNamespace(
+            message_id="om_newchat",
+            chat_id="oc_dm_chat",
+            chat_type="p2p",
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=sender_id,
+                chat_type="p2p",
+                message_id="om_newchat",
+            )
+        )
+
+        adapter._create_feishu_thread_seed.assert_awaited_once_with(
+            "oc_dm_chat",
+            "Hermes 任务：帮我整理电脑上的下载文件",
+            reply_to_message_id="om_newchat",
+        )
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.text, "帮我整理电脑上的下载文件")
+        self.assertEqual(event.message_type, MessageType.TEXT)
+        self.assertEqual(event.source.thread_id, "omt_task_topic")
+        self.assertEqual(event.reply_to_message_id, "om_topic_seed")
+
+        from gateway.session import build_session_key
+
+        self.assertEqual(
+            build_session_key(event.source),
+            "agent:main:feishu:dm:oc_dm_chat:omt_task_topic",
+        )
+
+    def test_newchat_allows_admin_via_tenant_user_id_when_open_id_also_exists(self):
+        from gateway.platforms.base import MessageType
+
+        adapter, _send_mock, _handle_message_mock = self._bot_menu_adapter()
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "u_tenant_admin",
+                "user_name": "Admin",
+                "user_id_alt": None,
+            }
+        )
+        adapter.gateway_runner = SimpleNamespace(
+            config=SimpleNamespace(
+                platforms={
+                    adapter.platform: SimpleNamespace(
+                        extra={
+                            "allow_admin_from": ["u_tenant_admin"],
+                            "user_allowed_commands": [],
+                        }
+                    )
+                }
+            ),
+            _profile_name_for_source=Mock(return_value=None),
+        )
+        adapter._create_feishu_thread_seed = AsyncMock(
+            return_value=("omt_task_topic", "om_topic_seed")
+        )
+        adapter._extract_message_content = AsyncMock(
+            return_value=(
+                "/newchat 帮我整理电脑上的下载文件",
+                MessageType.TEXT,
+                [],
+                [],
+                [],
+            )
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Task DM", "chat_type": "p2p"})
+        adapter._fetch_message_text = AsyncMock(return_value="Hermes 任务：整理下载文件")
+        adapter._dispatch_inbound_event = AsyncMock()
+        message = SimpleNamespace(
+            message_id="om_newchat",
+            chat_id="oc_dm_chat",
+            chat_type="p2p",
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=SimpleNamespace(
+                    open_id="ou_app_scoped",
+                    user_id="u_tenant_admin",
+                    union_id=None,
+                ),
+                chat_type="p2p",
+                message_id="om_newchat",
+            )
+        )
+
+        adapter._create_feishu_thread_seed.assert_awaited_once()
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.user_id, "u_tenant_admin")
+
+    def test_newchat_denied_by_slash_policy_creates_no_topic_or_task(self):
+        from gateway.platforms.base import MessageType
+
+        adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
+        adapter._create_feishu_thread_seed = AsyncMock()
+        adapter._extract_message_content = AsyncMock(
+            return_value=(
+                "/newchat 帮我整理电脑上的下载文件",
+                MessageType.TEXT,
+                [],
+                [],
+                [],
+            )
+        )
+        adapter.gateway_runner = SimpleNamespace(
+            config=SimpleNamespace(
+                platforms={
+                    adapter.platform: SimpleNamespace(
+                        extra={
+                            "allow_admin_from": ["ou_admin"],
+                            "user_allowed_commands": [],
+                        }
+                    )
+                }
+            ),
+            _profile_name_for_source=Mock(return_value=None),
+        )
+        message = SimpleNamespace(
+            message_id="om_newchat",
+            chat_id="oc_dm_chat",
+            chat_type="p2p",
+            thread_id=None,
+            root_id=None,
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user"),
+                chat_type="p2p",
+                message_id="om_newchat",
+            )
+        )
+
+        send_mock.assert_awaited_once_with(
+            "oc_dm_chat",
+            "⛔ /newchat is admin-only here. Use /whoami to review your command access.",
+            reply_to="om_newchat",
+        )
+        adapter._create_feishu_thread_seed.assert_not_awaited()
+        self.assertEqual(_handle_message_mock.await_count, 0)
+
+    def test_newchat_is_rejected_in_existing_thread(self):
+        from gateway.platforms.base import MessageType
+
+        adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
+        adapter._create_feishu_thread_seed = AsyncMock()
+        adapter._extract_message_content = AsyncMock(
+            return_value=(
+                "/newchat 帮我整理电脑上的下载文件",
+                MessageType.TEXT,
+                [],
+                [],
+                [],
+            )
+        )
+        message = SimpleNamespace(
+            message_id="om_newchat",
+            chat_id="oc_dm_chat",
+            chat_type="p2p",
+            thread_id="omt_existing",
+            root_id="omt_existing",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user"),
+                chat_type="p2p",
+                message_id="om_newchat",
+            )
+        )
+
+        send_mock.assert_awaited_once_with(
+            "oc_dm_chat",
+            "/newchat 只能从主私聊中创建；请回到主聊天后重试。",
+            reply_to="om_newchat",
+            metadata={
+                "thread_id": "omt_existing",
+                "reply_to_message_id": "om_newchat",
+            },
+        )
+        adapter._create_feishu_thread_seed.assert_not_awaited()
+
+    def test_newchat_is_rejected_in_group_without_creating_topic(self):
+        from gateway.platforms.base import MessageType
+
+        adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
+        adapter._create_feishu_thread_seed = AsyncMock()
+        adapter._extract_message_content = AsyncMock(
+            return_value=(
+                "/newchat 帮我整理电脑上的下载文件",
+                MessageType.TEXT,
+                [],
+                [],
+                [],
+            )
+        )
+        message = SimpleNamespace(
+            message_id="om_newchat",
+            chat_id="oc_group",
+            chat_type="group",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user"),
+                chat_type="group",
+                message_id="om_newchat",
+            )
+        )
+
+        send_mock.assert_awaited_once_with(
+            "oc_group",
+            "/newchat 目前只支持飞书机器人私聊。",
+            reply_to="om_newchat",
+        )
+        adapter._create_feishu_thread_seed.assert_not_awaited()
+
+    def test_newchat_without_task_returns_usage_without_creating_topic(self):
+        from gateway.platforms.base import MessageType
+
+        adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
+        adapter._create_feishu_thread_seed = AsyncMock()
+        adapter._extract_message_content = AsyncMock(
+            return_value=("/newchat", MessageType.TEXT, [], [], [])
+        )
+        message = SimpleNamespace(
+            message_id="om_newchat",
+            chat_id="oc_dm_chat",
+            chat_type="p2p",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user"),
+                chat_type="p2p",
+                message_id="om_newchat",
+            )
+        )
+
+        send_mock.assert_awaited_once_with(
+            "oc_dm_chat",
+            "用法：/newchat <任务描述>",
+            reply_to="om_newchat",
+        )
+        adapter._create_feishu_thread_seed.assert_not_awaited()
+
+    def test_create_handoff_thread_requires_actual_thread_id(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._feishu_send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(
+                    message_id="om_topic_seed",
+                    root_id="om_user_command",
+                    thread_id=None,
+                ),
+            )
+        )
+
+        thread_id = asyncio.run(
+            adapter.create_handoff_thread(
+                "oc_dm_chat",
+                "Hermes — 整理电脑文件",
+                reply_to_message_id="om_user_command",
+            )
+        )
+
+        self.assertIsNone(thread_id)
+
+    def test_create_handoff_thread_replies_in_thread_and_returns_thread_id(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(
+                message_id="om_topic_seed",
+                thread_id="omt_task_topic",
+            ),
+        )
+        adapter._feishu_send_with_retry = AsyncMock(return_value=response)
+
+        thread_id = asyncio.run(
+            adapter.create_handoff_thread(
+                "oc_dm_chat",
+                "Hermes — 整理电脑文件",
+                reply_to_message_id="om_user_command",
+            )
+        )
+
+        self.assertEqual(thread_id, "omt_task_topic")
+        adapter._feishu_send_with_retry.assert_awaited_once()
+        kwargs = adapter._feishu_send_with_retry.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], "oc_dm_chat")
+        self.assertEqual(kwargs["reply_to"], "om_user_command")
+        self.assertEqual(kwargs["metadata"], {"thread_id": "om_user_command"})
+
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
     def test_websocket_sdk_accepts_channel_ua_tag(self):
         """The shipped SDK must support the Channel signaling argument."""
