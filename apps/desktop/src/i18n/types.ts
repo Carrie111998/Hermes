@@ -450,6 +450,15 @@ export interface Translations {
       keepAwakeTitle: string
       keepAwakeDesc: string
     }
+    quickEntry: {
+      enabledTitle: string
+      enabledDesc: string
+      shortcutTitle: string
+      shortcutDesc: string
+      active: string
+      takenBy: string
+      invalidShortcut: string
+    }
     credentials: {
       pasteKey: string
       pasteLabelKey: (label: string) => string
