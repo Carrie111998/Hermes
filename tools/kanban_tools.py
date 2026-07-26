@@ -1250,6 +1250,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                board=board,
             )
         finally:
             conn.close()

@@ -499,13 +499,21 @@ def _post_tool_call_enforcement(
     # --- Durable readback ---
     # Read the actual created task from the board to verify the dispatch
     # decision was persisted correctly.  Do not trust the caller's args
-    # alone — the DB is the source of truth.
+    # alone - the DB is the source of truth.
+    #
+    # Resolve board: prefer the board returned in the kanban_create result
+    # (most reliable - it reflects the actual DB that accepted the write),
+    # fall back to the board in the original args.
+    result_board = res.get("board") if isinstance(res, dict) else None
+    args_board = str(args.get("board", "")).strip() or None
+    board = result_board or args_board
     readback_ok = _verify_dispatch_decision_from_db(
         created_task_id=str(created_task_id),
         expected_assignee=str(args.get("assignee", "")).strip() or None,
         expected_model=str(dd.get("model", "")).strip() or None,
         expected_provider=str(dd.get("provider", "")).strip() or None,
         exemption_keyword=str(dd.get("exemption", "")).strip() or None,
+        board=board,
     )
     if not readback_ok:
         logger.warning(
@@ -550,6 +558,7 @@ def _verify_dispatch_decision_from_db(
     expected_model: Optional[str],
     expected_provider: Optional[str],
     exemption_keyword: Optional[str],
+    board: Optional[str] = None,
 ) -> bool:
     """Read back the created task from the DB and verify dispatch_decision.
 
@@ -560,15 +569,15 @@ def _verify_dispatch_decision_from_db(
     Returns True when:
     - The task exists and is not archived/done/blocked.
     - For routes: assignee, model_override, and provider_override match.
-    - For exemptions: at minimum the assignee matches (exemption detection
-      is inferred from the absence of model/provider overrides + presence
-      of a dispatch_routed event).
-    - A dispatch_routed event exists in task_events.
+      A ``dispatch_routed`` event exists in task_events.
+    - For exemptions: assignee matches (if provided), model/provider
+      overrides are absent, and a ``dispatch_exempted`` event exists
+      whose payload contains the exact exemption keyword.
     """
     try:
         from hermes_cli import kanban_db as kdb
 
-        conn = kdb.connect()
+        conn = kdb.connect(board=board)
 
         # Get the task by id.
         task = kdb.get_task(conn, created_task_id)
@@ -638,20 +647,62 @@ def _verify_dispatch_decision_from_db(
                 )
                 return False
 
-        # Verify a dispatch_routed event exists in task_events.
+        # Verify the correct durable event exists in task_events.
+        # Routes record dispatch_routed; exemptions record
+        # dispatch_exempted.  For exemptions we additionally verify
+        # the event payload contains the exact keyword (forged or
+        # mismatched keywords must fail).
         try:
-            row = conn.execute(
-                "SELECT 1 FROM task_events "
-                "WHERE task_id = ? AND kind = 'dispatch_routed' "
-                "LIMIT 1",
-                (created_task_id,),
-            ).fetchone()
-            if row is None:
-                logger.warning(
-                    "dispatch enforcement: task %s has no dispatch_routed event",
-                    created_task_id,
-                )
-                return False
+            if exemption_keyword:
+                # Query for the exemption event and verify keyword in payload.
+                row = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'dispatch_exempted' "
+                    "LIMIT 1",
+                    (created_task_id,),
+                ).fetchone()
+                if row is None:
+                    logger.warning(
+                        "dispatch enforcement: exemption task %s has no "
+                        "dispatch_exempted event",
+                        created_task_id,
+                    )
+                    return False
+                # Verify the payload contains the exact exemption keyword.
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else {}
+                except Exception:
+                    logger.warning(
+                        "dispatch enforcement: exemption task %s has "
+                        "unparseable event payload",
+                        created_task_id,
+                    )
+                    return False
+                payload_keyword = str(
+                    payload.get("exemption", "")
+                ).strip().lower()
+                expected_kw = exemption_keyword.strip().lower()
+                if payload_keyword != expected_kw:
+                    logger.warning(
+                        "dispatch enforcement: exemption task %s keyword "
+                        "mismatch (expected %r, got %r in payload)",
+                        created_task_id, expected_kw, payload_keyword,
+                    )
+                    return False
+            else:
+                row = conn.execute(
+                    "SELECT 1 FROM task_events "
+                    "WHERE task_id = ? AND kind = 'dispatch_routed' "
+                    "LIMIT 1",
+                    (created_task_id,),
+                ).fetchone()
+                if row is None:
+                    logger.warning(
+                        "dispatch enforcement: task %s has no "
+                        "dispatch_routed event",
+                        created_task_id,
+                    )
+                    return False
         except Exception:
             logger.exception(
                 "dispatch enforcement: failed to query task_events for %s",
