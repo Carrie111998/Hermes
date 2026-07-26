@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs
+from cron.scheduler_runtime import SchedulerOwnershipPolicy
 from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
 
@@ -156,14 +157,14 @@ class TestCronCommandLifecycle:
 
 
 class TestGatewayNotRunningWarning:
-    """`cron create` / `cron list` must warn when the gateway (and thus the
-    cron ticker) isn't running, since jobs only fire inside the gateway.
-    Regression guard for #51038 — the most common cron 'jobs never fired'
-    report was simply a gateway that was never started.
-    """
+    """Create/list warnings follow the exact-home scheduler lease."""
 
     def test_create_warns_when_gateway_absent(self, tmp_cron_dir, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr(
+            cron_cli,
+            "_scheduler_health",
+            lambda: (SchedulerOwnershipPolicy("gateway", "builtin"), None),
+        )
         cron_command(
             Namespace(
                 cron_command="create",
@@ -184,7 +185,14 @@ class TestGatewayNotRunningWarning:
         assert "Gateway is not running" in out
 
     def test_create_silent_when_gateway_running(self, tmp_cron_dir, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4242])
+        monkeypatch.setattr(
+            cron_cli,
+            "_scheduler_health",
+            lambda: (
+                SchedulerOwnershipPolicy("gateway", "builtin"),
+                {"owner": "gateway", "provider": "builtin"},
+            ),
+        )
         cron_command(
             Namespace(
                 cron_command="create",
@@ -206,19 +214,47 @@ class TestGatewayNotRunningWarning:
 
     def test_list_warns_when_gateway_absent(self, tmp_cron_dir, capsys, monkeypatch):
         create_job(prompt="Daily report", schedule="0 11 * * *")
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr(
+            cron_cli,
+            "_scheduler_health",
+            lambda: (SchedulerOwnershipPolicy("gateway", "builtin"), None),
+        )
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
         assert "Gateway is not running" in out
+
+    @pytest.mark.parametrize(
+        ("policy", "owner"),
+        [
+            (
+                SchedulerOwnershipPolicy("gateway", "builtin"),
+                {"owner": "desktop", "provider": "builtin"},
+            ),
+            (
+                SchedulerOwnershipPolicy("desktop", "builtin"),
+                {"owner": "gateway", "provider": "builtin"},
+            ),
+            (
+                SchedulerOwnershipPolicy("auto", "chronos"),
+                {"owner": "desktop", "provider": "chronos"},
+            ),
+        ],
+    )
+    def test_warning_fails_closed_for_owner_policy_mismatch(
+        self, policy, owner, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(cron_cli, "_scheduler_health", lambda: (policy, owner))
+
+        cron_cli._warn_if_gateway_not_running()
+
+        assert "jobs won't fire automatically" in capsys.readouterr().out
 
 
 class TestExternalCronProviderStatus:
     """With an external cron provider (e.g. Chronos), jobs fire via a
     NAS-mediated webhook, NOT the in-process ticker. The ticker-heartbeat /
-    gateway-process heuristics are meaningless there, so neither
-    `cron status` nor the create/list warning must claim the gateway being
-    absent means jobs won't fire — that was a false-negative on every healthy
-    Chronos instance (the heartbeat is intentionally never written).
+    gateway-process heuristics are meaningless there. A healthy live provider
+    lease must report managed scheduling without requiring either signal.
     """
 
     def test_status_reports_provider_not_ticker_for_chronos(
@@ -226,7 +262,12 @@ class TestExternalCronProviderStatus:
     ):
         create_job(prompt="Ping", schedule="every 2m")
         monkeypatch.setattr(
-            "hermes_cli.cron._active_cron_provider_name", lambda: "chronos"
+            cron_cli,
+            "_scheduler_health",
+            lambda: (
+                SchedulerOwnershipPolicy("gateway", "chronos"),
+                {"owner": "gateway", "provider": "chronos"},
+            ),
         )
         # Even with NO gateway process and NO ticker heartbeat, Chronos status
         # must NOT report a stall / "not firing".
@@ -244,7 +285,9 @@ class TestExternalCronProviderStatus:
     def test_status_unchanged_for_builtin(self, tmp_cron_dir, capsys, monkeypatch):
         create_job(prompt="Ping", schedule="every 2m")
         monkeypatch.setattr(
-            "hermes_cli.cron._active_cron_provider_name", lambda: "builtin"
+            cron_cli,
+            "_scheduler_health",
+            lambda: (SchedulerOwnershipPolicy("gateway", "builtin"), None),
         )
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
         cron_command(Namespace(cron_command="status"))
@@ -256,10 +299,14 @@ class TestExternalCronProviderStatus:
     def test_create_silent_for_chronos_even_without_gateway(
         self, tmp_cron_dir, capsys, monkeypatch
     ):
-        # The create-time "gateway not running" nag is a ticker-only concern;
-        # an external provider doesn't depend on a live in-process ticker.
+        # The live Chronos lease is authoritative; a global Gateway PID is not.
         monkeypatch.setattr(
-            "hermes_cli.cron._active_cron_provider_name", lambda: "chronos"
+            cron_cli,
+            "_scheduler_health",
+            lambda: (
+                SchedulerOwnershipPolicy("gateway", "chronos"),
+                {"owner": "gateway", "provider": "chronos"},
+            ),
         )
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
         cron_command(
@@ -298,7 +345,11 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
         ],
     )
     monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
-    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr(
+        cron_cli,
+        "_scheduler_health",
+        lambda: (SchedulerOwnershipPolicy("gateway", "builtin"), None),
+    )
 
     cron_cli.cron_list()
 
@@ -308,7 +359,14 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
 
 
 def test_cron_status_reports_running_gateway(monkeypatch, capsys):
-    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr(
+        cron_cli,
+        "_scheduler_health",
+        lambda: (
+            SchedulerOwnershipPolicy("gateway", "builtin"),
+            {"owner": "gateway", "provider": "builtin"},
+        ),
+    )
     monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1234, 5678])
     monkeypatch.setattr(
         "cron.jobs.list_jobs",
@@ -325,6 +383,60 @@ def test_cron_status_reports_running_gateway(monkeypatch, capsys):
     assert "1234, 5678" in out
     assert "2 active job(s)" in out
     assert "2026-05-31T12:00:00Z" in out
+
+
+def test_cron_status_reports_desktop_owned_auto(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cron_cli,
+        "_scheduler_health",
+        lambda: (
+            SchedulerOwnershipPolicy("auto", "builtin"),
+            {"owner": "desktop", "provider": "builtin"},
+        ),
+    )
+    monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: 5.0)
+    monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: 5.0)
+    monkeypatch.setattr("cron.jobs.list_jobs", lambda include_disabled=False: [])
+
+    cron_cli.cron_status()
+
+    assert "Desktop owns cron" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("policy", "owner"),
+    [
+        (None, None),
+        (SchedulerOwnershipPolicy("auto", "chronos"), None),
+        (
+            SchedulerOwnershipPolicy("auto", "chronos"),
+            {"owner": "gateway", "provider": "builtin"},
+        ),
+        (
+            SchedulerOwnershipPolicy("gateway", "builtin"),
+            {"owner": "desktop", "provider": "builtin"},
+        ),
+        (
+            SchedulerOwnershipPolicy("desktop", "builtin"),
+            {"owner": "gateway", "provider": "builtin"},
+        ),
+        (
+            SchedulerOwnershipPolicy("auto", "chronos"),
+            {"owner": "desktop", "provider": "chronos"},
+        ),
+    ],
+)
+def test_cron_status_fails_closed_without_matching_live_owner(
+    policy, owner, monkeypatch, capsys
+):
+    monkeypatch.setattr(cron_cli, "_scheduler_health", lambda: (policy, owner))
+    monkeypatch.setattr("cron.jobs.list_jobs", lambda include_disabled=False: [])
+
+    cron_cli.cron_status()
+
+    out = capsys.readouterr().out
+    assert "automatic firing is disabled" in out or "will NOT fire automatically" in out
+    assert "✓" not in out
 
 
 def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):

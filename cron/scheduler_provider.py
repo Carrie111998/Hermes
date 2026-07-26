@@ -17,11 +17,68 @@ ticker. Alternative providers (e.g. Chronos, a NAS-mediated managed-cron
 provider for scale-to-zero deployments) live under plugins/cron_providers/<name>/ and are
 selected via the `cron.provider` config key (empty = built-in).
 """
+
 from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
 from typing import Any
+
+import logging
+
+logger = logging.getLogger("cron.scheduler_provider")
+_CRON_SCHEDULER_RUNTIME_OWNERS = frozenset({"gateway", "desktop"})
+
+
+def resolve_cron_scheduler_owner(*, config: dict[str, Any] | None = None) -> str | None:
+    """Compatibility wrapper for the strict ownership policy reader."""
+    from cron.scheduler_runtime import read_scheduler_ownership_policy_strict
+
+    policy = read_scheduler_ownership_policy_strict(config)
+    return policy.mode if policy is not None else None
+
+
+def should_start_cron_scheduler(
+    runtime_owner: str, *, config: dict[str, Any] | None = None
+) -> bool:
+    """Compatibility policy probe; the ownership lease is authoritative."""
+    if runtime_owner not in _CRON_SCHEDULER_RUNTIME_OWNERS:
+        raise ValueError("Unknown cron scheduler runtime owner")
+    owner = resolve_cron_scheduler_owner(config=config)
+    return owner == runtime_owner or owner == "auto"
+
+
+def resolve_owned_cron_scheduler(
+    runtime_owner: str, *, config: dict[str, Any] | None = None
+) -> "CronScheduler | None":
+    """Legacy one-shot resolver. Automatic runtimes use OwnedSchedulerRuntime."""
+    _owner, provider = resolve_cron_scheduler_startup(runtime_owner, config=config)
+    return provider
+
+
+def resolve_cron_scheduler_startup(
+    runtime_owner: str, *, config: dict[str, Any] | None = None
+) -> "tuple[str | None, CronScheduler | None]":
+    """Legacy strict policy snapshot retained for public API compatibility."""
+    from cron.scheduler_runtime import (
+        read_scheduler_ownership_policy_strict,
+        scheduler_runtime_is_eligible,
+    )
+
+    if runtime_owner not in _CRON_SCHEDULER_RUNTIME_OWNERS:
+        raise ValueError("Unknown cron scheduler runtime owner")
+    policy = read_scheduler_ownership_policy_strict(config)
+    if policy is None:
+        return None, None
+    if not scheduler_runtime_is_eligible(
+        policy,
+        runtime=runtime_owner,  # type: ignore[arg-type]
+        same_home_gateway_running=False,
+    ):
+        return policy.mode, None
+    return policy.mode, resolve_cron_scheduler_runtime_strict(
+        policy.configured_provider
+    )
 
 
 class CronScheduler(ABC):
@@ -119,6 +176,38 @@ class CronScheduler(ABC):
         return None
 
 
+_BUILTIN_PROVIDER_NAMES = frozenset({"", "builtin", "in-process", "inprocess"})
+
+
+def resolve_cron_scheduler_runtime_strict(
+    configured_provider: str,
+) -> "CronScheduler | None":
+    """Resolve a configured provider without silently changing its trigger."""
+    if configured_provider in _BUILTIN_PROVIDER_NAMES:
+        return InProcessCronScheduler()
+    try:
+        from plugins.cron_providers import load_cron_scheduler
+
+        provider = load_cron_scheduler(configured_provider)
+        if provider is None:
+            logger.error(
+                "Configured cron provider %r is not installed", configured_provider
+            )
+            return None
+        if not provider.is_available():
+            logger.error(
+                "Configured cron provider %r is unavailable", configured_provider
+            )
+            return None
+        logger.info("Using cron scheduler provider: %s", provider.name)
+        return provider
+    except Exception:
+        logger.exception(
+            "Configured cron provider %r failed to load", configured_provider
+        )
+        return None
+
+
 def resolve_cron_scheduler() -> "CronScheduler":
     """Return the active cron scheduler provider.
 
@@ -127,13 +216,10 @@ def resolve_cron_scheduler() -> "CronScheduler":
     False`` falls back to the built-in with a warning — cron must never be left
     without a trigger.
     """
-    import logging
-
-    logger = logging.getLogger("cron.scheduler_provider")
-
     name = ""
     try:
         from hermes_cli.config import cfg_get, load_config
+
         name = (cfg_get(load_config(), "cron", "provider", default="") or "").strip()
     except Exception:
         pass
@@ -143,12 +229,15 @@ def resolve_cron_scheduler() -> "CronScheduler":
 
     try:
         from plugins.cron_providers import load_cron_scheduler
+
         provider = load_cron_scheduler(name)
         if provider is None:
             logger.warning("cron.provider '%s' not found; using built-in ticker", name)
             return InProcessCronScheduler()
         if not provider.is_available():
-            logger.warning("cron.provider '%s' not available; using built-in ticker", name)
+            logger.warning(
+                "cron.provider '%s' not available; using built-in ticker", name
+            )
             return InProcessCronScheduler()
         logger.info("Using cron scheduler provider: %s", provider.name)
         return provider
@@ -226,7 +315,9 @@ class InProcessCronScheduler(CronScheduler):
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
+                    logger.debug(
+                        "Cron dispatch paused while gateway drains existing work"
+                    )
                 else:
                     cron_tick(
                         verbose=False,
@@ -286,7 +377,10 @@ class InProcessCronScheduler(CronScheduler):
             record_ticker_heartbeat,
             use_cron_store,
         )
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_constants import (
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info(
@@ -316,7 +410,9 @@ class InProcessCronScheduler(CronScheduler):
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
+                    logger.debug(
+                        "Cron dispatch paused while gateway drains existing work"
+                    )
                 else:
                     for entry in profile_homes:
                         home = entry[1] if isinstance(entry, tuple) else entry

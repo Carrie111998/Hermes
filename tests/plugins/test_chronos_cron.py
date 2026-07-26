@@ -166,6 +166,43 @@ def test_reconcile_skips_already_armed_same_time(temp_home, chronos, monkeypatch
     assert fake.provisions == []  # already armed at the same time → no re-arm
 
 
+def test_reconcile_provision_failure_propagates(temp_home, chronos, monkeypatch):
+    prov, fake = chronos
+    job = {
+        "id": "a",
+        "enabled": True,
+        "next_run_at": "2026-06-18T12:00:00+00:00",
+        "state": "scheduled",
+    }
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+    monkeypatch.setattr("cron.jobs.get_job", lambda _jid: job)
+    monkeypatch.setattr(
+        fake, "provision", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("down"))
+    )
+    with pytest.raises(RuntimeError, match="down"):
+        prov.reconcile()
+
+
+def test_reconcile_cancel_failure_propagates(temp_home, chronos, monkeypatch):
+    prov, fake = chronos
+    prov._armed = {"gone": "2026-06-18T11:00:00+00:00"}
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [])
+    monkeypatch.setattr(
+        fake, "cancel", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("down"))
+    )
+    with pytest.raises(RuntimeError, match="down"):
+        prov.reconcile()
+
+def test_reconcile_list_failure_propagates(temp_home, chronos, monkeypatch):
+    prov, fake = chronos
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [])
+    monkeypatch.setattr(
+        fake, "list_armed", lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    )
+    with pytest.raises(RuntimeError, match="down"):
+        prov.reconcile()
+
+
 # -- fire_due re-arm ----------------------------------------------------------
 
 def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):

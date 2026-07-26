@@ -332,6 +332,30 @@ def test_resolve_available_provider_is_used(monkeypatch):
     assert prov.name == "fake"
 
 
+def test_resolve_preserves_mixed_case_provider_name(monkeypatch):
+    import hermes_cli.config as cfg
+    import plugins.cron_providers as pc
+    from cron import scheduler_provider as sp
+    from cron.scheduler_provider import CronScheduler
+
+    seen = []
+
+    class Fake(CronScheduler):
+        name = "MyProvider"
+
+        def start(self, stop_event, **kw):
+            pass
+
+    monkeypatch.setattr(
+        cfg, "load_config", lambda: {"cron": {"provider": "MyProvider"}}
+    )
+    monkeypatch.setattr(
+        pc, "load_cron_scheduler", lambda name: seen.append(name) or Fake()
+    )
+    assert sp.resolve_cron_scheduler().name == "MyProvider"
+    assert seen == ["MyProvider"]
+
+
 # ── Phase 4B: additive hooks (on_jobs_changed / fire_due / reconcile) ────────
 
 
@@ -557,6 +581,16 @@ def test_cron_status_reports_alive_but_failing(tmp_path, monkeypatch, capsys):
     has succeeded recently (#32612: alive-but-failing must not look healthy)."""
     import cron.jobs as jobs
     from hermes_cli import cron as cron_cli
+    from cron.scheduler_runtime import SchedulerOwnershipPolicy
+
+    monkeypatch.setattr(
+        cron_cli,
+        "_scheduler_health",
+        lambda: (
+            SchedulerOwnershipPolicy("auto", "builtin"),
+            {"owner": "gateway", "provider": "builtin"},
+        ),
+    )
 
     monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4321])
     monkeypatch.setattr(jobs, "get_ticker_heartbeat_age", lambda: 5.0)      # fresh
@@ -572,6 +606,16 @@ def test_cron_status_reports_alive_but_failing(tmp_path, monkeypatch, capsys):
 def test_cron_status_healthy_when_both_fresh(tmp_path, monkeypatch, capsys):
     import cron.jobs as jobs
     from hermes_cli import cron as cron_cli
+    from cron.scheduler_runtime import SchedulerOwnershipPolicy
+
+    monkeypatch.setattr(
+        cron_cli,
+        "_scheduler_health",
+        lambda: (
+            SchedulerOwnershipPolicy("auto", "builtin"),
+            {"owner": "gateway", "provider": "builtin"},
+        ),
+    )
 
     monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4321])
     monkeypatch.setattr(jobs, "get_ticker_heartbeat_age", lambda: 5.0)
@@ -586,6 +630,16 @@ def test_cron_status_healthy_when_both_fresh(tmp_path, monkeypatch, capsys):
 def test_cron_status_reports_stalled_when_no_heartbeat(tmp_path, monkeypatch, capsys):
     import cron.jobs as jobs
     from hermes_cli import cron as cron_cli
+    from cron.scheduler_runtime import SchedulerOwnershipPolicy
+
+    monkeypatch.setattr(
+        cron_cli,
+        "_scheduler_health",
+        lambda: (
+            SchedulerOwnershipPolicy("auto", "builtin"),
+            {"owner": "gateway", "provider": "builtin"},
+        ),
+    )
 
     monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4321])
     monkeypatch.setattr(jobs, "get_ticker_heartbeat_age", lambda: 9_999.0)  # dead

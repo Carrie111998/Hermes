@@ -10060,13 +10060,31 @@ class TestDesktopCronTicker:
     def test_ticker_runs_when_desktop(self, monkeypatch, _isolate_hermes_home):
         import threading
         import cron.scheduler as sched
+        from cron.scheduler_runtime import get_active_scheduler_provider
+        from hermes_constants import get_hermes_home
 
         called = threading.Event()
         monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
         monkeypatch.setenv("HERMES_DESKTOP", "1")
+        existing_threads = set(threading.enumerate())
 
         with self._client():
             assert called.wait(3.0), "expected cron tick under HERMES_DESKTOP=1"
+            assert get_active_scheduler_provider(
+                hermes_home=get_hermes_home()
+            ) is not None
+
+        assert get_active_scheduler_provider(hermes_home=get_hermes_home()) is None
+        leaked = {
+            thread.name
+            for thread in threading.enumerate()
+            if thread not in existing_threads
+            and thread.name in {
+                "desktop-cron-supervisor",
+                "desktop-cron-provider",
+            }
+        }
+        assert leaked == set()
 
     def test_ticker_skipped_without_desktop(self, monkeypatch, _isolate_hermes_home):
         import threading

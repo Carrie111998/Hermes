@@ -110,10 +110,7 @@ class ChronosCronScheduler(CronScheduler):
         # process did. Classify those attempts unknown for audit only; do not
         # requeue them here.
         self.recover_interrupted()
-        try:
-            self.reconcile()
-        except Exception as e:
-            logger.warning("Chronos start() reconcile failed: %s", e)
+        self.reconcile()
         # Intentionally return — no loop, no periodic wake.
 
     def stop(self) -> None:
@@ -122,10 +119,7 @@ class ChronosCronScheduler(CronScheduler):
     def on_jobs_changed(self) -> None:
         """A job was created/updated/removed/paused/resumed — reconcile the NAS
         registry so the affected one-shot is (re-)armed or cancelled."""
-        try:
-            self.reconcile()
-        except Exception as e:
-            logger.debug("Chronos on_jobs_changed reconcile failed: %s", e)
+        self.reconcile()
 
     # -- arming -----------------------------------------------------------
 
@@ -160,25 +154,22 @@ class ChronosCronScheduler(CronScheduler):
     def _list_armed(self) -> Dict[str, str]:
         """Observed armed one-shots: job_id → fire_at.
 
-        Prefer the in-memory map (warm process); on a cold/empty map, ask NAS
-        (best-effort). If NAS list fails, return what we have — reconcile then
-        re-arms desired jobs idempotently.
+        Prefer the in-memory map (warm process); on a cold/empty map, ask NAS.
+        The NAS list is authoritative on a cold process, so failures propagate:
+        treating an unreadable registry as empty would hide stale remote arms
+        and let reconciliation advance as though it succeeded.
         """
         with self._lock:
             if self._armed:
                 return dict(self._armed)
-        try:
-            observed = {
-                item["job_id"]: item.get("fire_at", "")
-                for item in self._get_client().list_armed()
-                if item.get("job_id")
-            }
-            with self._lock:
-                self._armed.update(observed)
-            return observed
-        except Exception as e:
-            logger.debug("Chronos _list_armed failed (will re-arm idempotently): %s", e)
-            return {}
+        observed = {
+            item["job_id"]: item.get("fire_at", "")
+            for item in self._get_client().list_armed()
+            if item.get("job_id")
+        }
+        with self._lock:
+            self._armed.update(observed)
+        return observed
 
     # -- reconcile --------------------------------------------------------
 
@@ -201,18 +192,12 @@ class ChronosCronScheduler(CronScheduler):
                 from cron.jobs import get_job
                 job = get_job(job_id)
                 if job:
-                    try:
-                        self._arm_one_shot(job)
-                    except Exception as e:
-                        logger.warning("Chronos failed to arm job %s: %s", job_id, e)
+                    self._arm_one_shot(job)
 
         # Cancel orphans (armed but no longer desired).
         for job_id in list(observed.keys()):
             if job_id not in desired:
-                try:
-                    self._cancel(job_id)
-                except Exception as e:
-                    logger.warning("Chronos failed to cancel orphan %s: %s", job_id, e)
+                self._cancel(job_id)
 
     # -- fire -------------------------------------------------------------
 
@@ -229,10 +214,7 @@ class ChronosCronScheduler(CronScheduler):
             from cron.jobs import get_job
             job = get_job(job_id)
             if job and job.get("enabled") and job.get("next_run_at"):
-                try:
-                    self._arm_one_shot(job)
-                except Exception as e:
-                    logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
+                self._arm_one_shot(job)
         return ran
 
 

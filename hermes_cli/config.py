@@ -2845,13 +2845,17 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Exactly one long-running runtime owns automatic scheduling per
+        # HERMES_HOME. "auto" prefers Gateway while preserving standalone
+        # Desktop's built-in ticker when no same-home Gateway is running.
+        "scheduler_owner": "auto",
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or
         # $HERMES_HOME/plugins/<name>/) to relocate the trigger — e.g. "chronos",
         # the NAS-mediated managed-cron provider for scale-to-zero deployments.
-        # An unknown or unavailable provider falls back to the built-in, so cron
-        # never loses its trigger.
+        # Automatic runtimes fail closed when a configured provider is missing
+        # or unavailable; they never silently change the configured trigger.
         "provider": "",
         # Chronos (NAS-mediated managed cron) settings. Only consulted when
         # provider == "chronos". All non-secret (URLs + the JWT audience): the

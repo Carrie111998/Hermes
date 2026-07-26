@@ -1614,3 +1614,14 @@ updates:
 #     command: "cat /run/user/1000/hermes-secrets.env"
 #     helper_timeout_seconds: 3
 #     override_existing: false             # .env/shell win by default
+# Cron scheduler ownership and trigger provider.
+cron:
+  # Exactly one runtime may schedule jobs for each HERMES_HOME.
+  # auto: Gateway is preferred; standalone Desktop runs the built-in ticker
+  # when no same-home Gateway is active. Or pin "gateway" / "desktop".
+  scheduler_owner: auto
+
+  # Empty/builtin uses Hermes' in-process ticker. A configured external
+  # provider must be installed and available; automatic startup fails closed
+  # instead of silently falling back to the built-in ticker.
+  provider: ""

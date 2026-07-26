@@ -23721,6 +23721,46 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+def _start_gateway_cron_schedulers(runner, stop_event, loop):
+    """Start one exact-home ownership supervisor per served Gateway profile."""
+    from cron.scheduler_runtime import (
+        OwnedSchedulerRuntime,
+    )
+    from hermes_constants import get_hermes_home
+
+    homes = [("active", get_hermes_home())]
+    if getattr(runner.config, "multiplex_profiles", False):
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+            homes = list(profiles_to_serve(multiplex=True))
+        except Exception as exc:
+            logger.error("Could not resolve multiplex cron profile homes: %s", exc)
+            homes = []
+
+    supervisors = []
+    for profile_name, profile_home in homes:
+        home = Path(profile_home).expanduser().resolve()
+        runtime = OwnedSchedulerRuntime(
+            "gateway",
+            adapters=runner.adapters,
+            loop=loop,
+            can_dispatch=lambda: not (
+                runner._draining or runner._external_drain_active
+            ),
+            drain_timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT,
+            hermes_home=home,
+        )
+        thread = threading.Thread(
+            target=runtime.run,
+            args=(stop_event,),
+            daemon=True,
+            name=f"gateway-cron-supervisor-{profile_name}",
+        )
+        thread.start()
+        supervisors.append((runtime, thread))
+    return supervisors
+
+
 # Upper bound for cooperatively draining the cron ticker on shutdown. The cron
 # thread delivers via ``safe_schedule_threadsafe`` and blocks on
 # ``future.result(timeout=60)`` (see cron/scheduler.py::_deliver_result), so a
@@ -24248,53 +24288,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # historical in-process 60s ticker; an external provider (e.g. chronos)
     # may arm a schedule and return. Pass the event loop so cron delivery can
     # use live adapters (E2EE support).
-    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
-
-    # Multiplex profiles: tell the built-in ticker which profile homes to
-    # tick so secondary-profile cron jobs actually fire (#69377).
-    # Without this, only the process-global HERMES_HOME (default profile)
-    # is iterated and every secondary profile's cron store is silently
-    # ignored — jobs show as "scheduled" with a valid next_run_at but
-    # never execute because no ticker owns that store.
-    if (
-        isinstance(cron_provider, InProcessCronScheduler)
-        and getattr(runner.config, "multiplex_profiles", False)
-    ):
-        try:
-            from hermes_cli.profiles import profiles_to_serve
-
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if profile_homes:
-                cron_start_kwargs["profile_homes"] = profile_homes
-                logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
-                    len(profile_homes),
-                    [p[0] if isinstance(p, tuple) else p for p in profile_homes],
-                )
-        except Exception as exc:
-            logger.warning(
-                "Could not resolve profile homes for multiplex cron: %s",
-                exc,
-            )
-
-    # External cron providers own their remote scheduling contract. Only the
-    # in-process ticker polls local due jobs, so only it receives the local
-    # external-drain dispatch gate.
-    if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
-        )
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs=cron_start_kwargs,
-        daemon=True,
-        name="cron-scheduler",
+    cron_supervisors = _start_gateway_cron_schedulers(
+        runner, cron_stop, asyncio.get_running_loop()
     )
-    cron_thread.start()
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
@@ -24325,11 +24322,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
-    if runner.should_exit_with_failure:
-        if runner.exit_reason:
-            logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-        return False
-    
     # Stop cron scheduler + housekeeping cleanly.
     #
     # These MUST be awaited cooperatively, not join()ed. A cron delivery in
@@ -24340,18 +24332,29 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # silently dropped (#58818). Awaiting keeps the loop alive so the in-flight
     # delivery finishes before we tear down.
     cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
-        logger.warning(
-            "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
-            "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+    cron_exit_results = await asyncio.gather(
+        *(
+            _await_thread_exit(
+                cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT
+            )
+            for _runtime, cron_thread in cron_supervisors
         )
+    )
+    for exited in cron_exit_results:
+        if not exited:
+            logger.warning(
+                "Cron supervisor did not exit within %.0fs; ownership remains "
+                "held until provider and in-flight jobs drain.",
+                _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+            )
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )
+
+    if runner.should_exit_with_failure:
+        if runner.exit_reason:
+            logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+        return False
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()

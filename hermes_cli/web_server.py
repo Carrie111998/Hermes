@@ -13,6 +13,7 @@ import contextlib
 from contextlib import asynccontextmanager, contextmanager
 
 import asyncio
+import contextvars
 import atexit
 import base64
 import binascii
@@ -134,6 +135,8 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
+_DESKTOP_CRON_SHUTDOWN_TIMEOUT = 65.0
+_HOSTED_CRON_FIRE = contextvars.ContextVar("hosted_cron_fire", default=False)
 
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
@@ -166,6 +169,45 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     provider = resolve_cron_scheduler()
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
     provider.start(stop_event, interval=interval)
+
+
+def _start_desktop_cron_scheduler_if_owned():
+    """Start Desktop's dynamically yielding exact-home scheduler supervisor."""
+    if os.getenv("HERMES_DESKTOP") != "1":
+        return None, None, None
+    from cron.scheduler_runtime import OwnedSchedulerRuntime
+    from gateway.status import is_gateway_runtime_lock_active
+
+    stop = threading.Event()
+    runtime = OwnedSchedulerRuntime(
+        "desktop",
+        gateway_is_running=is_gateway_runtime_lock_active,
+        drain_timeout=_DESKTOP_CRON_SHUTDOWN_TIMEOUT,
+    )
+    thread = threading.Thread(
+        target=runtime.run, args=(stop,), daemon=True, name="desktop-cron-supervisor"
+    )
+    thread.start()
+    return runtime, stop, thread
+
+
+async def _stop_desktop_cron_scheduler(
+    _runtime, stop, thread, *, timeout=_DESKTOP_CRON_SHUTDOWN_TIMEOUT
+):
+    """Signal shutdown and wait boundedly without blocking the event loop."""
+    stop.set()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while thread.is_alive() and loop.time() < deadline:
+        await asyncio.sleep(0.1)
+    if thread.is_alive():
+        _log.warning(
+            "Desktop cron did not drain within %.0fs; ownership remains held "
+            "until drain or process death.",
+            timeout,
+        )
+        return False
+    return True
 
 
 def _warm_gateway_module() -> None:
@@ -206,17 +248,7 @@ async def _lifespan(app: "FastAPI"):
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
     # dashboard` is unaffected — it relies on its own gateway.
-    cron_stop: "threading.Event | None" = None
-    cron_thread: "threading.Thread | None" = None
-    if os.getenv("HERMES_DESKTOP") == "1":
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+    cron_runtime, cron_stop, cron_thread = _start_desktop_cron_scheduler_if_owned()
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
@@ -236,8 +268,8 @@ async def _lifespan(app: "FastAPI"):
         selftest_task.cancel()
         auto_archive_task.cancel()
         await PTY_REGISTRY.close_all()
-        if cron_stop is not None:
-            cron_stop.set()
+        if cron_runtime is not None and cron_stop is not None and cron_thread is not None:
+            await _stop_desktop_cron_scheduler(cron_runtime, cron_stop, cron_thread)
 
 
 def _get_event_state(app: "FastAPI"):
@@ -3092,19 +3124,28 @@ async def get_status(profile: Optional[str] = None):
             up empty, so the timeout is paid at most once per request and only
             in the cross-container case that needs it.
             """
+            deadline = time.monotonic() + _GATEWAY_HEALTH_ROUTE_TIMEOUT
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(_probe_gateway_health)
                 try:
-                    return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
-                except concurrent.futures.TimeoutError:
-                    _log.warning(
-                        "/api/status gateway health probe exceeded %.2fs; "
-                        "using local status",
-                        _GATEWAY_HEALTH_ROUTE_TIMEOUT,
+                    result = future.result(
+                        timeout=max(0.0, deadline - time.monotonic())
                     )
-                    return False, None
+                    # Future.result(timeout=...) may return a completed result
+                    # after the deadline when the waiting thread was not
+                    # scheduled promptly. Never accept a late health result.
+                    if time.monotonic() <= deadline:
+                        return result
+                except concurrent.futures.TimeoutError:
+                    pass
                 except Exception:
                     return False, None
+                _log.warning(
+                    "/api/status gateway health probe exceeded %.2fs; "
+                    "using local status",
+                    _GATEWAY_HEALTH_ROUTE_TIMEOUT,
+                )
+                return False, None
 
         local_runtime = (
             read_runtime_status(path=profile_dir / "gateway_state.json")
@@ -12278,14 +12319,38 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
 
 
 def _find_cron_job_profile(job_id: str) -> Optional[str]:
+    matches: List[str] = []
     for profile in _cron_profile_dicts():
         name = str(profile.get("name") or "")
         if not name:
             continue
         jobs = _call_cron_for_profile(name, "list_jobs", True)
         if any(j.get("id") == job_id or j.get("name") == job_id for j in jobs):
-            return name
-    return None
+            matches.append(name)
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cron job reference is ambiguous across profiles: {job_id}",
+        )
+    return matches[0] if matches else None
+
+
+def _find_exact_cron_job_profile(job_id: str) -> Optional[str]:
+    """Resolve a hosted fire target by canonical ID, never by display name."""
+    matches: List[str] = []
+    for profile in _cron_profile_dicts():
+        name = str(profile.get("name") or "")
+        if not name:
+            continue
+        jobs = _call_cron_for_profile(name, "list_jobs", True)
+        if any(j.get("id") == job_id for j in jobs):
+            matches.append(name)
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cron job ID exists in multiple profiles: {job_id}",
+        )
+    return matches[0] if matches else None
 
 
 def _list_cron_jobs_sync(profile: str = "all"):
@@ -12569,7 +12634,11 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     """
     _profile_name, home = _cron_profile_home(profile)
     from cron import jobs as cron_jobs
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_runtime import (
+        borrow_scheduler_provider,
+        read_scheduler_ownership_policy_strict,
+    )
+    from cron.scheduler_provider import resolve_cron_scheduler_runtime_strict
     from hermes_constants import (
         reset_hermes_home_override,
         set_hermes_home_override,
@@ -12578,10 +12647,41 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     token = set_hermes_home_override(str(home))
     try:
         with cron_jobs.use_cron_store(home):
-            provider = resolve_cron_scheduler()
+            with borrow_scheduler_provider(hermes_home=home) as provider:
+                if provider is not None:
+                    return bool(provider.fire_due(job_id, adapters=None, loop=None))
+            # Hosted dashboards are the scale-to-zero callback surface. They
+            # may strictly resolve only the configured external provider; the
+            # builtin ticker must always remain behind ownership admission.
+            policy = read_scheduler_ownership_policy_strict(hermes_home=home)
+            if policy is None or policy.configured_provider == "builtin":
+                if not _HOSTED_CRON_FIRE.get():
+                    # Backward-compatible direct-helper seam. The public
+                    # hosted callback always sets strict_external_only=True.
+                    from cron.scheduler_provider import resolve_cron_scheduler
+
+                    return bool(
+                        resolve_cron_scheduler().fire_due(
+                            job_id, adapters=None, loop=None
+                        )
+                    )
+                return None
+            provider = resolve_cron_scheduler_runtime_strict(
+                policy.configured_provider
+            )
+            if provider is None:
+                return None
             return bool(provider.fire_due(job_id, adapters=None, loop=None))
     finally:
         reset_hermes_home_override(token)
+
+
+def _fire_hosted_cron_job_for_profile(profile: str, job_id: str) -> bool:
+    token = _HOSTED_CRON_FIRE.set(True)
+    try:
+        return _fire_cron_job_for_profile(profile, job_id)
+    finally:
+        _HOSTED_CRON_FIRE.reset(token)
 
 
 @app.post("/api/cron/fire")
@@ -12600,24 +12700,11 @@ async def cron_fire_webhook(request: Request):
     dashboard is the agent's always-reachable public HTTP surface on hosted
     deployments; the gateway may be idle/scaled down.
 
-    Returns 202 immediately and runs the job in the background so a long agent
-    turn never trips NAS's HTTP timeout.
+    Returns 202 only after the exact-profile provider has completed the
+    admitted fire/re-arm callback.  This is intentionally synchronous at the
+    acceptance boundary: there is no durable background-work queue here, so an
+    earlier acknowledgement could be lost during scale-to-zero suspension.
     """
-    from plugins.cron_providers.chronos.verify import get_fire_verifier
-
-    auth = request.headers.get("Authorization", "")
-    token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-
-    cfg = load_config()
-    claims = get_fire_verifier()(
-        token=token,
-        expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-        jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-        issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
-    )
-    if claims is None:
-        return JSONResponse({"error": "invalid fire token"}, status_code=401)
-
     try:
         body = await request.json()
     except Exception:
@@ -12626,20 +12713,61 @@ async def cron_fire_webhook(request: Request):
     if not job_id:
         return JSONResponse({"error": "missing job_id"}, status_code=400)
 
-    # _find_cron_job_profile walks every profile and lists its jobs (file
+    # _find_exact_cron_job_profile walks every profile and lists its jobs (file
     # I/O per profile) — run it off the event loop like the other cron
     # dashboard endpoints.
-    profile = await _run_cron_dashboard_io(_find_cron_job_profile, job_id)
+    profile = await _run_cron_dashboard_io(_find_exact_cron_job_profile, job_id)
     if not profile:
         # Job is gone (cancelled / completed) — nothing to fire. 200 so NAS
         # does not retry a fire that is intentionally absent.
         return JSONResponse({"status": "gone", "job_id": job_id}, status_code=200)
 
-    # Run in the background; the store CAS claim inside fire_due de-dupes a
-    # NAS/scheduler retry that arrives while this is in flight.
-    asyncio.create_task(
-        asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id)
-    )
+    # Authentication is profile-scoped.  Resolve and enter the exact home
+    # before reading verifier settings so a default-profile credential cannot
+    # authorize a worker-profile job.
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.cron_providers.chronos.verify import get_fire_verifier
+
+    _profile_name, profile_home = _cron_profile_home(profile)
+    home_token = set_hermes_home_override(str(profile_home))
+    try:
+        cfg = load_config()
+        auth = request.headers.get("Authorization", "")
+        fire_token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        claims = get_fire_verifier()(
+            token=fire_token,
+            expected_audience=cfg_get(
+                cfg, "cron", "chronos", "expected_audience", default=""
+            ),
+            jwks_or_key=cfg_get(
+                cfg, "cron", "chronos", "nas_jwks_url", default=""
+            )
+            or None,
+            issuer=cfg_get(
+                cfg, "cron", "chronos", "portal_url", default=""
+            )
+            or None,
+        )
+    finally:
+        reset_hermes_home_override(home_token)
+    if claims is None:
+        return JSONResponse({"error": "invalid fire token"}, status_code=401)
+
+    try:
+        fired = await asyncio.to_thread(
+            _fire_hosted_cron_job_for_profile,
+            profile,
+            job_id,
+        )
+    except Exception:
+        logger.exception("Hosted cron fire failed for job %s", job_id)
+        return JSONResponse(
+            {"error": "scheduler execution unavailable"}, status_code=503
+        )
+    if fired is None:
+        return JSONResponse(
+            {"error": "scheduler ownership unavailable"}, status_code=503
+        )
     return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
 
 
