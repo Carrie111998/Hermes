@@ -11,10 +11,14 @@
     "fix": "npm run lint:fix"
   },
   "devDependencies": {
-    "eslint": "^9.39.4",
     "@types/plist": "^3.0.5",
+    "eslint": "^10.8.0",
     "plist": "^3.1.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "react-router-dom": "^7.18.1",
+    "react-router": "^7.18.1"
   }
 }
