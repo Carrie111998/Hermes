@@ -2103,6 +2103,7 @@ def _resolve_piper_voice_path(voice: str, download_dir: Path) -> str:
              "--download-dir", str(download_dir)],
             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300,
             stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(

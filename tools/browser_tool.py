@@ -4690,6 +4690,7 @@ def _maybe_autoinstall_chromium() -> bool:
             text=True, encoding='utf-8', errors='replace',
             timeout=600,
             env=_build_browser_env(),
+            creationflags=windows_hide_flags(),
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("browser: Chromium auto-install failed to start: %s", e)

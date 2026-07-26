@@ -27,7 +27,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, windows_hide_flags
 from hermes_constants import (
     find_node_executable,
     get_hermes_dir,
@@ -225,6 +225,7 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
                 timeout=10,
+                creationflags=windows_hide_flags(),
             )
         except FileNotFoundError:
             if force:
@@ -350,7 +351,8 @@ def check_whatsapp_requirements() -> bool:
             [_node, "--version"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
-            timeout=5
+            timeout=5,
+            creationflags=windows_hide_flags(),
         )
         return result.returncode == 0
     except Exception:
@@ -552,6 +554,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         text=True, encoding='utf-8', errors='replace',
                         timeout=npm_install_timeout,
                         env=with_hermes_node_path(),
+                        creationflags=windows_hide_flags(),
                     )
                     if install_result.returncode != 0:
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
