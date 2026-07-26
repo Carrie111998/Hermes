@@ -20567,6 +20567,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
 
+            # Discord has an additive reaction surface for compact tool
+            # progress.  Queue the emoji on the existing progress worker; if
+            # the active adapter supports this hook, do not also create a
+            # written tool-progress bubble.
+            _adapter_for_reactions = self.adapters.get(source.platform)
+            _reaction_only_progress = callable(
+                getattr(_adapter_for_reactions, "add_tool_progress_reaction_by_id", None)
+            )
+            progress_queue.put(("__tool_reaction__", emoji))
+            if _reaction_only_progress:
+                return
+
             # Markdown-capable platforms render a terminal command as a fenced
             # code block instead of the compact `terminal: "cmd…"` preview.
             # Gated on the adapter's ``supports_code_blocks`` capability so
@@ -20970,6 +20982,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             continue
                     except Exception:
                         pass
+
+                    if isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__tool_reaction__":
+                        emoji = str(raw[1] or "")
+                        if emoji:
+                            hook = getattr(adapter, "add_tool_progress_reaction_by_id", None)
+                            if callable(hook):
+                                try:
+                                    result = hook(source.chat_id, event_message_id, emoji)
+                                    if inspect.isawaitable(result):
+                                        await result
+                                except Exception:
+                                    logger.debug("tool-progress reaction hook failed", exc_info=True)
+                        continue
 
                     # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":

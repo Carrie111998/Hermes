@@ -982,6 +982,15 @@ class DiscordAdapter(BasePlatformAdapter):
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
 
+        # Discord displays at most one copy of a given emoji per bot account
+        # on a message.  Keep counts per originating message so repeat tool
+        # calls use visible related reactions instead of silently no-oping.
+        self._tool_progress_reaction_counts: Dict[tuple[str, str], int] = {}
+        # The agent boundary carries inbound message IDs, while discord.py owns
+        # raw Message objects. Keep a small cache so tool reactions do not make
+        # one REST fetch per tool call.
+        self._tool_progress_messages: Dict[str, Any] = {}
+
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None
     ) -> Any:
@@ -2829,6 +2838,11 @@ class DiscordAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
+        message_id = str(getattr(message, "id", None) or getattr(event, "message_id", None) or "")
+        if message_id and hasattr(message, "add_reaction"):
+            self._tool_progress_messages[message_id] = message
+            while len(self._tool_progress_messages) > 256:
+                self._tool_progress_messages.pop(next(iter(self._tool_progress_messages)))
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
             acked = await self._add_reaction(message, "👀")
@@ -2854,6 +2868,65 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._add_reaction(message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
+        message_id = str(getattr(message, "id", None) or getattr(event, "message_id", None) or "")
+        if message_id:
+            self._tool_progress_messages.pop(message_id, None)
+
+    async def add_tool_progress_reaction(self, raw_message: Any, emoji: str) -> bool:
+        """Add a tool-progress reaction to the initiating Discord message."""
+        if not self._reactions_enabled() or not emoji or not hasattr(raw_message, "add_reaction"):
+            return False
+        message_id = str(getattr(raw_message, "id", None) or id(raw_message))
+        key = (message_id, emoji)
+        count = self._tool_progress_reaction_counts.get(key, 0)
+        self._tool_progress_reaction_counts[key] = count + 1
+        return await self._add_reaction(raw_message, self._tool_progress_variant(emoji, count))
+
+    async def add_tool_progress_reaction_by_id(
+        self, chat_id: str, message_id: Optional[str], emoji: str
+    ) -> bool:
+        """Fetch an inbound Discord message and add a compact tool reaction.
+
+        The gateway's current agent boundary retains only the inbound message
+        ID, not the discord.py ``Message`` object.  Fetch on the adapter side
+        rather than widening that boundary with platform-owned raw objects.
+        """
+        if not self._reactions_enabled() or not chat_id or not message_id or not self._client:
+            return False
+        message = self._tool_progress_messages.get(str(message_id))
+        if message is None:
+            try:
+                channel = self._client.get_channel(int(chat_id))
+                if channel is None:
+                    channel = await self._client.fetch_channel(int(chat_id))
+                fetch_message = getattr(channel, "fetch_message", None)
+                if not callable(fetch_message):
+                    return False
+                result = fetch_message(int(message_id))
+                if not inspect.isawaitable(result):
+                    return False
+                message = await result
+            except Exception as exc:
+                logger.debug("[%s] tool-progress message fetch failed: %s", self.name, exc)
+                return False
+        return await self.add_tool_progress_reaction(message, emoji)
+
+    @staticmethod
+    def _tool_progress_variant(emoji: str, count: int) -> str:
+        """Return a visible reaction for repeated tool uses on one message."""
+        variants = {
+            "👀": ["👀", "👁️", "🧐", "🔭", "📡"],
+            "📚": ["📚", "📘", "📗", "📙", "📕"],
+            "📖": ["📖", "📄", "📃", "📝", "📑"],
+            "💻": ["💻", "⌨️", "🖥️", "🖱️", "🛠️"],
+            "🔎": ["🔎", "🔍", "🕵️", "🧭", "📌"],
+            "⚙️": ["⚙️", "🔧", "🧰", "🪛", "🧱"],
+        }
+        overflow = ["2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        sequence = variants.get(emoji, [emoji])
+        if count < len(sequence):
+            return sequence[count]
+        return overflow[(count - len(sequence)) % len(overflow)]
 
     async def send(
         self,

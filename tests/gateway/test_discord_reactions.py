@@ -246,3 +246,66 @@ async def test_on_processing_complete_cancelled_removes_eyes_without_terminal_re
 
     raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
     raw_message.add_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_add_tool_progress_reaction_uses_tool_emoji_on_raw_message(adapter):
+    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
+
+    assert await adapter.add_tool_progress_reaction(raw_message, "📋") is True
+    raw_message.add_reaction.assert_awaited_once_with("📋")
+
+
+@pytest.mark.asyncio
+async def test_add_tool_progress_reaction_by_id_fetches_inbound_message(adapter):
+    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=raw_message))
+    adapter._client.get_channel = lambda _id: channel
+
+    assert await adapter.add_tool_progress_reaction_by_id("123", "456", "📋") is True
+    channel.fetch_message.assert_awaited_once_with(456)
+    raw_message.add_reaction.assert_awaited_once_with("📋")
+
+
+@pytest.mark.asyncio
+async def test_add_tool_progress_reaction_by_id_uses_processing_cache(adapter):
+    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
+    adapter._tool_progress_messages["456"] = raw_message
+
+    assert await adapter.add_tool_progress_reaction_by_id("123", "456", "📋") is True
+    adapter._client.fetch_channel.assert_not_awaited()
+    raw_message.add_reaction.assert_awaited_once_with("📋")
+
+
+@pytest.mark.asyncio
+async def test_add_tool_progress_reaction_rotates_repeated_discord_emojis(adapter):
+    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
+
+    for _ in range(4):
+        assert await adapter.add_tool_progress_reaction(raw_message, "💻") is True
+
+    assert [call.args[0] for call in raw_message.add_reaction.await_args_list] == [
+        "💻", "⌨️", "🖥️", "🖱️"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_add_tool_progress_reaction_tracks_counts_per_message(adapter):
+    first = SimpleNamespace(id=123, add_reaction=AsyncMock())
+    second = SimpleNamespace(id=456, add_reaction=AsyncMock())
+
+    assert await adapter.add_tool_progress_reaction(first, "📚") is True
+    assert await adapter.add_tool_progress_reaction(first, "📚") is True
+    assert await adapter.add_tool_progress_reaction(second, "📚") is True
+
+    assert [call.args[0] for call in first.add_reaction.await_args_list] == ["📚", "📘"]
+    second.add_reaction.assert_awaited_once_with("📚")
+
+
+@pytest.mark.asyncio
+async def test_add_tool_progress_reaction_respects_disabled_reactions(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    raw_message = SimpleNamespace(add_reaction=AsyncMock())
+
+    assert await adapter.add_tool_progress_reaction(raw_message, "✍️") is False
+    raw_message.add_reaction.assert_not_awaited()
