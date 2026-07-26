@@ -58,6 +58,9 @@ python3 scripts/iyari_transform.py        <archivos>   # aplica in-place
    **SIN Co-Authored-By ni trailers**. Autor: `Digital Services LLC <info@digitalservices.app>`.
 7. **Push** a `main` y dar el **hash** del commit.
 
+**Norma:** la actualización de la sección "Progreso" de este `CLAUDE.md` va **DENTRO
+del commit de cada lote**, nunca en un commit suelto (excepción histórica: lote 4).
+
 Lotes de 20-50 archivos. "Si dudas, déjalo y me lo señalas": marcar ambigüedades en
 el resumen en vez de decidir a ciegas (p.ej. atribución de Nous Portal a su dueño,
 enlaces a recursos comunitarios externos como el Discord de Nous).
@@ -66,7 +69,10 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
 
 - Lote 1 `51b8f2874` + Lote 2 `017f84414`: `features/` + `getting-started/` (completos).
 - Lote 3 `73a4a14e1`: `guides/` (completo).
-- Lote reference/: aplicado, pendiente de OK del usuario al escribir esto.
+- Lote 4 `70cac80a0`: `reference/` (12 archivos, completo) + ancla `desktop.md`. Casos
+  faq.md decididos: L20 (atribución de Nous Portal a Nous Research) se dejó intacto;
+  L844 (antes Discord de Nous) ahora apunta a `github.com/digital-services-llc/iyari`
+  + `team@iyari.io`.
 - Pendiente: `user-guide/` resto (~270 archivos, dividir), `developer-guide/`,
   `integrations/`, `docs/` sueltos, `userStories.json`, `configuration.md` (~2132 líneas).
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
