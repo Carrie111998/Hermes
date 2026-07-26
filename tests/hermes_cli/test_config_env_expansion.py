@@ -196,3 +196,115 @@ class TestLoadCliConfigExpansion:
         config = load_cli_config()
 
         assert config["auxiliary"]["vision"]["api_key"] == "${UNSET_CLI_VAR_ABC}"
+
+
+class TestGatewayConfigExpandsEnvVars:
+    """Regression tests for issue #72096: gateway/config.py::load_gateway_config()
+    read config.yaml directly with yaml.safe_load() and never called
+    _expand_env_vars(), unlike hermes_cli.config.load_config() and the
+    existing expansion call sites in gateway/run.py. platforms.<name>.extra
+    values therefore kept literal ${VAR} text, which gateway/slash_access.py's
+    policy_from_extra() then treated as a real (unmatchable) admin id --
+    silently enabling slash-command gating with an admin list nothing could
+    satisfy.
+    """
+
+    def test_platform_extra_admin_list_var_is_expanded(self, monkeypatch, tmp_path):
+        from gateway.config import load_gateway_config, Platform
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "    token: xxx\n"
+            "    extra:\n"
+            "      group_allow_admin_from:\n"
+            "        - '${TELEGRAM_ADMIN_ID}'\n"
+            "      group_user_allowed_commands:\n"
+            "        - status\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_ADMIN_ID", "555444333")
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.TELEGRAM].extra
+        assert extra["group_allow_admin_from"] == ["555444333"], (
+            "The ${TELEGRAM_ADMIN_ID} reference must resolve to the real "
+            "env var value, not stay as the literal string"
+        )
+
+    def test_platform_extra_var_used_in_slash_access_policy(self, monkeypatch, tmp_path):
+        """End-to-end: the exact reported scenario -- resolving the
+        reference must let the configured admin actually match, rather
+        than locking every user out of every tiered slash command."""
+        from gateway.config import load_gateway_config, Platform
+        from gateway.slash_access import policy_from_extra
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "    token: xxx\n"
+            "    extra:\n"
+            "      group_allow_admin_from:\n"
+            "        - '${TELEGRAM_ADMIN_ID}'\n"
+            "      group_user_allowed_commands:\n"
+            "        - status\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_ADMIN_ID", "555444333")
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.TELEGRAM].extra
+        policy = policy_from_extra(extra, "group")
+
+        assert policy.enabled is True
+        assert policy.is_admin("555444333") is True, (
+            "The admin's real id must match the resolved policy -- this "
+            "was the silent-lockout bug: the admin got refused with the "
+            "same message as a non-admin"
+        )
+
+    def test_unresolved_var_reference_does_not_enable_impossible_admin_gate(
+        self, monkeypatch, tmp_path
+    ):
+        """If the env var is genuinely unset (operator error, or a var name
+        typo), the reference stays unresolved after loading -- the
+        defense-in-depth filter in gateway.slash_access._coerce_id_list()
+        must then treat it as no admin configured (policy disabled), not
+        as an admin list nothing can ever match."""
+        from gateway.config import load_gateway_config, Platform
+        from gateway.slash_access import policy_from_extra
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "    token: xxx\n"
+            "    extra:\n"
+            "      group_allow_admin_from:\n"
+            "        - '${TELEGRAM_ADMIN_ID_TYPO}'\n"
+            "      group_user_allowed_commands:\n"
+            "        - status\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("TELEGRAM_ADMIN_ID_TYPO", raising=False)
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.TELEGRAM].extra
+        policy = policy_from_extra(extra, "group")
+
+        assert policy.enabled is False, (
+            "An admin list consisting only of an unresolved ${VAR} must "
+            "not silently enable gating with an admin nothing can match"
+        )
