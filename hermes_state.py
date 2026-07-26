@@ -2878,17 +2878,31 @@ class SessionDB:
         # is matched against a Literal-validated allow-list before SQL
         # embedding so untrusted input cannot reach the SQL string.
         _VALID_COST_STATUSES = ("actual", "estimated", "included", "unknown")
-        _safe_new_status = (
-            cost_status if cost_status in _VALID_COST_STATUSES else "estimated"
-        )
-        _cost_status_sticky_sql = (
-            "cost_status = CASE "
-            "WHEN cost_status = 'actual' OR '{new}' = 'actual' THEN 'actual' "
-            "WHEN cost_status = 'included' OR '{new}' = 'included' THEN 'included' "
-            "WHEN cost_status = 'estimated' OR '{new}' = 'estimated' THEN 'estimated' "
-            "WHEN cost_status = 'unknown' OR '{new}' = 'unknown' THEN 'unknown' "
-            "END"
-        ).format(new=_safe_new_status)
+        # When cost_status is None (token-only updates, no new cost info),
+        # preserve the existing row value — matching the original COALESCE
+        # no-op behaviour and the Python sticky_cost_status() helper.
+        # Untrusted / unrecognised non-None values fall back to "estimated"
+        # as a safe conservative label rather than an invalid literal.
+        if cost_status is not None and cost_status in _VALID_COST_STATUSES:
+            _cost_status_sticky_sql = (
+                "cost_status = CASE "
+                "WHEN cost_status = 'actual' OR '{new}' = 'actual' THEN 'actual' "
+                "WHEN cost_status = 'included' OR '{new}' = 'included' THEN 'included' "
+                "WHEN cost_status = 'estimated' OR '{new}' = 'estimated' THEN 'estimated' "
+                "WHEN cost_status = 'unknown' OR '{new}' = 'unknown' THEN 'unknown' "
+                "END"
+            ).format(new=cost_status)
+        elif cost_status is None:
+            _cost_status_sticky_sql = "cost_status = COALESCE(NULL, cost_status)"
+        else:
+            _cost_status_sticky_sql = (
+                "cost_status = CASE "
+                "WHEN cost_status = 'actual' OR 'estimated' = 'actual' THEN 'actual' "
+                "WHEN cost_status = 'included' OR 'estimated' = 'included' THEN 'included' "
+                "WHEN cost_status = 'estimated' OR 'estimated' = 'estimated' THEN 'estimated' "
+                "WHEN cost_status = 'unknown' OR 'estimated' = 'unknown' THEN 'unknown' "
+                "END"
+            )
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -3078,17 +3092,31 @@ class SessionDB:
         # is matched against a Literal-validated allow-list before SQL
         # embedding so untrusted input cannot reach the SQL string.
         _VALID_COST_STATUSES = ("actual", "estimated", "included", "unknown")
-        _safe_new_status = (
-            cost_status if cost_status in _VALID_COST_STATUSES else "estimated"
-        )
-        _cost_status_sticky_sql = (
-            "cost_status = CASE "
-            "WHEN cost_status = 'actual' OR '{new}' = 'actual' THEN 'actual' "
-            "WHEN cost_status = 'included' OR '{new}' = 'included' THEN 'included' "
-            "WHEN cost_status = 'estimated' OR '{new}' = 'estimated' THEN 'estimated' "
-            "WHEN cost_status = 'unknown' OR '{new}' = 'unknown' THEN 'unknown' "
-            "END"
-        ).format(new=_safe_new_status)
+        # When cost_status is None (token-only updates, no new cost info),
+        # preserve the existing row value — matching the original COALESCE
+        # no-op behaviour and the Python sticky_cost_status() helper.
+        # Untrusted / unrecognised non-None values fall back to "estimated"
+        # as a safe conservative label rather than an invalid literal.
+        if cost_status is not None and cost_status in _VALID_COST_STATUSES:
+            _cost_status_sticky_sql = (
+                "cost_status = CASE "
+                "WHEN cost_status = 'actual' OR '{new}' = 'actual' THEN 'actual' "
+                "WHEN cost_status = 'included' OR '{new}' = 'included' THEN 'included' "
+                "WHEN cost_status = 'estimated' OR '{new}' = 'estimated' THEN 'estimated' "
+                "WHEN cost_status = 'unknown' OR '{new}' = 'unknown' THEN 'unknown' "
+                "END"
+            ).format(new=cost_status)
+        elif cost_status is None:
+            _cost_status_sticky_sql = "cost_status = COALESCE(NULL, cost_status)"
+        else:
+            _cost_status_sticky_sql = (
+                "cost_status = CASE "
+                "WHEN cost_status = 'actual' OR 'estimated' = 'actual' THEN 'actual' "
+                "WHEN cost_status = 'included' OR 'estimated' = 'included' THEN 'included' "
+                "WHEN cost_status = 'estimated' OR 'estimated' = 'estimated' THEN 'estimated' "
+                "WHEN cost_status = 'unknown' OR 'estimated' = 'unknown' THEN 'unknown' "
+                "END"
+            )
 
         # Aux-task rows (task != '') must NOT inherit the session's main-loop
         # route: an aux call may use a completely different provider/model
@@ -3141,7 +3169,11 @@ class SessionDB:
                 reasoning_tokens or 0,
                 float(estimated_cost_usd or 0.0),
                 float(actual_cost_usd or 0.0),
-                cost_status,
+                # Sanitize the INSERT binding the same way the ON CONFLICT
+                # UPDATE CASE ladder does: valid statuses pass through, None
+                # stays None, unrecognised values fall back to "estimated".
+                cost_status if cost_status is None or cost_status in _VALID_COST_STATUSES
+                else "estimated",
                 cost_source,
                 now,
                 now,

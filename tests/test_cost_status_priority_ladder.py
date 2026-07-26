@@ -258,8 +258,23 @@ class TestSqlSessionsSummaryPriorityLadder:
         assert _sessions_row_cost_status(db, "s1") == "actual"
 
     def test_sessions_status_with_no_cost_status_input(self, db):
-        """When ``cost_status`` is None, the value falls through to 'estimated'."""
+        """When ``cost_status`` is None (token-only update with no new cost
+        info), the existing row value is preserved — matching the original
+        COALESCE no-op semantics and the Python sticky_cost_status() helper."""
         db.create_session("s1", source="cli")
+        # Establish a known status first.
+        db.update_token_counts(
+            "s1",
+            input_tokens=100, output_tokens=10,
+            model="m",
+            billing_provider="anthropic",
+            api_call_count=1,
+            estimated_cost_usd=0.10,
+            cost_status="actual",
+        )
+        assert _sessions_row_cost_status(db, "s1") == "actual"
+        # Now update with cost_status=None — should keep "actual", not
+        # downgrade to "estimated".
         db.update_token_counts(
             "s1",
             input_tokens=100, output_tokens=10,
@@ -269,7 +284,7 @@ class TestSqlSessionsSummaryPriorityLadder:
             estimated_cost_usd=0.10,
             cost_status=None,
         )
-        assert _sessions_row_cost_status(db, "s1") == "estimated"
+        assert _sessions_row_cost_status(db, "s1") == "actual"
 
     def test_sessions_status_with_unknown_literal_input(self, db):
         """When ``cost_status`` is an unrecognized literal (e.g. a typo),
