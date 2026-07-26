@@ -7515,6 +7515,44 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
 
     from datetime import datetime, timezone
 
+    # On Windows, untracked files whose names match reserved device names
+    # (CON, PRN, AUX, NUL, COM1-9, LPT1-9) break ``git stash --include-untracked``
+    # because Windows treats those names as system devices.  Remove them before
+    # stashing — they are usually 0-byte artefacts created by accidental
+    # redirections (e.g. ``echo x > nul`` run in a context that creates a real
+    # file instead of discarding to the NUL device).
+    if sys.platform == "win32":
+        import re
+        _WIN_RESERVED = re.compile(
+            r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$", re.IGNORECASE
+        )
+        untracked = subprocess.run(
+            git_cmd + ["ls-files", "--others", "--exclude-standard"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        removed_any = False
+        for line in untracked.stdout.splitlines():
+            name = Path(line).name
+            if _WIN_RESERVED.match(name):
+                # Use the \\?\ prefix to bypass Windows' reserved-name check
+                # so we can actually delete the file.
+                abs_path = cwd / line
+                try:
+                    os.remove(r"\\?\" + str(abs_path))
+                    removed_any = True
+                except OSError:
+                    pass
+        if removed_any:
+            print(
+                "  ⚠ Removed Windows reserved-device-name file(s) from the "
+                "working tree before stashing."
+            )
+
     stash_name = datetime.now(timezone.utc).strftime(
         "hermes-update-autostash-%Y%m%d-%H%M%S"
     )
