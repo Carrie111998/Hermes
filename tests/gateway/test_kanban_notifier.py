@@ -69,6 +69,28 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def _board_notify_subs():
+    conn = kb.connect()
+    try:
+        return kb.list_board_notify_subs(conn)
+    finally:
+        conn.close()
+
+
+def _unseen_board_terminal_events(chat_id="chat-1"):
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_board_sub(
+            conn,
+            platform="telegram",
+            chat_id=chat_id,
+            kinds=kb.NOTIFY_TERMINAL_EVENT_KINDS,
+        )
+        return events
+    finally:
+        conn.close()
+
+
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
     db_path = tmp_path / "shared-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -307,3 +329,142 @@ def _unseen_terminal_events_for(tid, chat_id):
         return events
     finally:
         conn.close()
+
+
+def test_kanban_notifier_board_subscription_filters_kinds_and_persists(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "board-subscription.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        done_tid = kb.create_task(conn, title="done task", assignee="worker-a")
+        blocked_tid = kb.create_task(conn, title="blocked task", assignee="worker-b")
+        crashed_tid = kb.create_task(conn, title="crashed task", assignee="worker-c")
+        kb.add_board_notify_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["completed", "blocked"],
+        )
+        kb.complete_task(conn, done_tid, summary="done")
+        kb.block_task(conn, blocked_tid, reason="needs input")
+        kb._append_event(conn, crashed_tid, kind="crashed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2
+    texts = [item["text"] for item in adapter.sent]
+    assert any(done_tid in text and "done" in text.lower() for text in texts)
+    assert any(blocked_tid in text and "blocked" in text.lower() for text in texts)
+    assert all(crashed_tid not in text for text in texts)
+
+    subs = _board_notify_subs()
+    assert len(subs) == 1
+    assert subs[0]["kinds"] == ["completed", "blocked"]
+
+
+def test_kanban_notifier_board_claim_rewinds_and_retries_after_send_failure(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "board-send-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="retry board event", assignee="worker")
+        kb.add_board_notify_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    failing_adapter = FailingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(failing_adapter)))
+
+    assert failing_adapter.attempts == 1
+    assert [ev.kind for ev in _unseen_board_terminal_events()] == ["completed"]
+
+    retry_adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(retry_adapter)))
+
+    assert len(retry_adapter.sent) == 1
+    assert tid in retry_adapter.sent[0]["text"]
+    assert _unseen_board_terminal_events() == []
+
+
+def test_kanban_notifier_board_claim_prevents_second_watcher_send(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "board-single-owner.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="one board delivery", assignee="worker")
+        kb.add_board_notify_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    first_adapter = RecordingAdapter()
+    second_adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(first_adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(second_adapter)))
+
+    assert len(first_adapter.sent) == 1
+    assert tid in first_adapter.sent[0]["text"]
+    assert second_adapter.sent == []
+
+
+def test_kanban_notifier_board_owning_profile_no_default_fallback(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "board-profile-no-fallback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        kb.add_board_notify_sub(
+            conn,
+            platform="telegram",
+            chat_id="chat-beta",
+            notifier_profile="beta",
+        )
+        tid = kb.create_task(conn, title="owned by beta", assignee="worker")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    default_adapter = RecordingAdapter()
+    other_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: default_adapter}
+    runner._profile_adapters = {"beta": {Platform.DISCORD: other_adapter}}
+    runner._kanban_sub_fail_counts = {}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert default_adapter.sent == []
+    assert other_adapter.sent == []
+    assert [ev.kind for ev in _unseen_board_terminal_events("chat-beta")] == [
+        "completed"
+    ]
