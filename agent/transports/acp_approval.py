@@ -357,14 +357,26 @@ def _make_gateway_request_callback(
         **kwargs,
     ) -> str:
         tool_name = "acp_agent"
-        reason = f"{command_label}: {description}" if description else command_label
-        if kind:
-            reason = f"[{kind}] {reason}"
+        # Show the meaningful content (tool title / unwrapped command) inside
+        # the approval prompt's fenced code block instead of a synthetic
+        # "<acp_agent> (plugin approval rule)" placeholder. ``command_label``
+        # is already normalized by the caller (ACP title, Codex apply_patch
+        # summary, …) and carries no raw arguments/secrets, so it is safe to
+        # display. An explicitly-unwrapped ``command`` kwarg wins for execute
+        # kinds that slip through here without a command to guard.
+        display_target = (kwargs.get("command") or command_label or "").strip()
+        # Keep `reason` a short summary — the detail now lives in the fenced
+        # block via display_target, so we only need the kind + description.
+        if description:
+            reason = f"[{kind}] {description}" if kind else description
+        else:
+            reason = f"[{kind}]" if kind else (command_label or "ACP permission request")
 
         try:
             result = request_fn(
                 tool_name=tool_name,
                 reason=reason,
+                display_target=display_target or None,
             )
         except Exception:
             logger.warning(

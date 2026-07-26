@@ -2949,6 +2949,7 @@ def request_tool_approval(
     reason: str,
     *,
     rule_key: str = "",
+    display_target: Optional[str] = None,
     approval_callback=None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
@@ -2975,6 +2976,13 @@ def request_tool_approval(
             on the same tool persist independently (answering ``[a]lways`` to
             "write to ~/.ssh" does NOT auto-approve a later "send email" rule
             on the same tool).
+        display_target: Optional content shown inside the fenced code block of
+            the approval prompt (the command, a file path, a tool title…). When
+            omitted/empty, a synthetic label ``"<{tool_name}> (plugin approval
+            rule)"`` is used. Callers that already hold meaningful content
+            (e.g. the ACP bridge with the tool title or unwrapped command)
+            should pass it here so the user sees what is actually being
+            approved instead of a generic placeholder.
         approval_callback: Optional CLI callback for interactive prompts
             (same contract as ``check_dangerous_command``).
 
@@ -3003,9 +3011,12 @@ def request_tool_approval(
     # session/permanent allowlist machinery as command patterns, namespaced
     # to avoid ever colliding with a real command pattern key.
     pattern_key = f"plugin_rule:{key_suffix}"
-    # A synthetic "command" string for the display/allowlist layer. It never
-    # executes; it only labels the gate. Namespaced identically.
-    display_target = f"<{tool_name}> (plugin approval rule)"
+    # A "command" string for the display/allowlist layer. It never executes;
+    # it only labels the gate. A caller-supplied display_target (e.g. the ACP
+    # bridge passing the tool title or unwrapped command) wins so the user
+    # sees meaningful content in the fenced code block; otherwise fall back to
+    # a synthetic namespaced label.
+    display_target = display_target or f"<{tool_name}> (plugin approval rule)"
 
     return _run_approval_gate(
         pattern_key=pattern_key,
