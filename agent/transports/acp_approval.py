@@ -365,12 +365,17 @@ def _make_gateway_request_callback(
         # display. An explicitly-unwrapped ``command`` kwarg wins for execute
         # kinds that slip through here without a command to guard.
         display_target = (kwargs.get("command") or command_label or "").strip()
-        # Keep `reason` a short summary — the detail now lives in the fenced
-        # block via display_target, so we only need the kind + description.
+        # `reason` is the human-facing message rendered in the prompt. The
+        # plugin format adapter now supplies a short, readable ``description``
+        # ("Execute shell command", "Modify /path/file.py", …) aligned with
+        # the native dangerous-command style; fall back to ``command_label``
+        # / kind only for legacy callers that omit the adapter.
         if description:
-            reason = f"[{kind}] {description}" if kind else description
+            reason = description
+        elif command_label:
+            reason = command_label
         else:
-            reason = f"[{kind}]" if kind else (command_label or "ACP permission request")
+            reason = f"ACP agent permission request ({kind})" if kind else "ACP agent permission request"
 
         try:
             result = request_fn(
