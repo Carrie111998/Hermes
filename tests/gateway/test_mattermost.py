@@ -236,6 +236,79 @@ class TestMattermostFormatMessage:
         assert "http://b.com/2.png" in result
 
 
+class TestMattermostHiggsfieldBypassDetection:
+    def test_detects_nano_banana_pro_job_type(self):
+        from plugins.platforms.mattermost.adapter import _detect_higgsfield_image_job_type
+
+        assert _detect_higgsfield_image_job_type("모델: Nano Banana 2 Pro") == "nano_banana_pro"
+
+    def test_detects_seedream_job_type(self):
+        from plugins.platforms.mattermost.adapter import _detect_higgsfield_image_job_type
+
+        assert _detect_higgsfield_image_job_type("Seedream 4.5로 얼굴 유지") == "seedream_v4_5"
+
+    def test_image_edit_requires_image_attachment(self):
+        from plugins.platforms.mattermost.adapter import _looks_like_higgsfield_image_edit_request
+
+        text = "Nano Banana 2 Pro 요청: 옷만 정장으로 변경"
+        assert _looks_like_higgsfield_image_edit_request(text, has_image=True) is True
+        assert _looks_like_higgsfield_image_edit_request(text, has_image=False) is False
+
+    def test_extracts_aspect_and_resolution(self):
+        from plugins.platforms.mattermost.adapter import _extract_higgsfield_generation_params
+
+        assert _extract_higgsfield_generation_params("비율: 1:1 해상도: 1K") == ("1:1", "1k")
+
+    def test_confirmation_and_cancel_words(self):
+        from plugins.platforms.mattermost.adapter import _is_higgsfield_cancel, _is_higgsfield_confirmation
+
+        assert _is_higgsfield_confirmation("진행해줘") is True
+        assert _is_higgsfield_confirmation("네") is True
+        assert _is_higgsfield_cancel("취소") is True
+
+    def test_extracts_result_url_from_dict_json(self):
+        from plugins.platforms.mattermost.adapter import _extract_higgsfield_result_url
+
+        output = json.dumps({"result_url": "https://cdn.example.com/result.png"})
+        assert _extract_higgsfield_result_url(output) == "https://cdn.example.com/result.png"
+
+    def test_extracts_job_id_from_plain_uuid(self):
+        from plugins.platforms.mattermost.adapter import _extract_higgsfield_job_id
+
+        assert _extract_higgsfield_job_id("0a3144b3-985f-43b1-84b6-f2564896b854\n") == "0a3144b3-985f-43b1-84b6-f2564896b854"
+
+    @pytest.mark.asyncio
+    async def test_uuid_output_fetches_job_before_sending_image(self):
+        adapter = _make_adapter()
+        pending = {
+            "job_type": "nano_banana_pro",
+            "prompt": "edit",
+            "image_path": "C:/tmp/input.png",
+            "aspect": "1:1",
+            "resolution": "1k",
+            "cost": "2 credits",
+        }
+
+        async def fake_cli(args, *, timeout=600.0):
+            if args[:3] == ["generate", "create", "nano_banana_pro"]:
+                return 0, "0a3144b3-985f-43b1-84b6-f2564896b854\n", ""
+            if args == ["generate", "get", "0a3144b3-985f-43b1-84b6-f2564896b854", "--json"]:
+                return 0, json.dumps({"result_url": "https://cdn.example.com/result.png"}), ""
+            raise AssertionError(args)
+
+        adapter._run_higgsfield_cli = fake_cli
+        adapter.send = AsyncMock()
+        adapter.send_image = AsyncMock()
+
+        await adapter._run_pending_higgsfield_edit("channel_1", "", pending)
+
+        adapter.send.assert_not_called()
+        adapter.send_image.assert_awaited_once()
+        args, kwargs = adapter.send_image.call_args
+        assert args[:2] == ("channel_1", "https://cdn.example.com/result.png")
+        assert "Higgsfield 이미지 편집이 완료되었습니다" in kwargs["caption"]
+
+
 class TestMattermostTruncateMessage:
     def setup_method(self):
         self.adapter = _make_adapter()
