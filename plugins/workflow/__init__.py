@@ -723,6 +723,12 @@ def _start_completion_watcher():
                         if data.get("processed_at"):
                             continue
 
+                        # Only process markers for this gateway's profile
+                        _my_profile = os.environ.get("HERMES_PROFILE") or "default"
+                        _marker_profile = data.get("profile") or "default"
+                        if _marker_profile != _my_profile:
+                            continue
+
                         platform_str = data.get("platform", "")
                         chat_id = data.get("chat_id", "")
                         thread_id = data.get("thread_id")
