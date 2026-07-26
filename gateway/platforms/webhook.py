@@ -37,19 +37,24 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
+from urllib.parse import urlparse
 
 try:
-    from aiohttp import web
+    from aiohttp import ClientSession, ClientTimeout, web
 
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
+    ClientSession = None  # type: ignore[assignment,misc]
+    ClientTimeout = None  # type: ignore[assignment,misc]
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
@@ -57,12 +62,14 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
 )
 from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,
 )
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +108,14 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+_CALLBACK_EVENT_TYPE = "hermes_webhook_completion"
+_CALLBACK_CONFIG_KEYS = {
+    "include_payload_fields",
+    "max_attempts",
+    "secret",
+    "timeout_seconds",
+    "url",
+}
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -210,6 +225,14 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(
             script_timeout_seconds=self._script_timeout_seconds
         )
+        self._callback_replay_task: Optional[asyncio.Task] = None
+        self._callback_replay_interval: int = int(
+            config.extra.get("callback_replay_interval_seconds", 60)
+        )
+        if not 10 <= self._callback_replay_interval <= 3600:
+            raise ValueError(
+                "[webhook] callback_replay_interval_seconds must be 10..3600"
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -252,6 +275,7 @@ class WebhookAdapter(BasePlatformAdapter):
                         f"deliver is '{deliver}'. Direct delivery requires a "
                         f"real target (telegram, discord, slack, github_comment, etc.)."
                     )
+            self._completion_callback_config(name, route)
 
         # client_max_size makes aiohttp enforce the cap on every read path,
         # including Transfer-Encoding: chunked bodies that carry no
@@ -303,6 +327,11 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
         self._mark_connected()
+        self._callback_replay_task = asyncio.create_task(
+            self._completion_callback_replay_loop()
+        )
+        self._background_tasks.add(self._callback_replay_task)
+        self._callback_replay_task.add_done_callback(self._background_tasks.discard)
 
         route_names = ", ".join(self._routes.keys()) or "(none configured)"
         logger.info(
@@ -314,6 +343,12 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        if self._callback_replay_task:
+            self._callback_replay_task.cancel()
+            await asyncio.gather(
+                self._callback_replay_task, return_exceptions=True
+            )
+            self._callback_replay_task = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -341,10 +376,14 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "log":
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
-            return SendResult(success=True)
+            result = SendResult(success=True)
+            self._record_completion_delivery(delivery, metadata, result)
+            return result
 
         if deliver_type == "github_comment":
-            return await self._deliver_github_comment(content, delivery)
+            result = await self._deliver_github_comment(content, delivery)
+            self._record_completion_delivery(delivery, metadata, result)
+            return result
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
@@ -356,14 +395,30 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         if self.gateway_runner and _is_known_platform:
-            return await self._deliver_cross_platform(
+            result = await self._deliver_cross_platform(
                 deliver_type, content, delivery
             )
+            self._record_completion_delivery(delivery, metadata, result)
+            return result
 
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
-        return SendResult(
+        result = SendResult(
             success=False, error=f"Unknown deliver type: {deliver_type}"
         )
+        self._record_completion_delivery(delivery, metadata, result)
+        return result
+
+    @staticmethod
+    def _record_completion_delivery(
+        delivery: dict,
+        metadata: Optional[Dict[str, Any]],
+        result: SendResult,
+    ) -> None:
+        """Track the final user-visible send, excluding interim status messages."""
+        if not (metadata or {}).get("notify"):
+            return
+        delivery["completion_delivery_attempted"] = True
+        delivery["completion_delivery_succeeded"] = bool(result.success)
 
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL.
@@ -550,6 +605,19 @@ class WebhookAdapter(BasePlatformAdapter):
         if route_config.get("enabled", True) is False:
             return web.json_response(
                 {"error": f"Route disabled: {route_name}"}, status=403
+            )
+
+        try:
+            callback_config = self._completion_callback_config(
+                route_name, route_config
+            )
+        except ValueError:
+            logger.exception(
+                "[webhook] Invalid completion callback configuration for route %s",
+                route_name,
+            )
+            return web.json_response(
+                {"error": "Completion callback is misconfigured"}, status=503
             )
 
         # ── Auth-before-body ─────────────────────────────────────
@@ -810,11 +878,43 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            "route_name": route_name,
+            "delivery_id": delivery_id,
         }
+        if callback_config:
+            correlation = {}
+            for field in callback_config["include_payload_fields"]:
+                value = payload.get(field)
+                if not isinstance(value, (str, int, float, bool, type(None))):
+                    self._seen_deliveries.pop(delivery_id, None)
+                    return web.json_response(
+                        {"error": "Completion callback field must be scalar"},
+                        status=400,
+                    )
+                correlation[field] = value
+            deliver_config["completion_callback"] = callback_config
+            deliver_config["completion_correlation"] = correlation
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
+        if callback_config:
+            try:
+                self._spool_completion_intent(route_name, deliver_config)
+            except Exception:
+                self._seen_deliveries.pop(delivery_id, None)
+                self._delivery_info.pop(session_chat_id, None)
+                self._delivery_info_created.pop(session_chat_id, None)
+                logger.exception(
+                    "[webhook] Refusing callback-enabled request because "
+                    "accepted intent could not be persisted route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {"error": "Completion callback intent could not be persisted"},
+                    status=503,
+                )
 
         # Build source and event
         source = self.build_source(
@@ -862,6 +962,384 @@ class WebhookAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    def _completion_callback_config(
+        self, route_name: str, route_config: dict
+    ) -> Optional[dict]:
+        callback = route_config.get("completion_callback")
+        if callback is None:
+            return None
+        if not isinstance(callback, dict) or set(callback) - _CALLBACK_CONFIG_KEYS:
+            raise ValueError(
+                f"[webhook] Route '{route_name}' has invalid completion_callback keys"
+            )
+        url = callback.get("url")
+        secret = callback.get("secret")
+        fields = callback.get("include_payload_fields")
+        parsed = urlparse(url) if isinstance(url, str) else None
+        if (
+            parsed is None
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+        ):
+            raise ValueError(
+                f"[webhook] Route '{route_name}' has invalid completion callback URL"
+            )
+        if not isinstance(secret, str) or len(secret) < 32:
+            raise ValueError(
+                f"[webhook] Route '{route_name}' completion callback secret is too short"
+            )
+        if (
+            not isinstance(fields, list)
+            or not 1 <= len(fields) <= 8
+            or len(fields) != len(set(fields))
+            or any(
+                not isinstance(field, str)
+                or re.fullmatch(r"[A-Za-z0-9_]{1,64}", field) is None
+                for field in fields
+            )
+        ):
+            raise ValueError(
+                f"[webhook] Route '{route_name}' has invalid callback payload fields"
+            )
+        attempts = callback.get("max_attempts", 3)
+        timeout = callback.get("timeout_seconds", 5)
+        if not isinstance(attempts, int) or not 1 <= attempts <= 5:
+            raise ValueError(
+                f"[webhook] Route '{route_name}' callback max_attempts must be 1..5"
+            )
+        if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 30:
+            raise ValueError(
+                f"[webhook] Route '{route_name}' callback timeout must be 1..30s"
+            )
+        return {
+            "url": url,
+            "secret": secret,
+            "include_payload_fields": list(fields),
+            "max_attempts": attempts,
+            "timeout_seconds": float(timeout),
+        }
+
+    def _completion_callback_body(
+        self, event: "MessageEvent", status: str
+    ) -> Optional[dict]:
+        delivery = self._delivery_info.get(event.source.chat_id, {})
+        if not delivery.get("completion_callback"):
+            return None
+        return {
+            "correlation": delivery.get("completion_correlation", {}),
+            "delivery_id": delivery.get("delivery_id") or event.message_id,
+            "error_code": {
+                "running": None,
+                "completed": None,
+                "failed": "processing_failed",
+                "cancelled": "processing_cancelled",
+            }[status],
+            "event_type": _CALLBACK_EVENT_TYPE,
+            "occurred_at": int(time.time()),
+            "route": delivery.get("route_name", ""),
+            "status": status,
+        }
+
+    async def _emit_final_completion_callback(
+        self, event: "MessageEvent", outcome: Any
+    ) -> None:
+        status = (
+            "completed"
+            if outcome == ProcessingOutcome.SUCCESS
+            else "cancelled"
+            if outcome == ProcessingOutcome.CANCELLED
+            else "failed"
+        )
+        delivery = self._delivery_info.get(event.source.chat_id, {})
+        if status == "completed" and not delivery.get(
+            "completion_delivery_succeeded", False
+        ):
+            status = "failed"
+        body = self._completion_callback_body(event, status)
+        if body is None:
+            return
+        route_name = str(delivery["route_name"])
+        intent_path = self._completion_intent_path(
+            route_name, str(body["delivery_id"])
+        )
+        path: Optional[Path] = None
+        delivered = False
+        try:
+            path = self._spool_completion_callback(route_name, body)
+        except Exception:
+            logger.exception(
+                "[webhook] Failed to persist completion callback delivery=%s status=%s",
+                body.get("delivery_id"),
+                status,
+            )
+        try:
+            delivered = await self._send_completion_callback(
+                event.source.chat_id, body
+            )
+            if delivered and path:
+                self._remove_callback_spool(path)
+        except Exception:
+            logger.exception(
+                "[webhook] Failed to emit completion callback delivery=%s status=%s",
+                body.get("delivery_id"),
+                status,
+            )
+        finally:
+            if path is not None or delivered:
+                self._remove_callback_spool(intent_path)
+
+    def _callback_outbox_dir(self) -> Path:
+        return get_hermes_home() / "webhook_callback_outbox"
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            logger.debug("[webhook] Directory fsync unavailable for %s", path)
+
+    def _ensure_callback_outbox(self) -> Path:
+        outbox = self._callback_outbox_dir()
+        created = not outbox.exists()
+        outbox.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(outbox, 0o700)
+        if created:
+            self._fsync_directory(outbox.parent)
+        return outbox
+
+    def _write_callback_spool(self, path: Path, entry: bytes) -> Path:
+        outbox = self._ensure_callback_outbox()
+        if path.parent != outbox:
+            raise ValueError("callback spool path outside outbox")
+        if path.exists():
+            existing = path.read_bytes()
+            if existing != entry:
+                raise ValueError("completion callback spool conflict")
+            return path
+        tmp = outbox / f".{path.stem}.{os.getpid()}.{time.time_ns()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(entry)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+            self._fsync_directory(outbox)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return path
+
+    def _remove_callback_spool(self, path: Path) -> None:
+        if path.exists():
+            path.unlink()
+            self._fsync_directory(path.parent)
+
+    def _completion_intent_path(self, route_name: str, delivery_id: str) -> Path:
+        key = hashlib.sha256(f"{route_name}:{delivery_id}".encode()).hexdigest()
+        return self._callback_outbox_dir() / f"intent-{key}.json"
+
+    def _completion_callback_path(
+        self, route_name: str, delivery_id: str, status: str
+    ) -> Path:
+        key = hashlib.sha256(
+            f"{route_name}:{delivery_id}:{status}".encode()
+        ).hexdigest()
+        return self._callback_outbox_dir() / f"{key}.json"
+
+    def _spool_completion_intent(self, route_name: str, delivery: dict) -> Path:
+        delivery_id = str(delivery["delivery_id"])
+        path = self._completion_intent_path(route_name, delivery_id)
+        entry = json.dumps(
+            {
+                "accepted_at": int(time.time()),
+                "correlation": delivery["completion_correlation"],
+                "delivery_id": delivery_id,
+                "route": route_name,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return self._write_callback_spool(path, entry)
+
+    def _spool_completion_callback(self, route_name: str, body: dict) -> Path:
+        path = self._completion_callback_path(
+            route_name, str(body["delivery_id"]), str(body["status"])
+        )
+        entry = json.dumps(
+            {"body": body, "route": route_name},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return self._write_callback_spool(path, entry)
+
+    async def _send_completion_callback(
+        self, session_chat_id: str, body: dict
+    ) -> bool:
+        delivery = self._delivery_info.get(session_chat_id, {})
+        callback = delivery.get("completion_callback")
+        if not callback:
+            return False
+        raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+        for attempt in range(callback["max_attempts"]):
+            timestamp = str(int(time.time()))
+            signature = hmac.new(
+                callback["secret"].encode(),
+                timestamp.encode() + b"." + raw,
+                hashlib.sha256,
+            ).hexdigest()
+            try:
+                timeout = ClientTimeout(total=callback["timeout_seconds"])
+                async with ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        callback["url"],
+                        data=raw,
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Webhook-Signature-V2": signature,
+                            "X-Webhook-Timestamp": timestamp,
+                        },
+                        allow_redirects=False,
+                    ) as response:
+                        await response.read()
+                        if 200 <= response.status < 300:
+                            return True
+            except Exception as exc:
+                logger.warning(
+                    "[webhook] Completion callback attempt failed "
+                    "delivery=%s attempt=%d error=%s",
+                    body.get("delivery_id"),
+                    attempt + 1,
+                    type(exc).__name__,
+                )
+            if attempt + 1 < callback["max_attempts"]:
+                await asyncio.sleep(0.5 * (2**attempt))
+        logger.error(
+            "[webhook] Completion callback retained for replay "
+            "delivery=%s status=%s",
+            body.get("delivery_id"),
+            body.get("status"),
+        )
+        return False
+
+    async def _recover_completion_callback_intents(self) -> None:
+        outbox = self._callback_outbox_dir()
+        if not outbox.exists():
+            return
+        for path in sorted(outbox.glob("intent-*.json")):
+            try:
+                if path.is_symlink() or path.stat().st_mode & 0o077:
+                    logger.error(
+                        "[webhook] Refusing insecure callback intent file %s", path
+                    )
+                    continue
+                entry = json.loads(path.read_text())
+                if not isinstance(entry, dict) or set(entry) != {
+                    "accepted_at",
+                    "correlation",
+                    "delivery_id",
+                    "route",
+                }:
+                    raise ValueError("invalid callback intent schema")
+                route_name = entry["route"]
+                delivery_id = entry["delivery_id"]
+                correlation = entry["correlation"]
+                if (
+                    not isinstance(route_name, str)
+                    or not route_name
+                    or not isinstance(delivery_id, str)
+                    or not delivery_id
+                    or not isinstance(correlation, dict)
+                    or not isinstance(entry["accepted_at"], int)
+                ):
+                    raise ValueError("invalid callback intent values")
+                terminal_exists = any(
+                    self._completion_callback_path(
+                        route_name, delivery_id, terminal_status
+                    ).exists()
+                    for terminal_status in ("completed", "failed", "cancelled")
+                )
+                if not terminal_exists:
+                    self._spool_completion_callback(
+                        route_name,
+                        {
+                            "correlation": correlation,
+                            "delivery_id": delivery_id,
+                            "error_code": "processing_failed",
+                            "event_type": _CALLBACK_EVENT_TYPE,
+                            "occurred_at": int(time.time()),
+                            "route": route_name,
+                            "status": "failed",
+                        },
+                    )
+                self._remove_callback_spool(path)
+            except Exception:
+                logger.exception(
+                    "[webhook] Failed to recover callback intent %s", path
+                )
+
+    async def _completion_callback_replay_loop(self) -> None:
+        await self._recover_completion_callback_intents()
+        while True:
+            try:
+                await self._replay_completion_callbacks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[webhook] Completion callback replay loop failed")
+            await asyncio.sleep(self._callback_replay_interval)
+
+    async def _replay_completion_callbacks(self) -> None:
+        outbox = self._callback_outbox_dir()
+        if not outbox.exists():
+            return
+        for path in sorted(outbox.glob("*.json")):
+            if path.name.startswith("intent-"):
+                continue
+            try:
+                if path.is_symlink() or path.stat().st_mode & 0o077:
+                    logger.error(
+                        "[webhook] Refusing insecure callback spool file %s", path
+                    )
+                    continue
+                entry = json.loads(path.read_text())
+                if not isinstance(entry, dict) or set(entry) != {"body", "route"}:
+                    raise ValueError("invalid callback spool schema")
+                route_name = entry["route"]
+                route = self._routes.get(route_name)
+                callback = (
+                    self._completion_callback_config(route_name, route)
+                    if isinstance(route, dict)
+                    else None
+                )
+                if callback is None:
+                    continue
+                body = entry["body"]
+                session_chat_id = (
+                    f"webhook:{route_name}:{body['delivery_id']}"
+                )
+                self._delivery_info[session_chat_id] = {
+                    "completion_callback": callback,
+                    "delivery_id": body["delivery_id"],
+                    "route_name": route_name,
+                }
+                try:
+                    if await self._send_completion_callback(session_chat_id, body):
+                        self._remove_callback_spool(path)
+                finally:
+                    self._delivery_info.pop(session_chat_id, None)
+            except Exception:
+                logger.exception(
+                    "[webhook] Failed to replay callback spool %s", path
+                )
+
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
     ) -> None:
@@ -884,7 +1362,16 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        try:
+            await self._emit_final_completion_callback(event, outcome)
+        finally:
+            await self._end_webhook_session(event, event.source.chat_id)
+
+    async def on_processing_start(self, event: "MessageEvent") -> None:
+        """Best-effort running callback; final callbacks are durably spooled."""
+        body = self._completion_callback_body(event, "running")
+        if body is not None:
+            await self._send_completion_callback(event.source.chat_id, body)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
