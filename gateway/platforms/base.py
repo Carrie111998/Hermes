@@ -537,7 +537,14 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
     try:
         parsed = urlsplit(raw)
     except Exception:
-        return raw[:max_len]
+        # urlsplit() can reject malformed bracketed hosts before we have a
+        # chance to strip userinfo. Keep the fallback log-safe too.
+        safe = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@", r"\1", raw)
+        if len(safe) <= max_len:
+            return safe
+        if max_len <= 3:
+            return "." * max_len
+        return f"{safe[:max_len - 3]}..."
 
     if parsed.scheme and parsed.netloc:
         # Strip potential embedded credentials (user:pass@host).

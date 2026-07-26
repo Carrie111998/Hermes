@@ -107,6 +107,11 @@ class TestSafeUrlForLog:
         assert "token=abc" not in result
         assert "user:pass@" not in result
 
+    def test_strips_userinfo_when_url_parse_fails(self):
+        result = safe_url_for_log("http://user:pass@[")
+        assert result == "http://["
+        assert "user:pass@" not in result
+
     def test_truncates_long_values(self):
         long_url = "https://example.com/" + ("a" * 300)
         result = safe_url_for_log(long_url, max_len=40)
