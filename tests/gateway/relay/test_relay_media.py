@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+from gateway.relay import media as relay_media
 from gateway.relay.media import RelayMediaClient, media_base_url
 
 from tests.gateway.relay.stub_connector import StubConnector
@@ -270,6 +272,35 @@ def test_client_recognizes_rehost_urls():
     c = RelayMediaClient("https://c.example", "gw1", "sec")
     assert c.is_relay_media_url("https://c.example/relay/media/abc") is True
     assert c.is_relay_media_url("https://cdn.discordapp.com/a/b.png") is False
+
+
+@pytest.mark.asyncio
+async def test_client_download_blocks_private_url_before_network(monkeypatch):
+    c = RelayMediaClient("https://c.example", "gw1", "sec")
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError("private relay media URL reached the network")
+
+    monkeypatch.setattr(relay_media._RELAY_MEDIA_OPENER, "open", fail_open)
+
+    result = await c.download("http://169.254.169.254/latest/meta-data/")
+
+    assert result is None
+
+
+def test_client_download_redirect_handler_blocks_private_location():
+    handler = relay_media._RelayMediaRedirectHandler()
+    request = urllib.request.Request("https://cdn.example/file.png")
+
+    with pytest.raises(ValueError, match="Blocked relay media redirect"):
+        handler.redirect_request(
+            request,
+            fp=None,
+            code=302,
+            msg="Found",
+            headers={},
+            newurl="http://169.254.169.254/latest/meta-data/",
+        )
 
 
 @pytest.mark.asyncio
