@@ -3477,6 +3477,45 @@ class TestMessageRouting:
         adapter._app.client.users_info.assert_awaited_once_with(user="U_ROUTER_BOT")
 
     @pytest.mark.asyncio
+    async def test_real_sdk_response_marks_unlabeled_peer_bot_on_source(self, adapter):
+        try:
+            from slack_sdk.web.async_slack_response import AsyncSlackResponse
+        except ImportError:
+            pytest.skip("slack-sdk is not installed")
+
+        adapter.config.extra["allow_bots"] = "all"
+        response = AsyncSlackResponse(
+            client=adapter._app.client,
+            http_verb="GET",
+            api_url="https://slack.com/api/users.info",
+            req_args={"params": {"user": "U_PEER_BOT"}},
+            data={
+                "ok": True,
+                "user": {
+                    "is_bot": True,
+                    "profile": {"display_name": "Peer Bot"},
+                },
+            },
+            headers={},
+            status_code=200,
+        )
+        adapter._app.client.users_info = AsyncMock(return_value=response)
+        event = {
+            "text": "peer response",
+            "user": "U_PEER_BOT",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "123.1000",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        routed = adapter.handle_message.await_args.args[0]
+        assert routed.source.is_bot is True
+        assert routed.source.user_name == "Peer Bot"
+        adapter._app.client.users_info.assert_awaited_once_with(user="U_PEER_BOT")
+
+    @pytest.mark.asyncio
     async def test_app_authored_messages_without_client_msg_id_are_ignored(self, adapter):
         """Slack app-authored events can arrive without bot_id/subtype markers."""
         adapter._app.client.users_info = AsyncMock(
@@ -6046,6 +6085,40 @@ class TestChannelNameResolution:
 
         assert name == "project-x"
         team_client.conversations_info.assert_awaited_once_with(channel="C123")
+
+    @pytest.mark.asyncio
+    async def test_resolves_dm_peer_from_real_users_info_response(self, adapter):
+        try:
+            from slack_sdk.web.async_slack_response import AsyncSlackResponse
+        except ImportError:
+            pytest.skip("slack-sdk is not installed")
+
+        team_client = AsyncMock()
+        team_client.conversations_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {"is_im": True, "user": "U_PEER"},
+            }
+        )
+        response = AsyncSlackResponse(
+            client=team_client,
+            http_verb="GET",
+            api_url="https://slack.com/api/users.info",
+            req_args={"params": {"user": "U_PEER"}},
+            data={
+                "ok": True,
+                "user": {"profile": {"display_name": "Peer Person"}},
+            },
+            headers={},
+            status_code=200,
+        )
+        team_client.users_info = AsyncMock(return_value=response)
+        adapter._team_clients["T123"] = team_client
+
+        name = await adapter._resolve_channel_name("D123", team_id="T123")
+
+        assert name == "Peer Person"
+        team_client.users_info.assert_awaited_once_with(user="U_PEER")
 
 
 # ---------------------------------------------------------------------------

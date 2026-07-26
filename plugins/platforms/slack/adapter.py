@@ -3815,6 +3815,8 @@ class SlackAdapter(BasePlatformAdapter):
             )
             result = await client.users_info(user=user_id)
             if not isinstance(result, dict):
+                result = getattr(result, "data", None)
+            if not isinstance(result, dict):
                 self._user_is_bot_cache[cache_key] = False
                 self._user_name_cache[cache_key] = user_id
                 return user_id
@@ -3983,6 +3985,8 @@ class SlackAdapter(BasePlatformAdapter):
                 else self._app.client
             )
             result = await client.users_info(user=user_id)
+            if not isinstance(result, dict):
+                result = getattr(result, "data", None)
             if not isinstance(result, dict):
                 self._user_is_bot_cache[cache_key] = False
                 self._user_name_cache.setdefault(cache_key, user_id)
