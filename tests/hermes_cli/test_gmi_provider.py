@@ -334,6 +334,8 @@ class TestGmiMainFlow:
 
         monkeypatch.setattr("hermes_cli.main._prompt_provider_choice", fake_prompt_provider_choice)
         monkeypatch.setattr("hermes_cli.main._model_flow_api_key_provider", fake_model_flow_api_key_provider)
+        # Mock the "Make X your default provider?" prompt added by PR #43863
+        monkeypatch.setattr("builtins.input", lambda _prompt: "y")
 
         from hermes_cli.main import select_provider_and_model
 
