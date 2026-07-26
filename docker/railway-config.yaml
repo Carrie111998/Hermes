@@ -1,7 +1,13 @@
 # Hermes Agent — Railway Configuration
-# Pre-configured for the Discord + WhatsApp gateway with models served via
-# OpenRouter. Environment variables (OPENROUTER_API_KEY, DISCORD_BOT_TOKEN,
-# etc.) are injected by Railway and loaded from the container's .env file.
+# Pre-configured for the Discord gateway (orchestrateur unique) with models
+# served via OpenRouter. Environment variables (OPENROUTER_API_KEY,
+# DISCORD_BOT_TOKEN, etc.) are injected by Railway and loaded from the
+# container's .env file.
+#
+# WhatsApp a été RETIRÉ définitivement (2026-07-26) : le client non officiel
+# (Baileys) viole les CGU de Meta, et le nouveau flux d'appairage par passkey
+# (juin 2026) bloque structurellement la reconnexion. Discord est le canal
+# unique d'orchestration. Historique complet : git log sur ce fichier.
 
 model:
   # Orchestrateur (profil défaut) : Claude Opus 4.8 (upgrade depuis Haiku 4.5,
@@ -15,39 +21,9 @@ model:
 gateway:
   platforms:
     - discord
-    - whatsapp   # ACTIF (2026-07-02) — compte DÉDIÉ 33685686316, mode bot.
-                 # Pour re-pauser : recommenter ceci ET le bloc `whatsapp:` plus bas.
 
 terminal:
   backend: local
-
-# WhatsApp (groupes) — ACTIF (2026-07-02). Compte DÉDIÉ 33685686316 en mode bot.
-# ⚠️ La présence de ce bloc (avec `extra`) participe à l'activation via la porte
-# d'auto-activation de gateway/config.py (is_connected → True). Pour PAUSER WhatsApp,
-# il faut recommenter TOUT ce bloc ET retirer `- whatsapp` de gateway.platforms.
-# Poste fermé par défaut : group_policy=allowlist SANS JID => aucun groupe traité tant
-# que group_allow_from n'est pas rempli (sécurité). L'allowlist DM vient de
-# whatsapp.allow_from ci-dessous (voir le commentaire sous dm_policy).
-whatsapp:
-  group_policy: "allowlist"
-  group_allow_from:
-    - "120363426647005883@g.us"      # Test Pippa
-  require_mention: true
-  mention_patterns:
-    - "@bot"
-    - "@hermes"
-    - "@pippa"                        # le bot s'appelle Pippa
-  free_response_chats:               # groupes où TOUT message = une demande (sans @mention)
-    - "120363426647005883@g.us"      # Test Pippa (groupe de test → réponse à tout message)
-  dm_policy: "allowlist"             # ⚠️ allow_from ci-dessous est OBLIGATOIRE : la porte DM du
-                                     # gateway (_is_dm_allowed) lit whatsapp.allow_from → config.extra
-                                     # SEULEMENT. La var Railway WHATSAPP_ALLOWED_USERS ne nourrit QUE
-                                     # l'allowlist du pont Node, jamais cette porte (aucun pont env→extra
-                                     # WhatsApp dans gateway/config.py). Sans ceci, tout DM est rejeté
-                                     # en silence (le groupe marche car group_allow_from est rempli).
-  allow_from:
-    - "33609152093"                  # Gilles — numéro perso
-    - "159180145049752"              # Gilles — LID (forme réelle d'arrivée des DM WhatsApp)
 
 compression:
   enabled: true
@@ -75,18 +51,12 @@ stt:
 # all profiles (see hermes_cli/kanban_db.py: kanban_home).
 kanban:
   dispatch_in_gateway: true
-  # Notifications Kanban (25/07/2026) — ajout du DM WhatsApp direct de Gilles
-  # (chat id 159180145049752@lid) en parallèle du canal Discord existant
-  # (1467614563489812673) qui reste actif. Discord est conservé le temps de
-  # valider que le DM WhatsApp reçoit bien les notifications. Le groupe
-  # WhatsApp Test Pippa (120363426647005883@g.us) reste retiré.
-  # Lu par le monkeypatch kanban_always_notify_patch.py (usercustomize.py)
-  # qui appelle _kb.add_notify_sub sur chaque kanban_create.
+  # Notifications Kanban — Discord uniquement (WhatsApp retiré 2026-07-26).
+  # Lu par le monkeypatch kanban_always_notify_patch.py (usercustomize.py,
+  # sur le volume) qui appelle _kb.add_notify_sub sur chaque kanban_create.
   always_notify:
-    - platform: "whatsapp"
-      chat_id: "159180145049752@lid"   # DM WhatsApp Gilles (LID) — NOUVEAU
     - platform: "discord"
-      chat_id: "1467614563489812673"   # Discord — CONSERVÉ (canal qui fonctionne)
+      chat_id: "1467614563489812673"   # DM Discord Gilles (ID numérique obligatoire)
 
 # Enables the Kanban orchestrator tool surface (kanban_create/list/unblock) so
 # this profile can create and assign cross-profile tasks. Le gate lit cette liste
@@ -94,16 +64,10 @@ kanban:
 toolsets:
   - kanban
 
-# Outils PAR PLATEFORME. Le profil défaut est l'ORCHESTRATEUR : sur WhatsApp il doit
-# UNIQUEMENT trier et router (kanban_create), jamais coder/déployer. On restreint donc
-# whatsapp à un set minimal (kanban + planning + rappel) — SANS terminal/file/web/browser,
-# qui poussaient qwen à faire le travail lui-même au lieu de créer une carte. Sa réponse
-# texte part quand même dans le groupe (auto, pas besoin d'outil). Les autres plateformes
-# gardent leurs presets complets (Discord/chat non impactés).
+# Outils PAR PLATEFORME. Le profil défaut est l'ORCHESTRATEUR (persona SOUL.md :
+# triage → kanban_create, jamais d'exécution). Discord garde son preset complet
+# (voice, chat) ; la discipline route-only est portée par la persona + le modèle
+# Opus, pas par une restriction d'outils.
 platform_toolsets:
   cli: [hermes-cli]
   discord: [hermes-discord]
-  # Pas de `todo` : GLM s'en servait comme planning en mémoire au lieu de créer une
-  # carte. Son SEUL moyen d'action = kanban. session_search reste pour rappeler le
-  # contexte (repo/projet d'une conversation passée).
-  whatsapp: [kanban, session_search]
