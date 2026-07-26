@@ -1210,3 +1210,87 @@ async def test_try_edit_rich_records_streamed_final_for_reply_recovery(monkeypat
     result = await adapter._try_edit_rich("12345", "5724", "Готово. Основной бот живой.")
     assert result is not None and result.success
     assert rich_sent_store.lookup("12345", "5724") == "Готово. Основной бот живой."
+
+
+# ----------------------------------------------------------------------------
+# Non-numeric ids must degrade, not raise.
+#
+# The rich helpers coerce message_id / draft_id / thread_id with int() before
+# the try/except that implements their fallback contract. A non-numeric value
+# therefore escaped the helper entirely instead of returning None / False, so
+# the caller never reached the legacy path it was written to fall back to —
+# even though the legacy paths themselves tolerate the same value.
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_try_edit_rich_non_numeric_message_id_returns_none_for_legacy():
+    """A non-numeric message_id yields the documented ``None`` (fall back to
+    the legacy MarkdownV2 edit), not a ValueError out of the helper."""
+    adapter = _make_adapter()
+
+    result = await adapter._try_edit_rich("12345", "not-an-int", RICH_CONTENT)
+
+    assert result is None
+    adapter._bot.do_api_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_edit_non_numeric_message_id_degrades_instead_of_raising():
+    """End to end: finalizing rich content on a non-numeric message id returns
+    a SendResult from the legacy edit path instead of raising."""
+    adapter = _make_adapter()
+
+    result = await adapter.edit_message(
+        "12345", "not-an-int", RICH_CONTENT, finalize=True,
+    )
+
+    assert isinstance(result, SendResult)
+    assert result.success is False
+    adapter._bot.do_api_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_try_send_rich_draft_non_numeric_draft_id_returns_false():
+    """A non-numeric draft_id yields ``False`` so the caller renders the legacy
+    plain-text draft, rather than raising out of the draft frame."""
+    adapter = _make_adapter()
+
+    ok = await adapter._try_send_rich_draft("12345", "not-an-int", RICH_CONTENT, None)
+
+    assert ok is False
+    adapter._bot.do_api_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_try_send_rich_draft_non_numeric_thread_id_returns_false():
+    """``_metadata_thread_id`` str()s whatever the caller supplied and the
+    legacy draft path forwards it unconverted, so a non-numeric thread id must
+    degrade the rich frame rather than raise."""
+    adapter = _make_adapter()
+
+    ok = await adapter._try_send_rich_draft(
+        "12345", 7, RICH_CONTENT, {"thread_id": "general"},
+    )
+
+    assert ok is False
+    adapter._bot.do_api_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_try_send_rich_draft_numeric_thread_id_still_sent_as_int():
+    """The guard must not change the happy path: a numeric thread id is still
+    coerced and forwarded as ``message_thread_id``."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(return_value=True)
+
+    ok = await adapter._try_send_rich_draft(
+        "12345", 7, RICH_CONTENT, {"thread_id": "42"},
+    )
+
+    assert ok is True
+    call = adapter._bot.do_api_request.call_args
+    assert call.args[0] == "sendRichMessageDraft"
+    api_kwargs = call.kwargs["api_kwargs"]
+    assert api_kwargs["draft_id"] == 7
+    assert api_kwargs["message_thread_id"] == 42

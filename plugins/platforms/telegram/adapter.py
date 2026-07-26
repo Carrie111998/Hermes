@@ -1881,9 +1881,22 @@ class TelegramAdapter(BasePlatformAdapter):
         - transient / unknown → ``SendResult(success=False)`` with retry
           semantics (the message may already be edited; do NOT legacy-resend)
         """
+        # Coerced up front: this int() sits outside the try/except below that
+        # implements the fallback contract, so a non-numeric id would raise
+        # straight out of the method instead of degrading to the legacy
+        # MarkdownV2 edit the caller expects.
+        try:
+            message_id_int = int(message_id)
+        except (TypeError, ValueError):
+            logger.debug(
+                "[%s] editMessageText(rich): non-numeric message_id %r — "
+                "falling back to the legacy MarkdownV2 edit",
+                self.name, message_id,
+            )
+            return None
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id),
-            "message_id": int(message_id),
+            "message_id": message_id_int,
             "rich_message": self._rich_message_payload(content),
         }
         thread_id = self._metadata_thread_id(metadata)
@@ -1975,14 +1988,30 @@ class TelegramAdapter(BasePlatformAdapter):
         legacy plain-text draft. A permanent/capability failure additionally
         latches ``_rich_draft_disabled`` so later frames skip the rich attempt.
         """
+        # Coerced up front, like the ids in _try_edit_rich: both int() calls
+        # sit outside the try/except below, so a non-numeric value would raise
+        # out of the method instead of returning False for the legacy draft.
+        # _metadata_thread_id() str()s whatever the caller put in metadata, and
+        # the legacy draft path passes that value through without int(), so the
+        # rich path must not be the stricter of the two.
+        try:
+            draft_id_int = int(draft_id)
+            thread_id = self._metadata_thread_id(metadata)
+            thread_id_int = None if thread_id is None else int(thread_id)
+        except (TypeError, ValueError):
+            logger.debug(
+                "[%s] sendRichMessageDraft: non-numeric draft_id %r / thread_id "
+                "%r — using the legacy draft for this frame",
+                self.name, draft_id, self._metadata_thread_id(metadata),
+            )
+            return False
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id),
-            "draft_id": int(draft_id),
+            "draft_id": draft_id_int,
             "rich_message": self._rich_message_payload(content),
         }
-        thread_id = self._metadata_thread_id(metadata)
-        if thread_id is not None:
-            payload["message_thread_id"] = int(thread_id)
+        if thread_id_int is not None:
+            payload["message_thread_id"] = thread_id_int
         try:
             ok = await self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload)
             return bool(ok)
