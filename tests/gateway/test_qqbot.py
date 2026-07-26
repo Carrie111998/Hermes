@@ -1,5 +1,7 @@
 """Tests for the QQ Bot platform adapter."""
 
+from tests.os_env import PLATFORM_ENV
+
 import asyncio
 import os
 from types import SimpleNamespace
@@ -355,12 +357,12 @@ class TestResolveSTTConfig:
 
     def test_no_config(self):
         adapter = self._make_adapter(app_id="a", client_secret="b")
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(os.environ, PLATFORM_ENV, clear=True):
             assert adapter._resolve_stt_config() is None
 
     def test_env_config(self):
         adapter = self._make_adapter(app_id="a", client_secret="b")
-        with mock.patch.dict(os.environ, {
+        with mock.patch.dict(os.environ, {**PLATFORM_ENV, 
             "QQ_STT_API_KEY": "key123",
             "QQ_STT_BASE_URL": "https://example.com/v1",
             "QQ_STT_MODEL": "my-model",
@@ -378,7 +380,7 @@ class TestResolveSTTConfig:
             "model": "glm-asr",
         }
         adapter = self._make_adapter(app_id="a", client_secret="b", stt=stt_cfg)
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(os.environ, PLATFORM_ENV, clear=True):
             cfg = adapter._resolve_stt_config()
             assert cfg is not None
             assert cfg["base_url"] == "https://custom.api/v4"

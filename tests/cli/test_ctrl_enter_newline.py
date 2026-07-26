@@ -11,6 +11,8 @@ These tests pin the gating predicate and the resulting binding behavior.
 
 from __future__ import annotations
 
+from tests.os_env import PLATFORM_ENV
+
 import os
 import sys
 from unittest.mock import patch
@@ -33,21 +35,21 @@ def test_ssh_tty_alone_preserves_newline():
     import cli as cli_mod
     with patch.object(sys, "platform", "linux"):
         # Strip out anything that might leak truth
-        with patch.dict(os.environ, {"SSH_TTY": "/dev/pts/0"}, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, "SSH_TTY": "/dev/pts/0"}, clear=True):
             assert cli_mod._preserve_ctrl_enter_newline() is True
 
 
 def test_wsl_distro_name_preserves_newline():
     import cli as cli_mod
     with patch.object(sys, "platform", "linux"):
-        with patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu-Microsoft"}, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, "WSL_DISTRO_NAME": "Ubuntu-Microsoft"}, clear=True):
             assert cli_mod._preserve_ctrl_enter_newline() is True
 
 
 def test_windows_terminal_session_preserves_newline():
     import cli as cli_mod
     with patch.object(sys, "platform", "linux"):
-        with patch.dict(os.environ, {"WT_SESSION": "abc-def"}, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, "WT_SESSION": "abc-def"}, clear=True):
             assert cli_mod._preserve_ctrl_enter_newline() is True
 
 
@@ -57,7 +59,7 @@ def test_ghostty_tmux_session_preserves_ctrl_j_newline():
     with patch.object(sys, "platform", "linux"):
         with patch.dict(
             os.environ,
-            {"TERM": "tmux-256color", "TERM_PROGRAM": "tmux", "GHOSTTY_RESOURCES_DIR": "/usr/share/ghostty"},
+            {**PLATFORM_ENV, "TERM": "tmux-256color", "TERM_PROGRAM": "tmux", "GHOSTTY_RESOURCES_DIR": "/usr/share/ghostty"},
             clear=True,
         ):
             assert cli_mod._preserve_ctrl_enter_newline() is True
@@ -69,7 +71,7 @@ def test_pure_local_linux_does_not_preserve():
     import cli as cli_mod
     # Stub out /proc reads — those are the WSL fallback signal.
     with patch.object(sys, "platform", "linux"):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             with patch("builtins.open", side_effect=OSError("no /proc")):
                 assert cli_mod._preserve_ctrl_enter_newline() is False
 
@@ -79,7 +81,7 @@ def test_proc_version_microsoft_marker_preserves_newline():
     import cli as cli_mod
     from io import StringIO
     with patch.object(sys, "platform", "linux"):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             real_open = open
             def _fake_open(path, *args, **kwargs):
                 if "/proc/version" in str(path) or "/proc/sys/kernel/osrelease" in str(path):

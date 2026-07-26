@@ -1,5 +1,7 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
+from tests.os_env import PLATFORM_ENV
+
 import json
 import os
 import signal
@@ -671,7 +673,7 @@ class TestSpawnEnvSanitization:
 
         fake_thread = MagicMock()
 
-        with patch.dict(os.environ, {
+        with patch.dict(os.environ, {**PLATFORM_ENV, 
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
             "USER": "tester",

@@ -8,6 +8,8 @@ See: https://github.com/NousResearch/hermes-agent/issues/1002
 See: https://github.com/NousResearch/hermes-agent/issues/1264
 """
 
+from tests.os_env import PLATFORM_ENV
+
 import os
 import threading
 from unittest.mock import MagicMock, patch
@@ -643,7 +645,7 @@ class TestHermesBinDirOnPath:
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
-        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, "PATH": "/usr/bin:/bin"}, clear=True):
             result = _make_run_env({})
         entries = result["PATH"].split(os.pathsep)
         assert entries[0] == "/opt/hermes/bin"
@@ -744,7 +746,7 @@ class TestHermesInternalDynamicSecrets:
     def test_make_run_env_strips_internal_secrets(self):
         """The foreground _make_run_env path strips the same dynamic secrets."""
         from tools.environments.local import _make_run_env
-        with patch.dict(os.environ, {
+        with patch.dict(os.environ, {**PLATFORM_ENV, 
             "PATH": "/usr/bin:/bin",
             "AUXILIARY_VISION_API_KEY": "sk-secret",
             "GATEWAY_RELAY_SECRET": "relay-secret",

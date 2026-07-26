@@ -9,6 +9,8 @@ Run with:  python -m pytest tests/test_delegate.py -v
    or:     python tests/test_delegate.py
 """
 
+from tests.os_env import PLATFORM_ENV
+
 import json
 import os
 import threading
@@ -2620,7 +2622,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_default_is_three(self, mock_cfg):
         # Clear env var if set
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             self.assertEqual(_get_max_concurrent_children(), 3)
 
     @patch("tools.delegate_tool._load_config",
@@ -2670,7 +2672,7 @@ class TestAsyncCapUnified(unittest.TestCase):
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_default_matches_concurrent_children_default(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             self.assertEqual(_get_max_async_children(), _get_max_concurrent_children())
 
 

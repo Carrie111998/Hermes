@@ -1,5 +1,7 @@
 """Tests for the tirith security scanning subprocess wrapper."""
 
+from tests.os_env import PLATFORM_ENV
+
 import io
 import json
 import os
@@ -1185,7 +1187,7 @@ class TestHermesHomeIsolation:
     def test_get_hermes_home_fallback(self):
         """Without HERMES_HOME set, falls back to the active OS home."""
         from tools.tirith_security import _get_hermes_home
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             # Remove HERMES_HOME entirely. With HOME also absent, expanduser
             # falls back to the account database; compute expected under the
             # same environment instead of after patch.dict restores HOME.

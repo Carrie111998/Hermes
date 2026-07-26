@@ -1,5 +1,7 @@
 """Tests for plugins/memory/honcho/client.py — Honcho client configuration."""
 
+from tests.os_env import PLATFORM_ENV
+
 import importlib.util
 import json
 import os
@@ -55,7 +57,7 @@ class TestFromEnv:
         assert config.environment == "staging"
 
     def test_defaults_without_env(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             # Remove HONCHO_API_KEY if it exists
             os.environ.pop("HONCHO_API_KEY", None)
             os.environ.pop("HONCHO_ENVIRONMENT", None)
@@ -83,14 +85,14 @@ class TestFromEnv:
         assert config.enabled is True
 
     def test_reads_timeout_from_env(self):
-        with patch.dict(os.environ, {"HONCHO_TIMEOUT": "90"}, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, "HONCHO_TIMEOUT": "90"}, clear=True):
             config = HonchoClientConfig.from_env()
         assert config.timeout == 90.0
 
 
 class TestFromGlobalConfig:
     def test_missing_config_falls_back_to_env(self, tmp_path):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             config = HonchoClientConfig.from_global_config(
                 config_path=tmp_path / "nonexistent.json"
             )
@@ -438,7 +440,7 @@ class TestResolveActiveHost:
         assert profile_host_key("default") == "hermes"
 
     def test_default_returns_hermes(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True):
             os.environ.pop("HERMES_HONCHO_HOST", None)
             os.environ.pop("HERMES_HOME", None)
             with patch(
@@ -1175,7 +1177,7 @@ class TestGetHonchoClientBaseUrlDoublePrefixFix:
             },
         }))
 
-        with patch.dict(os.environ, {}, clear=True), \
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True), \
              patch("hermes_cli.profiles.get_active_profile_name", return_value="default"), \
              patch("plugins.memory.honcho.client.resolve_config_path", return_value=config_file):
             cfg = HonchoClientConfig.from_global_config(config_path=config_file)
@@ -1212,7 +1214,7 @@ class TestGetHonchoClientBaseUrlDoublePrefixFix:
             },
         }))
 
-        with patch.dict(os.environ, {}, clear=True), \
+        with patch.dict(os.environ, PLATFORM_ENV, clear=True), \
              patch("hermes_cli.profiles.get_active_profile_name", return_value="default"), \
              patch("plugins.memory.honcho.client.resolve_config_path", return_value=config_file):
             cfg = HonchoClientConfig.from_global_config(config_path=config_file)

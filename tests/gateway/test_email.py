@@ -12,6 +12,8 @@ Covers:
 9. Message dispatch and threading
 """
 
+from tests.os_env import PLATFORM_ENV
+
 import os
 import unittest
 from email.mime.text import MIMEText
@@ -55,7 +57,7 @@ class TestConfigEnvOverrides(unittest.TestCase):
         self.assertIsNotNone(home)
         self.assertEqual(home.chat_id, "user@test.com")
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, PLATFORM_ENV, clear=True)
     def test_email_not_loaded_without_env(self):
         from gateway.config import GatewayConfig, Platform, _apply_env_overrides
         config = GatewayConfig()
@@ -75,14 +77,14 @@ class TestCheckRequirements(unittest.TestCase):
         from plugins.platforms.email.adapter import check_email_requirements
         self.assertTrue(check_email_requirements())
 
-    @patch.dict(os.environ, {
+    @patch.dict(os.environ, {**PLATFORM_ENV, 
         "EMAIL_ADDRESS": "a@b.com",
     }, clear=True)
     def test_requirements_not_met(self):
         from plugins.platforms.email.adapter import check_email_requirements
         self.assertFalse(check_email_requirements())
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, PLATFORM_ENV, clear=True)
     def test_requirements_empty_env(self):
         from plugins.platforms.email.adapter import check_email_requirements
         self.assertFalse(check_email_requirements())
@@ -1254,7 +1256,7 @@ class TestSendEmailStandalone(unittest.TestCase):
             self.assertIn("error", result)
             self.assertIn("SMTP error", result["error"])
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, PLATFORM_ENV, clear=True)
     def test_send_email_tool_not_configured(self):
         """Missing config should return error."""
         import asyncio
