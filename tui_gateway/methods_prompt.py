@@ -217,13 +217,26 @@ def _(rid, params: dict) -> dict:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+        envelope = _capture_prompt_envelope_locked(
+            session,
+            rid,
+            text,
+            t or session.get("transport"),
+        )
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
+        session["active_prompt_envelope"] = envelope
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid,
+            sid,
+            session,
+            text,
+            envelope=envelope,
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -340,13 +353,13 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"attached": False, "message": msg})
 
-    session.setdefault("attached_images", []).append(str(img_path))
+    image_count = _append_attached_image(session, str(img_path))
     return _ok(
         rid,
         {
             "attached": True,
             "path": str(img_path),
-            "count": len(session["attached_images"]),
+            "count": image_count,
             **_image_meta(img_path),
         },
     )
@@ -379,13 +392,13 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4016, f"image not found: {path_token}")
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
-        session.setdefault("attached_images", []).append(str(image_path))
+        image_count = _append_attached_image(session, str(image_path))
         return _ok(
             rid,
             {
                 "attached": True,
                 "path": str(image_path),
-                "count": len(session["attached_images"]),
+                "count": image_count,
                 "remainder": remainder,
                 "text": remainder or f"[User attached image: {image_path.name}]",
                 **_image_meta(image_path),
@@ -637,14 +650,12 @@ def _(rid, params: dict) -> dict:
     raw = str(params.get("path", "") or "").strip()
     if not raw:
         return _err(rid, 4015, "path required")
-    images = session.setdefault("attached_images", [])
-    before = len(images)
-    session["attached_images"] = [path for path in images if path != raw]
+    detached, image_count = _detach_attached_image(session, raw)
     return _ok(
         rid,
         {
-            "detached": len(session["attached_images"]) != before,
-            "count": len(session["attached_images"]),
+            "detached": detached,
+            "count": image_count,
         },
     )
 
@@ -665,7 +676,7 @@ def _(rid, params: dict) -> dict:
         drop_path = dropped["path"]
         remainder = dropped["remainder"]
         if dropped["is_image"]:
-            session.setdefault("attached_images", []).append(str(drop_path))
+            image_count = _append_attached_image(session, str(drop_path))
             text = remainder or f"[User attached image: {drop_path.name}]"
             return _ok(
                 rid,
@@ -673,7 +684,7 @@ def _(rid, params: dict) -> dict:
                     "matched": True,
                     "is_image": True,
                     "path": str(drop_path),
-                    "count": len(session["attached_images"]),
+                    "count": image_count,
                     "text": text,
                     **_image_meta(drop_path),
                 },

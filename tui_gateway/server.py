@@ -239,6 +239,10 @@ _LONG_HANDLERS = frozenset(
         "pet.info",
         "pet.select",
         "pet.thumb",
+        # SMART busy routing may call an auxiliary LLM classifier. Run prompt
+        # ingress on the RPC pool so a slow classifier never blocks approval,
+        # interrupt, or heartbeat requests on the reader thread.
+        "prompt.submit",
         "learning.frames",
         "plugins.manage",
         # reload.mcp shuts down and rediscovers every MCP server — with a
@@ -661,6 +665,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    # Queued envelopes can retain response transports and media paths. Once the
+    # session is terminal they have no consumer, so release every reference at
+    # the same lifecycle chokepoint used by close, reaping, and host shutdown.
+    _clear_queued_prompts(session)
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
@@ -1497,15 +1505,21 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    *,
+    envelope: dict | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
-        attached_images = (
-            list(image_paths)
-            if image_paths is not None
-            else list(session.get("attached_images", []))
-        )
+        if isinstance(envelope, dict):
+            text = envelope.get("text", text)
+            attached_images = list(envelope.get("images", []) or [])
+        else:
+            attached_images = (
+                list(image_paths)
+                if image_paths is not None
+                else list(session.get("attached_images", []))
+            )
     return {
         "type": "turn.start",
         "sid": sid,
@@ -1600,6 +1614,8 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    *,
+    envelope: dict | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1609,6 +1625,7 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        envelope=envelope,
     )
 
     def _complete(done: dict) -> None:
@@ -1626,8 +1643,10 @@ def _submit_prompt_to_compute_host(
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
-        if image_paths is None:
+        if envelope is None and image_paths is None:
             session["attached_images"] = []
+        if session.get("active_prompt_envelope") is envelope:
+            session.pop("active_prompt_envelope", None)
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -6929,8 +6948,11 @@ def _inflight_text(value: Any) -> str:
 
 def _start_inflight_turn(session: dict, text: Any) -> None:
     now = time.time()
+    generation = int(session.get("turn_generation", 0) or 0) + 1
+    session["turn_generation"] = generation
     session["inflight_turn"] = {
         "assistant": "",
+        "generation": generation,
         "started_at": now,
         "streaming": True,
         "updated_at": now,
@@ -7161,41 +7183,306 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
+_TUI_BUSY_QUEUE_MAX_PENDING = 32
+_TUI_BUSY_QUEUE_MAX_BYTES_DEFAULT = 1024 * 1024
+_TUI_BUSY_QUEUE_TTL_SECONDS_DEFAULT = 15 * 60.0
+_prompt_queue_lock_init_guard = threading.Lock()
+
+
+def _load_tui_busy_queue_config() -> dict[str, float | int]:
+    """Read bounded TUI follow-up queue settings with conservative defaults."""
+
+    cfg = _load_cfg()
+    display = cfg.get("display") if isinstance(cfg, dict) else {}
+    if not isinstance(display, dict):
+        display = {}
+    try:
+        max_bytes = int(
+            display.get("busy_queue_max_bytes", _TUI_BUSY_QUEUE_MAX_BYTES_DEFAULT)
+        )
+        if max_bytes < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        max_bytes = _TUI_BUSY_QUEUE_MAX_BYTES_DEFAULT
+    try:
+        ttl_seconds = float(
+            display.get("busy_queue_ttl_seconds", _TUI_BUSY_QUEUE_TTL_SECONDS_DEFAULT)
+        )
+        if ttl_seconds <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        ttl_seconds = _TUI_BUSY_QUEUE_TTL_SECONDS_DEFAULT
+    return {"max_bytes": max_bytes, "ttl_seconds": ttl_seconds}
+
+
+def _prompt_queue_lock(session: dict) -> Any:
+    """Return one stable queue lock even for legacy/test session dictionaries."""
+
+    queue_lock: Any = session.get("queued_prompt_lock")
+    if hasattr(queue_lock, "acquire"):
+        return queue_lock
+    with _prompt_queue_lock_init_guard:
+        queue_lock = session.get("queued_prompt_lock")
+        if not hasattr(queue_lock, "acquire"):
+            queue_lock = threading.Lock()
+            session["queued_prompt_lock"] = queue_lock
+    return queue_lock
+
+
+def _capture_prompt_envelope_locked(
+    session: dict,
+    rid: Any,
+    text: Any,
+    transport: Any,
+) -> dict:
+    """Bind text, pending images, transport, and arrival metadata atomically.
+
+    The caller must hold ``history_lock``. Clearing ``attached_images`` here
+    reserves those paths for exactly this submission, so an image cannot leak
+    into whichever turn happens to drain next.
+    """
+
+    ordinal = int(session.get("prompt_arrival_ordinal", 0) or 0) + 1
+    session["prompt_arrival_ordinal"] = ordinal
+    images = list(session.get("attached_images", []) or [])
+    session["attached_images"] = []
+    return {
+        "text": text,
+        "images": images,
+        "transport": transport,
+        "metadata": {
+            "arrival_ordinal": ordinal,
+            "received_at": time.time(),
+            "request_id": rid,
+            "session_key": session.get("session_key"),
+        },
+    }
+
+
+def _append_attached_image(session: dict, path: str) -> int:
+    """Attach an image atomically with prompt-envelope capture/detach."""
+
+    with session["history_lock"]:
+        images = session.setdefault("attached_images", [])
+        images.append(path)
+        return len(images)
+
+
+def _detach_attached_image(session: dict, path: str) -> tuple[bool, int]:
+    """Detach an image atomically with prompt-envelope capture/append."""
+
+    with session["history_lock"]:
+        images = list(session.get("attached_images", []) or [])
+        retained = [candidate for candidate in images if candidate != path]
+        session["attached_images"] = retained
+        return len(retained) != len(images), len(retained)
+
+
+def _capture_busy_route_context_locked(session: dict) -> dict:
+    """Snapshot immutable run ownership at admission, before classifier waits."""
+
+    agent = session.get("agent")
+    inflight_value = session.get("inflight_turn")
+    inflight = dict(inflight_value) if isinstance(inflight_value, dict) else None
+    captured_generation = None
+    if session.get("running"):
+        try:
+            captured_generation = int((inflight or {}).get("generation") or 0)
+        except (TypeError, ValueError):
+            captured_generation = 0
+        if captured_generation <= 0:
+            captured_generation = max(
+                1,
+                int(session.get("turn_generation", 0) or 0),
+            )
+            session["turn_generation"] = captured_generation
+            if isinstance(inflight_value, dict):
+                inflight_value["generation"] = captured_generation
+            if isinstance(inflight, dict):
+                inflight["generation"] = captured_generation
+    return {
+        "agent": agent,
+        "generation": captured_generation,
+        "inflight": inflight,
+        "compute_host_owned": bool(session.get("_compute_host_active")),
+    }
+
+
+def _normalize_prompt_envelope(
+    session: dict,
+    text: Any,
+    transport: Any,
+    envelope: dict | None,
+) -> dict:
+    if not isinstance(envelope, dict):
+        with session["history_lock"]:
+            return _capture_prompt_envelope_locked(session, None, text, transport)
+
+    item = dict(envelope)
+    item["text"] = item.get("text", text)
+    item["images"] = list(item.get("images", []) or [])
+    item["transport"] = item.get("transport", transport)
+    metadata = dict(item.get("metadata") or {})
+    if not metadata.get("arrival_ordinal"):
+        with session["history_lock"]:
+            ordinal = int(session.get("prompt_arrival_ordinal", 0) or 0) + 1
+            session["prompt_arrival_ordinal"] = ordinal
+        metadata["arrival_ordinal"] = ordinal
+    metadata.setdefault("received_at", time.time())
+    metadata.setdefault("request_id", None)
+    metadata.setdefault("session_key", session.get("session_key"))
+    item["metadata"] = metadata
+    return item
+
+
+def _prompt_envelope_size(envelope: dict) -> int:
+    """Return deterministic serialized bytes, excluding shared transport internals."""
+
+    transport = envelope.get("transport")
+    if isinstance(transport, (str, int, float, bool)) or transport is None:
+        transport_marker: Any = transport
+    else:
+        transport_type = type(transport)
+        transport_marker = f"{transport_type.__module__}.{transport_type.__qualname__}"
+    serializable = {
+        "text": envelope.get("text"),
+        "images": envelope.get("images", []),
+        "transport": transport_marker,
+        "metadata": envelope.get("metadata", {}),
+    }
+    return len(
+        json.dumps(
+            serializable,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+
+def _queued_prompt_items_locked(session: dict) -> list[dict]:
+    items: list[dict] = []
+    first = session.get("queued_prompt")
+    if isinstance(first, dict):
+        items.append(first)
+    overflow = session.get("queued_prompt_overflow")
+    if isinstance(overflow, list):
+        items.extend(item for item in overflow if isinstance(item, dict))
+    return items
+
+
+def _store_queued_prompt_items_locked(session: dict, items: list[dict]) -> None:
+    if items:
+        session["queued_prompt"] = items[0]
+        if len(items) > 1:
+            session["queued_prompt_overflow"] = items[1:]
+        else:
+            session.pop("queued_prompt_overflow", None)
+    else:
+        session["queued_prompt"] = None
+        session.pop("queued_prompt_overflow", None)
+    session["queued_prompt_bytes"] = sum(_prompt_envelope_size(item) for item in items)
+
+
+def _prompt_arrival_ordinal(item: dict) -> int | None:
+    try:
+        ordinal = int((item.get("metadata") or {}).get("arrival_ordinal"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return ordinal if ordinal > 0 else None
+
+
+def _cleanup_expired_prompts_locked(
+    session: dict,
+    *,
+    now: float,
+    ttl_seconds: float,
+) -> tuple[list[dict], int]:
+    items = _queued_prompt_items_locked(session)
+    retained: list[dict] = []
+    expired = 0
+    for item in items:
+        try:
+            received_at = float((item.get("metadata") or {}).get("received_at"))
+        except (TypeError, ValueError, AttributeError):
+            received_at = 0.0
+        if received_at > 0 and now - received_at > ttl_seconds:
+            expired += 1
+        else:
+            retained.append(item)
+    if expired:
+        _store_queued_prompt_items_locked(session, retained)
+    return retained, expired
+
+
+def _restore_rejected_prompt_images(session: dict, item: dict) -> None:
+    images = list(item.get("images", []) or [])
+    if not images or session.get("_finalized"):
+        return
+    with session["history_lock"]:
+        current = list(session.get("attached_images", []) or [])
+        session["attached_images"] = [*images, *current]
+
+
+def _clear_queued_prompts(session: dict) -> int:
+    """Drop queued/active envelope references during terminal session cleanup."""
+
+    with _prompt_queue_lock(session):
+        count = len(_queued_prompt_items_locked(session))
+        _store_queued_prompt_items_locked(session, [])
+        session.pop("active_prompt_envelope", None)
+        return count
+
+
 def _enqueue_prompt(
     session: dict,
     text: Any,
     transport: Any,
-    image_paths: list[str] | None = None,
-) -> None:
-    """Stash a message to run as the very next turn once the live one ends.
+    *,
+    envelope: dict | None = None,
+) -> dict:
+    """Admit one intact FIFO envelope and return a truthful bounded receipt."""
 
-    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
-    arrivals share a slot and merge losslessly (mirroring the consecutive-user
-    merge in ``repair_message_sequence``). Image-bearing submissions stay as
-    separate envelopes, so their attachment ownership and chronology survive.
-    ``transport`` is pinned so the drained turn streams back to the client that
-    sent it even if the session transport is rebound meanwhile.
-    """
-    image_paths = list(image_paths or [])
-    queued = {"text": text, "transport": transport}
-    if image_paths:
-        queued["image_paths"] = image_paths
-    existing = session.get("queued_prompt")
-    if (
-        existing
-        and isinstance(existing.get("text"), str)
-        and isinstance(text, str)
-        and not existing.get("image_paths")
-        and not image_paths
-        and not session.get("queued_prompts")
-    ):
-        prev = existing["text"]
-        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
-        return
-    if existing:
-        session.setdefault("queued_prompts", []).append(queued)
-        return
-    session["queued_prompt"] = queued
+    item = _normalize_prompt_envelope(session, text, transport, envelope)
+    item_bytes = _prompt_envelope_size(item)
+    limits = _load_tui_busy_queue_config()
+    max_bytes = int(limits["max_bytes"])
+    ttl_seconds = float(limits["ttl_seconds"])
+    rejected = False
+    with _prompt_queue_lock(session):
+        items, expired = _cleanup_expired_prompts_locked(
+            session,
+            now=time.time(),
+            ttl_seconds=ttl_seconds,
+        )
+        queued_bytes = sum(_prompt_envelope_size(queued) for queued in items)
+        reason = "accepted"
+        if session.get("_finalized"):
+            reason = "session_finalized"
+            rejected = True
+        elif len(items) >= _TUI_BUSY_QUEUE_MAX_PENDING:
+            reason = "max_items"
+            rejected = True
+        elif queued_bytes + item_bytes > max_bytes:
+            reason = "max_bytes"
+            rejected = True
+        else:
+            items.append(item)
+            if all(_prompt_arrival_ordinal(queued) is not None for queued in items):
+                items.sort(key=lambda queued: _prompt_arrival_ordinal(queued) or 0)
+            _store_queued_prompt_items_locked(session, items)
+            queued_bytes += item_bytes
+        receipt = {
+            "accepted": not rejected,
+            "reason": reason,
+            "depth": len(items),
+            "queued_bytes": queued_bytes,
+            "expired": expired,
+        }
+    if rejected:
+        _restore_rejected_prompt_images(session, item)
+    return receipt
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7233,13 +7520,46 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
+def _requeue_prompt_front(session: dict, item: dict) -> dict:
+    """Restore a failed dispatch ahead of every still-queued TUI prompt."""
+
+    limits = _load_tui_busy_queue_config()
+    with _prompt_queue_lock(session):
+        items, expired = _cleanup_expired_prompts_locked(
+            session,
+            now=time.time(),
+            ttl_seconds=float(limits["ttl_seconds"]),
+        )
+        if session.get("_finalized"):
+            return {
+                "accepted": False,
+                "reason": "session_finalized",
+                "depth": len(items),
+                "queued_bytes": sum(_prompt_envelope_size(queued) for queued in items),
+                "expired": expired,
+            }
+        items.insert(0, item)
+        if all(_prompt_arrival_ordinal(queued) is not None for queued in items):
+            items.sort(key=lambda queued: _prompt_arrival_ordinal(queued) or 0)
+        _store_queued_prompt_items_locked(session, items)
+        return {
+            "accepted": True,
+            "reason": "dispatch_failed_requeued",
+            "depth": len(items),
+            "queued_bytes": int(session.get("queued_prompt_bytes", 0) or 0),
+            "expired": expired,
+        }
+
+
 def _handle_smart_busy_submit(
     rid: Any,
     sid: str,
     session: dict,
     text: Any,
     transport: Any,
-    image_paths: list[str] | None = None,
+    *,
+    envelope: dict,
+    route_context: dict | None = None,
 ) -> dict:
     """Classify a busy TUI prompt and never interrupt the active turn."""
     from hermes_cli.smart_orchestrator import (
@@ -7271,8 +7591,16 @@ def _handle_smart_busy_submit(
     except (TypeError, ValueError):
         timeout = 12.0
 
-    agent = session.get("agent")
-    inflight = session.get("inflight_turn")
+    # The run lease is captured at prompt admission, before waiting behind any
+    # earlier classifier. AIAgent objects are reused between turns, so identity
+    # alone cannot stop an input admitted in run N from steering run N+1.
+    if not isinstance(route_context, dict):
+        with session["history_lock"]:
+            route_context = _capture_busy_route_context_locked(session)
+    agent = route_context.get("agent")
+    inflight = route_context.get("inflight")
+    captured_generation = route_context.get("generation")
+
     active_goal = ""
     if isinstance(inflight, dict):
         active_goal = str(inflight.get("user") or "")
@@ -7317,13 +7645,26 @@ def _handle_smart_busy_submit(
     if not main_runtime.get("provider") or not main_runtime.get("model"):
         main_runtime = {}
 
-    image_paths = list(image_paths or [])
-    if image_paths or not _is_text_only_busy_payload(text):
+    has_media = bool(envelope.get("images"))
+    try:
+        compute_host_owned = bool(session.get("_compute_host_active")) or bool(
+            _session_uses_compute_host(session)
+        )
+    except Exception:
+        # Host ownership is a fail-closed boundary: a serving-process proxy has
+        # no acknowledged steer protocol for the live child turn.
+        compute_host_owned = bool(session.get("_compute_host_active"))
+    if has_media or compute_host_owned:
+        reason = (
+            "The live turn belongs to the compute host; remote steering is unavailable."
+            if compute_host_owned
+            else "Media-bearing input is preserved as a separate queued turn."
+        )
         decision = SmartRouteDecision(
-            route="dependent",
-            confidence=1.0,
-            reason="Attachments are preserved for the next full turn.",
-            source="policy",
+            route=ROUTE_AMBIGUOUS,
+            confidence=0.0,
+            reason=reason,
+            source="fallback",
         )
         payload = str(text or "")
     else:
@@ -7345,101 +7686,135 @@ def _handle_smart_busy_submit(
             )
             payload = str(text or "")
 
-    if decision is None:
-        decision = SmartRouteDecision(
-            route=ROUTE_AMBIGUOUS,
-            confidence=0.0,
-            reason="Classifier unavailable; using the safe queue fallback.",
-            source="fallback",
-        )
-        payload = str(text or "")
-
     steered = False
-    same_active_run = (
-        not image_paths
-        and bool(session.get("running"))
-        and session.get("agent") is agent
-    )
-    if (
-        same_active_run
-        and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}
-        and agent is not None
-    ):
-        steer_payload = payload
-        if decision.route == ROUTE_INDEPENDENT:
-            steer_payload = build_parallel_steer_payload(payload)
-        if steer_payload and hasattr(agent, "steer"):
-            try:
-                steered = bool(agent.steer(steer_payload))
-            except Exception:
-                steered = False
+    with session["history_lock"]:
+        current_inflight = session.get("inflight_turn")
+        try:
+            current_generation = int(
+                (current_inflight or {}).get("generation")
+                if isinstance(current_inflight, dict)
+                else 0
+            )
+        except (TypeError, ValueError):
+            current_generation = 0
+        same_active_run = (
+            captured_generation is not None
+            and bool(session.get("running"))
+            and session.get("agent") is agent
+            and current_generation == captured_generation
+        )
+        if (
+            same_active_run
+            and not has_media
+            and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}
+            and agent is not None
+        ):
+            steer_payload = payload
+            if decision.route == ROUTE_INDEPENDENT:
+                steer_payload = build_parallel_steer_payload(payload)
+            if steer_payload and hasattr(agent, "steer"):
+                try:
+                    steered = bool(agent.steer(steer_payload))
+                except Exception:
+                    steered = False
 
+    receipt = None
     if steered:
         status = "smart_parallel" if decision.route == ROUTE_INDEPENDENT else "smart_related"
     else:
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
-        status = "smart_queued"
-        if decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+        receipt = _enqueue_prompt(session, text, transport, envelope=envelope)
+        status = "smart_queued" if receipt["accepted"] else "smart_rejected"
+        if not receipt["accepted"]:
+            decision = SmartRouteDecision(
+                route=ROUTE_AMBIGUOUS,
+                confidence=0.0,
+                reason="The bounded next-turn queue rejected this message.",
+                source="fallback",
+            )
+        elif decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
             decision = SmartRouteDecision(
                 route=ROUTE_AMBIGUOUS,
                 confidence=0.0,
                 reason="The active checkpoint closed before steering; queued safely.",
                 source="fallback",
             )
+        # The run may have completed while classification was in flight. Drain
+        # now instead of waiting for a finalizer that has already passed its
+        # queue-drain checkpoint.
+        if receipt["accepted"] and _drain_queued_prompt(rid, sid, session):
+            status = "smart_started"
 
     prefix = str(smart_cfg.get("ack_prefix", "") or "").strip()
     session["last_active"] = time.time()
-    return _ok(
-        rid,
-        {
-            "status": status,
-            "route": decision.route,
-            "ack": format_smart_ack(decision, prefix=prefix),
-        },
-    )
+    ack = format_smart_ack(decision, prefix=prefix)
+    if status == "smart_started":
+        body = "▶ O turno anterior terminou durante a classificação; a mensagem foi iniciada como o próximo turno."
+        ack = f"{prefix}\n\n{body}" if prefix else body
+    elif status == "smart_rejected":
+        body = "⚠ A mensagem não foi aceita: a fila de próximos turnos atingiu o limite seguro."
+        ack = f"{prefix}\n\n{body}" if prefix else body
+    result = {
+        "status": status,
+        "route": decision.route,
+        "ack": ack,
+        "accepted": status != "smart_rejected",
+    }
+    if receipt is not None:
+        result.update(
+            {
+                "reason": receipt["reason"],
+                "depth": receipt["depth"],
+                "queued_bytes": receipt["queued_bytes"],
+            }
+        )
+    return _ok(rid, result)
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    envelope: dict | None = None,
+    route_context: dict | None = None,
+    queued: bool = False,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
 
     The old rejection forced clients into a deadline-bounded busy-retry that
-    silently dropped the send when turn teardown outlived the deadline. The
-    default policy now redirects a capable core agent in place; older agents
-    retain the proven interrupt-and-queue path drained from ``run``'s tail.
+    silently dropped the send when turn teardown outlived the deadline (e.g. a
+    slow, non-interruptible tool like ``web_search`` running when the user hits
+    stop). The message is instead queued to run as the next turn — and, for the
+    default ``interrupt`` policy, the live turn is interrupted so it winds down
+    promptly. Drained in ``run``'s tail (see ``_run_prompt_submit``).
 
-    Modes: ``interrupt`` (default) → redirect the live turn, falling back to
-    hard interrupt + queue for older agents; ``queue`` → queue without
-    interrupting; ``steer`` → inject after the current atomic action;
-    ``smart`` → classify into related/parallel/dependent without interrupting.
-
-    ``queued=True`` (client's queue drain, ``prompt.submit`` param) overrides
-    the mode entirely: the message was explicitly queued as "run after", so it
-    must NEVER become a live-turn correction or interrupt. Without this, a
-    drain that loses the settle race (client observed idle, server still
-    unwinding the turn) redirected the live turn with next-turn text — queue
-    semantics betrayed by a millisecond race the user can't see.
+    Modes: ``interrupt`` (default) → interrupt + queue; ``queue`` → queue
+    without interrupting; ``steer`` → inject into the live turn if accepted,
+    else queue; ``smart`` → classify into related/parallel/dependent and never
+    interrupt.
     """
+    if not isinstance(envelope, dict):
+        with session["history_lock"]:
+            envelope = _capture_prompt_envelope_locked(
+                session,
+                rid,
+                text,
+                transport,
+            )
+    with session["history_lock"]:
+        still_running = bool(session.get("running"))
+    if not still_running:
+        _restore_rejected_prompt_images(session, envelope)
+        return None
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
-    with session["history_lock"]:
-        if not session.get("running"):
-            # The turn ended between prompt.submit's first busy check and this
-            # helper. Let the caller retry and claim the now-idle session.
-            return None
-    with session["history_lock"]:
-        if not session.get("running"):
-            return None
-        image_paths = list(session.get("attached_images", []))
-        if image_paths:
-            # Claim at submission time. A later paste must not be consumed by
-            # this prompt after the active turn finally yields.
-            session["attached_images"] = []
-    text_only = not image_paths and _is_text_only_busy_payload(text)
-    plain_text = _coerce_message_text(text).strip() if text_only else ""
     if mode == "smart":
+        if not isinstance(route_context, dict):
+            with session["history_lock"]:
+                route_context = _capture_busy_route_context_locked(session)
         route_lock: Any = session.get("smart_route_lock")
         if not hasattr(route_lock, "acquire"):
             route_lock = threading.Lock()
@@ -7451,19 +7826,25 @@ def _handle_busy_submit(
                 session,
                 text,
                 transport,
-                image_paths=image_paths,
+                envelope=envelope,
+                route_context=route_context,
             )
-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
+    has_media = bool(envelope.get("images"))
+    text_only = not has_media and _is_text_only_busy_payload(text)
+    plain_text = _coerce_message_text(text).strip() if text_only else ""
+    if (
+        not has_media
+        and mode == "steer"
+        and plain_text
+        and agent is not None
+        and hasattr(agent, "steer")
+    ):
         try:
             if agent.steer(plain_text):
-                with session["history_lock"]:
-                    session["last_active"] = time.time()
+                session["last_active"] = time.time()
                 return _ok(rid, {"status": "steered"})
         except Exception:
             pass  # fall through to queue
-    # Text-only corrections redirect the live turn in place when the runtime
-    # supports it; media/attachment payloads and older agents fall through to
-    # the proven interrupt + queue path below.
     if (
         mode == "interrupt"
         and text_only
@@ -7479,23 +7860,32 @@ def _handle_busy_submit(
                     session["last_active"] = time.time()
                 return _ok(rid, {"status": "redirected"})
         except Exception:
-            pass  # preserve the proven interrupt + queue fallback below
-    # Queue before asking the live turn to stop. In particular, never call a
-    # provider or compute-host method while holding history_lock: an interrupt
-    # can wait behind the very operation it is trying to cancel.
-    with session["history_lock"]:
-        if not session.get("running"):
-            if image_paths:
-                session["attached_images"] = image_paths + list(session.get("attached_images", []))
-            return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
-        session["last_active"] = time.time()
-
-    # Attachments need a separate model invocation. Queue them without
-    # cancelling the active turn so the user gets both results in order.
-    if mode != "queue" and not image_paths:
+            pass
+    receipt = _enqueue_prompt(session, text, transport, envelope=envelope)
+    session["last_active"] = time.time()
+    if not receipt["accepted"]:
+        return _ok(
+            rid,
+            {
+                "status": "queue_rejected",
+                "accepted": False,
+                "reason": receipt["reason"],
+                "depth": receipt["depth"],
+                "queued_bytes": receipt["queued_bytes"],
+                "ack": "A mensagem não foi aceita: a fila de próximos turnos atingiu o limite seguro.",
+            },
+        )
+    if mode == "interrupt" and not has_media:
         _interrupt_busy_session(sid, session, agent)
-    return _ok(rid, {"status": "queued"})
+    return _ok(
+        rid,
+        {
+            "status": "queued",
+            "accepted": True,
+            "depth": receipt["depth"],
+            "queued_bytes": receipt["queued_bytes"],
+        },
+    )
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
@@ -7505,64 +7895,57 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    limits = _load_tui_busy_queue_config()
     with session["history_lock"]:
-        queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        if session.get("running"):
             return False
+        with _prompt_queue_lock(session):
+            items, _expired = _cleanup_expired_prompts_locked(
+                session,
+                now=time.time(),
+                ttl_seconds=float(limits["ttl_seconds"]),
+            )
+            if not items:
+                return False
+            queued = items.pop(0)
+            _store_queued_prompt_items_locked(session, items)
         queue_generation = int(session.get("_queued_prompt_generation", 0))
-        queued_prompts = session.get("queued_prompts") or []
-        session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
-        if not queued_prompts:
-            session.pop("queued_prompts", None)
         session["running"] = True
+        session["active_prompt_envelope"] = queued
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             session["running"] = False
+            session.pop("active_prompt_envelope", None)
             return True
-    dispatch_failed = False
     try:
         if use_compute_host:
-            if queued.get("image_paths"):
-                resp = _submit_prompt_to_compute_host(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                )
-            else:
-                resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
-                )
+            resp = _submit_prompt_to_compute_host(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                envelope=queued,
+                queued_prompt_generation=queue_generation,
+            )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
                     _clear_inflight_turn(session)
+                    session.pop("active_prompt_envelope", None)
+                    _requeue_prompt_front(session, queued)
                 _emit("error", sid, {"message": message})
-                dispatch_failed = True
         else:
-            if queued.get("image_paths"):
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    queued_prompt_generation=queue_generation,
-                )
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                queued_prompt_generation=queue_generation,
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -7571,14 +7954,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
-        dispatch_failed = True
-    if dispatch_failed:
-        with session["history_lock"]:
-            drain_next = bool(session.get("queued_prompt")) and not session.get(
-                "_turn_cancel_requested"
-            )
-        if drain_next:
-            _drain_queued_prompt(rid, sid, session)
+            session.pop("active_prompt_envelope", None)
+            _requeue_prompt_front(session, queued)
     return True
 
 
@@ -9368,10 +9745,17 @@ def _run_prompt_submit(
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
             session["running"] = False
+            session.pop("active_prompt_envelope", None)
             return
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
-        if image_paths is None:
+        envelope = session.pop("active_prompt_envelope", None)
+        if isinstance(envelope, dict):
+            text = envelope.get("text", text)
+            images = list(envelope.get("images", []) or [])
+            if envelope.get("transport") is not None:
+                session["transport"] = envelope["transport"]
+        elif image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
         else:
@@ -10061,8 +10445,16 @@ def _run_prompt_submit(
         # both texts.
         _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
         if isinstance(_leftover_steer, str) and _leftover_steer.strip():
-            with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+            _enqueue_prompt(
+                session,
+                _leftover_steer,
+                session.get("transport"),
+                envelope={
+                    "text": _leftover_steer,
+                    "images": [],
+                    "transport": session.get("transport"),
+                },
+            )
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -10255,7 +10647,7 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     except Exception:
         session["image_counter"] = max(0, session["image_counter"] - 1)
         raise
-    session.setdefault("attached_images", []).append(str(img_path))
+    _append_attached_image(session, str(img_path))
     return img_path
 
 

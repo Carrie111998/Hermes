@@ -2981,9 +2981,27 @@ def _(rid, params: dict) -> dict:
     # model as the next turn, instead of a misleading 4010 the client silently
     # swallows into a lost follow-up.
     if agent is None and session.get("running"):
-        _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+        receipt = _enqueue_prompt(
+            session,
+            text,
+            current_transport() or _stdio_transport,
+            envelope={
+                "text": text,
+                "images": [],
+                "transport": current_transport() or _stdio_transport,
+            },
+        )
         session["last_active"] = time.time()
-        return _ok(rid, {"status": "queued", "text": text})
+        if receipt["accepted"]:
+            return _ok(rid, {"status": "queued", "text": text})
+        return _ok(
+            rid,
+            {
+                "status": "rejected",
+                "text": text,
+                **receipt,
+            },
+        )
     if (
         agent is None
         or getattr(agent, "_supports_active_turn_redirect", False) is not True

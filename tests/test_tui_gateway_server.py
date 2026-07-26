@@ -1402,7 +1402,7 @@ def test_prompt_submit_typed_stop_phrase_ends_voice_chat(monkeypatch):
     monkeypatch.setenv("HERMES_VOICE", "1")
     monkeypatch.setenv("HERMES_VOICE_TTS", "1")
 
-    resp = server.dispatch(
+    resp = server.handle_request(
         {
             "id": "typed-stop",
             "method": "prompt.submit",
@@ -1431,7 +1431,7 @@ def test_prompt_submit_typed_stop_passes_through_when_voice_off(monkeypatch):
     )
     monkeypatch.setenv("HERMES_VOICE", "0")
 
-    resp = server.dispatch(
+    resp = server.handle_request(
         {
             "id": "typed-stop-off",
             "method": "prompt.submit",
@@ -1455,7 +1455,7 @@ def test_prompt_submit_longer_text_not_consumed_in_voice_mode(monkeypatch):
     )
     monkeypatch.setenv("HERMES_VOICE", "1")
 
-    resp = server.dispatch(
+    resp = server.handle_request(
         {
             "id": "typed-long",
             "method": "prompt.submit",
