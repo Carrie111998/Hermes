@@ -13888,12 +13888,34 @@ def _project_tree_inputs(
     return sessions, projects, discovered, active_id
 
 
+# Per-build memo for `_dir_exists_cached`. Cleared at the top of every
+# `_build_project_tree`, so a dir created or deleted between sidebar refreshes
+# is seen on the next one.
+_DIR_EXISTS_CACHE: dict[str, bool] = {}
+
+
+def _dir_exists_cached(path: str) -> bool:
+    """``os.path.isdir`` for the project tree, memoized per build.
+
+    ``build_tree`` asks per SESSION, not per distinct path, so a power user with
+    hundreds of sessions across a handful of dirs would otherwise fire hundreds
+    of redundant stats on every sidebar open. The memo is per build, so a dir
+    created or deleted between refreshes is picked up on the next one.
+    """
+    hit = _DIR_EXISTS_CACHE.get(path)
+    if hit is None:
+        hit = os.path.isdir(path)
+        _DIR_EXISTS_CACHE[path] = hit
+    return hit
+
+
 def _build_project_tree(
     db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool
 ) -> tuple[dict, str | None]:
     """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
     from tui_gateway import project_tree
 
+    _DIR_EXISTS_CACHE.clear()
     sessions, projects, discovered, active_id = _project_tree_inputs(
         db, session_limit, include_discovered=include_discovered
     )
@@ -13906,6 +13928,7 @@ def _build_project_tree(
         hydrate=hydrate,
         is_junk_root=_is_repo_junk,
         is_junk_cwd=_is_session_cwd_junk,
+        exists=_dir_exists_cached,
     )
     return tree, active_id
 
@@ -15806,6 +15829,14 @@ def _(rid, params: dict) -> dict:
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
         doc = Document(text, len(text))
+        # Skill commands and bundles are the only completions offered for an
+        # inline `/skill` reference typed mid-message, so the class has to
+        # reach the TUI as data. Derived from the same providers the completer
+        # uses — no sniffing the ⚡/▣ meta glyphs, which are display text.
+        skill_names = {
+            key.lstrip("/").lower()
+            for key in (*get_skill_commands(), *get_skill_bundles())
+        }
         items = [
             {
                 "text": c.text,
@@ -15816,6 +15847,11 @@ def _(rid, params: dict) -> dict:
                 # layout into 1-char truncation of the next column.
                 "display": to_plain_text(c.display) if c.display else c.text,
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
+                "kind": (
+                    "skill"
+                    if c.text.strip().lstrip("/").lower() in skill_names
+                    else "command"
+                ),
             }
             for c in completer.get_completions(doc, None)
         ][:30]
@@ -15825,21 +15861,25 @@ def _(rid, params: dict) -> dict:
                 "text": "/density",
                 "display": "/density",
                 "meta": "Toggle compact display mode",
+                "kind": "command",
             },
             {
                 "text": "/details",
                 "display": "/details",
                 "meta": "Control agent detail visibility",
+                "kind": "command",
             },
             {
                 "text": "/logs",
                 "display": "/logs",
                 "meta": "Show recent gateway log lines",
+                "kind": "command",
             },
             {
                 "text": "/mouse",
                 "display": "/mouse",
                 "meta": "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
+                "kind": "command",
             },
         ]
         for extra in extras:
