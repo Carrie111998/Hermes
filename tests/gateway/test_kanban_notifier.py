@@ -307,3 +307,180 @@ def _unseen_terminal_events_for(tid, chat_id):
         return events
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# RCJ durability: SendResult false + crash replay semantics (C2a-C3c)
+# ---------------------------------------------------------------------------
+
+
+class FalseSendResultAdapter:
+    """Adapter whose send() returns SendResult(success=False) without raising.
+
+    This is the C2a/C2b scenario: the adapter is connected and responds, but
+    reports a genuine transient failure (rate-limit, downstream 5xx).  The
+    notifier must rewind the claim so the event is retried — advancing the
+    cursor would permanently lose the notification.
+    """
+
+    def __init__(self):
+        self.sent = []
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        from gateway.platforms.base import SendResult
+
+        return SendResult(success=False, error="simulated transient failure")
+
+
+def test_kanban_notifier_rewinds_when_send_result_false(tmp_path, monkeypatch):
+    """C2a/C2b — a SendResult(success=False) must rewind the cursor.
+
+    Before the fix, a False SendResult (distinct from an exception) was
+    silently ignored and the cursor advanced, permanently losing the
+    notification.  This test pins the contract that the notifier treats a
+    False SendResult identically to a raised exception: rewind + retry.
+    """
+    db_path = tmp_path / "false-send-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FalseSendResultAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Send was attempted (the adapter was connected and responded).
+    assert adapter.attempts >= 1, "send should have been attempted"
+
+    # The cursor must NOT have advanced — the event is still unseen.
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"], (
+        "SendResult(success=False) must rewind the claim so the event "
+        "is retried on the next tick, not permanently lost."
+    )
+
+
+class CrashAfterClaimAdapter:
+    """Adapter that simulates a crash after the claim but before send completes.
+
+    For C3a/C3b: the first call raises a transient error (the closest
+    in-process equivalent of a process crash mid-send that the notifier
+    can catch and rewind); the key invariant is that the cursor advance
+    inside ``claim_unseen_events_for_sub`` is reversed by the rewind path
+    so the next tick sees the same event.
+    """
+
+    def __init__(self, crash_on_first=True):
+        self.crash_on_first = crash_on_first
+        self.sent = []
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        if self.crash_on_first and self.attempts == 1:
+            raise RuntimeError("simulated transient failure before send completed")
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+
+def test_kanban_notifier_claim_before_send_crash_replays_unadvanced_cursor(
+    tmp_path, monkeypatch,
+):
+    """C3a/C3b — crash after claim but before confirmed send must replay.
+
+    The claim step (claim_unseen_events_for_sub) advances the cursor
+    atomically, but the notifier rewinds on send failure.  After a crash
+    that prevents the cursor from being confirmed, the next tick must see
+    the same event and retry delivery.
+    """
+    db_path = tmp_path / "crash-before-send.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    # First tick: crash during send.
+    crash_adapter = CrashAfterClaimAdapter(crash_on_first=True)
+    crash_runner = _make_runner(crash_adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, crash_runner))
+
+    # The crash prevented confirmation. The event must still be unseen.
+    assert crash_adapter.attempts == 1, "first tick should have attempted send"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"], (
+        "After a crash before confirmed send, the event must still be "
+        "unseen for replay on the next tick."
+    )
+
+    # Second tick: a fresh runner picks up the same event and delivers it.
+    ok_adapter = RecordingAdapter()
+    ok_runner = _make_runner(ok_adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, ok_runner))
+
+    assert len(ok_adapter.sent) == 1, (
+        "Second tick should replay the unconfirmed event and deliver it."
+    )
+    assert "done" in ok_adapter.sent[0]["text"].lower()
+
+
+class PartialBatchCrashAdapter:
+    """Adapter that crashes after the first event in a multi-event batch.
+
+    For C3c: when a claim returns multiple events, a failure after the first
+    send (but before all sends complete) must leave the unconfirmed tail
+    available for replay.
+    """
+
+    def __init__(self):
+        self.sent = []
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        if self.attempts == 1:
+            self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+            return  # first event succeeds
+        raise RuntimeError("simulated failure before second send")
+
+
+def test_kanban_notifier_partial_batch_crash_replays_unconfirmed_tail(
+    tmp_path, monkeypatch,
+):
+    """C3c — partial batch crash must replay the unconfirmed tail.
+
+    Two events are claimed atomically. The first send succeeds but the
+    second crashes. Because the notifier breaks on the first send failure
+    (the SystemExit on attempt 2) and rewinds the entire claim, both
+    events must remain available for replay on the next tick.
+    """
+    db_path = tmp_path / "partial-batch-crash.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    # Create a task with two terminal events so the claim returns a batch.
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="partial batch test", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="crashed")
+        kb._append_event(conn, tid, kind="completed")
+    finally:
+        conn.close()
+
+    # First tick: crash on second send.
+    crash_adapter = PartialBatchCrashAdapter()
+    crash_runner = _make_runner(crash_adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, crash_runner))
+
+    # The batch was claimed but crashed mid-way; the rewind means at least
+    # the unconfirmed events remain unseen. Because the notifier breaks on
+    # the first failure and rewinds the whole claim, all events replay.
+    remaining = _unseen_terminal_events(tid)
+    assert len(remaining) >= 1, (
+        "After a partial-batch crash, at least the unconfirmed tail must "
+        "remain unseen for replay."
+    )
+

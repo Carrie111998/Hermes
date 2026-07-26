@@ -379,8 +379,19 @@ class TestSlackSlashConfirmAction:
         monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
 
+        # C5b: register the prompt origin (send_slash_confirm does this at send
+        # time) so the click callback can validate it came from the right place.
+        adapter.register_approval_origin(
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="",
+            confirm_id="confirm-1",
+            session_key="agent:main:slack:group:C1:1111",
+        )
+
         ack = AsyncMock()
         body = {
+            "team_id": "T1",
             "message": {
                 "ts": "2222.3333",
                 "blocks": [
@@ -417,6 +428,15 @@ class TestSlackSlashConfirmAction:
         monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
 
+        # C5b: origin registered under the outer payload's team (T2).
+        adapter.register_approval_origin(
+            team_id="T2",
+            channel_id="C1",
+            thread_ts="",
+            confirm_id="confirm-1",
+            session_key="agent:main:slack:group:C1:1111",
+        )
+
         ack = AsyncMock()
         body = {
             "team_id": "T2",
@@ -448,11 +468,21 @@ class TestSlackSlashConfirmAction:
         _attach_auth_runner(adapter)
         adapter._approval_resolved["2222.3333"] = False
 
+        # C5b: register origin so the click passes validation.
+        adapter.register_approval_origin(
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="",
+            confirm_id="confirm-1",
+            session_key="agent:main:slack:group:C1:1111",
+        )
+
         # Simulate Slack re-escaping inflating text past 3000 chars.
         inflated_text = "b" * 2990 + "&lt;" * 10  # 2990 + 40 = 3030 chars
 
         ack = AsyncMock()
         body = {
+            "team_id": "T1",
             "message": {"ts": "2222.3333", "blocks": [
                 {"type": "section", "text": {"type": "mrkdwn", "text": inflated_text}},
             ]},
@@ -1649,4 +1679,202 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
+
+
+# ===========================================================================
+# C5a/C5b — slash-confirm callback origin routing
+#
+# A slash-confirm callback must route by (team_id, channel_id, thread_ts,
+# confirm_id) so that two prompts with the same confirm_id in different
+# channels/threads resolve only their own origin.  Before the fix, the handler
+# resolved purely by session_key (embedded in the button value), so a click in
+# channel B could resolve a prompt created in channel A.
+#
+# The registry is populated at SEND time by send_slash_confirm, not by a test
+# helper — so these tests exercise the real send → click path.
+# ===========================================================================
+
+
+class TestSlackApprovalOriginRouting:
+    """C5a/C5b — slash-confirm callbacks route by full origin tuple."""
+
+    @pytest.mark.asyncio
+    async def test_send_slash_confirm_registers_origin_at_send_time(self):
+        """send_slash_confirm must populate the origin registry so a click can
+        be validated.  This is the production wiring: the registry is not
+        test-only bookkeeping."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "999.0"})
+
+        result = await adapter.send_slash_confirm(
+            chat_id="C1",
+            title="Run deploy",
+            message="Proceed?",
+            session_key="agent:main:slack:group:C1:1111",
+            confirm_id="confirm-1",
+            metadata={"team_id": "T1"},
+        )
+
+        assert result.success is True
+        # The origin must be registered after the send succeeds.
+        assert adapter.is_approval_origin_pending(
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="",
+            confirm_id="confirm-1",
+        ), "send_slash_confirm must register the prompt origin at send time."
+
+    @pytest.mark.asyncio
+    async def test_send_slash_confirm_with_thread_registers_thread_ts(self):
+        """When the prompt is sent in a thread, the origin key must carry the
+        thread_ts so the callback (which reads message.thread_ts) matches."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "999.0"})
+
+        await adapter.send_slash_confirm(
+            chat_id="C1",
+            title="Run deploy",
+            message="Proceed?",
+            session_key="agent:main:slack:group:C1:1111",
+            confirm_id="confirm-thread",
+            metadata={"team_id": "T1", "thread_id": "5555.0"},
+        )
+
+        assert adapter.is_approval_origin_pending(
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="5555.0",
+            confirm_id="confirm-thread",
+        )
+
+    @pytest.mark.asyncio
+    async def test_cross_origin_click_does_not_resolve_other_session(self):
+        """C5a reproduction + C5b fix via the real send → click path.
+
+        Two prompts share a confirm_id but are sent to different channels.
+        A click on prompt B must resolve ONLY session-b — never session-a.
+        """
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "ts-x"})
+        mock_client.chat_update = AsyncMock()
+
+        confirm_id = "shared-confirm-xyz"
+
+        # Send prompt A → channel C1 (no thread).
+        res_a = await adapter.send_slash_confirm(
+            chat_id="C1",
+            title="Command A",
+            message="Proceed with A?",
+            session_key="session-a",
+            confirm_id=confirm_id,
+            metadata={"team_id": "T1"},
+        )
+        assert res_a.success
+
+        # Send prompt B → channel C2 (no thread), same confirm_id.
+        # Map C2 to team T1 so the client resolves.
+        adapter._channel_team["C2"] = "T1"
+        res_b = await adapter.send_slash_confirm(
+            chat_id="C2",
+            title="Command B",
+            message="Proceed with B?",
+            session_key="session-b",
+            confirm_id=confirm_id,
+            metadata={"team_id": "T1"},
+        )
+        assert res_b.success
+
+        # Both origins must be pending.
+        assert adapter.is_approval_origin_pending(
+            team_id="T1", channel_id="C1", thread_ts="", confirm_id=confirm_id,
+        )
+        assert adapter.is_approval_origin_pending(
+            team_id="T1", channel_id="C2", thread_ts="", confirm_id=confirm_id,
+        )
+
+        # Click on prompt B (channel C2).  The button value carries session-b,
+        # but even if it somehow carried session-a the origin must govern.
+        resolved = []
+
+        async def _fake_resolve(session_key, confirm_id, choice):
+            resolved.append((session_key, confirm_id, choice))
+            return "ok"
+
+        ack = AsyncMock()
+        body_b = {
+            "team_id": "T1",
+            "message": {
+                "ts": "ts-b",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "Command B"}},
+                ],
+            },
+            "channel": {"id": "C2"},
+            "user": {"name": "operator", "id": "U_OP"},
+        }
+        action_b = {
+            "action_id": "hermes_confirm_once",
+            "value": f"session-b|{confirm_id}",
+        }
+
+        with patch("tools.slash_confirm.resolve", side_effect=_fake_resolve):
+            await adapter._handle_slash_confirm_action(ack, body_b, action_b)
+
+        # Only session-b resolved.
+        assert resolved == [("session-b", confirm_id, "once")], (
+            f"Click in C2 must resolve only session-b, got: {resolved}"
+        )
+
+        # session-a's origin must still be pending (unresolved).
+        assert adapter.is_approval_origin_pending(
+            team_id="T1", channel_id="C1", thread_ts="", confirm_id=confirm_id,
+        ), "Origin A must remain pending after Origin B was clicked."
+
+    @pytest.mark.asyncio
+    async def test_click_without_registered_origin_is_rejected(self):
+        """A click whose origin was never registered (e.g. a fabricated button
+        value, or a prompt whose origin already resolved) must NOT resolve any
+        session — it would mis-assign the confirmation."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        mock_client.chat_postMessage = AsyncMock()
+
+        resolved = []
+
+        async def _fake_resolve(session_key, confirm_id, choice):
+            resolved.append((session_key, confirm_id, choice))
+            return "ok"
+
+        ack = AsyncMock()
+        body = {
+            "team_id": "T1",
+            "message": {
+                "ts": "ts-1",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "cmd"}},
+                ],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "operator", "id": "U_OP"},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-x|confirm-never-sent",
+        }
+
+        with patch("tools.slash_confirm.resolve", side_effect=_fake_resolve):
+            await adapter._handle_slash_confirm_action(ack, body, action)
+
+        assert resolved == [], (
+            "A click with no registered origin must not resolve any session. "
+            f"Got: {resolved}"
+        )
+        # The message must not be updated (no decision rendered).
+        mock_client.chat_update.assert_not_called()
 

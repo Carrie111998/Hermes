@@ -951,6 +951,17 @@ class SlackAdapter(BasePlatformAdapter):
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
+        # C5b: origin-tracked slash-confirm registry. Maps the origin tuple
+        # (team_id, channel_id, thread_ts or "", confirm_id) to the session_key
+        # the prompt was created for.  Lets the slash-confirm callback validate
+        # that a click came from the same origin that the prompt was sent to —
+        # so two prompts sharing a confirm_id in different channels/threads
+        # resolve independently instead of cross-impacting.  ``user_id`` is
+        # intentionally NOT part of the key: any authorized user in the channel
+        # may click, so binding to the sender's identity would prevent the
+        # legitimate resolution path.  Bounded same as _approval_resolved.
+        self._pending_approval_origins: Dict[tuple, str] = {}
+        self._PENDING_APPROVAL_ORIGINS_MAX = 1000
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
@@ -6522,6 +6533,18 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self._get_client(
                 chat_id, team_id=self._metadata_team_id(metadata)
             ).chat_postMessage(**kwargs)
+            # C5b: register the origin so the slash-confirm callback can
+            # validate a click came from the (team/channel/thread) this prompt
+            # was sent to.  Keyed without user_id — any authorized user may
+            # click.  thread_ts is the resolved Slack thread parent (or ""),
+            # matching what the callback extracts from message.thread_ts.
+            self.register_approval_origin(
+                team_id=self._metadata_team_id(metadata),
+                channel_id=chat_id,
+                thread_ts=thread_ts or "",
+                confirm_id=confirm_id,
+                session_key=session_key,
+            )
             return SendResult(
                 success=True, message_id=result.get("ts", ""), raw_response=result
             )
@@ -6741,6 +6764,33 @@ class SlackAdapter(BasePlatformAdapter):
             return
         session_key, confirm_id = value.split("|", 1)
 
+        # C5b: validate the click's origin against the registry.  Two prompts
+        # may share a confirm_id (e.g. the same slash command run in two
+        # channels); without origin tracking a click on prompt B would resolve
+        # prompt A's session because ``session_key|confirm_id`` only identifies
+        # the confirm, not where it was sent.  We pop the origin-registered
+        # session_key and use it authoritatively when the (team/channel/thread)
+        # matches; if no origin was registered for this click's location the
+        # value's session_key is a stale cross-origin reference and must NOT
+        # resolve — it would mis-assign the confirmation to the wrong session.
+        cb_thread_ts = message.get("thread_ts", "") or ""
+        origin_session = self.resolve_approval_origin(
+            team_id=team_id,
+            channel_id=channel_id,
+            thread_ts=cb_thread_ts,
+            confirm_id=confirm_id,
+        )
+        if origin_session is None:
+            logger.warning(
+                "[Slack] Slash-confirm click for confirm_id=%s from "
+                "(team=%s channel=%s thread=%s) has no registered origin — "
+                "ignoring to prevent cross-origin misassignment.",
+                confirm_id, team_id, channel_id, cb_thread_ts,
+            )
+            return
+        # Use the registry's authoritative session_key for this origin.
+        session_key = origin_session
+
         choice_map = {
             "hermes_confirm_once": "once",
             "hermes_confirm_always": "always",
@@ -6842,6 +6892,84 @@ class SlackAdapter(BasePlatformAdapter):
             message.get("ts", ""),
         )
 
+    # ------------------------------------------------------------------
+    # C5b: origin-tracked slash-confirm registry
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _approval_origin_key(
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        confirm_id: str,
+    ) -> tuple:
+        """Build the deterministic origin key for a slash-confirm prompt/click.
+
+        ``user_id`` is deliberately excluded — any authorized user in the
+        channel may click the prompt, so the key must not bind to a specific
+        person.
+        """
+        return (
+            str(team_id or ""),
+            str(channel_id or ""),
+            str(thread_ts or ""),
+            str(confirm_id or ""),
+        )
+
+    def register_approval_origin(
+        self,
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        confirm_id: str,
+        session_key: str,
+    ) -> None:
+        """Record the origin of a slash-confirm prompt at send time so the
+        click callback can validate it came from the right
+        (team/channel/thread)."""
+        key = self._approval_origin_key(
+            team_id, channel_id, thread_ts, confirm_id,
+        )
+        self._pending_approval_origins[key] = session_key
+        self._trim_oldest_dict_entries(
+            self._pending_approval_origins,
+            self._PENDING_APPROVAL_ORIGINS_MAX,
+        )
+
+    def resolve_approval_origin(
+        self,
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        confirm_id: str,
+    ) -> Optional[str]:
+        """Pop and return the session_key for an origin-matched slash-confirm.
+
+        Returns None when no prompt was registered for this origin (either it
+        was never registered, or it was already resolved/cancelled).
+        """
+        key = self._approval_origin_key(
+            team_id, channel_id, thread_ts, confirm_id,
+        )
+        return self._pending_approval_origins.pop(key, None)
+
+    def is_approval_origin_pending(
+        self,
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        confirm_id: str,
+    ) -> bool:
+        """Check whether a slash-confirm prompt for this origin is still
+        pending."""
+        key = self._approval_origin_key(
+            team_id, channel_id, thread_ts, confirm_id,
+        )
+        return key in self._pending_approval_origins
+
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
         await ack()
@@ -6904,6 +7032,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)
         # shows "expired" instead of falsely claiming the command was approved.
+        #
+        # send_exec_approval uses a bare session_key as the button value (no
+        # confirm_id), so no origin registry lookup is needed here.  The
+        # origin-tracked slash-confirm path lives in _handle_slash_confirm_action.
         try:
             from tools.approval import resolve_gateway_approval
 

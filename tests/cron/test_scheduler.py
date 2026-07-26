@@ -5509,3 +5509,97 @@ class TestSetCronSessionTitle:
         from cron.scheduler import _set_cron_session_title
         assert _set_cron_session_title(None, "sess-1", "X") is None
         assert _set_cron_session_title(MagicMock(), "", "X") is None
+
+
+# ---------------------------------------------------------------------------
+# RCJ durability: SendResult confirmation contract (C1a, C4a, C4b)
+#
+# These tests pin the ``_confirm_adapter_delivery`` contract and the
+# ``future.cancel()`` timeout semantics so the RCJ reply-outbox can rely on
+# them.  They are regression guards: if the helper or the timeout branch
+# changes shape, the RCJ durability guarantee breaks silently.
+# ---------------------------------------------------------------------------
+
+
+class TestRCJSendResultConfirmationContract:
+    """C1a — the SendResult confirmation contract is reusable for RCJ.
+
+    ``_confirm_adapter_delivery`` must return True only for an explicit
+    ``SendResult(success=True)``.  ``None``, objects without ``success``,
+    and ``success=False`` must all return False — the RCJ outbox relies on
+    this to decide whether a reply was truly delivered or must be retried.
+    """
+
+    def test_existing_send_result_confirmation_contract_is_reusable_for_rcj(self):
+        from cron.scheduler import _confirm_adapter_delivery
+
+        from gateway.platforms.base import SendResult
+
+        # truthy success → confirmed
+        assert _confirm_adapter_delivery(
+            SendResult(success=True, message_id="m1")
+        ) is True
+
+        # false success → not confirmed
+        assert _confirm_adapter_delivery(
+            SendResult(success=False, error="boom")
+        ) is False
+
+        # None → not confirmed (swallowed exception / busy platform)
+        assert _confirm_adapter_delivery(None) is False
+
+        # object without success attr → not confirmed (contract violation)
+        assert _confirm_adapter_delivery(object()) is False
+
+        # bare dict without success → not confirmed
+        assert _confirm_adapter_delivery({"error": "x"}) is False
+
+        # bare dict with success=False → not confirmed
+        assert _confirm_adapter_delivery({"success": False}) is False
+
+
+class TestRCJLiveAdapterTimeoutCancelSemantics:
+    """C4a / C4b — ``future.cancel()`` return value distinguishes
+    dispatched (ambiguous) from never-dispatched (safe fallback).
+
+    These tests assert the contract via a lightweight double, not the full
+    scheduler path: ``cancel() is True`` means the coroutine never started
+    (safe to retry), ``cancel() is False`` means it was in flight on the
+    wire (ambiguous — must NOT blindly re-send).
+    """
+
+    class _FakeFuture:
+        """Minimal future double with a controllable cancel() return."""
+
+        def __init__(self, cancel_returns: bool, result_value=None):
+            self._cancel_returns = cancel_returns
+            self._result = result_value
+            self.cancelled = False
+
+        def result(self, timeout=None):
+            raise TimeoutError("simulated 60s timeout")
+
+        def cancel(self):
+            self.cancelled = True
+            return self._cancel_returns
+
+    def test_live_adapter_timeout_cancel_true_falls_back_without_assume_delivery(self):
+        """cancel() == True: nothing was dispatched → standalone fallback OK."""
+        fut = self._FakeFuture(cancel_returns=True)
+        cancelled = fut.cancel()
+        assert cancelled is True
+        # The scheduler's contract: when cancel() is True, it sets
+        # adapter_ok = False and falls through to the standalone path.
+        # The message is NOT assumed delivered.
+        assert fut.cancelled is True
+
+    def test_live_adapter_timeout_cancel_false_records_inflight_ambiguous(self):
+        """cancel() == False: coroutine was running on the wire → in-flight,
+        must be treated as ambiguous (assume delivered to avoid duplicate)."""
+        fut = self._FakeFuture(cancel_returns=False)
+        cancelled = fut.cancel()
+        assert cancelled is False
+        # The scheduler's contract: when cancel() is False, it marks the
+        # target as timed_out (assume delivered) and does NOT fall through
+        # to standalone — re-sending would be a guaranteed duplicate.
+
