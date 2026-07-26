@@ -334,6 +334,27 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # binary by absolute path, so this PATH ordering is transparent to
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
+
+# ...but a LOGIN shell ignores the inherited PATH and rebuilds it from
+# /etc/profile, which drops everything above. That is not hypothetical: the
+# terminal tool starts its in-container sessions with one —
+# tools/environments/docker.py::_run_bash() runs `docker exec … bash -l -c`
+# whenever login=True, which is how init_session snapshots the environment.
+#
+# Measured in a container built from this image:
+#
+#   bash -c  → python3 -> /opt/hermes/.venv/bin/python3
+#   bash -lc → python3 -> /usr/bin/python3
+#
+# The system interpreter has none of Hermes' dependencies, so the failures that
+# follow look like missing packages rather than a PATH problem.
+#
+# The ordering here deliberately mirrors the ENV above, /opt/hermes/bin first:
+# that is the privilege-drop shim, and it must keep winning PATH resolution in
+# login shells too. Prepending only the venv would silently invert that.
+RUN echo 'export PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"' \
+      > /etc/profile.d/hermes-venv.sh
+
 RUN mkdir -p /opt/data
 VOLUME [ "/opt/data" ]
 
