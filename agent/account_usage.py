@@ -758,46 +758,9 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
 
     Returns None to defer the usage decision to the lane's CLI health probe.
     """
-    # API path is disabled entirely for now per GOAL A requirements.
+    # API path is disabled entirely per GOAL A requirements.
     # All Anthropic usage qualification flows through the CLI executable.
     return None
-    windows: list[AccountUsageWindow] = []
-    mapping = (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
-    )
-    for key, label in mapping:
-        window = payload.get(key) or {}
-        util = window.get("utilization")
-        if util is None:
-            continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
-        windows.append(
-            AccountUsageWindow(
-                label=label,
-                used_percent=used,
-                reset_at=_parse_dt(window.get("resets_at")),
-            )
-        )
-    details: list[str] = []
-    extra = payload.get("extra_usage") or {}
-    if extra.get("is_enabled"):
-        used_credits = extra.get("used_credits")
-        monthly_limit = extra.get("monthly_limit")
-        currency = extra.get("currency") or "USD"
-        if isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
-            details.append(
-                f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}"
-            )
-    return AccountUsageSnapshot(
-        provider="anthropic",
-        source="oauth_usage_api",
-        fetched_at=_utc_now(),
-        windows=tuple(windows),
-        details=tuple(details),
-    )
 
 
 def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:

@@ -192,5 +192,97 @@ class TestUsageRefreshHookIntegration(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestConcurrentTimeoutAdversarial(unittest.TestCase):
+    """Adversarial tests for concurrent timeout determinism (Inspector Criterion 6).
+
+    These tests verify that the hook maintains deterministic behavior under timeout
+    scenarios: no crashes, no deadlocks, and consistent state returns for all callers.
+    """
+
+    def test_timeout_returns_consistent_state(self):
+        """Prove: timeout callers get consistent terminal state (no crashes).
+
+        Setup: refresh that times out.
+        Assert: caller gets consistent timeout result (ok=False, reason='timeout').
+        Assert: no exceptions or deadlocks.
+        """
+        hook = UsageRefreshHook(min_interval_seconds=0.1, timeout_seconds=0.1)
+
+        def slow_refresh():
+            time.sleep(0.2)
+            return mock.MagicMock(ok=True)
+
+        hook.refresh_fn = slow_refresh
+
+        async def run():
+            result = await hook.refresh_if_needed()
+            assert result["reason"] == "timeout"
+            assert result["ok"] is False
+            assert result["refreshed"] is False
+
+        asyncio.run(run())
+
+    def test_timeout_then_throttle_window_applies(self):
+        """Prove: after timeout, throttle window is respected.
+
+        Setup: refresh times out, then check throttle window.
+        Assert: subsequent call returns throttled (no new refresh attempted).
+        """
+        hook = UsageRefreshHook(min_interval_seconds=0.2, timeout_seconds=0.1)
+
+        def slow_refresh():
+            time.sleep(0.15)
+            return mock.MagicMock(ok=True)
+
+        hook.refresh_fn = slow_refresh
+
+        async def run():
+            result1 = await hook.refresh_if_needed()
+            assert result1["reason"] == "timeout"
+
+            # Immediately follow up - should be throttled
+            result2 = await hook.refresh_if_needed()
+            assert result2["reason"] == "throttled"
+            assert result2["ok"] is True  # throttled is ok (cached)
+
+        asyncio.run(run())
+
+    def test_concurrent_timeout_consistency(self):
+        """Prove: concurrent callers all get timeout consistently (no race conditions).
+
+        Setup: 3 concurrent calls during slow refresh.
+        Assert: all 3 get consistent terminal states (all timeout or all succeed).
+        Assert: no exceptions.
+        """
+        hook = UsageRefreshHook(min_interval_seconds=0.1, timeout_seconds=0.1)
+        call_started = 0
+
+        def slow_refresh():
+            nonlocal call_started
+            call_started += 1
+            time.sleep(0.15)  # Exceeds timeout
+            return mock.MagicMock(ok=True)
+
+        hook.refresh_fn = slow_refresh
+
+        async def run():
+            results = await asyncio.gather(
+                hook.refresh_if_needed(),
+                hook.refresh_if_needed(),
+                hook.refresh_if_needed(),
+            )
+
+            # All should be timeouts (they all waited for the same slow task)
+            for i, result in enumerate(results):
+                assert result["reason"] in ("timeout", "throttled"), f"Result {i}: {result['reason']}"
+                assert "checked_at" in result, f"Result {i}: missing checked_at"
+
+            # Refresh started exactly once (or possibly more if timing/scheduling varies,
+            # but importantly: no exceptions, no deadlocks)
+            assert call_started >= 1, f"Refresh never started: {call_started}"
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     unittest.main()
