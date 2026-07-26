@@ -1391,6 +1391,27 @@ def _restart_notification_pending() -> bool:
     return (_hermes_home / ".restart_notify.json").exists()
 
 
+def _update_notification_age(pending: dict) -> Optional[float]:
+    """Seconds since the /update that wrote this pending marker.
+
+    Read from the payload's ``timestamp`` rather than the marker's mtime:
+    deferring a notification rewrites the marker each pass, so its mtime is
+    always seconds old no matter how long the notification has been stuck.
+    Returns None when the timestamp is missing or unparseable, which the
+    caller treats as "cannot age out" so a malformed marker never causes a
+    real notification to be dropped.
+    """
+    raw = pending.get("timestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        written = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    now = datetime.now(written.tzinfo) if written.tzinfo else datetime.now()
+    return max(0.0, (now - written).total_seconds())
+
+
 def _planned_restart_notification_path() -> Path:
     return _hermes_home / ".restart_pending.json"
 
@@ -16164,6 +16185,15 @@ class GatewayRunner(
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
+    # How long a pending update notification may keep waiting for its target
+    # platform to reconnect before it is abandoned. Deferral preserves the
+    # marker so a platform that reconnects shortly after the update still gets
+    # notified, but a platform that is misconfigured (or simply never enabled)
+    # would otherwise defer forever: the watcher re-arms on every gateway
+    # start, so its own 30-minute deadline never retires the marker. Comfortably
+    # longer than the update timeout so a slow-but-real update still delivers.
+    _UPDATE_NOTIFICATION_MAX_AGE = 3600.0
+
 
 
     def _schedule_update_notification_watch(self) -> None:
@@ -16477,6 +16507,20 @@ class GatewayRunner(
                 # update succeeded or timed out. Preserve the markers instead so
                 # a later retry (the watcher poll loop, or the next gateway
                 # startup) can deliver the result once the adapter is back.
+                #
+                # Bounded, though: a platform that never reconnects would defer
+                # on every 2s poll forever. Age is measured from the payload
+                # timestamp because deferral rewrites the marker (and so its
+                # mtime) on every pass.
+                age = _update_notification_age(pending)
+                if age is not None and age > self._UPDATE_NOTIFICATION_MAX_AGE:
+                    logger.warning(
+                        "Update notification abandoned after %.0fs: %s adapter never "
+                        "connected; discarding markers",
+                        age,
+                        platform_str,
+                    )
+                    return True
                 logger.info(
                     "Update notification deferred: %s adapter not connected yet",
                     platform_str,

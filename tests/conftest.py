@@ -399,6 +399,21 @@ def _hermetic_environment(tmp_path, monkeypatch):
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
     except Exception:
         pass
+
+    # 5b. Re-point module-level hermes-home snapshots at the tempdir. Step 3
+    #     only redirects the env var, but modules that bind
+    #     ``_hermes_home = get_hermes_home()`` at import time captured the
+    #     REAL home before any fixture ran, so marker/state writes routed
+    #     through those constants escape isolation and land in the user's
+    #     live hermes home. (Observed: a /update gate test wrote a real
+    #     ``.update_pending.json``, leaving the live gateway retrying a
+    #     notification for an unconfigured platform.) Only patch modules
+    #     already imported — importing them here would be a large,
+    #     unnecessary cost for unrelated tests.
+    for _mod_name in ("gateway.run",):
+        _mod = sys.modules.get(_mod_name)
+        if _mod is not None and hasattr(_mod, "_hermes_home"):
+            monkeypatch.setattr(_mod, "_hermes_home", fake_hermes_home)
     # Explicitly clear provider-specific base URL overrides that don't match
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)

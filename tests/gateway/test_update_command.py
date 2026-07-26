@@ -5,11 +5,14 @@ the _send_update_notification startup hook (sends results after restart).
 """
 
 import json
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -525,6 +528,35 @@ class TestUpdateCommandPlatformGate:
 
         assert "only available from messaging platforms" not in result
 
+    @pytest.mark.asyncio
+    async def test_passing_the_gate_writes_markers_only_inside_the_test_home(
+        self, monkeypatch
+    ):
+        """A gate-only test must not write markers into the real hermes home.
+
+        These gating tests assert on the rejection string alone, but a platform
+        that passes the gate runs the handler to completion — which writes
+        ``.update_pending.json``. Without isolation that lands in the user's
+        live home and leaves the running gateway retrying a notification for a
+        platform that will never connect.
+        """
+        runner = _make_runner()
+        event = _make_event(platform=Platform.TELEGRAM)
+        monkeypatch.setenv("HERMES_MANAGED", "")
+
+        with patch("subprocess.Popen"):
+            await runner._handle_update_command(event)
+
+        # The autouse hermetic fixture must have re-pointed the import-time
+        # snapshot at the per-test tempdir, so any marker the handler wrote
+        # is confined to it.
+        isolated_home = gateway_run._hermes_home
+        assert isolated_home == Path(os.environ["HERMES_HOME"])
+        assert isolated_home.name == "hermes_test"
+        marker = isolated_home / ".update_pending.json"
+        assert marker.exists(), "handler should have written a marker somewhere"
+        assert json.loads(marker.read_text())["chat_id"] == "67890"
+
 
 # ---------------------------------------------------------------------------
 # _send_update_notification
@@ -903,6 +935,127 @@ class TestSendUpdateNotification:
         assert not output_path.exists()
         assert not exit_code_path.exists()
         assert not (hermes_home / ".update_pending.claimed.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_recent_marker_still_delivers_after_a_late_reconnect(self, tmp_path):
+        """The age bound must not cut short a platform that comes back in time."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {
+            "platform": "discord",
+            "chat_id": "111",
+            "user_id": "222",
+            "timestamp": datetime.now().isoformat(),
+        }
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps(pending))
+        (hermes_home / ".update_output.txt").write_text(
+            "Update complete!", encoding="utf-8"
+        )
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            assert await runner._send_update_notification() is False
+        assert pending_path.exists()
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.DISCORD: mock_adapter}
+        with patch("gateway.run._hermes_home", hermes_home):
+            assert await runner._send_update_notification() is True
+
+        mock_adapter.send.assert_called_once()
+        assert not pending_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_marker_older_than_max_age_is_abandoned_once(self, tmp_path):
+        """A platform that never reconnects must stop deferring forever.
+
+        Regression for the unbounded retry: an unconfigured platform deferred
+        on every 2s watcher poll indefinitely (the watcher re-arms its own
+        deadline on each gateway start), spamming the log and leaving the
+        markers behind permanently.
+        """
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        stale = datetime.now() - timedelta(
+            seconds=runner._UPDATE_NOTIFICATION_MAX_AGE + 60
+        )
+        pending = {
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+            "timestamp": stale.isoformat(),
+        }
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps(pending))
+        output_path.write_text("Update complete!", encoding="utf-8")
+        exit_code_path.write_text("0")
+
+        # No telegram adapter registered — it will never connect.
+        runner.adapters = {}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            assert await runner._send_update_notification() is True
+
+        # Abandoned: every marker is gone, so nothing can defer again.
+        assert not pending_path.exists()
+        assert not output_path.exists()
+        assert not exit_code_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            assert await runner._send_update_notification() is False
+
+    @pytest.mark.asyncio
+    async def test_deferral_does_not_refresh_the_marker_age(self, tmp_path):
+        """Age comes from the payload, not the file mtime.
+
+        Each deferral rewrites the marker, so an mtime-based age would reset to
+        zero on every poll and never reach the bound.
+        """
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        stale = datetime.now() - timedelta(
+            seconds=runner._UPDATE_NOTIFICATION_MAX_AGE - 30
+        )
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(
+            json.dumps({
+                "platform": "telegram",
+                "chat_id": "67890",
+                "user_id": "12345",
+                "timestamp": stale.isoformat(),
+            })
+        )
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        runner.adapters = {}
+
+        # Just inside the bound: defers and rewrites the marker (fresh mtime).
+        with patch("gateway.run._hermes_home", hermes_home):
+            assert await runner._send_update_notification() is False
+        assert pending_path.exists()
+
+        # The rewrite must not have reset the recorded age.
+        carried = json.loads(pending_path.read_text())["timestamp"]
+        assert carried == stale.isoformat()
+        assert gateway_run._update_notification_age(
+            {"timestamp": carried}
+        ) > runner._UPDATE_NOTIFICATION_MAX_AGE - 60
+
+    def test_unparseable_timestamp_never_ages_out(self):
+        """A malformed marker must not cause a real notification to be dropped."""
+        assert gateway_run._update_notification_age({}) is None
+        assert gateway_run._update_notification_age({"timestamp": "not-a-date"}) is None
+        assert gateway_run._update_notification_age({"timestamp": 12345}) is None
 
 
 # ---------------------------------------------------------------------------
