@@ -97,7 +97,8 @@ def _capture_session_for_engine() -> dict:
                 "profile": get_session_env("HERMES_SESSION_PROFILE", "")
                          or os.environ.get("HERMES_PROFILE")
                          or (Path(os.environ.get("HERMES_HOME", "")).name
-                             if "profiles/" in os.environ.get("HERMES_HOME", "") else ""),
+                             if "profiles/" in os.environ.get("HERMES_HOME", "")
+                             else "default"),
                 "session_key": get_session_env("HERMES_SESSION_KEY", ""),
             }
     except Exception:
