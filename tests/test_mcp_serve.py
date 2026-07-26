@@ -244,6 +244,7 @@ class _FakeFastMCP:
 def fake_mcp_server(populated_sessions_dir, mock_session_db, monkeypatch):
     import mcp_serve
 
+    monkeypatch.setenv("HERMES_HOME", str(populated_sessions_dir.parent / "hermes-home"))
     monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
     monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
     monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
@@ -500,6 +501,8 @@ def mcp_server_e2e(populated_sessions_dir, mock_session_db, monkeypatch):
     """Create a fully wired MCP server for E2E testing."""
     mcp = pytest.importorskip("mcp", reason="MCP SDK not installed")
     import mcp_serve
+
+    monkeypatch.setenv("HERMES_HOME", str(populated_sessions_dir.parent / "hermes-home-e2e"))
     monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
     monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
     monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
@@ -918,9 +921,32 @@ class TestE2EPermissions:
                           {"id": "nope", "decision": "deny"})
         assert "error" in result
 
+    def test_durable_request_can_be_listed_and_approved(self, mcp_server_e2e, _event_loop):
+        from tools.approval_store import ApprovalStore
+        from tools.governance import build_tool_call_envelope
+
+        server, _ = mcp_server_e2e
+        store = ApprovalStore()
+        request = store.create_request(
+            session_key="cron:daily",
+            envelope=build_tool_call_envelope(
+                "send_message",
+                {"target": "discord:#ops", "text": "daily"},
+                risk_class="external",
+            ),
+            reason="daily",
+            pattern_key="daily",
+        )
+        listed = _run_tool(server, "permissions_list_open")
+        assert request["id"] in {item["id"] for item in listed["approvals"]}
+        resolved = _run_tool(server, "permissions_respond", {
+            "id": request["id"], "decision": "allow-once",
+        })
+        assert resolved["status"] == "approved"
+
 
 # ---------------------------------------------------------------------------
-# 4. TOOL LISTING — verify all 10 tools are registered
+# 4. TOOL LISTING — verify all bridge and governance tools are registered
 # ---------------------------------------------------------------------------
 
 class TestToolRegistration:
@@ -934,6 +960,8 @@ class TestToolRegistration:
             "attachments_fetch", "events_poll", "events_wait",
             "messages_send", "channels_list",
             "permissions_list_open", "permissions_respond",
+            "permissions_rules_list", "permissions_rules_create",
+            "permissions_rules_revoke", "connectors_list",
         }
         assert expected == tool_names, f"Missing: {expected - tool_names}, Extra: {tool_names - expected}"
 

@@ -72,6 +72,7 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/config",
   "/api/env",
   "/api/mcp",
+  "/api/governance",
   "/api/messaging/platforms",
   "/api/messaging/telegram/onboarding",
   "/api/messaging/whatsapp/onboarding",
@@ -987,6 +988,35 @@ export const api = {
       body: JSON.stringify({ font }),
     }),
 
+  // ── Governance: approvals, exact standing rules, connector health ──
+  getGovernanceApprovals: () =>
+    fetchJSON<GovernanceApprovalList>(
+      "/api/governance/approvals?status=pending",
+    ),
+  decideGovernanceApproval: (
+    id: string,
+    decision: GovernanceDecision,
+  ) =>
+    fetchJSON<GovernanceDecisionResponse>(
+      `/api/governance/approvals/${encodeURIComponent(id)}/decision`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision }),
+      },
+    ),
+  getGovernanceRules: () =>
+    fetchJSON<GovernanceRuleList>(
+      "/api/governance/rules?active_only=true",
+    ),
+  revokeGovernanceRule: (id: string) =>
+    fetchJSON<{ revoked: boolean; id: string }>(
+      `/api/governance/rules/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+  getGovernanceConnectors: () =>
+    fetchJSON<GovernanceConnectorList>("/api/governance/connectors"),
+
   // ── Admin: MCP servers ──────────────────────────────────────────────
   getMcpServers: () => fetchJSON<{ servers: McpServer[] }>("/api/mcp/servers"),
   addMcpServer: (body: McpServerCreate) =>
@@ -1408,6 +1438,81 @@ export interface SkillHubScan {
 }
 
 // ── Admin types ───────────────────────────────────────────────────────
+
+export type GovernanceDecision = "allow-once" | "allow-always" | "deny";
+
+export interface GovernanceApproval {
+  id: string;
+  session_key: string;
+  tool_name: string;
+  risk_class: string;
+  target: string;
+  args_digest: string;
+  args_preview: string;
+  reason: string;
+  pattern_key: string;
+  status: "pending" | "approved" | "denied" | "expired" | "consumed";
+  source: string;
+  created_at: number;
+  expires_at: number;
+  integrity_ok: boolean;
+  decided_at?: number | null;
+  decision_reason?: string;
+  decided_by?: string;
+}
+
+export interface GovernanceApprovalList {
+  count: number;
+  approvals: GovernanceApproval[];
+}
+
+export interface GovernanceDecisionResponse {
+  resolved: boolean;
+  approval_id: string;
+  decision: GovernanceDecision;
+  status: GovernanceApproval["status"];
+  standing_rule_id: string | null;
+}
+
+export interface GovernanceRule {
+  id: string;
+  tool_name: string;
+  operation: string;
+  target_pattern: string;
+  match_mode: "exact";
+  risk_ceiling: string;
+  profile: string;
+  workspace: string;
+  job_id: string;
+  expires_at?: number | null;
+  max_uses?: number | null;
+  use_count: number;
+  enabled: boolean;
+  note: string;
+  created_at: number;
+  last_used_at?: number | null;
+}
+
+export interface GovernanceRuleList {
+  count: number;
+  rules: GovernanceRule[];
+}
+
+export interface GovernanceConnector {
+  id: string;
+  enabled: boolean;
+  health: string;
+  tool_count: number;
+  available_tool_count?: number;
+  tools: string[];
+  risk_classes: string[];
+  highest_risk?: string | null;
+}
+
+export interface GovernanceConnectorList {
+  count: number;
+  connectors: GovernanceConnector[];
+}
 
 export interface McpServer {
   name: string;

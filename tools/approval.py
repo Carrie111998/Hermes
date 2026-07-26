@@ -2926,16 +2926,20 @@ def check_dangerous_command(command: str, env_type: str,
     if not is_dangerous:
         return {"approved": True, "message": None}
 
-    return _run_approval_gate(
-        pattern_key=pattern_key,
-        description=description,
-        display_target=command,
+    return request_tool_approval(
+        "terminal",
+        description,
+        rule_key=pattern_key,
         approval_callback=approval_callback,
+        args={"command": command, "env_type": env_type},
+        risk_class="exec",
+        source="terminal",
+        fail_closed_when_no_human=False,
         cron_deny_message=(
             f"BLOCKED: Command flagged as dangerous ({description}) "
             "but cron jobs run without a user present to approve it. "
-            "Find an alternative approach that avoids this command. "
-            "To allow dangerous commands in cron jobs, set "
+            "The exact command has been parked in the durable approval inbox. "
+            "To pre-authorise dangerous commands in cron jobs, set "
             "approvals.cron_mode: approve in config.yaml."
         ),
         autoapprove_log_prefix=(
@@ -2950,6 +2954,15 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    args: Optional[dict] = None,
+    risk_class=None,
+    profile: str = "",
+    workspace: str = "",
+    job_id: str = "",
+    source: str = "plugin",
+    fail_closed_when_no_human: bool = True,
+    cron_deny_message: str = "",
+    autoapprove_log_prefix: str = "AUTO-APPROVED plugin tool request",
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -2992,43 +3005,134 @@ def request_tool_approval(
     description = reason or f"Plugin requires approval for {tool_name}"
     # Allowlist grain: an explicit plugin rule_key wins; otherwise derive from
     # tool + a short hash of the reason so distinct reasons on the same tool
-    # get independent [a]lways entries (Finding: rule_key=tool_name alone was
-    # too coarse — one "always" would blanket every rule on that tool).
+    # get independent [a]lways entries.
     if rule_key:
         key_suffix = rule_key
     else:
         _reason_hash = hashlib.sha256(description.encode("utf-8")).hexdigest()[:12]
         key_suffix = f"{tool_name}:{_reason_hash}"
-    # Synthetic pattern key so plugin-rule approvals live in the same
-    # session/permanent allowlist machinery as command patterns, namespaced
-    # to avoid ever colliding with a real command pattern key.
     pattern_key = f"plugin_rule:{key_suffix}"
-    # A synthetic "command" string for the display/allowlist layer. It never
-    # executes; it only labels the gate. Namespaced identically.
     display_target = f"<{tool_name}> (plugin approval rule)"
 
-    return _run_approval_gate(
+    # Calls made through the central resolver include arguments.  Bind durable
+    # and standing approvals to the exact canonical arguments and target.  The
+    # legacy direct API (args=None) retains its historical in-memory behaviour.
+    store = None
+    envelope = None
+    request_id = None
+    session_key = get_current_session_key()
+    if args is not None:
+        try:
+            from tools.approval_store import ApprovalStore
+            from tools.governance import build_tool_call_envelope, infer_risk_class
+            from tools.registry import registry
+
+            entry = registry.get_entry(tool_name)
+            resolved_risk = risk_class or (
+                entry.risk_class if entry is not None else infer_risk_class(tool_name)
+            )
+            target_resolver = entry.target_resolver if entry is not None else None
+            envelope = build_tool_call_envelope(
+                tool_name,
+                args,
+                risk_class=resolved_risk,
+                target_resolver=target_resolver,
+            )
+            if envelope.target:
+                display_target = f"<{tool_name}> target={envelope.target}"
+
+            # Preserve yolo/session-cache semantics before creating inbox noise.
+            if not (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled()) and not is_approved(
+                session_key, pattern_key
+            ):
+                store = ApprovalStore()
+                exact = store.consume_matching_approval(
+                    envelope,
+                    pattern_key=pattern_key,
+                    session_key=session_key,
+                )
+                if exact is not None:
+                    return {
+                        "approved": True,
+                        "message": None,
+                        "approval_id": exact["id"],
+                        "approval_source": "durable_once",
+                    }
+                standing = store.consume_standing_rule(
+                    envelope,
+                    profile=profile,
+                    workspace=workspace,
+                    job_id=job_id,
+                )
+                if standing is not None:
+                    return {
+                        "approved": True,
+                        "message": None,
+                        "approval_source": "standing_rule",
+                        "standing_rule_id": standing["id"],
+                    }
+                pending = store.create_request(
+                    session_key=session_key,
+                    envelope=envelope,
+                    reason=description,
+                    pattern_key=pattern_key,
+                    source=source,
+                )
+                request_id = pending["id"]
+        except Exception as exc:
+            # The live human gate remains authoritative.  A persistence failure
+            # must never turn a denied action into an allowed action.
+            logger.warning("Durable approval preparation failed for %s: %s", tool_name, exc)
+
+    result = _run_approval_gate(
         pattern_key=pattern_key,
         description=description,
         display_target=display_target,
         approval_callback=approval_callback,
-        cron_deny_message=(
+        cron_deny_message=cron_deny_message or (
             f"BLOCKED: Tool '{tool_name}' requires approval ({description}) "
-            "but cron jobs run without a user present to approve it. Find an "
-            "alternative approach. To allow flagged actions in cron jobs, set "
-            "approvals.cron_mode: approve in config.yaml."
+            "but cron jobs run without a user present to approve it. The action "
+            "has been parked in the durable approval inbox when available."
         ),
-        autoapprove_log_prefix=(
-            f"plugin-escalated tool call '{tool_name}' in "
-            "non-interactive non-gateway context"
-        ),
-        fail_closed_when_no_human=True,
+        autoapprove_log_prefix=autoapprove_log_prefix,
+        fail_closed_when_no_human=fail_closed_when_no_human,
         no_human_block_message=(
             f"BLOCKED: Tool '{tool_name}' requires approval ({description}) "
             "but no interactive user or gateway is present to approve it. "
-            "A plugin flagged this action for human confirmation."
+            "The action has been parked in the durable approval inbox when available."
         ),
     )
+
+    if store is not None and envelope is not None and request_id is not None:
+        result = dict(result)
+        result["approval_id"] = request_id
+        if result.get("approved"):
+            try:
+                store.resolve_request(request_id, "approved", decided_by="live_gate")
+                store.consume_matching_approval(
+                    envelope,
+                    pattern_key=pattern_key,
+                    session_key=session_key,
+                )
+            except (KeyError, ValueError):
+                pass
+        elif env_var_enabled("HERMES_CRON_SESSION"):
+            # cron_mode: deny is a terminal block for this invocation, even
+            # though its durable inbox row remains pending for later review.
+            # Do not advertise approval_required: there is no listener waiting
+            # to resume this cron run.
+            pass
+        elif result.get("status") == "approval_required" or (
+            not _is_interactive_cli() and not _is_gateway_approval_context()
+        ):
+            # Unattended calls are parked, not recorded as definitive denials.
+            result["status"] = "approval_required"
+        else:
+            try:
+                store.resolve_request(request_id, "denied", decided_by="live_gate")
+            except (KeyError, ValueError):
+                pass
+    return result
 
 
 # =========================================================================

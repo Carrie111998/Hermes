@@ -22,6 +22,9 @@ import type {
   DebugShareResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
+  GovernanceApprovalList,
+  GovernanceConnectorList,
+  GovernanceRuleList,
   HermesConfig,
   HermesConfigRecord,
   LogsResponse,
@@ -156,6 +159,12 @@ export type {
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   GatewayReadyPayload,
+  GovernanceApproval,
+  GovernanceApprovalList,
+  GovernanceConnector,
+  GovernanceConnectorList,
+  GovernanceRule,
+  GovernanceRuleList,
   HermesConfig,
   HermesConfigRecord,
   LogsResponse,
@@ -994,6 +1003,48 @@ export function getMcpOAuthFlow(flowId: string): Promise<McpOAuthFlow> {
   return window.hermesDesktop.api<McpOAuthFlow>({
     ...profileScoped(),
     path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`
+  })
+}
+
+export function getGovernanceApprovals(): Promise<GovernanceApprovalList> {
+  return window.hermesDesktop.api<GovernanceApprovalList>({
+    ...profileScoped(),
+    path: '/api/governance/approvals'
+  })
+}
+
+export function decideGovernanceApproval(
+  id: string,
+  decision: 'allow-once' | 'allow-always' | 'deny',
+  reason = ''
+): Promise<{ resolved: boolean; status: string; standing_rule_id?: string | null }> {
+  return window.hermesDesktop.api({
+    ...profileScoped(),
+    path: `/api/governance/approvals/${encodeURIComponent(id)}/decision`,
+    method: 'POST',
+    body: { decision, reason }
+  })
+}
+
+export function getGovernanceRules(): Promise<GovernanceRuleList> {
+  return window.hermesDesktop.api<GovernanceRuleList>({
+    ...profileScoped(),
+    path: '/api/governance/rules'
+  })
+}
+
+export function revokeGovernanceRule(id: string): Promise<{ revoked: boolean; id: string }> {
+  return window.hermesDesktop.api({
+    ...profileScoped(),
+    path: `/api/governance/rules/${encodeURIComponent(id)}`,
+    method: 'DELETE'
+  })
+}
+
+export function getGovernanceConnectors(): Promise<GovernanceConnectorList> {
+  return window.hermesDesktop.api<GovernanceConnectorList>({
+    ...profileScoped(),
+    path: '/api/governance/connectors'
   })
 }
 

@@ -6,11 +6,21 @@ import { test } from 'vitest'
 import {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
+  buildDesktopParentEnv,
   buildDesktopBackendPath,
   normalizeHermesHomeRoot,
   pathEnvKey,
   POSIX_SANE_PATH_ENTRIES
 } from './backend-env'
+
+test('desktop parent supervision env is explicit and validated', () => {
+  assert.deepEqual(buildDesktopParentEnv({ pid: 4242, nonce: 'a'.repeat(32) }), {
+    HERMES_DESKTOP_PARENT_PID: '4242',
+    HERMES_DESKTOP_PARENT_NONCE: 'a'.repeat(32)
+  })
+  assert.throws(() => buildDesktopParentEnv({ pid: 1, nonce: 'a'.repeat(32) }), /PID/)
+  assert.throws(() => buildDesktopParentEnv({ pid: 4242, nonce: 'short' }), /nonce/)
+})
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {
   const result = buildDesktopBackendPath({

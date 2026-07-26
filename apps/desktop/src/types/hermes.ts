@@ -856,6 +856,70 @@ export interface SkillInfo {
   provenance?: 'agent' | 'bundled' | 'hub'
 }
 
+export interface GovernanceApproval {
+  id: string
+  session_key: string
+  tool_name: string
+  risk_class: string
+  target: string
+  args_digest: string
+  args_preview: string
+  reason: string
+  pattern_key: string
+  status: 'pending' | 'approved' | 'denied' | 'expired' | 'consumed'
+  source: string
+  created_at: number
+  expires_at: number
+  integrity_ok: boolean
+  decided_at?: number | null
+  decision_reason?: string
+  decided_by?: string
+}
+
+export interface GovernanceApprovalList {
+  count: number
+  approvals: GovernanceApproval[]
+}
+
+export interface GovernanceRule {
+  id: string
+  tool_name: string
+  operation: string
+  target_pattern: string
+  match_mode: 'exact'
+  risk_ceiling: string
+  profile: string
+  workspace: string
+  job_id: string
+  expires_at?: number | null
+  max_uses?: number | null
+  use_count: number
+  enabled: boolean
+  note: string
+  created_at: number
+}
+
+export interface GovernanceRuleList {
+  count: number
+  rules: GovernanceRule[]
+}
+
+export interface GovernanceConnector {
+  id: string
+  enabled: boolean
+  health: string
+  tool_count: number
+  available_tool_count?: number
+  tools: string[]
+  risk_classes: string[]
+  highest_risk?: string | null
+}
+
+export interface GovernanceConnectorList {
+  count: number
+  connectors: GovernanceConnector[]
+}
+
 export interface ToolsetInfo {
   configured: boolean
   description: string
