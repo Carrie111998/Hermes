@@ -489,6 +489,13 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
                 timeout=60,
                 stdin=subprocess.DEVNULL,
                 env=noninteractive_git_env(),
+                # Run in a stable directory. The gateway process may have been
+                # launched from a temp dir (e.g. macOS /var/folders/.../T) that
+                # gets purged, leaving an unreadable CWD. git clone with no cwd
+                # inherits that dead CWD and fails with
+                # "Unable to read current working directory". plugins_dir
+                # (~/.hermes/plugins) always exists.
+                cwd=str(plugins_dir),
             )
         except FileNotFoundError as e:
             raise PluginOperationError(
