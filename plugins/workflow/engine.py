@@ -161,6 +161,10 @@ class WorkflowNode:
     Supported operators:
       ==, !=, >, <, >=, <=, contains, starts_with, in, and, or, not
     """
+    attachment: Optional[str] = None
+    """Attachment selector. E.g. "attachments[0]" picks the first
+    workflow attachment for this node. If None, all attachments
+    are attached (first layer) or none (other layers)."""
     reviews: list[str] = field(default_factory=list)
     """Sequential review pipeline. Each entry is a node ID that reviews
     this node's output. When the card moves to 'review' status, the
@@ -381,6 +385,7 @@ class WorkflowEngine:
                 triage=bool(node_data.get("triage", False)),
                 when=node_data.get("when", ""),
                 reviews=node_data.get("reviews", []),
+                attachment=node_data.get("attachment"),
             )
 
         return workflow
@@ -568,8 +573,23 @@ class WorkflowEngine:
                     if node.timeout_minutes is not None else None
                 ),
             )
-            # Attach files if any were passed via the tool call.
-            for fpath in getattr(self, "_current_attachments", []):
+            # Attach files based on node's attachment_index.
+            # If attachment_index is set, attach only that specific file.
+            # If None, attach all current attachments (first-layer default).
+            all_attachments = getattr(self, "_current_attachments", [])
+            if node.attachment is not None:
+                # Attach only the specified index
+                import re as _re
+                _m = _re.match(r"attachments\[(\d+)\]", node.attachment)
+                idx = int(_m.group(1)) if _m else -1
+                if 0 <= idx < len(all_attachments):
+                    attachments_to_attach = [all_attachments[idx]]
+                else:
+                    attachments_to_attach = []
+            else:
+                # Attach all (first-layer behavior)
+                attachments_to_attach = all_attachments
+            for fpath in attachments_to_attach:
                 try:
                     from pathlib import Path as _P
                     p = _P(fpath)
