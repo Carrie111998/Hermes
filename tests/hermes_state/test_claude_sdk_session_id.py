@@ -52,12 +52,16 @@ def test_fts_probe_error_classifier():
     assert not _fts_object_missing(sqlite3.OperationalError("disk I/O error"))
 
 
-def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
-    """Open a read-only SessionDB whose TRIGRAM probe raises `message`.
+def _read_only_db_with_probe_error(tmp_path, monkeypatch, message, sql_needle):
+    """Open a read-only SessionDB where the probe matching `sql_needle` raises.
 
     The seed DB is created first with a normal write handle (schema load),
-    THEN sqlite3.connect is wrapped so only the trigram probe statement
-    errors — the messages_fts probe and everything else run for real.
+    THEN sqlite3.connect is wrapped so only statements containing
+    `sql_needle` error — every other statement runs for real. The primary
+    probe is ``SELECT 1 FROM messages_fts LIMIT 1`` and the trigram probe
+    is ``SELECT 1 FROM messages_fts_trigram LIMIT 1``, so use
+    "messages_fts LIMIT" to hit the primary one only ("messages_fts" alone
+    is a substring of the trigram table name).
     """
     import sqlite3
 
@@ -73,7 +77,7 @@ def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
             self.__dict__["_real"] = real
 
         def execute(self, sql, *args, **kwargs):
-            if "messages_fts_trigram" in sql:
+            if sql_needle in sql:
                 raise sqlite3.OperationalError(message)
             return self.__dict__["_real"].execute(sql, *args, **kwargs)
 
@@ -89,6 +93,29 @@ def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
         lambda *args, **kwargs: _ProbeErrorConn(real_connect(*args, **kwargs)),
     )
     return SessionDB(db_path=db_path, read_only=True)
+
+
+def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
+    return _read_only_db_with_probe_error(
+        tmp_path, monkeypatch, message, sql_needle="messages_fts_trigram"
+    )
+
+
+def test_primary_fts_probe_transient_error_keeps_search_enabled(
+    tmp_path, monkeypatch
+):
+    # The transient-vs-absent rule on the PRIMARY messages_fts probe itself
+    # (the trigram tests below exercise only the second probe): a lock during
+    # a checkpoint must classify as transient and keep _fts_enabled=True, so
+    # a silent false-empty is confined to the query that hits the error
+    # instead of latching for the handle's lifetime.
+    db = _read_only_db_with_probe_error(
+        tmp_path, monkeypatch, "database is locked", sql_needle="messages_fts LIMIT"
+    )
+    try:
+        assert db._fts_enabled is True
+    finally:
+        db.close()
 
 
 def test_trigram_probe_transient_error_keeps_trigram_available(tmp_path, monkeypatch):
