@@ -1,5 +1,5 @@
 import { listAllProfileSessions } from '@/hermes'
-import { enqueueQueuedPrompt, profileQueueKey } from '@/store/composer-queue'
+import { enqueueQueuedPrompt } from '@/store/composer-queue'
 import { requestGatewayForProfile, withProfileGatewayLease } from '@/store/gateway'
 import { notify } from '@/store/notifications'
 import {
@@ -158,9 +158,4 @@ export async function submitTextForProfile(
       })
     )
   )
-}
-
-/** The queue bucket key a profile-targeted submit enqueues into. */
-export function profileSubmitQueueKey(profile: string, storedSessionId: string): string {
-  return profileQueueKey(profile, storedSessionId)
 }

@@ -19,12 +19,11 @@ import {
   setSessionBusy
 } from '@/store/pet-multi'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $queuedPromptsBySession } from '@/store/composer-queue'
+import { $queuedPromptsBySession, profileQueueKey } from '@/store/composer-queue'
 
 import {
   backgroundSubmitExecution,
   isProfileSessionBusy,
-  profileSubmitQueueKey,
   resolveProfileSession,
   submitTextForProfile
 } from './profile-submit'
@@ -225,7 +224,7 @@ describe('submitTextForProfile (tests 11, 12, 35)', () => {
     expect(ok).toBe(true)
     expect(submitText).not.toHaveBeenCalled()
 
-    const queued = $queuedPromptsBySession.get()[profileSubmitQueueKey('apollo', 'stored-1')]
+    const queued = $queuedPromptsBySession.get()[profileQueueKey('apollo', 'stored-1')]
 
     expect(queued).toHaveLength(1)
     expect(queued[0]?.text).toBe('queued')
