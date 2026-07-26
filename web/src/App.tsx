@@ -65,6 +65,7 @@ import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
 import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
+import { GovernancePendingBadge } from "@/components/GovernancePendingBadge";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
 import { ProfileProvider } from "@/contexts/ProfileProvider";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -871,6 +872,10 @@ function SidebarNavLink({
             >
               {navLabel}
             </span>
+
+            {path === "/governance" && (
+              <GovernancePendingBadge collapsed={collapsed} />
+            )}
 
             <span
               aria-hidden

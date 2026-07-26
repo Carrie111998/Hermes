@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import appSource from "../App.tsx?raw";
+import badgeSource from "../components/GovernancePendingBadge.tsx?raw";
 import pageSource from "../pages/GovernancePage.tsx?raw";
 import { api, setManagementProfile } from "./api";
+import {
+  PENDING_APPROVAL_REFRESH_MS,
+  startPendingApprovalPolling,
+} from "./governance-pending";
 
 function jsonFetchMock(body: unknown = { ok: true }) {
   return vi.fn<typeof fetch>(
@@ -66,6 +71,59 @@ describe("governance dashboard API", () => {
   });
 });
 
+describe("governance pending-approval polling", () => {
+  it("loads immediately, refreshes every 10 seconds, and stops cleanly", async () => {
+    const load = vi
+      .fn()
+      .mockResolvedValueOnce({ count: 2 })
+      .mockResolvedValueOnce({ count: 0 });
+    const onCount = vi.fn();
+    const onError = vi.fn();
+    let scheduledRefresh: (() => void) | undefined;
+    const clearIntervalFn = vi.fn();
+    const handle = startPendingApprovalPolling({
+      load,
+      onCount,
+      onError,
+      setIntervalFn: (callback, delay) => {
+        expect(delay).toBe(PENDING_APPROVAL_REFRESH_MS);
+        scheduledRefresh = callback;
+        return 73;
+      },
+      clearIntervalFn,
+    });
+
+    await handle.initial;
+    expect(onCount).toHaveBeenLastCalledWith(2);
+    expect(scheduledRefresh).toBeTypeOf("function");
+
+    scheduledRefresh?.();
+    await vi.waitFor(() => expect(onCount).toHaveBeenLastCalledWith(0));
+
+    handle.stop();
+    expect(clearIntervalFn).toHaveBeenCalledWith(73);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("reports refresh failures without inventing a pending count", async () => {
+    const onCount = vi.fn();
+    const onError = vi.fn();
+    const expectedError = new Error("offline");
+    const handle = startPendingApprovalPolling({
+      load: vi.fn().mockRejectedValue(expectedError),
+      onCount,
+      onError,
+      setIntervalFn: vi.fn(() => 91),
+      clearIntervalFn: vi.fn(),
+    });
+
+    await handle.initial;
+    expect(onCount).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expectedError);
+    handle.stop();
+  });
+});
+
 describe("governance dashboard route", () => {
   it("is a first-class sidebar route with the required operator controls", () => {
     expect(appSource).toContain(
@@ -73,6 +131,10 @@ describe("governance dashboard route", () => {
     );
     expect(appSource).toContain('"/governance": GovernancePage');
     expect(appSource).toContain('path: "/governance"');
+    expect(appSource).toContain(
+      "<GovernancePendingBadge collapsed={collapsed} />",
+    );
+    expect(badgeSource).toContain("pending approval");
     expect(pageSource).toContain("Approval inbox");
     expect(pageSource).toContain("Allow once");
     expect(pageSource).toContain("Allow for target");
