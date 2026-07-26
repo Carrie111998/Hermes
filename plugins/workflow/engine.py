@@ -1813,6 +1813,28 @@ class WorkflowEngine:
                         f"expected format: attachments[N]"
                     )
 
+        # Check reviews/depends_on conflicts
+        for nid, node in workflow.nodes.items():
+            for review_entry in (node.reviews or []):
+                rev_id = review_entry if isinstance(review_entry, str) else review_entry.get("review", "")
+                if not rev_id:
+                    continue
+                # Check if reviewer depends on this node (circular)
+                reviewer = workflow.nodes.get(rev_id)
+                if reviewer and nid in reviewer.depends_on:
+                    result["valid"] = False
+                    result["issues"].append(
+                        f"Node '{nid}' reviews '{rev_id}' but '{rev_id}' depends_on '{nid}' — "
+                        f"this causes double dispatch (DAG + supervisor)"
+                    )
+                # Check if this node depends on reviewer (conflict)
+                if rev_id in node.depends_on:
+                    result["valid"] = False
+                    result["issues"].append(
+                        f"Node '{nid}' depends_on '{rev_id}' and also reviews '{rev_id}' — "
+                        f"reviewer would be dispatched twice"
+                    )
+
         # incomplete_branch rule (adapted from itechmeat/hermes-workflows).
         # Catches non-terminal nodes that rely on the implicit default
         # ``fallback_on_timeout="skip"`` — which silently cascades skip to
