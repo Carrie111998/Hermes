@@ -1122,3 +1122,153 @@ async def test_mattermost_dm_post_does_not_seed_thread_root():
     msg_event = adapter.handle_message.call_args[0][0]
     assert msg_event.source.thread_id is None
     assert msg_event.source.message_id == "dm_post_123"
+
+
+# ----------------------------------------------------------------------
+# "auto" reply mode: thread in channels, stay flat in DMs / group DMs.
+# ----------------------------------------------------------------------
+
+
+def _auto_adapter(channel_type):
+    """Adapter in auto mode whose channel lookup returns ``channel_type``.
+
+    ``channel_type`` of None simulates a failed lookup (``_api_get`` returning
+    an empty dict), which is the case that must NOT thread.
+    """
+    adapter = _make_adapter()
+    adapter._reply_mode = "auto"
+    body = {} if channel_type is None else {"id": "chan", "type": channel_type}
+
+    async def fake_get(path, *args, **kwargs):
+        if path.startswith("channels/"):
+            return body
+        # _resolve_root_id: report the post as its own root.
+        return {"id": "root_post", "root_id": ""}
+
+    adapter._api_get = AsyncMock(side_effect=fake_get)
+    return adapter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_type", ["O", "P"])
+async def test_auto_mode_threads_in_channels(raw_type):
+    """Public and private channels both thread: both are channels."""
+    adapter = _auto_adapter(raw_type)
+
+    root = await adapter._thread_root_for_send("chan", "root_post", None)
+
+    assert root == "root_post"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_type", ["D", "G"])
+async def test_auto_mode_stays_flat_in_dms_and_group_dms(raw_type):
+    """A one-on-one or group conversation should not nest a thread."""
+    adapter = _auto_adapter(raw_type)
+
+    root = await adapter._thread_root_for_send("chan", "root_post", None)
+
+    assert root is None
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_stays_flat_when_channel_lookup_fails():
+    """A failed lookup must not thread.
+
+    get_chat_info() reports "channel" when its lookup fails, and "channel" is
+    the threadable answer -- so routing auto mode through it would start
+    threading inside a DM on any transient API failure. Regression for that.
+    """
+    adapter = _auto_adapter(None)
+
+    root = await adapter._thread_root_for_send("chan", "root_post", None)
+
+    assert root is None
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_stays_flat_for_unrecognised_channel_type():
+    """An unknown type code is indeterminate, so it must fall back to flat."""
+    adapter = _auto_adapter("Z")
+
+    root = await adapter._thread_root_for_send("chan", "root_post", None)
+
+    assert root is None
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_failed_lookup_is_not_cached():
+    """A failure must not poison the cache; a later send can still learn."""
+    adapter = _auto_adapter(None)
+
+    assert await adapter._thread_root_for_send("chan", "root_post", None) is None
+    assert "chan" not in adapter._channel_type_cache
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_caches_channel_type_across_sends():
+    """The type of a channel does not change; look it up once."""
+    adapter = _auto_adapter("O")
+
+    await adapter._thread_root_for_send("chan", "root_post", None)
+    await adapter._thread_root_for_send("chan", "root_post", None)
+
+    channel_lookups = [
+        call for call in adapter._api_get.call_args_list
+        if str(call.args[0]).startswith("channels/")
+    ]
+    assert len(channel_lookups) == 1
+    assert adapter._channel_type_cache["chan"] == "O"
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_honours_metadata_thread_root():
+    """Auto mode must keep the metadata-root handling thread mode has."""
+    adapter = _auto_adapter("O")
+
+    root = await adapter._thread_root_for_send(
+        "chan", None, {"thread_id": "root_post"}
+    )
+
+    assert root == "root_post"
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_ignores_metadata_root_in_a_dm():
+    """A metadata root does not override the DM decision."""
+    adapter = _auto_adapter("D")
+
+    root = await adapter._thread_root_for_send(
+        "chan", None, {"thread_id": "root_post"}
+    )
+
+    assert root is None
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_does_not_look_up_channel_without_a_root():
+    """No reply_to and no metadata root means nothing to thread under."""
+    adapter = _auto_adapter("O")
+
+    assert await adapter._thread_root_for_send("chan", None, None) is None
+
+
+def test_mode_threads_raw_type_matrix():
+    """Inbound path: thread mode excludes only DMs, auto only real channels."""
+    adapter = _make_adapter()
+
+    adapter._reply_mode = "thread"
+    assert adapter._mode_threads_raw_type("O") is True
+    assert adapter._mode_threads_raw_type("P") is True
+    assert adapter._mode_threads_raw_type("G") is True
+    assert adapter._mode_threads_raw_type("D") is False
+
+    adapter._reply_mode = "auto"
+    assert adapter._mode_threads_raw_type("O") is True
+    assert adapter._mode_threads_raw_type("P") is True
+    assert adapter._mode_threads_raw_type("G") is False
+    assert adapter._mode_threads_raw_type("D") is False
+
+    adapter._reply_mode = "off"
+    assert adapter._mode_threads_raw_type("O") is False
+    assert adapter._mode_threads_raw_type("D") is False

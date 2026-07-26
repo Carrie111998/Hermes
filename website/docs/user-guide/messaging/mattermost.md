@@ -205,6 +205,11 @@ The `MATTERMOST_REPLY_MODE` setting controls how Hermes posts responses:
 |------|----------|
 | `off` (default) | Hermes posts flat messages in the channel, like a normal user. |
 | `thread` | Hermes replies in a thread under your original message. Keeps channels clean when there's lots of back-and-forth. |
+| `auto` | Threads in channels, stays flat in DMs and group DMs. Gives you the channel tidiness of `thread` without the awkwardness of a one-on-one conversation nested inside itself. |
+
+`auto` decides per conversation by looking up the channel type, and caches the
+answer. If that lookup fails it posts flat, on the principle that a stray flat
+message is easier to live with than an unwanted thread in a DM.
 
 Set it in your `~/.hermes/.env`:
 

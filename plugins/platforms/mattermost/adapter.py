@@ -46,6 +46,16 @@ _CHANNEL_TYPE_MAP = {
 
 _MATTERMOST_DISABLE_MENTIONS_PROPS = {"disable_mentions": True}
 
+# Raw Mattermost channel-type codes that behave like channels for "auto" reply
+# mode. O (public) and P (private) are channels, where threading keeps a busy
+# channel legible; D (direct) and G (group DM) read as conversations, where a
+# nested thread is just noise. Anything else -- an unrecognised code, a missing
+# type, or a failed lookup -- counts as unknown and falls back to flat.
+#
+# Deliberately keyed on the RAW code rather than _CHANNEL_TYPE_MAP, which folds
+# P into "group" alongside real group DMs; a private channel should thread.
+_AUTO_THREAD_CHANNEL_TYPES = frozenset({"O", "P"})
+
 # Reconnect parameters (exponential backoff).
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
@@ -110,11 +120,17 @@ class MattermostAdapter(BasePlatformAdapter):
         self._reconnect_task: Optional[asyncio.Task] = None
         self._closing = False
 
-        # Reply mode: "thread" to nest replies, "off" for flat messages.
+        # Reply mode: "thread" to nest replies, "off" for flat messages, "auto"
+        # to thread in channels but stay flat in DMs and group DMs.
         self._reply_mode: str = (
             config.extra.get("reply_mode", "")
             or os.getenv("MATTERMOST_REPLY_MODE", "off")
         ).lower()
+
+        # chat_id -> raw Mattermost channel-type code, for "auto" reply mode.
+        # A channel's type does not change, so this is cached for the process
+        # lifetime; only successful lookups are recorded.
+        self._channel_type_cache: Dict[str, str] = {}
 
         self._last_post_status: Optional[int] = None
         self._last_post_error: str = ""
@@ -178,13 +194,61 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.error("MM API POST %s network error: %s", path, exc)
             return {}
 
+    async def _auto_mode_should_thread(self, chat_id: str) -> bool:
+        """Whether "auto" reply mode should thread in this conversation.
+
+        Resolves the channel type from the API directly rather than via
+        ``get_chat_info()``. That helper reports ``"channel"`` when its lookup
+        fails, and ``"channel"`` is the threadable answer -- so a transient DM
+        lookup failure would silently start threading inside a DM. Here an
+        indeterminate answer means flat.
+        """
+        if not chat_id:
+            return False
+
+        cached = self._channel_type_cache.get(chat_id)
+        if cached is None:
+            data = await self._api_get(f"channels/{chat_id}")
+            raw = (data or {}).get("type")
+            if not raw:
+                # Lookup failed or carried no type. Stay flat, and do not cache,
+                # so a later send can still learn the real type once the API
+                # recovers. Threading a DM is the worse failure: it is visible
+                # to the user and cannot be undone by a retry.
+                logger.debug(
+                    "MM auto reply mode: channel type unknown for %s; sending flat",
+                    chat_id,
+                )
+                return False
+            cached = str(raw)
+            self._channel_type_cache[chat_id] = cached
+
+        return cached in _AUTO_THREAD_CHANNEL_TYPES
+
+    def _mode_threads_raw_type(self, channel_type_raw: str) -> bool:
+        """Whether the active reply mode threads in a channel of this raw type.
+
+        Used on the inbound path, where the websocket event already carries the
+        channel type, so no lookup is needed. "thread" mode threads everywhere
+        except DMs (unchanged); "auto" threads only in real channels.
+        """
+        if self._reply_mode == "thread":
+            return channel_type_raw != "D"
+        if self._reply_mode == "auto":
+            return channel_type_raw in _AUTO_THREAD_CHANNEL_TYPES
+        return False
+
     async def _thread_root_for_send(
         self,
+        chat_id: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Optional[str]:
         """Resolve the Mattermost root_id from reply_to or metadata."""
-        if self._reply_mode != "thread":
+        if self._reply_mode == "auto":
+            if not await self._auto_mode_should_thread(chat_id):
+                return None
+        elif self._reply_mode != "thread":
             return None
         candidate = reply_to
         if not candidate and isinstance(metadata, dict):
@@ -378,7 +442,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 "message": chunk,
             })
             # Thread support: reply_to or metadata["thread_id"] is the root post ID.
-            resolved_root = await self._thread_root_for_send(reply_to, metadata)
+            resolved_root = await self._thread_root_for_send(chat_id, reply_to, metadata)
             if resolved_root:
                 payload["root_id"] = resolved_root
 
@@ -560,7 +624,7 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         })
-        resolved_root = await self._thread_root_for_send(reply_to, metadata)
+        resolved_root = await self._thread_root_for_send(chat_id, reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
@@ -601,7 +665,7 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         })
-        resolved_root = await self._thread_root_for_send(reply_to, metadata)
+        resolved_root = await self._thread_root_for_send(chat_id, reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
@@ -689,7 +753,7 @@ class MattermostAdapter(BasePlatformAdapter):
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 })
-                resolved_root = await self._thread_root_for_send(None, metadata)
+                resolved_root = await self._thread_root_for_send(chat_id, None, metadata)
                 if resolved_root:
                     payload["root_id"] = resolved_root
                 logger.info(
@@ -887,8 +951,7 @@ class MattermostAdapter(BasePlatformAdapter):
         thread_id = post.get("root_id") or None
         if (
             not thread_id
-            and self._reply_mode == "thread"
-            and channel_type_raw != "D"
+            and self._mode_threads_raw_type(channel_type_raw)
             and post_id
         ):
             thread_id = post_id
