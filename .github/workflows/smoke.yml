@@ -28,3 +28,8 @@ jobs:
         run: |
           python skills/model-advisor/model_advisor.py --backend openrouter --show-routes \
             && echo "OR routes OK" || echo "OR backend correctly requires OPENROUTER_API_KEY (expected without secret)"
+      - name: local-llm-routing JS syntax check
+        run: |
+          node --check skills/local-llm-routing/templates/model-adapter.js
+          node --check skills/local-llm-routing/scripts/verify-router.mjs
+          echo "local-llm-routing JS OK"

@@ -26,6 +26,17 @@
       "platforms": ["windows", "linux", "macos"],
       "dependencies": "stdlib-only; Ollama (http://localhost:11434) for default backend",
       "install": "cp -r skills/model-advisor ~/.hermes/skills/mlops/model-advisor"
+    },
+    {
+      "name": "local-llm-routing",
+      "category": "mlops",
+      "summary": "Pick + wire local Hugging Face GGUF models into a local-first app with per-agent routing + offline fallback.",
+      "entrypoint": "skills/local-llm-routing/SKILL.md",
+      "skill_md": "skills/local-llm-routing/SKILL.md",
+      "tags": ["local-llm", "ollama", "huggingface", "gguf", "model-routing", "offline-fallback"],
+      "platforms": ["windows", "linux", "macos"],
+      "dependencies": "Ollama; Node.js (for the .mjs verify script)",
+      "install": "cp -r skills/local-llm-routing ~/.hermes/skills/mlops/local-llm-routing"
     }
   ]
 }
