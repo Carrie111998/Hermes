@@ -1,5 +1,11 @@
 import { getSession } from '@/hermes'
-import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
+import {
+  assistantTextPart,
+  type ChatMessage,
+  chatMessageText,
+  preserveLocalAssistantErrors,
+  textPart
+} from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages, textWithoutImageRefs } from '@/lib/embedded-images'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -331,6 +337,23 @@ export function preserveLocalPendingTurnMessages(
   }
 
   return preserved.length ? [...nextMessages, ...preserved] : nextMessages
+}
+
+/**
+ * Reconcile a stored transcript without discarding a newer live renderer tail.
+ *
+ * Post-turn hydration can resolve after the next turn has already started. The
+ * stored snapshot is then legitimately behind: keep its authoritative history,
+ * but retain the newest optimistic user row and pending assistant stream before
+ * merging renderer-only assistant errors.
+ */
+export function reconcileStoredSessionMessages(
+  storedMessages: ChatMessage[],
+  currentMessages: ChatMessage[]
+): ChatMessage[] {
+  const withLiveTail = preserveLocalPendingTurnMessages(storedMessages, currentMessages)
+
+  return preserveLocalAssistantErrors(withLiveTail, currentMessages)
 }
 
 /**

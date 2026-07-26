@@ -98,22 +98,47 @@ export function useMessageStream({
             return state
           }
 
-          const streamId = state.streamId ?? nextStreamMessageId('assistant-stream')
+          const priorStreamId = state.streamId
+          const streamId = priorStreamId ?? nextStreamMessageId('assistant-stream')
           const groupId = state.pendingBranchGroup ?? undefined
           const prev = state.messages
           let nextMessages: ChatMessage[]
 
           if (!prev.some(m => m.id === streamId)) {
-            nextMessages = [
-              ...prev,
-              {
-                id: streamId,
-                role: 'assistant',
-                parts: seed(),
-                pending: true,
-                branchGroupId: groupId
-              }
-            ]
+            // A lagging transcript hydrate can replace the messages array while
+            // leaving the active stream id intact. Rebind the newest pending
+            // assistant instead of seeding a second bubble for the same turn
+            // (#38319, #71857). Only recover an already-established stream id;
+            // a genuinely new stream still creates its own message below.
+            const pendingFromEnd = priorStreamId
+              ? [...prev].reverse().findIndex(m => m.role === 'assistant' && m.pending && !m.hidden)
+              : -1
+
+            if (pendingFromEnd >= 0) {
+              const pendingIndex = prev.length - 1 - pendingFromEnd
+              nextMessages = prev.map((message, index) =>
+                index === pendingIndex
+                  ? {
+                      ...message,
+                      id: streamId,
+                      parts: transform(message.parts, message),
+                      pending: opts.pending ? opts.pending(message) : true,
+                      branchGroupId: message.branchGroupId ?? groupId
+                    }
+                  : message
+              )
+            } else {
+              nextMessages = [
+                ...prev,
+                {
+                  id: streamId,
+                  role: 'assistant',
+                  parts: seed(),
+                  pending: true,
+                  branchGroupId: groupId
+                }
+              ]
+            }
           } else {
             nextMessages = prev.map(m =>
               m.id === streamId

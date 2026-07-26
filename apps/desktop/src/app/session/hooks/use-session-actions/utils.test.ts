@@ -15,6 +15,7 @@ import {
   isSessionGoneError,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  reconcileStoredSessionMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
   toBranchMessages
@@ -362,6 +363,28 @@ describe('reconcileResumeMessages', () => {
     const [out] = reconcileResumeMessages(next, previous)
 
     expect(out.attachmentRefs).toBeUndefined()
+  })
+})
+
+describe('reconcileStoredSessionMessages', () => {
+  it('keeps the live turn when a lagging post-turn hydrate lands mid-stream', () => {
+    const stored = [msg('1-user', 'user', 'first'), msg('2-assistant', 'assistant', 'first answer')]
+
+    const current = [
+      ...stored,
+      msg('user-live', 'user', 'follow-up'),
+      msg('assistant-stream-live', 'assistant', 'partial', { pending: true })
+    ]
+
+    const reconciled = reconcileStoredSessionMessages(stored, current)
+
+    expect(reconciled.map(message => message.id)).toEqual([
+      '1-user',
+      '2-assistant',
+      'user-live',
+      'assistant-stream-live'
+    ])
+    expect(reconciled.at(-1)?.pending).toBe(true)
   })
 })
 
