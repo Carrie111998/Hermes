@@ -17,6 +17,7 @@ from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
     _format_timestamp,
+    _format_timestamp_iso,
     _is_compacted_message,
     _is_compression_ended,
     _resolve_to_parent,
@@ -121,12 +122,20 @@ class TestFormatTimestamp:
         out = _format_timestamp(1700000000)
         assert "2023" in out
 
+    def test_unix_timestamp_iso_surfaces_timezone(self):
+        out = _format_timestamp_iso(1700000000)
+        assert out is not None
+        assert "2023-" in out
+        assert out[-6] in ("+", "-")
+
     def test_none(self):
         assert _format_timestamp(None) == "unknown"
+        assert _format_timestamp_iso(None) is None
 
     def test_iso_string_passthrough(self):
         out = _format_timestamp("not-a-number-string")
         assert out == "not-a-number-string"
+        assert _format_timestamp_iso("not-a-number-string") == "not-a-number-string"
 
 
 # =========================================================================
@@ -153,6 +162,15 @@ class TestBrowseShape:
         titles = [r.get("title") for r in result["results"]]
         assert any("Modpack" in (t or "") for t in titles)
 
+    def test_browse_returns_causal_timestamps(self, db):
+        _seed_modpack_sessions(db)
+        result = json.loads(session_search(db=db))
+        first = result["results"][0]
+        assert isinstance(first["started_at"], (int, float))
+        assert isinstance(first["started_at_iso"], str)
+        assert isinstance(first["last_active"], (int, float))
+        assert isinstance(first["last_active_iso"], str)
+
 
 # =========================================================================
 # Discovery shape (with query)
@@ -174,9 +192,21 @@ class TestDiscoveryShape:
             assert "messages" in hit
             assert "bookend_end" in hit
             assert "match_message_id" in hit
+            assert "match_timestamp" in hit
+            assert "match_timestamp_iso" in hit
+            assert "session_started_at" in hit
+            assert "session_started_at_iso" in hit
             assert "snippet" in hit
             assert "messages_before" in hit
             assert "messages_after" in hit
+
+    def test_discovery_messages_include_causal_timestamps(self, db):
+        _seed_modpack_sessions(db)
+        result = json.loads(session_search(query="modpack", limit=3, db=db))
+        for hit in result["results"]:
+            for msg in hit["messages"] + hit["bookend_start"] + hit["bookend_end"]:
+                assert "timestamp" in msg
+                assert "timestamp_iso" in msg
 
     def test_match_message_id_is_anchor_in_window(self, db):
         _seed_modpack_sessions(db)
@@ -298,6 +328,19 @@ class TestRoleFilter:
         # Should now match the tool message
         if result["count"] > 0:
             assert result["results"][0]["matched_role"] == "tool"
+            tool_msg = result["results"][0]["messages"][0]
+            assert tool_msg["role"] == "tool"
+            assert tool_msg["tool_name"] == "x"
+            assert "timestamp_iso" in tool_msg
+
+    def test_role_filter_with_tool_keeps_tool_results_in_window(self, db):
+        db.create_session("s1", source="cli")
+        db.append_message("s1", role="user", content="modpack user question")
+        db.append_message("s1", role="assistant", content="modpack assistant action")
+        db.append_message("s1", role="tool", content="modpack tool result", tool_name="probe")
+        result = json.loads(session_search(query="modpack", role_filter="user,assistant,tool", db=db))
+        roles = [m["role"] for m in result["results"][0]["messages"]]
+        assert "tool" in roles
 
 
 # =========================================================================
@@ -353,6 +396,18 @@ class TestScrollShape:
         ))
         assert "messages_before" in result
         assert "messages_after" in result
+
+    def test_scroll_messages_include_causal_timestamps(self, db):
+        _seed_modpack_sessions(db)
+        disc = json.loads(session_search(query="modpack", limit=1, db=db))
+        anchor_sid = disc["results"][0]["session_id"]
+        anchor_mid = disc["results"][0]["match_message_id"]
+        result = json.loads(session_search(
+            session_id=anchor_sid, around_message_id=anchor_mid, window=3, db=db
+        ))
+        for msg in result["messages"]:
+            assert "timestamp" in msg
+            assert "timestamp_iso" in msg
 
     def test_scroll_anchor_in_window(self, db):
         _seed_modpack_sessions(db)

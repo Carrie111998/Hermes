@@ -91,6 +91,33 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
+def _format_timestamp_iso(ts: Union[int, float, str, None]) -> Optional[str]:
+    """Return a local ISO-8601 timestamp with seconds + timezone.
+
+    ``session_search`` already exposes raw Unix timestamps from SQLite. The ISO
+    companion is intentionally redundant: agents reading recall output need a
+    causal timeline without mentally converting floats, and JSON exports keep
+    the raw value for sorting/filtering.
+    """
+    if ts is None:
+        return None
+    try:
+        from datetime import datetime
+
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+        if isinstance(ts, str):
+            candidate = ts.strip()
+            if candidate.replace(".", "").replace("-", "").isdigit():
+                return datetime.fromtimestamp(float(candidate)).astimezone().isoformat(timespec="seconds")
+            return candidate
+    except (ValueError, OSError, OverflowError) as e:
+        logging.debug("Failed to ISO-format timestamp %s: %s", ts, e, exc_info=True)
+    except Exception as e:
+        logging.debug("Unexpected error ISO-formatting timestamp %s: %s", ts, e, exc_info=True)
+    return str(ts)
+
+
 def _is_compaction_summary(content: str) -> bool:
     """Return True if *content* looks like a generated compaction handoff."""
     if not content:
@@ -251,6 +278,7 @@ def _shape_message(
         "role": m.get("role"),
         "content": content,
         "timestamp": m.get("timestamp"),
+        "timestamp_iso": _format_timestamp_iso(m.get("timestamp")),
     }
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
@@ -432,7 +460,9 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
                 "title": s.get("title") or None,
                 "source": s.get("source", ""),
                 "started_at": s.get("started_at", ""),
+                "started_at_iso": _format_timestamp_iso(s.get("started_at")),
                 "last_active": s.get("last_active", ""),
+                "last_active_iso": _format_timestamp_iso(s.get("last_active")),
                 "message_count": s.get("message_count", 0),
                 "preview": s.get("preview", ""),
             })
@@ -750,7 +780,13 @@ def _discover(
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                hit_sid,
+                msg_id,
+                window=5,
+                bookend=3,
+                keep_roles=tuple(role_list) if role_list else None,
+            )
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
@@ -765,11 +801,17 @@ def _discover(
             "when": _format_timestamp(
                 session_meta.get("started_at") or match_info.get("session_started")
             ),
+            "session_started_at": session_meta.get("started_at") or match_info.get("session_started"),
+            "session_started_at_iso": _format_timestamp_iso(
+                session_meta.get("started_at") or match_info.get("session_started")
+            ),
             "source": session_meta.get("source") or match_info.get("source", "unknown"),
             "model": session_meta.get("model") or match_info.get("model") or "unknown",
             "title": session_meta.get("title") or None,
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
+            "match_timestamp": match_info.get("timestamp"),
+            "match_timestamp_iso": _format_timestamp_iso(match_info.get("timestamp")),
             "snippet": match_info.get("snippet") or "",
             "bookend_start": [
                 _shape_message(m, max_content_len=1200)
@@ -961,6 +1003,8 @@ SESSION_SEARCH_SCHEMA = {
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
         "Each result carries:\n"
         "       - session_id, title, when, source\n"
+        "       - session_started_at/session_started_at_iso and "
+        "match_timestamp/match_timestamp_iso for causal chronology\n"
         "       - snippet: FTS5-highlighted match excerpt\n"
         "       - bookend_start: first 3 user+assistant messages of the session "
         "(the goal / kickoff)\n"
@@ -975,7 +1019,9 @@ SESSION_SEARCH_SCHEMA = {
         "     session_search(session_id=\"...\", around_message_id=12345, window=10)\n"
         "     Returns a window of ±`window` messages centered on the anchor. No FTS5, "
         "no bookends — just the slice. Use after a discovery call when you need more "
-        "context than the ±5 default window.\n"
+        "context than the ±5 default window. Each returned message includes raw "
+        "timestamp plus timestamp_iso so user inputs, assistant outputs, and tool "
+        "results can be ordered causally.\n"
         "       - To scroll FORWARD: pass messages[-1].id back as around_message_id.\n"
         "       - To scroll BACKWARD: pass messages[0].id back as around_message_id.\n"
         "       - The boundary message appears in both windows — orientation marker.\n"
