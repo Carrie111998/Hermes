@@ -117,6 +117,9 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    event_stream_id: str = ""                    # Stable producer scope across restore
+    event_sequence: int = 0                      # Last emitted terminal-event sequence
+    completion_event_id: str = ""                # Stable completion replay identity
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -137,6 +140,10 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+
+    def __post_init__(self) -> None:
+        if not self.event_stream_id:
+            self.event_stream_id = f"process:{self.id}:{uuid.uuid4().hex}"
 
 
 class ProcessRegistry:
@@ -1171,7 +1178,30 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
+                **self.completion_event_identity(session),
             })
+
+    @staticmethod
+    def completion_event_identity(session: ProcessSession) -> Dict[str, Any]:
+        """Return one stable, producer-scoped identity for process completion."""
+
+        with session._lock:
+            if not session.event_stream_id:
+                session.event_stream_id = (
+                    f"process:{session.id}:{uuid.uuid4().hex}"
+                )
+            if session.event_sequence < 1:
+                session.event_sequence = 1
+            if not session.completion_event_id:
+                session.completion_event_id = (
+                    f"{session.event_stream_id}:completion:{session.event_sequence}"
+                )
+            return {
+                "event_id": session.completion_event_id,
+                "event_stream_id": session.event_stream_id,
+                "event_sequence": session.event_sequence,
+                "event_seq": session.event_sequence,
+            }
 
     # ----- Query Methods -----
 
@@ -1977,6 +2007,9 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            "event_stream_id": s.event_stream_id,
+                            "event_sequence": s.event_sequence,
+                            "completion_event_id": s.completion_event_id,
                         })
             
             # Atomic write to avoid corruption on crash
@@ -2055,6 +2088,9 @@ class ProcessRegistry:
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
+                event_stream_id=entry.get("event_stream_id", ""),
+                event_sequence=entry.get("event_sequence", 0),
+                completion_event_id=entry.get("completion_event_id", ""),
             )
             with self._lock:
                 self._running[session.id] = session

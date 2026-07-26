@@ -244,6 +244,43 @@ def test_completed_records_pruned_to_cap():
     assert len(ad.list_async_delegations()) <= ad._MAX_RETAINED_COMPLETED
 
 
+def test_async_completion_identity_is_stable_across_durable_restore(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    dispatched = ad.dispatch_async_delegation(
+        goal="identity",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="agent:main:telegram:dm:123",
+        parent_session_id="parent-session",
+        runner=lambda: {"status": "completed", "summary": "done"},
+    )
+    event = _drain_for(dispatched["delegation_id"])
+    assert event is not None
+    assert event["event_stream_id"]
+    assert event["event_sequence"] == 1
+    assert event["event_seq"] == 1
+    assert event["event_id"] == (
+        f"{event['event_stream_id']}:completion:{event['event_sequence']}"
+    )
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    replay = restored.get_nowait()
+    assert (
+        replay["event_id"],
+        replay["event_stream_id"],
+        replay["event_sequence"],
+    ) == (
+        event["event_id"],
+        event["event_stream_id"],
+        event["event_sequence"],
+    )
+
+
 def test_completion_is_persisted_and_delivery_can_be_acknowledged(tmp_path, monkeypatch):
     """A finished child remains pending on disk until its queue consumer acks it."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -395,6 +432,36 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
     assert restored.get_nowait()["status"] == "unknown"
+
+
+def test_abandoned_completion_retains_dispatch_stream_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_abandoned_identity",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "",
+        "parent_session_id": "parent-session",
+        "origin_session_id": "",
+        "dispatched_at": 1.0,
+        "event_sequence": 0,
+    }
+    record["event_stream_id"] = ad._async_event_stream_id(record)
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL "
+            "WHERE delegation_id=?",
+            (99999999, record["delegation_id"]),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    event = restored.get_nowait()
+
+    assert event["event_stream_id"] == record["event_stream_id"]
+    assert event["event_sequence"] == 1
+    assert event["event_id"] == f"{record['event_stream_id']}:completion:1"
 
 
 def test_origin_session_id_survives_persistence_round_trip(tmp_path, monkeypatch):
@@ -690,6 +757,55 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     assert evt["type"] == "async_delegation"
     assert evt["session_key"] == "post-compress-tip"
     assert evt["origin_ui_session_id"] == "origin-tab"
+
+
+def test_background_completion_keeps_spawn_origin_after_parent_rotates(monkeypatch):
+    """A later parent rotation cannot retarget an in-flight completion."""
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "spawn-origin-session"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_child(*_args, **_kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kw: fake_child)
+    monkeypatch.setattr(dt, "_run_single_child", blocked_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
+
+    out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+    assert json.loads(out)["status"] == "dispatched"
+    assert started.wait(timeout=2)
+    parent.session_id = "later-rotated-session"
+    release.set()
+    evt = _drain_one()
+
+    assert evt is not None
+    assert evt["parent_session_id"] == "spawn-origin-session"
+    assert evt["session_key"] == "spawn-origin-session"
 
 
 def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):

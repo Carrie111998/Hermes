@@ -470,6 +470,10 @@ class TestStdinHelpers:
         pty.sendeof.assert_called_once()
         assert result["status"] == "ok"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="ConPTY/pywinpty cannot close only the PTY input pipe",
+    )
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
@@ -674,6 +678,7 @@ class TestSpawnEnvSanitization:
         with patch.dict(os.environ, {
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
+            "HERMES_HOME": os.environ["HERMES_HOME"],
             "USER": "tester",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
@@ -844,7 +849,7 @@ class TestPopenLeakOnSetupFailure:
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
+             patch("os.getpgid", side_effect=ProcessLookupError, create=True), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
@@ -876,7 +881,7 @@ class TestPopenLeakOnSetupFailure:
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", return_value=fake_thread), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
+             patch("os.getpgid", side_effect=ProcessLookupError, create=True), \
              patch.object(registry, "_write_checkpoint", side_effect=OSError("disk full")):
             with pytest.raises(OSError, match="disk full"):
                 registry.spawn_local("echo hello", cwd="/tmp")
@@ -1110,6 +1115,34 @@ class TestCheckpoint:
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
 
+    def test_completion_identity_survives_checkpoint_restore(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        session = _make_session()
+        session.pid = os.getpid()
+        session.notify_on_complete = True
+        registry._running[session.id] = session
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            registry._write_checkpoint()
+            payload = json.loads(checkpoint.read_text())
+            stream_id = payload[0]["event_stream_id"]
+            assert stream_id
+            assert payload[0]["event_sequence"] == 0
+
+            restored = ProcessRegistry()
+            with patch.object(restored, "_host_pid_is_ours", return_value=True):
+                assert restored.recover_from_checkpoint() == 1
+            recovered = restored.get(session.id)
+            assert recovered.event_stream_id == stream_id
+
+            restored._move_to_finished(recovered)
+            event = restored.completion_queue.get_nowait()
+
+        assert event["event_stream_id"] == stream_id
+        assert event["event_sequence"] == 1
+        assert event["event_seq"] == 1
+        assert event["event_id"] == f"{stream_id}:completion:1"
+
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
@@ -1296,7 +1329,8 @@ class TestKillProcess:
             # touches ``os.kill`` directly. Mock both seams.  Disable the
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
-            with patch("gateway.status._pid_exists", return_value=True), \
+            with patch("tools.process_registry._IS_WINDOWS", False), \
+                 patch("gateway.status._pid_exists", return_value=True), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):

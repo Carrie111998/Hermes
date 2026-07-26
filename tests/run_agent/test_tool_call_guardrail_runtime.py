@@ -153,6 +153,127 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert "repeated_exact_failure_warning" in messages[0]["content"]
 
 
+def test_sequential_production_completion_threads_identity_retryability_and_dedupes_replay():
+    """The real standard tool path owns stable terminal-event metadata."""
+    agent = _make_agent("web_search")
+    completed = []
+    agent.tool_progress_callback = lambda event, name, preview, args, **kw: (
+        completed.append((event, name, kw)) if event == "tool.completed" else None
+    )
+
+    retryable = _mock_tool_call(
+        "web_search", json.dumps({"query": "same"}), "call-rate-limit"
+    )
+    distinct = _mock_tool_call(
+        "web_search", json.dumps({"query": "same"}), "call-auth"
+    )
+    result_429 = json.dumps({"error": {"status_code": 429, "message": "busy"}})
+    result_401 = json.dumps({"error": {"status": 401, "message": "auth failed"}})
+
+    with patch(
+        "run_agent.handle_function_call", side_effect=[result_429, result_429, result_401]
+    ):
+        for tc in (retryable, retryable, distinct):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[tc]), [], "task-1"
+            )
+
+    snapshot = agent._progress_telemetry.get_activity_snapshot()
+    assert snapshot["attempt_seq"] == 2
+    assert snapshot["failure_seq"] == 2
+    assert snapshot["failure_streak"] == 1
+    assert snapshot["last_call_id"] == "call-auth"
+    assert snapshot["last_retryability"] == "non_retryable"
+    assert [event[2]["call_id"] for event in completed] == [
+        "call-rate-limit",
+        "call-auth",
+    ]
+    assert completed[0][2]["retryability"] == "retryable"
+    assert completed[1][2]["retryability"] == "non_retryable"
+
+
+def test_standard_event_identity_scopes_reused_call_ids_by_request():
+    agent = _make_agent("web_search")
+    agent._current_turn_id = "turn-1"
+    agent._current_api_request_id = "request-1"
+    tc = _mock_tool_call("web_search", json.dumps({"query": "same"}), "call_1")
+    response = SimpleNamespace(content="", tool_calls=[tc])
+    result = json.dumps({"error": {"status_code": 429, "message": "busy"}})
+
+    with patch("run_agent.handle_function_call", side_effect=[result, result]):
+        agent._execute_tool_calls_sequential(response, [], "task-1")
+        agent._current_turn_id = "turn-2"
+        agent._current_api_request_id = "request-2"
+        agent._execute_tool_calls_sequential(response, [], "task-1")
+
+    snapshot = agent._progress_telemetry.get_activity_snapshot()
+    assert snapshot["attempt_seq"] == 2
+    assert snapshot["failure_seq"] == 2
+
+
+def test_production_file_completion_advances_progress_once_per_evidence():
+    agent = _make_agent("write_file")
+    agent._current_turn_id = "turn-progress"
+    agent._current_api_request_id = "request-progress-1"
+    args = {"path": "artifact.txt", "content": "done"}
+    tc = _mock_tool_call("write_file", json.dumps(args), "call-write")
+    response = SimpleNamespace(content="", tool_calls=[tc])
+    landed = json.dumps({"path": "artifact.txt", "bytes_written": 4})
+
+    with patch("run_agent.handle_function_call", side_effect=[landed, landed, landed]):
+        agent._execute_tool_calls_sequential(response, [], "task-1")
+        # Same provider event is a replay, not a second attempt.
+        agent._execute_tool_calls_sequential(response, [], "task-1")
+        # A new request with identical evidence is a real attempt but not new
+        # verified progress.
+        agent._current_api_request_id = "request-progress-2"
+        agent._execute_tool_calls_sequential(response, [], "task-1")
+
+    snapshot = agent._progress_telemetry.get_activity_snapshot()
+    assert snapshot["attempt_seq"] == 2
+    assert snapshot["progress_seq"] == 1
+    assert snapshot["no_progress_streak"] == 2
+
+
+def test_successful_terminal_build_is_production_verified_progress():
+    agent = _make_agent("terminal")
+    agent._current_turn_id = "turn-build"
+    agent._current_api_request_id = "request-build"
+    args = {"command": "npm run build"}
+    tc = _mock_tool_call("terminal", json.dumps(args), "call-build")
+    response = SimpleNamespace(content="", tool_calls=[tc])
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"output": "built", "exit_code": 0}),
+    ):
+        agent._execute_tool_calls_sequential(response, [], "task-1")
+
+    snapshot = agent._progress_telemetry.get_activity_snapshot()
+    assert snapshot["progress_seq"] == 1
+    assert snapshot["no_progress_streak"] == 0
+
+
+def test_successful_terminal_noop_cannot_manufacture_verified_progress():
+    agent = _make_agent("terminal")
+    agent._current_turn_id = "turn-noop"
+    agent._current_api_request_id = "request-noop"
+    args = {"command": "echo npm run build"}
+    tc = _mock_tool_call("terminal", json.dumps(args), "call-noop")
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"output": "npm run build", "exit_code": 0}),
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), [], "task-1"
+        )
+
+    snapshot = agent._progress_telemetry.get_activity_snapshot()
+    assert snapshot["progress_seq"] == 0
+    assert snapshot["attempt_seq"] == 1
+
+
 def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     agent = _make_agent("terminal")
     guardrails = getattr(agent, "_tool_guardrails")

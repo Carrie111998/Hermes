@@ -13,6 +13,7 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 from pathlib import Path
 import logging
@@ -158,6 +159,67 @@ def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
     return run_agent
+
+
+def _observe_tool_completion(
+    agent,
+    *,
+    tool_call_id: str,
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+    failed: bool,
+    api_call_count: int,
+):
+    """Emit the provider-neutral terminal observation for a standard tool."""
+
+    call_id = str(tool_call_id or "").strip()
+    identity = {
+        "session_id": str(getattr(agent, "session_id", "") or ""),
+        "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
+        "api_request_id": str(
+            getattr(agent, "_current_api_request_id", "") or ""
+        ),
+        "api_call_count": int(api_call_count),
+        "call_id": call_id,
+    }
+    event_digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return agent._observe_guardrail_completion(
+        function_name,
+        function_args,
+        function_result,
+        failed=failed,
+        event_id=f"tool:completed:{event_digest}",
+        call_id=call_id,
+        adapter=getattr(agent, "api_mode", None)
+        or getattr(agent, "provider", None)
+        or "tool_executor",
+        source="tool_executor",
+    )
+
+
+def _terminal_callback_metadata(recorded, *, call_id: str, result: Any) -> dict:
+    snapshot = dict(recorded.snapshot or {})
+    terminal_event = {
+        "event_id": recorded.event_id,
+        "event_sequence": recorded.event_sequence,
+        "call_id": call_id,
+        "adapter": snapshot.get("last_adapter"),
+        "source": snapshot.get("last_source"),
+        "status": snapshot.get("last_status"),
+        "result": result,
+        "retryability": snapshot.get("last_retryability"),
+        "error_code": snapshot.get("last_error_code"),
+        "usage": snapshot.get("last_usage"),
+        "session_id": snapshot.get("last_session_id") or snapshot.get("session_id"),
+    }
+    return {
+        **{key: value for key, value in terminal_event.items() if key != "result"},
+        "terminal_event": terminal_event,
+        "activity_snapshot": snapshot,
+    }
 
 
 def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
@@ -384,6 +446,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
     for tool_call in tool_calls:
         function_name = tool_call.function.name
+        completion = None
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
@@ -854,6 +917,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
+        completion = None
         # A worker can finish and write results[i] in the window between the
         # deadline snapshot (timed_out_indices, taken from not_done) and this
         # loop. Prefer that real result over a fabricated timeout message — the
@@ -913,12 +977,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 effect_disposition = "none"
 
             if not blocked:
-                function_result = agent._append_guardrail_observation(
-                    function_name,
-                    function_args,
-                    function_result,
+                completion = _observe_tool_completion(
+                    agent,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                    function_name=function_name,
+                    function_args=function_args,
+                    function_result=function_result,
                     failed=is_error,
+                    api_call_count=api_call_count,
                 )
+                function_result = completion.result
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -936,12 +1004,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-            if not blocked and agent.tool_progress_callback:
+            if (
+                not blocked
+                and completion is not None
+                and not completion.replayed
+                and agent.tool_progress_callback
+            ):
                 try:
+                    terminal_metadata = _terminal_callback_metadata(
+                        completion,
+                        call_id=getattr(tc, "id", "") or "",
+                        result=function_result,
+                    )
                     agent.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=is_error,
                         result=function_result,
+                        **terminal_metadata,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
@@ -967,7 +1046,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
-        if not blocked and agent.tool_complete_callback:
+        if (
+            not blocked
+            and (completion is None or not completion.replayed)
+            and agent.tool_complete_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 agent.tool_complete_callback(tc.id, name, display_args, function_result)
@@ -1083,6 +1166,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             break
 
         function_name = tool_call.function.name
+        completion = None
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
@@ -1619,12 +1703,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         if not _execution_blocked:
-            function_result = agent._append_guardrail_observation(
-                function_name,
-                function_args,
-                function_result,
+            completion = _observe_tool_completion(
+                agent,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                function_name=function_name,
+                function_args=function_args,
+                function_result=function_result,
                 failed=_is_error_result,
+                api_call_count=api_call_count,
             )
+            function_result = completion.result
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
@@ -1645,12 +1733,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-        if not _execution_blocked and agent.tool_progress_callback:
+        if (
+            not _execution_blocked
+            and completion is not None
+            and not completion.replayed
+            and agent.tool_progress_callback
+        ):
             try:
+                terminal_metadata = _terminal_callback_metadata(
+                    completion,
+                    call_id=getattr(tool_call, "id", "") or "",
+                    result=function_result,
+                )
                 agent.tool_progress_callback(
                     "tool.completed", function_name, None, None,
                     duration=tool_duration, is_error=_is_error_result,
                     result=function_result,
+                    **terminal_metadata,
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
@@ -1664,7 +1763,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
-        if not _execution_blocked and agent.tool_complete_callback:
+        if (
+            not _execution_blocked
+            and completion is not None
+            and not completion.replayed
+            and agent.tool_complete_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 agent.tool_complete_callback(tool_call.id, function_name, display_args, function_result)
