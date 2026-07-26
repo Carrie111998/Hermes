@@ -1937,6 +1937,10 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
+            if "session_stall_timeout" in _agent_cfg:
+                os.environ["HERMES_SESSION_STALL_TIMEOUT"] = str(
+                    _agent_cfg["session_stall_timeout"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -2234,6 +2238,9 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_pending_model_notes",
     "_last_resolved_model",
     "_queued_events",
+    # Stall-watchdog "already notified" latch (#72016). Cleared on /new so a
+    # fresh conversation can warn again if it later stalls with pending inbound.
+    "_session_stall_notified",
     # Staged-but-never-consumed sidecar notes (turn aborted between staging
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
@@ -3453,6 +3460,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /new and /reset.  /model and other mid-session operations
         # preserve the queue.
         self._queued_events: Dict[str, List[MessageEvent]] = {}
+        # Session keys that already received a stall notification for the
+        # current stall episode (cleared when pending clears / activity resumes
+        # / conversation boundary). See gateway.session_stall.
+        self._session_stall_notified: Dict[str, bool] = {}
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
@@ -8568,6 +8579,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
+        # Stall watchdog: pending inbound + stale agent activity → warn user
+        # to /new (does not kill the turn; see agent.session_stall_timeout).
+        self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
+
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
@@ -9138,6 +9153,211 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Session expiry watcher error: %s", e)
             # Sleep in small increments so we can stop quickly
             for _ in range(interval):
+                if not self._running:
+                    break
+                await asyncio.sleep(1)
+
+    def _session_stall_timeout_seconds(self) -> float:
+        """Return configured stall timeout (seconds); 0 disables the watchdog."""
+        return _float_env("HERMES_SESSION_STALL_TIMEOUT", 300)
+
+    def _iter_gateway_adapters(self):
+        """Yield every live platform adapter (default + multiplex profiles)."""
+        seen: set[int] = set()
+        for adapter in list(getattr(self, "adapters", {}).values()):
+            if adapter is None:
+                continue
+            aid = id(adapter)
+            if aid in seen:
+                continue
+            seen.add(aid)
+            yield adapter
+        for amap in list(getattr(self, "_profile_adapters", {}).values()):
+            for adapter in list(amap.values()):
+                if adapter is None:
+                    continue
+                aid = id(adapter)
+                if aid in seen:
+                    continue
+                seen.add(aid)
+                yield adapter
+
+    def _pending_inbound_for_session(self, session_key: str, adapter: Any):
+        """Return the head pending MessageEvent for ``session_key``, if any."""
+        pending_slot = getattr(adapter, "_pending_messages", None) or {}
+        event = pending_slot.get(session_key)
+        if event is not None:
+            return event
+        overflow = (getattr(self, "_queued_events", None) or {}).get(session_key) or []
+        if overflow:
+            return overflow[0]
+        return None
+
+    def _session_idle_seconds_for_stall(
+        self, session_key: str, pending_event: Any, *, now: Optional[float] = None
+    ) -> Optional[float]:
+        """Resolve idle seconds for stall detection from agent / turn clocks."""
+        from gateway.session_stall import resolve_session_idle_seconds
+
+        now_ts = time.time() if now is None else float(now)
+        last_activity_ts = None
+        agent = (getattr(self, "_running_agents", None) or {}).get(session_key)
+        if agent is not None and agent is not _AGENT_PENDING_SENTINEL:
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    summary = agent.get_activity_summary()
+                    last_activity_ts = summary.get("last_activity_ts")
+                except Exception:
+                    last_activity_ts = None
+            if last_activity_ts is None:
+                last_activity_ts = getattr(agent, "_last_activity_ts", None)
+
+        turn_started_ts = (getattr(self, "_running_agents_ts", None) or {}).get(
+            session_key
+        )
+
+        pending_event_ts = None
+        ts = getattr(pending_event, "timestamp", None)
+        if ts is not None:
+            try:
+                pending_event_ts = float(ts.timestamp()) if hasattr(ts, "timestamp") else float(ts)
+            except (TypeError, ValueError, OSError):
+                pending_event_ts = None
+
+        return resolve_session_idle_seconds(
+            now=now_ts,
+            last_activity_ts=last_activity_ts,
+            turn_started_ts=turn_started_ts,
+            pending_event_ts=pending_event_ts,
+        )
+
+    async def _check_session_stalls(self, timeout_seconds: float) -> int:
+        """Scan pending inbound sessions and notify once per stall episode.
+
+        Returns the number of notifications sent this pass (for tests).
+        """
+        from gateway.session_stall import (
+            format_session_stall_notification,
+            should_clear_session_stall_notification,
+            should_emit_session_stall_notification,
+        )
+
+        notified_map = getattr(self, "_session_stall_notified", None)
+        if notified_map is None:
+            notified_map = {}
+            self._session_stall_notified = notified_map
+
+        sent = 0
+        now = time.time()
+        candidates: Dict[str, tuple[Any, Any]] = {}
+
+        for adapter in self._iter_gateway_adapters():
+            pending_slot = getattr(adapter, "_pending_messages", None) or {}
+            for session_key, event in list(pending_slot.items()):
+                if session_key and session_key not in candidates and event is not None:
+                    candidates[session_key] = (adapter, event)
+
+        for session_key, overflow in list(
+            (getattr(self, "_queued_events", None) or {}).items()
+        ):
+            if not session_key or session_key in candidates or not overflow:
+                continue
+            event = overflow[0]
+            source = getattr(event, "source", None)
+            adapter = (
+                self._adapter_for_source(source) if source is not None else None
+            )
+            if adapter is None:
+                continue
+            candidates[session_key] = (adapter, event)
+
+        for session_key, (adapter, pending_event) in list(candidates.items()):
+            has_pending = pending_event is not None
+            idle_seconds = (
+                self._session_idle_seconds_for_stall(
+                    session_key, pending_event, now=now
+                )
+                if has_pending
+                else None
+            )
+            already = bool(notified_map.get(session_key))
+            if should_clear_session_stall_notification(
+                timeout_seconds=timeout_seconds,
+                idle_seconds=idle_seconds,
+                has_pending_inbound=has_pending,
+            ):
+                notified_map.pop(session_key, None)
+                already = False
+            if not should_emit_session_stall_notification(
+                timeout_seconds=timeout_seconds,
+                idle_seconds=idle_seconds,
+                has_pending_inbound=has_pending,
+                already_notified=already,
+            ):
+                continue
+
+            if idle_seconds is None:
+                continue
+            mins = max(1, int(idle_seconds // 60))
+            logger.warning(
+                "Session stall detected: session=%s idle=%.0fs "
+                "(timeout=%.0fs, ~%d min); pending inbound present",
+                session_key,
+                idle_seconds,
+                timeout_seconds,
+                mins,
+            )
+            source = getattr(pending_event, "source", None)
+            chat_id = getattr(source, "chat_id", None) if source is not None else None
+            if not chat_id:
+                logger.warning(
+                    "Session stall notify skipped (no chat_id): session=%s",
+                    session_key,
+                )
+                notified_map[session_key] = True
+                continue
+            try:
+                metadata = (
+                    self._thread_metadata_for_source(source)
+                    if source is not None and hasattr(self, "_thread_metadata_for_source")
+                    else None
+                )
+                await adapter.send(
+                    str(chat_id),
+                    format_session_stall_notification(idle_seconds),
+                    metadata=metadata,
+                )
+                sent += 1
+            except Exception as exc:
+                logger.warning(
+                    "Session stall notify failed for %s: %s",
+                    session_key,
+                    exc,
+                )
+            # Latch even on send failure so we don't spam every tick.
+            notified_map[session_key] = True
+
+        # Drop latches for sessions that no longer appear in any pending map.
+        for key in list(notified_map.keys()):
+            if key not in candidates:
+                notified_map.pop(key, None)
+
+        return sent
+
+    async def _session_stall_watcher(self, interval: float = 30.0):
+        """Periodic pending-inbound + stale-activity stall watchdog (#72016)."""
+        # Short initial delay so startup reconnect noise does not false-fire.
+        await asyncio.sleep(min(30.0, max(1.0, float(interval))))
+        while self._running:
+            try:
+                timeout = self._session_stall_timeout_seconds()
+                if timeout > 0:
+                    await self._check_session_stalls(timeout)
+            except Exception as exc:
+                logger.debug("Session stall watcher error: %s", exc)
+            # Interruptible sleep
+            steps = max(1, int(float(interval)))
+            for _ in range(steps):
                 if not self._running:
                     break
                 await asyncio.sleep(1)
