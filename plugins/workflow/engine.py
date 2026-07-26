@@ -1847,6 +1847,31 @@ class WorkflowEngine:
                     f"a declared input or node"
                 )
 
+        # Check that all declared inputs are actually used in node tasks
+        all_task_text = " ".join(
+            node.task + " " + str(node.description)
+            for node in workflow.nodes.values()
+        )
+        for inp in raw.get("inputs", []):
+            inp_name = inp.get("name", "")
+            if inp_name and f"{{{inp_name}}}" not in all_task_text:
+                result["issues"].append(
+                    f"Declared input '{inp_name}' is never referenced in any node task"
+                )
+
+        # Check that all declared attachments are actually used
+        for att in raw.get("attachments", []):
+            att_name = att.get("name", "")
+            if att_name:
+                used_in_attachment_field = any(
+                    getattr(n, "attachment", None) == att_name
+                    for n in workflow.nodes.values()
+                )
+                if not used_in_attachment_field:
+                    result["issues"].append(
+                        f"Declared attachment '{att_name}' is never referenced by any node"
+                    )
+
         # Check reviews/depends_on conflicts
         for nid, node in workflow.nodes.items():
             for review_entry in (node.reviews or []):
