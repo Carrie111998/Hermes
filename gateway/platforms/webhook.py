@@ -883,7 +883,35 @@ class WebhookAdapter(BasePlatformAdapter):
         fire-and-forget; wrapping IT closes before the run even starts.)
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
+
+        ``CANCELLED`` is the one outcome we must NOT close on.  A gateway
+        restart drains in-flight work through
+        ``BasePlatformAdapter.cancel_background_tasks()``, which cancels the
+        processing task — so a webhook run that a restart interrupted
+        mid-investigation arrives here as ``CANCELLED``, not ``SUCCESS``.
+        Stamping ``webhook_complete`` on it makes the row unrecoverable:
+        stale-route recovery in ``gateway/session.py`` only reopens rows that
+        are live or ended with ``agent_close``/``ws_orphan_reap``
+        (``find_latest_gateway_session_for_peer``), so the restart's
+        auto-resume pass cannot find the interrupted transcript.  It then
+        creates a BRAND NEW session for the routing key and synthesizes an
+        empty-text turn into it, and the agent — with no payload and no
+        history — answers "nothing came through" and ends.  The real work is
+        silently abandoned: for the ``helper-events`` route that means a
+        support ticket that was mid-investigation is never answered, while its
+        claim lock survives and blocks every later lane from picking it up.
+        Leaving a cancelled row live keeps it recoverable, and the ghost-leak
+        this hook exists to prevent is unaffected — a genuinely abandoned
+        session still gets reaped by the resume-pending expiry path.
         """
+        if getattr(outcome, "value", outcome) == "cancelled":
+            logger.info(
+                "[webhook] Not closing session for %s: run was CANCELLED "
+                "(likely a gateway restart drain). Leaving the row live so "
+                "restart auto-resume can recover the interrupted work.",
+                event.source.chat_id,
+            )
+            return
         await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(
