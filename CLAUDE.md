@@ -73,6 +73,14 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   faq.md decididos: L20 (atribución de Nous Portal a Nous Research) se dejó intacto;
   L844 (antes Discord de Nous) ahora apunta a `github.com/digital-services-llc/iyari`
   + `team@iyari.io`.
-- Pendiente: `user-guide/` resto (~270 archivos, dividir), `developer-guide/`,
-  `integrations/`, `docs/` sueltos, `userStories.json`, `configuration.md` (~2132 líneas).
+- Lote 5 (este commit): `user-guide/` sueltos (15, sin configuration.md) + `secrets/`
+  (3) = 18 archivos + ancla `env-vars.md#how-iyari-runs-shell-commands-on-windows`.
+  Preservados nuevos identificadores funcionales: header HTTP `X-Hermes-Session-Token`,
+  flag instalador `-HermesHome`, tarea schtasks `HermesGateway` (heredados del código).
+  `secrets/index.md`: Discord de Nous → repo propio (precedente faq:844). desktop.md:
+  "Nous Research" (botón/enlace OAuth) → Digital Services LLC por coherencia con
+  web-dashboard.md ya commiteado.
+- Sub-lotes user-guide/ restantes: 6=`messaging/` (33), 7=`configuration.md` (~2131 líneas),
+  8=`skills/bundled/`+google-workspace (74, dividir en 2), 9-10=`skills/optional/` (101, dividir).
+- Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).

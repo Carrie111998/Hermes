@@ -5,9 +5,9 @@ Pull API keys from [Bitwarden Secrets Manager](https://bitwarden.com/products/se
 ## How it works
 
 1. You create a **machine account** in Bitwarden Secrets Manager, give it read access to a project, and generate an **access token**.
-2. Hermes stores that single token in `~/.hermes/.env` as `BWS_ACCESS_TOKEN`.
-3. Every time `hermes` (or the gateway, or a cron job) starts, after `~/.hermes/.env` has loaded, Hermes calls `bws secret list <project_id>` and sets the returned keys into `os.environ`.
-4. By default Hermes **overrides** values already in your environment, so Bitwarden is the source of truth — rotate a key once in the web app and every Hermes process picks it up on next start. Flip `override_existing: false` in config if you want `.env` to win instead.
+2. IYARI stores that single token in `~/.hermes/.env` as `BWS_ACCESS_TOKEN`.
+3. Every time `hermes` (or the gateway, or a cron job) starts, after `~/.hermes/.env` has loaded, IYARI calls `bws secret list <project_id>` and sets the returned keys into `os.environ`.
+4. By default IYARI **overrides** values already in your environment, so Bitwarden is the source of truth — rotate a key once in the web app and every IYARI process picks it up on next start. Flip `override_existing: false` in config if you want `.env` to win instead.
 
 The `bws` binary is auto-downloaded into `~/.hermes/bin/` on first use — no `apt`, no `brew`, no `sudo`.
 
@@ -24,9 +24,9 @@ You set up the machine account *in the web app*, where your normal 2FA applies. 
 In the [Bitwarden web app](https://vault.bitwarden.com) (or [vault.bitwarden.eu](https://vault.bitwarden.eu) for EU accounts):
 
 1. Switch to **Secrets Manager** from the product switcher.
-2. Create or pick a **Project** (e.g. "Hermes keys").
+2. Create or pick a **Project** (e.g. "IYARI keys").
 3. Add your provider keys as secrets. The secret **Name** becomes the environment variable name — use `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, etc.
-4. **Machine accounts → New machine account → My Hermes machine** → **Projects** tab → grant Read access to your project.
+4. **Machine accounts → New machine account → My IYARI machine** → **Projects** tab → grant Read access to your project.
 5. **Access tokens** tab → **Create access token** → **Never** expires (or pick a date) → copy the token (starts with `0.`). Bitwarden cannot retrieve it again — keep the copy.
 
 Secrets Manager is included on the Bitwarden free tier with limits; no paid plan needed to try this.
@@ -102,7 +102,7 @@ secrets:
 
 ## Failure modes
 
-Bitwarden never blocks Hermes startup. If anything goes wrong, you'll see a one-line warning in stderr and Hermes continues with whatever credentials `.env` already had:
+Bitwarden never blocks IYARI startup. If anything goes wrong, you'll see a one-line warning in stderr and IYARI continues with whatever credentials `.env` already had:
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -116,9 +116,9 @@ Bitwarden never blocks Hermes startup. If anything goes wrong, you'll see a one-
 ## Security notes
 
 - The bootstrap token (`BWS_ACCESS_TOKEN`) is itself sensitive — anyone with it can read every secret the machine account has access to. Treat it the same as any other API key.
-- Hermes will refuse to let Bitwarden overwrite the bootstrap token itself, even with `override_existing: true`. If you store `BWS_ACCESS_TOKEN` as a secret inside the project, it's silently skipped during apply.
+- IYARI will refuse to let Bitwarden overwrite the bootstrap token itself, even with `override_existing: true`. If you store `BWS_ACCESS_TOKEN` as a secret inside the project, it's silently skipped during apply.
 - The `bws` binary download is verified against the published SHA-256 checksum from the same GitHub release. Mismatch aborts the install.
-- The pinned version (`bws v2.0.0` at time of writing) is updated through PRs to this repo — Hermes does not auto-upgrade `bws` to "latest" because upstream release shapes can change.
+- The pinned version (`bws v2.0.0` at time of writing) is updated through PRs to this repo — IYARI does not auto-upgrade `bws` to "latest" because upstream release shapes can change.
 
 ## When NOT to use this
 
@@ -126,4 +126,4 @@ Bitwarden never blocks Hermes startup. If anything goes wrong, you'll see a one-
 - **Air-gapped environments** that can't reach `api.bitwarden.com`.
 - **CI/CD** where the existing secrets-injection mechanism (GitHub Actions secrets, Vault, etc.) is already set up — pick one path, not two.
 
-The good case for this is multi-machine fleets, shared dev boxes, gateway VPSes, or any setup where you want centralized rotation and revocation across multiple Hermes installations.
+The good case for this is multi-machine fleets, shared dev boxes, gateway VPSes, or any setup where you want centralized rotation and revocation across multiple IYARI installations.

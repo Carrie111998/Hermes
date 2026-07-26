@@ -4,11 +4,11 @@ sidebar_position: 2
 
 # Profiles: Running Multiple Agents
 
-Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state.
+Run multiple independent IYARI agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state.
 
 ## What are profiles?
 
-A profile is a separate Hermes home directory. Each profile gets its own directory containing its own `config.yaml`, `.env`, `SOUL.md`, memories, sessions, skills, cron jobs, and state database. Profiles let you run separate agents for different purposes — a coding assistant, a personal bot, a research agent — without mixing up Hermes state.
+A profile is a separate IYARI home directory. Each profile gets its own directory containing its own `config.yaml`, `.env`, `SOUL.md`, memories, sessions, skills, cron jobs, and state database. Profiles let you run separate agents for different purposes — a coding assistant, a personal bot, a research agent — without mixing up IYARI state.
 
 When you create a profile, it automatically becomes its own command. Create a profile called `coder` and you immediately have `coder chat`, `coder setup`, `coder gateway start`, etc.
 
@@ -20,7 +20,7 @@ coder setup                       # configure API keys and model
 coder chat                        # start chatting
 ```
 
-That's it. `coder` is now its own Hermes profile with its own config, memory, and state.
+That's it. `coder` is now its own IYARI profile with its own config, memory, and state.
 
 ## Creating a profile
 
@@ -126,7 +126,7 @@ The CLI always shows which profile is active:
 
 Profiles are often confused with workspaces or sandboxes, but they are different things:
 
-- A **profile** gives Hermes its own state directory: `config.yaml`, `.env`, `SOUL.md`, sessions, memory, logs, cron jobs, and gateway state.
+- A **profile** gives IYARI its own state directory: `config.yaml`, `.env`, `SOUL.md`, sessions, memory, logs, cron jobs, and gateway state.
 - A **workspace** or **working directory** is where terminal commands start. That is controlled separately by `terminal.cwd`.
 - A **sandbox** is what limits filesystem access. Profiles do **not** sandbox the agent.
 
@@ -140,7 +140,7 @@ terminal:
   cwd: /absolute/path/to/project
 ```
 
-Using `cwd: "."` on the local backend means "the directory Hermes was launched from", not "the profile directory".
+Using `cwd: "."` on the local backend means "the directory IYARI was launched from", not "the profile directory".
 
 Also note:
 
@@ -269,7 +269,7 @@ Add the line to your `~/.bashrc` or `~/.zshrc` for persistent completion. Comple
 
 ## How it works
 
-Profiles use the `HERMES_HOME` environment variable. When you run `coder chat`, the wrapper script sets `HERMES_HOME=~/.hermes/profiles/coder` before launching hermes. Since 119+ files in the codebase resolve paths via `get_hermes_home()`, Hermes state automatically scopes to the profile's directory — config, sessions, memory, skills, state database, gateway PID, logs, and cron jobs.
+Profiles use the `HERMES_HOME` environment variable. When you run `coder chat`, the wrapper script sets `HERMES_HOME=~/.hermes/profiles/coder` before launching hermes. Since 119+ files in the codebase resolve paths via `get_hermes_home()`, IYARI state automatically scopes to the profile's directory — config, sessions, memory, skills, state database, gateway PID, logs, and cron jobs.
 
 This is separate from terminal working directory. Tool execution starts from `terminal.cwd` (or the launch directory when `cwd: "."` on the local backend), not automatically from `HERMES_HOME`.
 
@@ -281,22 +281,22 @@ per-profile tool config can opt in with `terminal.home_mode: profile`.
 
 This means two things that are easy to mix up:
 
-- `HERMES_HOME` is the profile boundary. It controls Hermes config, `.env`,
-  memory, sessions, skills, logs, cron jobs, gateway state, and other Hermes
+- `HERMES_HOME` is the profile boundary. It controls IYARI config, `.env`,
+  memory, sessions, skills, logs, cron jobs, gateway state, and other IYARI
   data.
 - `HOME` is the operating-system/user home that external CLIs expect. On host
-  installs, Hermes keeps it as the real user home by default so tools like
+  installs, IYARI keeps it as the real user home by default so tools like
   `git`, `ssh`, `gh`, `az`, `npm`, Claude Code, and Codex find the same
   credentials they use in your normal shell.
 
 The tradeoff is that host profiles share normal user-level CLI state by default.
 If you need separate CLI identities per profile, set `terminal.home_mode:
-profile` in that profile's `config.yaml`. In that mode Hermes launches tool
+profile` in that profile's `config.yaml`. In that mode IYARI launches tool
 subprocesses with `HOME={HERMES_HOME}/home`; you then need to initialize or link
 the profile-specific `~/.ssh`, `~/.gitconfig`, `~/.config/gh`, cloud CLI auth,
 Claude/Codex auth, npm state, and similar files inside that profile home.
 
-Hermes also exposes `HERMES_REAL_HOME` to subprocesses so scripts can still find
+IYARI also exposes `HERMES_REAL_HOME` to subprocesses so scripts can still find
 the actual account home when `home_mode: profile` is active.
 
 The default profile is simply `~/.hermes` itself. No migration needed — existing installs work identically.
