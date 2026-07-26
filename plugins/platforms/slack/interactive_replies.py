@@ -96,21 +96,32 @@ def parse_interactive_reply(content: str) -> InteractiveReply | None:
     Invalid directives deliberately return ``None`` so callers can send the
     original content literally instead of accidentally dropping agent output.
     """
-    match = _DIRECTIVE_RE.search(content)
-    if not match:
-        return None
+    remaining = content
+    directives: list[tuple[InteractiveButton, ...]] = []
+    while match := _DIRECTIVE_RE.search(remaining):
+        buttons: list[InteractiveButton] = []
+        for item in match.group("buttons").split(","):
+            if ":" not in item:
+                break
+            label, action_id = item.rsplit(":", 1)
+            buttons.append(InteractiveButton(label.strip(), action_id.strip()))
+        else:
+            parsed_buttons = tuple(buttons)
+            if _validate_buttons(parsed_buttons):
+                directives.insert(0, parsed_buttons)
+                remaining = remaining[: match.start()].rstrip()
+                continue
 
-    buttons: list[InteractiveButton] = []
-    for item in match.group("buttons").split(","):
-        if ":" not in item:
+        if not directives:
             return None
-        label, action_id = item.rsplit(":", 1)
-        buttons.append(InteractiveButton(label.strip(), action_id.strip()))
+        break
 
-    parsed_buttons = tuple(buttons)
-    if not _validate_buttons(parsed_buttons):
+    if not directives:
         return None
-    return InteractiveReply(content[: match.start()].rstrip(), parsed_buttons)
+    all_buttons = tuple(button for directive in directives for button in directive)
+    if not _validate_buttons(all_buttons):
+        return None
+    return InteractiveReply(remaining, all_buttons)
 
 
 @contextmanager
@@ -286,7 +297,7 @@ def append_actions_block(
             {
                 "type": "button",
                 "text": {"type": "plain_text", "text": button.label, "emoji": True},
-                "action_id": button.action_id,
+                "action_id": "hermes_interactive_reply",
                 "value": button.token,
             }
             for button in prepared.buttons

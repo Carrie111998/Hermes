@@ -18,6 +18,22 @@ def test_parse_valid_directive_strips_it_and_preserves_visible_reply():
     assert [button.action_id for button in reply.buttons] == ["enroll", "skip"]
 
 
+def test_parse_multiple_valid_trailing_directives_in_original_order():
+    reply = parse_interactive_reply(
+        "Approved lead.\n"
+        "[[slack_buttons: Enroll:enroll]]\n"
+        "[[slack_buttons: Skip:skip, Draft:draft]]"
+    )
+
+    assert reply is not None
+    assert reply.visible_content == "Approved lead."
+    assert [button.action_id for button in reply.buttons] == [
+        "enroll",
+        "skip",
+        "draft",
+    ]
+
+
 def test_parse_malformed_directives_return_none_for_literal_fallback():
     invalid = (
         "[[slack_buttons: :enroll]]",
@@ -74,7 +90,10 @@ def test_append_actions_block_returns_slack_buttons_without_mutating_input(tmp_p
     assert rendered[:-1] == blocks
     assert rendered is not blocks
     assert rendered[-1]["type"] == "actions"
-    assert [item["action_id"] for item in rendered[-1]["elements"]] == ["enroll", "skip"]
+    assert [item["action_id"] for item in rendered[-1]["elements"]] == [
+        "hermes_interactive_reply",
+        "hermes_interactive_reply",
+    ]
     assert [item["value"] for item in rendered[-1]["elements"]] == [
         button.token for button in prepared.buttons
     ]
