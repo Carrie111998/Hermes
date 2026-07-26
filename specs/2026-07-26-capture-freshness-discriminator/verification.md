@@ -180,3 +180,19 @@ Command: `npm test` from
 No client runtime was deployed, restarted, reconfigured, re-registered,
 silenced, waived, or re-thresholded. The bridge and check changes are source
 commits only. The active deployment freeze remains intact.
+
+Post-push live recheck:
+
+```text
+canonical live-runner sha256=414d768097de954bceb4f9ca674ea8a4bddb018e293280986e98620a80338b56
+new source-runner sha256=d92bb5bd49379307fd8f0ca9f03b649e0b260c43987485beef7e834b78cfc626
+bridge ActiveState=active
+bridge SubState=running
+bridge NRestarts=0
+bridge ActiveEnterTimestamp=2026-07-23T03:13:02Z
+bridge socket status=connected
+```
+
+The different runner hashes prove the canonical live runner was not refreshed
+to the new source. The unchanged service start time and zero restart count
+prove the bridge was not restarted.
