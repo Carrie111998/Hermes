@@ -1826,6 +1826,18 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Host-owned, post-authorization sidecar used only while an event is held
+    # in an in-memory busy-session queue. ``init=False`` prevents adapters or
+    # deserializers from asserting authenticated provenance at construction;
+    # GatewayRunner resets it at ingress and sets it only after its independent
+    # authorization check succeeds.
+    _authenticated_gateway_request: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins
@@ -2165,6 +2177,11 @@ def merge_pending_message_event(
         incoming_has_media = bool(event.media_urls)
 
         if existing_is_photo and incoming_is_photo:
+            # A single-message capability cannot faithfully represent merged
+            # content from multiple gateway events, even when every event was
+            # independently authenticated.  Preserve the first message ID for
+            # reply/thread behavior, but fail closed for protected dispatch.
+            existing._authenticated_gateway_request = False
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -2173,6 +2190,7 @@ def merge_pending_message_event(
             return
 
         if existing_has_media or incoming_has_media:
+            existing._authenticated_gateway_request = False
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2196,6 +2214,7 @@ def merge_pending_message_event(
             and getattr(existing, "message_type", None) == MessageType.TEXT
             and event.message_type == MessageType.TEXT
         ):
+            existing._authenticated_gateway_request = False
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return

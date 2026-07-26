@@ -221,15 +221,38 @@ class TestBusySessionAck:
 
         agent = MagicMock()
         agent._supports_active_turn_redirect = True
-        agent.redirect.return_value = True
+        agent.authenticated_gateway_tool_dispatch_version = 1
         agent._active_children = []
         agent.get_activity_summary.return_value = {}
         runner._running_agents[sk] = agent
         runner.adapters[event.source.platform] = adapter
 
-        assert await runner._handle_active_session_busy_message(event, sk) is True
+        from gateway.authenticated_dispatch import (
+            issue_authenticated_gateway_dispatch,
+            validate_authenticated_gateway_dispatch,
+        )
 
-        agent.redirect.assert_called_once_with("No, use Postgres")
+        with issue_authenticated_gateway_dispatch(
+            dispatch_kind="tool",
+            platform="telegram",
+            user_id="user-1",
+            chat_id="chat-1",
+            message_id="original-message",
+        ) as live:
+            agent._authenticated_gateway_context = live
+            def redirect(_text, *, before_mutation):
+                before_mutation()
+                return not validate_authenticated_gateway_dispatch(live)
+
+            agent.redirect.side_effect = redirect
+            assert validate_authenticated_gateway_dispatch(live)
+            assert await runner._handle_active_session_busy_message(event, sk) is True
+            assert not validate_authenticated_gateway_dispatch(live)
+
+        agent.redirect.assert_called_once()
+        redirect_args, redirect_kwargs = agent.redirect.call_args
+        assert redirect_args == ("No, use Postgres",)
+        assert callable(redirect_kwargs["before_mutation"])
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
@@ -655,8 +678,11 @@ class TestBusySessionAck:
         assert "10 min" in content  # elapsed
 
     @pytest.mark.asyncio
-    async def test_telegram_omits_status_detail_by_default(self):
+    async def test_telegram_omits_status_detail_by_default(self, monkeypatch):
         """Telegram busy acks stay concise unless busy_ack_detail is enabled."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()

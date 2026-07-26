@@ -19,13 +19,13 @@ def _make_source() -> SessionSource:
     )
 
 
-def _make_event(text: str) -> MessageEvent:
+def _make_event(text: str, *, internal: bool = True) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=_make_source(),
         message_id="m1",
-        internal=True,
+        internal=internal,
     )
 
 
@@ -146,3 +146,233 @@ async def test_idle_queue_without_payload_returns_usage():
     assert result == "Usage: /queue <prompt>"
     assert called is False
     assert runner._running_agents == {}
+
+
+@pytest.mark.asyncio
+async def test_protected_plugin_command_receives_live_context_and_revokes(monkeypatch):
+    import hermes_cli.plugins as plugins
+    from gateway.authenticated_dispatch import validate_authenticated_gateway_dispatch
+
+    runner, _adapter = _make_runner()
+    captured = {}
+
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_commands",
+        lambda: {"secure-test": {"requires_authenticated_gateway": True}},
+    )
+
+    def invoke(name, args, *, authenticated_gateway_context=None):
+        captured["name"] = name
+        captured["args"] = args
+        captured["context"] = authenticated_gateway_context
+        assert validate_authenticated_gateway_dispatch(authenticated_gateway_context)
+        return "accepted"
+
+    monkeypatch.setattr(plugins, "invoke_plugin_command", invoke)
+
+    result = await runner._handle_message(
+        _make_event("/secure_test payload", internal=False)
+    )
+
+    assert result == "accepted"
+    assert captured["name"] == "secure-test"
+    assert captured["args"] == "payload"
+    assert captured["context"].platform == "telegram"
+    assert captured["context"].user_id == "u1"
+    assert captured["context"].chat_id == "c1"
+    assert captured["context"].message_id == "m1"
+    assert not validate_authenticated_gateway_dispatch(captured["context"])
+
+
+@pytest.mark.asyncio
+async def test_protected_plugin_command_internal_event_denies_without_entry(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    runner, _adapter = _make_runner()
+    setattr(runner.hooks, "loaded_hooks", True)
+    entered = False
+
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_commands",
+        lambda: {"secure-test": {"requires_authenticated_gateway": True}},
+    )
+
+    def invoke(*args, **kwargs):
+        nonlocal entered
+        entered = True
+        return "unexpected"
+
+    monkeypatch.setattr(plugins, "invoke_plugin_command", invoke)
+    event = _make_event("/secure-test payload")
+    event.internal = True
+
+    result = await runner._handle_message(event)
+
+    assert result == "Authenticated gateway command dispatch denied."
+    assert entered is False
+    assert getattr(runner.hooks.emit_collect, "call_count") == 0
+
+
+@pytest.mark.asyncio
+async def test_protected_command_discovery_failure_denies_before_hooks_or_fallthrough(
+    monkeypatch,
+):
+    import hermes_cli.plugins as plugins
+
+    runner, _adapter = _make_runner()
+    setattr(runner.hooks, "loaded_hooks", True)
+    lookups = 0
+    entered = False
+    fell_through = False
+
+    def get_commands():
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            # The slash-access lookup runs before the security classification.
+            return {}
+        if lookups == 2:
+            raise RuntimeError("transient security-classification failure")
+        return {"secure-test": {"requires_authenticated_gateway": True}}
+
+    def invoke(*args, **kwargs):
+        nonlocal entered
+        entered = True
+        return "unexpected"
+
+    async def fallback(*args, **kwargs):
+        nonlocal fell_through
+        fell_through = True
+        return {"final_response": "unexpected"}
+
+    monkeypatch.setattr(plugins, "get_plugin_commands", get_commands)
+    monkeypatch.setattr(plugins, "invoke_plugin_command", invoke)
+    runner._handle_message_with_agent = fallback
+
+    result = await runner._handle_message(_make_event("/secure-test payload"))
+
+    assert result == "Authenticated gateway command dispatch denied."
+    assert entered is False
+    assert fell_through is False
+    assert getattr(runner.hooks.emit_collect, "call_count") == 0
+
+
+@pytest.mark.asyncio
+async def test_protected_plugin_command_missing_identity_denies_without_entry_or_fallthrough(
+    monkeypatch,
+):
+    import hermes_cli.plugins as plugins
+
+    runner, _adapter = _make_runner()
+    entered = False
+    fell_through = False
+
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_commands",
+        lambda: {"secure-test": {"requires_authenticated_gateway": True}},
+    )
+
+    def invoke(*args, **kwargs):
+        nonlocal entered
+        entered = True
+        return "unexpected"
+
+    async def fallback(*args, **kwargs):
+        nonlocal fell_through
+        fell_through = True
+        return {"final_response": "unexpected"}
+
+    monkeypatch.setattr(plugins, "invoke_plugin_command", invoke)
+    runner._handle_message_with_agent = fallback
+
+    source = _make_source()
+    source.user_id = None
+    event = MessageEvent(
+        text="/secure_test payload",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+        internal=False,
+    )
+    result = await runner._handle_message(event)
+
+    assert result == "Authenticated gateway command dispatch denied."
+    assert entered is False
+    assert fell_through is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_message_id", "source_message_id"),
+    [(None, None), ("event-message", "different-source-message")],
+)
+async def test_protected_plugin_command_requires_matching_trigger_message_id(
+    monkeypatch,
+    event_message_id,
+    source_message_id,
+):
+    import hermes_cli.plugins as plugins
+
+    runner, _adapter = _make_runner()
+    entered = False
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_commands",
+        lambda: {"secure-test": {"requires_authenticated_gateway": True}},
+    )
+
+    def invoke(*args, **kwargs):
+        nonlocal entered
+        entered = True
+        return "unexpected"
+
+    monkeypatch.setattr(plugins, "invoke_plugin_command", invoke)
+    source = _make_source()
+    source.message_id = source_message_id
+    event = MessageEvent(
+        text="/secure_test payload",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id=event_message_id,
+        internal=False,
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "Authenticated gateway command dispatch denied."
+    assert entered is False
+
+
+@pytest.mark.asyncio
+async def test_protected_plugin_command_handler_failure_does_not_fall_through(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    runner, _adapter = _make_runner()
+    fell_through = False
+
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_commands",
+        lambda: {"secure-test": {"requires_authenticated_gateway": True}},
+    )
+
+    def invoke(*args, **kwargs):
+        raise RuntimeError("private handler detail")
+
+    async def fallback(*args, **kwargs):
+        nonlocal fell_through
+        fell_through = True
+        return {"final_response": "unexpected"}
+
+    monkeypatch.setattr(plugins, "invoke_plugin_command", invoke)
+    runner._handle_message_with_agent = fallback
+
+    result = await runner._handle_message(
+        _make_event("/secure_test payload", internal=False)
+    )
+
+    assert result == "Authenticated gateway command dispatch denied."
+    assert fell_through is False

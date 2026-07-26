@@ -339,6 +339,11 @@ class LoadedPlugin:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
+    # Separate, exact-version capabilities. Plugins must validate the exact
+    # built-in integer before registering a protected surface.
+    authenticated_gateway_dispatch_version = 1
+    authenticated_gateway_tool_dispatch_version = 1
+
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
         self._manager = manager
@@ -400,6 +405,7 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        requires_authenticated_gateway: bool = False,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -438,6 +444,7 @@ class PluginContext:
             description=description,
             emoji=emoji,
             override=override,
+            requires_authenticated_gateway=requires_authenticated_gateway,
         )
         self._manager._plugin_tool_names.add(name)
         logger.debug(
@@ -532,11 +539,16 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        requires_authenticated_gateway: bool = False,
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
-        The handler signature is ``fn(raw_args: str) -> str | None``.
+        The legacy handler signature is ``fn(raw_args: str) -> str | None``.
         It may also be an async callable — the gateway dispatch handles both.
+
+        With ``requires_authenticated_gateway=True``, local and synthetic
+        dispatches are denied before handler entry. The protected handler gets
+        the live host-issued lease as keyword-only ``command_context``.
 
         Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
         terminal commands), this registers in-session slash commands that users
@@ -551,6 +563,8 @@ class PluginContext:
 
         Names conflicting with built-in commands are rejected with a warning.
         """
+        if type(requires_authenticated_gateway) is not bool:
+            raise TypeError("requires_authenticated_gateway must be a built-in bool")
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning(
@@ -577,6 +591,7 @@ class PluginContext:
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "requires_authenticated_gateway": requires_authenticated_gateway,
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
@@ -599,6 +614,12 @@ class PluginContext:
             JSON string from the tool handler (same format as model tool calls).
         """
         from tools.registry import registry
+
+        # Plugin-initiated dispatch is not a protected model-tool dispatch.
+        # Strip any lease a plugin attempts to forward through this API.  Keep
+        # legacy ``tool_context`` kwargs for ordinary tools; the registry
+        # replaces them only when dispatching a protected tool.
+        kwargs.pop("authenticated_gateway_context", None)
 
         # Wire up parent agent context when available (CLI mode).
         # In gateway mode _cli_ref is None — tools degrade gracefully
@@ -2343,9 +2364,40 @@ def get_plugin_context_engine():
 
 
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
-    """Return the handler for a plugin-registered slash command, or ``None``."""
+    """Return a handler while denying protected legacy dispatch before entry."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
-    return entry["handler"] if entry else None
+    if not entry:
+        return None
+    if entry.get("requires_authenticated_gateway") is True:
+        def _deny_protected_legacy_dispatch(_raw_args: str):
+            raise PermissionError("Authenticated gateway command dispatch required")
+
+        return _deny_protected_legacy_dispatch
+    return entry["handler"]
+
+
+def invoke_plugin_command(
+    name: str,
+    raw_args: str,
+    *,
+    authenticated_gateway_context: object = None,
+) -> Any:
+    """Invoke a command with centralized authenticated-provenance policy."""
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    if not entry:
+        return None
+    handler = entry["handler"]
+    if entry.get("requires_authenticated_gateway") is True:
+        from gateway.authenticated_dispatch import (
+            validate_authenticated_gateway_command_dispatch,
+        )
+
+        if not validate_authenticated_gateway_command_dispatch(
+            authenticated_gateway_context
+        ):
+            raise PermissionError("Authenticated gateway command dispatch required")
+        return handler(raw_args, command_context=authenticated_gateway_context)
+    return handler(raw_args)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0

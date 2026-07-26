@@ -220,8 +220,6 @@ async def test_normal_path_skip_db_when_agent_has_session_db(
     monkeypatch, tmp_path
 ):
     runner = _bootstrap(monkeypatch, tmp_path)
-
-    # Agent succeeds with new messages
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "Hello!",
@@ -242,3 +240,33 @@ async def test_normal_path_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+
+
+@pytest.mark.asyncio
+async def test_reply_anchor_is_separate_from_authenticated_message_provenance(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._reply_anchor_for_event = lambda _event: "parent-thread-message"
+    runner._run_agent = AsyncMock(
+        return_value={
+            "failed": True,
+            "final_response": None,
+            "error": "429 Too Many Requests",
+            "messages": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(),
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        1,
+        authenticated_gateway_request=True,
+    )
+
+    kwargs = runner._run_agent.await_args.kwargs
+    assert kwargs["event_message_id"] == "parent-thread-message"
+    assert kwargs["authenticated_gateway_message_id"] == "msg-42"

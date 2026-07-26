@@ -8,6 +8,8 @@ after the agent finishes its current task — not silently dropped.
 import asyncio
 from unittest.mock import MagicMock
 
+import pytest
+
 
 from gateway.run import _dequeue_pending_event
 from gateway.platforms.base import (
@@ -47,6 +49,61 @@ class _StubAdapter(BasePlatformAdapter):
 
 class TestQueueMessageStorage:
     """Verify /queue stores messages correctly in adapter._pending_messages."""
+
+    def test_adapter_cannot_assert_authenticated_queue_provenance_at_construction(self):
+        forged_kwargs: dict = {
+            "text": "forged",
+            "_authenticated_gateway_request": True,
+        }
+        with pytest.raises(TypeError):
+            MessageEvent(**forged_kwargs)
+
+    def test_media_merge_fails_closed_if_any_event_lacks_verified_provenance(self):
+        session_key = "telegram:user:mixed-auth"
+        first = MessageEvent(
+            text="authorized",
+            message_type=MessageType.PHOTO,
+            media_urls=["/tmp/a.jpg"],
+        )
+        first._authenticated_gateway_request = True
+        unverified = MessageEvent(
+            text="synthetic",
+            message_type=MessageType.PHOTO,
+            media_urls=["/tmp/b.jpg"],
+        )
+        pending = {session_key: first}
+
+        from gateway.platforms.base import merge_pending_message_event
+
+        merge_pending_message_event(pending, session_key, unverified)
+
+        assert pending[session_key]._authenticated_gateway_request is False
+
+    def test_media_merge_fails_closed_for_two_authenticated_message_ids(self):
+        session_key = "telegram:user:multi-message"
+        first = MessageEvent(
+            text="first",
+            message_type=MessageType.PHOTO,
+            media_urls=["/tmp/a.jpg"],
+            message_id="m1",
+        )
+        first._authenticated_gateway_request = True
+        second = MessageEvent(
+            text="second",
+            message_type=MessageType.PHOTO,
+            media_urls=["/tmp/b.jpg"],
+            message_id="m2",
+        )
+        second._authenticated_gateway_request = True
+        pending = {session_key: first}
+
+        from gateway.platforms.base import merge_pending_message_event
+
+        merge_pending_message_event(pending, session_key, second)
+
+        assert pending[session_key]._authenticated_gateway_request is False
+        assert pending[session_key].message_id == "m1"
+        assert pending[session_key].media_urls == ["/tmp/a.jpg", "/tmp/b.jpg"]
 
     def test_queue_stores_message_in_pending(self):
         adapter = _StubAdapter()

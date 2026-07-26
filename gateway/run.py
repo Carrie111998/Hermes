@@ -5802,6 +5802,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None, None
 
     @staticmethod
+    def _revoke_authenticated_gateway_authority(running_agent: Any) -> None:
+        """Atomically taint the current turn and close its published lease."""
+        from gateway.authenticated_dispatch import (
+            taint_and_revoke_authenticated_gateway_dispatch,
+        )
+
+        taint_and_revoke_authenticated_gateway_dispatch(running_agent)
+
+    @staticmethod
+    def _interrupt_authenticated_gateway_turn(
+        running_agent: Any,
+        reason: Optional[str],
+    ) -> None:
+        """Revoke/taint before publishing an interrupt to the active agent."""
+        GatewayRunner._revoke_authenticated_gateway_authority(running_agent)
+        running_agent.interrupt(reason)
+
+    @staticmethod
+    def _authenticated_gateway_request_for_turn(
+        requested: bool,
+        agent: Any,
+    ) -> bool:
+        """Deny lease issuance after any accepted mutation of this turn."""
+        if requested is not True:
+            return False
+        taint = getattr(agent, "_authenticated_gateway_turn_tainted", None)
+        if taint is None:
+            return True
+        try:
+            return taint.is_set() is False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _authenticated_gateway_mutation_kwargs(running_agent: Any) -> dict:
+        """Return the pre-mutation revocation callback for exact-capability agents."""
+        from gateway.authenticated_dispatch import (
+            AUTHENTICATED_GATEWAY_TOOL_DISPATCH_VERSION,
+        )
+
+        capability = getattr(
+            running_agent,
+            "authenticated_gateway_tool_dispatch_version",
+            None,
+        )
+        if (
+            type(capability) is int
+            and capability == AUTHENTICATED_GATEWAY_TOOL_DISPATCH_VERSION
+        ):
+            return {
+                "before_mutation": lambda: GatewayRunner._revoke_authenticated_gateway_authority(
+                    running_agent
+                )
+            }
+        return {}
+
+    @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
         """Return True when *running_agent* is currently driving subagents
         via the ``delegate_task`` tool.
@@ -5951,6 +6008,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
+        # The queue provenance sidecar is host-owned. Reset any dynamic value
+        # supplied by an adapter before making the independent auth decision.
+        event._authenticated_gateway_request = False
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
@@ -5965,6 +6025,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        if not event.internal:
+            event._authenticated_gateway_request = True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -6148,7 +6211,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if can_steer:
                 try:
-                    steered = bool(running_agent.steer(steer_text))
+                    steered = bool(
+                        running_agent.steer(
+                            steer_text,
+                            **self._authenticated_gateway_mutation_kwargs(
+                                running_agent
+                            ),
+                        )
+                    )
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
@@ -6166,10 +6236,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and hasattr(running_agent, "redirect")
         ):
             try:
-                redirected = bool(running_agent.redirect((event.text or "").strip()))
+                redirected = bool(
+                    running_agent.redirect(
+                        (event.text or "").strip(),
+                        **self._authenticated_gateway_mutation_kwargs(
+                            running_agent
+                        ),
+                    )
+                )
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False
+
+        if steered or redirected:
+            self._revoke_authenticated_gateway_authority(running_agent)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -6202,6 +6282,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and running_agent
             and running_agent is not _AGENT_PENDING_SENTINEL
         ):
+            self._revoke_authenticated_gateway_authority(running_agent)
             try:
                 _interrupt_text = event.text
                 _media_urls = getattr(event, "media_urls", None) or []
@@ -6441,6 +6522,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
+                self._revoke_authenticated_gateway_authority(agent)
                 agent.interrupt(reason)
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
@@ -10456,7 +10538,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
         # Internal events (e.g. background-process completion notifications)
-        # are system-generated and must skip user authorization.
+        # are system-generated and must skip user authorization. The queue
+        # provenance sidecar is host-owned, so clear any adapter-supplied value
+        # before this ingress makes its own authorization decision.
+        event._authenticated_gateway_request = False
         is_internal = bool(getattr(event, "internal", False))
 
         # Ignored-channel guard runs FIRST — before startup-restore queueing,
@@ -10588,7 +10673,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        # This decision is the only authority input downstream. Internal events
+        # may bypass the user gate for delivery, but are never authenticated
+        # gateway requests. External events reach here only after authorization.
+        authenticated_gateway_request = not is_internal
+        event._authenticated_gateway_request = authenticated_gateway_request
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -10924,6 +11015,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         internal=event.internal,
                         timestamp=event.timestamp,
                     )
+                    queued_event._authenticated_gateway_request = (
+                        event._authenticated_gateway_request is True
+                    )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self._adapter_for_source(source))
                 if depth <= 1:
@@ -10952,15 +11046,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             channel_prompt=event.channel_prompt,
                             channel_context=event.channel_context,
                         )
+                        queued_event._authenticated_gateway_request = (
+                            event._authenticated_gateway_request is True
+                        )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
-                        accepted = running_agent.steer(steer_text)
+                        accepted = running_agent.steer(
+                            steer_text,
+                            **self._authenticated_gateway_mutation_kwargs(
+                                running_agent
+                            ),
+                        )
                     except Exception as exc:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
                         return f"⚠️ Steer failed: {exc}"
                     if accepted:
+                        self._revoke_authenticated_gateway_authority(running_agent)
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
                     return "Steer rejected (empty payload)."
@@ -10974,6 +11077,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                         channel_context=event.channel_context,
+                    )
+                    queued_event._authenticated_gateway_request = (
+                        event._authenticated_gateway_request is True
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
@@ -11170,11 +11276,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and hasattr(running_agent, "steer")
                 ):
                     try:
-                        steered = bool(running_agent.steer(steer_text))
+                        steered = bool(
+                        running_agent.steer(
+                            steer_text,
+                            **self._authenticated_gateway_mutation_kwargs(
+                                running_agent
+                            ),
+                        )
+                    )
                     except Exception as exc:
                         logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
                         steered = False
                 if steered:
+                    self._revoke_authenticated_gateway_authority(running_agent)
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
@@ -11224,7 +11338,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and hasattr(running_agent, "redirect")
             ):
                 try:
-                    if running_agent.redirect((event.text or "").strip()):
+                    if running_agent.redirect(
+                        (event.text or "").strip(),
+                        **self._authenticated_gateway_mutation_kwargs(
+                            running_agent
+                        ),
+                    ):
+                        self._revoke_authenticated_gateway_authority(running_agent)
                         logger.debug("PRIORITY redirect for session %s", _quick_key)
                         return None
                 except Exception as exc:
@@ -11234,6 +11354,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc,
                     )
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
+            self._revoke_authenticated_gateway_authority(running_agent)
             _interrupt_text = event.text
             _media_urls = getattr(event, "media_urls", None) or []
             if self._pending_event_audio_paths(event):
@@ -11299,6 +11420,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _denied is not None:
                 return _denied
 
+        def _protected_plugin_command_status(name: Optional[str]) -> tuple[bool, bool]:
+            """Return (protected, authorized) before any command hook runs."""
+            if not name:
+                return False, False
+            try:
+                from hermes_cli.plugins import get_plugin_commands
+
+                entry = get_plugin_commands().get(name.replace("_", "-"))
+            except Exception:
+                # Plugin metadata is part of the security classification boundary.
+                # A failed lookup must not let an unknown command reach hooks and
+                # then become protected on a later successful discovery attempt.
+                try:
+                    from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS
+
+                    if name in GATEWAY_KNOWN_COMMANDS:
+                        return False, False
+                except Exception:
+                    pass
+                return True, False
+            if not isinstance(entry, dict) or entry.get(
+                "requires_authenticated_gateway"
+            ) is not True:
+                return False, False
+            platform = getattr(source.platform, "value", source.platform)
+            message_id = event.message_id
+            source_message_id = source.message_id
+            valid = (
+                authenticated_gateway_request is True
+                and type(platform) is str
+                and bool(platform)
+                and type(source.user_id) is str
+                and bool(source.user_id)
+                and type(source.chat_id) is str
+                and bool(source.chat_id)
+                and type(message_id) is str
+                and bool(message_id)
+                and (
+                    source.thread_id is None
+                    or (type(source.thread_id) is str and bool(source.thread_id))
+                )
+                and (
+                    source_message_id is None
+                    or (
+                        type(source_message_id) is str
+                        and bool(source_message_id)
+                        and source_message_id == message_id
+                    )
+                )
+            )
+            return True, valid
+
+        _hook_command_is_protected, _hook_command_is_authorized = (
+            _protected_plugin_command_status(canonical or command)
+        )
+        if _hook_command_is_protected and not _hook_command_is_authorized:
+            return "Authenticated gateway command dispatch denied."
+
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
         # dict with ``{"decision": "deny" | "handled" | "rewrite", ...}``
@@ -11352,6 +11531,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     command = event.get_command()
                     _cmd_def = _resolve_cmd(command) if command else None
                     canonical = _cmd_def.name if _cmd_def else command
+                    _rewritten_is_protected, _rewritten_is_authorized = (
+                        _protected_plugin_command_status(canonical or command)
+                    )
+                    if _rewritten_is_protected and not _rewritten_is_authorized:
+                        return "Authenticated gateway command dispatch denied."
                     break
 
         if canonical == "new":
@@ -11714,20 +11898,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Plugin-registered slash commands
         if command:
+            normalized_command = command.replace("_", "-")
+            protected_command = False
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_commands,
+                    invoke_plugin_command,
+                )
+
                 # Normalize underscores to hyphens so Telegram's underscored
-                # autocomplete form matches plugin commands registered with
-                # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
+                # autocomplete form matches hyphenated plugin commands.
+                entry = get_plugin_commands().get(normalized_command)
+                if entry:
+                    protected_command = (
+                        entry.get("requires_authenticated_gateway") is True
+                    )
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    if protected_command:
+                        if authenticated_gateway_request is not True:
+                            raise PermissionError(
+                                "Authenticated gateway command dispatch required"
+                            )
+                        from gateway.authenticated_dispatch import (
+                            issue_authenticated_gateway_dispatch,
+                        )
+
+                        platform = getattr(source.platform, "value", source.platform)
+                        message_id = event.message_id
+                        source_message_id = source.message_id
+                        if not (
+                            type(message_id) is str
+                            and bool(message_id)
+                            and (
+                                source_message_id is None
+                                or (
+                                    type(source_message_id) is str
+                                    and bool(source_message_id)
+                                    and source_message_id == message_id
+                                )
+                            )
+                        ):
+                            raise PermissionError(
+                                "Authenticated gateway command dispatch requires "
+                                "matching trigger message provenance"
+                            )
+                        with issue_authenticated_gateway_dispatch(
+                            dispatch_kind="command",
+                            platform=platform,
+                            user_id=source.user_id,
+                            chat_id=source.chat_id,
+                            thread_id=source.thread_id,
+                            message_id=message_id,
+                        ) as authenticated_context:
+                            result = invoke_plugin_command(
+                                normalized_command,
+                                user_args,
+                                authenticated_gateway_context=authenticated_context,
+                            )
+                            if asyncio.iscoroutine(result):
+                                result = await result
+                    else:
+                        result = invoke_plugin_command(normalized_command, user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
+                if protected_command:
+                    # Never reinterpret a denied/failed protected command as a
+                    # skill or model prompt.
+                    return "Authenticated gateway command dispatch denied."
 
         # Skill slash commands: /skill-name loads the skill and sends to agent.
         # resolve_skill_command_key() handles the Telegram underscore/hyphen
@@ -11935,7 +12175,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            if authenticated_gateway_request is True:
+                _agent_result = await self._handle_message_with_agent(
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                    authenticated_gateway_request=True,
+                )
+            else:
+                _agent_result = await self._handle_message_with_agent(
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -12506,7 +12760,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(
+        self,
+        event,
+        source,
+        _quick_key: str,
+        run_generation: int,
+        authenticated_gateway_request: bool = False,
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -13579,6 +13840,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                authenticated_gateway_message_id=event.message_id,
+                authenticated_gateway_request=authenticated_gateway_request,
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -18648,6 +18911,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            self._revoke_authenticated_gateway_authority(running_agent)
             running_agent.interrupt(interrupt_reason)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
@@ -19600,6 +19864,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        authenticated_gateway_message_id: Optional[str] = None,
+        authenticated_gateway_request: bool = False,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -19614,11 +19880,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        if authenticated_gateway_message_id is None and authenticated_gateway_request:
+            # Backward compatibility for direct callers that historically used
+            # event_message_id for both reply anchoring and security provenance.
+            authenticated_gateway_message_id = event_message_id
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                authenticated_gateway_message_id=authenticated_gateway_message_id,
+                authenticated_gateway_request=authenticated_gateway_request,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -19630,6 +19902,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                authenticated_gateway_message_id=authenticated_gateway_message_id,
+                authenticated_gateway_request=authenticated_gateway_request,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -19750,6 +20024,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        authenticated_gateway_message_id: Optional[str] = None,
+        authenticated_gateway_request: bool = False,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -20703,8 +20979,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
         
-        # We need to share the agent instance for interrupt support
+        # We need to share the agent instance for interrupt support. The taint
+        # is per run, not per cached agent: once an accepted steer/redirect or
+        # interrupt mutates this turn, later lease issuance for this same run
+        # must stay denied even if mutation won the pre-issuance race.
         agent_holder = [None]  # Mutable container for the agent instance
+        authenticated_gateway_turn_tainted = threading.Event()
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
@@ -21490,6 +21770,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # tool_progress mode. Mattermost needs an explicit per-platform
             # opt-in so global scratch-text display does not leak into threads.
             agent.thinking_progress = _thinking_enabled
+            # Publish the per-run taint marker before exposing the real agent
+            # through agent_holder/_running_agents. An interrupt that wins this
+            # pre-issuance window permanently denies authority for this run.
+            setattr(
+                agent,
+                "_authenticated_gateway_turn_tainted",
+                authenticated_gateway_turn_tainted,
+            )
             # Store agent reference for interrupt support
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
@@ -21844,7 +22132,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+
+                from gateway.authenticated_dispatch import authenticated_gateway_turn
+
+                with authenticated_gateway_turn(
+                    agent,
+                    source,
+                    authenticated_gateway_request=(
+                        self._authenticated_gateway_request_for_turn(
+                            authenticated_gateway_request,
+                            agent,
+                        )
+                    ),
+                    event_message_id=authenticated_gateway_message_id,
+                ) as _authenticated_context:
+                    if _authenticated_context is not None:
+                        _conversation_kwargs["authenticated_gateway_context"] = (
+                            _authenticated_context
+                        )
+                    result = agent.run_conversation(
+                        _api_run_message,
+                        **_conversation_kwargs,
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -22245,7 +22554,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 elif not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
-                            agent.interrupt(pending_text)
+                            self._interrupt_authenticated_gateway_turn(
+                                agent,
+                                pending_text,
+                            )
                             _interrupt_detected.set()
                             break
                 except asyncio.CancelledError:
@@ -22445,7 +22757,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _backup_agent.interrupt(_bp_text)
+                            self._interrupt_authenticated_gateway_turn(
+                                _backup_agent,
+                                _bp_text,
+                            )
                             _interrupt_detected.set()
             else:
                 # Poll loop: check the agent's built-in activity tracker
@@ -22518,7 +22833,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_key,
                                 "done" if interrupt_monitor.done() else "running",
                             )
-                            _backup_agent.interrupt(_bp_text)
+                            self._interrupt_authenticated_gateway_turn(
+                                _backup_agent,
+                                _bp_text,
+                            )
                             _interrupt_detected.set()
 
             if _inactivity_timeout:
@@ -22548,7 +22866,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
-                    _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                    self._interrupt_authenticated_gateway_turn(
+                        _timed_out_agent,
+                        _INTERRUPT_REASON_TIMEOUT,
+                    )
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
@@ -22832,7 +23153,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 updated_history = result.get("messages", history)
                 next_source = source
                 next_message = pending
-                next_message_id = None
+                next_reply_anchor = None
+                next_authenticated_gateway_message_id = None
+                next_authenticated_gateway_request = False
                 next_channel_prompt = None
                 next_session_key = session_key
                 if pending_event is not None:
@@ -22864,7 +23187,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if next_message is None:
                         return result
-                    next_message_id = self._reply_anchor_for_event(pending_event)
+                    next_reply_anchor = self._reply_anchor_for_event(pending_event)
+                    # Security provenance uses the exact inbound event id, not
+                    # the platform-specific outbound reply anchor (which may be
+                    # None or identify a parent message in threaded channels).
+                    next_authenticated_gateway_message_id = pending_event.message_id
+                    next_authenticated_gateway_request = (
+                        pending_event._authenticated_gateway_request is True
+                    )
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
                 # Restart typing indicator so the user sees activity while
@@ -22905,7 +23235,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=next_session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
+                    event_message_id=next_reply_anchor,
+                    authenticated_gateway_message_id=(
+                        next_authenticated_gateway_message_id
+                    ),
+                    authenticated_gateway_request=next_authenticated_gateway_request,
                     channel_prompt=next_channel_prompt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

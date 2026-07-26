@@ -102,6 +102,7 @@ async def test_queue_text_only_queues_and_does_not_interrupt():
     queued = adapter._pending_messages[sk]
     assert queued.text == "do this next"
     assert queued.message_type == MessageType.TEXT
+    assert queued._authenticated_gateway_request is True
 
 
 @pytest.mark.asyncio

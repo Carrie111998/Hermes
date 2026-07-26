@@ -2116,6 +2116,27 @@ class TestPluginDispatchTool:
 
         assert result == '{"result": "ok"}'
 
+    def test_dispatch_tool_forwards_legacy_tool_context_kwarg(self):
+        """Ordinary plugin dispatch preserves legacy handler context kwargs."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        mock_registry = MagicMock()
+        mock_registry.dispatch.return_value = "ok"
+
+        with patch("tools.registry.registry", mock_registry):
+            assert ctx.dispatch_tool(
+                "ordinary_tool",
+                {},
+                tool_context="legacy-host-context",
+            ) == "ok"
+
+        mock_registry.dispatch.assert_called_once_with(
+            "ordinary_tool",
+            {},
+            tool_context="legacy-host-context",
+        )
+
     def test_dispatch_tool_injects_parent_agent_from_cli_ref(self):
         """When _cli_ref has an agent, it's passed as parent_agent."""
         mgr = PluginManager()

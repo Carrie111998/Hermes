@@ -361,8 +361,8 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     )
     monkeypatch.setattr(
         _plugins_mod,
-        "get_plugin_command_handler",
-        lambda name: (lambda args: f"metrics {args}") if name == "metricas" else None,
+        "invoke_plugin_command",
+        lambda name, args, **kwargs: f"metrics {args}" if name == "metricas" else None,
     )
 
     result = await runner._handle_message(_make_event("/status"))

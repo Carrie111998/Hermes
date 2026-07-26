@@ -18,6 +18,7 @@ from gateway.session import SessionSource
 class _CapturingAgent:
     last_init = None
     last_run = None
+    authenticated_gateway_tool_dispatch_version = 1
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
@@ -30,13 +31,24 @@ class _CapturingAgent:
         task_id=None,
         persist_user_message=None,
         persist_user_timestamp=None,
+        authenticated_gateway_context=None,
     ):
+        from gateway.authenticated_dispatch import (
+            validate_authenticated_gateway_dispatch,
+        )
+
         type(self).last_run = {
             "user_message": user_message,
             "conversation_history": conversation_history,
             "task_id": task_id,
             "persist_user_message": persist_user_message,
             "persist_user_timestamp": persist_user_timestamp,
+            "authenticated_gateway_context": authenticated_gateway_context,
+            "authenticated_gateway_context_was_live": (
+                validate_authenticated_gateway_dispatch(
+                    authenticated_gateway_context
+                )
+            ),
         }
         return {
             "final_response": "ok",
@@ -253,6 +265,63 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_issues_live_context_only_for_verified_gateway_request(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway.authenticated_dispatch import (
+        validate_authenticated_gateway_dispatch,
+    )
+
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_gateway_model",
+        lambda config=None: "gpt-5.4",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key: {"core"},
+    )
+
+    await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:telegram:dm:12345",
+        event_message_id="event-message-1",
+        authenticated_gateway_request=True,
+    )
+
+    context = _CapturingAgent.last_run["authenticated_gateway_context"]
+    assert _CapturingAgent.last_run["authenticated_gateway_context_was_live"] is True
+    assert context.message_id == "event-message-1"
+    assert not validate_authenticated_gateway_dispatch(context)
 
 
 @pytest.mark.asyncio

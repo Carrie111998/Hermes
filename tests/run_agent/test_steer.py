@@ -77,6 +77,100 @@ class TestSteerAcceptance:
         agent.steer("third note")
         assert agent._pending_steer == "first note\nsecond note\nthird note"
 
+    def test_callback_runs_before_accepted_steer_is_published(self):
+        agent = _bare_agent()
+        observed = []
+
+        assert agent.steer(
+            "change course",
+            before_mutation=lambda: observed.append(agent._pending_steer),
+        ) is True
+
+        assert observed == [None]
+        assert agent._pending_steer == "change course"
+
+    def test_callback_does_not_run_for_rejected_steer(self):
+        agent = _bare_agent()
+        observed = []
+
+        assert agent.steer("  ", before_mutation=lambda: observed.append(True)) is False
+
+        assert observed == []
+
+    def test_authority_revocation_does_not_block_steer_behind_active_handler(self):
+        from gateway.authenticated_dispatch import issue_authenticated_gateway_dispatch
+        from gateway.run import GatewayRunner
+        from tools.registry import ToolRegistry
+
+        agent = _bare_agent()
+        setattr(agent, "_authenticated_gateway_turn_tainted", threading.Event())
+        handler_started = threading.Event()
+        release_handler = threading.Event()
+        steer_done = threading.Event()
+        outcomes = []
+        registry = ToolRegistry()
+
+        def protected_handler(_args, *, tool_context):
+            handler_started.set()
+            assert release_handler.wait(timeout=2)
+            return "ok"
+
+        registry.register(
+            name="protected-steer-test",
+            toolset="test",
+            schema={
+                "name": "protected-steer-test",
+                "description": "test",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=protected_handler,
+            requires_authenticated_gateway=True,
+        )
+
+        with issue_authenticated_gateway_dispatch(
+            dispatch_kind="tool",
+            platform="telegram",
+            user_id="user-1",
+            chat_id="chat-1",
+            message_id="message-1",
+        ) as context:
+            setattr(agent, "_authenticated_gateway_context", context)
+            handler_thread = threading.Thread(
+                target=lambda: outcomes.append(
+                    registry.dispatch(
+                        "protected-steer-test",
+                        {},
+                        authenticated_gateway_context=context,
+                    )
+                )
+            )
+            handler_thread.start()
+            assert handler_started.wait(timeout=2)
+
+            def steer():
+                outcomes.append(
+                    agent.steer(
+                        "change course",
+                        before_mutation=lambda: GatewayRunner._revoke_authenticated_gateway_authority(
+                            agent
+                        ),
+                    )
+                )
+                steer_done.set()
+
+            steer_thread = threading.Thread(target=steer)
+            steer_thread.start()
+            assert steer_done.wait(timeout=1)
+            assert getattr(agent, "_authenticated_gateway_turn_tainted").is_set()
+
+            release_handler.set()
+            handler_thread.join(timeout=2)
+            steer_thread.join(timeout=2)
+            assert not handler_thread.is_alive()
+            assert not steer_thread.is_alive()
+
+        assert outcomes == [True, "ok"]
+
 
 class TestSteerDrain:
     def test_drain_returns_and_clears(self):
@@ -104,6 +198,30 @@ class TestActiveTurnRedirect:
         assert agent._pending_redirect == "use Postgres"
         assert agent._interrupt_requested is True
         assert agent._interrupt_message is None
+
+    def test_callback_runs_before_accepted_redirect_is_published(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        observed = []
+
+        assert agent.redirect(
+            "use Postgres",
+            before_mutation=lambda: observed.append(agent._pending_redirect),
+        ) is True
+
+        assert observed == [None]
+        assert agent._pending_redirect == "use Postgres"
+
+    def test_callback_does_not_run_when_redirect_has_no_live_turn(self):
+        agent = _bare_agent()
+        observed = []
+
+        assert agent.redirect(
+            "change course",
+            before_mutation=lambda: observed.append(True),
+        ) is False
+
+        assert observed == []
 
     def test_multiple_redirects_preserve_message_boundaries(self):
         agent = _bare_agent()
