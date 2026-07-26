@@ -7201,18 +7201,6 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(target_id))
 
-            # Discord embed description limit is 4096; trim conservatively.
-            max_desc = 4088
-            body = str(question or "").strip()
-            if len(body) > max_desc:
-                body = body[: max_desc - 3] + "..."
-
-            embed = discord.Embed(
-                title="❓ Hermes needs your input",
-                description=body,
-                color=discord.Color.orange(),
-            )
-
             # Normalise choices: LLMs sometimes emit `[{"description": "..."}]`
             # instead of bare strings, which would render as raw Python repr on
             # the button label. Unwrap the common shapes, then stringify.
@@ -7250,11 +7238,6 @@ class DiscordAdapter(BasePlatformAdapter):
             clean_choices = clean_choices[:24]
 
             if clean_choices:
-                embed.add_field(
-                    name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
-                    inline=False,
-                )
                 view = ClarifyChoiceView(
                     choices=clean_choices,
                     clarify_id=clarify_id,
@@ -7262,15 +7245,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     allowed_role_ids=self._allowed_role_ids,
                 )
             else:
-                embed.add_field(
-                    name="Reply",
-                    value="Reply in this channel with your answer.",
-                    inline=False,
-                )
                 view = None
 
-            # Mirror the question in plain content — embeds are invisible on
-            # some clients (see send_exec_approval).
+            # Discord renders content and embeds together, so carrying the full
+            # prompt in both produces a duplicate. Keep the self-contained text
+            # form (which also works when embeds are hidden) and attach only the
+            # interactive view.
             clarify_tail = (
                 "\n\nPick one below, or click ✏️ Other to type a custom answer."
                 if clean_choices
@@ -7280,7 +7260,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "❓ **Hermes needs your input**", str(question or "").strip(),
                 tail=clarify_tail,
             )
-            msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
+            msg = await channel.send(content=content, view=view) if view else await channel.send(content=content)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
