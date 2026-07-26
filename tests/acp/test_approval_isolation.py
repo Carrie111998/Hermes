@@ -211,11 +211,54 @@ class TestAcpExecAskGate:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
-        from tools.approval import check_all_command_guards
+        from tools.approval import (
+            check_all_command_guards,
+            reset_hermes_interactive_context,
+            set_hermes_interactive_context,
+        )
+
+        # Force the CLI callback path by disabling ALL bypass routes that could
+        # short-circuit before the approval callback is consulted.  Tests in the
+        # full suite may have set YOLO mode, permanent allowlist entries, gateway
+        # context, or smart-approval config — any of which would cause
+        # check_all_command_guards to return before calling the callback.
+        #
+        # Instead of monkeypatching _get_approval_mode to "manual" (which would
+        # bypass testing the smart-mode path), we leave the real approval mode
+        # intact and monkeypatch _smart_approve to return "deny".  This ensures
+        # the test works with all modes:
+        #   - manual → _smart_approve never called, callback fires naturally
+        #   - smart  → _smart_approve returns "deny", falls through to CLI cb
+        #   - off    → caught by the yolo/permanent-allowlist patches above
+        monkeypatch.setattr(
+            "tools.approval._smart_approve",
+            lambda _cmd, _desc: "deny",
+        )
+        monkeypatch.setattr(
+            "tools.approval._YOLO_MODE_FROZEN", False
+        )
+        monkeypatch.setattr(
+            "tools.approval.is_current_session_yolo_enabled",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            "tools.approval._command_matches_permanent_allowlist",
+            lambda _cmd: False,
+        )
+        monkeypatch.setattr(
+            "tools.approval._is_gateway_approval_context",
+            lambda: False,
+        )
+        # In-memory approval cache may have this pattern pre-approved from an
+        # earlier test in the full suite — clear it so the callback path fires.
+        monkeypatch.setattr(
+            "tools.approval.is_approved",
+            lambda _session_key, _pattern_key: False,
+        )
 
         called_with = []
 
-        def fake_cb(command, description, *, allow_permanent=True):
+        def fake_cb(command, description, *, allow_permanent=True, smart_denied=False):
             called_with.append((command, description))
             return "once"
 
@@ -229,12 +272,19 @@ class TestAcpExecAskGate:
             "path should fire without consulting the callback"
         )
 
-        # With HERMES_INTERACTIVE: callback IS called, approval flows through it
+        # With HERMES_INTERACTIVE: callback IS called, approval flows through it.
+        # Use the context-var API alongside the env var — concurrent ACP sessions
+        # prefer the context var, and a stale value from an earlier test would
+        # shadow the env var, making the test flaky in full-suite runs.
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         called_with.clear()
-        result = check_all_command_guards(
-            "rm -rf /tmp/test-exec-ask", "local", approval_callback=fake_cb,
-        )
+        tok = set_hermes_interactive_context(True)
+        try:
+            result = check_all_command_guards(
+                "rm -rf /tmp/test-exec-ask", "local", approval_callback=fake_cb,
+            )
+        finally:
+            reset_hermes_interactive_context(tok)
         assert called_with, (
             "with HERMES_INTERACTIVE the approval path should consult the "
             "registered callback — this was the ACP bypass in "
@@ -263,9 +313,38 @@ class TestAcpExecAskGate:
             set_hermes_interactive_context,
         )
 
+        # Force the CLI callback path (see sibling test for rationale).
+        # Monkeypatch _smart_approve → "deny" so the test works with all
+        # approval modes (manual, smart, off).
+        monkeypatch.setattr(
+            "tools.approval._smart_approve",
+            lambda _cmd, _desc: "deny",
+        )
+        monkeypatch.setattr(
+            "tools.approval._YOLO_MODE_FROZEN", False
+        )
+        monkeypatch.setattr(
+            "tools.approval.is_current_session_yolo_enabled",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            "tools.approval._command_matches_permanent_allowlist",
+            lambda _cmd: False,
+        )
+        monkeypatch.setattr(
+            "tools.approval._is_gateway_approval_context",
+            lambda: False,
+        )
+        # In-memory approval cache may have this pattern pre-approved from an
+        # earlier test in the full suite — clear it so the callback path fires.
+        monkeypatch.setattr(
+            "tools.approval.is_approved",
+            lambda _session_key, _pattern_key: False,
+        )
+
         called_with = []
 
-        def fake_cb(command, description, *, allow_permanent=True):
+        def fake_cb(command, description, *, allow_permanent=True, smart_denied=False):
             called_with.append((command, description))
             return "once"
 
