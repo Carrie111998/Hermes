@@ -1353,15 +1353,29 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 f"profile '{args.assignee}'" if args.assignee
                 else "the worker profile"
             )
-            print(
-                f"kanban: unknown skill(s) for {scope}: {', '.join(unknown)}\n"
-                "Workers preload --skill values at startup and crash on "
-                "unknown names, burning the task's retry budget (see "
-                "#44072). Check the name with `hermes skills list` or "
-                "install the skill into that profile first.",
-                file=sys.stderr,
-            )
-            return 2
+            if len(unknown) == len(skills):
+                # Every requested skill is unresolvable — the worker would
+                # crash on startup. Reject hard (exit 2) so the task never
+                # enters the board to burn retries.
+                print(
+                    f"kanban: unknown skill(s) for {scope}: {', '.join(unknown)}\n"
+                    "Workers preload --skill values at startup and crash on "
+                    "unknown names, burning the task's retry budget (see "
+                    "#44072). Check the name with `hermes skills list` or "
+                    "install the skill into that profile first.",
+                    file=sys.stderr,
+                )
+                return 2
+            else:
+                # Mixed: some skills resolve, some don't. Current main
+                # (commit 018009bc) skips unknown entries and continues
+                # with whatever loaded. Accept the task — the worker will
+                # log a warning for the unresolvable ones.
+                print(
+                    f"kanban: some skills unresolvable for {scope}, "
+                    f"skipping: {', '.join(unknown)}",
+                    file=sys.stderr,
+                )
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,

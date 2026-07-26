@@ -7675,6 +7675,12 @@ def _skill_search_roots(hermes_home: Optional[str]) -> list:
                 if not isinstance(raw, str) or not raw.strip():
                     continue
                 ext = _Path(os.path.expandvars(raw)).expanduser()
+                # Resolve relative paths against HERMES_HOME (not cwd),
+                # matching get_external_skills_dirs() in agent/skill_utils.py.
+                if not ext.is_absolute():
+                    ext = (base / ext).resolve()
+                else:
+                    ext = ext.resolve()
                 if ext.is_dir():
                     roots.append(ext)
         except Exception:
@@ -7727,36 +7733,74 @@ def unresolvable_task_skills(
 
 
 def _skill_resolves(name: str, roots: list) -> bool:
-    """True if *name* matches any skill under any of *roots*."""
+    """True if *name* matches exactly one skill across all *roots*.
+
+    Uses ``iter_skill_index_files`` (the same walk ``skill_view()`` uses)
+    so excluded paths (VCS, venv, node_modules, cache dirs, skill support
+    dirs) are not counted. Returns False when multiple candidates match
+    the same name across different roots — matching ``skill_view()``'s
+    ambiguity rejection.
+    """
+    # Lazy imports — these are profile-aware lookups that may pull in
+    # a large module chain, and the validating CLI may be running under
+    # a different HERMES_HOME than the worker will.
+    from agent.skill_utils import (
+        is_skill_support_path as _is_skill_support_path,
+        iter_skill_index_files as _iter_skill_index_files,
+    )
+
+    candidates: list[str] = []
+
     for root in roots:
         direct = root / name
         try:
             if (direct / "SKILL.md").is_file():
-                return True
+                candidates.append(str(direct))
+                if len(candidates) > 1:
+                    return False
+                continue
             if direct.with_suffix(".md").is_file():
-                return True
+                candidates.append(str(direct))
+                if len(candidates) > 1:
+                    return False
+                continue
         except (OSError, ValueError):
             continue
+
         # Bare-name lookups: nested dir name, frontmatter alias, flat .md.
         if "/" in name or "\\" in name:
             continue
         try:
-            for skill_md in root.rglob("SKILL.md"):
+            for skill_md in _iter_skill_index_files(root, "SKILL.md"):
                 if skill_md.parent.name == name:
-                    return True
+                    candidates.append(str(skill_md))
+                    if len(candidates) > 1:
+                        return False
+                    continue
                 try:
-                    head = skill_md.read_text(encoding="utf-8", errors="replace")[:4096]
+                    head = skill_md.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[:4096]
                 except OSError:
                     continue
                 match = _SKILL_FRONTMATTER_NAME.search(head)
                 if match and match.group(1).strip() == name:
-                    return True
+                    candidates.append(str(skill_md))
+                    if len(candidates) > 1:
+                        return False
             for flat_md in root.rglob(f"{name}.md"):
-                if flat_md.name != "SKILL.md" and flat_md.is_file():
-                    return True
+                if (
+                    flat_md.name != "SKILL.md"
+                    and flat_md.is_file()
+                    and not _is_skill_support_path(flat_md)
+                ):
+                    candidates.append(str(flat_md))
+                    if len(candidates) > 1:
+                        return False
         except OSError:
             continue
-    return False
+
+    return len(candidates) == 1
 
 
 def _worker_terminal_timeout_env(

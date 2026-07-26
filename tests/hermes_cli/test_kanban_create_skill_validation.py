@@ -103,6 +103,95 @@ def test_external_dirs_from_config_are_searched(kanban_home, tmp_path):
     ) == []
 
 
+def test_relative_external_dirs_resolved_against_hermes_home(kanban_home):
+    """Relative skills.external_dirs are resolved against HERMES_HOME,
+    matching how get_external_skills_dirs() in agent/skill_utils.py
+    resolves them (not against the creator cwd)."""
+    ext_rel = kanban_home / "my-external-skills"
+    (ext_rel / "rel-skill").mkdir(parents=True)
+    (ext_rel / "rel-skill" / "SKILL.md").write_text(
+        "---\nname: rel-skill\n---\n", encoding="utf-8"
+    )
+    (kanban_home / "skills").mkdir()
+    # Use a relative path in config.yaml — must resolve against kanban_home
+    (kanban_home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n    - my-external-skills\n",
+        encoding="utf-8",
+    )
+    assert kb.unresolvable_task_skills(
+        ["rel-skill"], str(kanban_home)
+    ) == []
+
+
+def test_ambiguity_rejected_across_roots(kanban_home, tmp_path):
+    """Same bare skill name in multiple search roots => unresolvable."""
+    ext = tmp_path / "external-skills"
+    (ext / "common-name").mkdir(parents=True)
+    (ext / "common-name" / "SKILL.md").write_text(
+        "---\nname: common-name\n---\n", encoding="utf-8"
+    )
+    # Also in the local skills dir
+    (kanban_home / "skills" / "common-name").mkdir(parents=True)
+    (kanban_home / "skills" / "common-name" / "SKILL.md").write_text(
+        "---\nname: common-name\n---\n", encoding="utf-8"
+    )
+    (kanban_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {ext.as_posix()}\n",
+        encoding="utf-8",
+    )
+    # Ambiguous across roots — _skill_resolves returns False
+    assert kb.unresolvable_task_skills(
+        ["common-name"], str(kanban_home)
+    ) == ["common-name"]
+
+
+def test_excluded_paths_not_counted(kanban_home):
+    """A SKILL.md under .venv or node_modules should not be found."""
+    (kanban_home / "skills" / "real-skill").mkdir(parents=True)
+    (kanban_home / "skills" / "real-skill" / "SKILL.md").write_text(
+        "---\nname: real-skill\n---\n", encoding="utf-8"
+    )
+    # Excluded dirs that should be ignored
+    (kanban_home / "skills" / ".venv" / "real-skill").mkdir(parents=True)
+    (kanban_home / "skills" / ".venv" / "real-skill" / "SKILL.md").write_text(
+        "---\nname: real-skill\n---\n", encoding="utf-8"
+    )
+    assert kb.unresolvable_task_skills(
+        ["real-skill"], str(kanban_home)
+    ) == []
+
+
+def test_mixed_valid_invalid_allows_create(kanban_home):
+    """When SOME skills resolve, the task is accepted (main commits 018009bc
+    skips unknown entries and continues with whatever loaded)."""
+    _install_skill(kanban_home, "devops/valid-skill")
+    out = kc.run_slash(
+        "create 'mixed task' --skill valid-skill --skill missing-skill"
+    )
+    # Should accept the task even though one skill is missing
+    assert "Created" in out or "skipping" in out.lower()
+    with kb.connect() as conn:
+        tasks = kb.list_tasks(conn)
+    # At minimum the task was created
+    assert len(tasks) >= 1
+
+
+def test_skill_support_dirs_not_resolved(kanban_home):
+    """Skills nested under references/ of another skill are not counted."""
+    (kanban_home / "skills" / "real-skill").mkdir(parents=True)
+    (kanban_home / "skills" / "real-skill" / "SKILL.md").write_text(
+        "---\nname: real-skill\n---\n", encoding="utf-8"
+    )
+    # Support dir of real-skill with its own SKILL.md
+    (kanban_home / "skills" / "real-skill" / "references" / "child").mkdir(
+        parents=True
+    )
+    (kanban_home / "skills" / "real-skill" / "references" / "child" / "SKILL.md").write_text(
+        "---\nname: child\n---\n", encoding="utf-8"
+    )
+    assert kb.unresolvable_task_skills(["child"], str(kanban_home)) == ["child"]
+
+
 def test_missing_skills_root_rejects_concrete_names(kanban_home):
     # No <home>/skills at all → preloading any skill is fatal at worker
     # startup ("Skills directory does not exist yet").
