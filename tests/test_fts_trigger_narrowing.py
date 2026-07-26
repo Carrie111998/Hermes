@@ -1075,6 +1075,96 @@ def test_missing_current_table_is_backfilled_with_intact_triggers(
         restored.close()
 
 
+@pytest.mark.parametrize("missing_table", ["messages_fts", "messages_fts_trigram"])
+def test_missing_current_table_with_pending_gap_rebuilds_shared_indexes(
+    db_path, missing_table
+):
+    """A full table repair must retire shared partial-backfill gating."""
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("pending-gap", "test")
+    row_ids = [
+        seeded.append_message(
+            "pending-gap", "user", content=f"row{index} staleoldtoken"
+        )
+        for index in range(1, 4)
+    ]
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executemany(
+            "INSERT INTO state_meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                ("fts_rebuild_high_water", str(row_ids[-1])),
+                ("fts_rebuild_progress", str(row_ids[0])),
+            ),
+        )
+        conn.execute(f"DROP TABLE {missing_table}")
+        conn.commit()
+
+    restored = SessionDB(db_path=db_path)
+    try:
+        with restored._lock:
+            markers = restored._conn.execute(
+                "SELECT key FROM state_meta WHERE key IN "
+                "('fts_rebuild_high_water', 'fts_rebuild_progress')"
+            ).fetchall()
+            assert markers == []
+
+            gap_id = row_ids[1]
+            deleted_id = row_ids[2]
+            restored._conn.execute(
+                "UPDATE messages SET content='gap freshnewtoken' WHERE id=?",
+                (gap_id,),
+            )
+            restored._conn.execute("DELETE FROM messages WHERE id=?", (deleted_id,))
+            above_id = restored._conn.execute(
+                "INSERT INTO messages(session_id, timestamp, role, content) "
+                "VALUES('pending-gap', 1, 'user', 'abovehighwater token')"
+            ).lastrowid
+            restored._conn.commit()
+
+            for table in ("messages_fts", "messages_fts_trigram"):
+                stale = restored._conn.execute(
+                    f"SELECT rowid FROM {table} WHERE {table} MATCH 'staleoldtoken'"
+                ).fetchall()
+                fresh = restored._conn.execute(
+                    f"SELECT rowid FROM {table} WHERE {table} MATCH 'freshnewtoken'"
+                ).fetchall()
+                above = restored._conn.execute(
+                    f"SELECT rowid FROM {table} WHERE {table} MATCH 'abovehighwater'"
+                ).fetchall()
+                assert gap_id not in [row[0] for row in stale]
+                assert deleted_id not in [row[0] for row in stale]
+                assert [row[0] for row in fresh] == [gap_id]
+                assert [row[0] for row in above] == [above_id]
+
+            restored._conn.execute(
+                "UPDATE messages SET role='tool' WHERE id=?", (gap_id,)
+            )
+            restored._conn.commit()
+            assert restored._conn.execute(
+                "SELECT rowid FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'freshnewtoken'"
+            ).fetchall() == []
+            assert [
+                row[0]
+                for row in restored._conn.execute(
+                    "SELECT rowid FROM messages_fts "
+                    "WHERE messages_fts MATCH 'freshnewtoken'"
+                ).fetchall()
+            ] == [gap_id]
+
+            for table in ("messages_fts", "messages_fts_trigram"):
+                restored._conn.execute(
+                    f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)"
+                )
+    finally:
+        restored.close()
+
+
 def test_cjk_schema_ensure_keeps_writer_out_until_triggers_exist(
     db_path, monkeypatch
 ):

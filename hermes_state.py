@@ -2819,16 +2819,6 @@ class SessionDB:
         )
 
     @staticmethod
-    def _rebuild_current_fts_table(
-        cursor: sqlite3.Cursor,
-        table_name: str,
-    ) -> None:
-        """Backfill one newly recreated current external-content table."""
-        if table_name not in ("messages_fts", "messages_fts_trigram"):
-            raise ValueError(f"unsupported FTS table: {table_name}")
-        cursor.execute(f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')")
-
-    @staticmethod
     def _rebuild_legacy_fts_indexes(
         cursor: sqlite3.Cursor,
         *,
@@ -4308,18 +4298,16 @@ class SessionDB:
                             cursor,
                             include_trigram=trigram_enabled,
                         )
-                    else:
-                        # An intact trigger set does not prove a recreated
-                        # virtual table contains historical rows. Backfill each
-                        # newly created current table before exposing search.
-                        if base_table_missing:
-                            self._rebuild_current_fts_table(
-                                cursor, "messages_fts"
-                            )
-                        if trigram_table_missing and trigram_enabled:
-                            self._rebuild_current_fts_table(
-                                cursor, "messages_fts_trigram"
-                            )
+                    elif base_table_missing or trigram_table_missing:
+                        # The progress/high-water pair gates writes for BOTH
+                        # current indexes. A full repair of only one table while
+                        # retaining those shared markers leaves already indexed
+                        # gap rows frozen at stale terms. Rebuild every available
+                        # current index atomically and retire the shared markers.
+                        self._rebuild_fts_indexes(
+                            cursor,
+                            include_trigram=trigram_enabled,
+                        )
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)
