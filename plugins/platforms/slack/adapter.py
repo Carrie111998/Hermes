@@ -1651,6 +1651,7 @@ class SlackAdapter(BasePlatformAdapter):
         chat_id: str,
         ctx: Dict[str, Any],
         content: str,
+        team_id: str = "",
     ) -> "SendResult":
         """Post a slash reply with one usable ephemeral interactive control."""
         user_id = ctx.get("user_id", "")
@@ -1661,7 +1662,7 @@ class SlackAdapter(BasePlatformAdapter):
         visible_content = interactive.visible_content or "Interactive reply options"
         formatted = self.format_message(visible_content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH) or [formatted]
-        client = self._get_client(chat_id)
+        client = self._get_client(chat_id, team_id=team_id or None)
         prepared = None
         try:
             for chunk in chunks:
@@ -2539,7 +2540,7 @@ class SlackAdapter(BasePlatformAdapter):
             if slash_ctx:
                 if parse_interactive_reply(content) is not None:
                     ephemeral_result = await self._post_slash_interactive_ephemeral(
-                        chat_id, slash_ctx, content
+                        chat_id, slash_ctx, content, team_id=team_id
                     )
                 else:
                     ephemeral_result = await self._send_slash_ephemeral(
@@ -7092,6 +7093,18 @@ class SlackAdapter(BasePlatformAdapter):
             and channel_id not in allowed_channels
         ):
             return
+        if not self._is_interactive_user_authorized(
+            user_id,
+            channel_id=channel_id,
+            user_name=user.get("name"),
+            team_id=team_id,
+        ):
+            logger.warning(
+                "[Slack] Unauthorized interactive reply click by %s (%s) - ignoring",
+                user.get("name") or "unknown",
+                user_id,
+            )
+            return
 
         accepted = self._interactive_reply_store.consume(
             button_token, channel_id, message_ts
@@ -7165,6 +7178,17 @@ class SlackAdapter(BasePlatformAdapter):
                 updated_blocks.append(block)
             elif remaining_elements:
                 updated_blocks.append({**block, "elements": remaining_elements})
+        updated_blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Selected by <@{user_id}>",
+                    }
+                ],
+            }
+        )
         try:
             await self._get_client(
                 channel_id, team_id=team_id or None

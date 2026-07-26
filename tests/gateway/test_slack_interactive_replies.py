@@ -42,6 +42,7 @@ def _make_adapter():
         }
     )
     adapter._get_client = MagicMock(return_value=client)
+    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
     adapter.stop_typing = AsyncMock()
     return adapter, client
 
@@ -235,6 +236,44 @@ async def test_adapter_send_posts_slash_reply_buttons_ephemerally(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_slash_interactive_reply_uses_explicit_workspace_client_for_ambiguous_channel(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, _default_client = _make_adapter()
+    primary_client = AsyncMock()
+    target_client = AsyncMock()
+    primary_client.chat_postEphemeral = AsyncMock(
+        return_value={"ok": True, "message_ts": "111.222"}
+    )
+    target_client.chat_postEphemeral = AsyncMock(
+        return_value={"ok": True, "message_ts": "222.333"}
+    )
+    adapter._app.client = primary_client
+    adapter._team_clients = {
+        "W_PRIMARY": primary_client,
+        "W_TARGET": target_client,
+    }
+    adapter._channel_team.clear()
+    adapter._channel_teams.clear()
+    adapter._remember_channel_team("C_SHARED", "W_PRIMARY")
+    adapter._remember_channel_team("C_SHARED", "W_TARGET")
+    adapter._get_client = SlackAdapter._get_client.__get__(adapter)
+    adapter._pop_slash_context = MagicMock(return_value={"user_id": "U1"})
+    adapter._clear_thread_status_quietly = AsyncMock()
+
+    result = await adapter.send(
+        "C_SHARED",
+        "Lead ready\n[[slack_buttons: Enroll:enroll]]",
+        metadata={"slack_team_id": "W_TARGET"},
+    )
+
+    assert result.success is True
+    assert target_client.chat_postEphemeral.await_count == 2
+    primary_client.chat_postEphemeral.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_adapter_send_posts_one_button_control_after_long_reply(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     adapter, client = _make_adapter()
@@ -354,6 +393,41 @@ async def test_valid_click_relays_as_user_event_in_original_thread(tmp_path, mon
     assert update["channel"] == "C1"
     assert update["ts"] == "M1"
     assert all(block["type"] != "actions" for block in update["blocks"])
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_click_preserves_card_for_authorized_user(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, _client = _make_adapter()
+    adapter._is_interactive_user_authorized = MagicMock(
+        side_effect=lambda user_id, **_kwargs: user_id == "U_ALLOWED"
+    )
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        "C1", "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+    action = {
+        "action_id": "hermes_interactive_reply",
+        "value": prepared.buttons[0].token,
+    }
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(), _click_body(user="U_UNAUTHORIZED"), action
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._interactive_reply_store.pending_count() == 1
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(), _click_body(user="U_ALLOWED"), action
+    )
+
+    assert adapter.handle_message.await_count == 1
+    assert adapter.handle_message.await_args.args[0].source.user_id == "U_ALLOWED"
+    assert adapter._interactive_reply_store.pending_count() == 0
 
 
 @pytest.mark.asyncio
@@ -632,7 +706,7 @@ async def test_wrong_message_timestamp_does_not_consume_card(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_card_cleanup_preserves_unrelated_control_in_shared_actions_block(
+async def test_card_cleanup_preserves_unrelated_control_and_names_clicker(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
@@ -666,6 +740,15 @@ async def test_card_cleanup_preserves_unrelated_control_in_shared_actions_block(
     assert [element["action_id"] for element in actions[0]["elements"]] == [
         "unrelated_control"
     ]
+    acknowledgements = [
+        block
+        for block in updated_blocks
+        if block["type"] == "context"
+        and block.get("elements") == [
+            {"type": "mrkdwn", "text": "Selected by <@U1>"}
+        ]
+    ]
+    assert len(acknowledgements) == 1
 
 
 @pytest.mark.asyncio
