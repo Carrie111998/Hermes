@@ -987,7 +987,7 @@ class TelegramAdapter(BasePlatformAdapter):
             elif chat_type == "dm" and is_topic_message:
                 thread_id = str(thread_id_raw)
 
-        return SessionSource(
+        source = SessionSource(
             platform=Platform.TELEGRAM,
             chat_id=chat_id or "",
             chat_type=chat_type,
@@ -995,6 +995,18 @@ class TelegramAdapter(BasePlatformAdapter):
             user_name=user_name,
             thread_id=thread_id,
         )
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None:
+            try:
+                source.profile = runner._profile_name_for_source(source)
+            except Exception:
+                logger.debug(
+                    "[Telegram] Profile routing failed during intake auth",
+                    exc_info=True,
+                )
+        if not source.profile:
+            source.profile = getattr(self, "_gateway_profile_name", None)
+        return source
 
     def _telegram_auth_env_configured(self) -> bool:
         """Return True when profile-scoped auth vars make an early decision safe."""
@@ -1058,10 +1070,23 @@ class TelegramAdapter(BasePlatformAdapter):
             config_authorized is not None or self._telegram_auth_env_configured()
         )
 
-        # The gateway registers a profile-bound callback on every adapter.
-        # Prefer it over introspecting the message handler: multiplex handlers
-        # are closures, not bound runner methods, while this callback preserves
-        # the profile's pairing store and secret scope.
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        intake_auth = getattr(runner, "_is_user_authorized_for_adapter_intake", None)
+        if callable(intake_auth) and auth_is_configured:
+            try:
+                return bool(intake_auth(source))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Falling back after scoped auth failed for user %s",
+                    user_id,
+                    exc_info=True,
+                )
+
+        # The gateway also registers a profile-bound callback on every adapter.
+        # Keep it as the fallback for lightweight runners and adapter contexts
+        # that do not expose the source-aware intake authority above.
         registered_auth = getattr(self, "_authorization_check", None)
         if callable(registered_auth) and auth_is_configured:
             try:
@@ -1073,7 +1098,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             # Only make an early decision via the runner when an allowlist
