@@ -98,8 +98,9 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
 - Lote 8 (este commit): `skills/bundled/{apple,autonomous-ai-agents,creative,data-science,
   dogfood,email,github,media}` + `skills/google-workspace.md` = 40. Sin anclas. Preservados
   `HermesCLI` (clase), `Nous Portal`. Prosa core del skill "hermes-agent" rebrandeada a IYARI.
-- Sub-lotes skills/ restantes: 9=bundled/{mlops,note-taking,productivity,research,smart-home,
-  social-media,software-development,yuanbao} (34); 10=optional/ parte A (41);
+- Lote 9 (este commit): `skills/bundled/{mlops,note-taking,productivity,research,smart-home,
+  social-media,software-development,yuanbao}` = 34. Residual limpio. **`bundled/` COMPLETO.**
+- Sub-lotes skills/ restantes: 10=optional/ parte A (41);
   11=optional/mlops (30); 12=optional/ resto (30). Regla NousResearch/pokemon-agent = preservar.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
