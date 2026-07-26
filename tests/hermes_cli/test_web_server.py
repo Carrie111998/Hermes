@@ -7181,6 +7181,80 @@ class TestModelContextLength:
         assert isinstance(result["model"], dict)
         assert result["model"]["context_length"] == 32000
 
+    def test_put_config_clearing_override_actually_removes_the_pin(self):
+        """Saving model_context_length=0 must delete the on-disk pin.
+
+        ``_denormalize_config_from_web`` expresses "back to auto-detect" as the
+        ABSENCE of ``model.context_length``, but ``_deep_merge`` can only add or
+        replace keys -- so the merge used to resurrect the stored pin and the
+        override could never be cleared from the UI.
+        """
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+        from hermes_cli.config import load_config, save_config
+
+        save_config({
+            "model": {
+                "default": "anthropic/claude-opus-4.6",
+                "provider": "openrouter",
+                "context_length": 50000,
+            }
+        })
+
+        client = TestClient(app)
+        client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+        resp = client.put("/api/config", json={"config": {
+            "model": "anthropic/claude-opus-4.6",
+            "model_context_length": 0,
+        }})
+        assert resp.status_code == 200
+
+        model_cfg = load_config().get("model")
+        assert isinstance(model_cfg, dict)
+        assert "context_length" not in model_cfg
+        # Clearing the window must not disturb the rest of the model route.
+        assert model_cfg["default"] == "anthropic/claude-opus-4.6"
+        assert model_cfg["provider"] == "openrouter"
+
+    def test_put_config_persists_an_explicit_override(self):
+        """The round trip a user makes from the desktop dialog: set N, get N."""
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+        from hermes_cli.config import load_config, save_config
+
+        save_config({
+            "model": {"default": "anthropic/claude-opus-4.6", "provider": "openrouter"}
+        })
+
+        client = TestClient(app)
+        client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+        resp = client.put("/api/config", json={"config": {
+            "model": "anthropic/claude-opus-4.6",
+            "model_context_length": 128000,
+        }})
+        assert resp.status_code == 200
+        assert load_config()["model"]["context_length"] == 128000
+
+    def test_put_config_without_the_field_leaves_an_existing_pin_alone(self):
+        """A partial save of some unrelated section must not drop the pin."""
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+        from hermes_cli.config import load_config, save_config
+
+        save_config({
+            "model": {
+                "default": "anthropic/claude-opus-4.6",
+                "provider": "openrouter",
+                "context_length": 50000,
+            }
+        })
+
+        client = TestClient(app)
+        client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+        resp = client.put("/api/config", json={"config": {"timezone": "UTC"}})
+        assert resp.status_code == 200
+        assert load_config()["model"]["context_length"] == 50000
+
 
 class TestDenormalizeProviderSwitch:
     """The flat Config-page Model field carries no provider info. When the

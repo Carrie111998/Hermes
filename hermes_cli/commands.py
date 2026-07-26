@@ -54,6 +54,7 @@ class CommandDef:
     subcommands: tuple[str, ...] = ()  # tab-completable subcommands
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
+    desktop_only: bool = False         # only available in the Electron desktop app
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
 
 
@@ -135,6 +136,15 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
+    # Desktop-only: the Electron app fulfils this by opening its context-window
+    # dialog (see apps/desktop/src/lib/desktop-slash-commands.ts). It is listed
+    # here because `commands.catalog` — the source the desktop slash palette
+    # reads — is built from this registry, so a desktop-local command would
+    # execute when typed but never be discoverable. `cli_only=False` +
+    # `desktop_only=True` keeps it out of the CLI/gateway help and dispatch,
+    # where no handler exists.
+    CommandDef("context", "View or set the context-window override for the current model",
+               "Configuration", desktop_only=True),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
@@ -296,7 +306,7 @@ def _build_description(cmd: CommandDef) -> str:
 # Backwards-compatible flat dict: "/command" -> description
 COMMANDS: dict[str, str] = {}
 for _cmd in COMMAND_REGISTRY:
-    if not _cmd.gateway_only:
+    if not _cmd.gateway_only and not _cmd.desktop_only:
         COMMANDS[f"/{_cmd.name}"] = _build_description(_cmd)
         for _alias in _cmd.aliases:
             COMMANDS[f"/{_alias}"] = f"{_cmd.description} (alias for /{_cmd.name})"
@@ -304,7 +314,7 @@ for _cmd in COMMAND_REGISTRY:
 # Backwards-compatible categorized dict
 COMMANDS_BY_CATEGORY: dict[str, dict[str, str]] = {}
 for _cmd in COMMAND_REGISTRY:
-    if not _cmd.gateway_only:
+    if not _cmd.gateway_only and not _cmd.desktop_only:
         _cat = COMMANDS_BY_CATEGORY.setdefault(_cmd.category, {})
         _cat[f"/{_cmd.name}"] = COMMANDS[f"/{_cmd.name}"]
         for _alias in _cmd.aliases:
@@ -341,7 +351,7 @@ for _cmd in COMMAND_REGISTRY:
 GATEWAY_KNOWN_COMMANDS: frozenset[str] = frozenset(
     name
     for cmd in COMMAND_REGISTRY
-    if not cmd.cli_only or cmd.gateway_config_gate
+    if (not cmd.cli_only or cmd.gateway_config_gate) and not cmd.desktop_only
     for name in (cmd.name, *cmd.aliases)
 )
 
@@ -450,7 +460,13 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
     is True but ``gateway_config_gate`` is set, the command is available only
     when the config value is truthy.  Pass *config_overrides* (from
     ``_resolve_config_gates()``) to avoid re-reading config for every command.
+
+    ``desktop_only`` commands are fulfilled entirely by the Electron desktop
+    app and have no CLI or gateway handler, so they never appear in gateway
+    help, the Telegram menu, or Slack's subcommand mapping.
     """
+    if cmd.desktop_only:
+        return False
     if not cmd.cli_only:
         return True
     if cmd.gateway_config_gate:

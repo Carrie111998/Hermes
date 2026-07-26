@@ -6,6 +6,7 @@ import {
   desktopSlashUnavailableMessage,
   filterDesktopCommandsCatalog,
   isDesktopSlashCommand,
+  isDesktopSlashExtensionCommand,
   isDesktopSlashSuggestion,
   isModelPickerCommand,
   isPickerCommand,
@@ -38,6 +39,17 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/skills')).toBe(false)
     expect(isDesktopSlashSuggestion('/voice')).toBe(false)
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
+  })
+
+  it('opens the context-window dialog for /context and keeps it discoverable', () => {
+    // Unlike /model (reachable from the status-bar pill, so hidden from the
+    // popover), /context has no other entry point — it must stay suggestable.
+    expect(resolveDesktopCommand('/context')?.surface).toEqual({ kind: 'picker', picker: 'context' })
+    expect(isPickerCommand('/context', 'context')).toBe(true)
+    expect(isDesktopSlashCommand('/context')).toBe(true)
+    expect(isDesktopSlashSuggestion('/context')).toBe(true)
+    // It's a known built-in, not a skill/quick command.
+    expect(isDesktopSlashExtensionCommand('/context')).toBe(false)
   })
 
   it('routes /compact to /compress (context compression), not the TUI display toggle', () => {

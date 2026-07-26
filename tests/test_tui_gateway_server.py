@@ -6934,6 +6934,33 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+def test_commands_catalog_hides_desktop_only_commands_from_the_tui():
+    """`commands.catalog` feeds BOTH the Ink TUI and the desktop slash palette.
+
+    A `desktop_only` command has no TUI handler, so it must not appear in the
+    default (TUI) response -- otherwise the TUI popover would offer a command
+    that dead-ends.
+    """
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    assert "/context" not in dict(resp["result"]["pairs"])
+
+
+def test_commands_catalog_includes_desktop_only_commands_for_the_desktop():
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "commands.catalog",
+            "params": {"surface": "desktop"},
+        }
+    )
+    pairs = dict(resp["result"]["pairs"])
+    assert "/context" in pairs
+    # Commands available everywhere are unaffected by the opt-in.
+    assert "/status" in pairs
+
+
 def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     monkeypatch.setattr(
         server,

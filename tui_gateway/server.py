@@ -14731,8 +14731,17 @@ def _(rid, params: dict) -> dict:
         cat_map: dict[str, list[list[str]]] = {}
         cat_order: list[str] = []
 
+        # This catalog feeds BOTH the Ink TUI and the Electron desktop slash
+        # palette. `desktop_only` commands are fulfilled by a desktop overlay
+        # and have no TUI handler, so they're included only when the caller
+        # identifies itself as the desktop surface.
+        want_desktop = str(params.get("surface") or "") == "desktop"
+
         for cmd in COMMAND_REGISTRY:
             if cmd.name in _TUI_HIDDEN or cmd.gateway_only:
+                continue
+
+            if cmd.desktop_only and not want_desktop:
                 continue
 
             c = f"/{cmd.name}"

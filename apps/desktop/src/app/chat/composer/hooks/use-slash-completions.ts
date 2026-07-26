@@ -133,7 +133,12 @@ export function useSlashCompletions(options: {
 
       try {
         if (!query) {
-          const catalog = filterDesktopCommandsCatalog(await gateway.request<CommandsCatalogLike>('commands.catalog'))
+          // `surface: 'desktop'` opts this caller into commands the backend
+          // marks desktop-only (`/context`), which the Ink TUI must not list
+          // because it has no handler for them.
+          const catalog = filterDesktopCommandsCatalog(
+            await gateway.request<CommandsCatalogLike>('commands.catalog', { surface: 'desktop' })
+          )
 
           // Prefer the categorized layout so the popover renders section headers
           // (Session, Tools & Skills, ...). Fall back to the flat list when the

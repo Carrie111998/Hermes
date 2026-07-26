@@ -143,7 +143,9 @@ class TestDerivedDicts:
 
     def test_commands_dict_includes_all_cli_commands(self):
         for cmd in COMMAND_REGISTRY:
-            if not cmd.gateway_only:
+            # `desktop_only` commands are fulfilled by an Electron overlay and
+            # have no CLI handler, so they are deliberately absent here.
+            if not cmd.gateway_only and not cmd.desktop_only:
                 assert f"/{cmd.name}" in COMMANDS, \
                     f"/{cmd.name} missing from COMMANDS dict"
 
@@ -156,7 +158,11 @@ class TestDerivedDicts:
         assert "/gateway" in COMMANDS
 
     def test_commands_by_category_covers_all_categories(self):
-        registry_categories = {cmd.category for cmd in COMMAND_REGISTRY if not cmd.gateway_only}
+        registry_categories = {
+            cmd.category
+            for cmd in COMMAND_REGISTRY
+            if not cmd.gateway_only and not cmd.desktop_only
+        }
         assert set(COMMANDS_BY_CATEGORY.keys()) == registry_categories
 
     def test_every_command_has_nonempty_description(self):
@@ -184,7 +190,8 @@ class TestGatewayKnownCommands:
 
     def test_includes_gateway_commands(self):
         for cmd in COMMAND_REGISTRY:
-            if not cmd.cli_only:
+            # Desktop-only commands have no gateway handler either.
+            if not cmd.cli_only and not cmd.desktop_only:
                 assert cmd.name in GATEWAY_KNOWN_COMMANDS
                 for alias in cmd.aliases:
                     assert alias in GATEWAY_KNOWN_COMMANDS
@@ -2220,3 +2227,37 @@ class TestPluginCommandEnumeration:
         slack_names = set(slack_subcommand_map())
         assert "status" in tg_names
         assert "status" in slack_names
+
+
+class TestDesktopOnlyCommands:
+    """`desktop_only` commands are fulfilled by an Electron desktop overlay.
+
+    They live in the registry so the desktop slash palette (which is built from
+    `commands.catalog`) can discover them, but they have NO CLI or gateway
+    handler -- so every surface that would dispatch or advertise them must
+    leave them out rather than dead-ending on a missing handler.
+    """
+
+    def test_context_is_registered_as_desktop_only(self):
+        cmd = resolve_command("context")
+        assert cmd is not None
+        assert cmd.desktop_only is True
+
+    def test_desktop_only_commands_stay_out_of_cli_help(self):
+        assert "/context" not in COMMANDS
+        for commands in COMMANDS_BY_CATEGORY.values():
+            assert "/context" not in commands
+
+    def test_desktop_only_commands_are_not_gateway_dispatchable(self):
+        assert "context" not in GATEWAY_KNOWN_COMMANDS
+
+    def test_desktop_only_commands_are_absent_from_gateway_surfaces(self):
+        assert not any("/context" in line for line in gateway_help_lines())
+        assert "context" not in {name for name, _desc in telegram_bot_commands()}
+        assert "context" not in set(slack_subcommand_map())
+
+    def test_ordinary_commands_are_unaffected(self):
+        """The new flag must not narrow any existing command's reach."""
+        assert "/status" in COMMANDS
+        assert "status" in GATEWAY_KNOWN_COMMANDS
+        assert resolve_command("status").desktop_only is False
