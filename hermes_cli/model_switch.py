@@ -1439,16 +1439,30 @@ def switch_model(
                 )
     else:
         try:
+            # Bare custom/local sessions carry their live endpoint in current_*.
+            # resolve_runtime_provider("custom") without an explicit/config URL
+            # falls through to the OpenRouter default, which would replace the
+            # session endpoint on a same-provider /model switch. Pass the
+            # session URL/key as explicit so resolution stays on this endpoint
+            # (credential pool can still rotate keys for that URL). Named
+            # providers (OpenCode, etc.) omit these so base_url tweaks still run.
+            _same_provider_kwargs: dict = {}
+            if (
+                current_provider in {"custom", "local"}
+                or str(current_provider).startswith("custom:")
+            ) and current_base_url:
+                _same_provider_kwargs["explicit_base_url"] = current_base_url
+                if current_api_key:
+                    _same_provider_kwargs["explicit_api_key"] = current_api_key
             runtime = resolve_runtime_provider(
                 requested=current_provider,
                 target_model=new_model,
+                **_same_provider_kwargs,
             )
-            # If resolution fell through to "custom" (e.g. named custom provider like
-            # "ollama-launch" that resolve_runtime_provider doesn't know), keep existing
-            # credentials. Otherwise use the resolved values (picks up credential rotation,
-            # base_url adjustments for OpenCode, etc.).
-            api_key = runtime.get("api_key", "")
-            base_url = runtime.get("base_url", "")
+            # Prefer resolved values (rotation / OpenCode URL tweaks). Fall back
+            # to session creds when resolution returns empty.
+            api_key = runtime.get("api_key", "") or current_api_key
+            base_url = runtime.get("base_url", "") or current_base_url
             api_mode = runtime.get("api_mode", "")
         except Exception:
             pass

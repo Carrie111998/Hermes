@@ -1733,3 +1733,149 @@ def test_excluded_providers_empty_is_noop(monkeypatch):
         excluded_providers=[],
     )
     assert [p["slug"] for p in a] == [p["slug"] for p in b]
+
+
+# ---------------------------------------------------------------------------
+# Same-provider bare custom: keep session endpoint (no OpenRouter fallthrough)
+# ---------------------------------------------------------------------------
+
+
+def _clear_provider_env(monkeypatch) -> None:
+    for key in (
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OPENAI_API_KEY",
+        "CUSTOM_BASE_URL",
+        "CUSTOM_API_KEY",
+        "HERMES_INFERENCE_PROVIDER",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_same_provider_bare_custom_keeps_session_endpoint(tmp_path, monkeypatch):
+    """Same-provider /model on bare custom must not fall through to OpenRouter.
+
+    Without a trustworthy config model.base_url, resolve_runtime_provider("custom")
+    defaults to OpenRouter. Session-only custom endpoints must keep current_*.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    session_url = "https://my-private-llm.example.com/v1"
+    session_key = "sk-session-custom-key"
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == session_url
+    assert result.api_key == session_key
+    assert "openrouter.ai" not in (result.base_url or "").lower()
+
+
+def test_same_provider_bare_custom_passes_session_creds_to_resolve(
+    tmp_path, monkeypatch
+):
+    """Bare-custom same-provider resolve must receive explicit session URL/key."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    captured: dict = {}
+
+    def _fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return {
+            "provider": "custom",
+            "api_key": kwargs.get("explicit_api_key") or "",
+            "base_url": kwargs.get("explicit_base_url") or "",
+            "api_mode": "chat_completions",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _fake_resolve
+    )
+
+    session_url = "https://my-private-llm.example.com/v1"
+    session_key = "sk-session-custom-key"
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert captured.get("explicit_base_url") == session_url
+    assert captured.get("explicit_api_key") == session_key
+    assert captured.get("requested") == "custom"
+
+
+def test_same_provider_named_provider_does_not_force_session_url(
+    tmp_path, monkeypatch
+):
+    """Non-custom same-provider switches must not pin explicit session URL.
+
+    OpenCode and similar providers still need resolve-time base_url adjustments.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    captured: dict = {}
+
+    def _fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return {
+            "provider": "opencode-go",
+            "api_key": "sk-rotated",
+            "base_url": "https://api.opencode-go.com/v2",
+            "api_mode": "chat_completions",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _fake_resolve
+    )
+
+    result = switch_model(
+        raw_input="kimi-k2.5",
+        current_provider="opencode-go",
+        current_model="mimo-v2.5",
+        current_api_key="sk-old",
+        current_base_url="https://api.opencode-go.com/v1",
+    )
+
+    assert result.success is True
+    assert "explicit_base_url" not in captured or captured.get("explicit_base_url") in (
+        None,
+        "",
+    )
+    assert result.base_url == "https://api.opencode-go.com/v2"
+    assert result.api_key == "sk-rotated"
