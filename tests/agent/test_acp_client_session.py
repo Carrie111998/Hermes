@@ -882,11 +882,15 @@ class TestPermissionApprovalCallback:
         payload = mock_client.respond.call_args[0][1]
         assert payload["outcome"] == {"outcome": "cancelled"}
 
-    def test_callback_receives_command_label_and_description(self):
-        """Callback is called with (command_label, description, allow_permanent=False).
+    def test_callback_receives_raw_tool_call_dict(self):
+        """The session is a pure protocol forwarder: the callback receives the
+        raw ``toolCall`` dict extracted from the JSON-RPC request, untouched.
 
-        command_label = toolCall.title or kind or 'tool'.
-        description should contain title/kind context but not rawInput.
+        No field extraction, label building, or description formatting happens
+        in the session layer — that is the approval bridge / plugin adapter's
+        job.  The dict is forwarded by identity (same object), including any
+        ``rawInput`` (which may carry secrets; the callback/adapter is
+        responsible for never leaking it).
         """
         cb = MagicMock(return_value="once")
         session, mock_client = self._setup(cb)
@@ -900,46 +904,9 @@ class TestPermissionApprovalCallback:
 
         cb.assert_called_once()
         args, kwargs = cb.call_args
-        command_label = args[0]
-        description = args[1]
-        assert command_label == "git push"  # title used as label
+        # Single positional arg: the raw tool_call dict, forwarded as-is.
+        assert args[0] is tool_call
         assert kwargs.get("allow_permanent") is False
-
-    def test_callback_label_falls_back_to_kind(self):
-        """When title is absent, command_label = kind."""
-        cb = MagicMock(return_value="once")
-        session, mock_client = self._setup(cb)
-        tool_call = {"kind": "file_edit", "toolCallId": "tc-2"}
-        session._handle_server_request(_make_perm_request(tool_call=tool_call))
-
-        args = cb.call_args[0]
-        assert args[0] == "file_edit"
-
-    def test_callback_label_falls_back_to_tool(self):
-        """When both title and kind are absent, command_label = 'tool'."""
-        cb = MagicMock(return_value="once")
-        session, mock_client = self._setup(cb)
-        tool_call = {"toolCallId": "tc-3"}
-        session._handle_server_request(_make_perm_request(tool_call=tool_call))
-
-        args = cb.call_args[0]
-        assert args[0] == "tool"
-
-    def test_callback_description_does_not_leak_raw_input(self):
-        """Description must NOT contain rawInput secrets."""
-        cb = MagicMock(return_value="once")
-        session, mock_client = self._setup(cb)
-        secret = "«redacted:AKIA…»"
-        tool_call = {
-            "title": "aws s3 cp",
-            "kind": "tool",
-            "toolCallId": "tc-4",
-            "rawInput": f"--secret={secret}",
-        }
-        session._handle_server_request(_make_perm_request(tool_call=tool_call))
-
-        description = cb.call_args[0][1]
-        assert secret not in description
 
 
 class TestPermissionCallbackNonStringReturn:

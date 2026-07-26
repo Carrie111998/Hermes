@@ -209,10 +209,14 @@ class ACPClientSession:
                 to the ACP agent's API endpoint.
             on_delta: Optional callback invoked with each text delta during streaming.
                       Bridges to Hermes' ``_fire_stream_delta`` for live output.
-            approval_callback: Optional callback ``(command_label: str,
-                description: str, *, allow_permanent: bool) -> str`` invoked when
-                the ACP agent sends a ``session/request_permission``.  The return
-                value selects the permission outcome:
+            approval_callback: Optional callback ``(tool_call: dict,
+                *, allow_permanent: bool) -> str`` invoked when the ACP agent
+                sends a ``session/request_permission``.  The session layer is a
+                pure protocol forwarder: it extracts the raw ``toolCall`` dict
+                from the JSON-RPC request and passes it through untouched — no
+                field extraction, no label/description building (that lives in
+                the approval bridge / plugin adapter).  The return value selects
+                the permission outcome:
 
                 ``"once"``    → select allow_once (or cancelled if absent)
                 ``"session"`` → prefer allow_always, fall back to allow_once
@@ -1061,35 +1065,25 @@ class ACPClientSession:
     def _resolve_via_callback(self, tool_call: dict, options: list) -> dict:
         """Invoke the approval callback and map its decision to an ACP outcome.
 
-        The callback signature matches Hermes' standard approval flow:
-            ``(command_label: str, description: str, *, allow_permanent: bool) -> str``
+        This is a pure protocol forwarder: the raw ``tool_call`` dict is
+        passed to the callback untouched.  No field extraction, label
+        building, or description formatting happens here — that is the
+        responsibility of the approval bridge (generic ACP extraction) and
+        any plugin format adapter (e.g. Claude Code title-DSL parsing),
+        which enrich the dict with ``_normalized_*`` keys before the core
+        bridge consumes it.
+
+        Callback contract::
+
+            (tool_call: dict, *, allow_permanent: bool) -> str
 
         Non-string return values (True, 42, objects) are treated as deny
         (fail-closed) — they never raise or crash the turn.  See the
         ``__init__`` docstring for the full decision matrix.
         """
-        title = tool_call.get("title") or ""
-        kind = tool_call.get("kind") or ""
-        tool_call_id = tool_call.get("toolCallId") or ""
-
-        command_label = title or kind or "tool"
-
-        # Build a safe description that includes context but NOT rawInput
-        # (which may contain secrets like API keys).
-        desc_parts = []
-        if title:
-            desc_parts.append(f"Tool: {title}")
-        if kind:
-            desc_parts.append(f"Kind: {kind}")
-        if tool_call_id:
-            desc_parts.append(f"Call: {tool_call_id}")
-        description = " | ".join(desc_parts) if desc_parts else "ACP permission request"
-
         try:
             decision = self._approval_callback(
-                command_label, description, allow_permanent=False,
-                kind=kind,
-                tool_call=tool_call,
+                tool_call, allow_permanent=False,
             )
         except Exception:
             logger.warning(

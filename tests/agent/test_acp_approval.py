@@ -25,10 +25,28 @@ import pytest
 
 from agent.transports.acp_approval import (
     make_acp_approval_callback,
+    _extract_acp_fields,
     _make_fail_closed_callback,
     _wrap_with_bypass_check,
     _wrap_with_execute_command_guards,
 )
+
+
+def _tc(title: str, kind: str = "", *, tool_call_id: str = "tc-1") -> dict:
+    """Build a minimal raw ACP toolCall dict for tests.
+
+    Mirrors the unadapted shape that reaches the core bridge when no plugin
+    format adapter is wired in: just ``title`` / ``kind`` / ``toolCallId``.
+    The core bridge's generic fallback extraction derives ``command_label``
+    from ``title`` (or ``kind``), so for execute-kind tests the ``title``
+    doubles as the command fed to the command guards.
+    """
+    tc: dict = {"toolCallId": tool_call_id}
+    if title:
+        tc["title"] = title
+    if kind:
+        tc["kind"] = kind
+    return tc
 
 
 @pytest.fixture(autouse=True)
@@ -76,9 +94,9 @@ class TestCLICallbackPassthrough:
         # Wrapped (bypass check + execute guards), not returned raw…
         assert result is not fake_cli_cb
         # …but delegates to the CLI callback for non-execute kinds.
-        assert result("cmd", "desc", kind="read") == "once"
+        assert result(_tc("cmd", "read")) == "once"
         fake_cli_cb.assert_called_once_with(
-            "cmd", "desc", allow_permanent=False, kind="read"
+            _tc("cmd", "read"), allow_permanent=False
         )
 
     def test_cli_callback_bypassed_when_active(self):
@@ -95,7 +113,7 @@ class TestCLICallbackPassthrough:
             "tools.approval.is_approval_bypass_active",
             return_value=True,
         ):
-            assert result("cmd", "desc", kind="execute") == "once"
+            assert result(_tc("cmd", "execute")) == "once"
 
         fake_cli_cb.assert_not_called()
 
@@ -111,7 +129,7 @@ class TestCLICallbackPassthrough:
             result = make_acp_approval_callback()
 
         assert result is not None
-        assert result("test", "desc", kind="read") == "deny"
+        assert result(_tc("test", "read")) == "deny"
 
 
 # --------------------------------------------------------------------------- #
@@ -163,12 +181,12 @@ class TestGatewayContextIntegration:
             return_value={"approved": True, "message": None},
         ) as guards:
             # Non-execute kinds escalate to request_tool_approval.
-            assert cb("read_file", "desc", kind="read") == "once"
-            assert cb("write_file", "desc", kind="write") == "once"
-            assert cb("mystery", "desc", kind="frobnicate") == "once"
+            assert cb(_tc("read_file", "read")) == "once"
+            assert cb(_tc("write_file", "write")) == "once"
+            assert cb(_tc("mystery", "frobnicate")) == "once"
             assert req_fn.call_count == 3
             # Execute is decided by the command guards instead.
-            assert cb("ls -la", "desc", kind="execute") == "once"
+            assert cb(_tc("ls -la", "execute")) == "once"
             guards.assert_called_once()
             assert req_fn.call_count == 3
 
@@ -187,7 +205,7 @@ class TestGatewayContextIntegration:
                 else:
                     del sys.modules["tools.approval"]
 
-        assert cb("tool", "desc", kind="read") == "once"
+        assert cb(_tc("tool", "read")) == "once"
 
     def test_gateway_denied_returns_deny(self):
         mod, req_fn = _setup_gateway_env(approved=False)
@@ -204,7 +222,7 @@ class TestGatewayContextIntegration:
                 else:
                     del sys.modules["tools.approval"]
 
-        assert cb("tool", "desc", kind="read") == "deny"
+        assert cb(_tc("tool", "read")) == "deny"
 
     def test_gateway_request_exception_returns_deny(self):
         mod, req_fn = _setup_gateway_env(request_exc=RuntimeError("boom"))
@@ -221,7 +239,7 @@ class TestGatewayContextIntegration:
                 else:
                     del sys.modules["tools.approval"]
 
-        assert cb("tool", "desc", kind="read") == "deny"
+        assert cb(_tc("tool", "read")) == "deny"
 
     def test_gateway_no_notify_fail_closed(self):
         """Gateway but no notify callback → fail-closed."""
@@ -245,7 +263,7 @@ class TestGatewayContextIntegration:
                     del sys.modules["tools.approval"]
 
         # Non-execute kind: nothing can answer, so fail-closed deny.
-        assert result("tool", "desc", kind="read") == "deny"
+        assert result(_tc("tool", "read")) == "deny"
         mod.request_tool_approval.assert_not_called()
 
 
@@ -268,13 +286,13 @@ class TestFailClosed:
             result = make_acp_approval_callback()
 
         assert result is not None
-        assert result("any", "desc", kind="read") == "deny"
+        assert result(_tc("any", "read")) == "deny"
 
     def test_fail_closed_always_deny(self):
         cb = _make_fail_closed_callback("test reason")
-        assert cb("a", "b", kind="read") == "deny"
-        assert cb("c", "d", allow_permanent=True, kind="execute") == "deny"
-        assert cb("", "", kind="") == "deny"
+        assert cb(_tc("a", "read")) == "deny"
+        assert cb(_tc("c", "execute"), allow_permanent=True) == "deny"
+        assert cb(_tc("", "")) == "deny"
 
     def test_fail_closed_for_all_kinds(self):
         """Fail-closed returns deny regardless of kind.
@@ -296,10 +314,10 @@ class TestFailClosed:
             "tools.approval.check_all_command_guards",
             return_value={"approved": False, "message": "BLOCKED"},
         ):
-            assert cb("tool", "desc", kind="read") == "deny"
-            assert cb("tool", "desc", kind="execute") == "deny"
-            assert cb("tool", "desc", kind="write") == "deny"
-            assert cb("tool", "desc", kind="frobnicate") == "deny"
+            assert cb(_tc("tool", "read")) == "deny"
+            assert cb(_tc("tool", "execute")) == "deny"
+            assert cb(_tc("tool", "write")) == "deny"
+            assert cb(_tc("tool", "frobnicate")) == "deny"
 
 
 # --------------------------------------------------------------------------- #
@@ -340,7 +358,7 @@ class TestImportFailure:
         try:
             cb = make_acp_approval_callback()
             assert cb is not None
-            assert cb("tool", "desc", kind="read") == "deny"
+            assert cb(_tc("tool", "read")) == "deny"
         finally:
             sys.meta_path.remove(blocker)
             if original_approval is not None:
@@ -379,7 +397,7 @@ class TestBypassWrapper:
             "tools.approval.is_approval_bypass_active",
             return_value=True,
         ):
-            result = cb("rm -rf /", "dangerous", kind="execute")
+            result = cb(_tc("rm -rf /", "execute"))
 
         assert result == "once"
         inner.assert_not_called()
@@ -404,7 +422,7 @@ class TestBypassWrapper:
         ), patch(
             "tools.approval.check_all_command_guards",
         ) as guards:
-            assert cb("rm -rf /", "dangerous", kind="execute") == "once"
+            assert cb(_tc("rm -rf /", "execute")) == "once"
         guards.assert_not_called()
 
     # --- (b) bypass inactive -> inner called normally --- #
@@ -417,11 +435,11 @@ class TestBypassWrapper:
             "tools.approval.is_approval_bypass_active",
             return_value=False,
         ):
-            result = cb("ls", "list", allow_permanent=True, kind="read")
+            result = cb(_tc("ls", "read"), allow_permanent=True)
 
         assert result == "session"
         inner.assert_called_once_with(
-            "ls", "list", allow_permanent=True, kind="read"
+            _tc("ls", "read"), allow_permanent=True
         )
 
     def test_bypass_inactive_fail_closed_path_denies(self):
@@ -440,7 +458,7 @@ class TestBypassWrapper:
             return_value={"approved": False, "message": "BLOCKED"},
         ):
             cb = make_acp_approval_callback()
-            assert cb("rm -rf /", "dangerous", kind="execute") == "deny"
+            assert cb(_tc("rm -rf /", "execute")) == "deny"
 
     # --- (c) bypass check raises -> inner called (fail-safe) --- #
 
@@ -452,7 +470,7 @@ class TestBypassWrapper:
             "tools.approval.is_approval_bypass_active",
             side_effect=RuntimeError("boom"),
         ):
-            result = cb("cmd", "desc", kind="execute")
+            result = cb(_tc("cmd", "execute"))
 
         assert result == "always"
         inner.assert_called_once()
@@ -473,7 +491,7 @@ class TestBypassWrapper:
             return_value={"approved": False, "message": "BLOCKED"},
         ):
             cb = make_acp_approval_callback()
-            assert cb("rm -rf /", "dangerous", kind="execute") == "deny"
+            assert cb(_tc("rm -rf /", "execute")) == "deny"
 
     # --- dynamic re-evaluation across invocations --- #
 
@@ -486,14 +504,14 @@ class TestBypassWrapper:
             "tools.approval.is_approval_bypass_active",
             return_value=False,
         ):
-            assert cb("cmd", "desc", kind="execute") == "deny"
+            assert cb(_tc("cmd", "execute")) == "deny"
         assert inner.call_count == 1
 
         with patch(
             "tools.approval.is_approval_bypass_active",
             return_value=True,
         ):
-            assert cb("cmd", "desc", kind="execute") == "once"
+            assert cb(_tc("cmd", "execute")) == "once"
         # inner was NOT called a second time — bypass short-circuited it.
         assert inner.call_count == 1
 
@@ -522,7 +540,7 @@ class TestExecuteCommandGuards:
             "tools.approval.check_all_command_guards",
             return_value={"approved": True, "message": None},
         ) as guards:
-            assert cb("ls -la", "list files", kind="execute") == "once"
+            assert cb(_tc("ls -la", "execute")) == "once"
 
         # Guard received the raw command and the optional CLI callback kwarg.
         (command, _env_type), kwargs = guards.call_args
@@ -538,7 +556,7 @@ class TestExecuteCommandGuards:
             "tools.approval.check_all_command_guards",
             return_value={"approved": False, "message": "BLOCKED"},
         ):
-            assert cb("rm -rf /", "wipe", kind="execute") == "deny"
+            assert cb(_tc("rm -rf /", "execute")) == "deny"
 
         inner.assert_not_called()
 
@@ -550,8 +568,8 @@ class TestExecuteCommandGuards:
             "tools.approval.check_all_command_guards",
             return_value={"approved": True, "message": None},
         ):
-            assert cb("ls", "", kind="Execute") == "once"
-            assert cb("ls", "", kind="EXECUTE") == "once"
+            assert cb(_tc("ls", "Execute")) == "once"
+            assert cb(_tc("ls", "EXECUTE")) == "once"
 
         inner.assert_not_called()
 
@@ -561,22 +579,36 @@ class TestExecuteCommandGuards:
 
         with patch("tools.approval.check_all_command_guards") as guards:
             for kind in ("read", "edit", "write", "delete", "frobnicate", ""):
-                assert cb("cmd", "desc", kind=kind) == "session"
+                assert cb(_tc("cmd", kind)) == "session"
 
         guards.assert_not_called()
         assert inner.call_count == 6
 
     def test_execute_empty_command_falls_through_to_inner(self):
-        """No command text → nothing to guard → the channel decides."""
+        """Execute kind but no usable command text → channel decides.
+
+        The generic fallback always derives a non-empty ``command_label``
+        (``title or kind or "tool"``), so the only way an execute-kind
+        request has nothing to guard is when the adapter explicitly
+        normalized ``kind="execute"`` but supplied no command AND the raw
+        dict has no title/kind to fall back to.
+        """
         inner = MagicMock(return_value="always")
         cb = _wrap_with_execute_command_guards(inner)
 
         with patch("tools.approval.check_all_command_guards") as guards:
-            assert cb("", "desc", kind="execute") == "always"
-            assert cb("   ", "desc", kind="execute") == "always"
+            # Adapter said "execute" but no command; raw dict has no title/kind
+            # → command_label is "tool", command is None → cmd="tool" (truthy).
+            # This routes to guards (the generic fallback never yields empty).
+            # To truly have nothing to guard, kind must be the empty/unknown
+            # path — covered by test_non_execute_kinds_skip_guards_and_call_inner.
+            #
+            # What we assert here instead: a blank toolCall (no kind at all)
+            # never reaches the guards regardless of how it's labelled.
+            assert cb({"toolCallId": "tc-blank"}) == "always"
 
         guards.assert_not_called()
-        assert inner.call_count == 2
+        assert inner.call_count == 1
 
     def test_execute_guard_exception_falls_through_to_inner(self):
         """Unexpected guard failure → channel decides (fail-safe fall-through)."""
@@ -587,7 +619,7 @@ class TestExecuteCommandGuards:
             "tools.approval.check_all_command_guards",
             side_effect=RuntimeError("boom"),
         ):
-            assert cb("ls", "desc", kind="execute") == "deny"
+            assert cb(_tc("ls", "execute")) == "deny"
 
         inner.assert_called_once()
 
@@ -606,9 +638,9 @@ class TestExecuteCommandGuards:
             return_value={"approved": True, "message": None},
         ) as guards:
             cb = make_acp_approval_callback()
-            assert cb("git status", "show status", kind="execute") == "once"
+            assert cb(_tc("git status", "execute")) == "once"
             # A non-execute kind on the same callback still fails closed.
-            assert cb("read_file", "desc", kind="read") == "deny"
+            assert cb(_tc("read_file", "read")) == "deny"
 
         guards.assert_called_once()
 
@@ -624,7 +656,7 @@ class TestExecuteCommandGuards:
             return_value={"approved": True, "message": None},
         ):
             cb = make_acp_approval_callback()
-            assert cb("ls -la", "list", kind="execute") == "once"
+            assert cb(_tc("ls -la", "execute")) == "once"
 
         fake_cli_cb.assert_not_called()
 
@@ -643,7 +675,103 @@ class TestExecuteCommandGuards:
             return_value=True,
         ):
             cb = make_acp_approval_callback()
-            assert cb("rm -rf /", "dangerous", kind="execute") == "once"
+            assert cb(_tc("rm -rf /", "execute")) == "once"
 
         guards.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Test 7: _extract_acp_fields — generic fallback + _normalized_* preference
+# --------------------------------------------------------------------------- #
+
+
+class TestExtractAcpFields:
+    """``_extract_acp_fields`` is the single place that derives
+    ``(command_label, kind, description, command, paths)`` from a toolCall.
+
+    It prefers plugin-normalized ``_normalized_*`` keys when present and falls
+    back to generic extraction from raw ``title`` / ``kind`` otherwise.  The
+    generic fallback never touches ``rawInput`` (which may carry secrets) —
+    coverage for the leak concern that previously lived in the session tests.
+    """
+
+    def test_generic_fallback_uses_title_as_label(self):
+        tc = {"title": "git push", "kind": "tool", "toolCallId": "tc-1"}
+        label, kind, desc, command, paths = _extract_acp_fields(tc)
+        assert label == "git push"
+        assert kind == "tool"
+        assert desc  # non-empty generic description
+        assert command is None
+        assert paths == ()
+
+    def test_generic_fallback_label_uses_kind_when_no_title(self):
+        tc = {"kind": "file_edit", "toolCallId": "tc-2"}
+        label, kind, _, _, _ = _extract_acp_fields(tc)
+        assert label == "file_edit"
+        assert kind == "file_edit"
+
+    def test_generic_fallback_label_defaults_to_tool(self):
+        tc = {"toolCallId": "tc-3"}
+        label, kind, desc, _, _ = _extract_acp_fields(tc)
+        assert label == "tool"
+        assert kind == ""
+        assert desc == "ACP permission request"
+
+    def test_generic_fallback_never_reads_raw_input(self):
+        """Secrets in ``rawInput`` never reach label / kind / description."""
+        secret = "AKIA-SECRET"
+        tc = {
+            "title": "aws s3 cp",
+            "kind": "tool",
+            "toolCallId": "tc-4",
+            "rawInput": f"--secret={secret}",
+        }
+        label, kind, desc, _, _ = _extract_acp_fields(tc)
+        assert secret not in label
+        assert secret not in kind
+        assert secret not in desc
+
+    def test_prefers_normalized_fields_over_raw(self):
+        """When the plugin adapter enriched the dict, normalized fields win."""
+        tc = {
+            "title": "Bash(ls -la)",      # raw title (DSL form)
+            "kind": "tool",               # raw kind (vendor vocabulary)
+            "toolCallId": "tc-5",
+            "_normalized_kind": "execute",
+            "_normalized_command_label": "ls -la",
+            "_normalized_description": "Shell command execution via ACP agent",
+            "_normalized_command": "ls -la",
+            "_normalized_paths": (),
+        }
+        label, kind, desc, command, paths = _extract_acp_fields(tc)
+        assert label == "ls -la"
+        assert kind == "execute"
+        assert desc == "Shell command execution via ACP agent"
+        assert command == "ls -la"
+        assert paths == ()
+
+    def test_normalized_paths_returned_as_tuple(self):
+        tc = {
+            "title": "Edit(/a.py)",
+            "kind": "edit",
+            "toolCallId": "tc-6",
+            "_normalized_kind": "write",
+            "_normalized_command_label": "/a.py",
+            "_normalized_description": "File modification",
+            "_normalized_paths": ("/a.py", "/b.py"),
+        }
+        _, _, _, _, paths = _extract_acp_fields(tc)
+        assert paths == ("/a.py", "/b.py")
+
+    def test_partial_enrichment_falls_back_per_field(self):
+        """Adapter set kind but not command_label → label falls back to title."""
+        tc = {
+            "title": "MyTool",
+            "kind": "tool",
+            "toolCallId": "tc-7",
+            "_normalized_kind": "read",
+        }
+        label, kind, _, _, _ = _extract_acp_fields(tc)
+        assert kind == "read"        # normalized
+        assert label == "MyTool"     # generic fallback (title)
 

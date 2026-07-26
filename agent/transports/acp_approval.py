@@ -58,12 +58,72 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Internal: ACP toolCall field extraction
+# --------------------------------------------------------------------------- #
+#
+# Plugin format adapters (e.g. the Claude Code adapter in approval_adapter.py)
+# normalize the raw ACP ``toolCall`` into Hermes' vocabulary before this core
+# bridge sees it.  They do so by returning an *enriched* dict: a shallow copy
+# of the original ``toolCall`` plus a set of ``_normalized_*`` keys.  This
+# keeps the callback contract a single positional ``tool_call: dict`` — no
+# signature churn when a new vendor field appears — while still letting the
+# core bridge consume normalized fields.
+#
+# Enrichment keys (all optional; set by the plugin adapter, absent for raw /
+# unadapted toolCalls):
+#
+#   _normalized_kind            str   "read" | "execute" | "write" | "other"
+#   _normalized_command_label   str   human-display target (path / command)
+#   _normalized_description     str   short human-readable summary
+#   _normalized_command         str?  unwrapped shell command (execute only)
+#   _normalized_paths           tuple file-system paths (read / write)
+#
+# When these keys are absent (no adapter wired in, or the adapter raised and
+# the caller fell through with the raw dict), ``_extract_acp_fields`` performs
+# a generic fallback extraction directly from the raw ACP fields (``title``,
+# ``kind``).  The generic fallback never parses the ``ToolName(content)``
+# title DSL — that is vendor-specific work owned by the plugin adapter.
+
+
+def _extract_acp_fields(
+    tool_call: dict,
+) -> tuple[str, str, str, Optional[str], tuple[str, ...]]:
+    """Extract approval-relevant fields from an ACP ``toolCall`` dict.
+
+    Prefers plugin-normalized fields (``_normalized_*``) when present; falls
+    back to generic extraction from raw ACP fields (``title`` / ``kind``).
+
+    Returns ``(command_label, kind, description, command, paths)`` where
+    ``command`` is ``None`` and ``paths`` is ``()`` for non-execute /
+    non-path-bearing kinds, or whenever no adapter enriched the dict.
+    """
+    # Plugin-normalized fields (set by format adapters).
+    kind = tool_call.get("_normalized_kind") or ""
+    command_label = tool_call.get("_normalized_command_label") or ""
+    description = tool_call.get("_normalized_description") or ""
+    command = tool_call.get("_normalized_command")
+    paths = tool_call.get("_normalized_paths") or ()
+
+    # Generic fallback when no adapter enriched the dict.
+    if not command_label:
+        title = (tool_call.get("title") or "").strip()
+        raw_kind = (tool_call.get("kind") or "").strip()
+        command_label = title or raw_kind or "tool"
+    if not kind:
+        kind = (tool_call.get("kind") or "").strip()
+    if not description:
+        description = f"ACP {kind} request" if kind else "ACP permission request"
+
+    return command_label, kind, description, command, paths
+
+
 def make_acp_approval_callback() -> Optional[Callable[..., str]]:
     """Return a callback for ``ACPClientSession.approval_callback``.
 
     The returned callable has the signature::
 
-        (command_label: str, description: str, *, allow_permanent: bool, kind: str) -> str
+        (tool_call: dict, *, allow_permanent: bool) -> str
 
     and returns one of ``"once"``, ``"session"``, ``"always"``, or ``"deny"``.
 
@@ -194,17 +254,15 @@ def _wrap_with_bypass_check(inner: Callable[..., str]) -> Callable[..., str]:
     """
 
     def _bypass_aware_callback(
-        command_label: str,
-        description: str,
+        tool_call: dict,
         *,
         allow_permanent: bool = False,
-        kind: str = "",
-        **kwargs,
     ) -> str:
         try:
             from tools.approval import is_approval_bypass_active
 
             if is_approval_bypass_active():
+                command_label, kind, _, _, _ = _extract_acp_fields(tool_call)
                 logger.debug(
                     "ACP approval: bypass active (yolo/mode=off) — "
                     "auto-approve %r (kind=%r)",
@@ -217,13 +275,7 @@ def _wrap_with_bypass_check(inner: Callable[..., str]) -> Callable[..., str]:
                 "ACP approval: bypass check failed; falling through",
                 exc_info=True,
             )
-        return inner(
-            command_label,
-            description,
-            allow_permanent=allow_permanent,
-            kind=kind,
-            **kwargs,
-        )
+        return inner(tool_call, allow_permanent=allow_permanent)
 
     return _bypass_aware_callback
 
@@ -264,15 +316,17 @@ def _wrap_with_execute_command_guards(
     """
 
     def _execute_guard_callback(
-        command_label: str,
-        description: str,
+        tool_call: dict,
         *,
         allow_permanent: bool = False,
-        kind: str = "",
-        **kwargs,
     ) -> str:
-        cmd_kwarg = kwargs.get("command")
-        has_command = bool((cmd_kwarg and cmd_kwarg.strip()) or (command_label and command_label.strip()))
+        command_label, kind, _, command, _ = _extract_acp_fields(tool_call)
+        # Prefer an explicitly-unwrapped command (``_normalized_command``, set
+        # by the plugin's format adapter) over ``command_label``; the label
+        # may still be in ``Tool(command)`` form when no adapter is wired in,
+        # in which case we fall back to it.
+        cmd = command if command else (command_label or "").strip()
+        has_command = bool(cmd)
         if (kind or "").lower() == "execute" and has_command:
             try:
                 from tools.approval import (
@@ -290,11 +344,6 @@ def _wrap_with_execute_command_guards(
                 except Exception:
                     approval_cb = None
 
-                # Prefer an explicitly-unwrapped ``command`` kwarg (supplied
-                # by the plugin's format adapter) over ``command_label``;
-                # the label may still be in ``Tool(command)`` form when no
-                # adapter is wired in, in which case we fall back to it.
-                cmd = kwargs.get("command") or command_label.strip()
                 result = check_all_command_guards(
                     cmd,
                     os.getenv("TERMINAL_ENV", "local"),
@@ -309,13 +358,7 @@ def _wrap_with_execute_command_guards(
                     "falling through to channel",
                     exc_info=True,
                 )
-        return inner(
-            command_label,
-            description,
-            allow_permanent=allow_permanent,
-            kind=kind,
-            **kwargs,
-        )
+        return inner(tool_call, allow_permanent=allow_permanent)
 
     return _execute_guard_callback
 
@@ -349,33 +392,26 @@ def _make_gateway_request_callback(
     """
 
     def _callback(
-        command_label: str,
-        description: str,
+        tool_call: dict,
         *,
         allow_permanent: bool = False,
-        kind: str = "",
-        **kwargs,
     ) -> str:
         tool_name = "acp_agent"
+        command_label, _, description, command, _ = _extract_acp_fields(tool_call)
         # Show the meaningful content (tool title / unwrapped command) inside
         # the approval prompt's fenced code block instead of a synthetic
         # "<acp_agent> (plugin approval rule)" placeholder. ``command_label``
         # is already normalized by the caller (ACP title, Codex apply_patch
         # summary, …) and carries no raw arguments/secrets, so it is safe to
-        # display. An explicitly-unwrapped ``command`` kwarg wins for execute
-        # kinds that slip through here without a command to guard.
-        display_target = (kwargs.get("command") or command_label or "").strip()
+        # display. An explicitly-unwrapped ``_normalized_command`` wins for
+        # execute kinds that slip through here without a command to guard.
+        display_target = (command or command_label or "").strip()
         # `reason` is the human-facing message rendered in the prompt. The
-        # plugin format adapter now supplies a short, readable ``description``
+        # plugin format adapter supplies a short, readable ``description``
         # ("Execute shell command", "Modify /path/file.py", …) aligned with
         # the native dangerous-command style; fall back to ``command_label``
-        # / kind only for legacy callers that omit the adapter.
-        if description:
-            reason = description
-        elif command_label:
-            reason = command_label
-        else:
-            reason = f"ACP agent permission request ({kind})" if kind else "ACP agent permission request"
+        # only for legacy callers that omit the adapter.
+        reason = description or command_label or "ACP agent permission request"
 
         try:
             result = request_fn(
@@ -402,13 +438,11 @@ def _make_fail_closed_callback(reason: str) -> Callable[..., str]:
     """Return a callback that always returns ``"deny"`` with a debug log."""
 
     def _callback(
-        command_label: str,
-        description: str,
+        tool_call: dict,
         *,
         allow_permanent: bool = False,
-        kind: str = "",
-        **kwargs,
     ) -> str:
+        command_label, kind, _, _, _ = _extract_acp_fields(tool_call)
         logger.debug(
             "ACP approval: fail-closed deny (%s) for %r (kind=%r)",
             reason,
