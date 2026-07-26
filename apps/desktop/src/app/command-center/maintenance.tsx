@@ -94,15 +94,27 @@ export function MaintenancePanel() {
           return
         }
 
-        setActionStatus(status)
-        upsertDesktopActionTask(status)
         polls += 1
 
-        if (status.running && polls < ACTION_POLL_LIMIT) {
+        // Giving up on a still-running action: keep the log we tailed, but store
+        // it as settled. `actionStatus.running` gates every op button below and
+        // only `launch()` ever clears it, so a stored `running: true` we have
+        // stopped refreshing disables the very buttons needed to escape it.
+        const exhausted = status.running && polls >= ACTION_POLL_LIMIT
+
+        setActionStatus(exhausted ? { ...status, running: false } : status)
+        upsertDesktopActionTask(status)
+
+        if (status.running && !exhausted) {
           timer = window.setTimeout(() => void poll(), ACTION_POLL_MS)
         }
       } catch {
-        // Status endpoint hiccup — stop tailing; the activity rail still has the task.
+        // Status endpoint hiccup — stop tailing; the activity rail still has the
+        // task. Settle the last observation for the same reason as above: it is
+        // now stale, and leaving it `running` wedges the op buttons.
+        if (!cancelled) {
+          setActionStatus(prev => (prev === null || !prev.running ? prev : { ...prev, running: false }))
+        }
       }
     }
 
