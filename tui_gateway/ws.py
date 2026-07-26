@@ -303,22 +303,6 @@ async def handle_ws(ws: Any) -> None:
 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
 
-        # The desktop app and dashboard chat reach the agent through this WS
-        # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
-        # spawns the background MCP discovery thread). Without starting it here,
-        # discovery never runs in this process: _make_agent only *waits* on the
-        # thread (wait_for_mcp_discovery), which no-ops when it was never
-        # created, so the agent snapshots an MCP-less tool list and the only way
-        # to surface MCP tools is a manual /reload-mcp. Start it once per
-        # process here (idempotent, config-gated) before gateway.ready so the
-        # first agent build can pick up already-spawning servers. (#38945)
-        from hermes_cli.mcp_startup import start_background_mcp_discovery
-
-        start_background_mcp_discovery(
-            logger=_log,
-            thread_name="tui-ws-mcp-discovery",
-        )
-
         ready_ok = await transport.write_async(
             {
                 "jsonrpc": "2.0",
@@ -340,6 +324,24 @@ async def handle_ws(ws: Any) -> None:
             send_failures += 1
             _log.error("ws ready frame send failed peer=%s", peer)
             return
+
+        # The desktop app and dashboard chat reach the agent through this WS
+        # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
+        # spawns the background MCP discovery thread). Without starting it here,
+        # discovery never runs in this process: _make_agent only *waits* on the
+        # thread (wait_for_mcp_discovery), which no-ops when it was never
+        # created, so the agent snapshots an MCP-less tool list and the only way
+        # to surface MCP tools is a manual /reload-mcp. Start it once per
+        # process here (idempotent and config-gated), but only after the ready
+        # frame is on the wire: cold imports/config reads can hold the GIL long
+        # enough for a Desktop client to give up before receiving that frame.
+        # This still runs before the receive loop processes the first request.
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(
+            logger=_log,
+            thread_name="tui-ws-mcp-discovery",
+        )
 
         while True:
             try:
