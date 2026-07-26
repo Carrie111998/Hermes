@@ -7976,7 +7976,11 @@ def test_prompt_submit_user_ordinal_ignores_auto_continuation_marker(monkeypatch
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_message=None,
         ):
             seen["history"] = conversation_history
             return {
