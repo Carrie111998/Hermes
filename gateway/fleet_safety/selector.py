@@ -21,9 +21,10 @@ Key features:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from gateway.fleet_safety.usage_verify import verified_usage_for
 
@@ -179,6 +180,7 @@ def select_best_lane(
     *,
     is_heavy: bool = True,
     now: Optional[float] = None,
+    usage_by_lane: Optional[Mapping[str, float]] = None,
 ) -> SelectedLane:
     """Route to the enabled lane with the highest verified weekly headroom.
 
@@ -191,7 +193,12 @@ def select_best_lane(
     cfg = config or {}
     fleet_cfg = cfg.get("fleet") or {}
     lanes_cfg = fleet_cfg.get("lanes") or {}
-    switch_delta = float(fleet_cfg.get("switch_delta", 20.0))
+    switch_delta = float(
+        fleet_cfg.get(
+            "switch_delta_pct",
+            fleet_cfg.get("switch_delta", 20.0),
+        )
+    )
 
     candidates: Dict[str, Tuple[LaneConfig, Optional[float], Optional[float], List[str]]] = {}
 
@@ -211,16 +218,37 @@ def select_best_lane(
             enabled=True,
         )
 
-        verified = verified_usage_for(lane.provider, now=now)
-        used_pct = verified.used_percent
-
-        if is_heavy and (used_pct is None or verified.stale or verified.suspect):
-            used_pct = None
-            headroom = None
-        else:
+        if usage_by_lane is not None:
+            raw_used_pct = usage_by_lane.get(slug)
+            try:
+                used_pct = (
+                    float(raw_used_pct) if raw_used_pct is not None else None
+                )
+            except (TypeError, ValueError):
+                used_pct = None
+            if used_pct is not None and not (
+                math.isfinite(used_pct) and 0.0 <= used_pct <= 100.0
+            ):
+                used_pct = None
             headroom = (100.0 - used_pct) if used_pct is not None else None
+            reasons = [
+                "prevalidated fleet capacity"
+                if used_pct is not None
+                else "prevalidated fleet capacity: invalid or missing"
+            ]
+        else:
+            verified = verified_usage_for(lane.provider, now=now)
+            used_pct = verified.used_percent
+            if is_heavy and (
+                used_pct is None or verified.stale or verified.suspect
+            ):
+                used_pct = None
+                headroom = None
+            else:
+                headroom = (100.0 - used_pct) if used_pct is not None else None
+            reasons = verified.reasons
 
-        candidates[slug] = (lane, used_pct, headroom, verified.reasons)
+        candidates[slug] = (lane, used_pct, headroom, reasons)
 
     # Filter eligible lanes: known headroom >= reserve floor
     eligible: Dict[str, Tuple[LaneConfig, Optional[float], float, List[str]]] = {}
@@ -287,7 +315,9 @@ def rank_fallback_chain(
     lanes_cfg = fleet_cfg.get("lanes") or {}
 
     pool = list(chain) if chain else []
-    if not pool and fleet_cfg.get("enabled", True):
+    if not pool and fleet_cfg.get("enabled", False):
+        # Generate the standard safety net only after Fleet is explicitly
+        # commissioned. An absent fleet section must not create silent routes.
         for def_lane in DEFAULT_LANES.values():
             pool.append({"provider": def_lane.provider, "model": def_lane.model})
 
@@ -334,4 +364,3 @@ def rank_fallback_chain(
     eligible_entries.sort(key=lambda x: (x[0], -x[1]), reverse=True)
 
     return [e for _, _, e in eligible_entries]
-

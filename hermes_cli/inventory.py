@@ -112,15 +112,16 @@ def load_picker_context() -> ConfigContext:
 
 
 
-def _antigravity_parent_provider_row() -> dict | None:
-    """Expose Antigravity Gemini models as parent-selectable when lane is qualified."""
+def _antigravity_parent_provider_row(*, force_fresh: bool = False) -> dict | None:
+    """Expose only cache-proven Antigravity parent models unless refreshed."""
     try:
         from hermes_cli.fleet.adapters.live_routes import _AGY_MODEL_LABELS
         from hermes_cli.fleet.live import FleetQualificationDoctor
         from hermes_cli.fleet.profiles import profile_map
 
         qualification = FleetQualificationDoctor().qualify(
-            (profile_map()["antigravity"],)
+            (profile_map()["antigravity"],),
+            allow_live_probe=bool(force_fresh),
         )["antigravity"]
     except Exception:
         return None
@@ -128,7 +129,7 @@ def _antigravity_parent_provider_row() -> dict | None:
         return None
     models = [m for m in qualification.models if m in _AGY_MODEL_LABELS]
     if not models:
-        models = list(_AGY_MODEL_LABELS.keys())
+        return None
     return {
         "slug": "antigravity-subscription",
         "name": "Antigravity · Gemini",
@@ -141,10 +142,39 @@ def _antigravity_parent_provider_row() -> dict | None:
         "is_current": False,
         "is_user_defined": False,
         "base_url": "",
+        "selection_kind": "fleet_parent",
+        "fleet_lane_id": "antigravity",
+        "selectable": True,
+        "blocked_reason": None,
+        "source": "fleet_auto",
         "capabilities": {
             m: {"fast": False, "reasoning": True} for m in models
         },
     }
+
+
+def build_model_options_payload(
+    ctx: ConfigContext,
+    *,
+    explicit_only: bool = False,
+    include_unconfigured: bool = False,
+    refresh: bool = False,
+) -> dict:
+    """Build the stable API-server/dashboard/TUI model-options payload."""
+
+    refresh = bool(refresh)
+    return build_models_payload(
+        ctx,
+        explicit_only=bool(explicit_only),
+        include_unconfigured=bool(include_unconfigured),
+        picker_hints=True,
+        canonical_order=True,
+        pricing=True,
+        capabilities=True,
+        refresh=refresh,
+        probe_custom_providers=refresh,
+        probe_current_custom_provider=not refresh,
+    )
 
 
 def build_models_payload(
@@ -281,7 +311,11 @@ def build_models_payload(
                     row["models"] = filtered
                     row["total_models"] = len(filtered)
 
-    antigravity_row = _antigravity_parent_provider_row()
+    antigravity_row = (
+        _antigravity_parent_provider_row(force_fresh=True)
+        if refresh
+        else _antigravity_parent_provider_row()
+    )
     if antigravity_row is not None:
         rows = [antigravity_row] + [
             r

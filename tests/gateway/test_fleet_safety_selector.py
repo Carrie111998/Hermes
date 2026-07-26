@@ -43,6 +43,65 @@ def test_select_best_lane_ranking_by_headroom(monkeypatch):
     assert not selected.is_fallback
 
 
+@pytest.mark.parametrize(
+    ("antigravity_headroom", "expected_lane"),
+    [
+        (79.999, "chatgpt_codex"),
+        (80.0, "antigravity"),
+    ],
+)
+def test_select_best_lane_preserves_exact_twenty_point_band(
+    monkeypatch, antigravity_headroom, expected_lane
+):
+    def fake_verify(provider, **_kwargs):
+        used = {
+            "openai-codex": 40.0,
+            "antigravity": 100.0 - antigravity_headroom,
+        }.get(provider)
+        return _mock_usage(used_percent=used)
+
+    monkeypatch.setattr(selector, "verified_usage_for", fake_verify)
+    selected = select_best_lane(
+        config={
+            "fleet": {
+                "switch_delta_pct": 20.0,
+                "lanes": {
+                    "chatgpt_codex": {"enabled": True},
+                    "claude_code": {"enabled": False},
+                    "grok": {"enabled": False},
+                    "antigravity": {"enabled": True},
+                },
+            }
+        },
+        current_provider="openai-codex",
+    )
+
+    assert selected.lane == expected_lane
+
+
+@pytest.mark.parametrize("invalid_used_pct", [-1.0, 101.0, float("nan"), float("inf"), "bad"])
+def test_prevalidated_usage_rejects_non_finite_or_out_of_range_values(
+    invalid_used_pct,
+):
+    selected = select_best_lane(
+        config={
+            "fleet": {
+                "lanes": {
+                    "chatgpt_codex": {"enabled": True},
+                    "claude_code": {"enabled": False},
+                    "grok": {"enabled": False},
+                    "antigravity": {"enabled": False},
+                }
+            }
+        },
+        usage_by_lane={"chatgpt_codex": invalid_used_pct},
+    )
+
+    assert selected.lane == ""
+    assert selected.is_fallback
+    assert "no_eligible_lane" in selected.reason
+
+
 def test_select_best_lane_all_lanes_below_floor_edge_case(monkeypatch):
     def fake_verify(provider, **kwargs):
         # All below their respective floors (floors: codex 8%, claude 2%, grok 5%, antigravity 5%)
@@ -215,4 +274,3 @@ def test_e2e_temp_hermes_home_integration_path(tmp_path, monkeypatch):
     assert selected.lane == "claude_code"
     assert selected.remaining_headroom == 80.0
     assert selected.effort == "high"
-

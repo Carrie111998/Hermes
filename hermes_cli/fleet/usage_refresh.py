@@ -3,8 +3,8 @@
 Writes the profile-scoped capacity document under Hermes home with atomic
 replace semantics. Auto-queryable lanes (Codex/Claude) fetch weekly used % from
 provider APIs. Console-only Grok/Antigravity never invent a usage percentage,
-but when a live health probe succeeds they may receive a fresh ``checked_at``
-plus measured metadata while preserving the prior ``weekly_pct_used``.
+and their live health probes update only separate health fields while
+preserving prior usage evidence and its timestamp.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping
 
 from utils import atomic_replace
 
+from .live_capacity import RELEVANT_WEEKLY_WINDOWS
 from .usage_paths import COCKPIT_MIRROR_PATH, default_native_usage_path, resolve_usage_path
 
 SCHEMA_VERSION = "plans-1"
@@ -40,10 +41,19 @@ def _console_attestation_path(*, home: Path | None = None) -> Path:
     return (base / "fleet" / "usage-console-attestation.json").resolve()
 
 
-def _read_console_attestation(path: Path) -> dict[str, float]:
-    """Optional operator/CI file: {"lanes": {"grok": {"weekly_pct_used": 10}}}."""
+def _read_console_attestation(path: Path) -> dict[str, tuple[float, str]]:
+    """Read timestamped weekly usage evidence for console-only lanes.
+
+    A lane-level or document-level ``checked_at`` wins. For compatibility with
+    the original percentage-only schema, the file modification time is the
+    evidence timestamp; it ages naturally instead of being re-stamped by each
+    refresh.
+    """
     try:
         raw = path.read_text(encoding="utf-8")
+        file_checked_at = _iso(
+            datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        )
     except OSError:
         return {}
     try:
@@ -53,17 +63,26 @@ def _read_console_attestation(path: Path) -> dict[str, float]:
     lanes = document.get("lanes") if isinstance(document, dict) else None
     if not isinstance(lanes, dict):
         return {}
-    out: dict[str, float] = {}
+    document_checked_at = document.get("checked_at")
+    out: dict[str, tuple[float, str]] = {}
     for lane_id, row in lanes.items():
         if not isinstance(row, dict):
             continue
         pct = _clamp_pct(row.get("weekly_pct_used"))
-        if pct is not None:
-            out[str(lane_id)] = pct
+        checked_at = row.get("checked_at") or document_checked_at or file_checked_at
+        if pct is None or not isinstance(checked_at, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            continue
+        out[str(lane_id)] = (pct, _iso(parsed))
     return out
 
 
-def _probe_console_lane_health(lane_id: str) -> tuple[bool, str]:
+def _probe_console_lane_health(lane_id: str) -> tuple[bool | None, str]:
     """Return (healthy, detail) without inventing usage percentages."""
     if lane_id == "grok":
         try:
@@ -71,7 +90,7 @@ def _probe_console_lane_health(lane_id: str) -> tuple[bool, str]:
 
             status = get_xai_oauth_auth_status() or {}
         except Exception as exc:  # noqa: BLE001 - probe must fail closed
-            return False, f"xai-oauth status failed: {type(exc).__name__}"
+            return None, f"xai-oauth status failed: {type(exc).__name__}"
         if bool(status.get("logged_in")):
             return True, "xai-oauth logged_in"
         return False, "xai-oauth not logged_in"
@@ -84,11 +103,11 @@ def _probe_console_lane_health(lane_id: str) -> tuple[bool, str]:
                 (profile_map()["antigravity"],)
             )["antigravity"]
         except Exception as exc:  # noqa: BLE001
-            return False, f"antigravity doctor failed: {type(exc).__name__}"
+            return None, f"antigravity doctor failed: {type(exc).__name__}"
         if qualification.qualified:
             return True, "antigravity live-receipt qualified"
         return False, qualification.detail or "antigravity not qualified"
-    return False, f"unsupported console lane: {lane_id}"
+    return None, f"unsupported console lane: {lane_id}"
 
 
 
@@ -149,22 +168,25 @@ def _find_plan(plans: list[dict[str, Any]], needles: tuple[str, ...]) -> dict[st
     return matches[0] if matches else None
 
 
-def _weekly_used_from_snapshot(snapshot: object) -> float | None:
-    windows = getattr(snapshot, "windows", None) or ()
-    if not windows:
-        return None
-    weekly = [
-        window
-        for window in windows
-        if "week" in str(getattr(window, "label", "")).lower()
-    ]
-    chosen = weekly[0] if weekly else windows[-1]
-    return _clamp_pct(getattr(chosen, "used_percent", None))
+def _weekly_used_from_snapshot(
+    snapshot: object, *, lane_id: str
+) -> float | None:
+    relevant = RELEVANT_WEEKLY_WINDOWS.get(lane_id, frozenset())
+    values: list[float] = []
+    for window in getattr(snapshot, "windows", None) or ():
+        label = str(getattr(window, "label", "") or "").strip().casefold()
+        if label not in relevant:
+            continue
+        used = _clamp_pct(getattr(window, "used_percent", None))
+        if used is not None:
+            values.append(used)
+    return max(values) if values else None
 
 
 def _fetch_auto_lane_pct(
     provider_id: str,
     *,
+    lane_id: str,
     fetch_usage: Callable[[str], object | None] | None = None,
 ) -> float | None:
     if fetch_usage is None:
@@ -175,7 +197,7 @@ def _fetch_auto_lane_pct(
         snapshot = fetch_usage(provider_id)  # type: ignore[misc]
     except Exception as exc:  # pragma: no cover - provider network failures
         raise UsageRefreshError(f"{provider_id} usage fetch failed: {exc}") from exc
-    return _weekly_used_from_snapshot(snapshot)
+    return _weekly_used_from_snapshot(snapshot, lane_id=lane_id)
 
 
 def _empty_document(*, now: datetime | None = None) -> dict[str, Any]:
@@ -306,11 +328,16 @@ def refresh_usage_document(
     assert isinstance(plans, list)
     results: list[LaneRefreshResult] = []
     any_auto_success = False
+    any_console_health_evidence = False
     stamp = _iso(now)
 
     for lane_id, provider_id, default_label, needles in AUTO_LANES:
         try:
-            pct = _fetch_auto_lane_pct(provider_id, fetch_usage=fetch_usage)
+            pct = _fetch_auto_lane_pct(
+                provider_id,
+                lane_id=lane_id,
+                fetch_usage=fetch_usage,
+            )
         except UsageRefreshError as exc:
             results.append(
                 LaneRefreshResult(
@@ -358,8 +385,9 @@ def refresh_usage_document(
             )
         )
 
-    # Console-only lanes: never invent weekly_pct_used. Optional attestation may
-    # supply %, and a live health probe may stamp measured freshness metadata.
+    # Console-only lanes: usage and health have independent clocks. A health
+    # probe may update only health fields; it must never refresh a prior usage
+    # percentage or make an unattested percentage measured/comparable.
     attestation = _read_console_attestation(_console_attestation_path(home=home))
     for lane_id, default_label, needles in CONSOLE_ONLY_LANES:
         row = _find_plan(plans, needles)  # type: ignore[arg-type]
@@ -372,39 +400,49 @@ def refresh_usage_document(
             }
             plans.append(row)
         prior_pct = _clamp_pct(row.get("weekly_pct_used"))
-        if lane_id in attestation:
-            row["weekly_pct_used"] = attestation[lane_id]
-            prior_pct = attestation[lane_id]
-        healthy, health_detail = _probe_console_lane_health(lane_id)
-        if healthy:
-            row["checked_at"] = stamp
+        attested = lane_id in attestation
+        if attested:
+            attested_pct, attested_checked_at = attestation[lane_id]
+            row["weekly_pct_used"] = attested_pct
+            row["checked_at"] = attested_checked_at
+            row["measurement_kind"] = "measured"
             row["comparability_group"] = "subscription-weekly"
             row["quota_window_id"] = "subscription-weekly"
-            row["measurement_kind"] = "measured"
             row.setdefault("overage_disabled", True)
             row.setdefault("resets", "weekly")
-            results.append(
-                LaneRefreshResult(
-                    lane_id=lane_id,
-                    updated=True,
-                    weekly_pct_used=prior_pct,
-                    checked_at=stamp,
-                    detail=f"console health probe ok; {health_detail}",
-                )
-            )
-            continue
+            prior_pct = attested_pct
+
+        health_state, health_detail = _probe_console_lane_health(lane_id)
+        health_observed = health_state is not None
+        if health_observed:
+            any_console_health_evidence = True
+            row["health_status"] = "UP" if health_state else "DOWN"
+            row["health_checked_at"] = stamp
+
         prior_checked = row.get("checked_at")
+        if health_state is True:
+            health_summary = f"console health probe ok; {health_detail}"
+        elif health_state is False:
+            health_summary = f"console health probe down; {health_detail}"
+        else:
+            health_summary = f"console health probe unavailable; {health_detail}"
         results.append(
             LaneRefreshResult(
                 lane_id=lane_id,
-                updated=False,
+                updated=attested or health_observed,
                 weekly_pct_used=prior_pct,
-                checked_at=str(prior_checked) if isinstance(prior_checked, str) else None,
-                detail=f"console-only; health probe failed: {health_detail}",
+                checked_at=(
+                    str(prior_checked) if isinstance(prior_checked, str) else None
+                ),
+                detail=health_summary,
             )
         )
 
-    if not any_auto_success and previous is not None:
+    if (
+        not any_auto_success
+        and not any_console_health_evidence
+        and previous is not None
+    ):
         # Preserve prior file entirely when every auto lane failed.
         return UsageRefreshReport(
             path=target,
@@ -416,12 +454,13 @@ def refresh_usage_document(
             document=previous,
         )
 
-    document["source"] = (
-        "hermes native fleet usage refresh "
-        "(openai-codex + anthropic headless; grok/antigravity console health probe)"
-    )
     # Root checked_at tracks last successful auto refresh only.
     if any_auto_success:
+        document["source"] = (
+            "hermes native fleet usage refresh "
+            "(openai-codex + anthropic headless; "
+            "grok/antigravity console health probe)"
+        )
         document["checked_at"] = stamp
     document["schema_version"] = document.get("schema_version") or SCHEMA_VERSION
     validated = _validate_document(document)
@@ -446,8 +485,16 @@ def refresh_usage_document(
         mirrored_to=mirrored,
         source=str(validated.get("source") or ""),
         lanes=tuple(results),
-        ok=any_auto_success,
-        detail="refreshed" if any_auto_success else "created empty shell",
+        ok=any_auto_success or any_console_health_evidence,
+        detail=(
+            "refreshed"
+            if any_auto_success
+            else (
+                "console health refreshed; prior usage preserved"
+                if any_console_health_evidence
+                else "created empty shell"
+            )
+        ),
         document=validated,
     )
 
