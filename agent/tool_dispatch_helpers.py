@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -487,6 +488,7 @@ def make_tool_result_message(
         "tool_name": name,
         "content": wrapped,
         "tool_call_id": tool_call_id,
+        "timestamp": time.time(),
     }
     try:
         risk_metadata = _tool_output_risk_metadata(name, content)

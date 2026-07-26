@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import time
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -314,7 +315,7 @@ def finalize_turn(
             if _tail_role != "assistant":
                 # Tail is not an assistant row — append the final response
                 # so the durable turn closes with the answer (#43849/#44100).
-                messages.append({"role": "assistant", "content": final_response})
+                messages.append({"role": "assistant", "content": final_response, "timestamp": time.time()})
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:
                 # tool_calls with no text of its own. The role check alone
