@@ -549,7 +549,55 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
-| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's scheduled/terminal events. The gateway notifier drives delivery independently of task dispatch. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+
+### Task notifications in multi-profile gateways
+
+The Kanban notifier is independent of the embedded dispatcher. Setting
+`kanban.dispatch_in_gateway: false` creates a **notifier-only gateway**: it does
+not claim or spawn tasks, but it still delivers subscriptions for its connected
+profile adapters.
+
+Notification ownership is coordinated **per profile**. Standalone `default` and
+`writer` gateways can notify simultaneously, while two `writer` gateways use one
+profile-scoped advisory lock so exactly one polls. A lock loser does not open or
+poll board DBs. Multiplex gateways can own several profile locks and route each
+subscription through the adapter registry for its stamped `notifier_profile`.
+Blank subscriptions created by older Hermes versions belong to `default`.
+
+Tasks and auto-subscriptions created from messaging stamp the inbound
+`source.profile`; an unstamped source falls back to the gateway's startup
+profile. This prevents a task created through a multiplexed secondary bot from
+being delivered later by the primary bot.
+
+If a profile loses all connected adapters, the gateway releases that profile's
+notifier lock. Another eligible gateway retries within one second. Persistent
+DB cursors prevent already-delivered items from replaying after failover.
+
+Notifications are acknowledged one event at a time. If a later event fails,
+only that event is retried; an earlier successful scheduled/blocked review is
+not sent twice. Blocked and scheduled reviews include:
+
+- `ASK`
+- `WHY GATED` (the complete reason, not a 160-character preview)
+- `SCOPE`
+- `ROLLBACK`
+- `REPLY`
+- `WINDOW` for scheduled work
+- explicit `APPROVE <task-id>` and `VETO <task-id>` targets
+
+Existing optional `DEADLINE` and `SAFE DEFAULT` fields are preserved too.
+
+Hermes chunks the brief for adapters that do not split long messages natively,
+without omitting fields. For the API server there is no push channel, so the
+wake self-post carries the brief and must succeed before its cursor advances.
+Failed push sends or wake self-posts rewind the item for retry; three consecutive
+failures remove the dead subscription.
+
+If a notification does not arrive, check the subscription profile, that
+profile's connected platform adapter, and the gateway log's notifier-lock
+acquire/release lines. Do not enable task dispatch merely to fix notifications;
+the two ownership paths are intentionally separate.
 
 And the two auxiliary LLM slots:
 

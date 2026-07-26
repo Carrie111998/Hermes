@@ -69,15 +69,22 @@ class GatewayAuthorizationMixin:
         """Resolve the live adapter whose intake policy should gate authorization.
 
         In multiplex mode, secondary-profile adapters live in
-        ``_profile_adapters[profile]`` while the default/active profile uses
+        ``_profile_adapters[profile]`` while the process's active profile uses
         ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
-        When a stamped profile has its own adapter registry entry, the default
-        profile's same-platform adapter must not be consulted as a fallback.
+        A named standalone gateway therefore resolves its own stamped profile
+        through ``self.adapters`` just like the default profile does.
         """
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name and profile_name != "default":
+        active_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not active_profile:
+            try:
+                active_profile = self._active_profile_name()
+            except Exception:
+                active_profile = "default"
+        active_profile = active_profile or "default"
+        if profile_name and profile_name != active_profile:
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)

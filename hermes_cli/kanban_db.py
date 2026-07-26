@@ -9422,14 +9422,15 @@ def add_notify_sub(
                 (chat_type, task_id, platform, chat_id, thread_id or ""),
             )
         if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership by
-            # backfilling only when the existing value is unset.
+            # A subscription has one transport owner. Re-registering the same
+            # target from another profile is an explicit ownership transfer;
+            # leaving the stale owner would make the row permanently
+            # undeliverable when only the new profile's adapter is connected.
             conn.execute(
                 """
                 UPDATE kanban_notify_subs
                    SET notifier_profile = ?
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
             )
@@ -9472,6 +9473,7 @@ def unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    limit: Optional[int] = None,
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
@@ -9496,6 +9498,9 @@ def unseen_events_for_sub(
     params: list[Any] = [task_id, cursor]
     if kind_list:
         params.extend(kind_list)
+    if limit is not None:
+        q += " LIMIT ?"
+        params.append(max(1, int(limit)))
     rows = conn.execute(q, params).fetchall()
     out: list[Event] = []
     max_id = cursor
@@ -9521,6 +9526,7 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    limit: Optional[int] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -9552,6 +9558,7 @@ def claim_unseen_events_for_sub(
             chat_id=chat_id,
             thread_id=thread_id,
             kinds=kinds,
+            limit=limit,
         )
         if not events:
             return old_cursor, old_cursor, []

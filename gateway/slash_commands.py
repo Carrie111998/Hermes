@@ -457,6 +457,20 @@ class GatewaySlashCommandsMixin:
             break
 
         is_create = action == "create"
+        source = event.source
+        source_profile = str(getattr(source, "profile", "") or "").strip()
+        if not source_profile:
+            source_profile = (
+                getattr(self, "_kanban_notifier_profile", None)
+                or self._active_profile_name()
+                or "default"
+            )
+        if is_create:
+            # A multiplexed secondary command still executes in the primary
+            # gateway process. Stamp the task with the effective inbound
+            # profile instead of the process startup profile.
+            tokens.extend(("--created-by", source_profile))
+            text = shlex.join(tokens)
 
         try:
             output = await asyncio.to_thread(run_slash, text)
@@ -472,7 +486,6 @@ class GatewaySlashCommandsMixin:
             if m:
                 task_id = m.group(1)
                 try:
-                    source = event.source
                     platform = getattr(source, "platform", None)
                     platform_str = (
                         platform.value if hasattr(platform, "value") else str(platform or "")
@@ -492,7 +505,7 @@ class GatewaySlashCommandsMixin:
                                     chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    notifier_profile=source_profile,
                                 )
                             finally:
                                 conn.close()

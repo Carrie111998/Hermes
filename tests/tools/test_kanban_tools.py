@@ -2447,6 +2447,38 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
 
 
+def test_create_stamps_effective_gateway_session_profile(monkeypatch, worker_env):
+    """Multiplex session context, not the process profile, owns task + sub."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from gateway.session_context import _SESSION_PROFILE
+
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "wrong-process-profile")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "writer-chat")
+
+    token = _SESSION_PROFILE.set("writer")
+    try:
+        result = json.loads(
+            kt._handle_create({"title": "profile-owned", "assignee": "peer"})
+        )
+    finally:
+        _SESSION_PROFILE.reset(token)
+    assert result["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, result["task_id"])
+        assert task is not None
+        assert task.created_by == "writer"
+        subs = kb.list_notify_subs(conn, task.id)
+        assert len(subs) == 1
+        assert subs[0]["notifier_profile"] == "writer"
+    finally:
+        conn.close()
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
