@@ -4331,6 +4331,23 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def close_other_source_sessions(
+        self, session_id: str, source: str = "tui", end_reason: str = "session_switch"
+    ) -> None:
+        """Close all sessions from a given source except the specified one.
+
+        Used by session.resume to clean up stale open sessions when switching
+        between chats in the TUI sidebar. No-op when there are no other open
+        sessions from this source.
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                "WHERE source = ? AND ended_at IS NULL AND id != ?",
+                (time.time(), end_reason, source, session_id),
+            )
+        self._execute_write(_do)
+
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):

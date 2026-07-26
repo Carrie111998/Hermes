@@ -7249,6 +7249,13 @@ def _(rid, params: dict) -> dict:
             target = tip
             found = db.get_session(target) or found
 
+    # Close stale open sessions when switching — the TUI sidebar does not
+    # end the previous session, leaving ghost rows with ended_at=NULL.
+    try:
+        db.close_other_source_sessions(target, source="tui")
+    except Exception:
+        pass
+
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
