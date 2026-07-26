@@ -202,8 +202,11 @@ def test_returns_turn_context_with_user_message_appended():
     ctx = _build(agent)
     assert isinstance(ctx, TurnContext)
     assert ctx.user_message == "hello"
-    # The user turn was appended and indexed.
-    assert ctx.messages[-1] == {"role": "user", "content": "hello"}
+    # The user turn was appended and indexed. Compared field-wise because
+    # every message also carries a creation `timestamp`, whose value is the
+    # current time and so cannot be written into an equality literal.
+    assert ctx.messages[-1]["role"] == "user"
+    assert ctx.messages[-1]["content"] == "hello"
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
 
@@ -235,7 +238,9 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert agent._current_turn_id.startswith("compression-child:")
     log_context.assert_called_once_with("compression-child")
     assert ctx.conversation_history == compacted_history
-    assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
+    assert ctx.messages[:-1] == compacted_history
+    assert ctx.messages[-1]["role"] == "user"
+    assert ctx.messages[-1]["content"] == "hello"
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
@@ -512,3 +517,39 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+
+
+def test_user_message_is_stamped_with_a_creation_timestamp():
+    """Every user message carries when it was created, not when it was saved.
+
+    Persistence falls back to save time when a message has no timestamp
+    (hermes_state._insert_messages), so an unstamped message records the
+    moment it was written rather than the moment it was sent. That drift is
+    unbounded for any path where persistence is delayed.
+    """
+    import time
+
+    agent = _FakeAgent()
+    before = time.time()
+    ctx = _build(agent, user_message="hello")
+    after = time.time()
+
+    stamped = ctx.messages[-1].get("timestamp")
+    assert stamped is not None, "user messages must be stamped at creation"
+    assert before <= stamped <= after
+
+
+def test_an_existing_timestamp_is_not_overwritten():
+    """A staged or platform-supplied time is truth and must survive.
+
+    The CLI stages its own dict already stamped at staging time, which is
+    earlier and more accurate than turn setup; clobbering it here would
+    reintroduce the drift this stamping exists to remove.
+    """
+    agent = _FakeAgent()
+    staged = {"role": "user", "content": "staged prompt", "timestamp": 1785047442.06518}
+    agent._pending_cli_user_message = staged
+
+    ctx = _build(agent, user_message="staged prompt")
+
+    assert ctx.messages[-1]["timestamp"] == 1785047442.06518

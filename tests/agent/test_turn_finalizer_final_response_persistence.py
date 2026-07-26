@@ -193,9 +193,15 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
         _turn_exit_reason="fallback_prior_turn_content",
     )
 
-    assert result["messages"][-1] == {"role": "assistant", "content": "Done."}
+    # Compared field-wise rather than by dict equality: every message now
+    # carries a creation `timestamp`, whose value is the current time and so
+    # cannot appear in an equality literal.
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["content"] == "Done."
+    assert result["messages"][-1]["timestamp"] is not None
     assert agent.persisted_messages is not None
-    assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
+    assert agent.persisted_messages[-1]["role"] == "assistant"
+    assert agent.persisted_messages[-1]["content"] == "Done."
 
 
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):

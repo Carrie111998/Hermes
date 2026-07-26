@@ -214,6 +214,11 @@ class TestUntrustedWrapping:
 class TestMakeToolResultMessage:
     def test_low_risk_message_built_unchanged(self):
         msg = make_tool_result_message("terminal", "ls output", "call_1")
+        # `timestamp` is stamped at creation and is the current time, so the
+        # message is compared field-wise with the timestamp checked separately
+        # rather than dropped from the assertion.
+        stamped = msg.pop("timestamp", None)
+        assert stamped is not None, "tool results must be stamped at creation"
         assert msg == {
             "role": "tool",
             "name": "terminal",

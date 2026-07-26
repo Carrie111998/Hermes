@@ -12564,7 +12564,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent._persist_user_message_idx = None
             agent._persist_user_message_override = None
             agent._persist_user_message_timestamp = None
-            staged_user_message = {"role": "user", "content": message}
+            staged_user_message = {
+                "role": "user",
+                "content": message,
+                # Stamped at staging, which is when the user actually sent it;
+                # persistence can be arbitrarily later. The CLI path supplies
+                # no persist_user_timestamp override (set to None just above),
+                # so without this the row falls back to save time.
+                "timestamp": time.time(),
+            }
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 

@@ -451,7 +451,11 @@ def test_chat_clears_previous_turn_persistence_override_before_staging():
     assert agent.staged_override is None
     assert agent._persist_user_message_idx is None
     assert agent._persist_user_message_timestamp is None
-    assert agent.staged_message == {"role": "user", "content": "new prompt"}
+    # Field-wise: the staged message is now stamped at staging time, which is
+    # the moment the user sent it, so its value cannot be an equality literal.
+    assert agent.staged_message["role"] == "user"
+    assert agent.staged_message["content"] == "new prompt"
+    assert agent.staged_message["timestamp"] is not None
 
 
 def test_chat_close_does_not_persist_previous_turn_override(tmp_path, monkeypatch):
