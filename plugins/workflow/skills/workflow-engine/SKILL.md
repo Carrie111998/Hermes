@@ -186,6 +186,27 @@ reviews:
 
 When qa-review passes, security-review is dispatched. If any reviewer fails, the creator is enriched with feedback and reset to ready.
 
+### Retry limits
+
+Reviews have configurable retry limits with precedence (highest to lowest):
+
+1. **Per-review**: `{review: "qa-review", max_retries: 5}`
+2. **Node-level**: `max_retries: 3` on the node under review
+3. **Workflow-level**: `max_retries: 5` in YAML
+4. **Env var**: `HERMES_WORKFLOW_MAX_RETRIES`
+5. **Engine default**: 3
+
+```yaml
+nodes:
+  spec-author:
+    max_retries: 5
+    reviews:
+      - qa-review
+      - {review: security-review, max_retries: 2}
+```
+
+When the limit is hit, the reviewer is not dispatched and the node stays blocked.
+
 ## Dry-Run Mode
 
 ```python
