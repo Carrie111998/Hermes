@@ -8,23 +8,12 @@ import { $connection, setCurrentCwd } from '@/store/session'
 import { resetProjectTreeState } from './files/use-project-tree'
 
 import { RightSidebarPane } from './index'
+import { ReviewPane } from './review'
 
 const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
-const selectPaths = vi.fn()
-
-function ok(entries: { name: string; path: string; isDirectory: boolean }[]): HermesReadDirResult {
-  return { entries }
-}
 
 function installBridge() {
-  ;(
-    window as unknown as {
-      hermesDesktop: {
-        readDir: typeof readDir
-        selectPaths: typeof selectPaths
-      }
-    }
-  ).hermesDesktop = { readDir, selectPaths }
+  ;(window as unknown as { hermesDesktop: { readDir: typeof readDir } }).hermesDesktop = { readDir }
 }
 
 describe('RightSidebarPane', () => {
@@ -32,11 +21,8 @@ describe('RightSidebarPane', () => {
     $connection.set(null)
     $panesFlipped.set(false)
     resetProjectTreeState()
-    setCurrentCwd('/repo')
     readDir.mockReset()
-    selectPaths.mockReset()
-    readDir.mockResolvedValue(ok([{ name: 'README.md', path: '/repo/README.md', isDirectory: false }]))
-    selectPaths.mockResolvedValue(['/repo-next'])
+    readDir.mockResolvedValue({ entries: [{ isDirectory: false, name: 'README.md', path: '/repo/README.md' }] })
     installBridge()
   })
 
@@ -49,37 +35,32 @@ describe('RightSidebarPane', () => {
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
   })
 
-  it('refreshes the current tree without opening the folder picker', async () => {
-    const onChangeCwd = vi.fn()
+  it('renders the tree whenever the session has a working dir (repo or not) — no picker', async () => {
+    setCurrentCwd('/repo')
 
-    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} onChangeCwd={onChangeCwd} />)
+    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
 
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Refresh tree' }).hasAttribute('disabled')).toBe(false)
-    )
+    const refresh = await screen.findByRole('button', { name: 'Refresh tree' })
 
     readDir.mockClear()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh tree' }))
-
+    fireEvent.click(refresh)
     await waitFor(() => expect(readDir).toHaveBeenCalledWith('/repo'))
-    expect(selectPaths).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Open folder' }))
+    // The freeform folder picker is retired.
+    expect(screen.queryByRole('button', { name: 'Open folder' })).toBeNull()
+  })
 
-    await waitFor(() =>
-      expect(selectPaths).toHaveBeenCalledWith({
-        defaultPath: '/repo',
-        directories: true,
-        multiple: false,
-        title: 'Change working directory'
-      })
-    )
-    await waitFor(() => expect(onChangeCwd).toHaveBeenCalledWith('/repo-next'))
+  it('shows no tree for a detached chat (no working dir)', async () => {
+    setCurrentCwd('')
+
+    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Refresh tree' })).toBeNull())
+    expect(readDir).not.toHaveBeenCalled()
   })
 
   it('keeps the file browser edge below the titlebar controls', () => {
-    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} onChangeCwd={vi.fn()} />)
+    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
 
     const pane = screen.getByLabelText('Right sidebar')
 
@@ -91,9 +72,32 @@ describe('RightSidebarPane', () => {
   it('keeps the clipped edge on the main-column side when panes are flipped', () => {
     $panesFlipped.set(true)
 
-    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} onChangeCwd={vi.fn()} />)
+    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
 
     const pane = screen.getByLabelText('Right sidebar')
+
+    expect(pane.className).toContain('before:top-(--titlebar-height)')
+    expect(pane.className).toContain('before:right-0')
+    expect(pane.className).not.toContain('before:left-0')
+    expect(pane.className).not.toMatch(/\bborder-l\b|\bborder-r\b/)
+  })
+
+  it('keeps the review edge below the titlebar controls', () => {
+    render(<ReviewPane />)
+
+    const pane = screen.getByLabelText('Review')
+
+    expect(pane.className).toContain('before:top-(--titlebar-height)')
+    expect(pane.className).toContain('before:left-0')
+    expect(pane.className).not.toMatch(/\bborder-l\b|\bborder-r\b/)
+  })
+
+  it('keeps the review edge on the main-column side when panes are flipped', () => {
+    $panesFlipped.set(true)
+
+    render(<ReviewPane />)
+
+    const pane = screen.getByLabelText('Review')
 
     expect(pane.className).toContain('before:top-(--titlebar-height)')
     expect(pane.className).toContain('before:right-0')
