@@ -137,11 +137,13 @@ def _is_blocked_type(text: str) -> Optional[str]:
 # Backend selection — env-swappable for tests
 # ---------------------------------------------------------------------------
 
-# Per-process cached backend; lazily instantiated on first call.
+# Task-owned backends, lazily instantiated on the first action for that task.
+# The runtime dispatcher always supplies ``task_id``.  The empty key preserves
+# direct-call/test compatibility for legacy callers outside that dispatcher.
 _backend_lock = threading.Lock()
 # Process-scoped aux-vision routing cache: (provider, model) → bool.
 _AUX_VISION_ROUTE_CACHE: Dict[Tuple[str, str], bool] = {}
-_backend: Optional[ComputerUseBackend] = None
+_backends: Dict[str, ComputerUseBackend] = {}
 # Approval state, scoped per conversation/run (keyed by session_id) so a
 # gateway serving concurrent sessions can't leak one run's "always approve"
 # unlock into another. Falls back to a shared "" bucket for callers that
@@ -154,55 +156,63 @@ _session_auto_approve: Dict[str, bool] = {}
 _always_allow: Dict[str, set] = {}
 
 
-def _get_backend() -> ComputerUseBackend:
-    global _backend
+def _get_backend(task_id: str = "") -> ComputerUseBackend:
+    """Return the backend owned by ``task_id``, starting it once if needed."""
     with _backend_lock:
-        if _backend is None:
-            backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
-            if backend_name in {"cua", "cua-driver", ""}:
-                from tools.computer_use.cua_backend import CuaDriverBackend
-                _backend = CuaDriverBackend()
-            elif backend_name == "noop":  # pragma: no cover
-                _backend = _NoopBackend()
-            else:
-                raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
+        backend = _backends.get(task_id)
+        if backend is not None:
+            return backend
+
+        backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
+        if backend_name in {"cua", "cua-driver", ""}:
+            from tools.computer_use.cua_backend import CuaDriverBackend
+            backend = CuaDriverBackend()
+        elif backend_name == "noop":  # pragma: no cover
+            backend = _NoopBackend()
+        else:
+            raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
+        try:
+            backend.start()
+        except Exception:
+            # start() can allocate the async bridge before failing.  It is not
+            # registered yet, so task cleanup and atexit cannot reach it.
+            # Best-effort stop preserves the original startup failure.
             try:
-                _backend.start()
+                backend.stop()
             except Exception:
-                # Don't cache a backend whose start() failed (e.g. a lazy
-                # dependency install was declined / failed). The next call
-                # retries cleanly instead of returning a half-initialised
-                # backend.
-                _backend = None
-                raise
-        return _backend
+                logger.debug("computer_use backend stop after failed start failed", exc_info=True)
+            raise
+        _backends[task_id] = backend
+        return backend
+
+
+def cleanup_computer_use(task_id: str) -> None:
+    """Stop and forget only the CUA backend owned by ``task_id``.
+
+    Detaching while holding the registry lock makes repeated cleanup harmless
+    and prevents another task's backend from being selected for teardown.
+    ``stop()`` runs outside the lock because its bounded MCP shutdown can wait.
+    """
+    with _backend_lock:
+        backend = _backends.pop(task_id, None)
+    if backend is not None:
+        backend.stop()
 
 
 def _shutdown_backend_atexit() -> None:
-    """Stop the cached backend so the cua-driver child doesn't outlive us.
+    """Emergency process-exit fallback for every still-owned CUA backend.
 
-    The backend is cached per-process and holds a long-lived ``cua-driver``
-    subprocess, so without this the driver survives the Hermes process that
-    spawned it (#28152 item 3). #69903 kept the orphan from burning a core by
-    disabling the cursor overlay; the process itself still lingered.
-
-    Mirrors ``browser_tool``'s ``atexit.register(_emergency_cleanup_all_sessions)``
-    — same spawn-and-drive-a-subprocess shape. atexit only, no signal handlers:
-    a ``SystemExit`` raised from a prompt_toolkit key binding corrupts its
-    coroutine state and makes the process unkillable. Never raises, since an
-    exception escaping atexit prints a traceback on every exit.
+    Normal task completion uses :func:`cleanup_computer_use`.  This hook only
+    protects abrupt interpreter exit and must never let a teardown error escape.
     """
-    global _backend
-    # Drop the lock before stop() — teardown budgets 5s and shouldn't block
-    # an unrelated caller waiting to spawn.
     with _backend_lock:
-        backend, _backend = _backend, None
-    if backend is None:
-        return
-    try:
-        backend.stop()
-    except Exception as e:
-        logger.debug("cua-driver atexit teardown failed: %s", e)
+        backends = list(_backends.values())
+        _backends.clear()
+    for backend in backends:
+        try:
+            backend.stop()
+        except Exception as e:
+            logger.debug("cua-driver atexit teardown failed: %s", e)
 
 
 atexit.register(_shutdown_backend_atexit)
@@ -292,8 +302,9 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     action = (args.get("action") or "").strip().lower()
     if not action:
         return json.dumps({"error": "missing `action`"})
-    # Per-run key for approval-state isolation across concurrent sessions.
+    # Per-run keys isolate approvals and backend ownership across concurrent tasks.
     session_id = str(kwargs.get("session_id") or "")
+    task_id = str(kwargs.get("task_id") or "")
 
     # Safety: validate actions before approval prompt.
     if action == "type":
@@ -323,7 +334,7 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 
     # Dispatch to backend.
     try:
-        backend = _get_backend()
+        backend = _get_backend(task_id)
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",

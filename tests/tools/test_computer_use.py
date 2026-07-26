@@ -6,6 +6,8 @@ import base64
 import json
 import os
 import sys
+import threading
+from types import SimpleNamespace
 from typing import Any, Dict, List, cast
 from unittest.mock import MagicMock, patch
 
@@ -360,6 +362,146 @@ class TestDispatch:
         # Noop backend returns ok=True, so capture should have been called.
         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
         assert len(capture_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task-owned backend lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestTaskOwnedBackendLifecycle:
+    class _Backend:
+        def __init__(self, *, fail_start=False, fail_stop=False):
+            self.fail_start = fail_start
+            self.fail_stop = fail_stop
+            self.started = 0
+            self.stopped = 0
+            self.calls = []
+
+        def start(self):
+            self.started += 1
+            if self.fail_start:
+                raise RuntimeError("start failed")
+
+        def stop(self):
+            self.stopped += 1
+            if self.fail_stop:
+                raise RuntimeError("stop failed")
+
+        def is_available(self):
+            return True
+
+        def list_apps(self):
+            self.calls.append("list_apps")
+            return []
+
+        def list_windows(self):
+            self.calls.append("list_windows")
+            return []
+
+    def test_actions_in_one_task_reuse_one_backend(self, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "cua")
+        backend = self._Backend()
+        with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend) as factory:
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-a")
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-a")
+
+        assert factory.call_count == 1
+        assert backend.started == 1
+        assert backend.calls == ["list_apps", "list_apps"]
+
+    def test_concurrent_task_ids_receive_distinct_backends(self, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "cua")
+        first = self._Backend()
+        second = self._Backend()
+        barrier = threading.Barrier(3)
+        results = []
+
+        def run(task_id):
+            barrier.wait()
+            results.append(cu_tool.handle_computer_use({"action": "list_apps"}, task_id=task_id))
+
+        with patch("tools.computer_use.cua_backend.CuaDriverBackend", side_effect=[first, second]) as factory:
+            threads = [threading.Thread(target=run, args=(task_id,)) for task_id in ("task-a", "task-b")]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+
+        assert factory.call_count == 2
+        assert len(results) == 2
+        assert all("error" not in json.loads(result) for result in results)
+        assert first is not second
+
+    def test_cleanup_detaches_only_its_task_backend_and_is_idempotent(self, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "cua")
+        first = self._Backend()
+        second = self._Backend()
+        with patch("tools.computer_use.cua_backend.CuaDriverBackend", side_effect=[first, second]):
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-a")
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-b")
+            cu_tool.cleanup_computer_use("task-a")
+            cu_tool.cleanup_computer_use("task-a")
+
+            assert "task-a" not in cu_tool._backends
+            assert cu_tool._backends["task-b"] is second
+            assert first.stopped == 1
+            assert second.stopped == 0
+
+    def test_task_finalizer_closes_only_its_task_backend(self, monkeypatch):
+        from agent import chat_completion_helpers as helpers
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "cua")
+        first = self._Backend()
+        second = self._Backend()
+        runtime = SimpleNamespace(cleanup_vm=lambda task_id: None, cleanup_browser=lambda task_id: None)
+        agent = SimpleNamespace(verbose_logging=False)
+        with patch("tools.computer_use.cua_backend.CuaDriverBackend", side_effect=[first, second]), patch.object(
+            helpers, "_ra", return_value=runtime
+        ):
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-a")
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-b")
+            helpers.cleanup_task_resources(agent, "task-a")
+
+        assert first.stopped == 1
+        assert second.stopped == 0
+        assert "task-a" not in cu_tool._backends
+        assert cu_tool._backends["task-b"] is second
+
+    def test_start_failure_does_not_cache_backend(self, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "cua")
+        failed = self._Backend(fail_start=True)
+        with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=failed):
+            result = json.loads(cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-a"))
+
+        assert "backend unavailable" in result["error"]
+        assert failed.stopped == 1
+        assert "task-a" not in cu_tool._backends
+
+    def test_atexit_stops_all_task_backends_without_raising(self, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "cua")
+        healthy = self._Backend()
+        failing = self._Backend(fail_stop=True)
+        with patch("tools.computer_use.cua_backend.CuaDriverBackend", side_effect=[healthy, failing]):
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-a")
+            cu_tool.handle_computer_use({"action": "list_apps"}, task_id="task-b")
+            cu_tool._shutdown_backend_atexit()
+
+        assert healthy.stopped == 1
+        assert failing.stopped == 1
+        assert cu_tool._backends == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1397,7 +1539,7 @@ class TestCaptureAfterAppContext:
 
         backend = TrackingBackend()
         cu_tool.reset_backend_for_tests()
-        cu_tool._backend = backend
+        cu_tool._backends[""] = cast(Any, backend)
 
         cu_tool.handle_computer_use({"action": "click", "element": 14, "capture_after": True})
 
@@ -1463,7 +1605,7 @@ class TestCaptureAfterAppContext:
 
         backend = NoContextBackend()
         cu_tool.reset_backend_for_tests()
-        cu_tool._backend = backend
+        cu_tool._backends[""] = cast(Any, backend)
 
         cu_tool.handle_computer_use({"action": "click", "element": 5, "capture_after": True})
 
@@ -2377,7 +2519,7 @@ class TestCaptureAfterExactTarget:
             return original_call_tool(name, args)
 
         session.call_tool.side_effect = _call_tool
-        monkeypatch.setattr(computer_use_tool, "_backend", backend)
+        monkeypatch.setattr(computer_use_tool, "_backends", {"": backend})
 
         capture_out = computer_use_tool.handle_computer_use({
             "action": "capture", "mode": "ax", "app": "org.freecad.FreeCAD",

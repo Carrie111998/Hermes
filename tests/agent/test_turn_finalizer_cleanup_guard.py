@@ -8,6 +8,9 @@ for must still be returned.  Previously any of those raised straight out of
 traceback and lost the whole turn.
 """
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 from agent.turn_finalizer import finalize_turn
@@ -41,6 +44,7 @@ class _StubAgent:
         self._interrupt_message = None
         self._tool_guardrail_halt_decision = None
         self._response_was_previewed = False
+        self.cleaned_task_ids = []
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
         for attr in (
@@ -63,7 +67,8 @@ class _StubAgent:
         if "save_trajectory" in self._raise_in:
             raise RuntimeError("trajectory disk full")
 
-    def _cleanup_task_resources(self, *a, **k):
+    def _cleanup_task_resources(self, task_id, *a, **k):
+        self.cleaned_task_ids.append(task_id)
         if "cleanup_task_resources" in self._raise_in:
             raise RuntimeError("docker teardown EOF")
 
@@ -106,6 +111,7 @@ def _run(
     final_response=None,
     api_call_count=3,
     turn_exit_reason="unknown",
+    interrupted=False,
 ):
     messages = [
         {"role": "user", "content": "do a thing"},
@@ -122,7 +128,7 @@ def _run(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
-        interrupted=False,
+        interrupted=interrupted,
         failed=False,
         messages=messages,
         conversation_history=None,
@@ -162,6 +168,34 @@ def test_single_cleanup_step_raises_does_not_skip_others(step):
         )
     ]
     assert len(result["cleanup_errors"]) == 1
+
+
+def test_computer_use_cleanup_failure_does_not_block_vm_or_browser_cleanup(caplog):
+    from agent import chat_completion_helpers as helpers
+
+    calls = []
+    runtime = SimpleNamespace(
+        cleanup_vm=lambda task_id: calls.append(("vm", task_id)),
+        cleanup_browser=lambda task_id: calls.append(("browser", task_id)),
+    )
+    agent = SimpleNamespace(verbose_logging=False)
+
+    with patch.object(helpers, "_ra", return_value=runtime), patch(
+        "tools.computer_use.tool.cleanup_computer_use",
+        side_effect=RuntimeError("MCP bridge close failed"),
+    ):
+        helpers.cleanup_task_resources(agent, "task-1")
+
+    assert calls == [("vm", "task-1"), ("browser", "task-1")]
+    assert "Failed to cleanup computer_use for task task-1" in caplog.text
+
+
+def test_user_interrupt_reaches_task_resource_cleanup():
+    agent = _StubAgent(raise_in=())
+    result = _run(agent, interrupted=True)
+
+    assert result["interrupted"] is True
+    assert agent.cleaned_task_ids == ["task-1"]
 
 
 def test_clean_turn_has_no_cleanup_errors_key():

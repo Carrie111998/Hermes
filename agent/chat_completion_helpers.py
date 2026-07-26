@@ -2212,7 +2212,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:
-    """Clean up VM and browser resources for a given task.
+    """Clean up VM, browser, and computer-use resources for a given task.
 
     Skips ``cleanup_vm`` when the active terminal environment is marked
     persistent (``persistent_filesystem=True``) so that long-lived sandbox
@@ -2257,6 +2257,11 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     except Exception as e:
         if agent.verbose_logging:
             logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+    try:
+        from tools.computer_use.tool import cleanup_computer_use
+        cleanup_computer_use(task_id)
+    except Exception as e:
+        logger.warning("Failed to cleanup computer_use for task %s: %s", task_id, e)
 
 
 def _build_partial_stream_stub(
