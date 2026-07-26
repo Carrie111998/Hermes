@@ -748,9 +748,117 @@ def redeem_codex_reset_credit(
     )
 
 
+def _read_credential_pool_direct(provider_id: str) -> list:
+    """Read credential pool raw entries directly from disk, NO backup/recovery machinery.
+
+    CRITICAL: Reads auth.json file bytes directly, parses JSON without invoking
+    any backup recovery (which could write a corrupt-backup file). Fails-closed
+    on any parse error with empty list return (no side effects).
+
+    This is a write-incapable read used only for usage measurement probes to ensure
+    zero persistence risk from the pool reader itself.
+    """
+    import os
+    import json
+    from pathlib import Path
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        pool_path = get_hermes_home() / "auth.json"
+        # Read file bytes directly — no persistence machinery invoked.
+        file_bytes = pool_path.read_bytes()
+        # Parse JSON without any backup/recovery recovery machinery.
+        # On parse error, return empty list (fail-closed, no writes).
+        auth_store = json.loads(file_bytes.decode("utf-8"))
+        credential_pool = auth_store.get("credential_pool")
+        if not isinstance(credential_pool, dict):
+            return []
+        provider_entries = credential_pool.get(provider_id)
+        if not isinstance(provider_entries, list):
+            return []
+        return list(provider_entries)
+    except FileNotFoundError:
+        return []
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError, KeyError):
+        # Parse error, file missing, or permission issue — return empty list.
+        # Do NOT invoke any backup/recovery machinery.
+        logger.debug(
+            "Credential pool direct read failed (fail-closed, no backup attempted)",
+            exc_info=True,
+        )
+        return []
+
+
+def _resolve_anthropic_token_readonly() -> Optional[str]:
+    """Resolve Anthropic token READ-ONLY (no refresh, no writes, no pool persistence).
+
+    STRICTLY READ-ONLY resolver for usage-measurement probes. Never triggers:
+    - OAuth token refresh (no POST to token endpoint)
+    - Credential file writes (no writes to ~/.claude.json)
+    - Pool persistence (reads auth.json bytes directly, NO load_pool() / write_credential_pool())
+
+    Returns stored token or None if unavailable/expired (honest unknown).
+    """
+    import os
+
+    # 1. Hermes-managed OAuth/setup token env var (static, no refresh)
+    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    if token:
+        return token
+
+    # 2. CLAUDE_CODE_OAUTH_TOKEN (setup-token env var, no refresh)
+    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if cc_token:
+        return cc_token
+
+    # 3. Claude Code credential file — read stored token WITHOUT refresh.
+    # Expired tokens → None (honest unknown, no error/POST attempt).
+    try:
+        from agent.anthropic_adapter import read_claude_code_credentials, is_claude_code_token_valid
+
+        creds = read_claude_code_credentials()
+        if creds and is_claude_code_token_valid(creds):
+            return creds.get("accessToken", "").strip() or None
+    except Exception:
+        logger.debug("Claude Code credentials read failed (fail-closed)", exc_info=True)
+
+    # 4. Anthropic credential_pool — read raw JSON bytes directly (NO load_pool persistence).
+    # Critical: read_credential_pool() itself can have corrupt-backup write paths.
+    # We read auth.json bytes directly and parse without backup/recovery machinery.
+    try:
+        from agent.credential_pool import AUTH_TYPE_OAUTH, PooledCredential
+
+        raw_entries = _read_credential_pool_direct("anthropic")
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            try:
+                entry = PooledCredential.from_dict("anthropic", raw_entry)
+            except Exception:
+                continue
+            if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
+                continue
+            token = (getattr(entry, "access_token", None) or "").strip()
+            if token:
+                return token
+    except Exception:
+        logger.debug("Credential pool read failed (fail-closed)", exc_info=True)
+
+    # 5. Regular API key env var (no refresh).
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        return api_key
+
+    return None
+
+
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
-    """Measure subscription usage with OAuth; never perform Anthropic inference."""
-    token = resolve_anthropic_token()
+    """Measure subscription usage with OAuth; never perform Anthropic inference.
+
+    Uses read-only token resolver to avoid credential refresh, file writes, or pool persistence.
+    """
+    token = _resolve_anthropic_token_readonly()
     if not token:
         return None
     if not _is_oauth_token(token):
