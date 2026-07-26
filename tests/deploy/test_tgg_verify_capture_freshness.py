@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,8 @@ def _probe(**overrides: object) -> dict[str, object]:
         "capture_last_message_id": "M-20",
         "inbox_last_message_id": "M-20",
         "inbox_last_created_at": "2026-07-25T10:00:01+00:00",
+        "capture_inbox_divergence_age_seconds": None,
+        "capture_inbox_marker_found": True,
         "queue_length": 10,
         "socket_status": "connected",
         "queue_cap": 5000,
@@ -59,7 +62,10 @@ def _probe(**overrides: object) -> dict[str, object]:
 
 
 def _run(
-    tmp_path: Path, probe: dict[str, object]
+    tmp_path: Path,
+    probe: dict[str, object],
+    *,
+    env_overrides: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict]:
     path = tmp_path / "probe.json"
     path.write_text(json.dumps(probe))
@@ -68,7 +74,11 @@ def _run(
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "CAPTURE_MAX_STALE_HOURS": "12"},
+        env={
+            **os.environ,
+            "CAPTURE_MAX_STALE_HOURS": "12",
+            **(env_overrides or {}),
+        },
     )
     assert result.stdout, result.stderr
     return result, json.loads(result.stdout)
@@ -107,7 +117,10 @@ def test_induced_old_pending_inbound_fails_with_named_condition(
 def test_capture_inbox_divergence_fails_only_when_consumer_expected(
     tmp_path: Path,
 ) -> None:
-    divergent = _probe(inbox_last_message_id="M-19")
+    divergent = _probe(
+        inbox_last_message_id="M-19",
+        capture_inbox_divergence_age_seconds=7201,
+    )
     result, report = _run(tmp_path, divergent)
     assert result.returncode == 1
     assert report["condition"] == "capture-inbox-diverged"
@@ -119,6 +132,72 @@ def test_capture_inbox_divergence_fails_only_when_consumer_expected(
     assert result.returncode == 0
     assert report["condition"] == "quiet-within-measured-pattern"
     assert report["capture_inbox_lockstep"] is False
+
+
+def test_ongoing_capture_does_not_hide_old_inbox_divergence(
+    tmp_path: Path,
+) -> None:
+    result, report = _run(
+        tmp_path,
+        _probe(
+            capture_mtime_epoch=SATURDAY - 30,
+            inbox_last_message_id="M-19",
+            capture_inbox_divergence_age_seconds=7201,
+        ),
+    )
+
+    assert result.returncode == 1
+    assert report["condition"] == "capture-inbox-diverged"
+    assert report["capture_stale_seconds"] == 30
+    assert report["capture_inbox_divergence_age_seconds"] == 7201
+    assert "M-20" not in result.stdout
+    assert "M-19" not in result.stdout
+
+
+def test_missing_inbox_marker_fails_evidence_not_false_divergence(
+    tmp_path: Path,
+) -> None:
+    result, report = _run(
+        tmp_path,
+        _probe(
+            inbox_last_message_id="M-OLD-ROTATED",
+            capture_inbox_divergence_age_seconds=9000,
+            capture_inbox_marker_found=False,
+        ),
+    )
+
+    assert result.returncode == 1
+    assert report["condition"] == "capture-inbox-evidence-missing"
+    assert "FAIL capture-inbox-evidence-missing:" in result.stderr
+
+
+def test_missing_ids_are_not_lockstep(tmp_path: Path) -> None:
+    result, report = _run(
+        tmp_path,
+        _probe(
+            capture_last_message_id=None,
+            inbox_last_message_id=None,
+            capture_inbox_divergence_age_seconds=0,
+            processing_gate_enabled=False,
+        ),
+    )
+
+    assert result.returncode == 0
+    assert report["capture_inbox_lockstep"] is False
+
+
+def test_empty_inbox_ages_first_unmatched_capture(tmp_path: Path) -> None:
+    result, report = _run(
+        tmp_path,
+        _probe(
+            inbox_last_message_id=None,
+            capture_inbox_divergence_age_seconds=7201,
+            capture_inbox_marker_found=True,
+        ),
+    )
+
+    assert result.returncode == 1
+    assert report["condition"] == "capture-inbox-diverged"
 
 
 def test_failed_inbound_since_last_completion_fails_immediately(
@@ -148,6 +227,8 @@ def test_failed_inbound_since_last_completion_fails_immediately(
     [
         ({"socket_status": "disconnected"}, "socket-disconnected"),
         ({"inboundProgress": None}, "inbound-telemetry-missing"),
+        ({"queue_length": None}, "queue-telemetry-missing"),
+        ({"queue_cap": None}, "queue-telemetry-missing"),
         ({"queue_length": 4500}, "queue-saturated"),
     ],
 )
@@ -182,3 +263,77 @@ def test_invalid_inbound_timestamp_fails_closed(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert report["condition"] == "inbound-telemetry-missing"
     assert "lastReceivedAt" in report["reason"]
+
+
+def test_malformed_threshold_emits_named_red_not_traceback(tmp_path: Path) -> None:
+    result, report = _run(
+        tmp_path,
+        _probe(),
+        env_overrides={"CAPTURE_MAX_STALE_HOURS": "twelve"},
+    )
+
+    assert result.returncode == 1
+    assert report["condition"] == "configuration-invalid"
+    assert "FAIL configuration-invalid:" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["capture-evidence-missing", "capture-inbox-evidence-missing"],
+)
+def test_typed_subsidiary_probe_error_keeps_its_condition(
+    tmp_path: Path,
+    condition: str,
+) -> None:
+    result, report = _run(
+        tmp_path,
+        _probe(
+            probe_error_condition=condition,
+            probe_error_reason="fixture read failed",
+        ),
+    )
+
+    assert result.returncode == 1
+    assert report["condition"] == condition
+    assert f"FAIL {condition}: fixture read failed" in result.stderr
+
+
+def test_quiet_beyond_baseline_remains_informational(tmp_path: Path) -> None:
+    result, report = _run(
+        tmp_path,
+        _probe(capture_mtime_epoch=SATURDAY - 40 * 3600),
+    )
+
+    assert result.returncode == 0
+    assert report["condition"] == "quiet-outside-measured-pattern"
+
+
+def test_quiet_baseline_uses_singapore_weekday(tmp_path: Path) -> None:
+    sunday_2330_utc = int(
+        datetime(2026, 7, 26, 23, 30, tzinfo=timezone.utc).timestamp()
+    )
+    result, report = _run(
+        tmp_path,
+        _probe(
+            probe_epoch=sunday_2330_utc,
+            capture_mtime_epoch=sunday_2330_utc - 20 * 3600,
+        ),
+    )
+
+    assert result.returncode == 0
+    assert report["quiet_baseline_limit_hours"] == 14.60
+    assert report["condition"] == "quiet-outside-measured-pattern"
+
+
+def test_live_health_probe_retries_before_bridge_unavailable() -> None:
+    source = VERIFY.read_text()
+    assert "for attempt in range(2):" in source
+    assert "if attempt == 0:" in source
+    assert "time.sleep(0.5)" in source
+
+
+def test_unmatched_age_uses_capture_write_time_not_message_time() -> None:
+    source = VERIFY.read_text()
+    assert 'record.get("capturedAt")' in source
+    assert 'item.get("timestamp")' not in source
