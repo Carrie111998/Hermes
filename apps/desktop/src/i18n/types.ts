@@ -2017,6 +2017,8 @@ export interface Translations {
           tool_definitions: string
         }
         empty: string
+        estimatedBreakdown: string
+        estimatedBreakdownHint: string
         loading: string
         percentFull: (percent: number) => string
         title: string

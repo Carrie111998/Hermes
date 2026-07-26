@@ -2408,6 +2408,8 @@ export const en: Translations = {
           tool_definitions: 'Tool definitions'
         },
         empty: 'No context data yet',
+        estimatedBreakdown: 'Estimated breakdown',
+        estimatedBreakdownHint: 'Category values are approximate and may not add up to the measured total.',
         loading: 'Loading breakdown…',
         percentFull: percent => `${percent}% Full`,
         title: 'Context Usage',

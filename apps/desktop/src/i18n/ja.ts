@@ -2278,6 +2278,8 @@ export const ja = defineLocale({
           tool_definitions: 'ツール定義'
         },
         empty: 'コンテキストデータはまだありません',
+        estimatedBreakdown: '推定内訳',
+        estimatedBreakdownHint: 'カテゴリの値は概算であり、合計が測定値と一致しない場合があります。',
         loading: '内訳を読み込み中…',
         percentFull: percent => `${percent}% 使用中`,
         title: 'コンテキスト使用状況',
