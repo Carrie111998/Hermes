@@ -75,11 +75,20 @@ def test_toolsets_defined_in_toolsets_py():
 
 
 def test_get_tool_definitions_includes_openclaw_when_enabled(monkeypatch):
-    monkeypatch.setattr("tools.harness_tools._check_harness_running", lambda: True)
+    # Patch the name `_check_harness_running` closes over (imported binding),
+    # not the module attribute of `_check_harness_running` itself — registry
+    # holds a direct reference to the original function object.
+    monkeypatch.setattr("tools.harness_tools.is_harness_running", lambda: True)
     monkeypatch.setattr("tools.openclaw.harness_client.is_harness_running", lambda: True)
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    # Tiered disclosure collapses the live schema to tool_search + a budgeted
+    # tip; registration smoke must read the pre-assembly catalog.
     defs = get_tool_definitions(
         enabled_toolsets=list(OPENCLAW_TOOLSETS),
         quiet_mode=True,
+        skip_tool_search_assembly=True,
     )
     names = {item["function"]["name"] for item in defs}
     for toolset, required in EXPECTED_TOOLS.items():
