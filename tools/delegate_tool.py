@@ -2436,6 +2436,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2515,7 +2516,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(cfg, parent_agent, profile=profile)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -3199,7 +3200,7 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(cfg: dict, parent_agent, profile: Optional[str] = None) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3220,6 +3221,31 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    # --- Profile resolution ------------------------------------------------
+    # When a named profile is requested, merge its (possibly partial) fields
+    # over a copy of the base delegation config so the profile can inherit
+    # unset fields from the top-level block.  The merge happens *before* the
+    # field extraction below so the existing resolution logic runs unchanged
+    # on the combined dict.  An unknown profile name raises ValueError with
+    # the list of valid names — never a silent fallback to the default.
+    if profile is not None:
+        profiles = cfg.get("profiles")
+        if not isinstance(profiles, dict) or not profiles:
+            raise ValueError(
+                f"Delegation profile '{profile}' requested, but no "
+                f"delegation.profiles block is configured."
+            )
+        if profile not in profiles:
+            valid = ", ".join(sorted(profiles))
+            raise ValueError(
+                f"Unknown delegation profile '{profile}'. "
+                f"Valid profiles: {valid}"
+            )
+        merged = dict(cfg)
+        for k, v in profiles[profile].items():
+            merged[k] = v
+        cfg = merged
+
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
@@ -3549,6 +3575,30 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    # --- Profile enum -------------------------------------------------
+    # Read the live config to discover named delegation profiles.  If profiles
+    # are configured, expose them as an enum so the model can select one by
+    # name.  If none are configured, delete the ``profile`` property entirely
+    # so the model cannot request something unavailable.
+    _cfg = _load_config()
+    _profiles = _cfg.get("profiles")
+    if isinstance(_profiles, dict) and _profiles:
+        _profile_names = sorted(_profiles)
+        overrides_params["properties"]["profile"]["enum"] = _profile_names
+        # Build a description that lists each profile with its model so the
+        # model can make an informed choice.
+        _lines = []
+        for _name in _profile_names:
+            _pmodel = _profiles[_name].get("model", "inherited")
+            _lines.append(f"  - {_name}: {_pmodel}")
+        overrides_params["properties"]["profile"]["description"] = (
+            "Named delegation profile selecting a complete credential bundle "
+            "(model + endpoint). Omit to use the default delegation config. "
+            "Available profiles:\n" + "\n".join(_lines)
+        )
+    else:
+        del overrides_params["properties"]["profile"]
+
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -3629,6 +3679,14 @@ DELEGATE_TASK_SCHEMA = {
                     "backward compatibility."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "(rebuilt at get_definitions() time) Optional named "
+                    "delegation profile. When omitted, the default "
+                    "delegation config is used."
+                ),
+            },
         },
         "required": [],
     },
@@ -3689,6 +3747,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        profile=args.get("profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
