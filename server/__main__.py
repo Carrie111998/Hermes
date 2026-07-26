@@ -10,6 +10,7 @@ from .agent_service import AgentRunService, HermesProcessExecutor, StubRunExecut
 from .api_cli import main as api_main
 from .config import Settings
 from .db import json_dump, new_id, now
+from .demo_seed import seed_silverline
 from .markets import no_research_markets
 from .postgres import create_database
 from .run_types import REGISTRY
@@ -68,6 +69,9 @@ def main(argv=None) -> None:
         if name != "list":
             command.add_argument("run_id")
     sub.add_parser("types")
+    seed = sub.add_parser("seed-demo", help="Create/reset the tenant-backed Silverine test client")
+    seed.add_argument("--email", default="client@silverline.test")
+    seed.add_argument("--password", default="silverline-test-123")
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -79,6 +83,19 @@ def main(argv=None) -> None:
     if args.command == "types":
         for run_type, (skill, _) in REGISTRY.items():
             print(f"{run_type:26} -> {skill or '(deterministic aggregation)'}")
+        return
+
+    if args.command == "seed-demo":
+        settings = Settings.load()
+        if settings.auth_mode != "local":
+            raise SystemExit("seed-demo is intentionally limited to auth_mode: local")
+        db = create_database(settings)
+        try:
+            _print(seed_silverline(db, email=args.email, password=args.password))
+        finally:
+            close = getattr(db, "close", None)
+            if close:
+                close()
         return
 
     settings = Settings.load()
@@ -110,4 +127,3 @@ def main(argv=None) -> None:
 
 if __name__ == "__main__":
     main()
-

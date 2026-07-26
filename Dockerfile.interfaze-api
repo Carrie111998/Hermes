@@ -1,0 +1,151 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile for the interfaze-agent Sales Agent API (`interfaze-api`).
+#
+# This is NOT the upstream Hermes gateway image — that one is ./Dockerfile
+# (s6-overlay, gateway + dashboard services). This image ships exactly one
+# process: the FastAPI product API defined in server/app.py, plus a working
+# `hermes` CLI on PATH because server/agent_service.py shells out to it
+# (`hermes -z <prompt> --skills <skill> --yolo`) and /health reports
+# `agent_runs_enabled` from `shutil.which("hermes")`.
+#
+# Build:
+#   docker build -f Dockerfile.interfaze-api -t interfaze-api:local .
+# Run:
+#   docker compose -f docker-compose.interfaze.yml up -d
+#
+# Notes / deliberate choices:
+#   * Python is pinned to 3.13 — pyproject requires ">=3.11,<3.14" and 3.13
+#     matches what the upstream image and `[tool.ty.environment]` target.
+#   * Dependencies are resolved fresh from pyproject (`.[web,interfaze]`)
+#     rather than from uv.lock: as of this commit uv.lock's `interfaze`
+#     extra only lists asyncpg and is missing ddgs / scrapling / markdownify,
+#     so `uv sync --locked` would fail and `--frozen` would silently ship an
+#     image whose lead-discovery skill has no web-search backend.
+#   * server/api_cli.py defaults to 127.0.0.1; we pass --host on the command
+#     line (see CMD) instead of patching the file.
+#   * Writable state (SQLite DB, uploads, hermes home, synced skills) all
+#     lives under /data, which is a volume.
+
+ARG PYTHON_VERSION=3.13
+ARG UV_VERSION=0.11.6
+
+
+# ---------------------------------------------------------------------------
+# uv — used only as a fast pip replacement during the build.
+# ---------------------------------------------------------------------------
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+
+# ---------------------------------------------------------------------------
+# Builder: resolve + install the wheel into a self-contained venv at /opt/venv
+# ---------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim-trixie AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_LINK_MODE=copy \
+    UV_NO_CACHE=1 \
+    UV_COMPILE_BYTECODE=1
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+# Toolchain safety net: every direct dependency publishes manylinux wheels for
+# cp313, but a transitive sdist (or a future pin bump) must not turn the build
+# into a mystery failure. Builder-stage only — none of this reaches the runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+
+# `[web]` = fastapi/uvicorn/starlette/python-multipart.
+# `[interfaze]` = asyncpg + the web-research stack the lead-discovery skill
+# needs (ddgs, scrapling[fetchers], markdownify).
+RUN uv venv /opt/venv \
+    && uv pip install --python /opt/venv/bin/python ".[web,interfaze]"
+
+# Fail the build here rather than at container start if either console script
+# or the app package went missing.
+RUN test -x /opt/venv/bin/interfaze-api \
+    && test -x /opt/venv/bin/hermes \
+    && /opt/venv/bin/python -c "import server.app, tools.skills_sync"
+
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim-trixie AS runtime
+
+# git + ripgrep are used by hermes' own tooling; curl backs the healthcheck;
+# tini reaps the `hermes` subprocesses HermesProcessExecutor spawns (uvicorn
+# as PID 1 would leave zombies behind on the kill/timeout paths).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        procps \
+        ripgrep \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+
+# Bundled skills are NOT shipped inside the wheel (pyproject's
+# [tool.setuptools.data-files] covers locales/ and optional-mcps/ only), and
+# server/run_types.py dispatches to skills/sales/* — document-processing,
+# company-brain-build, lead-discovery, lead-research, contact-discovery,
+# cold-email-outreach, whatsapp-outreach, linkedin-notes. Copy the source
+# trees in and point hermes_constants' override env vars at them; the CMD
+# then syncs them into $HERMES_HOME/skills, which is where
+# agent/skill_utils.py actually looks.
+COPY --from=builder /src/skills /opt/interfaze/skills
+COPY --from=builder /src/optional-skills /opt/interfaze/optional-skills
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:${PATH}" \
+    HERMES_HOME=/data \
+    HERMES_WRITE_SAFE_ROOT=/data \
+    HERMES_BUNDLED_SKILLS=/opt/interfaze/skills \
+    HERMES_OPTIONAL_SKILLS=/opt/interfaze/optional-skills
+
+# /opt/venv is root-owned and immutable at runtime, so a lazy install must
+# never try to mutate it. The interfaze extra already preinstalls every
+# backend this service uses.
+ENV HERMES_DISABLE_LAZY_INSTALLS=1
+
+# Defaults for the vars server/config.py reads. Everything here can be
+# overridden by --env-file / -e at run time; the secrets deliberately have NO
+# default (see docker-compose.interfaze.yml).
+ENV INTERFAZE_DATABASE_PATH=/data/interfaze/interfaze.db \
+    INTERFAZE_PUBLIC_BASE_URL=http://localhost:8000 \
+    INTERFAZE_HOST=0.0.0.0 \
+    INTERFAZE_PORT=8000
+
+# uid/gid 10001 to avoid colliding with the upstream image's hermes user
+# (10000). Docker seeds a fresh named volume from the image directory it is
+# mounted over, ownership included, so /data stays writable for this user.
+RUN groupadd --gid 10001 interfaze \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash interfaze \
+    && mkdir -p /data/interfaze/uploads /data/workspace \
+    && chown -R interfaze:interfaze /data
+
+USER interfaze
+WORKDIR /data/workspace
+
+EXPOSE 8000
+VOLUME ["/data"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${INTERFAZE_PORT:-8000}/health" || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Sync bundled skills into $HERMES_HOME/skills (idempotent; user edits under
+# /data are preserved by skills_sync's manifest), then hand PID 1 to uvicorn.
+# `--host` comes from INTERFAZE_HOST because server/api_cli.py's argparse
+# default is 127.0.0.1, which would be unreachable from outside the container.
+CMD ["sh", "-c", "python -m tools.skills_sync || echo '[interfaze] warning: skills sync failed; continuing'; exec interfaze-api --host \"${INTERFAZE_HOST:-0.0.0.0}\" --port \"${INTERFAZE_PORT:-8000}\""]

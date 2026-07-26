@@ -1,0 +1,7 @@
+name: web-scrapling
+version: 1.0.0
+description: "Scrapling web content extraction — keyless, self-hosted scraper with TLS-fingerprint impersonation (fast path) and stealth-browser fallback (Cloudflare/anti-bot). Install with `pip install 'scrapling[fetchers]' markdownify` then `scrapling install`."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - scrapling

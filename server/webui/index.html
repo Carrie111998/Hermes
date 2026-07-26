@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>interfaze-agent</title>
+<!--
+  interfaze-agent — B2B sales-agent web app, served by the interfaze-api
+  FastAPI process (server/app.py) alongside the real /api/v1 backend.
+  All data flows through js/api.js. Real API mode is the default; mock mode
+  must be selected explicitly for isolated frontend development.
+  See server/WEBUI_CONNECTION_PRD.md for the connection contract.
+-->
+<script>
+  // Pre-paint theme: avoid a light flash in dark mode.
+  (function () {
+    try {
+      var t = localStorage.getItem('ifz-theme') || 'system';
+      var dark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (dark) document.documentElement.classList.add('dark');
+    } catch (e) { /* storage unavailable — default light */ }
+  })();
+</script>
+<link rel="stylesheet" href="./css/tokens.css">
+<link rel="stylesheet" href="./css/app.css">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%231C1B18'/%3E%3Cpath d='M16 7l7 9-7 9-7-9z' fill='%23FAF9F5'/%3E%3Cpath d='M16 12l3.5 4.5L16 21l-3.5-4.5z' fill='%23F3F1EB'/%3E%3C/svg%3E">
+<script>window.__HERMES_CONFIG__={maxUploadBytes:__MAX_UPLOAD_BYTES__,csrfToken:__CSRF_TOKEN_JSON__,chatEnabled:__CHAT_ENABLED__};</script>
+<script>(function(){
+  var cfg=window.__HERMES_CONFIG__||{},token=cfg.csrfToken||'';
+  if(!token||!window.fetch)return;
+  var originalFetch=window.fetch.bind(window);
+  function sameOriginUnsafe(input,init){
+    var method=((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
+    if(!/^(POST|PUT|PATCH|DELETE)$/.test(method))return false;
+    try{
+      var raw=(typeof input==='string'||input instanceof URL)?input:(input&&input.url)||'';
+      var url=new URL(raw,document.baseURI||location.href);
+      if(url.origin!==location.origin)return false;
+      return !/\/api\/(auth\/login|csp-report)$/.test(url.pathname);
+    }catch(_){return false;}
+  }
+  window.fetch=function(input,init){
+    if(sameOriginUnsafe(input,init)){
+      var opts=init?Object.assign({},init):{};
+      var headers=new Headers(opts.headers!==undefined?opts.headers:((input&&input.headers)||{}));
+      if(!headers.has('X-Hermes-CSRF-Token'))headers.set('X-Hermes-CSRF-Token',token);
+      opts.headers=headers;
+      return originalFetch(input,opts);
+    }
+    return originalFetch(input,init);
+  };
+})();</script>
+</head>
+<body>
+<a class="ifz-skip" href="#ifz-main">Skip to main content</a>
+<div id="app" class="ifz-app"></div>
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>

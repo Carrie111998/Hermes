@@ -120,6 +120,10 @@ def _read_config_key(*path: str) -> Optional[str]:
 # a free tier on upgrade). Filtered by ``is_available()`` at walk time so
 # we don't surface a provider the user has no credentials for.
 _LEGACY_PREFERENCE = (
+    # Scrapling first for extract: it's the default self-hosted scraper. It's
+    # extract-only (supports_search() is False), so the search resolution walk
+    # skips it and lands on the first real search backend below.
+    "scrapling",
     "firecrawl",
     "parallel",
     "tavily",

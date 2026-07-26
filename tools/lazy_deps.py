@@ -113,6 +113,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
+    # Self-hosted scraper (BSD-3). [fetchers] pulls curl_cffi + playwright +
+    # browserforge etc.; markdownify converts fetched HTML to clean markdown.
+    # The stealth browser itself is downloaded separately via `scrapling
+    # install` (post_setup), not pip — so it's not listed here.
+    "search.scrapling": ("scrapling[fetchers]==0.4.11", "markdownify==1.2.0"),
 
     # ─── TTS providers ─────────────────────────────────────────────────────
     # Pinned to exact versions to match pyproject.toml's no-ranges policy

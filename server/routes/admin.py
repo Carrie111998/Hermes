@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth import Principal, hash_password, require_admin
 from ..db import Database, json_dump, json_load, new_id, now
@@ -11,12 +11,21 @@ from ..schemas import AssignCompany, CompanyCreate, CompanyPatch, ResetPassword,
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-def _company(row) -> dict:
-    return {
+def _company(row, db: Database | None = None) -> dict:
+    result = {
         "id": row["id"], "name": row["name"], "legal_name": row["legal_name"],
         "status": row["status"], "data": json_load(row["data"], {}),
         "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
+    if db is not None:
+        result["users"] = db.one(
+            "SELECT COUNT(*) AS n FROM users WHERE company_id=? AND status='active'", (row["id"],)
+        )["n"]
+        result["last_seen_at"] = db.one(
+            "SELECT MAX(s.created_at) AS value FROM auth_sessions s "
+            "JOIN users u ON u.id=s.user_id WHERE u.company_id=?", (row["id"],)
+        )["value"]
+    return result
 
 
 def _user(row) -> dict:
@@ -28,9 +37,43 @@ def _user(row) -> dict:
     }
 
 
+@router.get("/errors")
+def errors(request: Request, limit: int = Query(default=200, ge=1, le=500),
+           _: Principal = Depends(require_admin)):
+    return [{
+        "id": row["id"],
+        "level": "error",
+        "area": row["run_type"],
+        "message": row["error"] or "Agent run failed",
+        "at": row["completed_at"] or row["updated_at"],
+        "company_id": row["company_id"],
+    } for row in request.app.state.db.all(
+        "SELECT id,company_id,run_type,error,completed_at,updated_at FROM agent_runs "
+        "WHERE status='failed' ORDER BY COALESCE(completed_at,updated_at) DESC LIMIT ?",
+        (limit,),
+    )]
+
+
+@router.get("/logs")
+def logs(request: Request, limit: int = Query(default=100, ge=1, le=500),
+         _: Principal = Depends(require_admin)):
+    return [{
+        "id": row["id"],
+        "area": row["entity_type"] or "system",
+        "message": str(row["action"]).replace("_", " "),
+        "at": row["created_at"],
+        "company_id": row["company_id"],
+    } for row in request.app.state.db.all(
+        "SELECT id,company_id,action,entity_type,created_at FROM activity_log "
+        "ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )]
+
+
 @router.get("/companies")
 def companies(request: Request, _: Principal = Depends(require_admin)):
-    return [_company(row) for row in request.app.state.db.all("SELECT * FROM companies ORDER BY name")]
+    db = request.app.state.db
+    return [_company(row, db) for row in db.all("SELECT * FROM companies ORDER BY name")]
 
 
 @router.post("/companies", status_code=201)
@@ -42,7 +85,7 @@ def create_company(body: CompanyCreate, request: Request, actor: Principal = Dep
                 json_dump(body.data), stamp, stamp))
     db.execute("INSERT INTO onboarding(company_id,updated_at) VALUES(?,?)", (company_id, stamp))
     db.activity(company_id, actor.id, "company_created", "company", company_id)
-    return _company(db.one("SELECT * FROM companies WHERE id=?", (company_id,)))
+    return _company(db.one("SELECT * FROM companies WHERE id=?", (company_id,)), db)
 
 
 @router.get("/companies/{company_id}")
@@ -50,7 +93,7 @@ def get_company(company_id: str, request: Request, _: Principal = Depends(requir
     row = request.app.state.db.one("SELECT * FROM companies WHERE id=?", (company_id,))
     if not row:
         raise HTTPException(404, "Company not found")
-    return _company(row)
+    return _company(row, request.app.state.db)
 
 
 @router.patch("/companies/{company_id}")
@@ -68,7 +111,7 @@ def patch_company(company_id: str, body: CompanyPatch, request: Request,
     db.execute(f"UPDATE companies SET {','.join(f'{key}=?' for key in values)} WHERE id=?",
                (*values.values(), company_id))
     db.activity(company_id, actor.id, "company_updated", "company", company_id)
-    return _company(db.one("SELECT * FROM companies WHERE id=?", (company_id,)))
+    return _company(db.one("SELECT * FROM companies WHERE id=?", (company_id,)), db)
 
 
 @router.delete("/companies/{company_id}", status_code=204)
@@ -86,7 +129,7 @@ def _company_status(company_id: str, value: str, request: Request, actor: Princi
     if not db.execute("UPDATE companies SET status=?,updated_at=? WHERE id=?", (value, now(), company_id)):
         raise HTTPException(404, "Company not found")
     db.activity(company_id, actor.id, f"company_{value}", "company", company_id)
-    return _company(db.one("SELECT * FROM companies WHERE id=?", (company_id,)))
+    return _company(db.one("SELECT * FROM companies WHERE id=?", (company_id,)), db)
 
 
 @router.post("/companies/{company_id}/activate")

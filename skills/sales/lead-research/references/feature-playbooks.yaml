@@ -1,0 +1,12 @@
+household-appliances:
+  required: [identity_scale, market_coverage, product_fit]
+  useful: [store_count, relevant_import_value, brands_carried, buying_intent]
+  not_applicable: []
+industrial-machinery:
+  required: [identity_scale, product_fit, certifications]
+  useful: [facilities, relevant_import_value, procurement_intent]
+  not_applicable: [store_count]
+textiles-and-apparel:
+  required: [identity_scale, market_coverage, product_fit]
+  useful: [store_count, relevant_import_value, certifications, private_label_fit]
+  not_applicable: []

@@ -271,8 +271,19 @@ def _get_extract_backend() -> str:
     Selection priority:
     1. ``web.extract_backend`` (per-capability override)
     2. ``web.backend`` (shared fallback — existing behavior)
-    3. Auto-detect from env vars
+    3. Scrapling (self-hosted default) when installed and nothing explicit set
+    4. Auto-detect from env vars
+
+    Scrapling is the default self-hosted scraper: when neither
+    ``web.extract_backend`` nor ``web.backend`` is set and the scrapling
+    package is installed, it wins over the env-key auto-detect so a user who
+    installed it gets it as their main fetcher without extra config. An
+    explicit config key for either still takes precedence (handled below).
     """
+    cfg = _load_web_config()
+    if not (cfg.get("extract_backend") or "").strip() and not (cfg.get("backend") or "").strip():
+        if _is_backend_available("scrapling"):
+            return "scrapling"
     return _get_capability_backend("extract")
 
 

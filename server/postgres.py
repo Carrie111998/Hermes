@@ -85,6 +85,29 @@ class PostgresDatabase:
             raise RuntimeError(
                 "Supabase schema is missing. Apply server/supabase/migrations/001_initial.sql first."
             ) from exc
+        self._assert_migrations_applied()
+
+    # Every migration file records itself in schema_migrations. Booting with a
+    # partial set is how a database ends up with lead-research tables that have
+    # no RLS, or credential tables that are world-readable — both silent.
+    REQUIRED_MIGRATIONS = ("001_initial", "002_chat_sessions", "003_lead_research",
+                           "004_lead_research_rls", "005_auth_table_rls")
+
+    def _assert_migrations_applied(self) -> None:
+        try:
+            applied = {row["version"] for row in self.all("SELECT version FROM schema_migrations")}
+        except Exception as exc:
+            raise RuntimeError(
+                "schema_migrations is missing. Re-apply server/supabase/migrations/ in order; "
+                "001_initial.sql creates it."
+            ) from exc
+        missing = [name for name in self.REQUIRED_MIGRATIONS if name not in applied]
+        if missing:
+            raise RuntimeError(
+                "Unapplied Supabase migrations: " + ", ".join(missing)
+                + ". Apply server/supabase/migrations/ in order before serving traffic; "
+                  "004 and 005 enable row-level security."
+            )
 
     def _run(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=60)

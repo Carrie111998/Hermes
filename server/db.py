@@ -88,6 +88,13 @@ CREATE TABLE IF NOT EXISTS contacts (
     do_not_contact INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
+-- Tenant-wide opt-out. Keyed on the address, not on a lead/contact row, so
+-- re-importing the same address as a new lead cannot resurrect it.
+CREATE TABLE IF NOT EXISTS suppressions (
+    company_id TEXT NOT NULL REFERENCES companies(id), email TEXT NOT NULL,
+    reason TEXT NOT NULL, created_at REAL NOT NULL,
+    PRIMARY KEY (company_id, email)
+);
 CREATE TABLE IF NOT EXISTS outreach_campaigns (
     id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
     channel TEXT NOT NULL DEFAULT 'email', status TEXT NOT NULL DEFAULT 'draft', data TEXT NOT NULL DEFAULT '{}',
@@ -148,6 +155,11 @@ CREATE TABLE IF NOT EXISTS run_events (
     company_id TEXT NOT NULL, ts REAL NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL DEFAULT '',
     data TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+    user_id TEXT NOT NULL REFERENCES users(id), profile TEXT NOT NULL DEFAULT 'default',
+    history TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
 
 CREATE INDEX IF NOT EXISTS ix_users_company ON users(company_id);
 CREATE INDEX IF NOT EXISTS ix_documents_company ON documents(company_id);
@@ -157,7 +169,15 @@ CREATE INDEX IF NOT EXISTS ix_messages_company ON outreach_messages(company_id);
 CREATE INDEX IF NOT EXISTS ix_delivery_message ON delivery_attempts(message_id);
 CREATE INDEX IF NOT EXISTS ix_runs_company ON agent_runs(company_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_activity_company ON activity_log(company_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_chat_sessions_tenant ON chat_sessions(company_id, user_id, updated_at DESC);
 """
+
+# Lead research is an application capability, not a model tool. Keeping its SQL
+# in a focused module avoids growing this already-dense product schema while
+# ensuring a fresh SQLite database is fully usable in one initialization pass.
+from .lead_research.schema import SCHEMA as LEAD_RESEARCH_SCHEMA
+
+SCHEMA = SCHEMA + "\n" + LEAD_RESEARCH_SCHEMA
 
 
 def new_id(prefix: str) -> str:

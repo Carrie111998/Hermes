@@ -7,12 +7,10 @@ import httpx
 from fastapi import HTTPException, UploadFile
 
 
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-
-
 class LocalStorage:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, max_upload_bytes: int = 25 * 1024 * 1024):
         self.root = root
+        self.max_upload_bytes = max(0, int(max_upload_bytes))
 
     async def save(self, company_id: str, document_id: str, name: str,
                    file: UploadFile) -> tuple[str, int]:
@@ -23,10 +21,10 @@ class LocalStorage:
         with destination.open("wb") as handle:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
+                if self.max_upload_bytes and size > self.max_upload_bytes:
                     handle.close()
                     destination.unlink(missing_ok=True)
-                    raise HTTPException(413, "Document exceeds the 50 MiB MVP limit")
+                    raise HTTPException(413, "Document exceeds the configured upload limit")
                 handle.write(chunk)
         return str(destination), size
 
@@ -40,9 +38,11 @@ class LocalStorage:
 class SupabaseStorage:
     BUCKET = "interfaze-documents"
 
-    def __init__(self, url: str, service_key: str):
+    def __init__(self, url: str, service_key: str,
+                 max_upload_bytes: int = 25 * 1024 * 1024):
         self.url = url.rstrip("/")
         self.service_key = service_key
+        self.max_upload_bytes = max(0, int(max_upload_bytes))
 
     @property
     def headers(self) -> dict:
@@ -53,8 +53,8 @@ class SupabaseStorage:
         chunks, size = [], 0
         while chunk := await file.read(1024 * 1024):
             size += len(chunk)
-            if size > MAX_UPLOAD_BYTES:
-                raise HTTPException(413, "Document exceeds the 50 MiB MVP limit")
+            if self.max_upload_bytes and size > self.max_upload_bytes:
+                raise HTTPException(413, "Document exceeds the configured upload limit")
             chunks.append(chunk)
         key = f"{company_id}/{document_id}/{name}"
         headers = {**self.headers, "Content-Type": file.content_type or "application/octet-stream",
@@ -95,6 +95,10 @@ class SupabaseStorage:
 
 def create_storage(settings):
     if settings.supabase_url and settings.supabase_service_role_key:
-        return SupabaseStorage(settings.supabase_url, settings.supabase_service_role_key)
-    return LocalStorage(settings.upload_dir)
+        return SupabaseStorage(
+            settings.supabase_url,
+            settings.supabase_service_role_key,
+            settings.max_upload_bytes,
+        )
+    return LocalStorage(settings.upload_dir, settings.max_upload_bytes)
 

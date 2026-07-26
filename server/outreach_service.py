@@ -7,10 +7,11 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
+from . import compliance
 from .crypto import CredentialCipher
 from .db import Database, json_dump, json_load, new_id, now
-from .email_providers import GmailProvider, MicrosoftProvider, OutgoingEmail, StubEmailProvider
-from .quality import content_hash, is_bounce, preflight_message
+from .email_providers import EMAIL_PROVIDERS, OutgoingEmail
+from .quality import EMAIL_IN_TEXT_RE, content_hash, is_bounce, preflight_message
 from .whatsapp_provider import WhatsAppCloudProvider
 
 
@@ -38,9 +39,14 @@ def message_dict(row) -> dict:
 
 
 class OutreachService:
-    def __init__(self, db: Database, cipher: CredentialCipher):
+    def __init__(self, db: Database, cipher: CredentialCipher,
+                 *, public_base_url: str = "", credential_key: str = ""):
         self.db = db
         self.cipher = cipher
+        self.public_base_url = public_base_url
+        # Reused as the opt-out HMAC secret: any tenant able to send email
+        # already requires this key, so it needs no separate configuration.
+        self.cipher_secret = credential_key
 
     def get(self, company_id: str, message_id: str):
         row = self.db.one("SELECT * FROM outreach_messages WHERE id=? AND company_id=?",
@@ -217,6 +223,10 @@ class OutreachService:
                               (message["contact_id"], company_id)) if message["contact_id"] else None
         if (lead and lead["do_not_contact"]) or (contact and contact["do_not_contact"]):
             raise HTTPException(409, "Lead or contact is marked do-not-contact")
+        if message["channel"] == "email":
+            for address in [content.get("to"), *content.get("cc", [])]:
+                if compliance.is_suppressed(self.db, company_id, str(address or "")):
+                    raise HTTPException(409, f"{address} has unsubscribed from this company's outreach")
         country = str(content.get("country") or (lead["country"] if lead else "")).upper()
         section = self.db.one("SELECT data FROM company_sections WHERE company_id=? AND section='market_preferences'",
                               (company_id,))
@@ -278,18 +288,22 @@ class OutreachService:
 
     def _deliver_email(self, company_id: str, content: dict, mode: str):
         integration, credentials = self._integration(company_id, "email")
-        provider = {
-            "google": GmailProvider,
-            "microsoft": MicrosoftProvider,
-            "stub": StubEmailProvider,
-        }.get(integration["provider"])
+        provider = EMAIL_PROVIDERS.get(integration["provider"])
         if not provider:
             raise HTTPException(422, "Unsupported email provider")
         adapter = provider()
         adapter.connect_account(credentials)
+        # Compliance is applied here, at the single adapter boundary, so no
+        # caller can construct a send that skips the opt-out link.
+        opt_out = compliance.unsubscribe_url(
+            self.public_base_url, self.cipher_secret, company_id, content["to"])
+        body = compliance.inject_footer(
+            content.get("body", ""), opt_out, content.get("language"))
         email = OutgoingEmail(to=content["to"], cc=list(content.get("cc", [])),
-                              subject=content.get("subject", ""), body=content.get("body", ""),
-                              language=content.get("language"), reply_to=content.get("reply_to"))
+                              subject=content.get("subject", ""), body=body,
+                              language=content.get("language"), reply_to=content.get("reply_to"),
+                              headers={"List-Unsubscribe": f"<{opt_out}>",
+                                       "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"})
         result = adapter.create_draft(email) if mode == "draft" else adapter.send_email(email)
         if hasattr(adapter, "credentials") and integration["provider"] != "stub":
             self.db.execute("UPDATE integrations SET encrypted_credentials=?,updated_at=? WHERE id=?",
@@ -298,8 +312,7 @@ class OutreachService:
 
     def poll_email_replies(self, company_id: str) -> dict:
         integration, credentials = self._integration(company_id, "email")
-        provider_cls = {"google": GmailProvider, "microsoft": MicrosoftProvider,
-                        "stub": StubEmailProvider}.get(integration["provider"])
+        provider_cls = EMAIL_PROVIDERS.get(integration["provider"])
         if not provider_cls:
             raise HTTPException(422, "Unsupported email provider")
         adapter = provider_cls()
@@ -318,8 +331,9 @@ class OutreachService:
                 ):
                     continue
                 bounces += 1
+                suppressed = self._suppress_bounced_recipient(company_id, subject)
                 self.db.activity(company_id, None, "email_bounce_observed", "email_bounce", inbound_id or None,
-                                 {"sender": sender, "subject": subject})
+                                 {"sender": sender, "subject": subject, "suppressed": suppressed})
                 continue
             email = sender.lower()
             contact = self.db.one(
@@ -351,6 +365,34 @@ class OutreachService:
         circuit = self._bounce_circuit(company_id)
         return {"matched_replies": matched, "bounces_observed": bounces,
                 "bounce_circuit": circuit}
+
+    def _suppress_bounced_recipient(self, company_id: str, subject: str) -> str | None:
+        """Suppress the failed address when the bounce names one.
+
+        ponytail: the adapters fetch headers only, so the address is available
+        only when the bounce subject carries it — which many mailers omit. A
+        named address is suppressed immediately; the rest are still counted and
+        caught by the bounce circuit breaker. Upgrade path when hard-bounce
+        precision matters: fetch the DSN body and parse its
+        message/delivery-status part for Final-Recipient.
+        """
+        candidates = {compliance.normalize_email(item)
+                      for item in EMAIL_IN_TEXT_RE.findall(subject or "")}
+        if not candidates:
+            return None
+        # Compared in Python rather than with json_extract: that function is
+        # SQLite-only and this service also runs on Postgres.
+        recent = self.db.all(
+            "SELECT content FROM outreach_messages WHERE company_id=? AND channel='email' "
+            "AND status IN ('sent','delivered') ORDER BY sent_at DESC LIMIT 200",
+            (company_id,),
+        )
+        sent_to = {compliance.normalize_email(json_load(row["content"], {}).get("to", ""))
+                   for row in recent}
+        for address in candidates & sent_to:
+            if compliance.suppress(self.db, company_id, address, "hard_bounce"):
+                return address
+        return None
 
     def _bounce_circuit(self, company_id: str) -> dict:
         since = now() - 7 * 86400

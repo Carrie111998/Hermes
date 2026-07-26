@@ -1,8 +1,8 @@
 # interfaze-agent product API
 
 The agent/backend implementation of the Sales Agent MVP in `PRODUCT.md`.
-The customer dashboard is a separate repository and consumes this service at
-`/api/v1`.
+The packaged customer dashboard is served by this process at `/` and consumes
+the product API at `/api/v1`.
 
 ## Start locally
 
@@ -14,6 +14,11 @@ interfaze_server:
   cors_origins:
     - http://localhost:3000
     - http://localhost:5173
+  webui_enabled: true
+  max_upload_bytes: 26214400  # 25 MiB; 0 disables the size limit
+  chat_enabled: true
+  chat_model: ""       # empty uses the configured Hermes default
+  chat_toolset: none   # allowed: none, search, web; anything else fails closed
 ```
 
 Bootstrap the first administrator with deployment secrets, then start:
@@ -27,9 +32,29 @@ interfaze-api --host 127.0.0.1 --port 8000
 
 OpenAPI is available at `/openapi.json` and interactive API docs at `/docs`.
 
+## Seed the tenant-backed test client
+
+For local product testing, seed the deterministic Silverine client into the
+configured local database. The command replaces only the `company_silverline`
+tenant and leaves every other company untouched:
+
+```bash
+python -m server seed-demo \
+  --email client@silverline.test \
+  --password silverline-test-123
+```
+
+Then sign in at `/` with those credentials. The profile contains 7 products,
+5 historical document records, 25 leads, 14 contacts, 2 campaigns, 10 outreach
+messages, and 16 completed agent runs. Historical document records cannot be
+reprocessed until their source files are uploaded again.
+
 ## Production / Supabase
 
-Apply `server/supabase/migrations/001_initial.sql` and configure:
+Apply `server/supabase/migrations/001_initial.sql` for a fresh database. Existing
+installations also apply `server/supabase/migrations/002_chat_sessions.sql` and
+`server/supabase/migrations/003_lead_research.sql`.
+Then configure:
 
 ```text
 SUPABASE_DB_URL
@@ -50,11 +75,18 @@ admin in the product database. Documents use the private
 - `db.py` / `postgres.py` — local SQLite and Supabase Postgres backends.
 - `agent_service.py` — queued runs, subprocess streaming, cancellation,
   retries, output contracts, and deterministic domain persistence.
+- `chat_bridge.py` — tenant-scoped WebUI sessions, restricted one-turn agents,
+  and single-use SSE stream capabilities.
+- `lead_research/` — canonical sectors/evidence, provider registry, immutable
+  tenant snapshots, identity/eligibility, fit/confidence scoring, metrics, and
+  deterministic fixture acquisition. Cataloged external sources stay gated by
+  their real access mode instead of falling back to unsupported scraping.
 - `outreach_service.py` — immutable approval revisions, preflight QA,
   provider idempotency, send windows/caps, reply polling, and bounce circuit.
 - `email_providers/` — Gmail, Microsoft Graph, and test adapter.
 - `whatsapp_provider.py` — Meta WhatsApp Business Cloud API.
-- `routes/` — all 207 method/path contracts specified by PRODUCT.md.
+- `routes/` — all 216 PRODUCT.md contracts, including promoted WebUI convenience routes,
+  and the service-gated chat bridge.
 - `quality.py` — deterministic rules ported from the prototype QA scripts.
 
 The Hermes runtime generates research and content. It never owns authorization,
@@ -63,11 +95,9 @@ tenant IDs, database IDs, approvals, or provider-send decisions.
 ## Qualification
 
 ```bash
-python tests/server/test_api_mvp.py
-python tests/server/test_run_harness.py
+scripts/run_tests.sh tests/server/
 ```
 
 The local suite is credential-free. Release qualification additionally
 requires sandbox runs against Gmail, Microsoft Graph, WhatsApp Cloud, and a
 hosted Supabase project.
-

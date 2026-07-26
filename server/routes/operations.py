@@ -51,6 +51,47 @@ def analytics_overview(request: Request, principal: Principal = Depends(current_
     return metrics
 
 
+def _weekly_counts(timestamps: list[float | None]) -> dict:
+    labels = [f"W-{weeks}" for weeks in range(7, 0, -1)] + ["Now"]
+    values = [0] * len(labels)
+    stamp, week = now(), 7 * 86400
+    for value in timestamps:
+        if value is None:
+            continue
+        age = int(max(0, stamp - float(value)) // week)
+        if age <= 7:
+            values[7 - age] += 1
+    return {"labels": labels, "values": values}
+
+
+def _market_fit(request: Request, company_id: str, markets: list[dict]) -> list[dict]:
+    products = [dict(row) for row in request.app.state.db.all(
+        "SELECT id,name FROM products WHERE company_id=? ORDER BY name", (company_id,),
+    )]
+    brain = request.app.state.db.one(
+        "SELECT content FROM company_brain_snapshots WHERE company_id=? AND status='approved' "
+        "ORDER BY version DESC LIMIT 1", (company_id,),
+    )
+    assumptions = json_load(brain["content"], {}).get("market_assumptions", {}) if brain else {}
+    candidates = assumptions.get("product_market_fit", []) if isinstance(assumptions, dict) else []
+    normalized = []
+    for item in candidates if isinstance(candidates, list) else []:
+        if not isinstance(item, dict) or not item.get("country"):
+            continue
+        fits = item.get("products") if isinstance(item.get("products"), list) else []
+        normalized.append({"country": item["country"], "products": fits})
+    if normalized or not products:
+        return normalized
+    return [{
+        "country": market["country"],
+        "products": [{
+            "product_id": product["id"],
+            "name": product["name"],
+            "score": max(1, int(market["opportunity_score"]) - index * 8),
+        } for index, product in enumerate(products[:3])],
+    } for market in markets]
+
+
 @router.get("/analytics/sales-pipeline")
 def sales_pipeline(request: Request, principal: Principal = Depends(current_principal),
                    x_company_id: str | None = Header(default=None)):
@@ -59,8 +100,32 @@ def sales_pipeline(request: Request, principal: Principal = Depends(current_prin
         "SELECT status,COUNT(*) AS count FROM leads WHERE company_id=? GROUP BY status ORDER BY status",
         (company_id,),
     )
-    return {"stages": [{"status": row["status"], "count": row["count"]} for row in rows],
-            "total": sum(row["count"] for row in rows)}
+    stages = [{"status": row["status"], "count": row["count"]} for row in rows]
+    db = request.app.state.db
+    messages = db.all(
+        "SELECT sent_at,replied_at FROM outreach_messages WHERE company_id=?",
+        (company_id,),
+    )
+    researched = _count(db, "research", company_id, "AND status='succeeded'")
+    contacts = _count(db, "contacts", company_id)
+    sent = sum(1 for row in messages if row["sent_at"] is not None)
+    replied = sum(1 for row in messages if row["replied_at"] is not None)
+    interested = _count(db, "leads", company_id, "AND status='interested'")
+    return {
+        "stages": stages,
+        "total": sum(row["count"] for row in rows),
+        "leads_by_status": stages,
+        "emails_sent_weekly": _weekly_counts([row["sent_at"] for row in messages]),
+        "replies_weekly": _weekly_counts([row["replied_at"] for row in messages]),
+        "funnel": [
+            {"stage": "Leads discovered", "value": sum(row["count"] for row in rows)},
+            {"stage": "Researched", "value": researched},
+            {"stage": "Contacts found", "value": contacts},
+            {"stage": "Emails sent", "value": sent},
+            {"stage": "Replies", "value": replied},
+            {"stage": "Interested", "value": interested},
+        ],
+    }
 
 
 def _country_metrics(request: Request, company_id: str) -> list[dict]:
@@ -90,7 +155,127 @@ def market_intelligence(request: Request, principal: Principal = Depends(current
         market.update({"sent": sent, "replies": replies,
                        "reply_rate": round(replies / sent * 100, 2) if sent else 0,
                        "opportunity_score": min(100, market["leads"] * 2 + replies * 10)})
-    return {"markets": markets}
+    industries = leads_by_industry(request, principal, x_company_id)
+    sources = source_performance(request, principal, x_company_id)
+    return {
+        "markets": markets,
+        "country_scores": [
+            {"country": market["country"], "score": market["opportunity_score"]}
+            for market in markets
+        ],
+        "top_industries": [
+            {"label": item["industry"].replace("_", " ").title(), "value": item["count"]}
+            for item in industries
+        ],
+        "source_performance": [
+            {"label": item["source"].replace("_", " ").title(), "value": item["lead_count"]}
+            for item in sources
+        ],
+        "product_market_fit": _market_fit(request, company_id, markets),
+    }
+
+
+def _recommended_actions(request: Request, company_id: str) -> list[dict]:
+    db = request.app.state.db
+    actions = []
+    awaiting = _count(db, "outreach_messages", company_id, "AND status='pending_approval'")
+    if awaiting:
+        actions.append({
+            "icon": "mail",
+            "title": f"Review {awaiting} generated messages awaiting approval",
+            "sub": "Approve or revise them before delivery.",
+            "href": "/app/outreach",
+        })
+    onboarding = db.one("SELECT status FROM onboarding WHERE company_id=?", (company_id,))
+    if not onboarding or onboarding["status"] != "completed":
+        actions.append({
+            "icon": "upload",
+            "title": "Finish workspace onboarding",
+            "sub": "Complete the source data and Company Brain review.",
+            "href": "/app/onboarding",
+        })
+    new_leads = _count(db, "leads", company_id, "AND status='new'")
+    if new_leads:
+        actions.append({
+            "icon": "search",
+            "title": f"Research {new_leads} new leads",
+            "sub": "Turn raw companies into scored opportunities.",
+            "href": "/app/leads?status=new",
+        })
+    if not actions:
+        actions.append({
+            "icon": "map",
+            "title": "Review market opportunities",
+            "sub": "Compare current country and source performance.",
+            "href": "/app/analytics",
+        })
+    return actions[:4]
+
+
+@router.get("/analytics/dashboard")
+def analytics_dashboard(request: Request, principal: Principal = Depends(current_principal),
+                        x_company_id: str | None = Header(default=None)):
+    company_id = _scope(principal, x_company_id)
+    db = request.app.state.db
+    overview = analytics_overview(request, principal, x_company_id)
+    market = market_intelligence(request, principal, x_company_id)
+    messages = db.all(
+        "SELECT channel,sent_at,replied_at FROM outreach_messages WHERE company_id=?",
+        (company_id,),
+    )
+    activities = [dict(row) for row in db.all(
+        "SELECT * FROM activity_log WHERE company_id=? ORDER BY created_at DESC LIMIT 8",
+        (company_id,),
+    )]
+    selected = [row["country_code"] for row in db.all(
+        "SELECT country_code FROM selected_countries WHERE company_id=? ORDER BY country_code",
+        (company_id,),
+    )]
+    sent = sum(1 for row in messages if row["sent_at"] is not None)
+    replied = sum(1 for row in messages if row["replied_at"] is not None)
+    return {
+        "sales": {
+            "leads_found": overview["leads"],
+            "contacts_found": overview["contacts"],
+            "emails_sent": sent,
+            "replies": replied,
+            "interested": _count(db, "leads", company_id, "AND status='interested'"),
+            "whatsapp_messages": sum(1 for row in messages if row["channel"] == "whatsapp"),
+            "active_campaigns": _count(
+                db, "outreach_campaigns", company_id,
+                "AND status NOT IN ('completed','cancelled')",
+            ),
+        },
+        "sparks": {
+            "leads": _weekly_counts([
+                row["created_at"] for row in db.all(
+                    "SELECT created_at FROM leads WHERE company_id=?", (company_id,),
+                )
+            ])["values"],
+            "emails": _weekly_counts([row["sent_at"] for row in messages])["values"],
+        },
+        "market": {
+            "best_countries": market["country_scores"][:5],
+            "top_industries": market["top_industries"][:5],
+            "source_performance": market["source_performance"][:4],
+        },
+        "recent_activity": [{
+            "id": row["id"],
+            "kind": "reply" if "repl" in row["action"] else (
+                "document" if row["entity_type"] == "document" else "agent"
+            ),
+            "label": row["action"].replace("_", " "),
+            "at": row["created_at"],
+            "ref": {
+                f"{row['entity_type']}_id": row["entity_id"]
+            } if row["entity_type"] and row["entity_id"] else {},
+        } for row in activities],
+        "recommended_actions": _recommended_actions(request, company_id),
+        "country_scores": {
+            item["country"]: item["score"] for item in market["country_scores"]
+        },
+        "selected_countries": selected,
+    }
 
 
 @router.get("/analytics/leads-by-country")
@@ -196,7 +381,15 @@ def admin_integrations(request: Request, _: Principal = Depends(require_admin)):
 
 @router.get("/admin/analytics/costs")
 def admin_costs(request: Request, _: Principal = Depends(require_admin)):
-    return [dict(row) for row in request.app.state.db.all(
+    """Per-tenant model spend.
+
+    `agent_runs.cost` is never written today: the run executor shells out to the
+    hermes CLI and does not parse token accounting back out of it. Every total
+    is therefore structurally 0. `metering_enabled` says so explicitly, because
+    a bare 0.0 reads as "this tenant cost nothing" rather than "not measured".
+    Populate it in AgentRunService before flipping the flag.
+    """
+    return [{**dict(row), "metering_enabled": False} for row in request.app.state.db.all(
         "SELECT company_id,SUM(cost) AS total_cost FROM agent_runs GROUP BY company_id")]
 
 
@@ -338,6 +531,26 @@ def test_data_source(source_id: str, request: Request,
 
 def _source_enabled(source_id: str, enabled: bool, request: Request,
                     principal: Principal, company_header: str | None):
+    # The provider catalog reuses the established enable/disable endpoints.
+    # Catalog lifecycle is admin-only and retains historical evidence; legacy
+    # tenant-created data sources keep their original behavior below.
+    if source_id in request.app.state.lead_research.registry.definitions:
+        if not principal.is_admin:
+            raise HTTPException(403, "Administrator role required")
+        definition = request.app.state.lead_research.registry.definitions[source_id]
+        if enabled and definition.health == "retired":
+            raise HTTPException(409, "Retired sources cannot be enabled for new campaigns")
+        company_id = _scope(principal, company_header)
+        request.app.state.lead_research.ensure_catalog(company_id)
+        request.app.state.db.execute(
+            "UPDATE dataset_definitions SET installed=1,enabled=?,updated_at=? "
+            "WHERE company_id=? AND source_id=?",
+            (int(enabled), now(), company_id, source_id),
+        )
+        return next(
+            item for item in request.app.state.lead_research.catalog(company_id)
+            if item["source_id"] == source_id
+        )
     get_data_source(source_id, request, principal, company_header)
     request.app.state.db.execute("UPDATE data_sources SET enabled=?,updated_at=? WHERE id=?",
                                  (int(enabled), now(), source_id))

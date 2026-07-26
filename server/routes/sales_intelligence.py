@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..agent_service import validate_payload
@@ -274,10 +274,33 @@ def scan_results(scan_id: str, request: Request, principal: Principal = Depends(
 
 @router.get("/leads")
 def leads(request: Request, principal: Principal = Depends(current_principal),
-          x_company_id: str | None = Header(default=None)):
-    return [_lead(row) for row in request.app.state.db.all(
-        "SELECT * FROM leads WHERE company_id=? ORDER BY created_at DESC", (_scope(principal, x_company_id),)
+          x_company_id: str | None = Header(default=None),
+          country: str | None = Query(default=None),
+          status: str | None = Query(default=None),
+          scan: str | None = Query(default=None),
+          band: str | None = Query(default=None),
+          q: str | None = Query(default=None)):
+    company_id = _scope(principal, x_company_id)
+    values = [_lead(row) for row in request.app.state.db.all(
+        "SELECT * FROM leads WHERE company_id=? ORDER BY created_at DESC", (company_id,)
     )]
+    for value in values:
+        value["score"] = _score(value["id"], company_id, request)
+    if country:
+        values = [value for value in values if value["country"] == country.upper()]
+    if status:
+        values = [value for value in values if value["status"] == status]
+    if scan:
+        values = [value for value in values if value["scan_id"] == scan]
+    if band:
+        values = [value for value in values if _score_band(value["score"]["final_score"]) == band]
+    if q:
+        needle = q.casefold()
+        values = [value for value in values if any(
+            needle in str(value.get(field) or "").casefold()
+            for field in ("company_name", "city", "industry", "website")
+        )]
+    return values
 
 
 @router.post("/leads", status_code=201)
@@ -399,6 +422,10 @@ def regenerate_insights(lead_id: str, request: Request, principal: Principal = D
     return _research_run(lead_id, request, principal, x_company_id)
 
 
+def _score_band(value: int) -> str:
+    return "high" if value >= 75 else "mid" if value >= 50 else "low"
+
+
 def _score(lead_id: str, company_id: str, request: Request) -> dict:
     row = request.app.state.db.one(
         "SELECT insights FROM research WHERE lead_id=? AND company_id=? AND status='succeeded' "
@@ -453,10 +480,26 @@ def archive_lead(lead_id: str, request: Request, principal: Principal = Depends(
 
 @router.get("/contacts")
 def contacts(request: Request, principal: Principal = Depends(current_principal),
-             x_company_id: str | None = Header(default=None)):
-    return [_contact(row) for row in request.app.state.db.all(
+             x_company_id: str | None = Header(default=None),
+             lead_id: str | None = Query(default=None),
+             email_status: str | None = Query(default=None),
+             q: str | None = Query(default=None)):
+    values = [_contact(row) for row in request.app.state.db.all(
         "SELECT * FROM contacts WHERE company_id=? ORDER BY created_at DESC", (_scope(principal, x_company_id),)
     )]
+    if lead_id:
+        values = [value for value in values if value["lead_id"] == lead_id]
+    if email_status:
+        values = [value for value in values if value["status"] == email_status or (
+            email_status == "unverified" and value["status"] == "active"
+        )]
+    if q:
+        needle = q.casefold()
+        values = [value for value in values if any(
+            needle in str(value.get(field) or value["data"].get(field) or "").casefold()
+            for field in ("email", "phone", "linkedin_url", "full_name", "name", "title")
+        )]
+    return values
 
 
 @router.post("/contacts", status_code=201)

@@ -17,6 +17,10 @@ from server.app import create_app
 from server.config import Settings
 from server.db import json_dump, new_id, now
 
+# Fixed test-only Fernet key. Real deployments read INTERFAZE_CREDENTIAL_KEY;
+# tests need one because outbound email must carry a signed opt-out link.
+TEST_CREDENTIAL_KEY = "KJ9KmdJiLL6itiwlEGTvGQ4ptS4dnd1ZZPyRPTwmjs4="
+
 
 def make_client():
     root = Path(tempfile.mkdtemp(prefix="interfaze-api-test-"))
@@ -25,6 +29,7 @@ def make_client():
         upload_dir=root / "uploads",
         bootstrap_admin_email="admin@example.test",
         bootstrap_admin_password="correct-horse-battery",
+        credential_key=TEST_CREDENTIAL_KEY,
     )
     app = create_app(settings, run_executor=StubRunExecutor())
     client = TestClient(app)
@@ -73,14 +78,14 @@ def test_all_product_routes_are_exposed():
     }
     expected = set()
     for method, path in re.findall(
-        r"^(GET|POST|PATCH|DELETE)\s+(/api/v1/[^\s]+)",
+        r"^(GET|POST|PUT|PATCH|DELETE)\s+(/api/v1/[^\s]+)",
         (ROOT / "PRODUCT.md").read_text(encoding="utf-8"), re.MULTILINE,
     ):
         for old, new in names.items():
             path = path.replace(f":{old}", "{" + new + "}")
         expected.add((method, path))
     actual = {(method.upper(), path) for path, value in client.app.openapi()["paths"].items()
-              for method in value if method.upper() in {"GET", "POST", "PATCH", "DELETE"}}
+              for method in value if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}}
     assert expected <= actual, sorted(expected - actual)
 
 

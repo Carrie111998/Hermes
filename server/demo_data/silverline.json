@@ -1,0 +1,2727 @@
+{
+  "schema_version": 1,
+  "source": "server/webui/js/mocks/seed.js",
+  "user": {
+    "id": "user_meltem",
+    "name": "Meltem Aydın",
+    "email": "meltem@silverine.com.tr",
+    "role": "owner",
+    "company_id": "company_silverine"
+  },
+  "company": {
+    "id": "company_silverine",
+    "name": "Silverine",
+    "legal_name": "Silverine Ev Aletleri A.Ş.",
+    "website": "https://silverine.com.tr",
+    "headquarters_country": "TR",
+    "city": "Istanbul",
+    "founded_year": 2004,
+    "industry": "Kitchen appliances",
+    "business_model": "Manufacturer / exporter / supplier",
+    "employee_count": "250-500",
+    "main_language": "tr",
+    "sales_regions_current": [
+      "TR",
+      "AZ",
+      "GE",
+      "IQ"
+    ],
+    "sales_regions_target": [
+      "DE",
+      "AE",
+      "SA",
+      "NL",
+      "GB"
+    ],
+    "positioning": {
+      "what_company_sells": "Built-in kitchen appliances and professional kitchen equipment for distributors, importers and project suppliers.",
+      "main_value_proposition": "European-certified quality at 25–35% below Western European factory prices, with 3-week delivery to EU and GCC.",
+      "quality_position": "Upper-mid market",
+      "price_position": "Value / competitive",
+      "premium_or_mass_market": "Premium-value hybrid",
+      "main_differentiators": [
+        "CE + TSE certified production",
+        "OEM/white-label program",
+        "Flexible MOQ from 50 units",
+        "In-house R&D and tooling"
+      ],
+      "certifications": [
+        "CE",
+        "ISO 9001",
+        "TSE",
+        "RoHS"
+      ],
+      "manufacturing_capacity": "420,000 units / year",
+      "export_capacity": "60% of production",
+      "delivery_capabilities": "FOB Istanbul, CIF EU main ports, door delivery GCC",
+      "after_sales_support": "Regional service partners + 24-month warranty"
+    },
+    "sales_preferences": {
+      "default_send_mode": "create_draft",
+      "default_language": "en",
+      "languages": [
+        "en",
+        "de",
+        "ar"
+      ],
+      "default_cc_rule_id": "ccrule_default",
+      "connected_mailbox": "sales@silverine.com.tr"
+    }
+  },
+  "products": [
+    {
+      "id": "prod_ovens",
+      "name": "Built-in oven series (SVN-B)",
+      "category": "Built-in ovens",
+      "description": "60cm multifunction built-in ovens, A+ energy, 9 programs, telescopic rails.",
+      "moq": "50 units",
+      "price_band": "€165–240 FOB",
+      "certifications": [
+        "CE",
+        "RoHS"
+      ],
+      "buyer_roles": [
+        "Purchasing Manager",
+        "Category Manager"
+      ],
+      "market_fit": [
+        {
+          "country": "DE",
+          "score": 92
+        },
+        {
+          "country": "SA",
+          "score": 82
+        },
+        {
+          "country": "NL",
+          "score": 85
+        },
+        {
+          "country": "GB",
+          "score": 86
+        }
+      ]
+    },
+    {
+      "id": "prod_cooktops",
+      "name": "Induction cooktop line (SVN-I)",
+      "category": "Cooktops",
+      "description": "4-zone induction cooktops with booster, slider touch control, 7.2kW.",
+      "moq": "100 units",
+      "price_band": "€88–130 FOB",
+      "certifications": [
+        "CE"
+      ],
+      "buyer_roles": [
+        "Purchasing Manager",
+        "Senior Buyer"
+      ],
+      "market_fit": [
+        {
+          "country": "DE",
+          "score": 84
+        },
+        {
+          "country": "NL",
+          "score": 88
+        }
+      ]
+    },
+    {
+      "id": "prod_hoods",
+      "name": "Range hood collection (SVN-H)",
+      "category": "Range hoods",
+      "description": "Wall-mount and telescopic hoods, 650 m³/h, low-noise EC motors.",
+      "moq": "100 units",
+      "price_band": "€42–95 FOB",
+      "certifications": [
+        "CE"
+      ],
+      "buyer_roles": [
+        "Senior Buyer"
+      ],
+      "market_fit": []
+    },
+    {
+      "id": "prod_dish",
+      "name": "Dishwasher series (SVN-D)",
+      "category": "Dishwashers",
+      "description": "60cm freestanding and fully-integrated dishwashers, 14 place settings.",
+      "moq": "80 units",
+      "price_band": "€180–260 FOB",
+      "certifications": [
+        "CE",
+        "RoHS"
+      ],
+      "buyer_roles": [
+        "Category Manager"
+      ],
+      "market_fit": [
+        {
+          "country": "DE",
+          "score": 87
+        },
+        {
+          "country": "GB",
+          "score": 79
+        }
+      ]
+    },
+    {
+      "id": "prod_fridge",
+      "name": "Refrigerator line (SVN-R)",
+      "category": "Refrigeration",
+      "description": "Combi no-frost refrigerators 320–420L, inverter compressors.",
+      "moq": "60 units",
+      "price_band": "€270–390 FOB",
+      "certifications": [
+        "CE"
+      ],
+      "buyer_roles": [
+        "Purchasing Manager"
+      ],
+      "market_fit": [
+        {
+          "country": "AE",
+          "score": 78
+        },
+        {
+          "country": "SA",
+          "score": 80
+        }
+      ]
+    },
+    {
+      "id": "prod_compact",
+      "name": "Compact kitchen program (SVN-C)",
+      "category": "Compact kitchens",
+      "description": "Mini-kitchen units for studios, hotels and modular housing projects.",
+      "moq": "30 units",
+      "price_band": "€420–780 FOB",
+      "certifications": [
+        "CE"
+      ],
+      "buyer_roles": [
+        "Project Buyer",
+        "Managing Director"
+      ],
+      "market_fit": [
+        {
+          "country": "AE",
+          "score": 86
+        },
+        {
+          "country": "NL",
+          "score": 76
+        },
+        {
+          "country": "GB",
+          "score": 83
+        }
+      ]
+    },
+    {
+      "id": "prod_horeca",
+      "name": "Professional HoReCa series (SVN-P)",
+      "category": "Professional kitchen",
+      "description": "Heavy-duty convection ovens and ranges for hotels and catering.",
+      "moq": "20 units",
+      "price_band": "€520–1,450 FOB",
+      "certifications": [
+        "CE",
+        "ISO 9001"
+      ],
+      "buyer_roles": [
+        "F&B Procurement",
+        "Hotel Equipment Buyer"
+      ],
+      "market_fit": [
+        {
+          "country": "AE",
+          "score": 94
+        },
+        {
+          "country": "SA",
+          "score": 90
+        }
+      ]
+    }
+  ],
+  "documents": [
+    {
+      "id": "doc_catalog",
+      "name": "Silverine_Export_Catalog_2026.pdf",
+      "type": "product_catalog",
+      "size_kb": 8420,
+      "status": "processed",
+      "uploaded_at": "2026-06-23T03:10:33.702Z"
+    },
+    {
+      "id": "doc_pricelist",
+      "name": "FOB_Pricelist_Q3.xlsx",
+      "type": "price_list",
+      "size_kb": 240,
+      "status": "processed",
+      "uploaded_at": "2026-06-23T03:10:33.702Z"
+    },
+    {
+      "id": "doc_pastsales",
+      "name": "Export_sales_2023-2025.xlsx",
+      "type": "past_sales",
+      "size_kb": 1130,
+      "status": "processed",
+      "uploaded_at": "2026-06-24T03:10:33.702Z"
+    },
+    {
+      "id": "doc_distributors",
+      "name": "Current_distributor_list.csv",
+      "type": "distributor_list",
+      "size_kb": 88,
+      "status": "processed",
+      "uploaded_at": "2026-06-24T03:10:33.702Z"
+    },
+    {
+      "id": "doc_certs",
+      "name": "CE_TSE_certificates.pdf",
+      "type": "certificate",
+      "size_kb": 3900,
+      "status": "processed",
+      "uploaded_at": "2026-06-25T03:10:33.702Z"
+    }
+  ],
+  "onboarding": {
+    "status": "in_progress",
+    "current_step": 4,
+    "steps": [
+      {
+        "key": "company-identity",
+        "label": "Company identity",
+        "status": "done"
+      },
+      {
+        "key": "positioning",
+        "label": "Positioning",
+        "status": "done"
+      },
+      {
+        "key": "products",
+        "label": "Product catalog",
+        "status": "done"
+      },
+      {
+        "key": "internal-sales-data",
+        "label": "Internal sales data",
+        "status": "done"
+      },
+      {
+        "key": "current-contacts",
+        "label": "Current contacts",
+        "status": "pending"
+      },
+      {
+        "key": "target-markets",
+        "label": "Target markets",
+        "status": "pending"
+      },
+      {
+        "key": "integrations",
+        "label": "Integration setup",
+        "status": "pending"
+      },
+      {
+        "key": "brain-review",
+        "label": "Company Brain review",
+        "status": "pending"
+      }
+    ]
+  },
+  "brain": {
+    "status": "approved",
+    "built_at": "2026-06-26T03:10:33.702Z",
+    "approved_at": "2026-06-27T03:10:33.702Z",
+    "version": 3,
+    "sections": {
+      "product_understanding": [
+        "Core strength is built-in cooking appliances (ovens, cooktops, hoods) with EU certification and OEM flexibility.",
+        "HoReCa series opens a second buyer universe: hotel equipment suppliers and F&B procurement, strongest in GCC.",
+        "Compact kitchen program fits hotel/studio construction projects — a differentiator few Turkish exporters offer."
+      ],
+      "ideal_customer_profile": [
+        "Importers/distributors of kitchen appliances, 10–200 employees, with dealer networks or project business.",
+        "Hotel equipment suppliers serving 4–5★ hospitality projects in GCC.",
+        "Retail chains and white goods dealers seeking white-label built-in lines with EU certificates."
+      ],
+      "buyer_roles": [
+        "Purchasing Manager",
+        "Procurement Director",
+        "Head of Imports",
+        "Category Manager",
+        "Managing Director / Owner"
+      ],
+      "market_assumptions": [
+        "Germany: large replacement market; price-sensitive mid segment growing; buyers demand CE + energy labels and stable delivery.",
+        "UAE: hospitality construction boom drives HoReCa demand; re-export hub for wider GCC and East Africa.",
+        "Saudi Arabia: giga-projects create bulk project demand; local distribution partners are essential.",
+        "Netherlands: strong appliance import channel; sustainability arguments (energy class, repairability) matter.",
+        "UK: post-Brexit sourcing diversification favors non-EU suppliers with fast logistics."
+      ],
+      "sales_arguments": [
+        "25–35% landed-cost advantage vs Western European brands at comparable spec.",
+        "3-week delivery to EU main ports; 2 weeks to Jebel Ali.",
+        "OEM / white-label program with MOQ from 50 units.",
+        "24-month warranty with regional service partners."
+      ],
+      "missing_data": [
+        "No pricing sheet uploaded for the HoReCa series.",
+        "Current contact list not imported yet (onboarding step 5).",
+        "Lost-deal history absent — win/loss reasoning is inferred only."
+      ]
+    },
+    "snapshots": [
+      {
+        "id": "snap_3",
+        "version": 3,
+        "created_at": "2026-06-26T03:10:33.702Z",
+        "note": "Rebuilt after price list + distributor list upload",
+        "approved": true
+      },
+      {
+        "id": "snap_2",
+        "version": 2,
+        "created_at": "2026-06-24T15:10:33.702Z",
+        "note": "Rebuilt with past-sales data",
+        "approved": false
+      },
+      {
+        "id": "snap_1",
+        "version": 1,
+        "created_at": "2026-06-23T03:10:33.702Z",
+        "note": "Initial build from catalog only",
+        "approved": false
+      }
+    ]
+  },
+  "selected_countries": [
+    "DE",
+    "AE",
+    "SA"
+  ],
+  "lead_scans": [
+    {
+      "id": "scan_de",
+      "name": "Germany — distributors & importers",
+      "countries": [
+        "DE"
+      ],
+      "depth": "standard",
+      "sources": [
+        "web_search",
+        "trade_data",
+        "exhibitor_lists"
+      ],
+      "products": [
+        "prod_ovens",
+        "prod_dish",
+        "prod_cooktops"
+      ],
+      "industries": [
+        "Appliance distributor",
+        "Kitchen appliance importer",
+        "Retail chain"
+      ],
+      "leads_per_country": 14,
+      "status": "completed",
+      "leads_found": 14,
+      "run_id": "run_scan_de",
+      "created_at": "2026-06-29T15:10:33.702Z",
+      "completed_at": "2026-06-29T22:22:33.702Z"
+    },
+    {
+      "id": "scan_ae",
+      "name": "UAE — HoReCa & projects",
+      "countries": [
+        "AE"
+      ],
+      "depth": "standard",
+      "sources": [
+        "web_search",
+        "trade_data",
+        "linkedin_reference"
+      ],
+      "products": [
+        "prod_horeca",
+        "prod_compact"
+      ],
+      "industries": [
+        "Hotel equipment supplier",
+        "Construction project supplier",
+        "Kitchen appliance importer"
+      ],
+      "leads_per_country": 11,
+      "status": "completed",
+      "leads_found": 11,
+      "run_id": "run_scan_ae",
+      "created_at": "2026-07-03T17:34:33.702Z",
+      "completed_at": "2026-07-04T00:46:33.702Z"
+    },
+    {
+      "id": "scan_sa",
+      "name": "Saudi Arabia — projects & retail",
+      "countries": [
+        "SA"
+      ],
+      "depth": "standard",
+      "sources": [
+        "web_search",
+        "trade_data",
+        "company_registries"
+      ],
+      "products": [
+        "prod_horeca",
+        "prod_ovens"
+      ],
+      "industries": [
+        "Construction project supplier",
+        "Hotel equipment supplier",
+        "Retail chain"
+      ],
+      "leads_per_country": 8,
+      "status": "running",
+      "leads_found": 0,
+      "run_id": "run_scan_sa",
+      "created_at": "2026-07-12T02:41:45.702Z",
+      "completed_at": null
+    }
+  ],
+  "leads": [
+    {
+      "id": "lead_de_1",
+      "company_name": "Küchenprofi Handels GmbH",
+      "country": "DE",
+      "city": "Frankfurt",
+      "industry": "Construction project supplier",
+      "website": "https://kuechenprofihandel.de",
+      "size_hint": "10-50",
+      "source": "trade_data",
+      "status": "contacted",
+      "scan_id": "scan_de",
+      "created_at": "2026-06-30T03:10:33.702Z",
+      "score": {
+        "value": 61,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_2",
+      "company_name": "Rheinland Küchentechnik GmbH",
+      "country": "DE",
+      "city": "Stuttgart",
+      "industry": "Construction project supplier",
+      "website": "https://rheinlandkuechente.de",
+      "size_hint": "100-250",
+      "source": "exhibitor_lists",
+      "status": "new",
+      "scan_id": "scan_de",
+      "created_at": "2026-06-30T06:46:33.702Z",
+      "score": {
+        "value": 85,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_3",
+      "company_name": "NordHaus Geräte GmbH",
+      "country": "DE",
+      "city": "Hamburg",
+      "industry": "Kitchen design company",
+      "website": "https://nordhausgeraete.de",
+      "size_hint": "250+",
+      "source": "linkedin_reference",
+      "status": "researched",
+      "scan_id": "scan_de",
+      "created_at": "2026-06-30T10:22:33.702Z",
+      "score": {
+        "value": 47,
+        "band": "low",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_4",
+      "company_name": "MetroKüche Distribution",
+      "country": "DE",
+      "city": "Cologne",
+      "industry": "Appliance distributor",
+      "website": "https://metrokuechedistrib.de",
+      "size_hint": "250+",
+      "source": "web_search",
+      "status": "new",
+      "scan_id": "scan_de",
+      "created_at": "2026-06-30T13:58:33.702Z",
+      "score": {
+        "value": 46,
+        "band": "low",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_5",
+      "company_name": "EuroKitchen Import GmbH",
+      "country": "DE",
+      "city": "Hamburg",
+      "industry": "Construction project supplier",
+      "website": "https://eurokitchenimport.de",
+      "size_hint": "50-100",
+      "source": "linkedin_reference",
+      "status": "new",
+      "scan_id": "scan_de",
+      "created_at": "2026-06-30T17:34:33.702Z",
+      "score": {
+        "value": 92,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_6",
+      "company_name": "Hanse Appliance Partners",
+      "country": "DE",
+      "city": "Hamburg",
+      "industry": "Appliance distributor",
+      "website": "https://hanseappliance.de",
+      "size_hint": "10-50",
+      "source": "company_registries",
+      "status": "interested",
+      "scan_id": "scan_de",
+      "created_at": "2026-06-30T21:10:33.702Z",
+      "score": {
+        "value": 40,
+        "band": "low",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_7",
+      "company_name": "KüchenWelt Vertriebs GmbH",
+      "country": "DE",
+      "city": "Berlin",
+      "industry": "Kitchen appliance importer",
+      "website": "https://kuechenweltvertrie.de",
+      "size_hint": "10-50",
+      "source": "linkedin_reference",
+      "status": "contacted",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-01T00:46:33.702Z",
+      "score": {
+        "value": 70,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_8",
+      "company_name": "Süddeutsche Elektrogeräte",
+      "country": "DE",
+      "city": "Munich",
+      "industry": "Kitchen appliance importer",
+      "website": "https://sueddeutscheelektr.de",
+      "size_hint": "10-50",
+      "source": "trade_data",
+      "status": "replied",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-01T04:22:33.702Z",
+      "score": {
+        "value": 89,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_9",
+      "company_name": "Westfalen Home Tech",
+      "country": "DE",
+      "city": "Frankfurt",
+      "industry": "Kitchen design company",
+      "website": "https://wfalenhometech.de",
+      "size_hint": "10-50",
+      "source": "trade_data",
+      "status": "replied",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-01T07:58:33.702Z",
+      "score": {
+        "value": 76,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_10",
+      "company_name": "Objektküchen München GmbH",
+      "country": "DE",
+      "city": "Düsseldorf",
+      "industry": "Appliance distributor",
+      "website": "https://objektkuechenmuenc.de",
+      "size_hint": "10-50",
+      "source": "linkedin_reference",
+      "status": "researched",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-01T11:34:33.702Z",
+      "score": {
+        "value": 88,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_11",
+      "company_name": "Gastrotechnik Hamburg",
+      "country": "DE",
+      "city": "Hamburg",
+      "industry": "White goods dealer",
+      "website": "https://gastrotechnikhambu.de",
+      "size_hint": "250+",
+      "source": "company_registries",
+      "status": "replied",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-01T15:10:33.702Z",
+      "score": {
+        "value": 57,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_12",
+      "company_name": "Prime Interieur Handel",
+      "country": "DE",
+      "city": "Frankfurt",
+      "industry": "Hotel equipment supplier",
+      "website": "https://primeinterieurhand.de",
+      "size_hint": "50-100",
+      "source": "trade_data",
+      "status": "replied",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-01T18:46:33.702Z",
+      "score": {
+        "value": 51,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_13",
+      "company_name": "Bergmann Küchensysteme",
+      "country": "DE",
+      "city": "Düsseldorf",
+      "industry": "Hotel equipment supplier",
+      "website": "https://bergmannkuechensys.de",
+      "size_hint": "10-50",
+      "source": "trade_data",
+      "status": "replied",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-01T22:22:33.702Z",
+      "score": {
+        "value": 53,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_de_14",
+      "company_name": "Elbe Home Appliances",
+      "country": "DE",
+      "city": "Berlin",
+      "industry": "White goods dealer",
+      "website": "https://elbehomeappliances.de",
+      "size_hint": "100-250",
+      "source": "linkedin_reference",
+      "status": "new",
+      "scan_id": "scan_de",
+      "created_at": "2026-07-02T01:58:33.702Z",
+      "score": {
+        "value": 60,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "Germany opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_1",
+      "company_name": "Gulf Horeca Trading LLC",
+      "country": "AE",
+      "city": "Abu Dhabi",
+      "industry": "Kitchen appliance importer",
+      "website": "https://gulfhorecatrading.ae",
+      "size_hint": "100-250",
+      "source": "linkedin_reference",
+      "status": "new",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-04T03:10:33.702Z",
+      "score": {
+        "value": 95,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_2",
+      "company_name": "Emirates Kitchen Solutions",
+      "country": "AE",
+      "city": "Sharjah",
+      "industry": "Kitchen appliance importer",
+      "website": "https://emirateskitchensol.ae",
+      "size_hint": "250+",
+      "source": "web_search",
+      "status": "contacted",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-04T06:46:33.702Z",
+      "score": {
+        "value": 64,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_3",
+      "company_name": "Al Manara Appliances LLC",
+      "country": "AE",
+      "city": "Abu Dhabi",
+      "industry": "White goods dealer",
+      "website": "https://almanaraappliances.ae",
+      "size_hint": "10-50",
+      "source": "trade_data",
+      "status": "researched",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-04T10:22:33.702Z",
+      "score": {
+        "value": 60,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_4",
+      "company_name": "Dubai Hospitality Supplies",
+      "country": "AE",
+      "city": "Abu Dhabi",
+      "industry": "Kitchen design company",
+      "website": "https://dubaihospitalitysu.ae",
+      "size_hint": "100-250",
+      "source": "linkedin_reference",
+      "status": "replied",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-04T13:58:33.702Z",
+      "score": {
+        "value": 91,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_5",
+      "company_name": "Marina Home Concepts",
+      "country": "AE",
+      "city": "Sharjah",
+      "industry": "White goods dealer",
+      "website": "https://marinahomeconcepts.ae",
+      "size_hint": "100-250",
+      "source": "trade_data",
+      "status": "researched",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-04T17:34:33.702Z",
+      "score": {
+        "value": 43,
+        "band": "low",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_6",
+      "company_name": "Oasis Building Materials",
+      "country": "AE",
+      "city": "Ajman",
+      "industry": "White goods dealer",
+      "website": "https://oasisbuildingmater.ae",
+      "size_hint": "100-250",
+      "source": "exhibitor_lists",
+      "status": "new",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-04T21:10:33.702Z",
+      "score": {
+        "value": 91,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_7",
+      "company_name": "Sharjah White Goods Co",
+      "country": "AE",
+      "city": "Ajman",
+      "industry": "White goods dealer",
+      "website": "https://sharjahwhitegoods.ae",
+      "size_hint": "50-100",
+      "source": "linkedin_reference",
+      "status": "replied",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-05T00:46:33.702Z",
+      "score": {
+        "value": 52,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_8",
+      "company_name": "Khaleej Kitchen Imports",
+      "country": "AE",
+      "city": "Abu Dhabi",
+      "industry": "Construction project supplier",
+      "website": "https://khaleejkitchenimpo.ae",
+      "size_hint": "50-100",
+      "source": "company_registries",
+      "status": "new",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-05T04:22:33.702Z",
+      "score": {
+        "value": 41,
+        "band": "low",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_9",
+      "company_name": "Al Fardan Home Retail",
+      "country": "AE",
+      "city": "Dubai",
+      "industry": "Hotel equipment supplier",
+      "website": "https://alfardanhomeretail.ae",
+      "size_hint": "100-250",
+      "source": "trade_data",
+      "status": "replied",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-05T07:58:33.702Z",
+      "score": {
+        "value": 73,
+        "band": "mid",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_10",
+      "company_name": "Desert Gate Projects LLC",
+      "country": "AE",
+      "city": "Abu Dhabi",
+      "industry": "Appliance distributor",
+      "website": "https://desertgateprojects.ae",
+      "size_hint": "100-250",
+      "source": "web_search",
+      "status": "new",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-05T11:34:33.702Z",
+      "score": {
+        "value": 88,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lead_ae_11",
+      "company_name": "Falcon Interiors Trading",
+      "country": "AE",
+      "city": "Ajman",
+      "industry": "Appliance distributor",
+      "website": "https://falconinteriorstra.ae",
+      "size_hint": "100-250",
+      "source": "company_registries",
+      "status": "new",
+      "scan_id": "scan_ae",
+      "created_at": "2026-07-05T15:10:33.702Z",
+      "score": {
+        "value": 79,
+        "band": "high",
+        "factors": [
+          {
+            "label": "Industry fit",
+            "weight": 30,
+            "note": "Matches Silverine buyer categories"
+          },
+          {
+            "label": "Import activity",
+            "weight": 25,
+            "note": "Trade data shows appliance import volume"
+          },
+          {
+            "label": "Company size",
+            "weight": 20,
+            "note": "Within ICP employee range"
+          },
+          {
+            "label": "Market opportunity",
+            "weight": 15,
+            "note": "United Arab Emirates opportunity score"
+          },
+          {
+            "label": "Web signals",
+            "weight": 10,
+            "note": "Product pages and brand portfolio"
+          }
+        ]
+      }
+    }
+  ],
+  "research": [
+    {
+      "id": "res_lead_de_1",
+      "lead_id": "lead_de_1",
+      "status": "completed",
+      "created_at": "2026-07-01T03:10:33.702Z",
+      "summary": "Küchenprofi Handels GmbH is a construction project supplier based in Frankfurt, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Tendering for a hotel project — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Dishwasher series (SVN-D) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_3",
+      "lead_id": "lead_de_3",
+      "status": "completed",
+      "created_at": "2026-07-01T07:58:33.702Z",
+      "summary": "NordHaus Geräte GmbH is a kitchen design company based in Hamburg, active for 10+ years with an estimated 250+ employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Attending Ambiente next season — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Induction cooktop line (SVN-I) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_6",
+      "lead_id": "lead_de_6",
+      "status": "completed",
+      "created_at": "2026-07-01T15:10:33.702Z",
+      "summary": "Hanse Appliance Partners is a appliance distributor based in Hamburg, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "New showroom opening announced — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Refrigerator line (SVN-R) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_7",
+      "lead_id": "lead_de_7",
+      "status": "completed",
+      "created_at": "2026-07-01T17:34:33.702Z",
+      "summary": "KüchenWelt Vertriebs GmbH is a kitchen appliance importer based in Berlin, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Tendering for a hotel project — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Refrigerator line (SVN-R) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_8",
+      "lead_id": "lead_de_8",
+      "status": "completed",
+      "created_at": "2026-07-01T19:58:33.702Z",
+      "summary": "Süddeutsche Elektrogeräte is a kitchen appliance importer based in Munich, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Range refresh listed for next quarter — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Built-in oven series (SVN-B) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_9",
+      "lead_id": "lead_de_9",
+      "status": "completed",
+      "created_at": "2026-07-01T22:22:33.702Z",
+      "summary": "Westfalen Home Tech is a kitchen design company based in Frankfurt, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Tendering for a hotel project — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Range hood collection (SVN-H) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_10",
+      "lead_id": "lead_de_10",
+      "status": "completed",
+      "created_at": "2026-07-02T00:46:33.702Z",
+      "summary": "Objektküchen München GmbH is a appliance distributor based in Düsseldorf, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Range refresh listed for next quarter — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Professional HoReCa series (SVN-P) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_11",
+      "lead_id": "lead_de_11",
+      "status": "completed",
+      "created_at": "2026-07-02T03:10:33.702Z",
+      "summary": "Gastrotechnik Hamburg is a white goods dealer based in Hamburg, active for 10+ years with an estimated 250+ employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Attending Ambiente next season — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Compact kitchen program (SVN-C) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_12",
+      "lead_id": "lead_de_12",
+      "status": "completed",
+      "created_at": "2026-07-02T05:34:33.702Z",
+      "summary": "Prime Interieur Handel is a hotel equipment supplier based in Frankfurt, active for 10+ years with an estimated 50-100 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Attending Ambiente next season — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Professional HoReCa series (SVN-P) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_de_13",
+      "lead_id": "lead_de_13",
+      "status": "completed",
+      "created_at": "2026-07-02T07:58:33.702Z",
+      "summary": "Bergmann Küchensysteme is a hotel equipment supplier based in Düsseldorf, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Tendering for a hotel project — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Induction cooktop line (SVN-I) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_ae_2",
+      "lead_id": "lead_ae_2",
+      "status": "completed",
+      "created_at": "2026-07-05T05:34:33.702Z",
+      "summary": "Emirates Kitchen Solutions is a kitchen appliance importer based in Sharjah, active for 10+ years with an estimated 250+ employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Attending Ambiente next season — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Built-in oven series (SVN-B) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_ae_3",
+      "lead_id": "lead_ae_3",
+      "status": "completed",
+      "created_at": "2026-07-05T07:58:33.702Z",
+      "summary": "Al Manara Appliances LLC is a white goods dealer based in Abu Dhabi, active for 10+ years with an estimated 10-50 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "New showroom opening announced — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Professional HoReCa series (SVN-P) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_ae_4",
+      "lead_id": "lead_ae_4",
+      "status": "completed",
+      "created_at": "2026-07-05T10:22:33.702Z",
+      "summary": "Dubai Hospitality Supplies is a kitchen design company based in Abu Dhabi, active for 10+ years with an estimated 100-250 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Tendering for a hotel project — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Compact kitchen program (SVN-C) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_ae_5",
+      "lead_id": "lead_ae_5",
+      "status": "completed",
+      "created_at": "2026-07-05T12:46:33.702Z",
+      "summary": "Marina Home Concepts is a white goods dealer based in Sharjah, active for 10+ years with an estimated 100-250 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Range refresh listed for next quarter — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Dishwasher series (SVN-D) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_ae_7",
+      "lead_id": "lead_ae_7",
+      "status": "completed",
+      "created_at": "2026-07-05T17:34:33.702Z",
+      "summary": "Sharjah White Goods Co is a white goods dealer based in Ajman, active for 10+ years with an estimated 50-100 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Range refresh listed for next quarter — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Dishwasher series (SVN-D) given local demand and their current assortment."
+        }
+      ]
+    },
+    {
+      "id": "res_lead_ae_9",
+      "lead_id": "lead_ae_9",
+      "status": "completed",
+      "created_at": "2026-07-05T22:22:33.702Z",
+      "summary": "Al Fardan Home Retail is a hotel equipment supplier based in Dubai, active for 10+ years with an estimated 100-250 employees. Current portfolio includes mid-range European and Asian appliance brands; recent signals suggest they are broadening their built-in range.",
+      "insights": [
+        {
+          "title": "Portfolio gap",
+          "body": "Carries competing brands but no Turkish manufacturer — a landed-cost pitch of 25–35% below current suppliers is credible."
+        },
+        {
+          "title": "Buying window",
+          "body": "Tendering for a hotel project — timing favors first contact now."
+        },
+        {
+          "title": "Entry product",
+          "body": "Best door-opener: Compact kitchen program (SVN-C) given local demand and their current assortment."
+        }
+      ]
+    }
+  ],
+  "contacts": [
+    {
+      "id": "contact_lead_de_1_1",
+      "lead_id": "lead_de_1",
+      "name": "Anna Müller",
+      "title": "Procurement Director",
+      "email": "anna@kuechenprofihandel.de",
+      "email_status": "unverified",
+      "linkedin_url": "https://www.linkedin.com/in/anna-mueller",
+      "phone": "+49 886 9883602",
+      "do_not_contact": false,
+      "created_at": "2026-06-30T03:10:33.702Z"
+    },
+    {
+      "id": "contact_lead_de_7_1",
+      "lead_id": "lead_de_7",
+      "name": "Sabine Fischer",
+      "title": "Purchasing Manager",
+      "email": "sabine@kuechenweltvertrie.de",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/sabine-fischer",
+      "phone": "+49 507 3675971",
+      "do_not_contact": false,
+      "created_at": "2026-07-01T00:46:33.702Z"
+    },
+    {
+      "id": "contact_lead_de_8_1",
+      "lead_id": "lead_de_8",
+      "name": "Jan Becker",
+      "title": "Category Manager",
+      "email": "jan@sueddeutscheelektr.de",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/jan-becker",
+      "phone": null,
+      "do_not_contact": false,
+      "created_at": "2026-07-01T04:22:33.702Z"
+    },
+    {
+      "id": "contact_lead_de_8_2",
+      "lead_id": "lead_de_8",
+      "name": "Lena Krause",
+      "title": "Managing Director",
+      "email": "lena@sueddeutscheelektr.de",
+      "email_status": "unverified",
+      "linkedin_url": "https://www.linkedin.com/in/lena-krause",
+      "phone": null,
+      "do_not_contact": false,
+      "created_at": "2026-07-01T04:22:33.702Z"
+    },
+    {
+      "id": "contact_lead_de_10_1",
+      "lead_id": "lead_de_10",
+      "name": "Felix Neumann",
+      "title": "Sales Director",
+      "email": "felix@objektkuechenmuenc.de",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/felix-neumann",
+      "phone": "+49 576 9688093",
+      "do_not_contact": false,
+      "created_at": "2026-07-01T11:34:33.702Z"
+    },
+    {
+      "id": "contact_lead_de_10_2",
+      "lead_id": "lead_de_10",
+      "name": "Anna Müller",
+      "title": "Procurement Director",
+      "email": "anna@objektkuechenmuenc.de",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/anna-mueller",
+      "phone": null,
+      "do_not_contact": false,
+      "created_at": "2026-07-01T11:34:33.702Z"
+    },
+    {
+      "id": "contact_lead_de_11_1",
+      "lead_id": "lead_de_11",
+      "name": "Anna Müller",
+      "title": "Head of Imports",
+      "email": "anna@gastrotechnikhambu.de",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/anna-mueller",
+      "phone": "+49 962 3331546",
+      "do_not_contact": false,
+      "created_at": "2026-07-01T15:10:33.702Z"
+    },
+    {
+      "id": "contact_lead_de_13_1",
+      "lead_id": "lead_de_13",
+      "name": "Julia Hoffmann",
+      "title": "Procurement Director",
+      "email": "julia@bergmannkuechensys.de",
+      "email_status": "unverified",
+      "linkedin_url": "https://www.linkedin.com/in/julia-hoffmann",
+      "phone": "+49 853 5706334",
+      "do_not_contact": false,
+      "created_at": "2026-07-01T22:22:33.702Z"
+    },
+    {
+      "id": "contact_lead_ae_2_1",
+      "lead_id": "lead_ae_2",
+      "name": "Fatima Hassan",
+      "title": "Managing Director",
+      "email": "fatima@emirateskitchensol.ae",
+      "email_status": "unverified",
+      "linkedin_url": "https://www.linkedin.com/in/fatima-hassan",
+      "phone": "+971 366 2062445",
+      "do_not_contact": false,
+      "created_at": "2026-07-04T06:46:33.702Z"
+    },
+    {
+      "id": "contact_lead_ae_2_2",
+      "lead_id": "lead_ae_2",
+      "name": "Khalid Mansoor",
+      "title": "Owner",
+      "email": "khalid@emirateskitchensol.ae",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/khalid-mansoor",
+      "phone": "+971 284 1403939",
+      "do_not_contact": false,
+      "created_at": "2026-07-04T06:46:33.702Z"
+    },
+    {
+      "id": "contact_lead_ae_4_1",
+      "lead_id": "lead_ae_4",
+      "name": "Layla Ibrahim",
+      "title": "Head of Imports",
+      "email": "layla@dubaihospitalitysu.ae",
+      "email_status": "unverified",
+      "linkedin_url": "https://www.linkedin.com/in/layla-ibrahim",
+      "phone": null,
+      "do_not_contact": false,
+      "created_at": "2026-07-04T13:58:33.702Z"
+    },
+    {
+      "id": "contact_lead_ae_4_2",
+      "lead_id": "lead_ae_4",
+      "name": "Yusuf Karim",
+      "title": "Owner",
+      "email": "yusuf@dubaihospitalitysu.ae",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/yusuf-karim",
+      "phone": "+971 636 1171506",
+      "do_not_contact": false,
+      "created_at": "2026-07-04T13:58:33.702Z"
+    },
+    {
+      "id": "contact_lead_ae_5_1",
+      "lead_id": "lead_ae_5",
+      "name": "Yusuf Karim",
+      "title": "Procurement Director",
+      "email": "yusuf@marinahomeconcepts.ae",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/yusuf-karim",
+      "phone": "+971 478 8830029",
+      "do_not_contact": false,
+      "created_at": "2026-07-04T17:34:33.702Z"
+    },
+    {
+      "id": "contact_lead_ae_7_1",
+      "lead_id": "lead_ae_7",
+      "name": "Ahmed Nasser",
+      "title": "Owner",
+      "email": "ahmed@sharjahwhitegoods.ae",
+      "email_status": "verified",
+      "linkedin_url": "https://www.linkedin.com/in/ahmed-nasser",
+      "phone": null,
+      "do_not_contact": false,
+      "created_at": "2026-07-05T00:46:33.702Z"
+    }
+  ],
+  "campaigns": [
+    {
+      "id": "camp_de",
+      "name": "DE distributors — built-in ovens intro",
+      "country": "DE",
+      "product_id": "prod_ovens",
+      "language": "de",
+      "send_mode": "create_draft",
+      "cc_rule_id": "ccrule_default",
+      "status": "completed",
+      "created_at": "2026-07-02T03:10:33.702Z",
+      "stats": {
+        "messages": 18,
+        "sent": 18,
+        "replied": 3,
+        "interested": 1
+      }
+    },
+    {
+      "id": "camp_ae",
+      "name": "UAE HoReCa — hotel projects intro",
+      "country": "AE",
+      "product_id": "prod_horeca",
+      "language": "en",
+      "send_mode": "create_draft",
+      "cc_rule_id": "ccrule_gcc",
+      "status": "awaiting_approval",
+      "created_at": "2026-07-10T22:22:33.702Z",
+      "stats": {
+        "messages": 6,
+        "sent": 0,
+        "replied": 0,
+        "interested": 0
+      }
+    }
+  ],
+  "messages": [
+    {
+      "id": "msg_de_1",
+      "campaign_id": "camp_de",
+      "lead_id": "lead_de_1",
+      "contact_id": "contact_lead_de_1_1",
+      "channel": "email",
+      "language": "de",
+      "subject": "Einbaugeräte mit CE-Zertifizierung — Partnerschaft mit Küchenprofi Handels GmbH",
+      "body": "Guten Tag Anna Müller,\n\nbei der Durchsicht des deutschen Fachhandels ist mir Küchenprofi Handels GmbH als etablierter Distributor in Frankfurt aufgefallen.\n\nSilverine fertigt seit 2004 Einbaugeräte in Istanbul — CE- und TSE-zertifiziert, mit A+ Energieklassen. Unsere Partner in der EU erzielen 25–35% niedrigere Einkaufspreise gegenüber westeuropäischen Marken bei vergleichbarer Spezifikation, mit 3 Wochen Lieferzeit ab Werk.\n\nBesonders interessant für Ihr Sortiment: unsere SVN-B Backofenserie (60cm, 9 Funktionen, Teleskopauszug) ab 50 Stück MOQ, auch als White-Label.\n\nHätten Sie kommende Woche 20 Minuten für ein kurzes Gespräch?\n\nMit freundlichen Grüßen\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "sent",
+      "cc": [
+        "export-team@silverine.com.tr"
+      ],
+      "sent_at": "2026-07-02T15:10:33.702Z",
+      "created_at": "2026-07-02T07:58:33.702Z"
+    },
+    {
+      "id": "msg_de_3",
+      "campaign_id": "camp_de",
+      "lead_id": "lead_de_7",
+      "contact_id": "contact_lead_de_7_1",
+      "channel": "email",
+      "language": "de",
+      "subject": "Einbaugeräte mit CE-Zertifizierung — Partnerschaft mit KüchenWelt Vertriebs GmbH",
+      "body": "Guten Tag Sabine Fischer,\n\nbei der Durchsicht des deutschen Fachhandels ist mir KüchenWelt Vertriebs GmbH als etablierter Distributor in Berlin aufgefallen.\n\nSilverine fertigt seit 2004 Einbaugeräte in Istanbul — CE- und TSE-zertifiziert, mit A+ Energieklassen. Unsere Partner in der EU erzielen 25–35% niedrigere Einkaufspreise gegenüber westeuropäischen Marken bei vergleichbarer Spezifikation, mit 3 Wochen Lieferzeit ab Werk.\n\nBesonders interessant für Ihr Sortiment: unsere SVN-B Backofenserie (60cm, 9 Funktionen, Teleskopauszug) ab 50 Stück MOQ, auch als White-Label.\n\nHätten Sie kommende Woche 20 Minuten für ein kurzes Gespräch?\n\nMit freundlichen Grüßen\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "sent",
+      "cc": [
+        "export-team@silverine.com.tr"
+      ],
+      "sent_at": "2026-07-03T05:34:33.702Z",
+      "created_at": "2026-07-02T22:22:33.702Z"
+    },
+    {
+      "id": "msg_de_4",
+      "campaign_id": "camp_de",
+      "lead_id": "lead_de_8",
+      "contact_id": "contact_lead_de_8_1",
+      "channel": "email",
+      "language": "de",
+      "subject": "Einbaugeräte mit CE-Zertifizierung — Partnerschaft mit Süddeutsche Elektrogeräte",
+      "body": "Guten Tag Jan Becker,\n\nbei der Durchsicht des deutschen Fachhandels ist mir Süddeutsche Elektrogeräte als etablierter Distributor in Munich aufgefallen.\n\nSilverine fertigt seit 2004 Einbaugeräte in Istanbul — CE- und TSE-zertifiziert, mit A+ Energieklassen. Unsere Partner in der EU erzielen 25–35% niedrigere Einkaufspreise gegenüber westeuropäischen Marken bei vergleichbarer Spezifikation, mit 3 Wochen Lieferzeit ab Werk.\n\nBesonders interessant für Ihr Sortiment: unsere SVN-B Backofenserie (60cm, 9 Funktionen, Teleskopauszug) ab 50 Stück MOQ, auch als White-Label.\n\nHätten Sie kommende Woche 20 Minuten für ein kurzes Gespräch?\n\nMit freundlichen Grüßen\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "replied",
+      "cc": [
+        "export-team@silverine.com.tr"
+      ],
+      "sent_at": "2026-07-03T12:46:33.702Z",
+      "created_at": "2026-07-03T05:34:33.702Z"
+    },
+    {
+      "id": "msg_de_6",
+      "campaign_id": "camp_de",
+      "lead_id": "lead_de_11",
+      "contact_id": "contact_lead_de_11_1",
+      "channel": "email",
+      "language": "de",
+      "subject": "Einbaugeräte mit CE-Zertifizierung — Partnerschaft mit Gastrotechnik Hamburg",
+      "body": "Guten Tag Anna Müller,\n\nbei der Durchsicht des deutschen Fachhandels ist mir Gastrotechnik Hamburg als etablierter Distributor in Hamburg aufgefallen.\n\nSilverine fertigt seit 2004 Einbaugeräte in Istanbul — CE- und TSE-zertifiziert, mit A+ Energieklassen. Unsere Partner in der EU erzielen 25–35% niedrigere Einkaufspreise gegenüber westeuropäischen Marken bei vergleichbarer Spezifikation, mit 3 Wochen Lieferzeit ab Werk.\n\nBesonders interessant für Ihr Sortiment: unsere SVN-B Backofenserie (60cm, 9 Funktionen, Teleskopauszug) ab 50 Stück MOQ, auch als White-Label.\n\nHätten Sie kommende Woche 20 Minuten für ein kurzes Gespräch?\n\nMit freundlichen Grüßen\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "replied",
+      "cc": [
+        "export-team@silverine.com.tr"
+      ],
+      "sent_at": "2026-07-04T03:10:33.702Z",
+      "created_at": "2026-07-03T19:58:33.702Z"
+    },
+    {
+      "id": "msg_ae_1",
+      "campaign_id": "camp_ae",
+      "lead_id": "lead_ae_1",
+      "contact_id": null,
+      "channel": "email",
+      "language": "en",
+      "subject": "CE-certified professional kitchen equipment for Gulf Horeca Trading LLC projects",
+      "body": "Dear Sir or Madam,\n\nI came across Gulf Horeca Trading LLC while researching hospitality suppliers in Abu Dhabi — your project portfolio stands out.\n\nSilverine manufactures professional kitchen equipment in Istanbul: heavy-duty convection ovens, ranges and compact kitchen units, all CE and ISO 9001 certified. We currently deliver to Jebel Ali within two weeks, which our GCC partners use to win time-critical hotel fit-outs.\n\nFor projects like yours, our SVN-P HoReCa series offers a 20–30% landed-cost advantage against European brands, with a 24-month warranty backed by regional service partners.\n\nWould you be open to a brief call this week? I can also send our GCC project reference list.\n\nBest regards,\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "draft_generated",
+      "cc": [
+        "mena@silverine.com.tr"
+      ],
+      "sent_at": null,
+      "created_at": "2026-07-11T00:46:33.702Z"
+    },
+    {
+      "id": "msg_ae_2",
+      "campaign_id": "camp_ae",
+      "lead_id": "lead_ae_2",
+      "contact_id": "contact_lead_ae_2_1",
+      "channel": "email",
+      "language": "en",
+      "subject": "CE-certified professional kitchen equipment for Emirates Kitchen Solutions projects",
+      "body": "Dear Fatima Hassan,\n\nI came across Emirates Kitchen Solutions while researching hospitality suppliers in Sharjah — your project portfolio stands out.\n\nSilverine manufactures professional kitchen equipment in Istanbul: heavy-duty convection ovens, ranges and compact kitchen units, all CE and ISO 9001 certified. We currently deliver to Jebel Ali within two weeks, which our GCC partners use to win time-critical hotel fit-outs.\n\nFor projects like yours, our SVN-P HoReCa series offers a 20–30% landed-cost advantage against European brands, with a 24-month warranty backed by regional service partners.\n\nWould you be open to a brief call this week? I can also send our GCC project reference list.\n\nBest regards,\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "draft_generated",
+      "cc": [
+        "mena@silverine.com.tr"
+      ],
+      "sent_at": null,
+      "created_at": "2026-07-11T00:46:33.702Z"
+    },
+    {
+      "id": "msg_ae_3",
+      "campaign_id": "camp_ae",
+      "lead_id": "lead_ae_3",
+      "contact_id": null,
+      "channel": "email",
+      "language": "en",
+      "subject": "CE-certified professional kitchen equipment for Al Manara Appliances LLC projects",
+      "body": "Dear Sir or Madam,\n\nI came across Al Manara Appliances LLC while researching hospitality suppliers in Abu Dhabi — your project portfolio stands out.\n\nSilverine manufactures professional kitchen equipment in Istanbul: heavy-duty convection ovens, ranges and compact kitchen units, all CE and ISO 9001 certified. We currently deliver to Jebel Ali within two weeks, which our GCC partners use to win time-critical hotel fit-outs.\n\nFor projects like yours, our SVN-P HoReCa series offers a 20–30% landed-cost advantage against European brands, with a 24-month warranty backed by regional service partners.\n\nWould you be open to a brief call this week? I can also send our GCC project reference list.\n\nBest regards,\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "draft_generated",
+      "cc": [
+        "mena@silverine.com.tr"
+      ],
+      "sent_at": null,
+      "created_at": "2026-07-11T00:46:33.702Z"
+    },
+    {
+      "id": "msg_ae_4",
+      "campaign_id": "camp_ae",
+      "lead_id": "lead_ae_4",
+      "contact_id": "contact_lead_ae_4_1",
+      "channel": "email",
+      "language": "en",
+      "subject": "CE-certified professional kitchen equipment for Dubai Hospitality Supplies projects",
+      "body": "Dear Layla Ibrahim,\n\nI came across Dubai Hospitality Supplies while researching hospitality suppliers in Abu Dhabi — your project portfolio stands out.\n\nSilverine manufactures professional kitchen equipment in Istanbul: heavy-duty convection ovens, ranges and compact kitchen units, all CE and ISO 9001 certified. We currently deliver to Jebel Ali within two weeks, which our GCC partners use to win time-critical hotel fit-outs.\n\nFor projects like yours, our SVN-P HoReCa series offers a 20–30% landed-cost advantage against European brands, with a 24-month warranty backed by regional service partners.\n\nWould you be open to a brief call this week? I can also send our GCC project reference list.\n\nBest regards,\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "draft_generated",
+      "cc": [
+        "mena@silverine.com.tr"
+      ],
+      "sent_at": null,
+      "created_at": "2026-07-11T00:46:33.702Z"
+    },
+    {
+      "id": "msg_ae_5",
+      "campaign_id": "camp_ae",
+      "lead_id": "lead_ae_5",
+      "contact_id": "contact_lead_ae_5_1",
+      "channel": "email",
+      "language": "en",
+      "subject": "CE-certified professional kitchen equipment for Marina Home Concepts projects",
+      "body": "Dear Yusuf Karim,\n\nI came across Marina Home Concepts while researching hospitality suppliers in Sharjah — your project portfolio stands out.\n\nSilverine manufactures professional kitchen equipment in Istanbul: heavy-duty convection ovens, ranges and compact kitchen units, all CE and ISO 9001 certified. We currently deliver to Jebel Ali within two weeks, which our GCC partners use to win time-critical hotel fit-outs.\n\nFor projects like yours, our SVN-P HoReCa series offers a 20–30% landed-cost advantage against European brands, with a 24-month warranty backed by regional service partners.\n\nWould you be open to a brief call this week? I can also send our GCC project reference list.\n\nBest regards,\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "draft_generated",
+      "cc": [
+        "mena@silverine.com.tr"
+      ],
+      "sent_at": null,
+      "created_at": "2026-07-11T00:46:33.702Z"
+    },
+    {
+      "id": "msg_ae_6",
+      "campaign_id": "camp_ae",
+      "lead_id": "lead_ae_6",
+      "contact_id": null,
+      "channel": "email",
+      "language": "en",
+      "subject": "CE-certified professional kitchen equipment for Oasis Building Materials projects",
+      "body": "Dear Sir or Madam,\n\nI came across Oasis Building Materials while researching hospitality suppliers in Ajman — your project portfolio stands out.\n\nSilverine manufactures professional kitchen equipment in Istanbul: heavy-duty convection ovens, ranges and compact kitchen units, all CE and ISO 9001 certified. We currently deliver to Jebel Ali within two weeks, which our GCC partners use to win time-critical hotel fit-outs.\n\nFor projects like yours, our SVN-P HoReCa series offers a 20–30% landed-cost advantage against European brands, with a 24-month warranty backed by regional service partners.\n\nWould you be open to a brief call this week? I can also send our GCC project reference list.\n\nBest regards,\nMeltem Aydın\nExport Sales — Silverine",
+      "status": "draft_generated",
+      "cc": [
+        "mena@silverine.com.tr"
+      ],
+      "sent_at": null,
+      "created_at": "2026-07-11T00:46:33.702Z"
+    }
+  ],
+  "cc_rules": [
+    {
+      "id": "ccrule_default",
+      "name": "Default — export team",
+      "market_country": null,
+      "market_region": null,
+      "product_id": null,
+      "industry": null,
+      "cc_emails": [
+        "export-team@silverine.com.tr"
+      ],
+      "is_default": true
+    },
+    {
+      "id": "ccrule_gcc",
+      "name": "GCC region",
+      "market_country": null,
+      "market_region": "GCC",
+      "product_id": null,
+      "industry": null,
+      "cc_emails": [
+        "mena@silverine.com.tr"
+      ],
+      "is_default": false
+    }
+  ],
+  "linkedin_actions": [
+    {
+      "id": "li_1",
+      "contact_id": "contact_lead_de_8_1",
+      "lead_id": "lead_de_3",
+      "profile_url": "https://www.linkedin.com/in/jan-becker",
+      "status": "connected",
+      "note": "Hallo! Wir liefern CE-zertifizierte Einbaugeräte an deutsche Distributoren — ich würde mich gern vernetzen.",
+      "created_at": "2026-07-06T03:10:33.702Z"
+    },
+    {
+      "id": "li_2",
+      "contact_id": "contact_lead_de_10_2",
+      "lead_id": "lead_de_5",
+      "profile_url": "https://www.linkedin.com/in/anna-mueller",
+      "status": "connection_sent",
+      "note": "Great meeting point: appliance sourcing from Türkiye with 3-week EU delivery.",
+      "created_at": "2026-07-09T03:10:33.702Z"
+    },
+    {
+      "id": "li_3",
+      "contact_id": "contact_lead_ae_2_1",
+      "lead_id": "lead_de_8",
+      "profile_url": "https://www.linkedin.com/in/fatima-hassan",
+      "status": "note_generated",
+      "note": "Hospitality projects in the Gulf need faster kitchen equipment lead times — happy to share how we deliver in 2 weeks.",
+      "created_at": "2026-07-11T03:10:33.702Z"
+    },
+    {
+      "id": "li_4",
+      "contact_id": "contact_lead_ae_4_2",
+      "lead_id": "lead_de_11",
+      "profile_url": "https://www.linkedin.com/in/yusuf-karim",
+      "status": "opened",
+      "note": "Connecting with procurement leaders across the GCC hospitality sector.",
+      "created_at": "2026-07-11T07:58:33.702Z"
+    }
+  ],
+  "agent_runs": [
+    {
+      "id": "run_brain_1",
+      "type": "company_brain_build",
+      "label": "Company Brain — initial build",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-23T03:10:33.702Z",
+      "finished_at": "2026-06-23T03:14:13.702Z",
+      "related": {},
+      "logs": []
+    },
+    {
+      "id": "run_doc_1",
+      "type": "document_processing",
+      "label": "Process Silverine_Export_Catalog_2026.pdf",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-23T03:10:33.702Z",
+      "finished_at": "2026-06-23T03:13:33.702Z",
+      "related": {
+        "document_id": "doc_catalog"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_prod_1",
+      "type": "product_extraction",
+      "label": "Extract products from catalog",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-23T07:58:33.702Z",
+      "finished_at": "2026-06-23T08:02:33.702Z",
+      "related": {},
+      "logs": []
+    },
+    {
+      "id": "run_doc_2",
+      "type": "document_processing",
+      "label": "Process Export_sales_2023-2025.xlsx",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-24T03:10:33.702Z",
+      "finished_at": "2026-06-24T03:12:43.702Z",
+      "related": {
+        "document_id": "doc_pastsales"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_brain_2",
+      "type": "company_brain_build",
+      "label": "Company Brain — rebuild v2",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-24T15:10:33.702Z",
+      "finished_at": "2026-06-24T15:14:53.702Z",
+      "related": {},
+      "logs": []
+    },
+    {
+      "id": "run_brain_3",
+      "type": "company_brain_build",
+      "label": "Company Brain — rebuild v3",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-26T03:10:33.702Z",
+      "finished_at": "2026-06-26T03:14:43.702Z",
+      "related": {},
+      "logs": []
+    },
+    {
+      "id": "run_scan_de",
+      "type": "lead_scan",
+      "label": "Lead scan — Germany",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-29T15:10:33.702Z",
+      "finished_at": "2026-06-29T22:22:33.702Z",
+      "related": {
+        "scan_id": "scan_de"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_research_de",
+      "type": "lead_research",
+      "label": "Research 9 German leads",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-30T07:58:33.702Z",
+      "finished_at": "2026-06-30T12:46:33.702Z",
+      "related": {
+        "scan_id": "scan_de"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_contacts_de",
+      "type": "contact_discovery",
+      "label": "Discover contacts — German leads",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-06-30T22:22:33.702Z",
+      "finished_at": "2026-07-01T03:10:33.702Z",
+      "related": {},
+      "logs": []
+    },
+    {
+      "id": "run_outreach_de",
+      "type": "outreach_generation",
+      "label": "Generate DE campaign messages",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-07-02T03:10:33.702Z",
+      "finished_at": "2026-07-02T03:13:53.702Z",
+      "related": {
+        "campaign_id": "camp_de"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_send_de",
+      "type": "email_send",
+      "label": "Create drafts — DE campaign (18 emails)",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-07-02T12:46:33.702Z",
+      "finished_at": "2026-07-02T15:10:33.702Z",
+      "related": {
+        "campaign_id": "camp_de"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_scan_ae",
+      "type": "lead_scan",
+      "label": "Lead scan — UAE",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-07-03T17:34:33.702Z",
+      "finished_at": "2026-07-04T00:46:33.702Z",
+      "related": {
+        "scan_id": "scan_ae"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_research_ae",
+      "type": "lead_research",
+      "label": "Research 8 UAE leads",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-07-04T12:46:33.702Z",
+      "finished_at": "2026-07-04T17:34:33.702Z",
+      "related": {
+        "scan_id": "scan_ae"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_outreach_ae",
+      "type": "outreach_generation",
+      "label": "Generate UAE HoReCa messages",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-07-10T22:22:33.702Z",
+      "finished_at": "2026-07-10T23:34:33.702Z",
+      "related": {
+        "campaign_id": "camp_ae"
+      },
+      "logs": []
+    },
+    {
+      "id": "run_li_1",
+      "type": "linkedin_note_generation",
+      "label": "Generate LinkedIn notes (4 contacts)",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-07-11T03:10:33.702Z",
+      "finished_at": "2026-07-11T03:12:03.702Z",
+      "related": {},
+      "logs": []
+    },
+    {
+      "id": "run_analytics_1",
+      "type": "analytics_refresh",
+      "label": "Refresh analytics",
+      "status": "completed",
+      "progress": 100,
+      "created_at": "2026-07-11T12:46:33.702Z",
+      "finished_at": "2026-07-11T12:47:18.702Z",
+      "related": {},
+      "logs": []
+    }
+  ],
+  "activity": [
+    {
+      "id": "act_1",
+      "kind": "document",
+      "label": "Uploaded product catalog and price list",
+      "ref": {
+        "document_id": "doc_catalog"
+      },
+      "at": "2026-06-23T03:10:33.702Z"
+    },
+    {
+      "id": "act_2",
+      "kind": "agent",
+      "label": "Agent extracted 7 products from the export catalog",
+      "ref": {
+        "run_id": "run_prod_1"
+      },
+      "at": "2026-06-23T07:58:33.702Z"
+    },
+    {
+      "id": "act_3",
+      "kind": "agent",
+      "label": "Company Brain rebuilt (v3) with past-sales and distributor data",
+      "ref": {
+        "run_id": "run_brain_3"
+      },
+      "at": "2026-06-26T03:10:33.702Z"
+    },
+    {
+      "id": "act_4",
+      "kind": "user",
+      "label": "Meltem approved the Company Brain",
+      "ref": {},
+      "at": "2026-06-27T03:10:33.702Z"
+    },
+    {
+      "id": "act_5",
+      "kind": "agent",
+      "label": "Lead scan started — Germany (standard depth)",
+      "ref": {
+        "run_id": "run_scan_de"
+      },
+      "at": "2026-06-29T15:10:33.702Z"
+    },
+    {
+      "id": "act_6",
+      "kind": "agent",
+      "label": "Lead scan completed — 14 German leads discovered",
+      "ref": {
+        "scan_id": "scan_de"
+      },
+      "at": "2026-06-29T22:22:33.702Z"
+    },
+    {
+      "id": "act_7",
+      "kind": "agent",
+      "label": "Research completed for 9 German leads",
+      "ref": {
+        "run_id": "run_research_de"
+      },
+      "at": "2026-06-30T12:46:33.702Z"
+    },
+    {
+      "id": "act_8",
+      "kind": "agent",
+      "label": "Contact discovery found 12 buyer contacts in Germany",
+      "ref": {
+        "run_id": "run_contacts_de"
+      },
+      "at": "2026-07-01T03:10:33.702Z"
+    },
+    {
+      "id": "act_9",
+      "kind": "agent",
+      "label": "Generated 18 German outreach emails for review",
+      "ref": {
+        "campaign_id": "camp_de"
+      },
+      "at": "2026-07-02T03:10:33.702Z"
+    },
+    {
+      "id": "act_10",
+      "kind": "user",
+      "label": "Meltem approved DE campaign — drafts created in Gmail",
+      "ref": {
+        "campaign_id": "camp_de"
+      },
+      "at": "2026-07-02T12:46:33.702Z"
+    },
+    {
+      "id": "act_11",
+      "kind": "agent",
+      "label": "Lead scan started — United Arab Emirates",
+      "ref": {
+        "run_id": "run_scan_ae"
+      },
+      "at": "2026-07-03T17:34:33.702Z"
+    },
+    {
+      "id": "act_12",
+      "kind": "agent",
+      "label": "Lead scan completed — 11 UAE leads discovered",
+      "ref": {
+        "scan_id": "scan_ae"
+      },
+      "at": "2026-07-04T00:46:33.702Z"
+    },
+    {
+      "id": "act_13",
+      "kind": "reply",
+      "label": "Reply received from Küchenprofi Handels GmbH",
+      "ref": {
+        "lead_id": "lead_de_1"
+      },
+      "at": "2026-07-05T03:10:33.702Z"
+    },
+    {
+      "id": "act_14",
+      "kind": "reply",
+      "label": "Reply received from EuroKitchen Import GmbH",
+      "ref": {
+        "lead_id": "lead_de_5"
+      },
+      "at": "2026-07-06T15:10:33.702Z"
+    },
+    {
+      "id": "act_15",
+      "kind": "reply",
+      "label": "NordHaus Geräte marked interested — sample order discussed",
+      "ref": {
+        "lead_id": "lead_de_3"
+      },
+      "at": "2026-07-08T03:10:33.702Z"
+    },
+    {
+      "id": "act_16",
+      "kind": "agent",
+      "label": "Generated 6 UAE HoReCa emails — awaiting approval",
+      "ref": {
+        "campaign_id": "camp_ae"
+      },
+      "at": "2026-07-10T22:22:33.702Z"
+    },
+    {
+      "id": "act_17",
+      "kind": "agent",
+      "label": "LinkedIn notes generated for 4 GCC contacts",
+      "ref": {
+        "run_id": "run_li_1"
+      },
+      "at": "2026-07-11T03:10:33.702Z"
+    },
+    {
+      "id": "act_18",
+      "kind": "agent",
+      "label": "Analytics refreshed",
+      "ref": {
+        "run_id": "run_analytics_1"
+      },
+      "at": "2026-07-11T12:46:33.702Z"
+    }
+  ]
+}

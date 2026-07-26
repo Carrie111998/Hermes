@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal
@@ -173,17 +173,46 @@ def _generation_run(company_id: str, request: Request, *, lead_id: str, contact_
         raise HTTPException(422, "Contact has no email address")
     to = contact["email"] if channel == "email" else contact["phone"]
     cc = _resolve_cc(company_id, lead, contact, request) if channel == "email" else []
+    subject, body = _template_for(company_id, request, language, lead, contact)
     payload = {
         "campaign_id": campaign_id, "lead_id": lead_id, "contact_id": contact_id,
         "channel": channel, "language": language, "to": to,
         "recipients": {"to": to, "cc": cc},
         "delivery_context": {"country": lead["country"]},
         "draft_content": {"to": to, "cc": cc, "language": language,
-                          "subject": "Partnership opportunity",
-                          "body": f"Hello, we would like to explore a potential partnership with {lead['company_name']}."},
+                          "subject": subject, "body": body},
     }
     run = request.app.state.runs.create(company_id, "outreach_generation", payload)
     return request.app.state.runs.start(company_id, run["id"])
+
+
+def _template_for(company_id: str, request: Request, language: str, lead, contact) -> tuple[str, str]:
+    """UI-authored template for the language, with {{placeholder}} substitution.
+
+    Falls back to English, then a generic partnership draft. Placeholders left
+    unresolved are caught by the deterministic preflight, not silently sent.
+    """
+    section = request.app.state.db.one(
+        "SELECT data FROM company_sections WHERE company_id=? AND section='email_templates'",
+        (company_id,),
+    )
+    templates = (json_load(section["data"], {}) if section else {}).get("templates", {})
+    tpl = templates.get(language) or templates.get("en") or {}
+    subject = tpl.get("subject") or "Partnership opportunity"
+    body = tpl.get("body") or (
+        f"Hello, we would like to explore a potential partnership with {lead['company_name']}.")
+    contact_data = json_load(contact["data"], {}) if contact["data"] else {}
+    fields = {
+        "company_name": lead["company_name"] or "",
+        "country": lead["country"] or "",
+        "contact_name": contact_data.get("name") or contact_data.get("full_name") or "",
+        "contact_title": contact_data.get("title") or "",
+    }
+    for key, value in fields.items():
+        token = "{{" + key + "}}"
+        subject = subject.replace(token, value)
+        body = body.replace(token, value)
+    return subject, body
 
 
 def _resolve_cc(company_id: str, lead, primary_contact, request: Request) -> list[str]:
@@ -287,11 +316,25 @@ def cancel_campaign(campaign_id: str, request: Request, principal: Principal = D
 
 @router.get("/outreach/messages")
 def messages(request: Request, principal: Principal = Depends(current_principal),
-             x_company_id: str | None = Header(default=None)):
-    return [message_dict(row) for row in request.app.state.db.all(
+             x_company_id: str | None = Header(default=None),
+             campaign_id: str | None = Query(default=None),
+             lead_id: str | None = Query(default=None),
+             contact_id: str | None = Query(default=None),
+             status: str | None = Query(default=None)):
+    values = [message_dict(row) for row in request.app.state.db.all(
         "SELECT * FROM outreach_messages WHERE company_id=? ORDER BY created_at DESC",
         (_scope(principal, x_company_id),),
     )]
+    filters = {
+        "campaign_id": campaign_id,
+        "lead_id": lead_id,
+        "contact_id": contact_id,
+        "status": status,
+    }
+    for key, expected in filters.items():
+        if expected:
+            values = [value for value in values if value.get(key) == expected]
+    return values
 
 
 @router.get("/outreach/messages/{message_id}")

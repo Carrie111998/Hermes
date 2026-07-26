@@ -406,7 +406,13 @@ DELETE /api/v1/admin/users/:userId
 POST   /api/v1/admin/users/:userId/assign-company
 POST   /api/v1/admin/users/:userId/reset-password
 POST   /api/v1/admin/users/:userId/disable
+
+GET    /api/v1/admin/errors
+GET    /api/v1/admin/logs
 ```
+
+The error and log views are administrator-only, cross-workspace operational
+summaries. Responses must omit credentials, message bodies, and other secrets.
 
 ---
 
@@ -434,9 +440,16 @@ PATCH  /api/v1/onboarding/company-identity
 PATCH  /api/v1/onboarding/positioning
 PATCH  /api/v1/onboarding/products
 PATCH  /api/v1/onboarding/internal-sales-data
+PATCH  /api/v1/onboarding/current-contacts
 PATCH  /api/v1/onboarding/target-markets
+PATCH  /api/v1/onboarding/integrations
+PATCH  /api/v1/onboarding/brain-review
 POST   /api/v1/onboarding/complete
 ```
+
+`current-contacts`, `integrations`, and `brain-review` persist WebUI progress.
+The original five data-bearing steps remain the completion compatibility
+boundary for existing API clients.
 
 ---
 
@@ -750,8 +763,8 @@ POST   /api/v1/outreach/messages/:messageId/mark-replied
 GET    /api/v1/integrations/email
 POST   /api/v1/integrations/email/connect/google
 POST   /api/v1/integrations/email/connect/microsoft
-POST   /api/v1/integrations/email/connect/zoho
 POST   /api/v1/integrations/email/connect/smtp
+POST   /api/v1/integrations/email/connect/browser
 
 GET    /api/v1/integrations/email/:integrationId
 PATCH  /api/v1/integrations/email/:integrationId
@@ -833,6 +846,9 @@ Example:
 ```text
 GET    /api/v1/integrations/whatsapp
 POST   /api/v1/integrations/whatsapp/connect
+GET    /api/v1/integrations/whatsapp/profile
+PUT    /api/v1/integrations/whatsapp/profile
+POST   /api/v1/integrations/whatsapp/profile/verify
 GET    /api/v1/integrations/whatsapp/:integrationId
 PATCH  /api/v1/integrations/whatsapp/:integrationId
 DELETE /api/v1/integrations/whatsapp/:integrationId
@@ -840,6 +856,10 @@ DELETE /api/v1/integrations/whatsapp/:integrationId
 POST   /api/v1/integrations/whatsapp/:integrationId/test
 POST   /api/v1/integrations/whatsapp/webhook
 ```
+
+The profile routes persist non-secret WhatsApp Business identifiers separately
+from server-managed credentials. Profile verification is a readiness check; it
+does not prove live Meta API access.
 
 ---
 
@@ -908,6 +928,7 @@ Customer analytics:
 
 ```text
 GET    /api/v1/analytics/overview
+GET    /api/v1/analytics/dashboard
 GET    /api/v1/analytics/sales-pipeline
 GET    /api/v1/analytics/market-intelligence
 GET    /api/v1/analytics/leads-by-country
@@ -917,6 +938,10 @@ GET    /api/v1/analytics/outreach
 GET    /api/v1/analytics/source-performance
 GET    /api/v1/analytics/product-market-fit
 ```
+
+`GET /api/v1/analytics/dashboard` is the tenant-scoped composite used by the
+customer dashboard. It combines sales totals, market signals, recent activity,
+recommended actions, and selected countries.
 
 Admin analytics:
 

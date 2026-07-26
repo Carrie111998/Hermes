@@ -1,0 +1,137 @@
+- source_id: fixture-directory
+  version: '1'
+  display_name: Verified buyer directory fixture
+  publisher: Interfaze test fixtures
+  jurisdiction: [global]
+  categories: [registry, opportunity]
+  homepage: null
+  access_tier: public
+  entity_levels: [named_company, opportunity]
+  capabilities: [organizations, company_signals, buying_requests]
+  countries: []
+  sector_ids: []
+  freshness_days: 30
+  adapter_mode: fixture
+  default_enabled: true
+  health: active
+  last_verified_at: '2026-07-14'
+- source_id: un-comtrade
+  version: '1'
+  display_name: UN Comtrade
+  publisher: United Nations Statistics Division
+  jurisdiction: [global]
+  categories: [trade]
+  homepage: https://comtradeplus.un.org/
+  access_tier: credentialed_public
+  entity_levels: [market]
+  capabilities: [market_signals]
+  countries: []
+  sector_ids: []
+  freshness_days: 120
+  adapter_mode: credential_required
+  default_enabled: false
+  health: active
+  last_verified_at: '2026-07-14'
+- source_id: eurostat-comext
+  version: '1'
+  display_name: Eurostat Comext
+  publisher: Eurostat
+  jurisdiction: [EU]
+  categories: [trade]
+  homepage: https://ec.europa.eu/eurostat/
+  access_tier: public
+  entity_levels: [market]
+  capabilities: [market_signals]
+  countries: []
+  sector_ids: []
+  freshness_days: 90
+  adapter_mode: manual_import
+  default_enabled: false
+  health: active
+  last_verified_at: '2026-07-14'
+- source_id: companies-house
+  version: '1'
+  display_name: Companies House
+  publisher: UK Companies House
+  jurisdiction: [GB]
+  categories: [registry, filings]
+  homepage: https://developer.company-information.service.gov.uk/
+  access_tier: credentialed_public
+  entity_levels: [named_company]
+  capabilities: [organizations, filings]
+  countries: [GB]
+  sector_ids: []
+  freshness_days: 30
+  adapter_mode: credential_required
+  default_enabled: false
+  health: active
+  last_verified_at: '2026-07-14'
+- source_id: ted
+  version: '1'
+  display_name: Tenders Electronic Daily
+  publisher: Publications Office of the European Union
+  jurisdiction: [EU]
+  categories: [procurement]
+  homepage: https://ted.europa.eu/
+  access_tier: public
+  entity_levels: [named_company, opportunity]
+  capabilities: [procurement, organizations]
+  countries: []
+  sector_ids: []
+  freshness_days: 7
+  adapter_mode: manual_import
+  default_enabled: false
+  health: active
+  last_verified_at: '2026-07-14'
+- source_id: auma
+  version: '1'
+  display_name: AUMA Fair Finder
+  publisher: Association of the German Trade Fair Industry
+  jurisdiction: [DE, global]
+  categories: [exhibition]
+  homepage: https://www.auma.de/en/find-your-fair/
+  access_tier: public
+  entity_levels: [event]
+  capabilities: [events]
+  countries: []
+  sector_ids: []
+  freshness_days: 30
+  adapter_mode: manual_import
+  default_enabled: false
+  health: active
+  last_verified_at: '2026-07-14'
+- source_id: b2match-export
+  version: '1'
+  display_name: b2match customer export
+  publisher: b2match / customer event organizer
+  jurisdiction: [global]
+  categories: [matchmaking]
+  homepage: https://support.b2match.com/
+  access_tier: customer_upload
+  entity_levels: [named_company, opportunity, event]
+  capabilities: [organizations, buying_requests, events]
+  countries: []
+  sector_ids: []
+  freshness_days: 30
+  adapter_mode: manual_import
+  default_enabled: false
+  health: active
+  last_verified_at: '2026-07-14'
+- source_id: jetro-jmesse
+  version: retired-2026
+  display_name: JETRO J-messe
+  publisher: JETRO
+  jurisdiction: [JP, global]
+  categories: [exhibition]
+  homepage: https://www.jetro.go.jp/en/database/j-messe/
+  access_tier: retired
+  entity_levels: [event]
+  capabilities: [events]
+  countries: []
+  sector_ids: []
+  freshness_days: 365
+  adapter_mode: catalog_only
+  default_enabled: false
+  health: retired
+  last_verified_at: '2026-07-14'
+  license_note: Service discontinued 2026-03-31; retained for historical provenance.

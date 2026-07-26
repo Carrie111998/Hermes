@@ -1354,6 +1354,60 @@ def _run_post_setup(post_setup_key: str):
         _print_info("    No API key required. DuckDuckGo enforces server-side rate limits.")
         _print_info("    Pair with an extract provider if you also need web_extract.")
 
+    elif post_setup_key == "scrapling":
+        try:
+            import importlib.util as _ilu
+            _have = _ilu.find_spec("scrapling") is not None and _ilu.find_spec("curl_cffi") is not None
+        except Exception:  # noqa: BLE001
+            _have = False
+        if _have:
+            _print_success("    scrapling is already installed")
+        else:
+            _print_info("    Installing scrapling[fetchers] + markdownify...")
+            try:
+                result = _pip_install(
+                    ["-U", "scrapling[fetchers]==0.4.11", "markdownify==1.2.0", "--quiet"],
+                    timeout=600,
+                )
+                if result.returncode == 0:
+                    _print_success("    scrapling installed")
+                else:
+                    _print_warning("    scrapling install failed:")
+                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                    _print_info("    Run manually: uv pip install -U 'scrapling[fetchers]' markdownify")
+                    return
+            except subprocess.TimeoutExpired:
+                _print_warning("    scrapling install timed out (>10min)")
+                _print_info("    Run manually: uv pip install -U 'scrapling[fetchers]' markdownify")
+                return
+        # Download the stealth browser (for the Cloudflare/anti-bot fallback).
+        # The fast TLS-impersonation path works without it; only the stealth
+        # fallback needs it, so a failure here is a warning, not fatal.
+        _print_info("    Downloading stealth browser (`scrapling install`, ~300MB)...")
+        try:
+            # No scrapling.__main__, so `python -m scrapling` fails; prefer the
+            # console script, fall back to invoking cli.main() directly.
+            _scrapling_bin = shutil.which("scrapling")
+            _install_cmd = (
+                [_scrapling_bin, "install"]
+                if _scrapling_bin
+                else [sys.executable, "-c", "from scrapling.cli import main; main(['install'])"]
+            )
+            result = subprocess.run(
+                _install_cmd, capture_output=True, text=True, timeout=900,
+            )
+            if result.returncode == 0:
+                _print_success("    stealth browser ready")
+            else:
+                _print_warning("    stealth browser download failed (fast fetch still works):")
+                _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                _print_info("    Run manually: python -m scrapling install")
+        except Exception as exc:  # noqa: BLE001 — non-fatal; fast path unaffected
+            _print_warning(f"    stealth browser download skipped: {exc}")
+            _print_info("    Run manually: python -m scrapling install")
+        _print_info("    No API key required — pages are fetched from this machine.")
+        _print_info("    Search-only: pair with a search provider (exa / brave-free / ddgs / …).")
+
     elif post_setup_key == "spotify":
         # Run the full `hermes auth spotify` flow — if the user has no
         # client_id yet, this drops them into the interactive wizard

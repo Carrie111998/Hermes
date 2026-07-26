@@ -72,3 +72,21 @@ def patch_sales_preferences(body: DataPatch, request: Request,
     return _put_section(request.app.state.db, _scope(principal, x_company_id),
                         "sales_preferences", body.data)
 
+
+@router.get("/email-templates")
+def email_templates(request: Request, principal: Principal = Depends(current_principal),
+                    x_company_id: str | None = Header(default=None)):
+    """Language-keyed outreach templates: {templates: {<lang>: {subject, body}}}."""
+    return _get_section(request.app.state.db, _scope(principal, x_company_id), "email_templates")
+
+
+@router.patch("/email-templates")
+def patch_email_templates(body: DataPatch, request: Request,
+                          principal: Principal = Depends(current_principal),
+                          x_company_id: str | None = Header(default=None)):
+    company_id = _scope(principal, x_company_id)
+    result = _put_section(request.app.state.db, company_id, "email_templates", body.data)
+    request.app.state.db.activity(company_id, principal.id, "email_templates_updated",
+                                  "company", company_id)
+    return result
+

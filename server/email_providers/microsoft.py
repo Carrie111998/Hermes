@@ -50,13 +50,22 @@ class MicrosoftProvider:
 
     @staticmethod
     def _message(email: OutgoingEmail) -> dict:
-        return {
+        message = {
             "subject": email.subject,
             "body": {"contentType": "HTML" if "<" in email.body and ">" in email.body else "Text",
                      "content": email.body},
             "toRecipients": [{"emailAddress": {"address": email.to}}],
             "ccRecipients": [{"emailAddress": {"address": address}} for address in email.cc],
         }
+        if email.reply_to:
+            message["replyTo"] = [{"emailAddress": {"address": email.reply_to}}]
+        if email.headers:
+            # Graph only accepts custom headers prefixed x- or registered ones,
+            # and only on a draft; List-Unsubscribe is accepted here.
+            message["internetMessageHeaders"] = [
+                {"name": name, "value": value} for name, value in email.headers.items()
+            ]
+        return message
 
     def create_draft(self, email: OutgoingEmail) -> SendResult:
         response = self._request("POST", f"{self.API}/messages", json=self._message(email))

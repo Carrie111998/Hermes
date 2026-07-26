@@ -57,3 +57,39 @@ never message blind.
 - Read-only: research never contacts the lead, on any channel.
 - Bulk research (§7.13 `/research/bulk`) is this skill fanned out one worker
   per lead, each within its own budget.
+
+## Evidence-bound campaign enrichment
+
+When invoked by the Research campaign pipeline, the input is one resolved
+organization, its compact evidence bundle, missing applicable fields, sector
+playbook, and explicit page/time/token budget. Structured sources always run
+first. Stop when the completeness target, source exhaustion, or any configured
+budget is reached; report remaining fields as `unknown` rather than guessing.
+
+Return claims as JSON objects matching the application `Claim` contract:
+
+```json
+{
+  "field": "store_count",
+  "value": 84,
+  "unit": "stores",
+  "currency": null,
+  "period": "FY2025",
+  "status": "observed",
+  "confidence": 0.86,
+  "method": "observed",
+  "evidence_ids": ["ev_example"],
+  "applicability": "useful"
+}
+```
+
+- Numeric claims require resolvable evidence, an explicit period when the value
+  changes over time, and separate unit/currency fields where applicable.
+- Aggregate market or trade evidence may inform market attractiveness. It must
+  never become a named-company metric, buying-intent claim, or lead by itself.
+- Unsupported numeric output is rejected by the application validator; do not
+  restate it as narrative to bypass validation.
+- Keep public market capitalization, reported company valuation, estimated
+  private value ranges, and addressable market value as distinct concepts.
+- Use `observed`, `calculated`, `estimated_range`, `conflicted`, `unknown`, or
+  `not_applicable`; never convert missing evidence to zero.

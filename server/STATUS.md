@@ -1,15 +1,20 @@
 # Sales Agent backend status
 
-Status as of 2026-07-11.
+Status as of 2026-07-16.
 
 ## Code-complete surfaces
 
-- All 207 API method/path contracts in PRODUCT.md are exposed and checked
+- All 216 API method/path contracts in PRODUCT.md are exposed and checked
   against generated OpenAPI.
 - Local auth plus Supabase GoTrue login/token validation/refresh/logout/reset.
 - Admin-managed companies and users with tenant-scoped customer access.
 - Onboarding, documents, products, versioned Company Brain snapshots.
 - Lead map, scans, leads, research, scoring, and contact discovery.
+- Evidence-first Research workspace with tenant campaign drafts, source catalog,
+  immutable local snapshots, canonical claims, separate fit/confidence scoring,
+  ordered funnel metrics, evidence inspection, CSV export, and source lifecycle
+  impact/purge handling. The offline fixture provider qualifies the full path;
+  public/credentialed source entries remain access-gated until adapters are configured.
 - Campaigns, custom outreach, revision-bound approvals, deterministic QA,
   draft/send modes, market CC rules, send limits/windows, and delivery
   idempotency.
@@ -18,6 +23,12 @@ Status as of 2026-07-11.
 - Analytics, CSV exports, data sources, activity logs, run logs/events.
 - SQLite local backend and Supabase Postgres/RLS/Storage deployment path.
 - Installable `interfaze-api` entry point and packaged server/company packs.
+- Packaged same-origin WebUI that uses the real API by default, with mock mode
+  available only when explicitly selected for frontend development.
+- Tenant-scoped Ask Hermes SSE bridge with restricted agent turns, durable
+  chat history, single-use stream capabilities, and concurrent-turn control.
+- Real WebUI multipart uploads, authenticated CSV downloads, dashboard-shaped
+  analytics, promoted onboarding/admin/WhatsApp routes, and server-side list filters.
 
 ## Run types
 
@@ -39,8 +50,17 @@ Status as of 2026-07-11.
 
 - `tests/server/test_api_mvp.py`: 9 API qualification checks.
 - `tests/server/test_run_harness.py`: 7 production run-service checks.
-- PRODUCT route comparison: 207/207.
+- `tests/server/test_webui.py`: 16 serving, security, connection, core-flow,
+  chat-isolation, and long-tail checks.
+- `tests/server/test_demo_seed.py`: 2 tenant seed and local draft-flow checks.
+- `tests/server/lead_research/` and `tests/server/test_research_webui.py`: 10
+  evidence-contract, tenant-isolation, refresh, source-removal, API, and WebUI checks.
+- Full `tests/server` qualification: 40 passed.
+- PRODUCT route comparison: 216/216.
 - Python compile pass for `server/` and `tests/server/`.
+- The persisted local Silverine profile passed an API smoke test for customer
+  login, tenant scoping, 25 seeded leads, approval-to-local-draft, health, and
+  browser security headers. The database was reset afterward for clean testing.
 
 ## External release gates
 
@@ -52,7 +72,9 @@ credential-free checkout:
 2. Complete OAuth sandbox delivery tests for Gmail and Microsoft Graph:
    create draft, send approved message, refresh token, read reply/status.
 3. Complete WhatsApp test-number delivery/webhook/ambiguous-timeout tests.
-4. Run the Silverline document→brain→scan→research→contact→email acceptance
+4. Run the Silverine document→brain→scan→research→contact→email acceptance
    chain with the production model and record its fixtures.
 5. Refresh `uv.lock`; this workspace could not access uv's cache because its
    approval/credit gate rejected the operation.
+6. Record and qualify live official-source adapters independently; catalog-only,
+   manual-import, credentialed, and retired entries do not claim live acquisition.

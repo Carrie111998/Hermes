@@ -14,7 +14,13 @@ STEPS = {
     "positioning": "positioning",
     "products": "products",
     "internal-sales-data": "internal_sales_data",
+    "current-contacts": "current_contacts",
     "target-markets": "market_preferences",
+    "integrations": "integrations",
+    "brain-review": "brain_review",
+}
+REQUIRED_STEPS = {
+    "company-identity", "positioning", "products", "internal-sales-data", "target-markets",
 }
 
 
@@ -91,7 +97,11 @@ def complete_onboarding(request: Request, principal: Principal = Depends(current
                         x_company_id: str | None = Header(default=None)):
     company_id = _company(principal, x_company_id)
     state = _status(request.app.state.db, company_id)
-    missing = [step for step in STEPS if step not in state["completed_steps"]]
+    # The original five PRODUCT.md steps remain the compatibility boundary.
+    # WebUI convenience steps are persisted when used, but do not make older
+    # API clients unable to complete onboarding.
+    missing = [step for step in STEPS
+               if step in REQUIRED_STEPS and step not in state["completed_steps"]]
     if missing:
         raise HTTPException(409, {"message": "Onboarding is incomplete", "missing_steps": missing})
     stamp = now()

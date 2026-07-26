@@ -38,7 +38,24 @@ class Settings:
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     credential_key: str = ""
+    # Absolute origin used to build opt-out links in outbound email. Must be
+    # publicly reachable, so it cannot be inferred from the request host.
+    public_base_url: str = "http://localhost:8000"
     upload_dir: Path = field(default_factory=lambda: get_hermes_home() / "interfaze" / "uploads")
+    webui_enabled: bool = True
+    max_upload_bytes: int = 25 * 1024 * 1024
+    chat_enabled: bool = True
+    chat_model: str = ""
+    chat_toolset: str = "none"
+    auth_max_attempts: int = 8
+    auth_window_seconds: int = 300
+    # One OAuth app per provider, shared by every tenant — the standard SaaS
+    # shape. Tenants authorize against it; they never supply client secrets.
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    microsoft_oauth_client_id: str = ""
+    microsoft_oauth_client_secret: str = ""
+    microsoft_oauth_tenant: str = "common"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -62,5 +79,22 @@ class Settings:
             bootstrap_admin_email=os.environ.get("INTERFAZE_BOOTSTRAP_ADMIN_EMAIL", ""),
             bootstrap_admin_password=os.environ.get("INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD", ""),
             credential_key=os.environ.get("INTERFAZE_CREDENTIAL_KEY", ""),
+            public_base_url=str(
+                os.environ.get("INTERFAZE_PUBLIC_BASE_URL")
+                or cfg.get("public_base_url")
+                or "http://localhost:8000"
+            ).rstrip("/"),
             upload_dir=Path(cfg.get("upload_dir") or home / "uploads").expanduser(),
+            webui_enabled=cfg.get("webui_enabled") is not False,
+            max_upload_bytes=max(0, int(cfg.get("max_upload_bytes", 25 * 1024 * 1024))),
+            chat_enabled=cfg.get("chat_enabled") is not False,
+            chat_model=str(cfg.get("chat_model") or ""),
+            chat_toolset=str(cfg.get("chat_toolset") or "none").lower(),
+            auth_max_attempts=max(1, int(cfg.get("auth_max_attempts", 8))),
+            auth_window_seconds=max(30, int(cfg.get("auth_window_seconds", 300))),
+            google_oauth_client_id=os.environ.get("GOOGLE_OAUTH_CLIENT_ID", ""),
+            google_oauth_client_secret=os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", ""),
+            microsoft_oauth_client_id=os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", ""),
+            microsoft_oauth_client_secret=os.environ.get("MICROSOFT_OAUTH_CLIENT_SECRET", ""),
+            microsoft_oauth_tenant=os.environ.get("MICROSOFT_OAUTH_TENANT", "common"),
         )
