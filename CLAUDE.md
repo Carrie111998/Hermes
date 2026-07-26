@@ -87,6 +87,11 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
 - Lote 7 (este commit): `configuration.md` (2131 líneas, 93 "Hermes" → IYARI). Sin
   anclas (headings son config-keys). Preservados `HermesSweEnv` (nombre de entorno
   benchmark RL) y `Nous-managed gateway` (servicio Nous).
+- Sub-lote B (este commit, paréntesis fuera de la numeración de docs): `README.md` raíz
+  reemplazado por versión IYARI (texto exacto del usuario) + logo `assets/iyari-logo-completo.png`
+  (PNG real 645×474). Único ajuste sobre el texto pegado: `src` de imagen `.jpg`→`.png` y
+  Quickstart envuelto en ```bash (aprobado por el usuario). Mensaje de commit:
+  "G5 sub-lote B: README raíz IYARI + logo marca".
 - Sub-lotes user-guide/ restantes: 8=`skills/bundled/`+google-workspace (74, dividir en 2),
   9-10=`skills/optional/` (101, dividir).
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
