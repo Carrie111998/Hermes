@@ -1,11 +1,27 @@
 """Behavior contracts for Slack interactive reply directives and storage."""
 
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from plugins.platforms.slack.adapter import SlackAdapter
 from plugins.platforms.slack.interactive_replies import (
     InteractiveButton,
     InteractiveReplyStore,
     append_actions_block,
     parse_interactive_reply,
 )
+
+
+def _make_adapter():
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+    adapter._app = MagicMock()
+    client = AsyncMock()
+    client.chat_postMessage = AsyncMock(return_value={"ts": "111.222"})
+    adapter._get_client = MagicMock(return_value=client)
+    adapter.stop_typing = AsyncMock()
+    return adapter, client
 
 
 def test_parse_valid_directive_strips_it_and_preserves_visible_reply():
@@ -97,3 +113,17 @@ def test_append_actions_block_returns_slack_buttons_without_mutating_input(tmp_p
     assert [item["value"] for item in rendered[-1]["elements"]] == [
         button.token for button in prepared.buttons
     ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_posts_buttons_without_literal_directive(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+
+    await adapter.send("C1", "Lead ready\n[[slack_buttons: Enroll:enroll]]")
+
+    posted = client.chat_postMessage.await_args.kwargs
+    assert "[[slack_buttons:" not in posted["text"]
+    assert posted["text"]
+    assert posted["blocks"][-1]["type"] == "actions"
+    assert posted["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"

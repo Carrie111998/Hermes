@@ -161,3 +161,23 @@ def test_standalone_send_stops_on_non_token_error(monkeypatch, _standalone_send)
 
     assert result == {"error": "Slack API error: msg_too_long"}
     assert len(fake_session.calls) == 1
+
+
+def test_standalone_send_posts_the_same_action_block(
+    monkeypatch, _standalone_send, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    fake_session = _SlackSession()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake_session)
+
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={})
+    result = asyncio.run(
+        _standalone_send(pconfig, "C123", "x\n[[slack_buttons: Go:go]]")
+    )
+
+    assert result["success"] is True
+    payload = fake_session.calls[0][1]
+    assert "[[slack_buttons:" not in payload["text"]
+    assert payload["text"]
+    assert payload["blocks"][-1]["type"] == "actions"
+    assert payload["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"

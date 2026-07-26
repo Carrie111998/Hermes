@@ -64,6 +64,11 @@ try:  # sibling module; support both package and flat plugin-dir import
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
 
+try:  # sibling module; support both package and flat plugin-dir import
+    from .interactive_replies import InteractiveReplyStore, append_actions_block, parse_interactive_reply
+except ImportError:  # pragma: no cover - plugin loaded outside package context
+    from interactive_replies import InteractiveReplyStore, append_actions_block, parse_interactive_reply  # type: ignore
+
 
 logger = logging.getLogger(__name__)
 
@@ -1016,6 +1021,7 @@ class SlackAdapter(BasePlatformAdapter):
         # cross-user collisions. The two-part form remains readable only for
         # commands that arrived without a workspace id.
         # Each value: {"response_url": str, "ts": float}
+        self._interactive_reply_store = InteractiveReplyStore()
         self._slash_command_contexts: Dict[Tuple[str, ...], Dict[str, Any]] = {}
         # Socket Mode resilience: track runtime connection state so we can
         # self-heal when Slack silently drops the websocket.
@@ -2508,8 +2514,14 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return fallback_result
 
-            # Convert standard markdown → Slack mrkdwn
-            formatted = self.format_message(content)
+            interactive = parse_interactive_reply(content)
+            visible_content = interactive.visible_content if interactive else content
+            if interactive and (not visible_content or not visible_content.strip()):
+                visible_content = "Interactive reply options"
+
+            # Convert standard markdown → Slack mrkdwn. Directives are control
+            # syntax, so valid ones are never included in visible Slack text.
+            formatted = self.format_message(visible_content)
 
             # Guard against empty/whitespace-only messages — Slack API
             # returns ``no_text`` for chat.postMessage with blank text.
@@ -2536,7 +2548,22 @@ class SlackAdapter(BasePlatformAdapter):
             # that had to be split is pathological for Block Kit's 50-block /
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
-            blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            prepared_interactive = None
+            blocks = self._maybe_blocks(visible_content) if len(chunks) == 1 else None
+            if interactive and len(chunks) == 1:
+                prepared_interactive = self._interactive_reply_store.create_card(
+                    chat_id, thread_ts, interactive.buttons
+                )
+                blocks = append_actions_block(
+                    blocks
+                    or [
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": formatted},
+                        }
+                    ],
+                    prepared_interactive,
+                )
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
@@ -2567,8 +2594,21 @@ class SlackAdapter(BasePlatformAdapter):
                         last_result = await self._get_client(
                             chat_id, team_id=team_id
                         ).chat_postMessage(**retry_kwargs)
+                        if "prepared_interactive" in locals() and prepared_interactive is not None:
+                            self._interactive_reply_store.discard(
+                                prepared_interactive.card_id
+                            )
+                            prepared_interactive = None
                     else:
                         raise
+            if prepared_interactive is not None:
+                sent_ts = last_result.get("ts") if last_result else None
+                if sent_ts:
+                    self._interactive_reply_store.bind_message(
+                        prepared_interactive.card_id, sent_ts
+                    )
+                else:
+                    self._interactive_reply_store.discard(prepared_interactive.card_id)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -2595,6 +2635,8 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
+            if "prepared_interactive" in locals() and prepared_interactive is not None:
+                self._interactive_reply_store.discard(prepared_interactive.card_id)
             # Clear the assistant status even when the failure happened
             # BEFORE thread_ts was resolved (formatting, slash-context, DM
             # resolution): stop_typing falls back to metadata / the uniquely
@@ -8668,7 +8710,11 @@ async def _standalone_send(
             )
             return text
 
-    formatted = _format_mrkdwn(message) if message else message
+    interactive = parse_interactive_reply(message) if message else None
+    visible_message = interactive.visible_content if interactive else message
+    if interactive and (not visible_message or not visible_message.strip()):
+        visible_message = "Interactive reply options"
+    formatted = _format_mrkdwn(visible_message) if visible_message else visible_message
     formatted_caption = _format_mrkdwn(caption) if caption else caption
 
     # --- Media path: AsyncWebClient.files_upload_v2 (+ optional text) ---
@@ -8810,7 +8856,23 @@ async def _standalone_send(
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
         ) as session:
+            interactive_store = None
+            prepared_interactive = None
             payload = {"channel": chat_id, "text": formatted, "mrkdwn": True}
+            if interactive:
+                interactive_store = InteractiveReplyStore()
+                prepared_interactive = interactive_store.create_card(
+                    chat_id, thread_id, interactive.buttons
+                )
+                payload["blocks"] = append_actions_block(
+                    [
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": formatted},
+                        }
+                    ],
+                    prepared_interactive,
+                )
             if thread_id:
                 payload["thread_ts"] = thread_id
             for tok in tokens:
@@ -8823,17 +8885,29 @@ async def _standalone_send(
                 ) as resp:
                     data = await resp.json()
                 if data.get("ok"):
+                    message_ts = data.get("ts")
+                    if prepared_interactive is not None:
+                        if message_ts:
+                            interactive_store.bind_message(
+                                prepared_interactive.card_id, message_ts
+                            )
+                        else:
+                            interactive_store.discard(prepared_interactive.card_id)
                     return {
                         "success": True,
                         "platform": "slack",
                         "chat_id": chat_id,
-                        "message_id": data.get("ts"),
+                        "message_id": message_ts,
                     }
                 last_error = data.get("error", "unknown")
                 if last_error not in retryable_token_errors:
                     break
+        if prepared_interactive is not None:
+            interactive_store.discard(prepared_interactive.card_id)
         return {"error": f"Slack API error: {last_error}"}
     except Exception as e:
+        if "prepared_interactive" in locals() and prepared_interactive is not None:
+            interactive_store.discard(prepared_interactive.card_id)
         return {"error": f"Slack send failed: {e}"}
 
 
