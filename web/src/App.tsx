@@ -581,7 +581,6 @@ export default function App() {
         </Button>
 
         <NavLink
-          aria-label={DASHBOARD_LABEL}
           className="focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground"
           end
           onClick={closeMobile}
@@ -643,7 +642,6 @@ export default function App() {
               )}
             >
               <NavLink
-                aria-label={DASHBOARD_LABEL}
                 className={cn(
                   "flex items-center gap-2",
                   "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground",
