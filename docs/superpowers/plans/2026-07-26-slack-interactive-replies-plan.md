@@ -249,7 +249,7 @@ git commit -m "feat: relay validated Slack button clicks"
 - Consumes: all production code and tests from Tasks 1–3.
 - Produces: an evidence-backed, review-ready branch with no uncommitted implementation changes.
 
-- [ ] **Step 1: Add a post-failure cleanup regression**
+- [x] **Step 1: Add a post-failure cleanup regression**
 
 ```python
 @pytest.mark.asyncio
@@ -265,6 +265,13 @@ async def test_post_failure_discards_unbound_card(adapter, client):
 Run: `scripts/run_tests.sh tests/gateway/test_slack_interactive_replies.py tests/gateway/test_slack_block_kit_adapter.py tests/gateway/test_slack_approval_buttons.py tests/gateway/test_slack_clarify_buttons.py tests/gateway/test_slack_plugin_action_handlers.py tests/tools/test_send_message_slack.py -q`
 
 Expected: PASS with no test deselection caused by the new feature.
+
+Actual (2026-07-26): **BLOCKED.** The exact wrapper command discovered 6 files
+and approximately 144 tests. It reported 150 passed and 1 failed. The new
+`test_post_failure_discards_unbound_card` failed because
+`InteractiveReplyStore` has no `pending_count()` method. Task 1's declared
+store interface contains only `create_card`, `bind_message`, `discard`, and
+`consume`. The repository suite was not run after this focused gate failed.
 
 - [ ] **Step 3: Run the repository suite required by the contributor guide**
 
