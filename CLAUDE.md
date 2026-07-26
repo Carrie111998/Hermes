@@ -100,7 +100,11 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   `HermesCLI` (clase), `Nous Portal`. Prosa core del skill "hermes-agent" rebrandeada a IYARI.
 - Lote 9 (este commit): `skills/bundled/{mlops,note-taking,productivity,research,smart-home,
   social-media,software-development,yuanbao}` = 34. Residual limpio. **`bundled/` COMPLETO.**
-- Sub-lotes skills/ restantes: 10=optional/ parte A (41);
-  11=optional/mlops (30); 12=optional/ resto (30). Regla NousResearch/pokemon-agent = preservar.
+- Lote 10 (este commit): `skills/optional/` parte A {autonomous-ai-agents,blockchain,
+  communication,creative,devops,dogfood,email,finance,gaming,health,mcp,migration} = 41.
+  Preservados `HermesTokenStorage` (clase), `NousResearch/pokemon-agent` (repo distinto),
+  `Nous catalog`. Autores → Digital Services LLC (incl. "Anthropic (adapted by DS LLC)").
+- Sub-lotes skills/ restantes: 11=optional/mlops (30); 12=optional/ resto {payments,
+  productivity,research,security,software-development,web-development} (30).
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
