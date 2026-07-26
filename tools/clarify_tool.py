@@ -32,19 +32,37 @@ def _flatten_choice(c) -> str:
     fixes the whole class in one place instead of per-adapter.
 
     Dict unwrap order is the canonical LLM tool-call user-facing keys:
-    ``label`` → ``description`` → ``text`` → ``title``. ``name`` and ``value``
-    are deliberately excluded — they're component-shaped fields that could
-    carry raw enum values or short identifiers, not human-readable labels. A
-    dict with none of the canonical keys is dropped (returns ""), since a
+    ``label`` → ``description`` → ``text`` → ``title``. A lone ``value`` is
+    accepted as a fallback because some model bridges emit that shape, but
+    component-shaped ``{name, value}`` mappings remain rejected: those fields
+    may carry raw enum values or short identifiers rather than human-readable
+    labels. A dict with no accepted key is dropped (returns ""), since a
     garbage label is worse than no choice at all.
     """
     if c is None:
         return ""
     if isinstance(c, str):
-        return c.strip()
+        text = c.strip()
+        # Some model/tool bridges serialize object-shaped choices before they
+        # reach the tool, e.g. '{"value": "Use OAuth"}'. Parse that
+        # representation so JSON does not leak onto UI labels.
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return _flatten_choice(parsed)
+        return text
     if isinstance(c, dict):
         for key in ("label", "description", "text", "title"):
             v = c.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # Accept value for serialized choice objects, but keep rejecting
+        # component-shaped {name, value} objects used elsewhere in the UI.
+        if "name" not in c:
+            v = c.get("value")
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return ""
