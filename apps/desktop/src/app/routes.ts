@@ -2,7 +2,7 @@ import { atom } from 'nanostores'
 import type { ReactNode } from 'react'
 
 import { registry } from '@/contrib/registry'
-import { IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from '@/lib/brand'
+import { IS_FOUNDRLY_BRAND, IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from '@/lib/brand'
 
 export const SESSION_ROUTE_PREFIX = '/'
 export const NEW_CHAT_ROUTE = '/'
@@ -17,6 +17,7 @@ export const AGENTS_ROUTE = '/agents'
 export const STARMAP_ROUTE = '/starmap'
 export const IX_AGENCY_ROUTE = '/ix-agency'
 export const QUIZVERSE_ROUTE = '/quizverse'
+export const FOUNDRLY_ROUTE = '/foundrly'
 
 export type AppView =
   | 'agents'
@@ -32,6 +33,8 @@ export type AppView =
   | 'ix-agency'
   | 'messaging'
   | 'profiles'
+  | 'foundrly'
+  | 'foundrly'
   | 'quizverse'
   | 'settings'
   | 'skills'
@@ -72,7 +75,8 @@ export const APP_ROUTES: readonly AppRoute[] = [
   { id: 'agents', path: AGENTS_ROUTE, view: 'agents' },
   { id: 'starmap', path: STARMAP_ROUTE, view: 'starmap' },
   ...(IS_IX_AGENCY_BRAND ? [{ id: 'ix-agency', path: IX_AGENCY_ROUTE, view: 'ix-agency' } as const] : []),
-  ...(IS_QUIZVERSE_BRAND ? [{ id: 'quizverse', path: QUIZVERSE_ROUTE, view: 'quizverse' } as const] : [])
+  ...(IS_QUIZVERSE_BRAND ? [{ id: 'quizverse', path: QUIZVERSE_ROUTE, view: 'quizverse' } as const] : []),
+  ...(IS_FOUNDRLY_BRAND ? [{ id: 'foundrly', path: FOUNDRLY_ROUTE, view: 'foundrly' } as const] : [])
 ]
 
 const APP_VIEW_BY_PATH = new Map<string, AppView>(APP_ROUTES.map(route => [route.path, route.view]))

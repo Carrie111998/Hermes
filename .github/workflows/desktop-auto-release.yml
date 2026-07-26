@@ -4,10 +4,10 @@
 # On every push (merge) to main that touches apps/desktop or the desktop
 # workflows, this decides whether a release is needed:
 #   - reads the version in apps/desktop/package.json,
-#   - skips only if EVERY brand's public S3 feed (ix-agency/ AND quizverse/)
+#   - skips only if EVERY brand's public S3 feed (ix-agency/, quizverse/, foundrly/)
 #     already serves that version (so ordinary merges that don't bump the
 #     version are no-ops, and a brand that missed a release catches up),
-#   - otherwise runs the full desktop-release build+publish chain (2 brands
+#   - otherwise runs the full desktop-release build+publish chain (3 brands
 #     x 3 OS -> s3://intelliverse-x-desktop/<brand>/) and then tags the
 #     commit ix-desktop-v<version> for traceability.
 #
@@ -44,7 +44,7 @@ jobs:
           VERSION="$(node -p "require('./apps/desktop/package.json').version")"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           RELEASE=false
-          for BRAND in ix-agency quizverse; do
+          for BRAND in ix-agency quizverse foundrly; do
             LIVE="$(curl -sf "https://intelliverse-x-desktop.s3.amazonaws.com/$BRAND/latest-mac.yml" \
               | awk '/^version:/ {print $2; exit}' || true)"
             echo "brand=$BRAND package.json=$VERSION live-feed=${LIVE:-<none>}"

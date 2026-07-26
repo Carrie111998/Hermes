@@ -13,7 +13,7 @@ import { Navigate, Route, Routes, useParams } from 'react-router-dom'
 
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
-import { IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from '@/lib/brand'
+import { IS_FOUNDRLY_BRAND, IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from '@/lib/brand'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
@@ -41,6 +41,10 @@ const IxAgencyView = IS_IX_AGENCY_BRAND ? lazy(async () => ({ default: (await im
 
 const QuizverseView = IS_QUIZVERSE_BRAND
   ? lazy(async () => ({ default: (await import('@/app/quizverse-brand')).QuizverseView }))
+  : null
+
+const FoundrlyView = IS_FOUNDRLY_BRAND
+  ? lazy(async () => ({ default: (await import('@/app/foundrly-brand')).FoundrlyView }))
   : null
 
 export function LegacySessionRedirect() {
@@ -191,6 +195,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />
       {IxAgencyView ? <Route element={page(<IxAgencyView />)} path="ix-agency" /> : null}
       {QuizverseView ? <Route element={page(<QuizverseView />)} path="quizverse" /> : null}
+      {FoundrlyView ? <Route element={page(<FoundrlyView />)} path="foundrly" /> : null}
       <Route element={null} path="agents" />
       <Route element={null} path="command-center" />
       <Route element={null} path="cron" />

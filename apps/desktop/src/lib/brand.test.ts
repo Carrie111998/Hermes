@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'vitest'
 
+import foundrlyBrand from '../../brands/foundrly.json'
 import ixAgencyBrand from '../../brands/ix-agency.json'
 import quizverseBrand from '../../brands/quizverse.json'
 
-import { BRAND, DESKTOP_BRAND_ID, IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from './brand'
+import {
+  BRAND,
+  DESKTOP_BRAND_ID,
+  IS_FOUNDRLY_BRAND,
+  IS_IX_AGENCY_BRAND,
+  IS_QUIZVERSE_BRAND
+} from './brand'
 
-// Invariants over the brand manifests — the contracts that keep two branded
-// apps strictly separated (not snapshots of any one brand's current values).
-
-const MANIFESTS = [ixAgencyBrand, quizverseBrand]
+const MANIFESTS = [ixAgencyBrand, quizverseBrand, foundrlyBrand]
 
 const IDENTITY_FIELDS = [
   'appId',
@@ -46,9 +50,6 @@ describe('brand manifests', () => {
   })
 
   it('no brand borrows another brand’s download landing page', () => {
-    // downloadPageUrl may be empty (→ direct artifact fallback), but a set
-    // value must never be another brand's page — that is how a QuizVerse
-    // user would end up on the IX Agency installer page.
     for (const manifest of MANIFESTS) {
       const others = MANIFESTS.filter(other => other.id !== manifest.id)
 
@@ -66,13 +67,20 @@ describe('brand manifests', () => {
     expect(qv.deeptutorRemoteUrl).toMatch(/^https:\/\//)
     expect(qv).not.toHaveProperty('subdomains')
   })
+
+  it('foundrly manifest declares product web + admin portal URLs', () => {
+    expect(foundrlyBrand.foundrly.webUrl).toMatch(/^https:\/\//)
+    expect(foundrlyBrand.foundrly.adminPortalUrl).toMatch(/^https:\/\//)
+  })
 })
 
 describe('active brand resolution', () => {
   it('resolves to exactly one brand and the flags agree with it', () => {
-    expect(IS_IX_AGENCY_BRAND).not.toBe(IS_QUIZVERSE_BRAND)
-    expect(BRAND.id).toBe(IS_QUIZVERSE_BRAND ? 'quizverse' : 'ix-agency')
+    const flags = [IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND, IS_FOUNDRLY_BRAND].filter(Boolean)
+
+    expect(flags).toHaveLength(1)
     expect(BRAND.workspace).toBe(BRAND.id)
-    expect(['ix-agency', 'quizverse']).toContain(DESKTOP_BRAND_ID)
+    expect(['ix-agency', 'quizverse', 'foundrly']).toContain(DESKTOP_BRAND_ID)
+    expect(BRAND.id).toBe(DESKTOP_BRAND_ID)
   })
 })

@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-22.04]
-        brand: [ix-agency, quizverse]
+        brand: [ix-agency, quizverse, foundrly]
     runs-on: ${{ matrix.os }}
     defaults:
       run:

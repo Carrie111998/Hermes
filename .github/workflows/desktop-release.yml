@@ -1,8 +1,8 @@
 # desktop-release.yml — branded desktop release chain (fork-only; upstream
 # hermes-agent has no packaged-release CI). Full docs: apps/desktop/RELEASING.md
 #
-# One repo ships TWO branded desktop apps (IX Agency + QuizVerse) from the
-# same Hermes core — the build matrix is 2 brands x 3 OS. DESKTOP_BRAND
+# One repo ships THREE branded desktop apps (IX Agency + QuizVerse + Foundrly) from the
+# same Hermes core — the build matrix is 3 brands x 3 OS. DESKTOP_BRAND
 # selects the flavor (apps/desktop/brands/<brand>.json owns the identity).
 #
 # Triggers:
@@ -47,7 +47,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: [macos-latest, ubuntu-22.04, windows-latest]
-        brand: [ix-agency, quizverse]
+        brand: [ix-agency, quizverse, foundrly]
     runs-on: ${{ matrix.platform }}
     defaults:
       run:
@@ -202,7 +202,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        brand: [ix-agency, quizverse]
+        brand: [ix-agency, quizverse, foundrly]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
