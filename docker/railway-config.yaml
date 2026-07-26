@@ -10,13 +10,12 @@
 # unique d'orchestration. Historique complet : git log sur ce fichier.
 
 model:
-  # Orchestrateur (profil défaut) : Claude Opus 4.8 (upgrade depuis Haiku 4.5,
-  # 2026-07-16) — tool-calling discipliné (route via kanban_create, réponses
-  # courtes). Historique : GLM 5.2 fumblait (kanban_show au lieu de kanban_create,
-  # ou contenu en texte → tronqué) ; Qwen faisait le travail lui-même.
-  # Via OpenRouter (OPENROUTER_API_KEY).
-  default: "anthropic/claude-opus-4.8"
-  provider: "openrouter"
+  # Orchestrateur (profil défaut) : Claude Opus 5 en DIRECT sur l'API Anthropic
+  # (ANTHROPIC_API_KEY, var Railway — la même que Claude Code CLI), plus
+  # d'OpenRouter pour ce profil (2026-07-26). Historique : qwen/GLM exécutaient
+  # au lieu de router → Haiku 4.5 → Opus 4.8 (OpenRouter) → Opus 5 (direct).
+  default: "claude-opus-5"
+  provider: "anthropic"
 
 gateway:
   platforms:

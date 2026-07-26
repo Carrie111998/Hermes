@@ -2,11 +2,12 @@
 # Persona : SOUL.md (design & intégration web, fidélité maquette, mobile-first).
 # Aucun connecteur MCP requis. Amorcé sur le volume par docker/entrypoint.sh.
 
-# Gemini 3.1 Pro pour le jugement esthétique/vision (le bundle web-design-charter
-# déconseille qwen, non validé sur ce use case). Via OpenRouter.
+# Claude Opus 5 en direct sur l'API Anthropic (ANTHROPIC_API_KEY, var Railway)
+# pour le jugement esthétique/vision — remplace Gemini 3.1 Pro via OpenRouter
+# (2026-07-26).
 model:
-  default: "google/gemini-3.1-pro"
-  provider: "openrouter"
+  default: "claude-opus-5"
+  provider: "anthropic"
 
 terminal:
   backend: local
