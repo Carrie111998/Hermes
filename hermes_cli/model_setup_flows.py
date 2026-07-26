@@ -129,6 +129,49 @@ def _prune_replaced_custom_model_config_credentials(
         return
 
 
+def _resolve_existing_api_key_for_wizard(provider_id: str, pconfig) -> str:
+    """Resolve an existing API key for the wizard's pre-prompt detection.
+
+    Issue #65977: the wizard used to only look at ``~/.hermes/.env`` / process
+    env, which silently mis-reported providers whose key lives in the
+    ``auth.json`` credential pool (added by ``hermes auth login``). This
+    fallback mirrors ``hermes_cli.auth._resolve_api_key_provider_secret`` so
+    flows like ``openrouter`` / ``kimi`` / ``stepfun`` / the generic
+    ``_model_flow_api_key_provider`` path also detect credentials stored via
+    ``hermes auth``.
+
+    Order: env vars (``get_env_value`` + ``os.getenv``) → credential pool.
+    """
+    try:
+        from hermes_cli.config import get_env_value
+    except Exception:
+        get_env_value = None  # type: ignore[assignment]
+
+    env_vars = list(getattr(pconfig, "api_key_env_vars", None) or ())
+    for ev in env_vars:
+        try:
+            if get_env_value is not None:
+                val = get_env_value(ev) or ""
+                if val:
+                    return val
+        except Exception:
+            pass
+        val = os.getenv(ev, "") or ""
+        if val:
+            return val
+
+    try:
+        from hermes_cli.auth import _resolve_api_key_provider_secret
+    except Exception:
+        return ""
+
+    try:
+        api_key, _key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    except Exception:
+        return ""
+    return api_key or ""
+
+
 def _prompt_auth_credentials_choice(title: str) -> str:
     """Prompt for reuse / reauthenticate / cancel with the standard radio UI.
 
@@ -190,7 +233,8 @@ def _model_flow_openrouter(config, current_model=""):
         auth_type="api_key",
         api_key_env_vars=("OPENROUTER_API_KEY",),
     )
-    existing_key = get_env_value("OPENROUTER_API_KEY") or ""
+    # #65977: also check auth.json credential pool, not just .env / process env.
+    existing_key = _resolve_existing_api_key_for_wizard("openrouter", pconfig)
     if not existing_key:
         print("Get one at: https://openrouter.ai/keys")
         print()
@@ -1975,11 +2019,8 @@ def _model_flow_kimi(config, current_model=""):
     base_url_env = pconfig.base_url_env_var or ""
 
     # Step 1: Check / prompt for API key
-    existing_key = ""
-    for ev in pconfig.api_key_env_vars:
-        existing_key = get_env_value(ev) or os.getenv(ev, "")
-        if existing_key:
-            break
+    # #65977: env vars + auth.json credential pool (hermes auth login)
+    existing_key = _resolve_existing_api_key_for_wizard(provider_id, pconfig)
 
     existing_key, abort = _prompt_api_key(
         pconfig, existing_key, provider_id=provider_id
@@ -2060,11 +2101,8 @@ def _model_flow_stepfun(config, current_model=""):
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
 
-    existing_key = ""
-    for ev in pconfig.api_key_env_vars:
-        existing_key = get_env_value(ev) or os.getenv(ev, "")
-        if existing_key:
-            break
+    # #65977: env vars + auth.json credential pool (hermes auth login)
+    existing_key = _resolve_existing_api_key_for_wizard(provider_id, pconfig)
 
     existing_key, abort = _prompt_api_key(
         pconfig, existing_key, provider_id=provider_id
@@ -2642,11 +2680,8 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     base_url_env = pconfig.base_url_env_var or ""
 
     # Check / prompt for API key
-    existing_key = ""
-    for ev in pconfig.api_key_env_vars:
-        existing_key = get_env_value(ev) or os.getenv(ev, "")
-        if existing_key:
-            break
+    # #65977: env vars + auth.json credential pool (hermes auth login)
+    existing_key = _resolve_existing_api_key_for_wizard(provider_id, pconfig)
 
     existing_key, abort = _prompt_api_key(
         pconfig, existing_key, provider_id=provider_id

@@ -155,3 +155,73 @@ def test_lmstudio_replace_empty_does_not_overwrite_with_placeholder(profile_env)
     assert key == "my-real-lmstudio-key"
     assert abort is False
     assert get_env_value("LM_API_KEY") == "my-real-lmstudio-key"
+
+
+# #65977: wizard helper must also check auth.json credential pool ─────────────
+
+def test_wizard_helper_env_only(profile_env, monkeypatch):
+    """When no credential pool entry exists, env var resolves the key."""
+    from hermes_cli.config import save_env_value
+    from hermes_cli.model_setup_flows import _resolve_existing_api_key_for_wizard
+
+    pconfig = _pconfig("deepseek")
+    save_env_value("DEEPSEEK_API_KEY", "sk-from-env")
+
+    # No credential pool → still resolves via env path
+    from hermes_cli.auth import _resolve_api_key_provider_secret
+    monkeypatch.setattr(
+        "hermes_cli.auth._resolve_api_key_provider_secret",
+        lambda provider_id, p: ("", ""),  # pool empty
+    )
+    assert _resolve_existing_api_key_for_wizard("deepseek", pconfig) == "sk-from-env"
+
+
+def test_wizard_helper_credential_pool(profile_env, monkeypatch):
+    """#65977: credential pool entry should be detected when .env has no key."""
+    from hermes_cli.model_setup_flows import _resolve_existing_api_key_for_wizard
+
+    pconfig = _pconfig("deepseek")
+    # .env is empty (profile_env fixture writes "")
+    # Stub the auth helper to simulate a pool entry
+    from hermes_cli.auth import _resolve_api_key_provider_secret
+    monkeypatch.setattr(
+        "hermes_cli.auth._resolve_api_key_provider_secret",
+        lambda provider_id, p: ("sk-from-pool", "credential_pool:deepseek"),
+    )
+    assert _resolve_existing_api_key_for_wizard("deepseek", pconfig) == "sk-from-pool"
+
+
+def test_wizard_helper_neither_configured(profile_env, monkeypatch):
+    """When neither .env nor credential pool has the key, helper returns ""."""
+    from hermes_cli.model_setup_flows import _resolve_existing_api_key_for_wizard
+
+    pconfig = _pconfig("deepseek")
+    # .env empty; pool empty
+    from hermes_cli.auth import _resolve_api_key_provider_secret
+    monkeypatch.setattr(
+        "hermes_cli.auth._resolve_api_key_provider_secret",
+        lambda provider_id, p: ("", ""),
+    )
+    assert _resolve_existing_api_key_for_wizard("deepseek", pconfig) == ""
+
+
+def test_wizard_helper_openrouter_via_pool(profile_env, monkeypatch):
+    """#65977 specifically: openrouter flow synthesizes a ProviderConfig and
+    should still detect a credential pool entry, not just env vars."""
+    from hermes_cli.model_setup_flows import _resolve_existing_api_key_for_wizard
+    from hermes_cli.auth import ProviderConfig
+
+    pconfig = ProviderConfig(
+        id="openrouter",
+        name="OpenRouter",
+        auth_type="api_key",
+        api_key_env_vars=("OPENROUTER_API_KEY",),
+    )
+    # No OPENROUTER_API_KEY in env; pool returns the key
+    from hermes_cli.auth import _resolve_api_key_provider_secret
+    monkeypatch.setattr(
+        "hermes_cli.auth._resolve_api_key_provider_secret",
+        lambda provider_id, p: ("sk-or-pool-key", "credential_pool:openrouter"),
+    )
+    assert _resolve_existing_api_key_for_wizard("openrouter", pconfig) == "sk-or-pool-key"
+
