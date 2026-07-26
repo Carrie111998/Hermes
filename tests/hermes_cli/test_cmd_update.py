@@ -182,6 +182,7 @@ class TestCmdUpdateBranchFallback:
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
         assert "main" in pull_cmds[0]
+        assert not any("upstream" in command for command in commands)
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -225,14 +226,10 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_on_fork_checks_upstream_when_origin_up_to_date(
+    def test_update_on_fork_uses_origin_only_when_up_to_date(
         self, mock_run, _mock_which, mock_args, capsys
     ):
-        """Regression for issue #26172: forks whose local HEAD already matches
-        origin/main must still consult upstream/main before printing
-        "Already up to date!" — otherwise a fork that's caught up to its own
-        origin but behind NousResearch/hermes-agent silently misses updates.
-        """
+        """A maintained fork's normal updater must not inspect upstream."""
         from hermes_cli import main as hm
 
         mock_run.side_effect = _make_run_side_effect(
@@ -243,51 +240,16 @@ class TestCmdUpdateBranchFallback:
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
-            cmd_update(mock_args)
-
-        sync_mock.assert_called_once_with(["git"], PROJECT_ROOT)
-        captured = capsys.readouterr()
-        assert "Already up to date!" in captured.out
-
-    @patch("subprocess.run")
-    def test_fork_upstream_check_never_pulls_or_pushes(self, mock_run, capsys):
-        from hermes_cli import main as hm
-
-        mock_run.return_value = subprocess.CompletedProcess(
-            [], 0, stdout="", stderr=""
-        )
-        with patch.object(hm, "_has_upstream_remote", return_value=True), patch.object(
-            hm, "_count_commits_between", side_effect=[2, 5]
         ):
-            hm._sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+            cmd_update(mock_args)
 
         commands = [
             " ".join(str(arg) for arg in call.args[0])
             for call in mock_run.call_args_list
         ]
-        assert any("fetch upstream main" in command for command in commands)
-        assert not any(" pull " in f" {command} " for command in commands)
-        assert not any(" push " in f" {command} " for command in commands)
-        assert "No merge or push was performed." in capsys.readouterr().out
-
-    @patch("subprocess.run")
-    def test_fork_only_commits_are_up_to_date_when_upstream_has_no_new_work(
-        self, mock_run, capsys
-    ):
-        from hermes_cli import main as hm
-
-        mock_run.return_value = subprocess.CompletedProcess(
-            [], 0, stdout="", stderr=""
-        )
-        with patch.object(hm, "_has_upstream_remote", return_value=True), patch.object(
-            hm, "_count_commits_between", side_effect=[2, 0]
-        ):
-            hm._sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
-
-        output = capsys.readouterr().out
-        assert "contains all current upstream commits" in output
-        assert "requires a separately reviewed candidate" not in output
+        assert not any("upstream" in command for command in commands)
+        captured = capsys.readouterr()
+        assert "Already up to date!" in captured.out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -835,7 +797,6 @@ class TestCmdUpdateCheckBranchFlag:
         *,
         verify_ok: bool = True,
         commit_count: str = "0",
-        upstream_fetch_ok: bool = True,
     ):
         """Mock side-effect for the _cmd_update_check git pipeline.
 
@@ -844,17 +805,10 @@ class TestCmdUpdateCheckBranchFlag:
                                  origin/<branch>`` fails (branch missing
                                  on origin)
         - ``commit_count``       rev-list count (0 = up-to-date)
-        - ``upstream_fetch_ok``  if False, ``git fetch upstream`` fails
-                                 (forces fallback to origin on branch==main)
         """
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
-
-            if "fetch" in joined and "upstream" in joined:
-                rc = 0 if upstream_fetch_ok else 128
-                err = "" if upstream_fetch_ok else "fatal: 'upstream' does not appear to be a git repository\n"
-                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "fetch" in joined and "origin" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -884,7 +838,7 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Non-main branch skips upstream probe entirely.
+        # Normal checks never probe upstream.
         assert not any("fetch" in c and "upstream" in c for c in commands), commands
         # Verify and rev-list both target origin/bb/gui.
         verify_cmds = [c for c in commands if "rev-parse" in c and "--verify" in c]
@@ -926,10 +880,10 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_main_uses_origin_only(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """No --branch checks the maintained fork's origin/main."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
@@ -938,11 +892,10 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
-        # Compare ref is upstream/main (upstream fetch succeeded).
+        assert not any("upstream" in c for c in commands), commands
+        assert any("fetch" in c and "origin main" in c for c in commands), commands
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+        assert any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
     @patch("hermes_cli.config.detect_install_method", return_value="pip")
     @patch("hermes_cli.banner.check_via_pypi", return_value=0)
