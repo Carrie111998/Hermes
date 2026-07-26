@@ -952,3 +952,80 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# load_on_disk_store() negative limit clamping
+# =========================================================================
+
+
+class TestLoadOnDiskStoreLimits:
+    """load_on_disk_store() clamps negative config limits to 0 instead of
+    propagating a ValueError (which would be swallowed by a blanket except
+    higher up the call stack). A warning is logged so operators can fix config.
+    """
+
+    def test_negative_memory_limit_clamped_to_zero(self, caplog, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"memory": {"memory_char_limit": -100, "user_char_limit": 1375}},
+        )
+        from tools.memory_tool import load_on_disk_store
+
+        store = load_on_disk_store()
+        assert store.memory_char_limit == 0
+        assert store.user_char_limit == 1375
+
+    def test_negative_user_limit_clamped_to_zero(self, caplog, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"memory": {"memory_char_limit": 2200, "user_char_limit": -50}},
+        )
+        from tools.memory_tool import load_on_disk_store
+
+        store = load_on_disk_store()
+        assert store.memory_char_limit == 2200
+        assert store.user_char_limit == 0
+
+    def test_both_negative_clamped_to_zero(self, caplog, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"memory": {"memory_char_limit": -1, "user_char_limit": -999}},
+        )
+        from tools.memory_tool import load_on_disk_store
+
+        store = load_on_disk_store()
+        assert store.memory_char_limit == 0
+        assert store.user_char_limit == 0
+
+    def test_positive_limits_pass_through(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"memory": {"memory_char_limit": 888, "user_char_limit": 666}},
+        )
+        from tools.memory_tool import load_on_disk_store
+
+        store = load_on_disk_store()
+        assert store.memory_char_limit == 888
+        assert store.user_char_limit == 666
+
+    def test_warning_logged_for_negative_limits(self, caplog, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"memory": {"memory_char_limit": -10, "user_char_limit": -20}},
+        )
+        from tools.memory_tool import load_on_disk_store
+
+        load_on_disk_store()
+        assert len(caplog.records) >= 1
+        assert any(
+            "Negative memory char limit" in r.message for r in caplog.records
+        )
+        assert any(
+            "-10" in r.message and "-20" in r.message for r in caplog.records
+        )
