@@ -1023,6 +1023,52 @@ class TestSendRouting:
         assert "Usame" in adapter._auto_push_reservations
         adapter._quota_budget.finish.assert_not_called()
 
+    def test_reconnect_does_not_handoff_stale_final_to_replacement_adapter(
+        self, adapter, monkeypatch
+    ):
+        from gateway.config import PlatformConfig
+
+        replacement = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "replacement-token",
+            "channel_secret": "replacement-secret",
+        }))
+        replacement._client = MagicMock()
+        replacement._client.reply = AsyncMock()
+        replacement._client.push = AsyncMock()
+        source = adapter.build_source(
+            chat_id="Uchat",
+            chat_type="dm",
+            user_id="Uuser",
+        )
+        adapter.gateway_runner = SimpleNamespace(
+            _adapter_for_source=lambda _source: replacement
+        )
+
+        guard_token = _line._DELIVERY_TASK_GUARD.set(
+            _line._DeliveryTaskGuard(adapter, "Uchat", "old-run")
+        )
+        epoch_token = _line._DELIVERY_TASK_EPOCH.set(
+            (adapter, adapter._delivery_epoch)
+        )
+        try:
+            adapter._disconnecting = True
+            adapter._delivery_epoch += 1
+            delivery_adapter = adapter._final_delivery_adapter(source)
+            result = asyncio.run(delivery_adapter._send_with_retry(
+                chat_id="Uchat",
+                content="stale final",
+                max_retries=0,
+            ))
+        finally:
+            _line._DELIVERY_TASK_EPOCH.reset(epoch_token)
+            _line._DELIVERY_TASK_GUARD.reset(guard_token)
+
+        assert result.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
+        replacement._client.reply.assert_not_called()
+        replacement._client.push.assert_not_called()
+
     def test_system_bypass_is_suppressed_during_auto_push_reservation(self, adapter):
         adapter._auto_push_reservations.add("Uchat")
         adapter._quota_budget = MagicMock()

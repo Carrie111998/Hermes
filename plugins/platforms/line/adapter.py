@@ -1690,6 +1690,19 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound send (text)
     # ------------------------------------------------------------------
 
+    def _final_delivery_adapter(
+        self, source: Any
+    ) -> BasePlatformAdapter:
+        """Keep LINE finals on the adapter that owns their run and quota state.
+
+        The base implementation hands an unsent final to a replacement adapter
+        after reconnect. LINE cannot safely do that: Reply-token ownership,
+        delivery generation, and paid-Push reservations are adapter-local. A
+        disconnected owner therefore suppresses its stale final instead of
+        letting a replacement treat it as an unbound proactive Push.
+        """
+        return self
+
     async def _reply_current(
         self, chat_id: str, reply_token: str, messages: List[Dict[str, Any]]
     ) -> bool:
