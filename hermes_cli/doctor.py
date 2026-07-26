@@ -2532,7 +2532,7 @@ def run_doctor(args):
                     check_fail("Honcho L3 connectivity unavailable")
                 else:
                     check_fail(f"Honcho L3 connectivity check failed: {status}")
-                
+
                 from plugins.memory.honcho.client import get_honcho_client, reset_honcho_client
                 reset_honcho_client()
                 try:

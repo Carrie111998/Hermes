@@ -1261,10 +1261,10 @@ def check_health(
             return HealthStatus.UNAVAILABLE
         elif err_type == "APIError":
             return HealthStatus.DEGRADED
-        
+
         # If the error is a generic OSError, it's also UNAVAILABLE
         if isinstance(e, OSError):
             return HealthStatus.UNAVAILABLE
-            
+
         return HealthStatus.UNAVAILABLE
     return HealthStatus.HEALTHY
