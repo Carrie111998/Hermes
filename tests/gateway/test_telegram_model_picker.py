@@ -354,3 +354,98 @@ class TestTelegramModelPicker:
         assert len(call_log) == 2
         assert call_log[0]["message_thread_id"] == 99999
         assert "message_thread_id" not in call_log[1] or call_log[1]["message_thread_id"] is None
+
+    def test_provider_keyboard_shows_mixed_case_slug_provider(self, monkeypatch):
+        """Regression for #35932: providers with mixed-case slugs (e.g.
+        'BitFun') must still appear in the /model picker keyboard.
+
+        group_providers() lowercases slugs when emitting its rows, so the
+        by_slug lookup in _build_provider_keyboard must key on the lowercased
+        slug too — otherwise the lookup fails and the provider is silently
+        dropped from the keyboard."""
+        import plugins.platforms.telegram.adapter as tg
+
+        built: list = []
+
+        class _RecordingButton:
+            def __init__(self, text, callback_data=None, **kw):
+                self.text = text
+                self.callback_data = callback_data
+                built.append(callback_data)
+
+        class _RecordingMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _RecordingButton)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _RecordingMarkup)
+
+        adapter = _make_adapter()
+
+        # Mixed-case slug that would be silently dropped without the fix.
+        # group_providers() emits this as {"slug": "bitfun", "kind": ...}
+        # (lowercased), so by_slug must use the lowercased key to resolve it.
+        providers = [
+            {"slug": "BitFun", "name": "BitFun", "total_models": 2, "is_current": False},
+        ]
+
+        adapter._build_provider_keyboard(providers)
+
+        # The provider must surface as a direct mp: button with its ORIGINAL
+        # slug preserved in callback_data (so the configured slug still
+        # works when the user taps it).
+        assert "mp:BitFun" in built, "Mixed-case slug provider was dropped from the picker"
+        assert "mx" in built  # Cancel button is always present
+
+    @pytest.mark.asyncio
+    async def test_provider_group_callback_resolves_mixed_case_member_slugs(self, monkeypatch):
+        """Regression for #35932: the mpg: callback path must resolve group
+        members case-insensitively. PROVIDER_GROUPS emits lowercase member
+        slugs, but the provider's configured slug may be mixed-case (e.g.
+        'Minimax'); the by_slug lookup in the callback must lowercase its
+        keys or the group expansion shows no members for the mixed-case one."""
+        import plugins.platforms.telegram.adapter as tg
+
+        built: list = []
+
+        class _RecordingButton:
+            def __init__(self, text, callback_data=None, **kw):
+                self.text = text
+                self.callback_data = callback_data
+                built.append(callback_data)
+
+        class _RecordingMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _RecordingButton)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _RecordingMarkup)
+
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {
+            "providers": [
+                {"slug": "Minimax", "name": "Minimax", "total_models": 2},
+                {"slug": "minimax-cn", "name": "Minimax CN", "total_models": 3},
+            ],
+            "current_model": "m",
+            "current_provider": "Minimax",
+            "session_key": "s",
+            "on_model_selected": AsyncMock(),
+            "msg_id": 42,
+        }
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "mpg:minimax", "12345")
+
+        # Both members must surface as mp: buttons. Before the fix, the
+        # mixed-case "Minimax" slug would not match the lowercase "minimax"
+        # member slug from PROVIDER_GROUPS, so only minimax-cn appeared.
+        assert "mp:Minimax" in built, "Mixed-case group member 'Minimax' was dropped"
+        assert "mp:minimax-cn" in built
+        assert "mb" in built  # Back button

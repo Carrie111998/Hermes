@@ -5659,7 +5659,11 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             group_providers = None
 
-        by_slug = {p.get("slug"): p for p in providers}
+        # group_providers() normalises slugs to lowercase for canonical
+        # matching; the lookup dict must use the same casing so providers
+        # whose configured slug is mixed-case (e.g. "BitFun") still resolve
+        # instead of being silently dropped from the keyboard. See #35932.
+        by_slug = {p.get("slug", "").lower(): p for p in providers}
 
         def _provider_button(p):
             count = p.get("total_models", len(p.get("models", [])))
@@ -6017,7 +6021,10 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 _label, member_slugs = "", []
 
-            by_slug = {p["slug"]: p for p in state["providers"]}
+            # Member slugs from PROVIDER_GROUPS are lowercase; the lookup
+            # must be case-insensitive so mixed-case configured slugs
+            # (e.g. "Minimax") resolve here too. See #35932.
+            by_slug = {p.get("slug", "").lower(): p for p in state["providers"]}
             members = [by_slug[m] for m in member_slugs if m in by_slug]
             if not members:
                 await query.answer(text="Group not found.")
