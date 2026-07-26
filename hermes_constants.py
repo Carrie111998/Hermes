@@ -490,13 +490,41 @@ def find_hermes_node_executable(command: str) -> str | None:
 def find_node_executable_on_path(command: str) -> str | None:
     """Return a Node/npm executable from PATH with Windows shim ordering.
 
-    ``shutil.which("npm")`` can resolve an extensionless npm shim before the
+    ``shutil.which(\"npm\")`` can resolve an extensionless npm shim before the
     ``.cmd`` shim on Windows. Python's CreateProcess cannot execute that shim
     directly, so prefer the launchable variants explicitly for Hermes-owned
     subprocesses.
+
+    On non-Windows, when ``shutil.which`` fails (e.g. the Electron updater
+    chain Desktop -> Rust -> Python strips PATH of common locations), fall
+    back to scanning known Node.js installation directories so the desktop
+    rebuild can find npm regardless of the process's inherited PATH.
     """
     if sys.platform != "win32":
-        return shutil.which(command)
+        resolved = shutil.which(command)
+        if resolved:
+            return resolved
+        # Fallback: scan known Node.js installation paths on macOS/Linux.
+        for name in _candidate_node_command_names(command):
+            for known_dir in (
+                "/usr/local/bin",
+                "/opt/homebrew/bin",
+                "/opt/local/bin",
+                os.path.expanduser("~/.nvm/versions/node/*/bin"),
+            ):
+                if "*" in known_dir:
+                    # glob expansion for nvm-style versioned paths.
+                    import glob as _glob
+
+                    for match in sorted(_glob.glob(known_dir), reverse=True):
+                        candidate = Path(match) / name
+                        if candidate.is_file():
+                            return str(candidate)
+                else:
+                    candidate = Path(known_dir) / name
+                    if candidate.is_file():
+                        return str(candidate)
+        return None
 
     command_str = str(command)
     has_path_separator = any(
@@ -532,7 +560,13 @@ def find_node_executable(command: str) -> str | None:
 
 
 def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
-    """Return *env* with Hermes-managed Node directories prepended to PATH."""
+    """Return *env* with Hermes-managed Node directories prepended to PATH.
+
+    When no managed tree is present, also prepend common system Node.js
+    installation directories so npm subprocesses can find ``node`` even
+    when the inherited PATH is stripped (e.g. the Electron updater chain
+    Desktop -> Rust -> Python).
+    """
     merged = dict(os.environ if env is None else env)
     existing = merged.get("PATH", "")
     parts = [p for p in existing.split(os.pathsep) if p]
@@ -540,6 +574,16 @@ def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
     for entry in reversed(managed):
         if entry not in parts:
             parts.insert(0, entry)
+    # If no managed Node tree exists, prepend common system Node.js bin dirs
+    # so npm subprocesses (which shell out to ``node``) find the runtime.
+    if not managed:
+        for common_dir in (
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/opt/local/bin",
+        ):
+            if common_dir not in parts:
+                parts.insert(0, common_dir)
     merged["PATH"] = os.pathsep.join(parts)
     return merged
 
