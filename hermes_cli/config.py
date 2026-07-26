@@ -6034,6 +6034,26 @@ def _persist_migration(config: Dict[str, Any]) -> None:
     save_config(config)
 
 
+# ── Deferred toolset warnings ──
+# When migrate_config() runs before plugin discovery, plugin-registered
+# toolsets trigger false-positive "unknown toolset" warnings.  Those warnings
+# are stored here so the startup path can re-emit (or suppress) them after
+# discover_plugins() completes.  See #71650.
+_deferred_toolset_warnings: List[str] = []
+
+
+def get_deferred_toolset_warnings() -> List[str]:
+    """Return toolset warnings deferred from migrate_config().
+
+    After calling this, the internal buffer is cleared so warnings are only
+    emitted once.
+    """
+    global _deferred_toolset_warnings
+    warnings = list(_deferred_toolset_warnings)
+    _deferred_toolset_warnings = []
+    return warnings
+
+
 def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
     """
     Migrate config to latest version, prompting for new required fields.
@@ -6645,6 +6665,12 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     # platform_toolsets silently disables the affected tools — resolve_toolset()
     # returns [] for an unknown name, so the agent quietly loses tools with no
     # error or warning. Surface it loudly instead. See #38798.
+    #
+    # However, plugin-registered toolsets are only known AFTER discover_plugins()
+    # runs. When migrate_config() fires during early startup (before plugins
+    # load), any plugin-registered toolset triggers a false-positive "unknown
+    # toolset" warning.  Defer warnings to a module-level list so the caller
+    # can re-emit them after plugin discovery.  (#71650)
     try:
         from toolsets import validate_toolset
         from hermes_cli.toolset_validation import validate_platform_toolsets
@@ -6652,10 +6678,30 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         ts_warnings = validate_platform_toolsets(
             read_raw_config().get("platform_toolsets"), validate_toolset
         )
-        for w in ts_warnings:
-            results["warnings"].append(w)
-            if not quiet:
-                print(f"  ⚠ {w}")
+        if ts_warnings:
+            # Check whether the tool registry already has plugin toolsets
+            # (i.e. plugins were already discovered).  If so, these warnings
+            # are real and should be emitted immediately.
+            _has_plugin_toolsets = False
+            try:
+                from toolsets import _get_plugin_toolset_names
+                _has_plugin_toolsets = bool(_get_plugin_toolset_names())
+            except Exception:
+                pass
+
+            if _has_plugin_toolsets:
+                # Plugins already loaded — emit inline (original behavior)
+                for w in ts_warnings:
+                    results["warnings"].append(w)
+                    if not quiet:
+                        print(f"  ⚠ {w}")
+            else:
+                # Plugins not yet loaded — defer for post-discovery check
+                _deferred_toolset_warnings.extend(ts_warnings)
+                logger.debug(
+                    "Deferring %d toolset warning(s) until after plugin "
+                    "discovery: %s", len(ts_warnings), ts_warnings
+                )
     except Exception as _ts_val_err:
         # best-effort; never block migration on validation
         logger.debug("platform_toolsets validation skipped: %s", _ts_val_err)

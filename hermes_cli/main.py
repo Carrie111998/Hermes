@@ -14643,6 +14643,28 @@ def _prepare_agent_startup(args) -> None:
             "plugin discovery failed at CLI startup",
             exc_info=True,
         )
+
+    # ── Emit deferred toolset warnings after plugin discovery ──
+    # migrate_config() fires before plugins load, so plugin-registered
+    # toolsets trigger false-positive "unknown" warnings.  Now that
+    # discover_plugins() has populated the registry, re-validate and
+    # emit only the truly invalid ones.  (#71650)
+    try:
+        from hermes_cli.config import get_deferred_toolset_warnings
+        from hermes_cli.toolset_validation import validate_platform_toolsets
+        from toolsets import validate_toolset
+        from hermes_cli.config import read_raw_config
+
+        # Re-run validation with the now-populated plugin registry
+        fresh_warnings = validate_platform_toolsets(
+            read_raw_config().get("platform_toolsets"), validate_toolset
+        )
+        for w in fresh_warnings:
+            print(f"  ⚠ {w}")
+        # Clear the deferred buffer (we re-validated above)
+        get_deferred_toolset_warnings()
+    except Exception:
+        logger.debug("post-discovery toolset validation skipped", exc_info=True)
     _run_inline_mcp_discovery = True
     if _is_tui_chat_launch(args):
         # The TUI launcher hands off to a dedicated startup path that already
