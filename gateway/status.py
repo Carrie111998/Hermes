@@ -47,6 +47,7 @@ _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
+_runtime_status_write_lock = threading.RLock()
 
 logger = logging.getLogger(__name__)
 
@@ -987,41 +988,49 @@ def write_runtime_status(
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
-    current_record = _build_pid_record()
-    payload.setdefault("platforms", {})
-    payload["kind"] = current_record["kind"]
-    payload["pid"] = current_record["pid"]
-    payload["argv"] = current_record["argv"]
-    payload["start_time"] = current_record["start_time"]
-    payload["updated_at"] = _utc_now_iso()
+    # Platform adapters and active-turn accounting update this shared document
+    # from different gateway threads.  The atomic replace below protects
+    # readers from partial JSON, but without a lock the read-modify-write
+    # sequence can still lose a sibling update entirely.
+    with _runtime_status_write_lock:
+        payload = _read_json_file(path) or _build_runtime_status_record()
+        current_record = _build_pid_record()
+        if not isinstance(payload.get("platforms"), dict):
+            payload["platforms"] = {}
+        payload["kind"] = current_record["kind"]
+        payload["pid"] = current_record["pid"]
+        payload["argv"] = current_record["argv"]
+        payload["start_time"] = current_record["start_time"]
+        payload["updated_at"] = _utc_now_iso()
 
-    if gateway_state is not _UNSET:
-        payload["gateway_state"] = gateway_state
-    if exit_reason is not _UNSET:
-        payload["exit_reason"] = exit_reason
-    if restart_requested is not _UNSET:
-        payload["restart_requested"] = bool(restart_requested)
-    if active_agents is not _UNSET:
-        payload["active_agents"] = parse_active_agents(active_agents)
-    if served_profiles is not _UNSET:
-        # Profiles this gateway multiplexes (multi-profile mode). Absent/empty
-        # for a single-profile gateway. Lets `hermes status` show per-profile
-        # coverage without a second probe.
-        payload["served_profiles"] = list(served_profiles or [])
+        if gateway_state is not _UNSET:
+            payload["gateway_state"] = gateway_state
+        if exit_reason is not _UNSET:
+            payload["exit_reason"] = exit_reason
+        if restart_requested is not _UNSET:
+            payload["restart_requested"] = bool(restart_requested)
+        if active_agents is not _UNSET:
+            payload["active_agents"] = parse_active_agents(active_agents)
+        if served_profiles is not _UNSET:
+            # Profiles this gateway multiplexes (multi-profile mode). Absent/empty
+            # for a single-profile gateway. Lets `hermes status` show per-profile
+            # coverage without a second probe.
+            payload["served_profiles"] = list(served_profiles or [])
 
-    if platform is not _UNSET:
-        platform_payload = payload["platforms"].get(platform, {})
-        if platform_state is not _UNSET:
-            platform_payload["state"] = platform_state
-        if error_code is not _UNSET:
-            platform_payload["error_code"] = error_code
-        if error_message is not _UNSET:
-            platform_payload["error_message"] = error_message
-        platform_payload["updated_at"] = _utc_now_iso()
-        payload["platforms"][platform] = platform_payload
+        if platform is not _UNSET:
+            platform_payload = payload["platforms"].get(platform)
+            if not isinstance(platform_payload, dict):
+                platform_payload = {}
+            if platform_state is not _UNSET:
+                platform_payload["state"] = platform_state
+            if error_code is not _UNSET:
+                platform_payload["error_code"] = error_code
+            if error_message is not _UNSET:
+                platform_payload["error_message"] = error_message
+            platform_payload["updated_at"] = _utc_now_iso()
+            payload["platforms"][platform] = platform_payload
 
-    _write_json_file(path, payload)
+        _write_json_file(path, payload)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
@@ -2185,7 +2194,10 @@ def get_running_pid(
         if _record_matches_live_gateway_pid(record, pid):
             return pid
 
-    _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+    # The held OS lock is authoritative even when both identity records are
+    # malformed.  Unlinking an actively locked pathname would let another
+    # process create and lock a replacement inode while the live gateway still
+    # owns the original, defeating the singleton guard.
     if pid_path is None:
         runtime_pid = get_runtime_status_running_pid()
         if runtime_pid is not None:

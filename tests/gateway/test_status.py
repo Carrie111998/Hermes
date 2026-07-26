@@ -359,6 +359,32 @@ class TestGatewayPidState:
         finally:
             status.release_gateway_runtime_lock()
 
+    def test_get_running_pid_never_unlinks_an_actively_locked_identity_file(
+        self, tmp_path, monkeypatch
+    ):
+        """A live OS lock is authoritative even when its JSON is damaged.
+
+        Unlinking an actively locked file creates a new unlocked pathname while
+        the live process still owns the old inode, allowing a second gateway to
+        claim the replacement lock and run concurrently.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pid_path = tmp_path / "gateway.pid"
+        lock_path = tmp_path / "gateway.lock"
+
+        assert status.acquire_gateway_runtime_lock() is True
+        try:
+            status.write_pid_file()
+            pid_path.write_text("damaged", encoding="utf-8")
+            lock_path.write_text("damaged", encoding="utf-8")
+
+            assert status.is_gateway_runtime_lock_active(lock_path) is True
+            assert status.get_running_pid(pid_path) is None
+            assert pid_path.exists()
+            assert lock_path.exists()
+        finally:
+            status.release_gateway_runtime_lock()
+
     def test_gateway_identity_files_use_process_home_not_context_override(
         self, tmp_path, monkeypatch
     ):
@@ -396,6 +422,68 @@ class TestGatewayPidState:
 
 
 class TestGatewayRuntimeStatus:
+    def test_concurrent_platform_updates_preserve_both_records(
+        self, tmp_path, monkeypatch
+    ):
+        """Concurrent read-modify-write updates must not drop sibling state."""
+        import threading
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        worker_count = 24
+        barrier = threading.Barrier(worker_count)
+        errors = []
+
+        def update(platform):
+            try:
+                barrier.wait(timeout=5)
+                status.write_runtime_status(
+                    platform=platform, platform_state="connected"
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=update, args=(f"platform-{index}",))
+            for index in range(worker_count)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        assert not errors
+        assert all(not worker.is_alive() for worker in workers)
+        payload = status.read_runtime_status()
+        assert set(payload["platforms"]) == {
+            f"platform-{index}" for index in range(worker_count)
+        }
+
+    def test_platform_update_recovers_malformed_platform_container(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({"platforms": []}), encoding="utf-8")
+
+        status.write_runtime_status(platform="slack", platform_state="connected")
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["slack"]["state"] == "connected"
+
+    def test_platform_update_recovers_malformed_platform_record(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(
+            json.dumps({"platforms": {"slack": "damaged"}}), encoding="utf-8"
+        )
+
+        status.write_runtime_status(platform="slack", platform_state="connected")
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["slack"]["state"] == "connected"
+
     def test_write_json_file_uses_atomic_json_write(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         calls = []
