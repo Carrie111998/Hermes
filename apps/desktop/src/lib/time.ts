@@ -7,6 +7,31 @@ export const MINUTE = 60_000
 export const HOUR = 3_600_000
 export const DAY = 86_400_000
 
+// Hermes persists transcript timestamps as Unix seconds, while live renderer
+// message ids embed Date.now() milliseconds. Normalize both at the display
+// boundary so a live id is never multiplied by 1000 into the distant future.
+const MIN_PLAUSIBLE_MILLISECONDS = 100_000_000_000
+
+export function coerceTimestampDate(value: Date | number | string | null | undefined): Date | null {
+  if (value === null || value === undefined || value === '') {
+    return null
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : new Date(value.getTime())
+  }
+
+  const numeric = typeof value === 'number' ? value : Number(value)
+
+  if (!Number.isFinite(numeric)) {
+    return null
+  }
+
+  const date = new Date(Math.abs(numeric) < MIN_PLAUSIBLE_MILLISECONDS ? numeric * SECOND : numeric)
+
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
 // ── Absolute date/time formatters ──────────────────────────────────────────
 // `hh:mm` clock (thread today/yesterday lines).
 export const fmtClock = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })

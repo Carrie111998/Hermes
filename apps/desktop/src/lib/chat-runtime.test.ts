@@ -8,7 +8,8 @@ import {
   coerceThinkingText,
   optimisticAttachmentRef,
   parseCommandDispatch,
-  parseSlashCommand
+  parseSlashCommand,
+  toRuntimeMessage
 } from './chat-runtime'
 
 const DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANS'
@@ -83,6 +84,26 @@ describe('coerceThinkingText', () => {
         "◉_◉ processing... I don't see any current rewritten thinking or next thinking to process. Could you provide the thinking content you'd like me to rewrite?"
       )
     ).toBe('')
+  })
+})
+
+describe('toRuntimeMessage timestamps', () => {
+  it('uses the millisecond timestamp embedded in a live stream id', () => {
+    const createdAt = 1_785_064_294_529
+
+    const message = toRuntimeMessage({
+      id: `assistant-stream-${createdAt}-1`,
+      parts: [],
+      role: 'assistant'
+    })
+
+    expect(message.createdAt.getTime()).toBe(createdAt)
+  })
+
+  it('converts persisted Unix seconds to milliseconds', () => {
+    const message = toRuntimeMessage({ id: 'stored-1', parts: [], role: 'assistant', timestamp: 1_785_064_294 })
+
+    expect(message.createdAt.getTime()).toBe(1_785_064_294_000)
   })
 })
 

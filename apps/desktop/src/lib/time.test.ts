@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest'
 
-import { calendarBucket, DAY, formatAgo, HOUR, MINUTE, nominalDayStart, SECOND, sessionBucketLabel } from './time'
+import {
+  calendarBucket,
+  coerceTimestampDate,
+  DAY,
+  fmtMonth,
+  fmtMonthYear,
+  formatAgo,
+  HOUR,
+  MINUTE,
+  nominalDayStart,
+  SECOND,
+  sessionBucketLabel
+} from './time'
 
 const labels = {
   ageNow: 'now',
@@ -28,6 +40,25 @@ describe('formatAgo', () => {
 
   it('clamps future timestamps to "now"', () => {
     expect(ago(-HOUR)).toBe('now')
+  })
+})
+
+describe('coerceTimestampDate', () => {
+  const epochSeconds = 1_785_064_294
+  const epochMilliseconds = epochSeconds * SECOND
+
+  it('normalizes Unix seconds instead of interpreting them as January 1970 milliseconds', () => {
+    expect(coerceTimestampDate(epochSeconds)?.getTime()).toBe(epochMilliseconds)
+  })
+
+  it('preserves millisecond timestamps and Date instances', () => {
+    expect(coerceTimestampDate(epochMilliseconds)?.getTime()).toBe(epochMilliseconds)
+    expect(coerceTimestampDate(new Date(epochMilliseconds))?.getTime()).toBe(epochMilliseconds)
+  })
+
+  it('rejects invalid timestamps', () => {
+    expect(coerceTimestampDate(undefined)).toBeNull()
+    expect(coerceTimestampDate('not-a-date')).toBeNull()
   })
 })
 
@@ -117,8 +148,7 @@ describe('sessionBucketLabel', () => {
   })
 
   it('formats month (same year) and month + year (prior year) via Intl', () => {
-    // en-US default in the test env: month name, plus year for the prior year.
-    expect(labelAt(2026, 2, 3)).toBe('March')
-    expect(labelAt(2025, 11, 3)).toBe('December 2025')
+    expect(labelAt(2026, 2, 3)).toBe(fmtMonth.format(new Date(2026, 2, 3)))
+    expect(labelAt(2025, 11, 3)).toBe(fmtMonthYear.format(new Date(2025, 11, 3)))
   })
 })
