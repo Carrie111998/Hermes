@@ -379,6 +379,22 @@ def test_zero_collected_across_run_fails_and_says_so(tmp_path: Path) -> None:
     assert "NOT a pass" in proc.stdout
 
 
+def test_file_that_hard_exits_zero_without_a_summary_fails(tmp_path: Path) -> None:
+    """A test process cannot hide the rest of its file behind ``os._exit(0)``."""
+    probe_dir = tmp_path / "hardexit"
+    probe_dir.mkdir()
+    (probe_dir / "test_hardexit.py").write_text(
+        "import os\n\n"
+        "def test_exits_process():\n    os._exit(0)\n\n"
+        "def test_never_reached():\n    assert False\n"
+    )
+
+    proc = _run_runner(probe_dir)
+
+    assert proc.returncode == 1, proc.stdout
+    assert "exited 0 without a pytest summary" in proc.stdout
+
+
 def test_all_skipped_file_is_still_a_pass(tmp_path: Path) -> None:
     """Per-file zero-collection stays tolerated.
 

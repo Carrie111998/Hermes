@@ -360,7 +360,15 @@ def _run_one_file_once(
 
         output +=  "\n"
 
-    if rc == 5:
+    summary = _parse_pytest_summary(output)
+    if rc == 0 and not summary:
+        rc = 1
+        output = (
+            "ERROR: pytest exited 0 without a pytest summary; the process "
+            "terminated before reporting its collected outcomes (for example, "
+            "via os._exit(0)).\n" + output
+        )
+    elif rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
         # platform-gated or fully-marker-filtered file (e.g. a win32-only
         # suite on Linux) collects nothing and must not fail the suite.
@@ -368,7 +376,6 @@ def _run_one_file_once(
         # NOTHING was collected across every file, so a broken invocation
         # (venv without pytest, -k that matches nothing) can't report green.
         rc = 0
-    summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
     return file, rc, output, summary, subproc_wall
 
