@@ -1171,6 +1171,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    dispatch_decision = args.get("dispatch_decision")
+    if dispatch_decision is not None and not isinstance(dispatch_decision, dict):
+        return tool_error("dispatch_decision must be an object/dict")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -1236,6 +1239,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                dispatch_decision=dispatch_decision,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1941,8 +1945,27 @@ KANBAN_CREATE_SCHEMA = {
                     "'running', which preserves the usual dispatch path."
                 ),
             },
+            "dispatch_decision": {
+                "type": "object",
+                "properties": {
+                    "route": {"type": "string", "description": "Profile to route to (e.g. 'worker-terra')."},
+                    "exemption": {"type": "string", "description": "Exemption keyword when NOT routing."},
+                    "model": {"type": "string", "description": "Model name when routing (e.g. 'deepseek-v4-flash')."},
+                    "provider": {"type": "string", "description": "Provider when routing (e.g. 'custom')."},
+                },
+                "description": (
+                    "Controller dispatch decision record. Omit for simple inline tasks. "
+                    "Set ``{\"route\": \"worker-terra\", \"model\": \"deepseek-v4-flash\", "
+                    "\"provider\": \"custom\"}`` to queue the task for worker-terra execution. "
+                    "Set ``{\"exemption\": \"tiny\"}`` (or another bounded keyword) when the "
+                    "controller keeps the work and does NOT dispatch it. "
+                    "Route and exemption are mutually exclusive. "
+                    "When routing, 'model' and 'provider' are REQUIRED. "
+                    "Exemption keywords: tiny, requires_full_context, security_critical, "
+                    "controller_judgment, quality_escalation, already_running."
+                ),
+            },
             "skills": {
-                "type": "array",
                 "items": {"type": "string"},
                 "description": (
                     "Skill names to force-load into the dispatched "

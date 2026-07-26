@@ -4999,3 +4999,259 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Dispatch decision tests
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchDecision:
+    """Tests for dispatch_decision recording on create_task."""
+
+    def test_route_decision_records_dispatch_routed_event(self, kanban_home):
+        """A dispatch_decision with 'route' produces a dispatch_routed event."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="test route",
+                assignee="worker-terra",
+                dispatch_decision={
+                    "route": "worker-terra",
+                    "model": "deepseek-v4-flash",
+                    "provider": "custom",
+                },
+            )
+            events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "created" in kinds
+        assert "dispatch_routed" in kinds
+        routed = [e for e in events if e.kind == "dispatch_routed"]
+        assert len(routed) == 1
+        assert routed[0].payload == {
+            "route": "worker-terra",
+            "model": "deepseek-v4-flash",
+            "provider": "custom",
+        }
+
+    def test_exemption_decision_records_dispatch_exempted_event(self, kanban_home):
+        """A dispatch_decision with a valid exemption produces dispatch_exempted."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="test exemption",
+                dispatch_decision={"exemption": "tiny"},
+            )
+            events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "dispatch_exempted" in kinds
+        exempted = [e for e in events if e.kind == "dispatch_exempted"]
+        assert len(exempted) == 1
+        assert exempted[0].payload == {"exemption": "tiny"}
+
+    def test_no_dispatch_decision_omits_routing_events(self, kanban_home):
+        """Without dispatch_decision, no dispatch_routed/exempted event."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="no decision")
+            events = kb.list_events(conn, tid)
+        kinds = {e.kind for e in events}
+        assert "dispatch_routed" not in kinds
+        assert "dispatch_exempted" not in kinds
+        assert "created" in kinds
+
+    def test_event_order_created_before_dispatch(self, kanban_home):
+        """The 'created' event precedes dispatch_routed/exempted."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="order test",
+                dispatch_decision={
+                    "route": "worker-terra",
+                    "model": "deepseek-v4-flash",
+                    "provider": "custom",
+                },
+            )
+            events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        created_idx = kinds.index("created")
+        routed_idx = kinds.index("dispatch_routed")
+        assert created_idx < routed_idx, (
+            f"'created' ({created_idx}) must precede "
+            f"'dispatch_routed' ({routed_idx})"
+        )
+
+    def test_lifecycle_created_not_running(self, kanban_home):
+        """A newly created task starts in 'ready' or 'todo', never 'running'."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="lifecycle test", assignee="worker-terra")
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status in ("ready", "todo"), (
+            f"Expected 'ready' or 'todo', got '{task.status}'"
+        )
+        assert task.status != "running", "New tasks must not start as 'running'"
+
+    def test_claimed_event_signals_work_started(self, kanban_home):
+        """A 'claimed' event appears only after a task transitions to running."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="claim test", assignee="worker-terra")
+            events_before = kb.list_events(conn, tid)
+            claimed_before = [e for e in events_before if e.kind == "claimed"]
+            assert len(claimed_before) == 0, "No claimed event before dispatch"
+
+            # Simulate dispatcher claiming the task
+            claimed = kb.claim_task(conn, tid)
+            events_after = kb.list_events(conn, tid)
+        assert claimed is not None
+        claimed_after = [e for e in events_after if e.kind == "claimed"]
+        assert len(claimed_after) == 1, (
+            "Expected one claimed event after claim_task"
+        )
+
+    def test_completed_event_signals_work_done(self, kanban_home):
+        """A 'completed' event records the run outcome."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="complete test", assignee="worker-terra")
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            ok = kb.complete_task(
+                conn, tid, summary="done", result="success"
+            )
+            assert ok
+            events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "completed" in kinds
+
+
+# ---------------------------------------------------------------------------
+# DISPATCH_EXEMPTIONS validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchExemptions:
+    """Bounded exemption vocabulary enforcement."""
+
+    def test_valid_exemptions_accepted(self, kanban_home):
+        """Every keyword in DISPATCH_EXEMPTIONS is accepted."""
+        for keyword in sorted(kb.DISPATCH_EXEMPTIONS):
+            with kb.connect() as conn:
+                tid = kb.create_task(
+                    conn,
+                    title=f"exemption-{keyword}",
+                    dispatch_decision={"exemption": keyword},
+                )
+                events = kb.list_events(conn, tid)
+            exempted = [e for e in events if e.kind == "dispatch_exempted"]
+            assert len(exempted) == 1, (
+                f"Exemption '{keyword}' should be accepted"
+            )
+
+    def test_unknown_exemption_rejected(self, kanban_home):
+        """A string not in DISPATCH_EXEMPTIONS is rejected with ValueError."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="unknown exemption"):
+                kb.create_task(
+                    conn,
+                    title="bad exemption",
+                    dispatch_decision={"exemption": "not_a_valid_keyword"},
+                )
+
+    def test_exemption_mutually_exclusive_with_route(self, kanban_home):
+        """route and exemption together raise ValueError."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="mutually exclusive"):
+                kb.create_task(
+                    conn,
+                    title="both",
+                    dispatch_decision={
+                        "route": "worker-terra",
+                        "exemption": "tiny",
+                        "model": "deepseek-v4-flash",
+                        "provider": "custom",
+                    },
+                )
+
+    def test_route_requires_model(self, kanban_home):
+        """route without model raises ValueError."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="requires.*model"):
+                kb.create_task(
+                    conn,
+                    title="no model",
+                    dispatch_decision={"route": "worker-terra"},
+                )
+
+    def test_route_requires_provider(self, kanban_home):
+        """route without provider raises ValueError."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="requires.*provider"):
+                kb.create_task(
+                    conn,
+                    title="no provider",
+                    dispatch_decision={
+                        "route": "worker-terra",
+                        "model": "deepseek-v4-flash",
+                    },
+                )
+
+    def test_none_decision_accepted(self, kanban_home):
+        """dispatch_decision=None (the default) should not raise."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="none decision",
+                dispatch_decision=None,
+            )
+        assert tid is not None
+
+    def test_empty_exemption_value_rejected(self, kanban_home):
+        """Empty exemption string raises ValueError."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="non-empty"):
+                kb.create_task(
+                    conn,
+                    title="empty exemption",
+                    dispatch_decision={"exemption": ""},
+                )
+
+
+# ---------------------------------------------------------------------------
+# validate_dispatch_decision unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDispatchDecision:
+    """Direct tests for validate_dispatch_decision helper."""
+
+    def test_none_passes(self):
+        kb.validate_dispatch_decision(None)
+
+    def test_valid_route_passes(self):
+        kb.validate_dispatch_decision({
+            "route": "worker-terra",
+            "model": "deepseek-v4-flash",
+            "provider": "custom",
+        })
+
+    def test_valid_exemption_passes(self):
+        for kw in kb.DISPATCH_EXEMPTIONS:
+            kb.validate_dispatch_decision({"exemption": kw})
+
+    def test_invalid_type(self):
+        with pytest.raises(ValueError, match="must be a dict"):
+            kb.validate_dispatch_decision("not a dict")
+
+    def test_missing_keys(self):
+        with pytest.raises(ValueError, match="must contain either"):
+            kb.validate_dispatch_decision({"some": "thing"})
+
+    def test_mutual_exclusivity(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            kb.validate_dispatch_decision({
+                "route": "worker-terra",
+                "exemption": "tiny",
+            })
+
+    def test_bad_exemption_keyword(self):
+        with pytest.raises(ValueError, match="unknown exemption"):
+            kb.validate_dispatch_decision({"exemption": "made_up"})

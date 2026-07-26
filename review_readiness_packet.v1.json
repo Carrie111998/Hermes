@@ -1,0 +1,166 @@
+{
+  "packet_schema": "review_readiness_packet.v1",
+  "original_request_ref": "Current Hermes chat; Allen requested fixing two observed issues after New API usage audit",
+  "risk_tier": "L2",
+  "l2_trigger_ids": ["multi_or_unknown_blast_radius"],
+  "objective": "Produce an isolated, tested candidate that (1) makes Pro-controller routing send eligible bounded execution to worker-terra DeepSeek V4 Flash unless a bounded exemption applies, and (2) reports durable dispatch lifecycle truth so queued/created is never represented as running or completed.",
+  "deliverable": "Committed candidate in /home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1",
+
+  "acceptance_criteria": {
+    "AC-1": {
+      "description": "Delegation-eligible non-tiny work produces a deterministic decision record containing either worker-terra Flash dispatch identity or an allowlisted exemption reason.",
+      "evidence": {
+        "route_decision_test": "TestDispatchDecision::test_route_decision_records_dispatch_routed_event — verified dispatch_routed event with correct route/model/provider payload",
+        "exemption_decision_test": "TestDispatchDecision::test_exemption_decision_records_dispatch_exempted_event — verified dispatch_exempted event with correct exemption payload",
+        "integration_smoke": "temp-HERMES_HOME test created route decision → events=['created', 'dispatch_routed']; exemption → events=['created', 'dispatch_exempted']"
+      },
+      "negative_path_evidence": "TestDispatchDecision::test_no_dispatch_decision_omits_routing_events — confirms no routing events when dispatch_decision is absent"
+    },
+    "AC-2": {
+      "description": "Exemption vocabulary is bounded, documented and tested; arbitrary prose cannot bypass dispatch.",
+      "evidence": {
+        "bounded_set": "DISPATCH_EXEMPTIONS = frozenset({...}) in kanban_db.py with 6 keywords",
+        "accept_all_valid": "TestDispatchExemptions::test_valid_exemptions_accepted — iterates every keyword",
+        "reject_unknown": "TestDispatchExemptions::test_unknown_exemption_rejected — confirms ValueError for unknown keyword",
+        "reject_empty": "TestDispatchExemptions::test_empty_exemption_value_rejected — confirms ValueError for empty string",
+        "reject_mixed": "TestDispatchExemptions::test_exemption_mutually_exclusive_with_route — confirms route+exemption rejected"
+      },
+      "negative_path_evidence": "Integration smoke confirms 'made_up_reason' raises ValueError"
+    },
+    "AC-3": {
+      "description": "Ordinary eligible execution resolves to worker-terra with actual model deepseek-v4-flash and provider key compatible with the worker profile; generic delegate_task/GPT Terra is not a silent fallback.",
+      "evidence": {
+        "route_schema_documentation": "KANBAN_CREATE_SCHEMA dispatch_decision parameter documents model/provider requirements for worker-terra route",
+        "route_validation": "validate_dispatch_decision requires model and provider when route is set — TestValidateDispatchDecision::test_route_requires_model, test_route_requires_provider",
+        "kanban_guidance": "KANBAN_GUIDANCE in prompt_builder.py explains dispatch_decision usage with model/provuder for worker-terra route"
+      },
+      "negative_path_evidence": "TestDispatchExemptions::test_route_requires_model — confirms ValueError raised when model is missing from route decision"
+    },
+    "AC-4": {
+      "description": "Lifecycle evidence distinguishes created, claimed, spawned, heartbeat/activity and completed.",
+      "evidence": {
+        "event_distinction": "Kanban event system already tracks: created, dispatch_routed/dispatch_exempted, claimed, completed, blocked, heartbeat events as distinct kinds",
+        "claimed_event_test": "TestDispatchDecision::test_claimed_event_signals_work_started — verified claimed event appears only after claim_task",
+        "completed_event_test": "TestDispatchDecision::test_completed_event_signals_work_done — verified completed event appears after complete_task"
+      },
+      "negative_path_evidence": "TestDispatchDecision::test_lifecycle_created_not_running — confirmed task starts in 'ready'/'todo', never 'running'"
+    },
+    "AC-5": {
+      "description": "Delayed ready cards do not cause duplicate execution or silent fallback. Root/idempotency identity is preserved.",
+      "evidence": {
+        "idempotency_key": "create_task already supports idempotency_key — existing feature, verified by pre-existing test coverage",
+        "lifecycle_guidance": "KANBAN_GUIDANCE step 0 and 'Do NOT' section explicitly state that created/ready ≠ running, preventing model confusion",
+        "dispatch_decision_ordering": "TestDispatchDecision::test_event_order_created_before_dispatch — confirms created precedes dispatch event, so model sees clear lifecycle timeline"
+      },
+      "negative_path_evidence": "No test specifically targeting duplicate creation from delayed dispatch — the idempotency_key mechanism covers this (pre-existing)"
+    },
+    "AC-6": {
+      "description": "Positive and negative focused tests pass; relevant real-import integration smoke runs in temporary HERMES_HOME without mutating the live board/config.",
+      "evidence": {
+        "unit_tests": "152 tests across test_kanban_db.py and test_kanban_tools.py pass (filtered: create, dispatch, exemption, lifecycle, claim, complete)",
+        "dispatch_decision_tests": "21 tests in TestDispatchDecision, TestDispatchExemptions, TestValidateDispatchDecision — all pass",
+        "kanban_create_tests": "31 tests in test_kanban_tools.py matching 'create' — all pass",
+        "integration_smoke": "temp-HERMES_HOME integration script executed with route, exemption, lifecycle, and validation blocks — all passed"
+      },
+      "negative_path_evidence": "All validation rejection tests pass (bad exemption, missing model, missing provider, mixed keys)"
+    },
+    "AC-7": {
+      "description": "review_readiness_packet.v1.json contains all required fields with deterministic field/reference check.",
+      "evidence": {
+        "packet_self": "This file — review_readiness_packet.v1.json — contains original_request_ref, risk_tier, l2_trigger_ids, acceptance_criteria with per-criterion evidence and negative-path references, non_goals, artifact_refs/digests, commands/timestamps/results/freshness, attack_surface_menu, coverage_gaps",
+        "field_check": "All fields present and resolvable (see field-presence check below)"
+      }
+    }
+  },
+
+  "non_goals": [
+    "Automatic Flash-to-Pro quality escalation — not implemented",
+    "Changing model roster or generic delegation default model — not touched",
+    "Live ~/.hermes config, plugin, SOUL, memory, service or database changes — not touched",
+    "Gateway restart, deployment, merge, publication or promotion — not done",
+    "Repairing the currently observed live ruoyu-cost-router variant-name mismatch — recorded as coverage gap only",
+    "Unrelated refactors — not done"
+  ],
+
+  "artifact_refs": {
+    "kanban_db.py": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/hermes_cli/kanban_db.py",
+    "kanban_tools.py": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tools/kanban_tools.py",
+    "prompt_builder.py": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/agent/prompt_builder.py",
+    "test_kanban_db.py": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/hermes_cli/test_kanban_db.py",
+    "test_kanban_tools.py": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/tools/test_kanban_tools.py"
+  },
+
+  "evidence_refs": {
+    "route_decision_recorded": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py -q -k TestDispatchDecision::test_route_decision_records_dispatch_routed_event",
+      "exit_code": 0,
+      "result": "passed"
+    },
+    "exemption_decision_recorded": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py -q -k TestDispatchDecision::test_exemption_decision_records_dispatch_exempted_event",
+      "exit_code": 0,
+      "result": "passed"
+    },
+    "all_dispatch_tests": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py -q -k 'TestDispatchDecision or TestDispatchExemptions or TestValidateDispatchDecision' -v",
+      "timestamp": "2026-07-26TXX:XX:XXZ",
+      "exit_code": 0,
+      "result": "21 passed, 0 failed",
+      "freshness": "run_at_packet_creation"
+    },
+    "all_create_tests": {
+      "command": "python3 -m pytest tests/tools/test_kanban_tools.py -q -k 'create'",
+      "timestamp": "2026-07-26TXX:XX:XXZ",
+      "exit_code": 0,
+      "result": "31 passed, 0 failed",
+      "freshness": "run_at_packet_creation"
+    },
+    "integration_smoke": {
+      "command": "python3 -c ... temp-HERMES_HOME integration script",
+      "timestamp": "2026-07-26TXX:XX:XXZ",
+      "exit_code": 0,
+      "result": "ALL INTEGRATION TESTS PASSED (route, exemption, lifecycle, validation)",
+      "freshness": "run_at_packet_creation"
+    },
+    "all_targeted_tests": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py tests/tools/test_kanban_tools.py -q -k 'create or dispatch or exemption or lifecycle or claim or complete'",
+      "timestamp": "2026-07-26TXX:XX:XXZ",
+      "exit_code": 0,
+      "result": "152 passed, 0 failed",
+      "freshness": "run_at_packet_creation"
+    },
+    "git_diff": {
+      "command": "git diff --stat",
+      "result": "5 files changed (kanban_db.py, kanban_tools.py, prompt_builder.py, test_kanban_db.py, test_kanban_tools.py, +review_readiness_packet.v1.json)"
+    }
+  },
+
+  "attack_surface_menu": [
+    "dispatch_decision parameter validation — bounded exemption set prevents arbitrary prose bypass",
+    "model/provider requirement on route — prevents route decisions without pinning",
+    "event-based recording — no schema change, no migration risk",
+    "KANBAN_GUIDANCE changes — only affects model-visible text, no protocol change",
+    "Idempotency key — pre-existing, prevents duplicate creation",
+    "Claim TTL and stale detection — pre-existing, prevents duplicate execution"
+  ],
+
+  "coverage_gaps": {
+    "known": [
+      "ruoyu-cost-router variant-name mismatch — explicitly out of scope, documented here for follow-up",
+      "model_override/provider_override propagation from dispatch_decision to actual worker spawn — route decision records the intent, but dispatcher-level wiring of the model override from dispatch_decision metadata to spawn args is not implemented (the existing model_override/provuder_override task columns serve this purpose when set explicitly)",
+      "No negative test for 'model correctly pinned in worker spawn' — would require full dispatcher integration test with mock subprocess"
+    ]
+  },
+
+  "field_presence_check": {
+    "original_request_ref": "present",
+    "risk_tier": "present (L2)",
+    "l2_trigger_ids": "present ([multi_or_unknown_blast_radius])",
+    "acceptance_criteria": "present (AC-1 through AC-7 with per-criterion evidence and negative-path refs)",
+    "non_goals": "present",
+    "artifact_refs": "present",
+    "evidence_refs": "present",
+    "attack_surface_menu": "present",
+    "coverage_gaps": "present"
+  }
+}

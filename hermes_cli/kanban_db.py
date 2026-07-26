@@ -257,6 +257,97 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Bounded vocabulary of exemption reasons for controller dispatch decisions.
+# When the controller decides NOT to route a task through worker-terra Flash,
+# it MUST use one of these keywords as the ``exemption`` key in the
+# dispatch decision. Any other string is rejected at creation time.
+#
+#   ``tiny``                  — trivially small work; delegation overhead exceeds
+#                               the work itself (one-shot classification, single
+#                               field extraction, trivial read-and-return).
+#   ``requires_full_context`` — the task needs the full conversation history / the
+#                               controller's existing session state (mid-stream
+#                               reasoning, context-dependent judgment).
+#   ``security_critical``     — involves credentials, access-boundary changes,
+#                               destructive data actions, or adversarial-review L2.
+#   ``controller_judgment``   — the controller's own final judgment is the
+#                               deliverable (evidence review, risk assessment,
+#                               configuration authorization).
+#   ``quality_escalation``    — Flash quality gate failure; controller or Terra
+#                               must finish what Flash could not.
+#   ``already_running``       — the controller is already executing this work
+#                               and the incremental cost to finish is near zero.
+DISPATCH_EXEMPTIONS = frozenset({
+    "tiny",
+    "requires_full_context",
+    "security_critical",
+    "controller_judgment",
+    "quality_escalation",
+    "already_running",
+})
+
+
+def validate_dispatch_decision(decision: Optional[dict]) -> None:
+    """Validate a dispatch decision dict.
+
+    A valid dispatch decision is either:
+      ``{"route": "worker-terra", "model": "<model>", "provider": "<provider>"}``
+      — the provider and model keys are REQUIRED for route decisions so the
+        dispatcher pins the worker to the correct model; or
+      ``{"exemption": "<keyword from DISPATCH_EXEMPTIONS>"}``
+      — a bounded exemption reason.
+
+    Raises ``ValueError`` when the decision is structurally invalid, uses
+    an unrecognised exemption keyword, or mixes route + exemption keys.
+    Returns ``None`` when ``decision`` is ``None`` (no decision recorded).
+    """
+    if decision is None:
+        return
+
+    if not isinstance(decision, dict):
+        raise ValueError(
+            f"dispatch_decision must be a dict, got {type(decision).__name__}"
+        )
+
+    keys = set(decision.keys()) - {"model", "provider"}
+    has_route = "route" in keys
+    has_exemption = "exemption" in keys
+
+    if has_route and has_exemption:
+        raise ValueError(
+            "dispatch_decision: route and exemption are mutually exclusive"
+        )
+    if not has_route and not has_exemption:
+        raise ValueError(
+            "dispatch_decision must contain either 'route' or 'exemption'"
+        )
+
+    if has_route:
+        route = str(decision.get("route", "")).strip()
+        if not route:
+            raise ValueError("dispatch_decision: 'route' value must be non-empty")
+        model = decision.get("model")
+        if not model or not str(model).strip():
+            raise ValueError(
+                "dispatch_decision: 'route' requires 'model' "
+                "(e.g. 'deepseek-v4-flash')"
+            )
+        provider = decision.get("provider")
+        if not provider or not str(provider).strip():
+            raise ValueError(
+                "dispatch_decision: 'route' requires 'provider' "
+                "(e.g. 'custom')"
+            )
+    elif has_exemption:
+        exemption = str(decision.get("exemption", "")).strip()
+        if not exemption:
+            raise ValueError("dispatch_decision: 'exemption' value must be non-empty")
+        if exemption not in DISPATCH_EXEMPTIONS:
+            raise ValueError(
+                f"dispatch_decision: unknown exemption {exemption!r}. "
+                f"Valid exemptions: {sorted(DISPATCH_EXEMPTIONS)}"
+            )
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -2838,6 +2929,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    dispatch_decision: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3183,6 +3275,26 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                # Record the dispatch decision as a distinct event when present.
+                # This creates an auditable record of the controller's routing
+                # intent: ``dispatch_routed`` (task should go to worker-terra
+                # with a specific model/provider) or ``dispatch_exempted``
+                # (controller kept the work with a bounded reason). The event
+                # appears between ``created`` and any subsequent ``claimed`` /
+                # ``promoted`` events — the task is created, the dispatch
+                # decision is recorded, and only later does the dispatcher
+                # actually claim and spawn it. This prevents "created/queued"
+                # from being mistaken for "work started."
+                if dispatch_decision is not None:
+                    validate_dispatch_decision(dispatch_decision)
+                    if "route" in dispatch_decision:
+                        evt_kind = "dispatch_routed"
+                    else:
+                        evt_kind = "dispatch_exempted"
+                    _append_event(
+                        conn, task_id, evt_kind, dict(dispatch_decision),
+                    )
+
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
