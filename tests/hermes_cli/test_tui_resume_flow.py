@@ -224,6 +224,16 @@ def test_cmd_chat_tui_forwards_chat_flags(monkeypatch, main_mod):
     assert captured["accept_hooks"] is True
 
 
+def test_launch_tui_fallback_rejection_mentions_cli(monkeypatch, capsys, main_mod):
+    with pytest.raises(SystemExit) as exc:
+        main_mod._launch_tui(fallbacks=["openai-codex/gpt-5.6-sol"])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--cli" in err
+    assert "-z" in err
+
+
 def test_main_top_level_tui_accepts_toolsets(monkeypatch, main_mod):
     captured = {}
 
@@ -401,9 +411,52 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "prompt": "hello",
         "model": "gpt-test",
         "provider": "openai",
+        "fallbacks": None,
         "toolsets": None,
         "usage_file": "usage.json",
     }
+
+
+def test_termux_fast_cli_launch_oneshot_forwards_fallback_list(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("TERMUX_VERSION", "1")
+    monkeypatch.delenv("HERMES_TUI", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "-z",
+            "hello",
+            "--fallback",
+            "openai-codex/gpt-5.6-sol",
+            "--fallback",
+            "gemini/gemini-3.1-pro-preview",
+        ],
+    )
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda args: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(
+            run_oneshot=lambda prompt, **kwargs: captured.update(
+                {"prompt": prompt, **kwargs}
+            )
+            or 0
+        ),
+    )
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", _raise_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod._try_termux_fast_cli_launch()
+
+    assert exc.value.code == 0
+    assert captured["prompt"] == "hello"
+    assert captured["fallbacks"] == [
+        "openai-codex/gpt-5.6-sol",
+        "gemini/gemini-3.1-pro-preview",
+    ]
 
 
 def test_termux_fast_cli_launch_version_skips_update_check(monkeypatch, main_mod):
@@ -655,9 +708,70 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "prompt": "hello",
         "model": None,
         "provider": None,
+        "fallbacks": None,
         "toolsets": "web,terminal",
         "usage_file": "usage.json",
     }
+
+
+def test_main_top_level_oneshot_forwards_fallback_list(monkeypatch, main_mod):
+    captured = {}
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "-z",
+            "hello",
+            "--fallback",
+            "openai-codex/gpt-5.6-sol",
+            "--fallback",
+            "gemini/gemini-3.1-pro-preview",
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(discover_plugins=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(discover_mcp_tools=lambda: None),
+    )
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        types.SimpleNamespace(
+            register_from_config=lambda _cfg, accept_hooks=False: None
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(
+            run_oneshot=lambda prompt, **kwargs: captured.update(
+                {"prompt": prompt, **kwargs}
+            )
+            or 0
+        ),
+    )
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", _raise_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+
+    assert exc.value.code == 0
+    assert captured["prompt"] == "hello"
+    assert captured["fallbacks"] == [
+        "openai-codex/gpt-5.6-sol",
+        "gemini/gemini-3.1-pro-preview",
+    ]
 
 
 def test_exit_after_oneshot_flushes_stdio_and_calls_os_exit(
