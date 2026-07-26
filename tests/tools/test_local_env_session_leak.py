@@ -231,3 +231,49 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+def test_clear_session_vars_clears_cron_delivery_vars(monkeypatch):
+    """clear_session_vars must also clear HERMES_CRON_AUTO_DELIVER_* vars.
+
+    The cron auto-delivery context variables (HERMES_CRON_AUTO_DELIVER_PLATFORM,
+    HERMES_CRON_AUTO_DELIVER_CHAT_ID, HERMES_CRON_AUTO_DELIVER_THREAD_ID) are
+    part of _VAR_MAP but were previously omitted from the explicit clearing
+    loop in clear_session_vars.  After a cron job sets these and a handler
+    finishes, the delivery vars must NOT retain stale values.
+    """
+    from gateway.session_context import (
+        _CRON_AUTO_DELIVER_CHAT_ID,
+        _CRON_AUTO_DELIVER_PLATFORM,
+        _CRON_AUTO_DELIVER_THREAD_ID,
+        _UNSET,
+    )
+
+    tokens = set_session_vars(
+        session_key="cron-job:main",
+        platform="telegram",
+        chat_id="cron_chat",
+    )
+    # Simulate the cron scheduler setting delivery target after set_session_vars
+    _CRON_AUTO_DELIVER_PLATFORM.set("telegram")
+    _CRON_AUTO_DELIVER_CHAT_ID.set("12345")
+    _CRON_AUTO_DELIVER_THREAD_ID.set("thread-99")
+
+    # Verify the vars are set before clearing
+    assert _CRON_AUTO_DELIVER_PLATFORM.get() == "telegram"
+    assert _CRON_AUTO_DELIVER_CHAT_ID.get() == "12345"
+    assert _CRON_AUTO_DELIVER_THREAD_ID.get() == "thread-99"
+
+    clear_session_vars(tokens)
+
+    # After clearing, cron delivery vars must be "" (explicitly cleared),
+    # NOT the stale values from the cron job.
+    assert _CRON_AUTO_DELIVER_PLATFORM.get() == "", (
+        f"Cron platform var not cleared: {_CRON_AUTO_DELIVER_PLATFORM.get()!r}"
+    )
+    assert _CRON_AUTO_DELIVER_CHAT_ID.get() == "", (
+        f"Cron chat_id var not cleared: {_CRON_AUTO_DELIVER_CHAT_ID.get()!r}"
+    )
+    assert _CRON_AUTO_DELIVER_THREAD_ID.get() == "", (
+        f"Cron thread_id var not cleared: {_CRON_AUTO_DELIVER_THREAD_ID.get()!r}"
+    )

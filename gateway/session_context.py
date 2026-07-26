@@ -274,13 +274,15 @@ def set_session_vars(
 def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared.
 
-    Sets all variables to ``""`` so that ``get_session_env`` returns an empty
-    string instead of falling back to (potentially stale) ``os.environ``
-    values.  The *tokens* argument is accepted for API compatibility with
-    callers that saved the return value of ``set_session_vars``, but the
-    actual clearing uses ``var.set("")`` rather than ``var.reset(token)``
-    to ensure the "explicitly cleared" state is distinguishable from
-    "never set" (which holds the ``_UNSET`` sentinel).
+    Sets all session context variables — including the cron auto-delivery
+    vars (``HERMES_CRON_AUTO_DELIVER_*``) — to ``""`` so that
+    ``get_session_env`` returns an empty string instead of falling back to
+    (potentially stale) ``os.environ`` values.  The *tokens* argument is
+    accepted for API compatibility with callers that saved the return value
+    of ``set_session_vars``, but the actual clearing uses
+    ``var.set("")`` rather than ``var.reset(token)`` to ensure the
+    "explicitly cleared" state is distinguishable from "never set" (which
+    holds the ``_UNSET`` sentinel).
     """
     for var in (
         _SESSION_PLATFORM,
@@ -297,6 +299,9 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
         _CRON_SESSION,
+        _CRON_AUTO_DELIVER_PLATFORM,
+        _CRON_AUTO_DELIVER_CHAT_ID,
+        _CRON_AUTO_DELIVER_THREAD_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
