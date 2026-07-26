@@ -605,6 +605,14 @@ def render_notice_line(notice) -> str:
     return str(getattr(notice, "text", "") or "").strip()
 
 
+def _reply_to_for_thread_metadata(metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Return the reply anchor only for explicit thread-aware sends."""
+    if not metadata or not metadata.get("reply_in_thread"):
+        return None
+    reply_to = metadata.get("reply_to_message_id")
+    return str(reply_to) if reply_to else None
+
+
 async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
     """Route a status message through adapter.send_or_update_status when supported.
 
@@ -22776,6 +22784,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
+                            reply_to=_reply_to_for_thread_metadata(_status_thread_metadata),
                             metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
                         )
                         if getattr(_notify_res, "success", False) and getattr(

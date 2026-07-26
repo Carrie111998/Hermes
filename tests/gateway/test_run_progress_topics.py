@@ -15,6 +15,19 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from gateway.session import SessionSource
 
 
+from gateway.run import _reply_to_for_thread_metadata
+
+
+def test_feishu_heartbeat_metadata_keeps_trigger_reply_anchor():
+    assert _reply_to_for_thread_metadata(
+        {"reply_in_thread": True, "reply_to_message_id": "om_trigger"}
+    ) == "om_trigger"
+
+
+def test_non_thread_status_metadata_has_no_reply_anchor():
+    assert _reply_to_for_thread_metadata({"reply_to_message_id": "om_trigger"}) is None
+
+
 class ProgressCaptureAdapter(BasePlatformAdapter):
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
