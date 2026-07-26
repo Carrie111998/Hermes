@@ -6795,17 +6795,20 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             with open(file_path, "rb") as f:
+                payload = {
+                    "chat_id": normalize_telegram_chat_id(chat_id),
+                    "document": f,
+                    "filename": display_name,
+                    "caption": caption[:1024] if caption else None,
+                    "reply_to_message_id": reply_to_id,
+                    **thread_kwargs,
+                    **self._notification_kwargs(metadata),
+                }
+                if kwargs.get("disable_content_type_detection"):
+                    payload["disable_content_type_detection"] = True
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_document,
-                    {
-                        "chat_id": normalize_telegram_chat_id(chat_id),
-                        "document": f,
-                        "filename": display_name,
-                        "caption": caption[:1024] if caption else None,
-                        "reply_to_message_id": reply_to_id,
-                        **thread_kwargs,
-                        **self._notification_kwargs(metadata),
-                    },
+                    payload,
                     metadata,
                     reply_to_id,
                     "document",

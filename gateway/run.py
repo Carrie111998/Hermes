@@ -15168,17 +15168,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
-                    elif ext in _VIDEO_EXTS:
+                    elif ext in _VIDEO_EXTS and not force_document_attachments:
                         await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
+                        _doc_kwargs = {}
+                        if force_document_attachments:
+                            _doc_kwargs['disable_content_type_detection'] = True
                         await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
+                            **_doc_kwargs,
                         )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
@@ -15382,7 +15386,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 audio_path=media_path,
                                 metadata=_thread_metadata,
                             )
-                        elif _ext in _VIDEO_EXTS:
+                        elif _ext in _VIDEO_EXTS and not force_document_attachments:
                             await adapter.send_video(
                                 chat_id=source.chat_id,
                                 video_path=media_path,

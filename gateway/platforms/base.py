@@ -5396,17 +5396,21 @@ class BasePlatformAdapter(ABC):
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
-                        elif ext in _VIDEO_EXTS:
+                        elif ext in _VIDEO_EXTS and not force_document_attachments:
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
+                            _doc_kwargs = {}
+                            if force_document_attachments:
+                                _doc_kwargs['disable_content_type_detection'] = True
                             media_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
+                                **_doc_kwargs,
                             )
 
                         if not media_result.success:
@@ -5420,17 +5424,21 @@ class BasePlatformAdapter(ABC):
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(file_path).suffix.lower()
-                        if ext in _VIDEO_EXTS:
+                        if ext in _VIDEO_EXTS and not force_document_attachments:
                             await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
+                            _doc_kwargs = {}
+                            if force_document_attachments:
+                                _doc_kwargs['disable_content_type_detection'] = True
                             await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
+                                **_doc_kwargs,
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
