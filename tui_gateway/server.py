@@ -5333,10 +5333,21 @@ def _(rid, params: dict) -> dict:
             # should be read-only — the child runs inside the parent's turn
             # and must never accept follow-up prompts that would fork the
             # conversation away from the parent.  (#45336)
+            #
+            # Use the _delegate_from marker in model_config (set at child
+            # creation in tools/delegate_tool.py) rather than parent_session_id,
+            # because parent_session_id is also set for compression
+            # continuations and TUI branches — those ARE valid conversation
+            # targets and must not be blocked.
             session_meta = db.get_session(target)
-            is_delegate_child = bool(
-                session_meta and session_meta.get("parent_session_id")
-            )
+            is_delegate_child = False
+            if session_meta:
+                mc_raw = session_meta.get("model_config") or "{}"
+                try:
+                    mc = json.loads(mc_raw) if isinstance(mc_raw, str) else mc_raw
+                    is_delegate_child = bool(mc.get("_delegate_from"))
+                except (ValueError, TypeError):
+                    pass
         except Exception as e:
             if lease is not None:
                 lease.release()

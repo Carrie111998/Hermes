@@ -187,6 +187,49 @@ def test_prompt_submit_rejected_while_child_run_active(server, emits):
     assert server._child_run_active("child-1") is False
 
 
+def test_prompt_submit_rejected_for_delegate_child_after_completion(server):
+    """A delegate child session (marked via _delegate_from in model_config)
+    must permanently reject prompts even after the child run completes.
+    The session is a read-only historical record; follow-up prompts belong
+    in the parent session.  (#45336)"""
+    import threading
+
+    server._sessions["live-1"] = {
+        "agent": None,
+        "history_lock": threading.Lock(),
+        "lazy": True,
+        "running": False,
+        "session_key": "child-1",
+        "delegate_child": True,
+    }
+    assert server._child_run_active("child-1") is False
+
+    result = server._methods["prompt.submit"]("rid-1", {"session_id": "live-1", "text": "follow up"})
+    assert result["error"]["code"] == 4009
+    assert "read-only" in result["error"]["message"]
+
+
+def test_prompt_submit_allowed_for_non_delegate_with_parent_session_id(server):
+    """Sessions with parent_session_id but NO _delegate_from marker (e.g.
+    compression continuations, TUI branches) must NOT be blocked; they
+    are valid conversation targets.  Regression guard for #45547."""
+    import threading
+
+    server._sessions["live-1"] = {
+        "agent": None,
+        "history_lock": threading.Lock(),
+        "lazy": True,
+        "running": False,
+        "session_key": "branch-1",
+        "delegate_child": False,
+    }
+    assert server._child_run_active("branch-1") is False
+
+    result = server._methods["prompt.submit"]("rid-1", {"session_id": "live-1", "text": "continue"})
+    if "error" in result:
+        assert result["error"]["code"] != 4009 or "read-only" not in result["error"].get("message", "")
+
+
 def test_active_child_runs_registry_tracks_liveness(server, emits):
     """Every relayed event marks the child as in flight (even with no window
     open), and completion clears it — lazy watch resumes read this registry to
