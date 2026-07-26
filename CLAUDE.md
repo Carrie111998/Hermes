@@ -92,6 +92,9 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   (PNG real 645×474). Único ajuste sobre el texto pegado: `src` de imagen `.jpg`→`.png` y
   Quickstart envuelto en ```bash (aprobado por el usuario). Mensaje de commit:
   "G5 sub-lote B: README raíz IYARI + logo marca".
+- Micro-lote READMEs idiomas (este commit): `git rm README.zh-CN.md README.ur-pk.md`
+  (huérfanos con marca vieja); `README.es.md` reemplazado por versión IYARI (verbatim del
+  usuario + "Inicio rápido" en ```bash). `README.md` y `README.es.md` únicos READMEs vivos.
 - Sub-lotes user-guide/ restantes: 8=`skills/bundled/`+google-workspace (74, dividir en 2),
   9-10=`skills/optional/` (101, dividir).
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
