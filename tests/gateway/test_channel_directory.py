@@ -269,6 +269,14 @@ class TestResolveChannelName:
 
 
 class TestBuildFromSessions:
+    @pytest.fixture(autouse=True)
+    def _force_legacy_json_fallback(self, monkeypatch):
+        """Keep these tests focused on the legacy sessions.json source."""
+        monkeypatch.setattr(
+            "gateway.channel_directory._build_from_sessions_db",
+            lambda _platform_name: [],
+        )
+
     def _write_sessions(self, tmp_path, sessions_data):
         """Write sessions.json at the path _build_from_sessions expects."""
         sessions_path = tmp_path / "sessions" / "sessions.json"
@@ -301,6 +309,8 @@ class TestBuildFromSessions:
             },
         })
 
+        # This test targets the legacy JSON fallback explicitly. The normal
+        # production path prefers state.db when it has session rows.
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             entries = _build_from_sessions("telegram")
 
