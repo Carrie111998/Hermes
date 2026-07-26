@@ -3331,6 +3331,12 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
         config["model_context_length"] = ctx_len if isinstance(ctx_len, int) else 0
         config["model_provider"] = model_val.get("provider", "")
         config["model_base_url"] = model_val.get("base_url", "")
+        # Surface whether an api_key is configured (boolean only — never the
+        # actual key value) so the frontend can distinguish "configured with a
+        # key" from "has base_url but no key" for the custom-endpoint card.
+        config["model_has_api_key"] = bool(
+            str(model_val.get("api_key") or "").strip()
+        )
     else:
         config["model_context_length"] = 0
     return config

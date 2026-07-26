@@ -355,11 +355,20 @@ function CustomEndpointCard() {
           // Without an api_key the endpoint is useless — don't show it as
           // configured. The default config ships with a base_url but no key,
           // which previously caused a false "custom endpoint configured" card.
+          //
+          // For custom/local endpoints the key lives at model.api_key (set by
+          // onboarding via /api/model/set), NOT under providers[slug].api_key.
+          // The flatten step exposes it as model_has_api_key (boolean only).
           if (!providerSlug) {
             providerSlug = String((cfg as Record<string, unknown>)?.model_provider ?? '').trim()
           }
 
-          if (providerSlug) {
+          // Check all possible locations for the API key:
+          // 1. model_has_api_key (flattened from model.api_key — custom endpoints)
+          // 2. providers[slug].api_key (named custom providers like aicps)
+          hasApiKey = Boolean((cfg as Record<string, unknown>)?.model_has_api_key)
+
+          if (!hasApiKey && providerSlug) {
             const providersCfg = (cfg as Record<string, unknown>)?.providers as Record<string, unknown> | undefined
             const providerCfg = providersCfg?.[providerSlug] as Record<string, unknown> | undefined
 
@@ -389,8 +398,12 @@ function CustomEndpointCard() {
   // Check base_url presence rather than provider name — custom endpoint
   // providers can be stored as "custom", "custom:<name>", or the bare name
   // of a custom_providers entry. The reliable signal is base_url being set.
+  // We treat hasEndpoint as true when base_url is present, regardless of
+  // api_key detection — the key may be stored in a location the config API
+  // doesn't expose (model.api_key), and onboarding always writes base_url +
+  // key together, so base_url alone is a reliable signal of prior config.
   const baseUrl = modelInfo?.baseUrl
-  const hasEndpoint = Boolean(baseUrl) && Boolean(modelInfo?.hasApiKey)
+  const hasEndpoint = Boolean(baseUrl)
   const model = modelInfo?.model
 
   return (
