@@ -260,6 +260,89 @@ def test_items_sanitized_in_array_schema():
     assert items == {"type": "object", "properties": {}}
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Array ``items`` backfill — Gemini's function-declaration validator
+# rejects array parameters that lack an item schema with HTTP 400
+# ``properties[...].items: missing field`` (#71804).
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_array_without_items_gets_empty_items():
+    """Flat repro from #71804: array param with no ``items``."""
+    tools = [_tool("run", {
+        "type": "object",
+        "properties": {
+            "command": {"type": "array", "description": "argv list"},
+        },
+        "required": ["command"],
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["command"]
+    assert prop["type"] == "array"
+    assert prop["items"] == {}
+    # Sibling keywords survive the backfill.
+    assert prop["description"] == "argv list"
+
+
+def test_nested_array_without_items_gets_empty_items():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "matrix": {
+                "type": "array",
+                "items": {"type": "array"},  # inner array lacks items
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    inner = out[0]["function"]["parameters"]["properties"]["matrix"]["items"]
+    assert inner == {"type": "array", "items": {}}
+
+
+def test_bare_string_array_value_gets_items():
+    # The bare-string normalization itself must not produce an items-less
+    # array schema.
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"tags": "array"},
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["tags"]
+    assert prop == {"type": "array", "items": {}}
+
+
+def test_array_with_prefix_items_not_backfilled():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "pair": {
+                "type": "array",
+                "prefixItems": [{"type": "string"}, {"type": "integer"}],
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["pair"]
+    assert "items" not in prop
+    assert prop["prefixItems"] == [{"type": "string"}, {"type": "integer"}]
+
+
+def test_nullable_array_type_gets_items():
+    # ["array", "null"] collapses to type: "array" + nullable — the result
+    # must still get the items backfill.
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "maybe_list": {"type": ["array", "null"]},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["maybe_list"]
+    assert prop["type"] == "array"
+    assert prop.get("nullable") is True
+    assert prop["items"] == {}
+
+
 def test_ref_with_default_sibling_stripped():
     """Strict backends reject ``default`` alongside ``$ref``."""
     tools = [_tool("t", {
@@ -334,11 +417,11 @@ def test_none_tools_returns_none():
     assert sanitize_tool_schemas(None) is None
 
 
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 # strip_pattern_and_format — reactive recovery when llama.cpp rejects a
 # schema with an HTTP 400 grammar-parse error. Must be opt-in (only
 # invoked on recovery) and must not damage property names.
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 
 
 def test_strip_pattern_removes_schema_pattern_keyword():
@@ -622,13 +705,13 @@ def test_strip_responses_mixed_formats():
     assert result[1]["parameters"]["type"] == "object"
 
 
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 # strip_slash_enum — reactive recovery when xAI's /v1/responses (and
 # /v1/chat/completions) grammar-compiler rejects enum values containing
 # a forward slash. Symptom: HTTP 400 "Invalid arguments passed to the
 # model" before any token is emitted. Most commonly hit by MCP-derived
 # tools whose enum lists HuggingFace IDs like "Qwen/Qwen3.5-0.8B".
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 
 
 def test_strip_slash_enum_removes_huggingface_id_enum():

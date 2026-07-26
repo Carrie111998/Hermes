@@ -13,6 +13,9 @@ The failure modes we've seen in the wild:
 
 * ``{"type": "object"}`` with no ``properties`` — rejected as a node the
   grammar generator can't constrain.
+* ``{"type": "array"}`` with no ``items`` — Gemini's function-declaration
+  validator rejects array parameters that lack an item schema (HTTP 400
+  ``properties[...].items: missing field``).
 * A schema value that is the bare string ``"object"`` instead of a dict
   (malformed MCP server output, e.g. ``additionalProperties: "object"``).
 * ``"type": ["string", "null"]`` array types — many converters only accept
@@ -234,6 +237,8 @@ def _sanitize_node(node: Any, path: str) -> Any:
     - Replaces bare-string schema values ("object", "string", ...) with
       ``{"type": <value>}`` so downstream consumers see a dict.
     - Injects ``properties: {}`` into object-typed nodes missing it.
+    - Injects ``items: {}`` into array-typed nodes missing it — Gemini's
+      function-declaration validator rejects array schemas without ``items``.
     - Normalizes ``type: [X, "null"]`` arrays to single ``type: X`` (keeping
       ``nullable: true`` as a hint), and multi-type arrays like
       ``["number", "string"]`` to an ``anyOf`` of single-type schemas so no
@@ -249,10 +254,11 @@ def _sanitize_node(node: Any, path: str) -> Any:
                 "with {'type': %r}",
                 path, node, node,
             )
-            return {"type": node} if node != "object" else {
-                "type": "object",
-                "properties": {},
-            }
+            if node == "object":
+                return {"type": "object", "properties": {}}
+            if node == "array":
+                return {"type": "array", "items": {}}
+            return {"type": node}
         # Any other stray string is not a schema — drop it by replacing with
         # a permissive object schema rather than propagate something the
         # backend will reject.
@@ -339,6 +345,18 @@ def _sanitize_node(node: Any, path: str) -> Any:
     # llama.cpp's grammar generator can't constrain a free-form object.
     if out.get("type") == "object" and not isinstance(out.get("properties"), dict):
         out["properties"] = {}
+
+    # Array nodes without items: inject a permissive empty items schema.
+    # Gemini's function-declaration validator rejects array parameters that
+    # lack ``items`` (HTTP 400 ``properties[...].items: missing field``);
+    # other backends accept ``items: {}`` fine. ``prefixItems`` (tuple form)
+    # already constrains the array, so leave those nodes alone.
+    if (
+        out.get("type") == "array"
+        and "items" not in out
+        and "prefixItems" not in out
+    ):
+        out["items"] = {}
 
     # Prune ``required`` entries that don't exist in properties (defense
     # against malformed MCP schemas; also caught upstream for MCP tools, but
