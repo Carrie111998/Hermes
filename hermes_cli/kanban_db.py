@@ -133,6 +133,11 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+LIFETIME_IDEMPOTENCY_PREFIX = "lifetime-v1:"
+LIFETIME_IDEMPOTENCY_KEY_RE = re.compile(
+    r"^lifetime-v1:[a-z0-9][a-z0-9._-]{0,63}:[A-Za-z0-9._~-]{1,256}$"
+)
+LIFETIME_IDEMPOTENCY_INDEX = "idx_tasks_idempotency_lifetime"
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -2383,6 +2388,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
     )
+    duplicate_lifetime_keys = conn.execute(
+        "SELECT idempotency_key, COUNT(*) AS duplicate_count FROM tasks "
+        "WHERE idempotency_key >= ? AND idempotency_key < ? "
+        "GROUP BY idempotency_key HAVING COUNT(*) > 1 "
+        "ORDER BY idempotency_key LIMIT 10",
+        (LIFETIME_IDEMPOTENCY_PREFIX, "lifetime-v1;"),
+    ).fetchall()
+    if duplicate_lifetime_keys:
+        keys = ", ".join(
+            f"{row['idempotency_key']!r} ({row['duplicate_count']} rows)"
+            for row in duplicate_lifetime_keys
+        )
+        raise RuntimeError(
+            "cannot enable lifetime idempotency: duplicate lifetime idempotency "
+            f"key(s) already exist: {keys}. Resolve the duplicate rows before retrying."
+        )
+    # Prefix-range predicate keeps legacy keys unchanged while making every
+    # lifetime-v1 key unique across all statuses, including archived rows.
+    conn.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {LIFETIME_IDEMPOTENCY_INDEX} "
+        "ON tasks(idempotency_key) "
+        "WHERE idempotency_key >= 'lifetime-v1:' "
+        "AND idempotency_key < 'lifetime-v1;'"
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
@@ -2770,6 +2799,54 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _is_lifetime_idempotency_key(key: Optional[str]) -> bool:
+    return isinstance(key, str) and key.startswith(LIFETIME_IDEMPOTENCY_PREFIX)
+
+
+def _validate_idempotency_key(key: Optional[str]) -> None:
+    if _is_lifetime_idempotency_key(key) and not LIFETIME_IDEMPOTENCY_KEY_RE.fullmatch(key):
+        raise ValueError(
+            "lifetime-v1 idempotency keys must use "
+            "lifetime-v1:<namespace>:<token> with a lowercase namespace and "
+            "a URL-safe token"
+        )
+
+
+def _find_idempotent_task_id(
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    lifetime: bool,
+) -> Optional[str]:
+    status_clause = "" if lifetime else "AND status != 'archived' "
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        f"{status_clause}ORDER BY created_at DESC LIMIT 1",
+        (key,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _record_duplicate_suppression(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    idempotency_key: str,
+    requested_title: str,
+    requested_by: Optional[str],
+) -> None:
+    _append_event(
+        conn,
+        task_id,
+        "duplicate_suppressed",
+        {
+            "idempotency_key": idempotency_key,
+            "requested_title": requested_title,
+            "requested_by": requested_by,
+        },
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2808,8 +2885,9 @@ def create_task(
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    creating a duplicate. Keys using ``lifetime-v1:<namespace>:<token>``
+    remain unique across every status, including archived, and record a
+    ``duplicate_suppressed`` event on the canonical task.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -2832,13 +2910,39 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    if not title or not title.strip():
+        raise ValueError("title is required")
+    _validate_idempotency_key(idempotency_key)
+    lifetime_idempotency = _is_lifetime_idempotency_key(idempotency_key)
+
+    # Lifetime identity wins over every optional route-shape field. A renamed or
+    # malformed replacement for an existing packet must converge on the
+    # canonical task before provider/assignee/status/worktree/project/skill
+    # validation can turn it into a fresh failure path. The insertion
+    # transaction below rechecks after this early miss, preserving race safety
+    # for first creation.
+    if lifetime_idempotency and idempotency_key:
+        with write_txn(conn):
+            existing_task_id = _find_idempotent_task_id(
+                conn,
+                idempotency_key,
+                lifetime=True,
+            )
+            if existing_task_id:
+                _record_duplicate_suppression(
+                    conn,
+                    existing_task_id,
+                    idempotency_key=idempotency_key,
+                    requested_title=title.strip(),
+                    requested_by=created_by,
+                )
+                return existing_task_id
+
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
-    if not title or not title.strip():
-        raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -2990,16 +3094,16 @@ def create_task(
         skills_list = cleaned
 
     # Idempotency fast path — avoid taking a write lock for ordinary retries.
-    # Concurrent creators must recheck after entering write_txn below.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+    # Lifetime keys always enter write_txn so duplicate_suppressed is durable.
+    # Concurrent creators recheck after entering write_txn below.
+    if idempotency_key and not lifetime_idempotency:
+        existing_task_id = _find_idempotent_task_id(
+            conn,
+            idempotency_key,
+            lifetime=False,
+        )
+        if existing_task_id:
+            return existing_task_id
 
     now = int(time.time())
 
@@ -3029,14 +3133,21 @@ def create_task(
         try:
             with write_txn(conn):
                 if idempotency_key:
-                    row = conn.execute(
-                        "SELECT id FROM tasks WHERE idempotency_key = ? "
-                        "AND status != 'archived' "
-                        "ORDER BY created_at DESC LIMIT 1",
-                        (idempotency_key,),
-                    ).fetchone()
-                    if row:
-                        return row["id"]
+                    existing_task_id = _find_idempotent_task_id(
+                        conn,
+                        idempotency_key,
+                        lifetime=lifetime_idempotency,
+                    )
+                    if existing_task_id:
+                        if lifetime_idempotency:
+                            _record_duplicate_suppression(
+                                conn,
+                                existing_task_id,
+                                idempotency_key=idempotency_key,
+                                requested_title=title.strip(),
+                                requested_by=created_by,
+                            )
+                        return existing_task_id
 
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
@@ -3149,10 +3260,34 @@ def create_task(
                     },
                 )
             return task_id
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            if lifetime_idempotency and idempotency_key:
+                existing_task_id = _find_idempotent_task_id(
+                    conn,
+                    idempotency_key,
+                    lifetime=True,
+                )
+                if existing_task_id:
+                    with write_txn(conn):
+                        canonical_task_id = _find_idempotent_task_id(
+                            conn,
+                            idempotency_key,
+                            lifetime=True,
+                        )
+                        if canonical_task_id:
+                            _record_duplicate_suppression(
+                                conn,
+                                canonical_task_id,
+                                idempotency_key=idempotency_key,
+                                requested_title=title.strip(),
+                                requested_by=created_by,
+                            )
+                            return canonical_task_id
+            if str(exc) != "UNIQUE constraint failed: tasks.id":
+                raise
             if attempt == 1:
                 raise
-            # Retry with a fresh id.
+            # Retry only a genuine task-id collision with a fresh id.
             continue
     raise RuntimeError("unreachable")
 

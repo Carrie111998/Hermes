@@ -327,7 +327,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
-                               "its id is returned instead of creating a duplicate.")
+                               "its id is returned instead of creating a duplicate. "
+                               "Use lifetime-v1:<namespace>:<token> to retain uniqueness "
+                               "after terminal/archive states.")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -398,7 +400,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--tenant", default=None, help="Tenant namespace")
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
-    p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
+    p_swarm.add_argument(
+        "--idempotency-key",
+        default=None,
+        help="Dedup key for the root card; lifetime-v1:<namespace>:<token> "
+        "retains uniqueness after terminal/archive states",
+    )
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
