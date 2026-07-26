@@ -357,7 +357,11 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
         normalized["reason"] = reason.strip()
     message = error_context.get("message")
     if isinstance(message, str) and message.strip():
-        normalized["message"] = message.strip()
+        try:
+            from agent.redact import redact_sensitive_text
+            normalized["message"] = redact_sensitive_text(message.strip())
+        except Exception:
+            normalized["message"] = message.strip()
     reset_at = (
         error_context.get("reset_at")
         or error_context.get("resets_at")
