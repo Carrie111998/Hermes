@@ -2,6 +2,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,7 +32,10 @@ def _make_agent(monkeypatch):
         verbose_logging = False
         log_prefix_chars = 200
         _checkpoint_mgr = MagicMock(enabled=False)
-        _subdirectory_hints = MagicMock()
+        # A bare MagicMock returns a mock from check_tool_call, which then gets
+        # concatenated onto the tool result and destroys the text a test wants
+        # to assert on. No hints is the honest default here.
+        _subdirectory_hints = MagicMock(**{"check_tool_call.return_value": ""})
         tool_progress_callback = None
         tool_start_callback = None
         tool_complete_callback = None
@@ -43,6 +47,16 @@ def _make_agent(monkeypatch):
         _current_tool = None
         _last_activity = 0
         _print_fn = print
+        # Every tool goes through the guardrail gate before dispatch. The
+        # pre-existing tests never reach it (they interrupt before any tool
+        # runs); a test that actually dispatches does, so allow everything —
+        # these tests exercise the batch's result loop, not guardrail policy.
+        _tool_guardrails = SimpleNamespace(
+            before_call=lambda name, args: SimpleNamespace(allows_execution=True),
+            after_call=lambda name, args, result, failed=False: SimpleNamespace(
+                action="allow", should_halt=False
+            ),
+        )
         # Worker-thread tracking state mirrored from AIAgent.__init__ so the
         # real interrupt() method can fan out to concurrent-tool workers.
         _active_children: list = []
@@ -76,6 +90,15 @@ def _make_agent(monkeypatch):
     stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
     stub.interrupt = _ra.AIAgent.interrupt.__get__(stub)
     stub.clear_interrupt = _ra.AIAgent.clear_interrupt.__get__(stub)
+    # Real method rather than a stub: it short-circuits to the result unchanged
+    # for the plain string results these tests produce, and only multimodal
+    # results would need agent state we don't have.
+    stub._tool_result_content_for_active_model = (
+        _ra.AIAgent._tool_result_content_for_active_model.__get__(stub)
+    )
+    stub._append_guardrail_observation = (
+        _ra.AIAgent._append_guardrail_observation.__get__(stub)
+    )
     # /steer injection (added in PR #12116) fires after every concurrent
     # tool batch. Stub it as a no-op — this test exercises interrupt
     # fanout, not steer injection.
