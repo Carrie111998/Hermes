@@ -104,8 +104,12 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   communication,creative,devops,dogfood,email,finance,gaming,health,mcp,migration} = 41.
   Preservados `HermesTokenStorage` (clase), `NousResearch/pokemon-agent` (repo distinto),
   `Nous catalog`. Autores → Digital Services LLC (incl. "Anthropic (adapted by DS LLC)").
-- Lote 11 (este commit): `skills/optional/mlops` = 30. Residual limpio.
-- Sub-lote skills/ restante: 12=optional/ resto {payments,productivity,research,security,
-  software-development,web-development} (30) → cierra `skills/` y `user-guide/`.
+- Lote 11 `f76567d7e`: `skills/optional/mlops` = 30. Residual limpio.
+- Lote 12 (este commit): `skills/optional/` resto {payments,productivity,research,security,
+  software-development,web-development} = 30. **`skills/`, `optional/` y `user-guide/` COMPLETOS.**
+  Verificación global skills/: residual solo `Nous` (servicio), `HermesTokenStorage`/`HermesCLI`
+  (clases), `NousResearch/pokemon-agent` (repo distinto) — todo preservado a propósito.
+- **`features/`, `getting-started/`, `guides/`, `reference/`, `user-guide/` (todo) COMPLETOS.**
+- Pendiente GRUPO 5: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
