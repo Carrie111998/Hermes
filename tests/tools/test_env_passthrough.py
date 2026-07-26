@@ -267,3 +267,41 @@ class TestTerminalIntegration:
         assert "OPENAI_API_KEY" not in child_env
         assert "ANTHROPIC_API_KEY" not in child_env
         assert child_env["PATH"] == "/usr/bin"
+
+
+class TestScrubbedProviderCredentialNotes:
+    """#71788: surface when provider credentials are scrubbed (DX only)."""
+
+    def test_list_and_format_single(self):
+        from tools.env_passthrough import (
+            format_scrubbed_provider_env_note,
+            list_scrubbed_provider_credentials,
+        )
+
+        names = list_scrubbed_provider_credentials(
+            {"DASHSCOPE_API_KEY": "secret", "PATH": "/usr/bin"},
+            {"PATH": "/usr/bin"},
+        )
+        assert "DASHSCOPE_API_KEY" in names
+        note = format_scrubbed_provider_env_note(names)
+        assert "DASHSCOPE_API_KEY" in note
+        assert "credential scrub" in note
+        assert "not missing from the gateway" in note
+
+    def test_empty_parent_value_not_reported(self):
+        from tools.env_passthrough import list_scrubbed_provider_credentials
+
+        names = list_scrubbed_provider_credentials(
+            {"DASHSCOPE_API_KEY": "", "PATH": "/usr/bin"},
+            {"PATH": "/usr/bin"},
+        )
+        assert "DASHSCOPE_API_KEY" not in names
+
+    def test_present_in_child_not_reported(self):
+        from tools.env_passthrough import list_scrubbed_provider_credentials
+
+        names = list_scrubbed_provider_credentials(
+            {"OPENAI_API_KEY": "sk-x", "PATH": "/usr/bin"},
+            {"OPENAI_API_KEY": "sk-x", "PATH": "/usr/bin"},
+        )
+        assert "OPENAI_API_KEY" not in names

@@ -161,6 +161,62 @@ def _load_config_passthrough() -> frozenset[str]:
     return _config_passthrough
 
 
+
+def list_scrubbed_provider_credentials(
+    parent_env: dict | None,
+    child_env: dict | None = None,
+) -> list[str]:
+    """Return Hermes-managed provider credential names present in *parent*
+    but absent from *child* (or would be blocked, if *child* is None).
+
+    Used for operator/agent DX only (#71788): the scrub policy itself is
+    unchanged. Empty-string parent values are ignored so a genuinely unset
+    gateway env is not reported as "scrubbed".
+    """
+    parent = parent_env or {}
+    child = child_env if child_env is not None else {}
+    try:
+        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
+    except Exception:
+        return []
+
+    scrubbed: list[str] = []
+    for name in sorted(_HERMES_PROVIDER_ENV_BLOCKLIST):
+        parent_val = parent.get(name)
+        if parent_val is None or parent_val == "":
+            continue
+        if name in child:
+            continue
+        # Honor explicit passthrough — those are preserved in child env.
+        if is_env_passthrough(name):
+            continue
+        scrubbed.append(name)
+    return scrubbed
+
+
+def format_scrubbed_provider_env_note(names: Iterable[str] | None) -> str:
+    """Human-readable one-line note for tool results when credentials were scrubbed."""
+    names = [n for n in (names or []) if n]
+    if not names:
+        return ""
+    shown = names[:8]
+    extra = len(names) - len(shown)
+    joined = ", ".join(shown)
+    if extra > 0:
+        joined = f"{joined} (+{extra} more)"
+    return (
+        f"note: {joined} was removed from this sandbox by Hermes credential "
+        f"scrub (provider blocklist). It is not missing from the gateway "
+        f"process. See GHSA-rhgp-j443-p4rf / env_passthrough."
+        if len(names) == 1
+        else (
+            f"note: {joined} were removed from this sandbox by Hermes "
+            f"credential scrub (provider blocklist). They are not missing "
+            f"from the gateway process. See GHSA-rhgp-j443-p4rf / env_passthrough."
+        )
+    )
+
+
 def is_env_passthrough(var_name: str) -> bool:
     """Check whether *var_name* is allowed to pass through to sandboxes.
 

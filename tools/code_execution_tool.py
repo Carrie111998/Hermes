@@ -1164,6 +1164,15 @@ def _execute_remote(
         "duration_seconds": duration,
     }
     result.update(stdout_metadata)
+    try:
+        _note = locals().get("_scrub_note") or ""
+        if _note:
+            result["credential_scrub_note"] = _note
+            out = result.get("output") or ""
+            if _note not in out:
+                result["output"] = (out + ("\n\n" if out else "") + _note)
+    except Exception:
+        pass
 
     if status == "timeout":
         timeout_msg = f"Script timed out after {timeout}s and was killed."
@@ -1369,6 +1378,16 @@ def execute_code(
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
+        try:
+            from tools.env_passthrough import (
+                format_scrubbed_provider_env_note,
+                list_scrubbed_provider_credentials,
+            )
+            _scrub_note = format_scrubbed_provider_env_note(
+                list_scrubbed_provider_credentials(os.environ, child_env)
+            )
+        except Exception:
+            _scrub_note = ""
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
