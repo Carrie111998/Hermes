@@ -725,7 +725,12 @@ def _start_completion_watcher():
                             continue
 
                         # Only process markers for this gateway's profile
-                        _my_profile = os.environ.get("HERMES_PROFILE") or "default"
+                        _my_profile = (
+                            os.environ.get("HERMES_PROFILE")
+                            or (Path(os.environ.get("HERMES_HOME", "")).name
+                                if "profiles/" in os.environ.get("HERMES_HOME", "")
+                                else "default")
+                        )
                         _marker_profile = data.get("profile") or "default"
                         if _marker_profile != _my_profile:
                             continue
