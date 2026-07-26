@@ -625,6 +625,38 @@ class TestSendUpdateNotification:
         assert not claimed_path.exists()
 
     @pytest.mark.asyncio
+    async def test_utf8_output_reaches_the_user_unmangled(self, tmp_path):
+        """`hermes update` emits UTF-8; the notifier must not decode it as ANSI.
+
+        Reading the output file without an explicit codec picks up the Windows
+        ANSI codepage, so the progress markers arrive as mojibake (or raise on
+        a byte that codepage leaves undefined).
+        """
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        (hermes_home / ".update_pending.json").write_text(
+            json.dumps({
+                "platform": "telegram", "chat_id": "67890", "user_id": "12345",
+            })
+        )
+        (hermes_home / ".update_output.txt").write_text(
+            "→ Found 3 new commit(s)\n✓ Code updated! — naïve ✓", encoding="utf-8"
+        )
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._send_update_notification()
+
+        sent = mock_adapter.send.call_args[0][1]
+        assert "→ Found 3 new commit(s)" in sent
+        assert "✓ Code updated! — naïve ✓" in sent
+
+    @pytest.mark.asyncio
     async def test_sends_notification_with_output(self, tmp_path):
         """Sends update output to the correct platform and chat."""
         runner = _make_runner()
@@ -640,7 +672,8 @@ class TestSendUpdateNotification:
         }
         (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
         (hermes_home / ".update_output.txt").write_text(
-            "→ Found 3 new commit(s)\n✓ Code updated!\n✓ Update complete!"
+            "→ Found 3 new commit(s)\n✓ Code updated!\n✓ Update complete!",
+            encoding="utf-8",
         )
         (hermes_home / ".update_exit_code").write_text("0")
 
@@ -699,7 +732,8 @@ class TestSendUpdateNotification:
         pending = {"platform": "telegram", "chat_id": "111", "user_id": "222"}
         (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
         (hermes_home / ".update_output.txt").write_text(
-            "\x1b[32m✓ Code updated!\x1b[0m\n\x1b[1mDone\x1b[0m"
+            "\x1b[32m✓ Code updated!\x1b[0m\n\x1b[1mDone\x1b[0m",
+            encoding="utf-8",
         )
         (hermes_home / ".update_exit_code").write_text("0")
 
@@ -794,7 +828,7 @@ class TestSendUpdateNotification:
         pending_path.write_text(json.dumps({
             "platform": "telegram", "chat_id": "111", "user_id": "222",
         }))
-        output_path.write_text("✓ Done")
+        output_path.write_text("✓ Done", encoding="utf-8")
         exit_code_path.write_text("0")
 
         mock_adapter = AsyncMock()
@@ -820,7 +854,7 @@ class TestSendUpdateNotification:
         pending_path.write_text(json.dumps({
             "platform": "telegram", "chat_id": "111", "user_id": "222",
         }))
-        output_path.write_text("✓ Done")
+        output_path.write_text("✓ Done", encoding="utf-8")
         exit_code_path.write_text("0")
 
         # Adapter send raises
@@ -909,7 +943,7 @@ class TestSendUpdateNotification:
         output_path = hermes_home / ".update_output.txt"
         exit_code_path = hermes_home / ".update_exit_code"
         pending_path.write_text(json.dumps(pending))
-        output_path.write_text("✓ Update complete!")
+        output_path.write_text("✓ Update complete!", encoding="utf-8")
         exit_code_path.write_text("0")
 
         # First pass: target platform (discord) is still offline → defer.

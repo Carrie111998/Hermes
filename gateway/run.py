@@ -16321,7 +16321,9 @@ class GatewayRunner(
                 # Read any remaining output
                 if output_path.exists():
                     try:
-                        content = output_path.read_text()
+                        content = output_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
                         if len(content) > bytes_sent:
                             buffer += content[bytes_sent:]
                             bytes_sent = len(content)
@@ -16360,7 +16362,9 @@ class GatewayRunner(
             # Check for new output
             if output_path.exists():
                 try:
-                    content = output_path.read_text()
+                    content = output_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
                     if len(content) > bytes_sent:
                         buffer += content[bytes_sent:]
                         bytes_sent = len(content)
@@ -16492,7 +16496,12 @@ class GatewayRunner(
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text()
+                # `hermes update` emits UTF-8 (✓/→ progress markers). Without an
+                # explicit codec this decodes as the Windows ANSI codepage and
+                # the notification arrives mojibake, or raises on an undefined
+                # byte. errors="replace" keeps arbitrary subprocess output from
+                # breaking the notifier outright.
+                output = output_path.read_text(encoding="utf-8", errors="replace")
 
             # Resolve adapter
             platform = Platform(platform_str)

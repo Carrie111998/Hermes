@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,202 @@ from tools.environments.local import hermes_subprocess_env
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+
+
+_CODEX_HELPER_NAMES = {
+    "codex-command-runner.exe",
+    "codex-computer-use.exe",
+    "conhost.exe",
+    "node_repl.exe",
+}
+
+
+def _windows_startup() -> tuple[int, Any]:
+    """Return the Codex-only Windows flags used for a hidden, owned child.
+
+    All three stdio streams are pipes.  STARTF_USESTDHANDLES makes CPython
+    populate real inheritable handles in this STARTUPINFO, so helpers spawned
+    by codex do not inherit NULL handles and lose their diagnostics.
+    """
+    if os.name != "nt":
+        return 0, None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= (
+        subprocess.STARTF_USESHOWWINDOW | subprocess.STARTF_USESTDHANDLES
+    )
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    # CREATE_SUSPENDED is a Win32 flag but is not exported by subprocess.
+    return subprocess.CREATE_NO_WINDOW | 0x00000004, startupinfo
+
+
+def _create_kill_job() -> Any:
+    """Create a per-dispatch Job Object with KILL_ON_JOB_CLOSE (Windows)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )]
+
+    class _ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimit),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    info = _ExtendedLimit()
+    info.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        raise ctypes.WinError(error)
+    return handle
+
+
+def _assign_job_and_resume(job: Any, proc: subprocess.Popen) -> None:
+    """Assign the suspended root before any Codex child can escape the job."""
+    if os.name != "nt":
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.AssignProcessToJobObject(job, proc._handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    # subprocess closes CreateProcess's primary-thread handle before Popen
+    # returns. Re-open the suspended thread by PID via the documented Toolhelp
+    # API; at this point user code has not run, so the process has one thread.
+    from ctypes import wintypes
+
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    invalid_handle = ctypes.c_void_p(-1).value
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)  # SNAPTHREAD
+    if snapshot == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    resumed = False
+    try:
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == proc.pid:
+                thread = kernel32.OpenThread(0x0002, False, entry.th32ThreadID)
+                if thread:
+                    try:
+                        if kernel32.ResumeThread(thread) != 0xFFFFFFFF:
+                            resumed = True
+                    finally:
+                        kernel32.CloseHandle(thread)
+            ok = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if not resumed:
+        raise RuntimeError(f"could not resume suspended Codex process {proc.pid}")
+
+
+def _close_windows_handle(handle: Any) -> None:
+    if os.name == "nt" and handle:
+        import ctypes
+
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+
+
+def _snapshot_codex_tree(root_pid: int) -> list[dict[str, Any]]:
+    """Record identities from this one Codex root; never match by name alone."""
+    try:
+        import psutil
+
+        root = psutil.Process(root_pid)
+        processes = [root, *root.children(recursive=True)]
+    except Exception:
+        return []
+    snapshot = []
+    for proc in processes:
+        try:
+            snapshot.append({
+                "pid": proc.pid,
+                "ppid": proc.ppid(),
+                "name": proc.name(),
+                "exe": proc.exe(),
+                "create_time": proc.create_time(),
+            })
+        except Exception:
+            continue
+    return snapshot
+
+
+def _audit_snapshot(snapshot: list[dict[str, Any]]) -> dict[str, Any]:
+    """Read-only post-cleanup audit of identities attributed to this dispatch."""
+    try:
+        import psutil
+    except ImportError:
+        return {"orphan_count": 0, "conhost_orphan_count": 0, "orphans": []}
+    orphans = []
+    # Job termination is asynchronous. Give the kernel a short grace period
+    # before calling a still-exiting helper an orphan.
+    deadline = time.monotonic() + 1.0
+    while True:
+        orphans = []
+        for recorded in snapshot:
+            if recorded["name"].lower() not in _CODEX_HELPER_NAMES:
+                continue
+            try:
+                live = psutil.Process(recorded["pid"])
+                if abs(live.create_time() - recorded["create_time"]) < 0.01:
+                    orphans.append(recorded)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        if not orphans or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    return {
+        "orphan_count": len(orphans),
+        "conhost_orphan_count": sum(
+            item["name"].lower() == "conhost.exe" for item in orphans
+        ),
+        "orphans": orphans,
+    }
 
 
 @dataclass
@@ -54,12 +251,13 @@ class _Pending:
 class CodexAppServerClient:
     """Minimal JSON-RPC 2.0 client for `codex app-server` over stdio.
 
-    Threading model:
+    Threading model (pipe-drain invariant):
       - Spawning thread (caller) drives request/response pairs synchronously.
       - One reader thread parses stdout, dispatches replies to the right
         pending future, and routes notifications + server-initiated requests
         to bounded queues that the caller drains on their own cadence.
-      - One reader thread captures stderr for diagnostics; codex emits
+      - One independent daemon reader thread captures stderr for diagnostics;
+        every PIPE is drained from spawn until exit, never sequentially. Codex emits
         tracing logs there at RUST_LOG-controlled levels.
 
     Intentionally NOT async. AIAgent.run_conversation() is synchronous and
@@ -127,14 +325,35 @@ class CodexAppServerClient:
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env=spawn_env,
-        )
+        creationflags, startupinfo = _windows_startup()
+        self._job = _create_kill_job()
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+            "env": spawn_env,
+        }
+        if creationflags:
+            popen_kwargs["creationflags"] = creationflags
+        if startupinfo is not None:
+            popen_kwargs["startupinfo"] = startupinfo
+        try:
+            self._proc = subprocess.Popen(cmd, **popen_kwargs)
+            if self._job and hasattr(self._proc, "_handle"):
+                _assign_job_and_resume(self._job, self._proc)
+            elif self._job:
+                # Test doubles and alternate Popen implementations may not
+                # expose CPython's Windows handles. Never retain a job that
+                # could not own the child.
+                _close_windows_handle(self._job)
+                self._job = None
+        except Exception:
+            if getattr(self, "_proc", None) is not None:
+                self._proc.kill()
+            _close_windows_handle(self._job)
+            self._job = None
+            raise
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
@@ -144,6 +363,11 @@ class CodexAppServerClient:
         self._stderr_lock = threading.Lock()
         self._closed = False
         self._initialized = False
+        self._leak_audit = {
+            "orphan_count": 0,
+            "conhost_orphan_count": 0,
+            "orphans": [],
+        }
 
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
@@ -187,8 +411,14 @@ class CodexAppServerClient:
                 self._proc.stdin.close()
         except Exception:
             pass
+        snapshot = _snapshot_codex_tree(self._proc.pid) if os.name == "nt" else []
         try:
-            self._proc.terminate()
+            # Closing the per-worker job is kernel-scoped tree cleanup. It is
+            # also automatic if this Python process is hard-killed.
+            _close_windows_handle(self._job)
+            self._job = None
+            if self._proc.poll() is None:
+                self._proc.terminate()
             self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
@@ -196,6 +426,14 @@ class CodexAppServerClient:
                 self._proc.wait(timeout=1.0)
             except Exception:
                 pass
+        finally:
+            self._leak_audit = _audit_snapshot(snapshot)
+            print(
+                "[codex console leak audit] "
+                + json.dumps(self._leak_audit, sort_keys=True),
+                file=sys.stderr,
+                flush=True,
+            )
 
     def __enter__(self) -> "CodexAppServerClient":
         return self
@@ -279,6 +517,10 @@ class CodexAppServerClient:
         """Return last n lines of codex's stderr (for error reports)."""
         with self._stderr_lock:
             return list(self._stderr_lines[-n:])
+
+    def leak_audit(self) -> dict[str, Any]:
+        """Return the most recent read-only, task-scoped cleanup audit."""
+        return dict(self._leak_audit)
 
     def is_alive(self) -> bool:
         return self._proc.poll() is None

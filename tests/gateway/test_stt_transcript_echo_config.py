@@ -56,7 +56,9 @@ def test_gateway_runner_uses_stt_echo_transcripts_flag():
 
 def test_all_gateway_transcript_echo_sends_are_gated():
     source = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
-    lines = source.read_text().splitlines()
+    # Python source is UTF-8; without the explicit codec this reads as the
+    # platform's locale encoding and dies on the emoji it is scanning for.
+    lines = source.read_text(encoding="utf-8").splitlines()
 
     echo_send_lines = [
         index
