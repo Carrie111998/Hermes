@@ -1308,6 +1308,8 @@ def create_job(
                 watchdogs and periodic alerts that don't need LLM reasoning.
         feedback: Optional interactive response prompt and choices. Platforms that
                   support interactive controls can render these with the delivery.
+                  Clearly reminder-style jobs receive conservative defaults when
+                  this is omitted; pass ``{}`` to suppress automatic feedback.
 
     Returns:
         The created job dict
@@ -1340,7 +1342,10 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
-    from cron.feedback import normalize_feedback_config
+    prompt_text = _coerce_job_text(prompt)
+    from cron.feedback import default_feedback_for_reminder, normalize_feedback_config
+    if feedback is None:
+        feedback = default_feedback_for_reminder(prompt_text, name)
     normalized_feedback = normalize_feedback_config(feedback)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -1359,8 +1364,6 @@ def create_job(
         context_from = [str(j).strip() for j in context_from if str(j).strip()] or None
     else:
         context_from = None
-
-    prompt_text = _coerce_job_text(prompt)
 
     # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
     # agent-driven SIGTERM-respawn loops under launchd/systemd KeepAlive

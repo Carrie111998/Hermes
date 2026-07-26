@@ -11,6 +11,42 @@ MAX_FEEDBACK_CHOICES = 8
 MAX_FEEDBACK_LABEL_LENGTH = 64
 MAX_FEEDBACK_PROMPT_LENGTH = 200
 
+DEFAULT_REMINDER_FEEDBACK = {
+    "prompt": "What happened?",
+    "choices": [
+        {"code": "done", "label": "✅ Done"},
+        {"code": "not_yet", "label": "⏳ Not yet"},
+        {"code": "skip", "label": "❌ Didn't do it"},
+    ],
+}
+
+
+def default_feedback_for_reminder(
+    prompt: Optional[str], name: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Return conservative defaults for clearly reminder-style jobs.
+
+    Detection is deliberately limited to the job name and the opening of the
+    prompt. This avoids attaching buttons merely because a longer task says
+    something like "do not create reminders" in its instructions.
+    """
+    job_name = str(name or "").strip()
+    prompt_lead = str(prompt or "").strip()[:240]
+    name_is_reminder = bool(re.search(r"\bremind(?:er)?\b", job_name, re.IGNORECASE))
+    prompt_is_reminder = bool(
+        re.match(
+            r"^(?:remind(?:er)?\b|send this exact reminder\b|one-time\b.{0,80}\breminder\b)",
+            prompt_lead,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+    if not (name_is_reminder or prompt_is_reminder):
+        return None
+    return {
+        "prompt": DEFAULT_REMINDER_FEEDBACK["prompt"],
+        "choices": [dict(choice) for choice in DEFAULT_REMINDER_FEEDBACK["choices"]],
+    }
+
 
 def normalize_feedback_config(value: Any) -> Optional[Dict[str, Any]]:
     """Validate and normalize a feedback config, returning ``None`` when cleared."""

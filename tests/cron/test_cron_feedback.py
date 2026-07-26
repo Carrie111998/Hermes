@@ -74,3 +74,35 @@ def test_legacy_telegram_feedback_is_read_but_new_jobs_use_generic_key():
     assert feedback_for_job(legacy) == _feedback()
     job = create_job("Do the thing", "every 1h", feedback=_feedback())
     assert "telegram_feedback" not in job
+
+
+def test_reminder_jobs_get_default_feedback_when_omitted():
+    job = create_job(
+        "Reminder: follow up with Wendell Butler about the sponsorship.",
+        "30m",
+        name="Follow up with Wendell Butler",
+        deliver="origin",
+    )
+    assert job["feedback"] == {
+        "prompt": "What happened?",
+        "choices": [
+            {"code": "done", "label": "✅ Done"},
+            {"code": "not_yet", "label": "⏳ Not yet"},
+            {"code": "skip", "label": "❌ Didn't do it"},
+        ],
+    }
+
+
+def test_non_reminder_jobs_do_not_get_default_feedback():
+    job = create_job("Check server status", "every 1h", deliver="origin")
+    assert job["feedback"] is None
+
+
+def test_explicit_empty_feedback_suppresses_reminder_default():
+    job = create_job(
+        "Remind me to check the build",
+        "30m",
+        deliver="origin",
+        feedback={},
+    )
+    assert job["feedback"] is None

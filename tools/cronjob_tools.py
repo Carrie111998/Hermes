@@ -1044,7 +1044,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "feedback": {
                 "type": "object",
-                "description": "Optional interactive response prompt and choices for platforms that support buttons. On update, pass an empty object to clear.",
+                "description": "Optional interactive response prompt and choices for platforms that support buttons. Clearly reminder-style jobs receive Done / Not yet / Didn't do it defaults when this field is omitted. Pass an empty object on create to suppress those defaults, or on update to clear feedback.",
                 "properties": {
                     "prompt": {"type": "string", "maxLength": 200},
                     "choices": {

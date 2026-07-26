@@ -100,6 +100,11 @@ Cron jobs can include structured feedback choices. Telegram renders them as inli
 buttons on the final message chunk; platforms without interactive controls ignore
 the optional metadata and deliver the message normally.
 
+Clearly reminder-style jobs get a conservative default set when `feedback` is
+omitted: **Done**, **Not yet**, and **Didn't do it**. Detection is limited to the
+job name and the opening of its prompt. Pass `feedback={}` at creation to suppress
+automatic buttons, or provide explicit choices to replace the defaults.
+
 ```python
 cronjob(
     action="create",
