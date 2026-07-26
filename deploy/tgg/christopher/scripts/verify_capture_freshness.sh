@@ -308,6 +308,7 @@ required_ints = (
     "receivedMessages", "completedMessages", "pendingMessages",
     "failedBatches", "failedMessages",
     "failedBatchesSinceLastCompletion", "failedMessagesSinceLastCompletion",
+    "unresolvedPersistedFailures",
 )
 telemetry_error = None
 if not isinstance(progress, dict):
@@ -408,6 +409,32 @@ else:
                             telemetry_error = (
                                 "inboundProgress.lastFailedAt is missing or invalid"
                             )
+            unresolved_at = progress.get("oldestUnresolvedFailureAt")
+            if telemetry_error is None:
+                if (
+                    progress["unresolvedPersistedFailures"] == 0
+                    and unresolved_at is not None
+                ):
+                    telemetry_error = (
+                        "inboundProgress.oldestUnresolvedFailureAt must be null "
+                        "when unresolvedPersistedFailures is zero"
+                    )
+                elif progress["unresolvedPersistedFailures"] > 0:
+                    if not isinstance(unresolved_at, str):
+                        telemetry_error = (
+                            "inboundProgress.oldestUnresolvedFailureAt "
+                            "is missing or invalid"
+                        )
+                    else:
+                        try:
+                            datetime.datetime.fromisoformat(
+                                unresolved_at.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            telemetry_error = (
+                                "inboundProgress.oldestUnresolvedFailureAt "
+                                "is missing or invalid"
+                            )
 
 queue_length = probe.get("queue_length")
 queue_cap = probe.get("queue_cap")
@@ -453,6 +480,12 @@ elif socket_status != "connected":
 elif not queue_valid:
     condition = "queue-telemetry-missing"
     reason = "queue length or queue cap is missing or invalid"
+elif progress["unresolvedPersistedFailures"] > 0:
+    condition = "inbound-arrived-not-written"
+    reason = (
+        f"{progress['unresolvedPersistedFailures']} unresolved persisted "
+        "inbound capture failure(s) remain"
+    )
 elif (
     progress["pendingBatches"] > 0
     and progress["oldestPendingAgeSeconds"] >= freshness_sla_seconds

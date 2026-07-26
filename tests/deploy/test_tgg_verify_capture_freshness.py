@@ -34,9 +34,11 @@ def _progress(*, pending_age: int | None = None) -> dict[str, object]:
         "failedMessages": 0,
         "failedBatchesSinceLastCompletion": 0,
         "failedMessagesSinceLastCompletion": 0,
+        "unresolvedPersistedFailures": 0,
         "lastReceivedAt": "2026-07-25T22:59:00.000Z",
         "lastCompletedAt": "2026-07-25T22:58:59.000Z",
         "lastFailedAt": None,
+        "oldestUnresolvedFailureAt": None,
         "oldestPendingAgeSeconds": pending_age,
     }
 
@@ -222,6 +224,26 @@ def test_failed_inbound_since_last_completion_fails_immediately(
     assert "failed since the last successful capture completion" in result.stderr
 
 
+def test_persisted_failure_survives_restart_and_fails_immediately(
+    tmp_path: Path,
+) -> None:
+    progress = _progress()
+    progress.update(
+        {
+            "unresolvedPersistedFailures": 1,
+            "oldestUnresolvedFailureAt": "2026-07-25T21:00:00.000Z",
+        }
+    )
+    result, report = _run(tmp_path, _probe(inboundProgress=progress))
+
+    assert result.returncode == 1
+    assert report["condition"] == "inbound-arrived-not-written"
+    assert (
+        "FAIL inbound-arrived-not-written: 1 unresolved persisted "
+        "inbound capture failure(s) remain"
+    ) in result.stderr
+
+
 @pytest.mark.parametrize(
     ("overrides", "condition"),
     [
@@ -263,6 +285,33 @@ def test_invalid_inbound_timestamp_fails_closed(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert report["condition"] == "inbound-telemetry-missing"
     assert "lastReceivedAt" in report["reason"]
+
+
+@pytest.mark.parametrize(
+    ("count", "timestamp"),
+    [
+        (1, None),
+        (1, "not-a-timestamp"),
+        (0, "2026-07-25T21:00:00.000Z"),
+    ],
+)
+def test_malformed_persisted_failure_pair_fails_closed(
+    tmp_path: Path,
+    count: int,
+    timestamp: str | None,
+) -> None:
+    progress = _progress()
+    progress.update(
+        {
+            "unresolvedPersistedFailures": count,
+            "oldestUnresolvedFailureAt": timestamp,
+        }
+    )
+    result, report = _run(tmp_path, _probe(inboundProgress=progress))
+
+    assert result.returncode == 1
+    assert report["condition"] == "inbound-telemetry-missing"
+    assert "oldestUnresolvedFailureAt" in report["reason"]
 
 
 def test_malformed_threshold_emits_named_red_not_traceback(tmp_path: Path) -> None:
