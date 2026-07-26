@@ -285,10 +285,18 @@ export function usePromptActions({
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { updateComposerAttachments?: boolean } = {}
+      options: {
+        connectionMode?: 'local' | 'remote'
+        requestGateway?: GatewayRequest
+        updateComposerAttachments?: boolean
+      } = {}
     ): Promise<ComposerAttachment[]> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
-      const remote = $connection.get()?.mode === 'remote'
+      // A background (profile-targeted) submit injects its own connection mode +
+      // profile-routed requester; the foreground defaults to the live $connection
+      // and the hook-captured gateway.
+      const remote = (options.connectionMode ?? $connection.get()?.mode ?? 'local') === 'remote'
+      const gateway = options.requestGateway ?? requestGateway
       const synced: ComposerAttachment[] = []
 
       for (const original of attachments) {
@@ -316,7 +324,7 @@ export function usePromptActions({
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
-          const nextAttachment = await uploadComposerAttachment(attachment, { remote, requestGateway, sessionId })
+          const nextAttachment = await uploadComposerAttachment(attachment, { remote, requestGateway: gateway, sessionId })
 
           // Update-only: never resurrect a chip the user removed mid-upload.
           if (updateComposerAttachments) {

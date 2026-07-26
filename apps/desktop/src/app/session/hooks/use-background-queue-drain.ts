@@ -15,9 +15,19 @@ import {
 import { notify } from '@/store/notifications'
 import { $workingSessionIds } from '@/store/session-states'
 
+import { isProfileSessionBusy, submitTextForProfile } from './use-prompt-actions/profile-submit'
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 
 type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+
+/** The bare storedSessionId behind an in-memory queue key. Background profile
+ *  buckets use a composite `${profile}::${storedSessionId}` key; strip the
+ *  (normalized) profile prefix to recover the durable id. */
+function storedIdOfQueueKey(sessionKey: string, profile: string): string {
+  const prefix = `${profile}::`
+
+  return sessionKey.startsWith(prefix) ? sessionKey.slice(prefix.length) : sessionKey
+}
 
 interface BackgroundQueueDrainOptions {
   enabled: boolean
@@ -116,14 +126,26 @@ export function useBackgroundQueueDrain({
 
           const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(sessionKey) ?? null
 
-          const accepted = await Promise.resolve(
-            submitTextRef.current(liveEntry.text, {
-              attachments: liveEntry.attachments,
-              fromQueue: true,
-              sessionId: runtimeSessionId,
-              storedSessionId: sessionKey
-            })
-          )
+          // Profile-targeted (background) entries route through the profile-safe
+          // entry point on their OWN gateway; profile-less entries keep the
+          // foreground drain (backwards compat) until ownership resolution
+          // re-attributes them.
+          const profile = liveEntry.profile
+          const accepted = profile
+            ? await submitTextForProfile(
+                profile,
+                liveEntry.text,
+                { storedSessionId: storedIdOfQueueKey(sessionKey, profile) },
+                submitTextRef.current
+              )
+            : await Promise.resolve(
+                submitTextRef.current(liveEntry.text, {
+                  attachments: liveEntry.attachments,
+                  fromQueue: true,
+                  sessionId: runtimeSessionId,
+                  storedSessionId: sessionKey
+                })
+              )
 
           if (accepted === false) {
             return false
@@ -171,6 +193,15 @@ export function useBackgroundQueueDrain({
       const entry = entries[0]
 
       if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+        continue
+      }
+
+      // A background profile bucket keys on a composite the foreground working
+      // set never contains, so gate it on its OWN profile-scoped busy state —
+      // otherwise a busy profile session would drain → re-enqueue → drain in a
+      // spin. Leaving it queued here is correct: it drains once the profile is
+      // idle.
+      if (entry.profile && isProfileSessionBusy(entry.profile, null, storedIdOfQueueKey(sessionKey, entry.profile))) {
         continue
       }
 

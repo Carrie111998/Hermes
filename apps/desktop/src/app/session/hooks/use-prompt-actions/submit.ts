@@ -20,7 +20,14 @@ import {
 } from '@/store/composer'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { $sessions, resolveComposerSessionKey, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import {
+  $connection,
+  $sessions,
+  resolveComposerSessionKey,
+  setAwaitingResponse,
+  setBusy,
+  setMessages
+} from '@/store/session'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -34,6 +41,7 @@ import {
   isProviderSetupError,
   isSessionBusyError,
   isSessionNotFoundError,
+  type SubmitExecution,
   type SubmitTextOptions,
   withSessionBusyRetry
 } from './utils'
@@ -52,7 +60,15 @@ interface SubmitPromptDeps {
   syncAttachmentsForSubmit: (
     sessionId: string,
     attachments: ComposerAttachment[],
-    options?: { updateComposerAttachments?: boolean }
+    options?: {
+      /** Connection mode to choose path- vs bytes-upload. Defaults to the
+       *  foreground `$connection`; a background execution passes its own. */
+      connectionMode?: 'local' | 'remote'
+      /** Gateway to upload through. Defaults to the hook-captured foreground
+       *  requester; a background execution passes its profile-routed one. */
+      requestGateway?: GatewayRequest
+      updateComposerAttachments?: boolean
+    }
   ) => Promise<ComposerAttachment[]>
   updateSessionState: (
     sessionId: string,
@@ -101,6 +117,30 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
+      // Select the per-call execution seam. Foreground submits run on the hook
+      // deps (busy ref, active gateway, foreground stores); a non-active profile
+      // submit passes backgroundSubmitExecution(profile) and every gateway call,
+      // busy read, connection probe, and state write below routes through it —
+      // there is no parallel pipeline.
+      const mainExecution: SubmitExecution = {
+        background: false,
+        readBusy: () => busyRef.current,
+        requestGateway,
+        resolveConnectionMode: async () => ($connection.get()?.mode === 'remote' ? 'remote' : 'local'),
+        scope,
+        updateSessionState
+      }
+      const execution = options?.execution ?? mainExecution
+      const request = execution.requestGateway
+      const submitScope = execution.scope
+      const updateSubmitState = execution.updateSessionState
+      // A background (profile-targeted) submit must not consult the foreground
+      // selection/active/route identities — only options.sessionId /
+      // options.storedSessionId may pick the target. This flag gates every
+      // foreground-identity read; targetStartedInCurrentView=false then makes the
+      // targetIsCurrentView() guards skip every foreground write.
+      const bg = execution.background
+
       const visibleText = sanitizeComposerInput(rawText).trim()
       const usingComposerAttachments = !options?.attachments
 
@@ -109,7 +149,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // this, the sibling iterations below (a.kind / a.label / a.refText, and the
       // sync step) throw "Cannot read properties of undefined (reading 'refText')"
       // and break the chat surface.
-      const attachments = (options?.attachments ?? scope.readAttachments()).filter((a): a is ComposerAttachment =>
+      const attachments = (options?.attachments ?? submitScope.readAttachments()).filter((a): a is ComposerAttachment =>
         Boolean(a)
       )
 
@@ -145,7 +185,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // keeps the guard so a stray Enter mid-turn can't double-submit.
       const hasSendable = Boolean(visibleText || terminalContextBlocks || attachments.length || hasImage)
 
-      if (!hasSendable || (!options?.fromQueue && busyRef.current)) {
+      if (!hasSendable || (!options?.fromQueue && execution.readBusy())) {
         return false
       }
 
@@ -161,11 +201,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       // Queue drains carry their source session explicitly. A background drain
       // must never inherit the currently selected session after the user moves
-      // to another chat.
-      const targetStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
+      // to another chat. A background EXECUTION (profile-targeted submit) reads
+      // no foreground identity at all — only options.sessionId/storedSessionId
+      // select the target.
+      const fgSelectedStoredId = bg ? null : selectedStoredSessionIdRef.current
+      const fgActiveSessionId = bg ? null : activeSessionIdRef.current
+
+      const targetStoredSessionId = options?.storedSessionId ?? fgSelectedStoredId
 
       const targetStartedInCurrentView =
-        !targetStoredSessionId || targetStoredSessionId === selectedStoredSessionIdRef.current
+        !bg && (!targetStoredSessionId || targetStoredSessionId === fgSelectedStoredId)
 
       // A queued/background drain whose runtime binding was reaped must NOT
       // inherit the foreground runtime id when its storedSessionId targets a
@@ -174,19 +219,20 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // drain is for the current view (no storedSessionId, or it matches the
       // foreground), the foreground runtime is correct and must be kept.
       const isBackgroundQueueDrain = Boolean(
-        options?.fromQueue && options?.storedSessionId && options.storedSessionId !== selectedStoredSessionIdRef.current
+        options?.fromQueue && options?.storedSessionId && options.storedSessionId !== fgSelectedStoredId
       )
 
-      let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
+      let sessionId: null | string =
+        options?.sessionId ?? (isBackgroundQueueDrain || bg ? null : fgActiveSessionId)
 
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
       // can redirect the user's text into a different chat (#54527). Mutable —
       // not const — because a new-chat submit legitimately re-homes to the
       // session it creates (see the re-pin after createBackendSessionForSend).
-      const startingActiveSessionId = activeSessionIdRef.current
-      const selectedStoredSessionId = selectedStoredSessionIdRef.current
-      const routedStoredSessionId = getRoutedStoredSessionId()
+      const startingActiveSessionId = fgActiveSessionId
+      const selectedStoredSessionId = fgSelectedStoredId
+      const routedStoredSessionId = bg ? null : getRoutedStoredSessionId()
 
       const routedRuntimeId = routedStoredSessionId ? getRuntimeIdForStoredSession(routedStoredSessionId) : null
 
@@ -234,11 +280,22 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       const targetIsCurrentView = (): boolean => targetStartedInCurrentView && !sessionDriftReason()
 
+      // Whether the execution's UI scope should reflect busy/awaiting right now.
+      // Foreground reflects it only while the target is still the viewed session
+      // (a mid-pipeline switch stops painting it); background always reflects it
+      // because its scope is profile-scoped and never touches the viewed session.
+      const scopeIsActive = (): boolean => bg || targetIsCurrentView()
+
       // One submit in flight per session — drop any concurrent re-fire so a
       // stalled turn can't stack the same prompt into multiple real turns. The
       // foreground ChatBar and background drainers can briefly overlap during a
-      // session switch; this per-session lock makes that safe.
-      const submitLockKey = targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'
+      // session switch; this per-session lock makes that safe. A background
+      // (profile-targeted) submit namespaces the lock by profile so two profiles
+      // can submit into same-named session keys without colliding.
+      const baseSubmitLockKey = targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'
+      const submitLockKey = execution.profile
+        ? JSON.stringify([execution.profile, baseSubmitLockKey])
+        : baseSubmitLockKey
 
       if (_submitInFlight.has(submitLockKey)) {
         return false
@@ -266,17 +323,22 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const releaseBusy = () => {
         releaseSubmitLock()
 
-        if (targetIsCurrentView()) {
-          setMutableRef(busyRef, false)
-          scope.setBusy(false)
-          scope.setAwaitingResponse(false)
+        if (scopeIsActive()) {
+          // busyRef is the foreground-only sync source; a background execution
+          // drives its profile-scoped busy through submitScope alone.
+          if (!bg) {
+            setMutableRef(busyRef, false)
+          }
+
+          submitScope.setBusy(false)
+          submitScope.setAwaitingResponse(false)
         }
       }
 
       // Idempotent optimistic insert — re-running with the resolved sessionId
       // after createBackendSessionForSend just overwrites with the same id.
       const seedOptimistic = (sid: string) =>
-        updateSessionState(
+        updateSubmitState(
           sid,
           state => ({
             ...state,
@@ -298,7 +360,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // After sync rewrites refs, refresh the optimistic message in place so the
       // transcript shows the resolved @file: ref rather than the local path.
       const rewriteOptimistic = (sid: string) =>
-        updateSessionState(
+        updateSubmitState(
           sid,
           state => ({
             ...state,
@@ -310,13 +372,13 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const dropOptimistic = (sid: null | string) => {
         if (!sid) {
           if (targetIsCurrentView()) {
-            scope.setMessages(current => current.filter(m => m.id !== optimisticId))
+            submitScope.setMessages(current => current.filter(m => m.id !== optimisticId))
           }
 
           return
         }
 
-        updateSessionState(
+        updateSubmitState(
           sid,
           state => ({
             ...state,
@@ -336,13 +398,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         return false
       }
 
-      // Foreground-only state: a background queue drain must never write the
-      // selected view's busy/awaiting flags or clear its notifications.
-      if (targetIsCurrentView()) {
-        setMutableRef(busyRef, true)
-        scope.setBusy(true)
-        scope.setAwaitingResponse(true)
-        clearNotifications()
+      // Busy/awaiting state. Foreground writes the viewed session's flags only
+      // while the target is still current (a background queue drain or a
+      // mid-pipeline switch must never paint it); a background execution always
+      // drives its own profile-scoped flags and never touches the foreground
+      // busyRef / notifications.
+      if (scopeIsActive()) {
+        if (!bg) {
+          setMutableRef(busyRef, true)
+          clearNotifications()
+        }
+
+        submitScope.setBusy(true)
+        submitScope.setAwaitingResponse(true)
       }
 
       // A route whose selected/runtime binding is incomplete or cross-wired
@@ -356,7 +424,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       if (sessionId) {
         seedOptimistic(sessionId)
       } else if (targetIsCurrentView()) {
-        scope.setMessages(current => [...current, buildUserMessage()])
+        submitScope.setMessages(current => [...current, buildUserMessage()])
       }
 
       if (!sessionId && routedStoredSessionId && routedSessionNeedsResume) {
@@ -405,9 +473,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         try {
           // Re-register on the session's OWNING profile — resuming on whichever
           // profile is live would fork the conversation into the wrong DB (#67603).
-          const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
+          // A background execution already knows its owner and never probes the
+          // active profile.
+          const resumeProfile = execution.profile ?? (await resolveSessionProfile(targetStoredSessionId))
 
-          const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+          const resumed = await request<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
             source: 'desktop',
             ...(resumeProfile ? { profile: resumeProfile } : {})
@@ -453,6 +523,13 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       if (!sessionId) {
+        // A background (profile-targeted) submit always targets an existing
+        // session resolved above; it must never mint a session on the active
+        // profile. Reaching here means its target could not be rebound — abort.
+        if (bg) {
+          return abortForSessionSwitch(null)
+        }
+
         try {
           sessionId = await createBackendSessionForSend(visibleText)
         } catch (err) {
@@ -510,6 +587,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       try {
         const syncedAttachments = await syncAttachmentsForSubmit(sessionId, attachments, {
+          connectionMode: await execution.resolveConnectionMode(),
+          requestGateway: request,
           updateComposerAttachments: usingComposerAttachments
         })
 
@@ -541,10 +620,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         try {
           await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', submitParams(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            request('prompt.submit', submitParams(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
           )
         } catch (firstErr) {
-          const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
+          const recoverStoredSessionId = targetStoredSessionId ?? fgSelectedStoredId
 
           if ((isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) && recoverStoredSessionId) {
             // Re-register the session in the gateway and get a fresh live ID.
@@ -552,9 +631,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // backend loop (#55578 symptom d) rejects the submit even though
             // the stored session is fine — resume + retry instead of erroring
             // out and losing the session binding.
-            const resumeProfile = await resolveSessionProfile(recoverStoredSessionId)
+            const resumeProfile = execution.profile ?? (await resolveSessionProfile(recoverStoredSessionId))
 
-            const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+            const resumed = await request<{ session_id: string }>('session.resume', {
               session_id: recoverStoredSessionId,
               source: 'desktop',
               ...(resumeProfile ? { profile: resumeProfile } : {})
@@ -576,7 +655,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               }
 
               await withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                request('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               )
             } else {
               submitErr = firstErr
@@ -591,7 +670,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         }
 
         if (usingComposerAttachments) {
-          scope.clearAttachments()
+          submitScope.clearAttachments()
         }
 
         // Submit landed — the turn now runs (busy stays true), but the submit
@@ -611,7 +690,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         const message = inlineErrorMessage(err, copy.promptFailed)
 
-        updateSessionState(
+        updateSubmitState(
           sessionId,
           state => ({
             ...state,

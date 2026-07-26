@@ -1,5 +1,7 @@
 import { atom } from 'nanostores'
 
+import type { ClientSessionState } from '@/app/types'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { normalizeProfileKey } from '@/store/profile'
 
 import type { PetActivity, PetInfo } from './pet'
@@ -68,6 +70,16 @@ const beats = new Map<string, ProfileBeat>()
 // Global "a session is awaiting the user" sync (use-pet-bridge) — OR-ed into the
 // derived awaitingInput so it survives a session-reducer republish.
 const manualAwaitingInput = new Map<string, boolean>()
+// Background (profile-targeted) submit state. A background submit drives the
+// profile's busy pose through these profile-scoped flags — never the foreground
+// $busy — so a reply sent to a non-active profile from its overlay still animates
+// that profile's pet.
+const profileSubmitBusy = new Map<string, boolean>()
+const profileAwaitingResponse = new Map<string, boolean>()
+// Per-(profile, runtimeId) background session-state cache. The submit pipeline's
+// optimistic inserts run against this so a background submit never publishes into
+// the foreground session cache or $messages.
+const backgroundSessionStates = new Map<string, ClientSessionState>()
 
 export function activityKey(profile: string, runtimeSessionId: string): string {
   return `${normalizeProfileKey(profile)}::${runtimeSessionId}`
@@ -101,7 +113,10 @@ export function deriveProfileActivity(profile: string): PetActivity {
 
   return {
     awaitingInput: sessions.some(s => s.awaitingInput) || (manualAwaitingInput.get(key) ?? false),
-    busy: sessions.some(s => s.busy),
+    busy:
+      sessions.some(s => s.busy) ||
+      (profileSubmitBusy.get(key) ?? false) ||
+      (profileAwaitingResponse.get(key) ?? false),
     celebrate: beat?.celebrate ?? false,
     error: beat?.error ?? false,
     justCompleted: beat?.justCompleted ?? false,
@@ -372,6 +387,11 @@ export function hasBusyActivityForStoredSession(profile: string, storedSessionId
   return false
 }
 
+/** Whether a specific runtime session under `profile` is currently busy. */
+export function profileRuntimeBusy(profile: string, runtimeSessionId: string): boolean {
+  return sessionActivity.get(activityKey(profile, runtimeSessionId))?.busy ?? false
+}
+
 /** The one runtime id bound to `storedSessionId` under `profile`, or null for
  *  zero/multiple matches (callers then use the durable session.resume path). */
 export function runtimeIdForStoredActivity(profile: string, storedSessionId: string): null | string {
@@ -393,29 +413,43 @@ export function runtimeIdForStoredActivity(profile: string, storedSessionId: str
   return found
 }
 
-// ── Layer 6 stubs (profile-safe submission) ────────────────────────────────
+// ── Layer 6c (profile-safe submission) ─────────────────────────────────────
 
 /**
- * Composite-keyed background session-state adapter. Layer 6 wires this to a
- * profile-scoped state cache that cannot write the foreground session cache or
- * `$messages`. Stubbed here so Layer 2/3 callers can reference the symbol.
+ * Composite-keyed background session-state adapter. The submit pipeline's
+ * optimistic inserts/rewrites/drops run against a per-(profile, runtimeId) cache
+ * here, so a background submit can keep its own bookkeeping without ever
+ * publishing into the foreground session cache or `$messages`. Returns the
+ * updated state (the pipeline calls this for its side effect).
  */
 export function updateBackgroundSessionState(
-  _profile: string,
-  _runtimeId: string,
-  _updater: unknown,
-  _storedId?: string | null
-): unknown {
-  // TODO(PR2b): route through the profile-scoped background state adapter.
-  return undefined
+  profile: string,
+  runtimeId: string,
+  updater: (state: ClientSessionState) => ClientSessionState,
+  storedId?: string | null
+): ClientSessionState {
+  const key = `${normalizeProfileKey(profile)}::${runtimeId}`
+  const prev = backgroundSessionStates.get(key) ?? createClientSessionState(storedId ?? null)
+  const next = updater(prev)
+  backgroundSessionStates.set(key, next)
+
+  return next
 }
 
-export function setProfileAwaitingResponse(_profile: string, _awaiting: boolean): void {
-  // TODO(PR2b): profile-scoped awaiting-response state for background submits.
+/** Profile-scoped awaiting-response flag for background submits — drives the
+ *  profile's busy pose, never the foreground `$awaitingResponse`. */
+export function setProfileAwaitingResponse(profile: string, awaiting: boolean): void {
+  const key = normalizeProfileKey(profile)
+  profileAwaitingResponse.set(key, awaiting)
+  publishProfileActivity(profile)
 }
 
-export function setProfileSubmitBusy(_profile: string, _busy: boolean): void {
-  // TODO(PR2b): profile-scoped submit busy state for background submits.
+/** Profile-scoped submit-busy flag for background submits — drives the profile's
+ *  busy pose, never the foreground `$busy`. */
+export function setProfileSubmitBusy(profile: string, busy: boolean): void {
+  const key = normalizeProfileKey(profile)
+  profileSubmitBusy.set(key, busy)
+  publishProfileActivity(profile)
 }
 
 /** Test-only: clear all per-session activity, beats, and profile slices so cases
@@ -424,5 +458,8 @@ export function __resetPetMultiForTests(): void {
   sessionActivity.clear()
   beats.clear()
   manualAwaitingInput.clear()
+  profileSubmitBusy.clear()
+  profileAwaitingResponse.clear()
+  backgroundSessionStates.clear()
   $profilePets.set(new Map())
 }

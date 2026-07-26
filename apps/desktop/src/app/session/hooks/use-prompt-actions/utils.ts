@@ -6,7 +6,52 @@ import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/de
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
 
-export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+import type { ClientSessionState } from '../../../types'
+
+export type GatewayRequest = <T>(
+  method: string,
+  params?: Record<string, unknown>,
+  timeoutMs?: number,
+  signal?: AbortSignal
+) => Promise<T>
+
+/**
+ * The UI surfaces a submit writes through. The main chat uses the module-level
+ * foreground stores (MAIN_SUBMIT_SCOPE); a background, profile-targeted submit
+ * supplies no-op / profile-scoped equivalents so it never paints the view the
+ * user is looking at.
+ */
+export interface SubmitUiScope {
+  clearAttachments: () => void
+  readAttachments: () => ComposerAttachment[]
+  setAwaitingResponse: (awaiting: boolean) => void
+  setBusy: (busy: boolean) => void
+  setMessages: (updater: (current: ChatMessage[]) => ChatMessage[]) => void
+}
+
+/**
+ * Per-call execution seam. A submit runs either in the foreground (the default,
+ * assembled from the hook deps — busy ref, active gateway, foreground stores) or
+ * in the background for a non-active profile (`backgroundSubmitExecution(profile)`
+ * — profile-routed gateway, profile-scoped busy/awaiting, no foreground writes).
+ * The pipeline selects ONE execution at the top and routes every gateway call,
+ * busy read, connection-mode probe, and state write through it — there is no
+ * parallel submit path (a reduced `submitTextForProfile` that re-implemented the
+ * pipeline would drift from it).
+ */
+export interface SubmitExecution {
+  background: boolean
+  profile?: string
+  readBusy: () => boolean
+  requestGateway: GatewayRequest
+  resolveConnectionMode: () => Promise<'local' | 'remote'>
+  scope: SubmitUiScope
+  updateSessionState: (
+    sessionId: string,
+    updater: (state: ClientSessionState) => ClientSessionState,
+    storedSessionId?: string | null
+  ) => ClientSessionState
+}
 
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -367,6 +412,11 @@ export interface SubmitTextOptions {
    *  (queue drain, steer, external submit requests): the check is a no-op
    *  without it. */
   composerScope?: string | null
+  /** Per-call execution seam. Omit for the foreground pipeline; a non-active
+   *  profile submit passes `backgroundSubmitExecution(profile)` so every gateway
+   *  call, busy read, and state write routes through that profile instead of the
+   *  foreground view. */
+  execution?: SubmitExecution
   fromQueue?: boolean
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground

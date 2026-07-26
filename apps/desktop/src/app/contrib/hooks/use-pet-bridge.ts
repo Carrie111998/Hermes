@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react'
 
+import { submitTextForProfile } from '@/app/session/hooks/use-prompt-actions/profile-submit'
+import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { requestGatewayForProfile } from '@/store/gateway'
-import { notify } from '@/store/notifications'
 import { petProfile } from '@/store/pet'
 import { setPetScale } from '@/store/pet-gallery'
 import {
@@ -30,7 +31,7 @@ function profileRequest(profile: string): GatewayRequester {
 interface PetBridgeParams {
   requestGateway: GatewayRequester
   resumeSession: (sessionId: string) => Promise<unknown> | unknown
-  submitText: (text: string) => Promise<unknown> | unknown
+  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
 }
 
 /**
@@ -53,23 +54,21 @@ export function usePetBridge({ requestGateway, resumeSession, submitText }: PetB
       return
     }
 
-    // Overlay submit, addressed by the sender-derived profile. The active
-    // profile routes through the full existing submit pipeline (optimistic
-    // messages, locks, queue recovery). A background profile's submit needs the
-    // SubmitExecution seam (PR3) — until then it surfaces a clear notice rather
-    // than a reduced parallel path that would bypass that pipeline.
+    // Overlay submit, addressed by the sender-derived profile. Routes through the
+    // shared profile-targeted entry point: the active profile runs the ordinary
+    // foreground execution; a background profile runs the SAME pipeline through
+    // backgroundSubmitExecution (profile-routed gateway, profile-scoped busy, no
+    // foreground writes). A busy session queues under (profile, storedSessionId).
     setPetOverlaySubmitHandler((profile, text) => {
-      if (normalizeProfileKey(profile) === normalizeProfileKey($activeGatewayProfile.get())) {
-        void submitTextRef.current(text)
+      const key = normalizeProfileKey(profile)
+      const state = $profilePets.get().get(key)
 
-        return
-      }
-
-      // TODO(PR3): backgroundSubmitExecution(profile) + submitTextForProfile.
-      notify({
-        kind: 'warning',
-        message: `Replying to ${normalizeProfileKey(profile)} from its overlay arrives in a future update.`
-      })
+      void submitTextForProfile(
+        key,
+        text,
+        { sessionId: state?.sourceSessionId, storedSessionId: state?.sourceDurableSessionId },
+        submitTextRef.current
+      )
     })
     // Alt+wheel resize from the popped-out pet — persist through the profile's
     // own gateway (the overlay has none) so it survives restart.
