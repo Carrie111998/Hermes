@@ -5,10 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hermes_cli.cost.kill_switch import (
-    KillSwitchTripped,
-    PerTaskCapExceeded,
-)
+from hermes_cli.cost.kill_switch import KillSwitchTripped
 from hermes_cli.lanes.contracts import ApprovalGrant, LaneDraft, LaneTask
 from hermes_cli.lanes.dry_run import (
     FakeLLMCaller,
@@ -151,15 +148,19 @@ def test_dry_run_never_calls_real_publish_when_publish_enabled_false(
     assert not (tmp_path / "tihna-digests").exists()
 
 
-def test_dry_run_respects_per_task_cost_cap_from_CS10a(tmp_path):
+def test_dry_run_accumulates_simulated_cost_above_task_threshold(tmp_path):
     harness = _harness(tmp_path, task_cap_aud=0.005)
-    with pytest.raises(PerTaskCapExceeded):
+    for _ in range(2):
         harness.call_llm(
             task=_task(),
             prompt="fixture",
             max_tokens=10,
             purpose="draft",
         )
+
+    assert harness.simulated_cost_aud == pytest.approx(0.02)
+    assert harness.task_costs["dry-run-task"] == pytest.approx(0.02)
+    assert "dry-run-task" not in harness.killed_tasks
 
 
 def test_dry_run_respects_kill_switch_from_CS10a(tmp_path):

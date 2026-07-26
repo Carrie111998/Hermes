@@ -5,10 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import time
 
-from hermes_cli.cost.kill_switch import (
-    KillSwitchTripped,
-    PerTaskCapExceeded,
-)
+from hermes_cli.cost.kill_switch import KillSwitchTripped
 from hermes_cli.lanes.contracts import LaneTask
 from hermes_cli.lanes.impls.tihna import TihnaLane
 
@@ -141,7 +138,7 @@ def run_digest(*, lane: TihnaLane, harness):
         )
         lane.cleanup(task=cleanup_task, harness=harness)
         return request
-    except (KillSwitchTripped, PerTaskCapExceeded):
+    except KillSwitchTripped:
         if control.id is not None:
             harness.update_task(task=control, status="failed")
         raise

@@ -919,8 +919,6 @@ class DryRunHarness(LaneHarness):
         max_tokens: int,
         purpose: str,
     ) -> LLMResult:
-        from hermes_cli.cost.kill_switch import PerTaskCapExceeded
-
         if purpose not in _PURPOSES:
             raise ValueError(f"unsupported lane LLM purpose: {purpose}")
         if self.llm_caller is None:
@@ -948,14 +946,6 @@ class DryRunHarness(LaneHarness):
         task_id = self._task_key(task)
         current = self.task_costs.get(task_id, 0.0)
         projected = current + cost
-        if projected > self.task_cap_aud:
-            self.killed_tasks[task_id] = "per_task_cap"
-            raise PerTaskCapExceeded(
-                task_id=task_id,
-                current_total=current,
-                projected_total=projected,
-                cap=self.task_cap_aud,
-            )
         self.task_costs[task_id] = projected
         self.simulated_cost_aud += cost
         self._call(

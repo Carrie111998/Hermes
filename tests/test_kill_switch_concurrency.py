@@ -12,7 +12,6 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.cost import gate_integration, ledger, task_cap_schema
 from hermes_cli.cost.kill_switch import (
     KillSwitchTripped,
-    PerTaskCapExceeded,
     is_task_killed,
     kill_task,
 )
@@ -112,7 +111,7 @@ def test_two_writers_racing_below_cap_both_succeed_when_sum_below(
     assert is_task_killed(task_id, db_path=concurrency_env) is None
 
 
-def test_two_writers_racing_at_cap_only_one_succeeds_and_kills(
+def test_two_writers_racing_over_cap_both_record_without_implicit_kill(
     concurrency_env,
 ):
     task_id = _claimed_task(concurrency_env, 0.10)
@@ -128,10 +127,9 @@ def test_two_writers_racing_at_cap_only_one_succeeds_and_kills(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(writer, range(2)))
-    assert sum(not isinstance(item, Exception) for item in results) == 1
-    assert sum(isinstance(item, PerTaskCapExceeded) for item in results) == 1
-    assert _cost_count(concurrency_env, task_id) == 2
-    assert is_task_killed(task_id, db_path=concurrency_env) is not None
+    assert all(not isinstance(item, Exception) for item in results)
+    assert _cost_count(concurrency_env, task_id) == 3
+    assert is_task_killed(task_id, db_path=concurrency_env) is None
 
 
 def test_kill_from_cli_during_active_write_fences_immediately(

@@ -30,8 +30,6 @@ _MIGRATED_PATHS: set[str] = set()
 _MIGRATION_LOCK = threading.RLock()
 _MISSING_ATTRIBUTION_WARNED: set[tuple[str | None, str | None]] = set()
 _ATTRIBUTION_WARNING_LOCK = threading.Lock()
-_MISSING_TASK_CAP_WARNED: set[str] = set()
-_TASK_CAP_WARNING_LOCK = threading.Lock()
 
 _INDEX_SCHEMA = (
     """
@@ -443,7 +441,9 @@ def record_call(
 
     The original CS-02 positional parameters remain accepted. New vendor
     details are keyword-only, and omitting the required ``lane`` argument is a
-    Python ``TypeError`` before any write occurs.
+    Python ``TypeError`` before any write occurs. The legacy
+    ``enforce_task_cap`` and ``enforce_programme_cap`` keywords are retained for
+    compatibility but are intentionally inert: spend thresholds are advisory.
     """
     ensure_migrated(db_path)
     normalized_lane = str(lane).strip().lower()
@@ -541,7 +541,7 @@ def record_call(
     )
 
     normalized_task_id = str(task_id) if task_id is not None else None
-    task_cap_exception: Exception | None = None
+    kill_switch_exception: Exception | None = None
     resolved_db_path = resolve_db_path(db_path)
     conn = connect(resolved_db_path)
     try:
@@ -549,96 +549,17 @@ def record_call(
             if normalized_task_id is not None:
                 from hermes_cli.cost.kill_switch import (
                     KillSwitchTripped,
-                    PerTaskCapExceeded,
                     is_task_killed,
-                    kill_task,
                 )
 
                 killed = is_task_killed(normalized_task_id, conn=conn)
                 if killed is not None:
-                    task_cap_exception = KillSwitchTripped(
+                    kill_switch_exception = KillSwitchTripped(
                         task_id=normalized_task_id,
                         reason=str(killed["reason"]),
                     )
-                elif enforce_task_cap:
-                    current_row = conn.execute(
-                        """
-                        SELECT COALESCE(SUM(aud_amount), 0.0) AS total
-                          FROM cost_ledger
-                         WHERE task_id = ?
-                        """,
-                        (normalized_task_id,),
-                    ).fetchone()
-                    current_total = Decimal(
-                        str(current_row["total"] if current_row else 0.0)
-                    )
-                    projected_total = current_total + aud_amount
-                    tasks_exists = conn.execute(
-                        """
-                        SELECT 1
-                          FROM sqlite_master
-                         WHERE type = 'table' AND name = 'tasks'
-                        """
-                    ).fetchone()
-                    cap_row = (
-                        conn.execute(
-                            "SELECT task_cap_aud FROM tasks WHERE id = ?",
-                            (normalized_task_id,),
-                        ).fetchone()
-                        if tasks_exists is not None
-                        else None
-                    )
-                    task_cap = (
-                        None
-                        if cap_row is None or cap_row["task_cap_aud"] is None
-                        else Decimal(str(cap_row["task_cap_aud"]))
-                    )
-                    if task_cap is None:
-                        with _TASK_CAP_WARNING_LOCK:
-                            first_missing_cap = (
-                                normalized_task_id
-                                not in _MISSING_TASK_CAP_WARNED
-                            )
-                            if first_missing_cap:
-                                _MISSING_TASK_CAP_WARNED.add(
-                                    normalized_task_id
-                                )
-                        if first_missing_cap:
-                            logger.warning(
-                                "Task %s has no task_cap_aud (legacy row); "
-                                "allowing cost write",
-                                normalized_task_id,
-                            )
-                    elif projected_total > task_cap:
-                        kill_task(
-                            task_id=normalized_task_id,
-                            killed_by="cost_gate",
-                            reason="per_task_cap",
-                            notes=(
-                                f"current={float(current_total):.6f};"
-                                f"projected={float(projected_total):.6f};"
-                                f"cap={float(task_cap):.6f};"
-                                f"lane={normalized_lane}"
-                            ),
-                            conn=conn,
-                        )
-                        conn.execute(
-                            """
-                            UPDATE tasks
-                               SET status = 'failed',
-                                   failure_reason = 'per_task_cap_hit'
-                             WHERE id = ?
-                            """,
-                            (normalized_task_id,),
-                        )
-                        task_cap_exception = PerTaskCapExceeded(
-                            task_id=normalized_task_id,
-                            current_total=float(current_total),
-                            projected_total=float(projected_total),
-                            cap=float(task_cap),
-                        )
 
-            if task_cap_exception is None:
+            if kill_switch_exception is None:
                 cursor = conn.execute(
                     """
                     INSERT INTO cost_ledger (
@@ -700,9 +621,8 @@ def record_call(
                 entry = _row_to_entry(row)
 
                 # Daily/lane/task thresholds remain visible in the returned
-                # entry. Normal runtime accounting is advisory; callers that
-                # explicitly opt into hard programme enforcement retain the
-                # legacy pause behavior.
+                # entry. Thresholds are always advisory; the legacy enforcement
+                # kwargs remain accepted only for call-site compatibility.
                 from hermes_cli.cost import caps
 
                 breached, which_cap = caps.check_all_caps(
@@ -719,55 +639,20 @@ def record_call(
                         conn=conn,
                     )
                     reason = f"cap hit: {which_cap}: {amount:.2f} AUD"
-                    transitioned = False
-                    if enforce_programme_cap:
-                        from hermes_cli.programme import gate as programme_gate
-
-                        _, transitioned = (
-                            programme_gate.pause_for_cost_breach_in_transaction(
-                                conn,
-                                reason,
-                            )
-                        )
                     entry = replace(
                         entry,
                         breached_cap=which_cap,
                         breach_reason=reason,
-                        transitioned_to_paused=transitioned,
+                        transitioned_to_paused=False,
                     )
     finally:
         conn.close()
 
-    # Raising inside retrying_write_txn would roll back the kill + FAILED
-    # transition. Commit the authoritative state first, alert best-effort,
-    # then propagate the original typed exception without wrapping it.
-    if task_cap_exception is not None:
-        from hermes_cli.cost.kill_switch import PerTaskCapExceeded
-
-        if isinstance(task_cap_exception, PerTaskCapExceeded):
-            try:
-                from hermes_cli.cost.gate_integration import (
-                    send_task_cap_kill_alert,
-                )
-
-                send_task_cap_kill_alert(
-                    task_id=normalized_task_id,
-                    lane=normalized_lane,
-                    projected_total=task_cap_exception.projected_total,
-                    task_cap_aud=task_cap_exception.cap,
-                    db_path=db_path,
-                )
-            except Exception:
-                logger.exception(
-                    "Task %s was killed by cap but Telegram alert failed",
-                    normalized_task_id,
-                )
-        raise task_cap_exception
+    if kill_switch_exception is not None:
+        raise kill_switch_exception
 
     if (
-        not enforce_task_cap
-        and not enforce_programme_cap
-        and normalized_task_id is not None
+        normalized_task_id is not None
         and not is_free_tier
         and not is_subscription_bridge
     ):

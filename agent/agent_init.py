@@ -1612,6 +1612,9 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    agent._foreground_turn_active = False
+    agent._pending_memory_review = False
+    agent._pending_skill_review = False
     # A flush/background agent may pass skip_memory=True to avoid spinning up an
     # external memory *provider*, but if the caller also explicitly enables the
     # "memory" toolset it still needs the built-in file-backed store — otherwise
@@ -1708,11 +1711,29 @@ def init_agent(
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
 
-    # Skills config: nudge interval for skill creation reminders
+    # Skills config: nudge interval and post-task review lifecycle.
     agent._skill_nudge_interval = 10
+    agent._review_task_terminal_only = False
+    agent._review_idempotent = False
+    agent._review_start_delay_seconds = 1.0
+    agent._review_max_wait_seconds = 300.0
     try:
         skills_config = _agent_cfg.get("skills", {})
         agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+        agent._review_task_terminal_only = bool(
+            skills_config.get("review_task_terminal_only", False)
+        )
+        agent._review_idempotent = bool(
+            skills_config.get("review_idempotent", False)
+        )
+        agent._review_start_delay_seconds = max(
+            0.0,
+            float(skills_config.get("review_start_delay_seconds", 1.0)),
+        )
+        agent._review_max_wait_seconds = max(
+            0.0,
+            float(skills_config.get("review_max_wait_seconds", 300.0)),
+        )
     except Exception:
         pass
 

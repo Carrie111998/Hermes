@@ -218,7 +218,7 @@ def test_scheduler_digest_stage_runs_classify_then_draft_then_approve(
     assert classify < draft < approve
 
 
-def test_scheduler_digest_stage_halts_on_PerTaskCapExceeded(tmp_path):
+def test_scheduler_digest_does_not_mark_legacy_cap_exception_terminal(tmp_path):
     failure = PerTaskCapExceeded(
         task_id="tihna-digest",
         current_total=0.9,
@@ -230,7 +230,7 @@ def test_scheduler_digest_stage_halts_on_PerTaskCapExceeded(tmp_path):
     with pytest.raises(PerTaskCapExceeded):
         run_digest(lane=_lane(tmp_path), harness=harness)
     assert "approve" not in harness.events
-    assert any(task.status == "failed" for task in harness.tasks)
+    assert not any(task.status == "failed" for task in harness.tasks)
 
 
 def test_scheduler_digest_stage_halts_on_KillSwitchTripped(tmp_path):

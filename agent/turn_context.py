@@ -351,6 +351,9 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    # Delayed learning workers stay dormant while this foreground task runs.
+    agent._foreground_turn_active = True
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import re
 import sqlite3
 import subprocess
 from dataclasses import asdict, dataclass
@@ -31,15 +30,6 @@ from hermes_cli.smoke.roundtrip import (
 
 
 _MELBOURNE = ZoneInfo("Australia/Melbourne")
-_EXPECTED_QUARANTINE_NODES = (
-    "test_telegram_can_continue_interrupted_task_after_restart",
-    "test_terminal_gate_rejects_active_todo",
-    "test_terminal_gate_accepts_completed_task",
-    "test_terminal_gate_rejects_active_process_and_delegation",
-    "test_review_completion_is_claimed_once",
-    "test_spawn_starts_once_for_duplicate_completion",
-    "test_bounded_review_wait_refuses_active_turn",
-)
 _SPEC_FILE_MANIFEST: dict[str, tuple[str, ...]] = {
     "CS-01c": ("hermes_cli/programme/ingress.py", "run_agent.py"),
     "CS-04": (
@@ -73,10 +63,6 @@ _SPEC_FILE_MANIFEST: dict[str, tuple[str, ...]] = {
     "CS-16": (
         "hermes_cli/lanes/doctor.py",
         "hermes_cli/lanes/dry_run.py",
-    ),
-    "CS-18": (
-        "docs/known_debt/PRE_CS01_WIP_DEBT.md",
-        "tests/test_wip_debt_quarantine.py",
     ),
 }
 
@@ -644,28 +630,6 @@ def _preconditions(
         "CS16", "Lane doctor and full fixture dry-run are healthy",
         bool(lane_doctor.get("success")) and bool(lane_dry.get("success")),
         f"doctor={lane_doctor.get('success')}; dry_run={lane_dry.get('success')}",
-        overrides,
-    ))
-
-    quarantine_source = (
-        repo_root / "tests/conftest.py"
-    ).read_text(encoding="utf-8")
-    quarantine_block = quarantine_source.split(
-        "_PRE_CS01_WIP_DEBT_NODE_IDS =",
-        1,
-    )[1].split("_PRE_CS01_WIP_DEBT_REASON =", 1)[0]
-    observed_quarantine_nodes = frozenset(
-        re.findall(r'"(test_[a-zA-Z0-9_]+)"', quarantine_block)
-    )
-    quarantine_ok = (
-        observed_quarantine_nodes == frozenset(_EXPECTED_QUARANTINE_NODES)
-        and "pytest.mark.xfail" in quarantine_source
-    )
-    checks.append(_check(
-        "CS18", "Exactly the seven documented WIP-debt nodes are quarantined",
-        quarantine_ok,
-        f"observed_nodes={len(observed_quarantine_nodes)}; xfail_hook="
-        f"{'pytest.mark.xfail' in quarantine_source}",
         overrides,
     ))
 

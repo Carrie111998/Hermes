@@ -189,17 +189,6 @@ def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
 
 
-_PRE_CS01_WIP_DEBT_LINE = (
-    "pre-CS01 WIP debt: 7 tests quarantined "
-    "(docs/known_debt/PRE_CS01_WIP_DEBT.md)"
-)
-
-
-def _report_pre_cs01_wip_debt() -> None:
-    """Report quarantined WIP debt without affecting doctor health."""
-    check_info(_PRE_CS01_WIP_DEBT_LINE)
-
-
 def _report_lane_manifest_audit() -> None:
     """Report lane-control audit history without changing doctor health."""
     try:
@@ -2665,7 +2654,6 @@ def run_doctor(args):
         )
         issues.append("Repair the business-lane framework installation")
 
-    _report_pre_cs01_wip_debt()
     _report_lane_manifest_audit()
 
     print()

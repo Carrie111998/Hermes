@@ -2534,6 +2534,12 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Post-task learning can opt into terminal-only, exactly-once review.
+        # Defaults preserve the historical per-turn behavior.
+        "review_task_terminal_only": False,
+        "review_idempotent": False,
+        "review_start_delay_seconds": 1.0,
+        "review_max_wait_seconds": 300.0,
     },
 
     # Curator — background skill maintenance.

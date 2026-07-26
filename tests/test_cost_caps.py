@@ -181,15 +181,25 @@ def test_advisory_sent_once_per_task_per_utc_day(cost_env, monkeypatch):
     assert len(calls) == 1
 
 
-def test_hard_programme_pause_remains_explicit_opt_in(cost_env, monkeypatch):
-    calls = []
+def test_legacy_programme_enforcement_kwarg_remains_advisory(
+    cost_env,
+    monkeypatch,
+):
+    advisory_calls = []
+    hard_pause_calls = []
     monkeypatch.setattr(
         telegram_alert,
         "send_cost_alert",
-        lambda *args: calls.append(args),
+        lambda *args: hard_pause_calls.append(args),
+    )
+    monkeypatch.setattr(
+        telegram_alert,
+        "send_bridge_alert",
+        lambda message: advisory_calls.append(message),
     )
     _breaching_call(enforce_programme_cap=True)
     state = programme_gate.get_state()
-    assert state.state == "PAUSED"
-    assert state.reason.startswith("cap hit:")
-    assert len(calls) == 1
+    assert state.state == "RUNNING"
+    assert len(advisory_calls) == 1
+    assert "advisory_only: yes" in advisory_calls[0]
+    assert hard_pause_calls == []

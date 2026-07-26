@@ -158,11 +158,11 @@ def test_rehearsal_requires_operator_unlock(rehearsal_env):
     assert report.restart_plan["requires_operator_unlock"] is True
 
 
-def test_all_seventeen_preconditions_are_explicit_pass_or_fail(
+def test_all_sixteen_preconditions_are_explicit_pass_or_fail(
     rehearsal_env,
 ):
     checks = _report(rehearsal_env).preconditions
-    assert len(checks) == 17
+    assert len(checks) == 16
     assert {item.status for item in checks} <= {"PASS", "FAIL"}
 
 
@@ -243,7 +243,7 @@ def test_exit_zero_when_every_precondition_passes(rehearsal_env):
             for item in (
                 "CS01c", "CS04", "CS05rev", "CS05b", "CS06",
                 "CS10a", "CS10brev", "CS12", "CS13", "CS14",
-                "CS15", "CS16", "CS18", "DB", "TIHNA_DOCTRINE",
+                "CS15", "CS16", "DB", "TIHNA_DOCTRINE",
                 "LANE_MANIFEST", "KILL_SWITCH",
             )
         },

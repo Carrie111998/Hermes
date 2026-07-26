@@ -331,7 +331,28 @@ def test_record_call_default_task_cap_is_advisory(
     assert "advisory_only: yes" in messages[0]
 
 
-def test_record_call_above_cap_kills_task_and_raises_PerTaskCapExceeded(
+def test_record_call_legacy_enforcement_kwarg_is_advisory(
+    task_cap_env,
+    monkeypatch,
+):
+    messages = []
+    monkeypatch.setattr(
+        gate_integration.telegram_alert,
+        "send_bridge_alert",
+        messages.append,
+    )
+    task_id = _create_task(task_cap_env)
+    _claim(task_cap_env, task_id, cap=0.10)
+    entry = _record(task_cap_env, task_id, 0.11)
+    assert entry.aud_amount == pytest.approx(0.11)
+    assert _cost_count(task_cap_env, task_id) == 1
+    assert is_task_killed(task_id, db_path=task_cap_env) is None
+    assert _task_row(task_cap_env, task_id)["status"] == "running"
+    assert len(messages) == 1
+    assert "advisory_only: yes" in messages[0]
+
+
+def test_record_call_above_cap_always_inserts_cost_row(
     task_cap_env,
     monkeypatch,
 ):
@@ -342,15 +363,11 @@ def test_record_call_above_cap_kills_task_and_raises_PerTaskCapExceeded(
     )
     task_id = _create_task(task_cap_env)
     _claim(task_cap_env, task_id, cap=0.10)
-    with pytest.raises(PerTaskCapExceeded) as raised:
-        _record(task_cap_env, task_id, 0.11)
-    assert raised.value.cap == pytest.approx(0.10)
-    assert is_task_killed(task_id, db_path=task_cap_env)["reason"] == (
-        "per_task_cap"
-    )
+    _record(task_cap_env, task_id, 0.11)
+    assert _cost_count(task_cap_env, task_id) == 1
 
 
-def test_record_call_above_cap_does_not_insert_cost_row(
+def test_record_call_above_cap_does_not_mark_task_failed(
     task_cap_env,
     monkeypatch,
 ):
@@ -361,30 +378,13 @@ def test_record_call_above_cap_does_not_insert_cost_row(
     )
     task_id = _create_task(task_cap_env)
     _claim(task_cap_env, task_id, cap=0.10)
-    with pytest.raises(PerTaskCapExceeded):
-        _record(task_cap_env, task_id, 0.11)
-    assert _cost_count(task_cap_env, task_id) == 0
-
-
-def test_record_call_above_cap_marks_task_failed_atomically(
-    task_cap_env,
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        gate_integration.telegram_alert,
-        "send_bridge_alert",
-        lambda _message: None,
-    )
-    task_id = _create_task(task_cap_env)
-    _claim(task_cap_env, task_id, cap=0.10)
-    with pytest.raises(PerTaskCapExceeded):
-        _record(task_cap_env, task_id, 0.11)
+    _record(task_cap_env, task_id, 0.11)
     row = _task_row(task_cap_env, task_id)
-    assert row["status"] == "failed"
-    assert row["failure_reason"] == "per_task_cap_hit"
+    assert row["status"] == "running"
+    assert row["failure_reason"] is None
 
 
-def test_record_call_kill_and_fail_are_single_transaction(
+def test_record_call_legacy_enforcement_does_not_touch_task_state(
     task_cap_env,
 ):
     task_id = _create_task(task_cap_env)
@@ -399,13 +399,13 @@ def test_record_call_kill_and_fail_are_single_transaction(
             END
             """
         )
-    with pytest.raises(sqlite3.IntegrityError, match="forced failure"):
-        _record(task_cap_env, task_id, 0.11)
+    _record(task_cap_env, task_id, 0.11)
+    assert _cost_count(task_cap_env, task_id) == 1
     assert is_task_killed(task_id, db_path=task_cap_env) is None
     assert _task_row(task_cap_env, task_id)["status"] == "running"
 
 
-def test_record_call_enforce_task_cap_false_bypass_for_tests_only(
+def test_record_call_enforcement_boolean_values_are_equally_advisory(
     task_cap_env,
 ):
     task_id = _create_task(task_cap_env)
@@ -416,7 +416,13 @@ def test_record_call_enforce_task_cap_false_bypass_for_tests_only(
         0.11,
         enforce_task_cap=False,
     )
-    assert _cost_count(task_cap_env, task_id) == 1
+    _record(
+        task_cap_env,
+        task_id,
+        0.11,
+        enforce_task_cap=True,
+    )
+    assert _cost_count(task_cap_env, task_id) == 2
     assert is_task_killed(task_id, db_path=task_cap_env) is None
 
 
@@ -515,7 +521,7 @@ def test_unkill_task_does_not_change_tasks_status(task_cap_env):
 # Telegram (3)
 
 
-def test_per_task_cap_kill_emits_telegram_via_side_effects_bucket(
+def test_per_task_threshold_emits_advisory_via_side_effects_bucket(
     task_cap_env,
     monkeypatch,
 ):
@@ -527,15 +533,15 @@ def test_per_task_cap_kill_emits_telegram_via_side_effects_bucket(
     )
     task_id = _create_task(task_cap_env)
     _claim(task_cap_env, task_id, cap=0.10)
-    with pytest.raises(PerTaskCapExceeded):
-        _record(task_cap_env, task_id, 0.11)
+    _record(task_cap_env, task_id, 0.11)
     assert len(sent) == 1
-    assert "⚠️ TASK CAP HIT" in sent[0]
+    assert "TASK SPEND ADVISORY" in sent[0]
+    assert "advisory_only: yes" in sent[0]
     with sqlite3.connect(task_cap_env) as conn:
         key = conn.execute(
             "SELECT idempotency_key FROM side_effects"
         ).fetchone()[0]
-    assert key.startswith(f"task_cap_kill:{task_id}:")
+    assert key.startswith(f"task_cost_advisory:{task_id}:")
 
 
 def test_operator_kill_does_not_alert(task_cap_env, monkeypatch):
@@ -555,7 +561,7 @@ def test_operator_kill_does_not_alert(task_cap_env, monkeypatch):
     assert sent == []
 
 
-def test_repeated_cap_hits_within_hour_deduped_by_bucket(
+def test_repeated_threshold_hits_dedupe_per_task_alert(
     task_cap_env,
     monkeypatch,
 ):
@@ -567,17 +573,11 @@ def test_repeated_cap_hits_within_hour_deduped_by_bucket(
     )
     task_id = _create_task(task_cap_env)
     _claim(task_cap_env, task_id, cap=0.10)
-    with pytest.raises(PerTaskCapExceeded):
-        _record(task_cap_env, task_id, 0.11)
-    unkill_task(task_id=task_id, db_path=task_cap_env)
-    with sqlite3.connect(task_cap_env) as conn:
-        conn.execute(
-            "UPDATE tasks SET status='running', failure_reason=NULL WHERE id=?",
-            (task_id,),
-        )
-    with pytest.raises(PerTaskCapExceeded):
-        _record(task_cap_env, task_id, 0.11)
+    _record(task_cap_env, task_id, 0.11)
+    _record(task_cap_env, task_id, 0.11)
     assert len(sent) == 1
+    assert _cost_count(task_cap_env, task_id) == 2
+    assert is_task_killed(task_id, db_path=task_cap_env) is None
     with sqlite3.connect(task_cap_env) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM side_effects"

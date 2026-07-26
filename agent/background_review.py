@@ -18,14 +18,140 @@ for invariants and PR review criteria.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
+
+
+def task_is_terminal_for_review(
+    agent: Any,
+    *,
+    final_response: Any,
+    completed: bool,
+    interrupted: bool,
+    failed: bool,
+    task_id: str,
+) -> bool:
+    """Fail closed unless an opted-in profile's task is genuinely terminal."""
+    if not getattr(agent, "_review_task_terminal_only", False):
+        return bool(final_response) and not interrupted
+    if not final_response or not completed or interrupted or failed:
+        return False
+    if getattr(agent, "_foreground_turn_active", False):
+        return False
+
+    store = getattr(agent, "_todo_store", None)
+    if store is not None:
+        try:
+            if any(
+                item.get("status") in {"pending", "in_progress"}
+                for item in store.read()
+            ):
+                return False
+        except Exception:
+            return False
+
+    try:
+        from tools.process_registry import process_registry
+
+        if task_id and process_registry.has_active_processes(task_id):
+            return False
+    except Exception:
+        return False
+
+    try:
+        from tools.async_delegation import list_async_delegations
+
+        session_id = str(getattr(agent, "session_id", "") or "")
+        for record in list_async_delegations():
+            if (
+                record.get("status") in {"running", "finalizing"}
+                and str(record.get("parent_session_id") or "") == session_id
+            ):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def claim_review_completion(agent: Any, completion_id: str) -> Optional[Path]:
+    """Atomically claim a completion identifier for exactly-once review."""
+    if not getattr(agent, "_review_idempotent", False):
+        return Path()
+    if not completion_id:
+        return None
+
+    from hermes_cli.config import get_hermes_home
+
+    marker_dir = get_hermes_home() / "state" / "background-review-completions"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(completion_id.encode("utf-8")).hexdigest()
+    marker = marker_dir / f"{digest}.json"
+    payload = {
+        "completion_id": completion_id,
+        "session_id": str(getattr(agent, "session_id", "") or ""),
+        "status": "scheduled",
+        "scheduled_at": time.time(),
+    }
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return None
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return marker
+
+
+def mark_review_completion(marker: Optional[Path], status: str) -> None:
+    """Update only the review claim marker, never conversation state."""
+    if marker is None or marker == Path():
+        return
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["status"] = status
+        payload["updated_at"] = time.time()
+        temporary = marker.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, marker)
+    except Exception:
+        logger.debug("background review marker update failed", exc_info=True)
+
+
+def wait_until_review_idle(agent: Any) -> bool:
+    """Wait for foreground idleness up to the configured bounded deadline."""
+    if not getattr(agent, "_review_task_terminal_only", False):
+        return True
+    delay = max(
+        0.0,
+        float(getattr(agent, "_review_start_delay_seconds", 1.0)),
+    )
+    max_wait = max(
+        0.0,
+        float(getattr(agent, "_review_max_wait_seconds", 300.0)),
+    )
+    deadline = time.monotonic() + max_wait
+    if delay:
+        time.sleep(min(delay, max_wait))
+    while getattr(agent, "_foreground_turn_active", False):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1111,11 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "claim_review_completion",
+    "mark_review_completion",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
+    "task_is_terminal_for_review",
+    "wait_until_review_idle",
     "build_memory_write_metadata",
 ]

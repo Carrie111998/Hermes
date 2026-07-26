@@ -1696,7 +1696,8 @@ class AIAgent:
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
-    ) -> None:
+        completion_id: str = "",
+    ) -> bool:
         """Spawn the background memory/skill review thread.
 
         Thin wrapper — the heavy lifting lives in
@@ -1705,20 +1706,50 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
-        from agent.background_review import spawn_background_review_thread
+        from agent.background_review import (
+            claim_review_completion,
+            mark_review_completion,
+            spawn_background_review_thread,
+            wait_until_review_idle,
+        )
         from tools.thread_context import propagate_context_to_thread
+
+        marker = claim_review_completion(self, completion_id)
+        if marker is None:
+            logger.info(
+                "background review duplicate suppressed: completion=%s",
+                completion_id,
+            )
+            return False
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
         )
+
+        def _bounded_idle_review():
+            if not wait_until_review_idle(self):
+                mark_review_completion(marker, "skipped_active_timeout")
+                return
+            mark_review_completion(marker, "running")
+            try:
+                target()
+            except Exception:
+                mark_review_completion(marker, "failed")
+                raise
+            else:
+                mark_review_completion(marker, "completed")
+
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
         t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
+            target=propagate_context_to_thread(_bounded_idle_review),
+            daemon=True,
+            name="bg-review",
         )
         t.start()
+        return True
 
     def _build_memory_write_metadata(
         self,

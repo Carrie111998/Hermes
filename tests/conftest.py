@@ -581,28 +581,6 @@ def _wal_is_usable() -> bool:
         return True  # 3.44.x backport
     return False
 
-_PRE_CS01_WIP_DEBT_NODE_IDS = frozenset({
-    "tests/gateway/test_telegram_restart_resume_policy.py::"
-    "test_telegram_can_continue_interrupted_task_after_restart",
-    "tests/run_agent/test_post_task_review_lifecycle.py::"
-    "test_terminal_gate_rejects_active_todo",
-    "tests/run_agent/test_post_task_review_lifecycle.py::"
-    "test_terminal_gate_accepts_completed_task",
-    "tests/run_agent/test_post_task_review_lifecycle.py::"
-    "test_terminal_gate_rejects_active_process_and_delegation",
-    "tests/run_agent/test_post_task_review_lifecycle.py::"
-    "test_review_completion_is_claimed_once",
-    "tests/run_agent/test_post_task_review_lifecycle.py::"
-    "test_spawn_starts_once_for_duplicate_completion",
-    "tests/run_agent/test_post_task_review_lifecycle.py::"
-    "test_bounded_review_wait_refuses_active_turn",
-})
-_PRE_CS01_WIP_DEBT_REASON = (
-    "pre-CS-01 WIP debt; implementation parked in stash@{0} 85cc4ddbe; "
-    "see docs/known_debt/PRE_CS01_WIP_DEBT.md"
-)
-
-
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
     config.addinivalue_line(
@@ -628,7 +606,7 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
-    """Apply platform WAL skips and the documented pre-CS-01 quarantine.
+    """Skip ``requires_wal`` tests when the linked SQLite cannot use WAL.
 
     Cheaper and more honest than each test hand-rolling a version check: the
     reason string names the actual linked version so the skip is diagnosable
@@ -643,16 +621,6 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
         for item in items:
             if item.get_closest_marker(_REQUIRES_WAL_MARK) is not None:
                 item.add_marker(skip_marker)
-
-    for item in items:
-        if item.nodeid in _PRE_CS01_WIP_DEBT_NODE_IDS:
-            item.add_marker(
-                pytest.mark.xfail(
-                    strict=False,
-                    reason=_PRE_CS01_WIP_DEBT_REASON,
-                )
-            )
-
 
 @pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):

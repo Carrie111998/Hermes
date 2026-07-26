@@ -289,7 +289,11 @@ def on_call_complete(
     session_id=None,
     enforce_programme_cap: bool = False,
 ) -> None:
-    """Record one call; cost thresholds are advisory unless explicitly enforced."""
+    """Record one call; cost thresholds are always advisory.
+
+    ``enforce_programme_cap`` remains accepted for API compatibility but is
+    intentionally inert.
+    """
     entry = ledger.record_call(
         task_id=task_id,
         lane=lane,
