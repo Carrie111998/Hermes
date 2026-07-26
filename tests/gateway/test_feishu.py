@@ -305,7 +305,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         ]
         self.assertEqual(message_ids, ["evt_menu_1", "evt_menu_2"])
 
-    def test_newchat_command_creates_topic_and_dispatches_task_in_topic_session(self):
+    def test_thread_command_creates_topic_and_dispatches_task_in_topic_session(self):
         from gateway.platforms.base import MessageType
 
         adapter, _send_mock, handle_message_mock = self._bot_menu_adapter()
@@ -314,7 +314,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
         adapter._extract_message_content = AsyncMock(
             return_value=(
-                "/newchat 帮我整理电脑上的下载文件",
+                "/thread 帮我整理电脑上的下载文件",
                 MessageType.TEXT,
                 [],
                 [],
@@ -325,7 +325,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter._fetch_message_text = AsyncMock(return_value="Hermes 任务：整理下载文件")
         adapter._dispatch_inbound_event = AsyncMock()
         message = SimpleNamespace(
-            message_id="om_newchat",
+            message_id="om_thread",
             chat_id="oc_dm_chat",
             chat_type="p2p",
             thread_id=None,
@@ -341,14 +341,14 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 message=message,
                 sender_id=sender_id,
                 chat_type="p2p",
-                message_id="om_newchat",
+                message_id="om_thread",
             )
         )
 
         adapter._create_feishu_thread_seed.assert_awaited_once_with(
             "oc_dm_chat",
             "Hermes 任务：帮我整理电脑上的下载文件",
-            reply_to_message_id="om_newchat",
+            reply_to_message_id="om_thread",
         )
         event = adapter._dispatch_inbound_event.await_args.args[0]
         self.assertEqual(event.text, "帮我整理电脑上的下载文件")
@@ -363,7 +363,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             "agent:main:feishu:dm:oc_dm_chat:omt_task_topic",
         )
 
-    def test_newchat_allows_admin_via_tenant_user_id_when_open_id_also_exists(self):
+    def test_thread_allows_admin_via_tenant_user_id_when_open_id_also_exists(self):
         from gateway.platforms.base import MessageType
 
         adapter, _send_mock, _handle_message_mock = self._bot_menu_adapter()
@@ -392,7 +392,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
         adapter._extract_message_content = AsyncMock(
             return_value=(
-                "/newchat 帮我整理电脑上的下载文件",
+                "/thread 帮我整理电脑上的下载文件",
                 MessageType.TEXT,
                 [],
                 [],
@@ -403,7 +403,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter._fetch_message_text = AsyncMock(return_value="Hermes 任务：整理下载文件")
         adapter._dispatch_inbound_event = AsyncMock()
         message = SimpleNamespace(
-            message_id="om_newchat",
+            message_id="om_thread",
             chat_id="oc_dm_chat",
             chat_type="p2p",
             thread_id=None,
@@ -422,7 +422,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                     union_id=None,
                 ),
                 chat_type="p2p",
-                message_id="om_newchat",
+                message_id="om_thread",
             )
         )
 
@@ -430,14 +430,14 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         event = adapter._dispatch_inbound_event.await_args.args[0]
         self.assertEqual(event.source.user_id, "u_tenant_admin")
 
-    def test_newchat_denied_by_slash_policy_creates_no_topic_or_task(self):
+    def test_thread_denied_by_slash_policy_creates_no_topic_or_task(self):
         from gateway.platforms.base import MessageType
 
         adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
         adapter._create_feishu_thread_seed = AsyncMock()
         adapter._extract_message_content = AsyncMock(
             return_value=(
-                "/newchat 帮我整理电脑上的下载文件",
+                "/thread 帮我整理电脑上的下载文件",
                 MessageType.TEXT,
                 [],
                 [],
@@ -458,7 +458,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             _profile_name_for_source=Mock(return_value=None),
         )
         message = SimpleNamespace(
-            message_id="om_newchat",
+            message_id="om_thread",
             chat_id="oc_dm_chat",
             chat_type="p2p",
             thread_id=None,
@@ -471,26 +471,26 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 message=message,
                 sender_id=SimpleNamespace(open_id="ou_user"),
                 chat_type="p2p",
-                message_id="om_newchat",
+                message_id="om_thread",
             )
         )
 
         send_mock.assert_awaited_once_with(
             "oc_dm_chat",
-            "⛔ /newchat is admin-only here. Use /whoami to review your command access.",
-            reply_to="om_newchat",
+            "⛔ /thread is admin-only here. Use /whoami to review your command access.",
+            reply_to="om_thread",
         )
         adapter._create_feishu_thread_seed.assert_not_awaited()
         self.assertEqual(_handle_message_mock.await_count, 0)
 
-    def test_newchat_is_rejected_in_existing_thread(self):
+    def test_thread_is_rejected_in_existing_thread(self):
         from gateway.platforms.base import MessageType
 
         adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
         adapter._create_feishu_thread_seed = AsyncMock()
         adapter._extract_message_content = AsyncMock(
             return_value=(
-                "/newchat 帮我整理电脑上的下载文件",
+                "/thread 帮我整理电脑上的下载文件",
                 MessageType.TEXT,
                 [],
                 [],
@@ -498,7 +498,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
         )
         message = SimpleNamespace(
-            message_id="om_newchat",
+            message_id="om_thread",
             chat_id="oc_dm_chat",
             chat_type="p2p",
             thread_id="omt_existing",
@@ -511,29 +511,29 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 message=message,
                 sender_id=SimpleNamespace(open_id="ou_user"),
                 chat_type="p2p",
-                message_id="om_newchat",
+                message_id="om_thread",
             )
         )
 
         send_mock.assert_awaited_once_with(
             "oc_dm_chat",
-            "/newchat 只能从主私聊中创建；请回到主聊天后重试。",
-            reply_to="om_newchat",
+            "/thread 只能从主私聊中创建；请回到主聊天后重试。",
+            reply_to="om_thread",
             metadata={
                 "thread_id": "omt_existing",
-                "reply_to_message_id": "om_newchat",
+                "reply_to_message_id": "om_thread",
             },
         )
         adapter._create_feishu_thread_seed.assert_not_awaited()
 
-    def test_newchat_is_rejected_in_group_without_creating_topic(self):
+    def test_thread_is_rejected_in_group_without_creating_topic(self):
         from gateway.platforms.base import MessageType
 
         adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
         adapter._create_feishu_thread_seed = AsyncMock()
         adapter._extract_message_content = AsyncMock(
             return_value=(
-                "/newchat 帮我整理电脑上的下载文件",
+                "/thread 帮我整理电脑上的下载文件",
                 MessageType.TEXT,
                 [],
                 [],
@@ -541,7 +541,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
         )
         message = SimpleNamespace(
-            message_id="om_newchat",
+            message_id="om_thread",
             chat_id="oc_group",
             chat_type="group",
         )
@@ -552,27 +552,27 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 message=message,
                 sender_id=SimpleNamespace(open_id="ou_user"),
                 chat_type="group",
-                message_id="om_newchat",
+                message_id="om_thread",
             )
         )
 
         send_mock.assert_awaited_once_with(
             "oc_group",
-            "/newchat 目前只支持飞书机器人私聊。",
-            reply_to="om_newchat",
+            "/thread 目前只支持飞书机器人私聊。",
+            reply_to="om_thread",
         )
         adapter._create_feishu_thread_seed.assert_not_awaited()
 
-    def test_newchat_without_task_returns_usage_without_creating_topic(self):
+    def test_thread_without_task_returns_usage_without_creating_topic(self):
         from gateway.platforms.base import MessageType
 
         adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
         adapter._create_feishu_thread_seed = AsyncMock()
         adapter._extract_message_content = AsyncMock(
-            return_value=("/newchat", MessageType.TEXT, [], [], [])
+            return_value=("/thread", MessageType.TEXT, [], [], [])
         )
         message = SimpleNamespace(
-            message_id="om_newchat",
+            message_id="om_thread",
             chat_id="oc_dm_chat",
             chat_type="p2p",
         )
@@ -583,14 +583,14 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 message=message,
                 sender_id=SimpleNamespace(open_id="ou_user"),
                 chat_type="p2p",
-                message_id="om_newchat",
+                message_id="om_thread",
             )
         )
 
         send_mock.assert_awaited_once_with(
             "oc_dm_chat",
-            "用法：/newchat <任务描述>",
-            reply_to="om_newchat",
+            "用法：/thread <任务描述>",
+            reply_to="om_thread",
         )
         adapter._create_feishu_thread_seed.assert_not_awaited()
 

@@ -3480,8 +3480,8 @@ class FeishuAdapter(BasePlatformAdapter):
         forced_thread_id: Optional[str] = None
         forced_reply_to_message_id: Optional[str] = None
         normalized_command = text.strip()
-        newchat_match = re.match(r"^/newchat(?:\s+([\s\S]*))?$", normalized_command, re.IGNORECASE)
-        if inbound_type == MessageType.COMMAND and newchat_match:
+        thread_match = re.match(r"^/thread(?:\s+([\s\S]*))?$", normalized_command, re.IGNORECASE)
+        if inbound_type == MessageType.COMMAND and thread_match:
             chat_id = getattr(message, "chat_id", "") or ""
             # This provider-local command creates platform state before the
             # synthetic task reaches the normal runner, so enforce the same
@@ -3513,19 +3513,19 @@ class FeishuAdapter(BasePlatformAdapter):
             denied = bool(
                 policy is not None
                 and policy.enabled
-                and not policy.can_run(preliminary_source.user_id, "newchat")
+                and not policy.can_run(preliminary_source.user_id, "thread")
             )
             if denied:
                 await self.send(
                     chat_id,
-                    "⛔ /newchat is admin-only here. Use /whoami to review your command access.",
+                    "⛔ /thread is admin-only here. Use /whoami to review your command access.",
                     reply_to=message_id,
                 )
                 return
             if chat_type != "p2p":
                 await self.send(
                     chat_id,
-                    "/newchat 目前只支持飞书机器人私聊。",
+                    "/thread 目前只支持飞书机器人私聊。",
                     reply_to=message_id,
                 )
                 return
@@ -3537,7 +3537,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if existing_thread_id:
                 await self.send(
                     chat_id,
-                    "/newchat 只能从主私聊中创建；请回到主聊天后重试。",
+                    "/thread 只能从主私聊中创建；请回到主聊天后重试。",
                     reply_to=message_id,
                     metadata={
                         "thread_id": existing_thread_id,
@@ -3545,11 +3545,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     },
                 )
                 return
-            task_text = (newchat_match.group(1) or "").strip()
+            task_text = (thread_match.group(1) or "").strip()
             if not task_text:
                 await self.send(
                     getattr(message, "chat_id", "") or "",
-                    "用法：/newchat <任务描述>",
+                    "用法：/thread <任务描述>",
                     reply_to=message_id,
                 )
                 return

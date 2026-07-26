@@ -87,15 +87,15 @@ In **Events and Callbacks**:
 
 ### Start a Task in a Dedicated Topic
 
-In a Feishu/Lark direct chat, use `/newchat <task>` when the work should have its own conversation and scrollback:
+In a Feishu/Lark direct chat, use `/thread <task>` when the work should have its own conversation and scrollback:
 
 ```text
-/newchat Organize the files in my Downloads folder
+/thread Organize the files in my Downloads folder
 ```
 
-Hermes replies to that command in-thread, creating a new Feishu topic, and dispatches only the text after `/newchat` as the task. The generated `thread_id` is part of the Hermes session key, so progress messages, the final result, and later replies inside that topic share one isolated conversation. The parent DM session is not reused. If topic creation fails, Hermes reports the failure in the parent chat and does not start the task there.
+Hermes replies to that command in-thread, creating a new Feishu topic, and dispatches only the text after `/thread` as the task. The generated `thread_id` is part of the Hermes session key, so progress messages, the final result, and later replies inside that topic share one isolated conversation. The parent DM session is not reused. If topic creation fails, Hermes reports the failure in the parent chat and does not start the task there.
 
-Use `/newchat` for explicit task boundaries. Ordinary one-turn questions remain in the main chat; automatic promotion of arbitrary messages is intentionally not performed because Hermes cannot reliably know before execution whether a task will require multiple turns.
+Use `/thread` for explicit task boundaries. Ordinary one-turn questions remain in the main chat; automatic promotion of arbitrary messages is intentionally not performed because Hermes cannot reliably know before execution whether a task will require multiple turns.
 
 ### Bot Custom Menu Commands
 
