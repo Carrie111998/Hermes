@@ -1723,6 +1723,7 @@ registry.register(
         category=args.get("category"), task_id=kw.get("task_id")
     ),
     check_fn=check_skills_requirements,
+    is_read_only=True,
     emoji="📚",
 )
 def _skill_view_with_bump(args, **kw):
@@ -1756,5 +1757,6 @@ registry.register(
     schema=SKILL_VIEW_SCHEMA,
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
+    is_read_only=True,
     emoji="📚",
 )

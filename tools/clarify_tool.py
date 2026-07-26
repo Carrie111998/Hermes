@@ -187,5 +187,6 @@ registry.register(
         choices=args.get("choices"),
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
+    is_read_only=True,
     emoji="❓",
 )

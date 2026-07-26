@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
 # Read-only tools with no shared mutable session state.
+# Dynamically resolved from registry.is_read_only — tools declare
+# their own parallel-safety at registration time.
+# Keep the literal set as a fast-path cache (avoids registry import
+# at module level), but prefer the dynamic check below.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
     "ha_list_entities",
@@ -186,6 +190,14 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             continue
 
         if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
+            current.append(tool_call)
+            continue
+
+        # Dynamic check: tools marked is_read_only in the registry
+        # are also parallel-safe, even if not in the hardcoded set.
+        from tools.registry import registry as _registry
+        _entry = _registry.get_entry(tool_name)
+        if _entry is not None and _entry.is_read_only:
             current.append(tool_call)
             continue
 

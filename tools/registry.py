@@ -89,12 +89,12 @@ class ToolEntry:
 
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
-        "requires_env", "is_async", "description", "emoji",
+        "requires_env", "is_async", "is_read_only", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
-                 requires_env, is_async, description, emoji,
+                 requires_env, is_async, is_read_only, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None):
         self.name = name
         self.toolset = toolset
@@ -103,6 +103,7 @@ class ToolEntry:
         self.check_fn = check_fn
         self.requires_env = requires_env
         self.is_async = is_async
+        self.is_read_only = is_read_only
         self.description = description
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
@@ -371,6 +372,7 @@ class ToolRegistry:
         check_fn: Callable = None,
         requires_env: list = None,
         is_async: bool = False,
+        is_read_only: bool = False,
         description: str = "",
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
@@ -441,6 +443,7 @@ class ToolRegistry:
                 check_fn=check_fn,
                 requires_env=requires_env or [],
                 is_async=is_async,
+                is_read_only=is_read_only,
                 description=description or schema.get("description", ""),
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,

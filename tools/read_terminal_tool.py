@@ -90,5 +90,6 @@ registry.register(
         callback=kw.get("callback"),
     ),
     check_fn=check_read_terminal_requirements,
+    is_read_only=True,
     emoji="🖥️",
 )
