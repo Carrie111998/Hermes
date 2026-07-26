@@ -55,19 +55,21 @@ def main():
     engine = WorkflowEngine()
 
     if args.command == "start":
-        context = {}
+        context = None
         if args.context:
+            context = {}
             for pair in args.context:
                 k, v = pair.split("=", 1)
                 context[k] = v
-        inputs = {}
+        inputs = None
         if args.inputs:
+            inputs = {}
             for pair in args.inputs:
                 k, v = pair.split("=", 1)
                 inputs[k] = v
         engine.execute(args.workflow, context=context, start_node=args.node,
                       dry_run=args.dry_run, resume=args.resume,
-                      board=args.board, inputs=inputs or None,
+                      board=args.board, inputs=inputs,
                       run_id=args.run_id)
 
     elif args.command == "validate":
