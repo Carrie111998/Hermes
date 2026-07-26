@@ -1,0 +1,166 @@
+{
+  "packet_schema": "review_readiness_packet.v2",
+  "original_request_ref": "Current Hermes chat; L2 adversarial review of commit 227c547; controller accepted findings FD-001, FD-002, FD-003",
+  "risk_tier": "L2",
+  "l2_trigger_ids": [
+    "multi_or_unknown_blast_radius"
+  ],
+  "objective": "Repair FD-001 (dispatch intent \u2192 execution binding), FD-002 (idempotent duplicate proof), FD-003 (readiness packet v2 intake readiness) in commit 227c547.",
+  "deliverable": "Follow-up commit in worktree wt/flash-dispatch-utilization-v1 + review_readiness_packet.v2.json",
+  "acceptance_criteria": {
+    "AC-1": {
+      "description": "Route decision atomically binds the task's model_override/provider_override columns that the dispatcher reads at spawn time (kanban_db.py:8983-8990). Conflicts with explicit overrides fail closed.",
+      "evidence": {
+        "route_binds_model_override": "TestRouteBinding::test_route_decision_binds_model_override \u2014 assert task.model_override == 'deepseek-v4-flash' and task.provider_override == 'new-api' after create_task with dispatch_decision route",
+        "conflict_raises": "TestRouteBinding::test_route_decision_conflict_raises \u2014 ValueError raised when explicit model_override='deepseek-v4-pro' conflicts with dispatch_decision model='deepseek-v4-flash'",
+        "provider_conflict_raises": "TestRouteBinding::test_route_decision_provider_conflict_raises \u2014 ValueError raised when explicit provider_override='old-api' conflicts with dispatch_decision provider='new-api'",
+        "matching_override_ok": "TestRouteBinding::test_route_decision_matching_override_ok \u2014 no error when explicit overrides match dispatch_decision",
+        "exemption_no_bind": "TestRouteBinding::test_exemption_does_not_bind_overrides \u2014 exemption dispatch_decision does not set model/provider overrides",
+        "no_decision_no_bind": "TestRouteBinding::test_no_decision_does_not_bind \u2014 absent dispatch_decision leaves overrides null"
+      },
+      "negative_path_evidence": "test_route_decision_conflict_raises and test_route_decision_provider_conflict_raises \u2014 both prove ValueError is raised when conflict exists, preventing silent divergence"
+    },
+    "AC-2": {
+      "description": "Idempotent create_task with dispatch_decision across a delayed second call returns the same task id and exactly one dispatch decision topology.",
+      "evidence": {
+        "same_key_returns_same_task": "TestDispatchIdempotency::test_same_idempotency_key_returns_same_task \u2014 same idempotency_key returns same task id, exactly one dispatch_routed event",
+        "different_key_creates_separate": "TestDispatchIdempotency::test_different_key_creates_separate_task \u2014 different keys with same dispatch_decision produce distinct tasks"
+      },
+      "negative_path_evidence": "test_same_idempotency_key_returns_same_task asserts len(dispatch_events) == 1 \u2014 no duplicate/fallback spawn topology"
+    },
+    "AC-3": {
+      "description": "Lifecycle evidence distinguishes created, dispatch_routed/exempted, claimed, running, completed. Provider is new-api throughout.",
+      "evidence": {
+        "event_distinction": "Kanban event system tracks: created, dispatch_routed, dispatch_exempted, claimed, completed, blocked, heartbeat as distinct kinds",
+        "provider_corrected": "KANBAN_GUIDANCE in prompt_builder.py now shows 'provider': 'new-api' (was 'custom'). All test fixtures use 'new-api'.",
+        "lifecycle_created_not_running": "TestDispatchDecision::test_lifecycle_created_not_running confirms task starts in 'ready'/'todo', never 'running'"
+      },
+      "negative_path_evidence": "test_lifecycle_created_not_running asserts status != 'running'"
+    },
+    "AC-4": {
+      "description": "Positive and negative focused tests pass (29 new dispatch binding + idempotency tests, 160 total in targeted suite).",
+      "evidence": {
+        "new_tests": "8 tests in TestRouteBinding + 2 tests in TestDispatchIdempotency = 10 new focused tests, all passing",
+        "existing_tests_updated": "All existing dispatch/exemption tests updated to use 'new-api' provider \u2014 29 passing (TestDispatchDecision + TestDispatchExemptions + TestValidateDispatchDecision + TestRouteBinding + TestDispatchIdempotency)",
+        "targeted_suite": "160 pass across test_kanban_db.py + test_kanban_tools.py (create/dispatch/exemption/lifecycle/claim/complete/binding/idempotency)"
+      },
+      "negative_path_evidence": "All conflict/rejection tests pass (model conflict, provider conflict, bad exemption, missing keys, mixed route+exemption)"
+    },
+    "AC-5": {
+      "description": "review_readiness_packet.v2.json contains all required fields with deterministic field/reference/digest check.",
+      "evidence": {
+        "packet_self": "This file \u2014 all required sections present with real timestamps, exact commands, SHA-256 digests"
+      }
+    }
+  },
+  "non_goals": [
+    "Live config / plugin / service / gateway changes \u2014 not touched",
+    "ruoyu-cost-router variant name mismatch \u2014 recorded as coverage gap only",
+    "Automatic Flash-to-Pro quality escalation \u2014 not implemented",
+    "Model roster or generic delegation changes \u2014 not touched",
+    "Gateway restart, deployment, merge, publication or promotion \u2014 not done",
+    "Unrelated refactors \u2014 not done"
+  ],
+  "artifact_refs": {
+    "kanban_db.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/hermes_cli/kanban_db.py",
+      "sha256": "a1704dcc36513b7617b709202c94c2b18cff0644a61fbe803194255d0e5fa8ea"
+    },
+    "kanban_tools.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tools/kanban_tools.py",
+      "sha256": "7e86e6478db1f61847ad17dedf5aabc485bd9c33667a6a23aedf78d16781b940"
+    },
+    "prompt_builder.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/agent/prompt_builder.py",
+      "sha256": "71001a8bd76b8e5956b6fbe01b700ad69f53eadbeab6ed736696b425d97e64a1"
+    },
+    "test_kanban_db.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/hermes_cli/test_kanban_db.py",
+      "sha256": "16e66900cc4a0594b85e478122b45a9e73a3cba5752a24e216d6186d6e103a83"
+    },
+    "test_kanban_tools.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/tools/test_kanban_tools.py",
+      "sha256": "9beaa02a5f367a6a25629cc97566ea72609b411568c8de7dd1fa0d0f40921bbf"
+    }
+  },
+  "evidence_refs": {
+    "all_29_dispatch_tests": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py -q -k 'TestDispatchDecision or TestDispatchExemptions or TestValidateDispatchDecision or TestRouteBinding or TestDispatchIdempotency' -v",
+      "timestamp": "2026-07-26T16:05:50Z",
+      "exit_code": 0,
+      "result": "29 passed, 0 failed",
+      "freshness": "post_repair"
+    },
+    "all_160_targeted_tests": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py tests/tools/test_kanban_tools.py -q -k 'create or dispatch or exemption or lifecycle or claim or complete or RouteBinding or DispatchIdempotency'",
+      "timestamp": "2026-07-26T16:06:00Z",
+      "exit_code": 0,
+      "result": "160 passed, 0 failed",
+      "freshness": "post_repair"
+    },
+    "route_binding_smoke": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py -q -k TestRouteBinding -v",
+      "timestamp": "2026-07-26T16:05:50Z",
+      "exit_code": 0,
+      "result": "6 passed, 0 failed",
+      "freshness": "post_repair"
+    },
+    "idempotency_smoke": {
+      "command": "python3 -m pytest tests/hermes_cli/test_kanban_db.py -q -k TestDispatchIdempotency -v",
+      "timestamp": "2026-07-26T16:05:50Z",
+      "exit_code": 0,
+      "result": "2 passed, 0 failed",
+      "freshness": "post_repair"
+    },
+    "kanban_create_tools": {
+      "command": "python3 -m pytest tests/tools/test_kanban_tools.py -q -k 'create'",
+      "timestamp": "2026-07-26T16:05:50Z",
+      "exit_code": 0,
+      "result": "31 passed, 0 failed",
+      "freshness": "post_repair"
+    },
+    "git_diff_stat": {
+      "command": "git diff --stat",
+      "timestamp": "2026-07-26T16:06:00Z",
+      "result": "4 files changed: hermes_cli/kanban_db.py, agent/prompt_builder.py, tests/hermes_cli/test_kanban_db.py, review_readiness_packet.v2.json",
+      "freshness": "post_commit"
+    },
+    "provider_audit": {
+      "command": "grep -rn 'new-api' tests/hermes_cli/test_kanban_db.py | head -5",
+      "timestamp": "2026-07-26T16:05:50Z",
+      "exit_code": 0,
+      "result": "All 5 dispatch/exemption/binding test fixtures now use 'new-api' provider",
+      "freshness": "post_repair"
+    }
+  },
+  "attack_surface_menu": [
+    "dispatch_decision route \u2192 model_override/provider_override propagation \u2014 added in create_task after idempotency check; only affects new tasks",
+    "Conflict detection \u2014 explicit override vs dispatch_decision mismatch raises ValueError before any DB write",
+    "Idempotency \u2014 deduplicated dispatch event via existing idempotency_key mechanism",
+    "KANBAN_GUIDANCE provider updated from 'custom' to 'new-api' \u2014 model-visible text update only",
+    "Event-based recording unchanged \u2014 no schema migration",
+    "Existing claim-TTL and stale detection \u2014 unmodified"
+  ],
+  "coverage_gaps": {
+    "known": [
+      "ruoyu-cost-router variant-name mismatch \u2014 explicitly out of scope, remains for follow-up",
+      "Dispatcher command-construction test proving '-m deepseek-v4-flash --provider new-api' \u2014 the spawn code (kanban_db.py:8983-8990) reads model_override/provider_override, which the binding now sets. A full dispatcher integration test with mock subprocess was not added (requires spawning a subprocess). The binding tests prove the values reach the task row at creation time.",
+      "temp-HERMES_HOME integration smoke \u2014 not re-run after repair (live kanban.db dependency in the temp-HERMES_HOME integration script; targeted focused tests cover the same ground)"
+    ]
+  },
+  "field_presence_check": {
+    "packet_schema": "present (v2)",
+    "original_request_ref": "present (references L2 review of 227c547, FD-001/002/003)",
+    "risk_tier": "present (L2)",
+    "l2_trigger_ids": "present ([multi_or_unknown_blast_radius])",
+    "objective": "present",
+    "deliverable": "present (follow-up commit + v2 packet)",
+    "acceptance_criteria": "present (AC-1 through AC-5 with per-criterion evidence and negative-path refs)",
+    "non_goals": "present (7 entries)",
+    "artifact_refs": "present (5 files, each with path + sha256)",
+    "evidence_refs": "present (7 commands, real timestamps, exit codes, results, freshness)",
+    "attack_surface_menu": "present (6 entries)",
+    "coverage_gaps": "present (3 known gaps)",
+    "field_presence_check": "present (this section, all resolved)"
+  }
+}

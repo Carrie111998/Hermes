@@ -3137,6 +3137,41 @@ def create_task(
         if row:
             return row["id"]
 
+    # -----------------------------------------------------------------------
+    # Atomic dispatch-route → execution binding
+    # -----------------------------------------------------------------------
+    # When dispatch_decision contains a route with model/provider, propagate
+    # those values into model_override and provider_override so the task row
+    # carries the exact fields the dispatcher reads at spawn time
+    # (kanban_db.py:8983-8990). This ensures a route decision atomically and
+    # consistently binds the worker's model/provider at creation time, rather
+    # than recording intent as an event while leaving the task's override
+    # columns unset (gap FD-001).
+    #
+    # If the caller explicitly passed model_override/provider_override that
+    # conflict with the dispatch_decision values, fail closed with ValueError
+    # so the caller must resolve the inconsistency before creating the task.
+    if dispatch_decision is not None:
+        validate_dispatch_decision(dispatch_decision)
+        if "route" in dispatch_decision:
+            dd_model = str(dispatch_decision["model"]).strip()
+            dd_provider = str(dispatch_decision["provider"]).strip()
+            if model_override is not None and model_override != dd_model:
+                raise ValueError(
+                    f"dispatch_decision route model {dd_model!r} conflicts with "
+                    f"explicit model_override {model_override!r}. Either remove "
+                    f"the explicit override or align dispatch_decision."
+                )
+            if provider_override is not None and provider_override != dd_provider:
+                raise ValueError(
+                    f"dispatch_decision route provider {dd_provider!r} conflicts with "
+                    f"explicit provider_override {provider_override!r}. Either remove "
+                    f"the explicit override or align dispatch_decision."
+                )
+            model_override = dd_model
+            provider_override = dd_provider
+    # --- end propagation ---
+
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the

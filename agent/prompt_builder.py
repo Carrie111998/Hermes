@@ -281,7 +281,7 @@ KANBAN_GUIDANCE = (
     "\n"
     "* To **route** work to a worker profile: "
     "``dispatch_decision={\"route\": \"worker-terra\", "
-    "\"model\": \"deepseek-v4-flash\", \"provider\": \"custom\"}``. "
+    "\"model\": \"deepseek-v4-flash\", \"provider\": \"new-api\"}``. "
     "The ``model`` and ``provider`` keys are REQUIRED when routing — they "
     "tell the dispatcher which model to pin the worker to.\n"
     "* To **keep** work without dispatching (exemption): "

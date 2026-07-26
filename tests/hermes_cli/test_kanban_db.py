@@ -5019,7 +5019,7 @@ class TestDispatchDecision:
                 dispatch_decision={
                     "route": "worker-terra",
                     "model": "deepseek-v4-flash",
-                    "provider": "custom",
+                    "provider": "new-api",
                 },
             )
             events = kb.list_events(conn, tid)
@@ -5031,7 +5031,7 @@ class TestDispatchDecision:
         assert routed[0].payload == {
             "route": "worker-terra",
             "model": "deepseek-v4-flash",
-            "provider": "custom",
+            "provider": "new-api",
         }
 
     def test_exemption_decision_records_dispatch_exempted_event(self, kanban_home):
@@ -5068,7 +5068,7 @@ class TestDispatchDecision:
                 dispatch_decision={
                     "route": "worker-terra",
                     "model": "deepseek-v4-flash",
-                    "provider": "custom",
+                    "provider": "new-api",
                 },
             )
             events = kb.list_events(conn, tid)
@@ -5167,7 +5167,7 @@ class TestDispatchExemptions:
                         "route": "worker-terra",
                         "exemption": "tiny",
                         "model": "deepseek-v4-flash",
-                        "provider": "custom",
+                        "provider": "new-api",
                     },
                 )
 
@@ -5230,7 +5230,7 @@ class TestValidateDispatchDecision:
         kb.validate_dispatch_decision({
             "route": "worker-terra",
             "model": "deepseek-v4-flash",
-            "provider": "custom",
+            "provider": "new-api",
         })
 
     def test_valid_exemption_passes(self):
@@ -5255,3 +5255,183 @@ class TestValidateDispatchDecision:
     def test_bad_exemption_keyword(self):
         with pytest.raises(ValueError, match="unknown exemption"):
             kb.validate_dispatch_decision({"exemption": "made_up"})
+
+
+# ---------------------------------------------------------------------------
+# FD-001: Route decision binding — dispatch_decision must atomically set
+# model_override/provider_override, and conflict with explicit overrides
+# must fail closed.
+# ---------------------------------------------------------------------------
+
+
+class TestRouteBinding:
+    """dispatch_decision route must bind the task model/provider fields
+    that the dispatcher reads at spawn time (kanban_db.py:8983-8990)."""
+
+    def test_route_decision_binds_model_override(self, kanban_home):
+        """Route dispatch_decision propagates model to model_override."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="binding test",
+                assignee="worker-terra",
+                dispatch_decision={
+                    "route": "worker-terra",
+                    "model": "deepseek-v4-flash",
+                    "provider": "new-api",
+                },
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.model_override == "deepseek-v4-flash", (
+            f"Expected model_override='deepseek-v4-flash', "
+            f"got {task.model_override!r}"
+        )
+        assert task.provider_override == "new-api", (
+            f"Expected provider_override='new-api', "
+            f"got {task.provider_override!r}"
+        )
+
+    def test_route_decision_conflict_raises(self, kanban_home):
+        """Conflicting explicit model_override and dispatch_decision raises."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="conflicts with"):
+                kb.create_task(
+                    conn,
+                    title="conflict test",
+                    assignee="worker-terra",
+                    model_override="deepseek-v4-pro",
+                    dispatch_decision={
+                        "route": "worker-terra",
+                        "model": "deepseek-v4-flash",
+                        "provider": "new-api",
+                    },
+                )
+
+    def test_route_decision_provider_conflict_raises(self, kanban_home):
+        """Conflicting explicit provider_override raises ValueError."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="conflicts with"):
+                kb.create_task(
+                    conn,
+                    title="provider conflict",
+                    assignee="worker-terra",
+                    model_override="deepseek-v4-flash",
+                    provider_override="old-api",
+                    dispatch_decision={
+                        "route": "worker-terra",
+                        "model": "deepseek-v4-flash",
+                        "provider": "new-api",
+                    },
+                )
+
+    def test_route_decision_matching_override_ok(self, kanban_home):
+        """Explicit override matching dispatch_decision is not a conflict."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="matching test",
+                assignee="worker-terra",
+                model_override="deepseek-v4-flash",
+                provider_override="new-api",
+                dispatch_decision={
+                    "route": "worker-terra",
+                    "model": "deepseek-v4-flash",
+                    "provider": "new-api",
+                },
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.model_override == "deepseek-v4-flash"
+        assert task.provider_override == "new-api"
+
+    def test_exemption_does_not_bind_overrides(self, kanban_home):
+        """Exemption dispatch_decision must NOT set model/provider overrides."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="exemption no bind",
+                dispatch_decision={"exemption": "tiny"},
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.model_override is None
+        assert task.provider_override is None
+
+    def test_no_decision_does_not_bind(self, kanban_home):
+        """No dispatch_decision leaves model/provider override columns null."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="no decision bind")
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.model_override is None
+        assert task.provider_override is None
+
+
+# ---------------------------------------------------------------------------
+# FD-002: Idempotent dispatch duplicate test — same idempotency_key across a
+# delayed second call must return the same task and produce exactly one
+# dispatch decision topology, no fallback/duplicate spawn.
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchIdempotency:
+    """Idempotent create_task with dispatch_decision must deduplicate."""
+
+    def test_same_idempotency_key_returns_same_task(self, kanban_home):
+        """Second create with same idempotency_key returns existing task id."""
+        decision = {
+            "route": "worker-terra",
+            "model": "deepseek-v4-flash",
+            "provider": "new-api",
+        }
+        with kb.connect() as conn:
+            tid1 = kb.create_task(
+                conn,
+                title="dedup test",
+                assignee="worker-terra",
+                idempotency_key="dup-key-001",
+                dispatch_decision=decision,
+            )
+            # Second call with same key — should return same id
+            tid2 = kb.create_task(
+                conn,
+                title="dedup test (duplicate)",
+                assignee="worker-terra",
+                idempotency_key="dup-key-001",
+                dispatch_decision=decision,
+            )
+            events = kb.list_events(conn, tid1)
+        assert tid1 == tid2, (
+            f"Idempotent create must return same id; "
+            f"got {tid1} vs {tid2}"
+        )
+        dispatch_events = [e for e in events if e.kind == "dispatch_routed"]
+        assert len(dispatch_events) == 1, (
+            f"Expected exactly one dispatch_routed event, "
+            f"got {len(dispatch_events)}: {[e.payload for e in dispatch_events]}"
+        )
+
+    def test_different_key_creates_separate_task(self, kanban_home):
+        """Same dispatch_decision with different keys creates distinct tasks."""
+        decision = {
+            "route": "worker-terra",
+            "model": "deepseek-v4-flash",
+            "provider": "new-api",
+        }
+        with kb.connect() as conn:
+            tid1 = kb.create_task(
+                conn,
+                title="sep-1",
+                assignee="worker-terra",
+                idempotency_key="dup-key-a",
+                dispatch_decision=decision,
+            )
+            tid2 = kb.create_task(
+                conn,
+                title="sep-2",
+                assignee="worker-terra",
+                idempotency_key="dup-key-b",
+                dispatch_decision=decision,
+            )
+        assert tid1 != tid2, "Different keys must produce distinct tasks"
