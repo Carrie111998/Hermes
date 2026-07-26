@@ -163,7 +163,10 @@ def test_resolve_normalizes_both_roots(monkeypatch):
     monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "/repo/sub/..")
     monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "/repo/./")
 
-    assert git_probe.resolve("/repo/x") == {"repo_root": "/repo", "worktree_root": "/repo"}
+    # Build the expected spelling through normpath so this holds on Windows too,
+    # where os.path.normpath renders "/repo" as "\\repo" (issue #71837 target).
+    expected = os.path.normpath("/repo")
+    assert git_probe.resolve("/repo/x") == {"repo_root": expected, "worktree_root": expected}
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific regression (issue #71837)")
@@ -192,9 +195,13 @@ def test_resolve_preserves_distinct_worktree_root(monkeypatch):
     monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "/home/u/repo/../repo-wt")
     monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "/home/u/repo")
 
+    # Construct expected paths via normpath so they match on Windows too, where
+    # the separator flips and "/home/u/..." becomes "\\home\\u\\...".
+    expected_repo = os.path.normpath("/home/u/repo")
+    expected_wt = os.path.normpath("/home/u/repo-wt")
     info = git_probe.resolve("/home/u/repo-wt")
 
-    assert info == {"repo_root": "/home/u/repo", "worktree_root": "/home/u/repo-wt"}
+    assert info == {"repo_root": expected_repo, "worktree_root": expected_wt}
     assert info["worktree_root"] != info["repo_root"]
 
 
