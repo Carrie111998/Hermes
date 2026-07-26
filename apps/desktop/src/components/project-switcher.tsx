@@ -67,70 +67,82 @@ export function ProjectSwitcherDialog({
             <CommandInput onValueChange={setSearch} placeholder={copy.searchPlaceholder} value={search} />
             <CommandList className="max-h-[min(24rem,60vh)]">
               <CommandEmpty>{copy.empty}</CommandEmpty>
-              <CommandGroup
-                className="**:[[cmdk-group-heading]]:uppercase **:[[cmdk-group-heading]]:tracking-wider **:[[cmdk-group-heading]]:text-[0.6875rem] **:[[cmdk-group-heading]]:text-muted-foreground/70"
-                heading={copy.recentHeading}
-              >
-                {rows.map(row => {
-                  const label = projectPathLabel(row.path)
-                  const isActive = row.path === activeCwd
+              {/* cmdk's CommandEmpty only fires when NOTHING matches, and the
+                  "Open folder…" row below ALWAYS matches — so on a first run it
+                  never renders, leaving a "Recent projects" heading with nothing
+                  under it. Own the first-run empty state here instead, and drop
+                  the heading when there is nothing to head. Gated on an empty
+                  query so a search that matches nothing stays CommandEmpty's
+                  job and the two can never both show. */}
+              {rows.length === 0 && search === '' && (
+                <div className="px-3 py-6 text-center text-sm text-muted-foreground">{copy.empty}</div>
+              )}
+              {rows.length > 0 && (
+                <CommandGroup
+                  className="**:[[cmdk-group-heading]]:uppercase **:[[cmdk-group-heading]]:tracking-wider **:[[cmdk-group-heading]]:text-[0.6875rem] **:[[cmdk-group-heading]]:text-muted-foreground/70"
+                  heading={copy.recentHeading}
+                >
+                  {rows.map(row => {
+                    const label = projectPathLabel(row.path)
+                    const isActive = row.path === activeCwd
 
-                  return (
-                    <CommandItem
-                      className="gap-2.5"
-                      key={row.path}
-                      onSelect={() => {
-                        // A folder we've already proven gone must never
-                        // re-anchor a session's tools at a dead path.
-                        if (row.missing) {
-                          return
-                        }
+                    return (
+                      <CommandItem
+                        className="gap-2.5"
+                        key={row.path}
+                        onSelect={() => {
+                          // A folder we've already proven gone must never
+                          // re-anchor a session's tools at a dead path.
+                          if (row.missing) {
+                            return
+                          }
 
-                        onSelect(row.path)
-                        onOpenChange(false)
-                      }}
-                      value={`${label} ${row.path}`}
-                    >
-                      <FolderOpen
-                        className={cn('size-4 shrink-0 text-muted-foreground', row.missing && 'opacity-50')}
-                      />
-                      <span className="flex min-w-0 flex-col leading-snug">
-                        <span className={cn('truncate', row.missing && 'text-muted-foreground line-through')}>
-                          {label}
-                        </span>
-                        <span className="truncate text-xs text-muted-foreground/70">
-                          {row.missing ? copy.missingHint : row.path}
-                        </span>
-                      </span>
-                      {row.missing && (
-                        <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-                          <AlertTriangle className="size-3.5" />
-                          {copy.missingBadge}
-                        </span>
-                      )}
-                      {isActive && !row.missing && (
-                        <span className="ml-auto size-1.5 shrink-0 rounded-full bg-foreground/70" />
-                      )}
-                      <button
-                        aria-label={copy.remove}
-                        className={cn(
-                          'shrink-0 rounded p-1 text-muted-foreground/60 hover:text-foreground',
-                          !row.missing && !isActive && 'ml-auto'
-                        )}
-                        onClick={event => {
-                          // The row owns Enter/click; removing must not also switch.
-                          event.stopPropagation()
-                          forgetRecentProject(row.path)
+                          onSelect(row.path)
+                          onOpenChange(false)
                         }}
-                        title={copy.remove}
-                        type="button"
+                        value={`${label} ${row.path}`}
                       >
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    </CommandItem>
-                  )
-                })}
-              </CommandGroup>
+                        <FolderOpen
+                          className={cn('size-4 shrink-0 text-muted-foreground', row.missing && 'opacity-50')}
+                        />
+                        <span className="flex min-w-0 flex-col leading-snug">
+                          <span className={cn('truncate', row.missing && 'text-muted-foreground line-through')}>
+                            {label}
+                          </span>
+                          <span className="truncate text-xs text-muted-foreground/70">
+                            {row.missing ? copy.missingHint : row.path}
+                          </span>
+                        </span>
+                        {row.missing && (
+                          <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+                            <AlertTriangle className="size-3.5" />
+                            {copy.missingBadge}
+                          </span>
+                        )}
+                        {isActive && !row.missing && (
+                          <span className="ml-auto size-1.5 shrink-0 rounded-full bg-foreground/70" />
+                        )}
+                        <button
+                          aria-label={copy.remove}
+                          className={cn(
+                            'shrink-0 rounded p-1 text-muted-foreground/60 hover:text-foreground',
+                            !row.missing && !isActive && 'ml-auto'
+                          )}
+                          onClick={event => {
+                            // The row owns Enter/click; removing must not also switch.
+                            event.stopPropagation()
+                            forgetRecentProject(row.path)
+                          }}
+                          title={copy.remove}
+                          type="button"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </CommandItem>
+                    )
+                  })}
+                </CommandGroup>
+              )}
               <CommandGroup>
                 <CommandItem
                   className="gap-2.5"
