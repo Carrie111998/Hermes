@@ -10,6 +10,8 @@ Validates that the enforcement middleware:
 - Captures kanban_create dispatch decisions via post_tool_call
 - Verifies durable task state via DB readback (mocked in unit tests)
 - Is a no-op when enforcement disabled (default)
+- (FD-016) Verifies dispatch_routed/dispatch_exempted events with real DB
+- (FD-017) Passes board parameter through to DB readback
 """
 
 from __future__ import annotations
@@ -484,11 +486,13 @@ class TestTurnBoundaries:
 
     def test_reset_enforcement_state(self, enforcement_on):
         """reset_all_state clears all sessions."""
-        state_a, _ = ke._get_or_create_state("a")
-        state_a.record_route("t_a", "worker-terra", "deepseek-v4-flash", "new-api", 0)
+        ke.advance_turn_for("a")
+        state_a, turn_a = ke._get_or_create_state("a")
+        state_a.record_route("t_a", "worker-terra", "deepseek-v4-flash", "new-api", turn_a)
 
-        state_b, _ = ke._get_or_create_state("b")
-        state_b.record_exemption("tiny", 0)
+        ke.advance_turn_for("b")
+        state_b, turn_b = ke._get_or_create_state("b")
+        state_b.record_exemption("tiny", turn_b)
 
         assert ke.dispatch_enforcement_is_established("a")
         assert ke.dispatch_enforcement_is_established("b")
@@ -561,3 +565,240 @@ class TestEnforcementSummary:
         summary = ke.dispatch_enforcement_summary()
         assert summary["established"] is True
         assert summary["exemption_keyword"] == "security_critical"
+
+
+# ---------------------------------------------------------------------------
+# FD-016 / FD-017: Durable event verification with real DB
+# ---------------------------------------------------------------------------
+
+
+def _insert_task_row(conn, task_id, assignee="worker-terra",
+                     model_override=None, provider_override=None):
+    import time
+    now = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO tasks (id, title, assignee, status, created_by,"
+        " workspace_kind, created_at, model_override, provider_override)"
+        " VALUES (?, ?, ?, 'ready', 'test', 'scratch', ?, ?, ?)",
+        (task_id, "Test " + task_id, assignee, now,
+         model_override, provider_override),
+    )
+    conn.commit()
+
+
+def _insert_event(conn, task_id, kind, payload):
+    import time
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, kind, json.dumps(payload), now),
+    )
+    conn.commit()
+
+
+class TestDurableEventVerification:
+    """FD-016 / FD-017: Durable event verification with real SQLite DB."""
+
+    def _db(self):
+        import sqlite3
+        from hermes_cli import kanban_db as kdb
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(kdb.SCHEMA_SQL)
+        conn.commit()
+        return conn
+
+    def test_route_verifies_dispatch_routed(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_r01", "worker-terra",
+                         model_override="deepseek-v4-flash",
+                         provider_override="new-api")
+        _insert_event(conn, "t_r01", "dispatch_routed",
+                      {"route": "worker-terra", "model": "deepseek-v4-flash",
+                       "provider": "new-api"})
+        with patch("hermes_cli.kanban_db.connect", return_value=conn):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_r01", "worker-terra", "deepseek-v4-flash", "new-api", None,
+            ) is True
+        conn.close()
+
+    def test_route_missing_event_fails(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_r02", "worker-terra",
+                         model_override="deepseek-v4-flash",
+                         provider_override="new-api")
+        with patch("hermes_cli.kanban_db.connect", return_value=conn):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_r02", "worker-terra", "deepseek-v4-flash", "new-api", None,
+            ) is False
+        conn.close()
+
+    def test_route_wrong_event_kind_fails(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_r03", "worker-terra",
+                         model_override="deepseek-v4-flash",
+                         provider_override="new-api")
+        _insert_event(conn, "t_r03", "dispatch_exempted", {"exemption": "tiny"})
+        with patch("hermes_cli.kanban_db.connect", return_value=conn):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_r03", "worker-terra", "deepseek-v4-flash", "new-api", None,
+            ) is False
+        conn.close()
+
+    def test_exemption_verifies_dispatch_exempted(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_e01", "worker-terra")
+        _insert_event(conn, "t_e01", "dispatch_exempted", {"exemption": "tiny"})
+        with patch("hermes_cli.kanban_db.connect", return_value=conn):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_e01", None, None, None, "tiny",
+            ) is True
+        conn.close()
+
+    def test_exemption_wrong_event_kind_fails(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_e02", "worker-terra")
+        _insert_event(conn, "t_e02", "dispatch_routed",
+                      {"route": "worker-terra", "model": "deepseek-v4-flash",
+                       "provider": "new-api"})
+        with patch("hermes_cli.kanban_db.connect", return_value=conn):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_e02", None, None, None, "tiny",
+            ) is False
+        conn.close()
+
+    def test_exemption_keyword_mismatch_fails(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_e03", "worker-terra")
+        _insert_event(conn, "t_e03", "dispatch_exempted",
+                      {"exemption": "controller_judgment"})
+        with patch("hermes_cli.kanban_db.connect", return_value=conn):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_e03", None, None, None, "tiny",
+            ) is False
+        conn.close()
+
+    def test_exemption_missing_event_fails(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_e04", "worker-terra")
+        with patch("hermes_cli.kanban_db.connect", return_value=conn):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_e04", None, None, None, "tiny",
+            ) is False
+        conn.close()
+
+    def test_board_passed_to_connect(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_board01", "worker-terra",
+                         model_override="deepseek-v4-flash",
+                         provider_override="new-api")
+        _insert_event(conn, "t_board01", "dispatch_routed",
+                      {"route": "worker-terra", "model": "deepseek-v4-flash",
+                       "provider": "new-api"})
+        with patch("hermes_cli.kanban_db.connect",
+                   return_value=conn) as mock_connect:
+            assert ke._verify_dispatch_decision_from_db(
+                "t_board01", "worker-terra", "deepseek-v4-flash", "new-api", None,
+                board="my-custom-board",
+            ) is True
+            mock_connect.assert_called_once_with(board="my-custom-board")
+        conn.close()
+
+    def test_wrong_board_task_not_found(self, enforcement_on):
+        import sqlite3
+        from hermes_cli import kanban_db as kdb
+        conn_a = sqlite3.connect(":memory:")
+        conn_a.row_factory = sqlite3.Row
+        conn_a.executescript(kdb.SCHEMA_SQL)
+        conn_a.commit()
+        _insert_task_row(conn_a, "t_cross", "worker-terra",
+                         model_override="deepseek-v4-flash",
+                         provider_override="new-api")
+        _insert_event(conn_a, "t_cross", "dispatch_routed",
+                      {"route": "worker-terra", "model": "deepseek-v4-flash",
+                       "provider": "new-api"})
+        conn_b = sqlite3.connect(":memory:")
+        conn_b.row_factory = sqlite3.Row
+        conn_b.executescript(kdb.SCHEMA_SQL)
+        conn_b.commit()
+
+        def _fake_connect(board=None):
+            if board == "board-a":
+                return conn_a
+            return conn_b
+
+        with patch("hermes_cli.kanban_db.connect",
+                   side_effect=_fake_connect):
+            assert ke._verify_dispatch_decision_from_db(
+                "t_cross", "worker-terra", "deepseek-v4-flash", "new-api", None,
+                board="board-b",
+            ) is False
+        conn_a.close()
+        conn_b.close()
+
+    def test_correct_board_finds_task(self, enforcement_on):
+        conn = self._db()
+        _insert_task_row(conn, "t_board_ok", "worker-terra",
+                         model_override="deepseek-v4-flash",
+                         provider_override="new-api")
+        _insert_event(conn, "t_board_ok", "dispatch_routed",
+                      {"route": "worker-terra", "model": "deepseek-v4-flash",
+                       "provider": "new-api"})
+        with patch("hermes_cli.kanban_db.connect",
+                   return_value=conn) as mock_connect:
+            assert ke._verify_dispatch_decision_from_db(
+                "t_board_ok", "worker-terra", "deepseek-v4-flash", "new-api", None,
+                board="correct-board",
+            ) is True
+            mock_connect.assert_called_once_with(board="correct-board")
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# FD-018: Hook registration via PluginContext
+# ---------------------------------------------------------------------------
+
+
+class TestHookRegistration:
+    """register_enforcement_hooks via PluginContext registers all 5 hooks."""
+
+    def test_registers_all_hooks(self):
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        pm = PluginManager()
+        m = PluginManifest(name="kanban-enforcement", version="1.0.0",
+                           source="bundled", kind="standalone")
+        ke._registered = False
+        ke.register_enforcement_hooks(PluginContext(manifest=m, manager=pm))
+        assert ke._registered is True
+        for hook_name in ("pre_tool_call", "post_tool_call", "post_llm_call",
+                          "on_session_start", "on_session_end"):
+            assert hook_name in pm._hooks, f"{hook_name} should be registered"
+
+    def test_registration_idempotent(self):
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        pm = PluginManager()
+        m = PluginManifest(name="kanban-enforcement", version="1.0.0",
+                           source="bundled", kind="standalone")
+        ke._registered = False
+        ke.register_enforcement_hooks(PluginContext(manifest=m, manager=pm))
+        pre = dict(pm._hooks)
+        ke.register_enforcement_hooks(PluginContext(manifest=m, manager=pm))
+        assert ke._registered is True
+        assert dict(pm._hooks) == pre, "no double-registration"
+
+    def test_session_start_cleanup(self, enforcement_on):
+        ke.advance_turn_for("test_sesh")
+        s, _ = ke._get_or_create_state("test_sesh")
+        s.record_route("t_stale", "worker-terra", "deepseek-v4-flash", "new-api", 0)
+        assert ke.dispatch_enforcement_is_established("test_sesh")
+        ke._on_session_start_enforcement(session_id="test_sesh")
+        assert not ke.dispatch_enforcement_is_established("test_sesh")
+
+    def test_session_end_cleanup(self, enforcement_on):
+        ke.advance_turn_for("test_endsesh")
+        s, _ = ke._get_or_create_state("test_endsesh")
+        s.record_route("t_end", "worker-terra", "deepseek-v4-flash", "new-api", 0)
+        assert ke.dispatch_enforcement_is_established("test_endsesh")
+        ke._on_session_end_enforcement(session_id="test_endsesh")
+        assert not ke.dispatch_enforcement_is_established("test_endsesh")
