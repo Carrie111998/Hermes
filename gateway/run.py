@@ -10879,12 +10879,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 == "pair"
             ):
                 platform_name = source.platform.value if source.platform else "unknown"
+                pairing_store = self._pairing_store_for(source)
+                if pairing_store is None:
+                    logger.error(
+                        "No pairing store available for %s profile=%s",
+                        platform_name,
+                        source.profile or "default",
+                    )
+                    return None
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                if pairing_store._is_rate_limited(platform_name, source.user_id):
                     return None
-                code = self.pairing_store.generate_code(
+                code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
@@ -10906,7 +10914,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
