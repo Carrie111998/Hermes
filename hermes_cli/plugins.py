@@ -534,6 +534,7 @@ class PluginContext:
         args_hint: str = "",
         *,
         accepts_context: bool = False,
+        control_plane: bool = False,
     ) -> None:
         """Register an in-session slash command for CLI and gateway sessions.
 
@@ -542,6 +543,11 @@ class PluginContext:
         context is supplied only by the dispatch surface and contains trusted
         local metadata such as the gateway platform and authenticated user ID;
         legacy handlers are never called with an unexpected second argument.
+
+        ``control_plane=True`` opts the command into gateway dispatch while an
+        agent is running. It remains subject to normal gateway authorization
+        and cannot override a built-in command; use it only for bounded,
+        non-agent control actions such as resolving an external wait.
         """
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
@@ -570,6 +576,7 @@ class PluginContext:
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
             "accepts_context": bool(accepts_context),
+            "control_plane": bool(control_plane),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
@@ -2333,6 +2340,12 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
 def get_plugin_context_engine():
     """Return the plugin-registered context engine, or None."""
     return _ensure_plugins_discovered()._context_engine
+
+
+def is_plugin_control_plane_command(name: str) -> bool:
+    """Return whether a plugin command explicitly opts into busy-time dispatch."""
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    return bool(entry and entry.get("control_plane", False))
 
 
 def invoke_plugin_command(

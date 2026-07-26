@@ -18,6 +18,7 @@ from hermes_cli.plugins import (
     get_plugin_command_handler,
     get_plugin_commands,
     invoke_plugin_command,
+    is_plugin_control_plane_command,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
@@ -2108,6 +2109,19 @@ class TestPluginCommands:
         mgr = PluginManager()
         with patch("hermes_cli.plugins._plugin_manager", mgr):
             assert invoke_plugin_command("missing", "x", context={}) is None
+
+
+    def test_control_plane_registration_is_explicit_and_queryable(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        ctx.register_command("control", lambda args: args, control_plane=True)
+        ctx.register_command("normal", lambda args: args)
+
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            assert is_plugin_control_plane_command("control") is True
+            assert is_plugin_control_plane_command("normal") is False
+            assert is_plugin_control_plane_command("missing") is False
 
 
 class TestPluginCommandResultResolution:

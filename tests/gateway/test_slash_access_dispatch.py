@@ -414,6 +414,60 @@ async def test_admin_runs_quick_command_when_gating_enabled():
     assert result == "quick-command-admin"
 
 
+@pytest.mark.asyncio
+async def test_control_plane_plugin_command_bypasses_running_agent_guard(monkeypatch):
+    """An opted-in plugin control command resolves an external wait mid-run."""
+    runner = _make_runner()
+    source = _make_source(user_id="111", chat_id="222")
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = MagicMock()
+    runner._running_agents_ts[session_key] = 0
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.is_plugin_control_plane_command",
+        lambda name: name == "control",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: object() if name == "control" else None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_plugin_command",
+        lambda name, raw_args, *, context: "control-ok",
+    )
+
+    result = await runner._handle_message(_make_event("/control deny 1234", source))
+
+    assert result == "control-ok"
+
+
+@pytest.mark.asyncio
+async def test_control_plane_plugin_command_still_requires_gateway_authorization(monkeypatch):
+    runner = _make_runner(
+        platform_extra={"allow_admin_from": ["111"], "user_allowed_commands": []}
+    )
+    source = _make_source(user_id="999", chat_id="222")
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = MagicMock()
+    runner._running_agents_ts[session_key] = 0
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.is_plugin_control_plane_command",
+        lambda name: name == "control",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: object() if name == "control" else None,
+    )
+    invoked = MagicMock(return_value="must-not-run")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_plugin_command", invoked)
+
+    result = await runner._handle_message(_make_event("/control deny 1234", source))
+
+    assert "⛔" in result
+    invoked.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Running-agent fast-path gating — admin/user split must hold even when an
 # agent is already running. The fast-path block in _handle_message dispatches
