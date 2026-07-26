@@ -56,11 +56,11 @@ def test_regex_preserves_user_env():
 def test_export_snippet_shape():
     snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
     assert "export -p" in snippet
-    assert "grep -vE" in snippet
+    assert "awk" in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the pipeline,
-    # NOT to the grep segment: a redirect on grep expands $BASHPID inside
-    # grep's pipeline subshell (a different PID than the parent shell that
+    # NOT to the awk segment: a redirect on awk expands $BASHPID inside
+    # awk's pipeline subshell (a different PID than the parent shell that
     # expands the follow-up ``mv`` operand), silently orphaning the dump and
     # breaking snapshot env persistence entirely.
     assert snippet.lstrip().startswith("{ ")
@@ -111,3 +111,45 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
                 assert "HERMES_SESSION_ID" not in f.read()
     finally:
         env.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Security: multiline injection through export -p continuation lines.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_multiline_injection_filtered(tmp_path):
+    """Continuation lines from excluded vars must not leak into the snapshot.
+
+    Some bash versions emit multi-line values as raw continuation lines
+    without a ``declare -x`` prefix.  The awk state-machine must suppress
+    those continuation lines, not just the first line of each excluded var.
+    GH-71296.
+    """
+    import subprocess
+
+    # Build a fake export -p dump with an injected multiline value.
+    dump = (
+        'declare -x HERMES_SESSION_CHAT_NAME="demo\n'
+        "touch /tmp/pwned #\n"
+        'declare -x HERMES_SESSION_ID="abc123"\n'
+        'declare -x PATH="/usr/bin"\n'
+        'declare -x SAFE_VAR="hello"\n'
+    )
+    snap_file = tmp_path / "snap.sh"
+    out_file = tmp_path / "out.sh"
+    snap_file.write_text(dump)
+
+    snippet = _export_dump_excluding_session_vars(str(out_file))
+    # Replace ``export -p`` with ``cat <dump>`` so the test uses our fake data.
+    test_cmd = snippet.replace("export -p", f"cat {snap_file}")
+    result = subprocess.run(
+        ["bash", "-c", f"set +H; {test_cmd} && cat {out_file}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, f"command failed: {result.stderr}"
+    out = result.stdout
+    assert "pwned" not in out, f"injection leaked into snapshot: {out!r}"
+    assert "touch" not in out, f"continuation line leaked: {out!r}"
+    assert 'SAFE_VAR="hello"' in out, f"safe var was dropped: {out!r}"
+    assert 'PATH="/usr/bin"' in out, f"PATH was dropped: {out!r}"
