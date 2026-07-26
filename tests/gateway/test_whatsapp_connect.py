@@ -594,6 +594,7 @@ class TestHttpSessionLifecycle:
             encoding="utf-8",
             errors="replace",
             timeout=10,
+            creationflags=0,
         )
         mock_proc.terminate.assert_not_called()
         mock_proc.kill.assert_not_called()
