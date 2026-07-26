@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 from typing import Any, Mapping
 
 import yaml
@@ -8,6 +9,71 @@ import yaml
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 DEFAULT_HUB_OPS_DIR = Path(__file__).resolve().parents[2] / "docs" / "projects" / "hub-ops"
+TASK_TYPE_ALIASES = {
+    "legal_review": "legal_compliance",
+    "compliance_review": "legal_compliance",
+    "legal_and_compliance": "legal_compliance",
+    "legal_compliance_review": "legal_compliance",
+    "contract_review": "legal_compliance",
+    "privacy_review": "legal_compliance",
+    "platform_compliance": "legal_compliance",
+    "listing": "browser_publish",
+    "relisting": "browser_publish",
+    "re_listing": "browser_publish",
+    "republish": "browser_publish",
+    "browser_republish": "browser_publish",
+    "cross_platform_listing": "browser_publish",
+    "secondhand_commerce_cross_platform_listing": "browser_publish",
+    "facebook_existing_listing_group_distribution": "browser_publish",
+    "group_distribution": "browser_publish",
+}
+ALWAYS_APPROVAL_TASK_TYPES = {"browser_publish", "browser_ops"}
+
+
+def normalize_clawops_task_type(value: str) -> str:
+    """Return a registered task type or a safe legacy alias candidate."""
+    normalized = "_".join((value or "").strip().lower().replace("-", "_").split())
+    return TASK_TYPE_ALIASES.get(normalized, normalized)
+
+
+def registered_worker_task_types(
+    hub_ops_dir: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Read the canonical model-visible task types from active HubOps routing."""
+    docs_dir = Path(hub_ops_dir) if hub_ops_dir else DEFAULT_HUB_OPS_DIR
+    rules = _read_yaml(docs_dir / "routing-rules.yaml")
+    return _worker_task_types(rules)
+
+
+def resolved_route_binding(route: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the immutable route fields that affect execution authority."""
+    return deepcopy(
+        {
+            key: route.get(key)
+            for key in (
+                "project",
+                "task_type",
+                "risk_level",
+                "agent_assignment",
+                "assignment",
+                "approval_checklist",
+                "output_schema",
+            )
+        }
+    )
+
+
+def route_requires_owner_approval(route: Mapping[str, Any]) -> bool:
+    """Fail closed for every route with controlled capabilities."""
+    assignment = route.get("assignment")
+    return bool(
+        str(route.get("risk_level") or "").lower() in {"high", "critical"}
+        or str(route.get("task_type") or "") in ALWAYS_APPROVAL_TASK_TYPES
+        or (
+            isinstance(assignment, Mapping)
+            and assignment.get("approval_required")
+        )
+    )
 
 
 def route_clawops_objective(
@@ -17,6 +83,7 @@ def route_clawops_objective(
     task_type: str = "ops",
     risk_level: str = "low",
     approved: bool = False,
+    contract_fingerprint: str = "",
     hub_ops_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     clean_objective = " ".join((objective or "").split())
@@ -43,13 +110,31 @@ def route_clawops_objective(
             risk_level=risk_level,
         )
 
-    route = _match_worker_route(worker_routes, project=project, task_type=task_type, risk_level=risk_level)
+    requested_task_type = (task_type or "").strip()
+    canonical_task_type = normalize_clawops_task_type(requested_task_type)
+    allowed_task_types = _worker_task_types(rules)
+    if canonical_task_type not in allowed_task_types:
+        return _blocked(
+            f"Unsupported task_type={requested_task_type or '<empty>'}. "
+            f"Allowed task types: {', '.join(allowed_task_types)}.",
+            objective=clean_objective,
+            project=project,
+            task_type=requested_task_type,
+            risk_level=risk_level,
+        )
+
+    route = _match_worker_route(
+        worker_routes,
+        project=project,
+        task_type=canonical_task_type,
+        risk_level=risk_level,
+    )
     if route is None:
         return _blocked(
             "No HubOps worker route matched this task.",
             objective=clean_objective,
             project=project,
-            task_type=task_type,
+            task_type=canonical_task_type,
             risk_level=risk_level,
         )
 
@@ -61,40 +146,73 @@ def route_clawops_objective(
             f"HubOps worker profile is missing: {worker_id or '<empty>'}",
             objective=clean_objective,
             project=project,
-            task_type=task_type,
+            task_type=canonical_task_type,
             risk_level=risk_level,
         )
 
     risk = _normalize_risk(risk_level)
     risk_limit = _normalize_risk(str(worker.get("risk_level_limit") or "low"))
+    contract_risk_limit = _normalize_risk(
+        str(worker.get("contract_risk_level_limit") or risk_limit)
+    )
     approval_required = bool((assign or {}).get("approval_required", worker.get("approval_required", False)))
     if risk in {"high", "critical"} and not approved:
         return _blocked(
             f"Human approval is required before routing risk_level={risk} ClawOps work.",
             objective=clean_objective,
             project=project,
-            task_type=task_type,
+            task_type=canonical_task_type,
             risk_level=risk,
             worker_id=worker_id,
             worker=worker,
             approval_required=True,
         )
+    risk_authorization: dict[str, Any] = {}
     if RISK_ORDER[risk] > RISK_ORDER[risk_limit]:
-        return _blocked(
-            f"Task risk_level={risk} exceeds worker risk_level_limit={risk_limit}.",
-            objective=clean_objective,
-            project=project,
-            task_type=task_type,
-            risk_level=risk,
-            worker_id=worker_id,
-            worker=worker,
-            approval_required=True,
-        )
+        clean_fingerprint = (contract_fingerprint or "").strip()
+        if not clean_fingerprint:
+            return _blocked(
+                f"Task risk_level={risk} exceeds worker risk_level_limit={risk_limit}; "
+                "a validated single-Loop-Contract authorization is required.",
+                objective=clean_objective,
+                project=project,
+                task_type=canonical_task_type,
+                risk_level=risk,
+                worker_id=worker_id,
+                worker=worker,
+                approval_required=True,
+            )
+        if RISK_ORDER[risk] > RISK_ORDER[contract_risk_limit]:
+            return _blocked(
+                f"Task risk_level={risk} exceeds worker contract_risk_level_limit={contract_risk_limit}.",
+                objective=clean_objective,
+                project=project,
+                task_type=canonical_task_type,
+                risk_level=risk,
+                worker_id=worker_id,
+                worker=worker,
+                approval_required=True,
+            )
+        risk_authorization = {
+            "mode": "single_loop_contract",
+            "issued_by": "Hermes",
+            "contract_fingerprint": clean_fingerprint,
+            "risk_level": risk,
+            "human_approved": True,
+            "worker_risk_level_limit": risk_limit,
+            "contract_risk_level_limit": contract_risk_limit,
+            # This is the authoritative ceiling for this one compiled
+            # contract.  The worker_risk_level_limit above remains useful
+            # audit context, but must not be mistaken for the effective
+            # ceiling after Hermes has issued a scoped elevation.
+            "effective_risk_level_limit": risk,
+            "reusable": False,
+        }
     agent_id = _match_agent_id(
         agent_routes if isinstance(agent_routes, list) else [],
         agents if isinstance(agents, Mapping) else {},
         project=project,
-        task_type=task_type,
+        task_type=canonical_task_type,
         risk_level=risk,
     )
 
@@ -102,10 +220,17 @@ def route_clawops_objective(
         "status": "routed",
         "objective": clean_objective,
         "project": project,
-        "task_type": task_type,
+        "task_type": canonical_task_type,
+        "requested_task_type": requested_task_type,
         "risk_level": risk,
         "agent_assignment": _agent_assignment(agent_id, (agents or {}).get(agent_id) if isinstance(agents, Mapping) else None),
-        "assignment": _assignment(worker_id, worker, approval_required=approval_required),
+        "assignment": _assignment(
+            worker_id,
+            worker,
+            approval_required=approval_required,
+            effective_risk_level_limit=(risk if risk_authorization else risk_limit),
+        ),
+        "risk_authorization": risk_authorization,
         "approval_checklist": str((assign or {}).get("approval_checklist") or worker.get("approval_checklist") or ""),
         "output_schema": worker.get("output_schema") or {},
     }
@@ -116,6 +241,19 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"HubOps YAML must be an object: {path}")
     return raw
+
+
+def _worker_task_types(rules: Mapping[str, Any]) -> tuple[str, ...]:
+    result: list[str] = []
+    routes = rules.get("worker_routes")
+    if not isinstance(routes, list):
+        return ()
+    for route in routes:
+        match = route.get("match") if isinstance(route, Mapping) else None
+        task_type = str((match or {}).get("task_type") or "").strip()
+        if task_type and task_type not in result:
+            result.append(task_type)
+    return tuple(result)
 
 
 def _match_worker_route(
@@ -171,13 +309,18 @@ def _assignment(
     worker: Mapping[str, Any],
     *,
     approval_required: bool,
+    effective_risk_level_limit: str = "",
 ) -> dict[str, Any]:
+    risk_level_limit = _normalize_risk(str(worker.get("risk_level_limit") or "low"))
     return {
         "assigned_worker": worker_id,
         "runtime_profile": str(worker.get("runtime_profile") or worker_id.replace(".", "-")),
         "display_name": str(worker.get("display_name") or worker_id),
         "allowed_tools": list(worker.get("allowed_tools") or []),
-        "risk_level_limit": _normalize_risk(str(worker.get("risk_level_limit") or "low")),
+        "risk_level_limit": risk_level_limit,
+        "effective_risk_level_limit": _normalize_risk(
+            effective_risk_level_limit or risk_level_limit
+        ),
         "approval_required": approval_required,
         "approval_required_actions": list(worker.get("approval_required_actions") or []),
         "timeout_seconds": int(worker.get("timeout_seconds") or 900),

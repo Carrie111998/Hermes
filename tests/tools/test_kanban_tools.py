@@ -1221,6 +1221,9 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_create" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
+    # File uploads must use the audited browser tool instead of an ad-hoc bypass.
+    assert "browser_upload_files" in prompt
+    assert "shell CDP/WebSocket scripts" in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):

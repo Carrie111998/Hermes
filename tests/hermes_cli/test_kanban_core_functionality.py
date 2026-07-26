@@ -2854,6 +2854,260 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def _grace_execution_body_with_tools(*tool_names):
+    contract = {
+        "routing": {
+            "resolved": {
+                "assignment": {
+                    "allowed_tools": list(tool_names),
+                }
+            }
+        }
+    }
+    return (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        "Authority: Execute only the compiled contract below.\n\n"
+        "```json\n"
+        f"{json.dumps(contract)}\n"
+        "```\n"
+    )
+
+
+def test_compiled_contract_tool_parser_ignores_free_form_mentions():
+    assert kb._compiled_contract_allowed_tools(
+        "Please use browser_upload_files if useful."
+    ) == []
+    assert kb._compiled_contract_allowed_tools(
+        _grace_execution_body_with_tools(
+            "browser_upload_files", "browser_upload_files", "browser_cdp",
+        )
+    ) == ["browser_upload_files", "browser_cdp"]
+
+
+def test_worker_capability_probe_uses_effective_schema_in_isolated_process(
+    kanban_home, tmp_path,
+):
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(kanban_home)
+    env["HERMES_KANBAN_TASK"] = "t_probe"
+
+    available = kb._probe_worker_capabilities(
+        declared_tools=["read_file", "contract_only_pseudo_tool"],
+        toolsets=["file"],
+        env=env,
+        workspace=str(tmp_path),
+    )
+    assert available["ok"] is True
+    assert "read_file" in available["required_runtime_tools"]
+    assert "contract_only_pseudo_tool" in available["abstract_contract_tools"]
+
+    missing = kb._probe_worker_capabilities(
+        declared_tools=["browser_upload_files"],
+        toolsets=["file"],
+        env=env,
+        workspace=str(tmp_path),
+    )
+    assert missing["ok"] is False
+    assert missing["missing_required_tools"] == ["browser_upload_files"]
+    assert missing["tool_checks"]["browser_upload_files"]["available"] is False
+
+
+def test_default_spawn_blocks_before_popen_and_preserves_capability_audit(
+    kanban_home, monkeypatch,
+):
+    popen_called = False
+
+    def fake_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("Popen must not run after a failed capability preflight")
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_cli_toolsets",
+        lambda _home: ["file"],
+    )
+    monkeypatch.setattr(
+        kb,
+        "_probe_worker_capabilities",
+        lambda **kwargs: {
+            "ok": False,
+            "declared_tools": ["browser_upload_files"],
+            "required_runtime_tools": ["browser_upload_files"],
+            "available_tools": ["read_file"],
+            "missing_required_tools": ["browser_upload_files"],
+            "tool_checks": {
+                "browser_upload_files": {
+                    "toolset": "browser-cdp",
+                    "check_fn": "_browser_upload_files_check",
+                    "available": False,
+                }
+            },
+        },
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="contract capability preflight",
+            body=_grace_execution_body_with_tools("browser_upload_files"),
+            assignee="clawops-browser",
+        )
+        task = kb.claim_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        run_id = task.current_run_id
+        with pytest.raises(
+            kb.WorkerCapabilityError,
+            match="browser_upload_files",
+        ):
+            kb._default_spawn(task, str(workspace))
+        assert popen_called is False
+
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="missing required worker tools: browser_upload_files",
+            kind="capability",
+            expected_run_id=run_id,
+        )
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        metadata = json.loads(run["metadata"])
+        audit = metadata["worker_spawn"]
+        assert audit["ok"] is False
+        assert audit["missing_required_tools"] == ["browser_upload_files"]
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'worker_capability_preflight'",
+            (tid,),
+        ).fetchone()
+        assert json.loads(event["payload"])["ok"] is False
+    finally:
+        conn.close()
+
+
+def test_dispatch_blocks_controlled_worker_when_capability_preflight_fails(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_cli_toolsets",
+        lambda _home: ["file"],
+    )
+    monkeypatch.setattr(
+        kb,
+        "_probe_worker_capabilities",
+        lambda **kwargs: {
+            "ok": False,
+            "declared_tools": ["browser_upload_files"],
+            "required_runtime_tools": ["browser_upload_files"],
+            "available_tools": ["read_file"],
+            "missing_required_tools": ["browser_upload_files"],
+            "tool_checks": {
+                "browser_upload_files": {
+                    "registered": True,
+                    "toolset": "browser-cdp",
+                    "check_fn": "_browser_upload_files_check",
+                    "available": False,
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail(
+            "dispatcher must not spawn a capability-incomplete worker"
+        ),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="dispatch capability gate",
+            body=_grace_execution_body_with_tools("browser_upload_files"),
+            assignee="clawops-browser",
+        )
+        result = kb.dispatch_once(conn)
+        assert tid in result.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+        run = kb.list_runs(conn, tid)[0]
+        assert run.outcome == "blocked"
+        assert run.metadata["worker_spawn"]["ok"] is False
+        assert run.metadata["worker_spawn"]["missing_required_tools"] == [
+            "browser_upload_files"
+        ]
+    finally:
+        conn.close()
+
+
+def test_default_spawn_records_passing_capability_preflight(
+    kanban_home, monkeypatch,
+):
+    captured = {}
+
+    class FakeProc:
+        pid = 777
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_cli_toolsets",
+        lambda _home: ["file"],
+    )
+    monkeypatch.setattr(
+        kb,
+        "_probe_worker_capabilities",
+        lambda **kwargs: {
+            "ok": True,
+            "declared_tools": ["read_file"],
+            "required_runtime_tools": ["read_file"],
+            "available_tools": ["read_file"],
+            "missing_required_tools": [],
+            "tool_checks": {
+                "read_file": {
+                    "toolset": "file",
+                    "check_fn": "check_file_requirements",
+                    "available": True,
+                }
+            },
+        },
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="passing capability preflight",
+            body=_grace_execution_body_with_tools("read_file"),
+            assignee="clawops-browser",
+        )
+        task = kb.claim_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        assert kb._default_spawn(task, str(workspace)) == 777
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (task.current_run_id,),
+        ).fetchone()
+        audit = json.loads(run["metadata"])["worker_spawn"]
+        assert audit["ok"] is True
+        assert audit["toolsets"] == ["file"]
+        assert audit["command"] == captured["cmd"]
+    finally:
+        conn.close()
+
+
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
     """A task runtime cap should raise the worker's terminal default.
 
@@ -3733,6 +3987,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             "kanban": {
                 "dispatch_in_gateway": True,
                 "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
             }
         },
     )
@@ -3793,13 +4048,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # First tick connect (dispatch) + one `_ready_nonempty` connection that
+    # checks both ready and review work. The second dispatch tick skips its
+    # dispatch connection because the corrupt board fingerprint is disabled,
+    # but still performs the shared ready/review probe.
+    assert calls["connect"] == 3
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
@@ -3827,6 +4080,7 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
             "kanban": {
                 "dispatch_in_gateway": True,
                 "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
             }
         },
     )
@@ -4492,6 +4746,10 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
         assert "gave_up" in kinds, (
             f"breaker should trip, expected 'gave_up' event, got {kinds}"
         )
+        assert kb.recompute_ready(conn, failure_limit=2) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
     finally:
         conn.close()
 

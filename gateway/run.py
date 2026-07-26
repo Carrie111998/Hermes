@@ -1039,6 +1039,63 @@ _TOOL_MEDIA_RE = re.compile(
 )
 
 
+def _find_bound_clawops_approval_args(
+    messages: List[Dict[str, Any]],
+    approval_token: str,
+) -> Optional[Dict[str, Any]]:
+    """Recover the exact contract that created a durable approval challenge."""
+    call_args: Dict[str, Dict[str, Any]] = {}
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        raw_calls = message.get("tool_calls") or []
+        if isinstance(raw_calls, str):
+            try:
+                raw_calls = json.loads(raw_calls)
+            except Exception:
+                raw_calls = []
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            if str(function.get("name") or call.get("name") or "") != "clawops_delegate":
+                continue
+            call_id = str(call.get("id") or call.get("call_id") or "")
+            raw_args = function.get("arguments") or call.get("arguments") or {}
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except Exception:
+                    continue
+            if call_id and isinstance(raw_args, dict):
+                call_args[call_id] = dict(raw_args)
+
+    for message in reversed(messages):
+        if message.get("role") not in {"tool", "function"}:
+            continue
+        call_id = str(
+            message.get("tool_call_id") or message.get("call_id") or ""
+        )
+        args = call_args.get(call_id)
+        if args is None:
+            continue
+        try:
+            payload = json.loads(str(message.get("content") or ""))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if (
+            payload.get("status") == "approval_required"
+            and payload.get("approval_token") == approval_token
+        ):
+            recovered = dict(args)
+            recovered.pop("approval_token", None)
+            recovered["approved"] = False
+            return recovered
+    return None
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
@@ -9823,7 +9880,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context,
+            internal=bool(getattr(event, "internal", False)),
+            owner_user_id=self._configured_external_action_owner(source),
+            message_text=str(event.text or ""),
+            grace_callback_board=str(
+                (
+                    getattr(event, "internal_context", None) or {}
+                ).get("grace_callback_board")
+                or ""
+            ),
+            grace_callback_lease_owner=str(
+                (
+                    getattr(event, "internal_context", None) or {}
+                ).get("grace_callback_lease_owner")
+                or ""
+            ),
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -9837,6 +9911,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        try:
+            from proactive.prompt_policy import approval_turn_prompt
+
+            approval_prompt = approval_turn_prompt(str(event.text or ""))
+            if approval_prompt:
+                context_prompt = f"{context_prompt}\n\n{approval_prompt}"
+        except Exception:
+            logger.warning(
+                "Failed to inject approval-turn routing prompt",
+                exc_info=True,
+            )
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                await adapter.send(
+                    source.chat_id,
+                    "核准路由政策目前無法驗證，這則訊息未交給模型、也沒有"
+                    "執行任何外部動作。請稍後重試。",
+                    metadata=self._thread_metadata_for_source(source),
+                )
+            return None
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -9939,8 +10033,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # Load conversation history from transcript
+        # Load conversation history from transcript. Trusted internal
+        # orchestration callbacks can request an isolated model context while
+        # retaining the same route, owner, and durable session identity. This
+        # prevents prior failed callbacks (or a very large human transcript)
+        # from teaching the model to repeat an obsolete response.
         history = self.session_store.load_transcript(session_entry.session_id)
+        if (
+            bool(getattr(event, "internal", False))
+            and bool(
+                (
+                    getattr(event, "internal_context", None) or {}
+                ).get("isolated_history")
+            )
+        ):
+            history = []
+            logger.info(
+                "Using isolated transcript context for trusted internal event "
+                "(session=%s)",
+                session_entry.session_id,
+            )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -10432,6 +10544,218 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+        # Approval-token turns are a protocol operation, not an ordinary model
+        # turn. Recover the exact contract from the tool call that created the
+        # challenge and invoke the authoritative validator directly. This keeps
+        # a large or stale conversation from teaching the model to invent
+        # formatting rules or omit the required tool call.
+        from proactive.prompt_policy import approval_token_candidate
+
+        _approval_token = approval_token_candidate(str(event.text or ""))
+        if _approval_token:
+            recovered_args = _find_bound_clawops_approval_args(
+                history, _approval_token,
+            )
+            _approval_records: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+            if recovered_args is None:
+                response = (
+                    "這則核准訊息沒有找到可驗證的原始合約，因此沒有執行"
+                    "任何外部動作。請重新要求 Grace 產生核准碼。"
+                )
+            else:
+                from plugins.openclaw_bridge.clawops_delegate import (
+                    handle_clawops_delegate,
+                )
+
+                approval_args = dict(recovered_args)
+                approval_args["approval_token"] = _approval_token
+                approval_args["approved"] = True
+                try:
+                    raw_approval_result = await asyncio.to_thread(
+                        handle_clawops_delegate, approval_args,
+                    )
+                    approval_result = json.loads(raw_approval_result)
+                except Exception as exc:
+                    logger.exception("Deterministic approval handling failed")
+                    approval_result = {
+                        "status": "rejected",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                _approval_records.append((approval_args, approval_result))
+
+                reason = str(approval_result.get("reason") or "")
+                if (
+                    approval_result.get("status") == "rejected"
+                    and "expired" in reason.lower()
+                ):
+                    from gateway.session_context import (
+                        override_session_message_text,
+                    )
+
+                    try:
+                        refresh_args = dict(recovered_args)
+                        refresh_args["_approval_refresh_token"] = (
+                            _approval_token
+                        )
+                        with override_session_message_text(""):
+                            raw_fresh_result = await asyncio.to_thread(
+                                handle_clawops_delegate, refresh_args,
+                            )
+                        fresh_result = json.loads(raw_fresh_result)
+                    except Exception as exc:
+                        logger.exception(
+                            "Fresh approval challenge handling failed"
+                        )
+                        fresh_result = {
+                            "status": "rejected",
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    _approval_records.append((recovered_args, fresh_result))
+                    if fresh_result.get("status") == "approval_required":
+                        response = (
+                            "原核准碼已過期；不是「好吧」、標點或空白的"
+                            "問題。我已為同一份未變更的合約換發新核准碼：\n\n"
+                            f"`{fresh_result.get('exact_reply')}`\n\n"
+                            "可以加「好的」「好吧」「收到」等簡短禮貌語，"
+                            "但不能同時更改動作、平台或範圍。"
+                        )
+                    else:
+                        response = (
+                            "原核准碼已過期，而且無法自動換發新碼；本次"
+                            "沒有執行任何外部動作。原因："
+                            + str(fresh_result.get("reason") or "未知錯誤")
+                        )
+                elif approval_result.get("status") == "queued":
+                    response = (
+                        "核准已由工具驗證，並已交給 ClawOps 執行。\n\n"
+                        f"- 執行任務：{approval_result.get('execution_task_id')}\n"
+                        f"- 審核任務：{approval_result.get('grace_review_task_id')}"
+                    )
+                else:
+                    response = (
+                        "核准工具已拒絕這次請求；不是由 Grace 自行判斷"
+                        "文字格式。本次沒有執行外部動作。原因："
+                        + reason
+                    )
+
+            _approval_ts = time.time()
+            _approval_user_entry: Dict[str, Any] = {
+                "role": "user",
+                "content": (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else message_text
+                ),
+                "timestamp": (
+                    persist_user_timestamp
+                    if persist_user_timestamp is not None
+                    else _approval_ts
+                ),
+            }
+            if event.message_id:
+                _approval_user_entry["message_id"] = str(event.message_id)
+            self.session_store.append_to_transcript(
+                session_entry.session_id, _approval_user_entry,
+            )
+            for index, (record_args, record_result) in enumerate(
+                _approval_records, start=1,
+            ):
+                call_id = (
+                    f"gateway_approval_{_approval_token}_"
+                    f"{str(event.message_id or 'message')}_{index}"
+                )
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "clawops_delegate",
+                                    "arguments": json.dumps(
+                                        record_args,
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                    ),
+                                },
+                            }
+                        ],
+                        "timestamp": _approval_ts,
+                    },
+                )
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "tool",
+                        "tool_name": "clawops_delegate",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(
+                            record_result,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        "timestamp": _approval_ts,
+                    },
+                )
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                raise RuntimeError(
+                    "Approval result could not be delivered: platform adapter "
+                    "is unavailable."
+                )
+            send_result = await adapter.send(
+                source.chat_id,
+                response,
+                metadata=self._thread_metadata_for_source(source),
+            )
+            if not getattr(send_result, "success", False):
+                logger.warning(
+                    "Approval result delivery failed; retrying once "
+                    "(session=%s token=%s)",
+                    session_entry.session_id,
+                    _approval_token,
+                )
+                send_result = await adapter.send(
+                    source.chat_id,
+                    response,
+                    metadata=self._thread_metadata_for_source(source),
+                )
+            if not getattr(send_result, "success", False):
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "session_meta",
+                        "content": (
+                            "Approval protocol completed, but the user-facing "
+                            "result was not delivered."
+                        ),
+                        "timestamp": _approval_ts,
+                    },
+                )
+                raise RuntimeError(
+                    "Approval protocol completed, but its result could not be "
+                    "delivered after two attempts."
+                )
+            self.session_store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "assistant",
+                    "content": response,
+                    "timestamp": _approval_ts,
+                },
+            )
+            logger.info(
+                "Deterministic approval turn completed "
+                "(session=%s token=%s records=%d)",
+                session_entry.session_id,
+                _approval_token,
+                len(_approval_records),
+            )
+            return None
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -13633,7 +13957,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        internal: bool = False,
+        owner_user_id: str = "",
+        message_text: str = "",
+        grace_callback_board: str = "",
+        grace_callback_lease_owner: str = "",
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -13661,9 +13994,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
+            message_text=message_text,
+            internal=internal,
+            owner_user_id=owner_user_id,
+            grace_callback_board=grace_callback_board,
+            grace_callback_lease_owner=grace_callback_lease_owner,
             async_delivery=_async_delivery,
         )
+
+    def _configured_external_action_owner(self, source: SessionSource) -> str:
+        """Return only an explicitly configured external-action owner.
+
+        Session origin identifies a routing/conversation lane, not an
+        authorization principal. In shared chats especially, the first person
+        to create the session must never become the approver implicitly.
+        """
+        platform_value = (
+            source.platform.value if getattr(source, "platform", None) else ""
+        )
+        platform_cfg = (
+            (getattr(self, "config", None).platforms or {}).get(source.platform)
+            if getattr(self, "config", None) is not None
+            else None
+        )
+        configured = str(
+            (getattr(platform_cfg, "extra", {}) or {}).get("owner_user_id")
+            or ""
+        ).strip()
+        if configured:
+            return configured
+        env_prefix = platform_value.upper().replace("-", "_")
+        return str(
+            os.getenv(f"{env_prefix}_OWNER_USER_ID", "")
+            or os.getenv("GATEWAY_OWNER_USER_ID", "")
+        ).strip()
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -16167,6 +16533,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        # Cross-thread latches for the two-phase Grace response. The fast ack
+        # fires only while the turn is still silent; a real model commentary
+        # or a completed run suppresses it.
+        _fast_ack_interim_visible = threading.Event()
+        _fast_ack_run_finished = threading.Event()
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -16223,6 +16594,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+
+        # Once Grace has compiled the canonical Loop Contract, show the user
+        # that exact understanding before ClawOps begins. This replaces the
+        # generic timer acknowledgement for delegated Telegram tasks and is
+        # deliberately emitted before the tool result, so it never claims the
+        # task has already been accepted or queued.
+        _delegation_confirmation_enabled = source.platform == Platform.TELEGRAM and bool(
+            resolve_display_setting(user_config, platform_key, "delegation_confirmation")
+        )
+        _delegation_confirmation_fired = threading.Event()
+
+        def tool_start_ack_callback(call_id, tool_name, args):
+            voice_ack_callback(call_id, tool_name, args)
+            if (
+                not _delegation_confirmation_enabled
+                or _delegation_confirmation_fired.is_set()
+                or not _status_adapter
+                or not _run_still_current()
+            ):
+                return
+            try:
+                from gateway.grace_confirmation import build_delegation_confirmation
+
+                confirmation = build_delegation_confirmation(tool_name, args)
+            except Exception:
+                logger.debug("Tool-work confirmation formatting failed", exc_info=True)
+                return
+            if not confirmation:
+                return
+            _delegation_confirmation_fired.set()
+            _fast_ack_interim_visible.set()
+            confirmation_future = safe_schedule_threadsafe(
+                _status_adapter.send(
+                    _status_chat_id,
+                    confirmation,
+                    metadata=_non_conversational_metadata(
+                        _status_thread_metadata,
+                        platform=source.platform,
+                    ),
+                ),
+                _loop_for_step,
+                logger=logger,
+                log_message="delegation confirmation scheduling error",
+            )
+            if confirmation_future is not None:
+                def _log_delegation_confirmation(future) -> None:
+                    try:
+                        result = future.result()
+                        if getattr(result, "success", False):
+                            logger.info(
+                                "Contract-derived delegation confirmation delivered "
+                                "(chat=%s tool=%s)",
+                                _status_chat_id,
+                                tool_name,
+                            )
+                        else:
+                            logger.warning(
+                                "Contract-derived delegation confirmation was not delivered "
+                                "(chat=%s tool=%s)",
+                                _status_chat_id,
+                                tool_name,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Delegation confirmation delivery failed",
+                            exc_info=True,
+                        )
+
+                confirmation_future.add_done_callback(_log_delegation_confirmation)
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -16416,6 +16856,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                if str(text or "").strip():
+                    _fast_ack_interim_visible.set()
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -16595,10 +17037,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # None callback — so _thinking scratch bubbles never relayed even
             # though the progress queue was created for them.
             agent.tool_progress_callback = progress_callback if needs_progress_queue else None
-            # Discord voice verbal-ack hook (fires once per turn on first tool
-            # call; armed only when in a voice channel with the mixer running).
+            # Shared tool-start hook: Discord voice acknowledgement and/or the
+            # Telegram contract-derived ClawOps handoff confirmation.
             agent.tool_start_callback = (
-                voice_ack_callback if _voice_ack_guild[0] is not None else None
+                tool_start_ack_callback
+                if _voice_ack_guild[0] is not None or _delegation_confirmation_enabled
+                else None
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
@@ -17571,6 +18015,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
+        # Fast confirmation is independent from token streaming. It gives the
+        # user a visible first phase while the full Grace/tool turn continues
+        # in the executor. The text is deliberately neutral: it confirms
+        # receipt and process, never completion, approval, or task creation.
+        from gateway.fast_ack import deliver_fast_ack, resolve_fast_ack_config
+
+        _fast_ack_cfg = resolve_fast_ack_config(user_config, platform_key)
+        _fast_ack_task = asyncio.create_task(
+            deliver_fast_ack(
+                adapter=_status_adapter,
+                chat_id=_status_chat_id,
+                metadata=_non_conversational_metadata(
+                    _status_thread_metadata, platform=source.platform,
+                ),
+                config=_fast_ack_cfg,
+                run_is_current=_run_still_current,
+                interim_is_visible=_fast_ack_interim_visible.is_set,
+                run_is_finished=_fast_ack_run_finished.is_set,
+                has_message=bool(str(message or "").strip()),
+            )
+        )
+
         def _stream_confirmed_final_delivery(
             consumer,
             final_text: str,
@@ -17608,6 +18074,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _warning_fired = False
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(run_sync)
+            )
+            _executor_task.add_done_callback(
+                lambda _future: _fast_ack_run_finished.set()
             )
 
             _inactivity_timeout = False
@@ -18050,6 +18519,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 progress_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+            _fast_ack_task.cancel()
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
@@ -18094,7 +18564,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [
+                progress_task, interrupt_monitor, tracking_task, _notify_task,
+                _fast_ack_task,
+            ]:
                 if task:
                     try:
                         await task

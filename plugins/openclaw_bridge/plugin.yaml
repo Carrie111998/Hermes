@@ -4,8 +4,12 @@ description: "Hermes-owned safety bridge for delegated OpenClaw execution."
 author: KJ
 kind: backend
 provides_tools:
+  - clawops_delegate
+  - grace_callback_outcome
   - openclaw_delegate
 provides_commands:
   - openclaw-dry-run
 hooks:
   - pre_gateway_dispatch
+middleware:
+  - tool_execution

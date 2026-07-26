@@ -11,7 +11,12 @@ from __future__ import annotations
 
 import pytest
 
-from gateway.kanban_watchers import _resolve_auto_decompose_settings
+from types import SimpleNamespace
+
+from gateway.kanban_watchers import (
+    _is_loop_breaker_triage,
+    _resolve_auto_decompose_settings,
+)
 
 
 def test_enabled_by_default_when_key_absent():
@@ -81,3 +86,19 @@ def test_live_toggle_takes_effect_between_calls():
     # User edits config.yaml mid-run.
     state["kanban"]["auto_decompose"] = False
     assert _resolve_auto_decompose_settings(lambda: state)[0] is False
+
+
+def test_repeated_block_triage_is_reserved_for_human_decision():
+    assert _is_loop_breaker_triage(
+        SimpleNamespace(block_kind="needs_input", block_recurrences=2)
+    ) is True
+    assert _is_loop_breaker_triage(
+        SimpleNamespace(block_kind="capability", block_recurrences=3)
+    ) is True
+
+
+def test_fresh_triage_remains_auto_decomposable():
+    assert _is_loop_breaker_triage(
+        SimpleNamespace(block_kind=None, block_recurrences=0)
+    ) is False
+    assert _is_loop_breaker_triage(None) is False

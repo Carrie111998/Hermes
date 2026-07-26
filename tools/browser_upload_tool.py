@@ -71,7 +71,7 @@ async function main() {
   try {
     const contexts = browser.contexts();
     const pages = contexts.flatMap((context) => context.pages());
-    let page = null;
+    const matchingPages = [];
     for (const candidate of pages) {
       const url = candidate.url();
       const title = await candidate.title().catch(() => "");
@@ -79,29 +79,75 @@ async function main() {
         (!payload.targetUrlContains || url.includes(payload.targetUrlContains)) &&
         (!payload.targetTitleContains || title.includes(payload.targetTitleContains))
       ) {
-        page = candidate;
-        break;
+        matchingPages.push(candidate);
       }
     }
-    if (!page) {
+    if (matchingPages.length < 1) {
       throw new Error("No matching page found for requested target filters");
     }
+    if (matchingPages.length > 1 && payload.pageIndex === null) {
+      throw new Error(
+        `Multiple pages (${matchingPages.length}) matched the target filters; ` +
+        "provide page_index to select one deterministically"
+      );
+    }
+    const pageIndex = payload.pageIndex === null ? 0 : payload.pageIndex;
+    if (pageIndex < 0 || pageIndex >= matchingPages.length) {
+      throw new Error(
+        `page_index=${pageIndex} is outside the ${matchingPages.length} matching pages`
+      );
+    }
+    const page = matchingPages[pageIndex];
 
-    const locator = page.locator(payload.selector).first();
     const count = await page.locator(payload.selector).count();
     if (count < 1) {
       throw new Error(`No file input matched selector: ${payload.selector}`);
     }
+    if (count > 1 && payload.inputIndex === null) {
+      throw new Error(
+        `Multiple file inputs (${count}) matched selector ${payload.selector}; ` +
+        "provide input_index or a narrower selector"
+      );
+    }
+    const inputIndex = payload.inputIndex === null ? 0 : payload.inputIndex;
+    if (inputIndex < 0 || inputIndex >= count) {
+      throw new Error(`input_index=${inputIndex} is outside the ${count} matching inputs`);
+    }
+    const locator = page.locator(payload.selector).nth(inputIndex);
 
+    if (payload.verifyTextContains) {
+      const markerAlreadyPresent = await page.evaluate(
+        (expected) => (document.body ? document.body.innerText : "").includes(expected),
+        payload.verifyTextContains
+      );
+      if (markerAlreadyPresent) {
+        throw new Error(
+          `Upload verification marker was already present before upload: ` +
+          `${JSON.stringify(payload.verifyTextContains)}`
+        );
+      }
+    }
     await locator.setInputFiles(payload.files);
     await page.waitForTimeout(payload.settleMs);
+    if (payload.verifyTextContains) {
+      await page.waitForFunction(
+        (expected) => (document.body ? document.body.innerText : "").includes(expected),
+        payload.verifyTextContains,
+        { timeout: payload.verifyTimeoutMs }
+      ).catch(() => {
+        throw new Error(
+          `Upload postcondition was not observed: page text did not contain ` +
+          `${JSON.stringify(payload.verifyTextContains)}`
+        );
+      });
+    }
 
-    const state = await page.evaluate((selector) => {
+    const state = await locator.evaluate((selectedInput, inputIndex) => {
       const norm = (value) => (value || "").replace(/\s+/g, " ").trim();
       const fileInputs = Array.from(document.querySelectorAll("input[type=file]")).map(
         (el, index) => ({
           index,
-          selectorMatched: el.matches(selector),
+          selected: el === selectedInput,
           accept: el.getAttribute("accept") || "",
           multiple: !!el.multiple,
           disabled: !!el.disabled,
@@ -123,16 +169,32 @@ async function main() {
       return {
         href: location.href,
         title: document.title,
+        selectedInput: selectedInput ? {
+          selectorMatchIndex: inputIndex,
+          accept: selectedInput.getAttribute("accept") || "",
+          multiple: !!selectedInput.multiple,
+          disabled: !!selectedInput.disabled,
+          files: selectedInput.files ? selectedInput.files.length : null,
+          fileNames: selectedInput.files
+            ? Array.from(selectedInput.files).map((file) => file.name)
+            : [],
+        } : null,
         fileInputs,
         actionButtons: buttons,
         textTail: norm(document.body ? document.body.innerText : "").slice(-1200),
       };
-    }, payload.selector);
+    }, inputIndex);
 
     return {
       success: true,
       uploadedFiles: payload.files.length,
       selector: payload.selector,
+      matchingPages: matchingPages.length,
+      pageIndex,
+      matchingInputs: count,
+      inputIndex,
+      postconditionVerified: !!payload.verifyTextContains,
+      verifyTextContains: payload.verifyTextContains,
       targetUrl: page.url(),
       targetTitle: await page.title().catch(() => ""),
       state,
@@ -187,6 +249,10 @@ def browser_upload_files(
     selector: str = DEFAULT_SELECTOR,
     target_url_contains: Optional[str] = None,
     target_title_contains: Optional[str] = None,
+    page_index: Optional[int] = None,
+    input_index: Optional[int] = None,
+    verify_text_contains: Optional[str] = None,
+    verify_timeout_ms: int = 30000,
     timeout: float = 60.0,
     settle_ms: int = 5000,
 ) -> str:
@@ -222,6 +288,10 @@ def browser_upload_files(
         "selector": selector.strip(),
         "targetUrlContains": target_url_contains or "",
         "targetTitleContains": target_title_contains or "",
+        "pageIndex": int(page_index) if page_index is not None else None,
+        "inputIndex": int(input_index) if input_index is not None else None,
+        "verifyTextContains": str(verify_text_contains or ""),
+        "verifyTimeoutMs": max(1000, min(int(verify_timeout_ms or 0), 120000)),
         "settleMs": max(0, min(int(settle_ms or 0), 30000)),
     }
 
@@ -281,6 +351,25 @@ BROWSER_UPLOAD_FILES_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": "Optional substring used to select the browser tab by title.",
             },
+            "page_index": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based index among pages matching the target filters. Required when more than one page matches.",
+            },
+            "input_index": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based index among inputs matching selector. Required when more than one input matches.",
+            },
+            "verify_text_contains": {
+                "type": "string",
+                "description": "Optional visible page text that must appear after upload before success is returned.",
+            },
+            "verify_timeout_ms": {
+                "type": "integer",
+                "description": "Milliseconds to wait for verify_text_contains (default 30000, max 120000).",
+                "default": 30000,
+            },
             "timeout": {
                 "type": "number",
                 "description": "Timeout in seconds (default 60, max 300).",
@@ -310,6 +399,10 @@ registry.register(
         selector=args.get("selector", DEFAULT_SELECTOR),
         target_url_contains=args.get("target_url_contains"),
         target_title_contains=args.get("target_title_contains"),
+        page_index=args.get("page_index"),
+        input_index=args.get("input_index"),
+        verify_text_contains=args.get("verify_text_contains"),
+        verify_timeout_ms=args.get("verify_timeout_ms", 30000),
         timeout=args.get("timeout", 60.0),
         settle_ms=args.get("settle_ms", 5000),
     ),

@@ -3,11 +3,12 @@ import os
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
     get_session_env,
+    override_session_message_text,
     set_session_vars,
     clear_session_vars,
     _VAR_MAP,
@@ -28,6 +29,46 @@ def _reset_contextvars():
     for var in _VAR_MAP.values():
         # Can't use var.reset() without a token; just set back to sentinel.
         var.set(_UNSET)
+
+
+def test_external_action_owner_requires_explicit_configuration(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(extra={})},
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="session-creator",
+        thread_id="2",
+    )
+    monkeypatch.delenv("TELEGRAM_OWNER_USER_ID", raising=False)
+    monkeypatch.delenv("GATEWAY_OWNER_USER_ID", raising=False)
+
+    assert runner._configured_external_action_owner(source) == ""
+
+    monkeypatch.setenv("TELEGRAM_OWNER_USER_ID", "kj-owner")
+    assert runner._configured_external_action_owner(source) == "kj-owner"
+
+    runner.config.platforms[Platform.TELEGRAM].extra["owner_user_id"] = "config-owner"
+    assert runner._configured_external_action_owner(source) == "config-owner"
+
+
+@pytest.mark.asyncio
+async def test_message_text_override_is_task_local_and_restored():
+    set_session_vars(message_text="核准 expiredtoken")
+
+    with override_session_message_text(""):
+        assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == ""
+        assert await asyncio.to_thread(
+            get_session_env, "HERMES_SESSION_MESSAGE_TEXT"
+        ) == ""
+
+    assert (
+        get_session_env("HERMES_SESSION_MESSAGE_TEXT")
+        == "核准 expiredtoken"
+    )
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -216,8 +257,8 @@ def test_session_id_set_via_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_ID") == ""
 
 
-def test_set_session_env_includes_session_key():
-    """_set_session_env should propagate session_key from SessionContext."""
+def test_set_session_env_includes_session_identity():
+    """_set_session_env should propagate key and id from SessionContext."""
     runner = object.__new__(GatewayRunner)
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -231,17 +272,59 @@ def test_set_session_env_includes_session_key():
         connected_platforms=[],
         home_channels={},
         session_key="tg:-1001:17585",
+        session_id="session-actual-456",
     )
 
     # Capture baseline value before setting (may be non-empty from another
     # test in the same pytest-xdist worker sharing the context).
     tokens = runner._set_session_env(context)
     assert get_session_env("HERMES_SESSION_KEY") == "tg:-1001:17585"
+    assert get_session_env("HERMES_SESSION_ID") == "session-actual-456"
     runner._clear_session_env(tokens)
     # After clearing, the session key must not retain the value we just set.
     # The exact post-clear value depends on context propagation from other
     # tests, so only check that our value was removed, not what replaced it.
     assert get_session_env("HERMES_SESSION_KEY") != "tg:-1001:17585"
+
+
+def test_set_session_env_marks_internal_turn_and_owner():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="callback-user",
+        thread_id="17585",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+    )
+
+    tokens = runner._set_session_env(
+        context,
+        internal=True,
+        owner_user_id="kj-owner",
+        message_text="[SYSTEM: callback]",
+        grace_callback_board="secondhand",
+        grace_callback_lease_owner="gateway:test",
+    )
+    assert get_session_env("HERMES_SESSION_INTERNAL") == "true"
+    assert get_session_env("HERMES_SESSION_OWNER_USER_ID") == "kj-owner"
+    assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == "[SYSTEM: callback]"
+    assert get_session_env("HERMES_GRACE_CALLBACK_BOARD") == "secondhand"
+    assert (
+        get_session_env("HERMES_GRACE_CALLBACK_LEASE_OWNER")
+        == "gateway:test"
+    )
+
+    runner._clear_session_env(tokens)
+    assert get_session_env("HERMES_SESSION_INTERNAL") == ""
+    assert get_session_env("HERMES_SESSION_OWNER_USER_ID") == ""
+    assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == ""
+    assert get_session_env("HERMES_GRACE_CALLBACK_BOARD") == ""
+    assert get_session_env("HERMES_GRACE_CALLBACK_LEASE_OWNER") == ""
 
 
 def test_session_key_no_race_condition_with_contextvars(monkeypatch):
@@ -393,4 +476,3 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
             await runner._run_in_executor_with_context(lambda: "second")
     finally:
         runner._shutdown_executor()
-

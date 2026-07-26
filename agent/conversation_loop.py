@@ -333,6 +333,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    try:
+        from proactive.prompt_policy import ensure_active_policy_prompt
+
+        agent._cached_system_prompt = ensure_active_policy_prompt(agent._cached_system_prompt)
+    except Exception as exc:
+        logger.warning("Failed to inject active Grace prompt policy", exc_info=True)
+        raise RuntimeError(
+            "Active Grace prompt policy could not be verified; refusing to "
+            "start an unprotected model turn."
+        ) from exc
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
@@ -396,6 +406,18 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_provider = line_value("Provider")
     current_provider = str(getattr(agent, "provider", "") or "").strip()
     if stored_provider and current_provider and stored_provider != current_provider:
+        return False
+
+    # A live Grace policy marker in ~/.hermes/AGENTS.md is a cache version.
+    # If policy changes, old long-lived gateway sessions must rebuild their
+    # prompt automatically instead of silently continuing with stale rules.
+    try:
+        from proactive.prompt_policy import stored_prompt_matches_active_policy
+
+        if not stored_prompt_matches_active_policy(prompt):
+            return False
+    except Exception:
+        logger.warning("Failed to compare active Grace prompt policy", exc_info=True)
         return False
 
     return True

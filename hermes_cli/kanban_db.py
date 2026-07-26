@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -88,7 +89,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -136,6 +137,14 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+
+
+class WorkerAuthorizationError(RuntimeError):
+    """Raised when a delegated worker cannot prove ownership of its active run."""
+
+
+class WorkerCapabilityError(WorkerAuthorizationError):
+    """Raised when a worker's immutable startup schema misses contract tools."""
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -915,6 +924,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Ephemeral bearer credential for this exact claimed run. The dispatcher
+    # stores only its SHA-256 digest in task_runs.metadata and passes the raw
+    # value to the child process. It is never persisted on the task row.
+    worker_auth_token: Optional[str] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1264,6 +1277,97 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable handoff from a terminal Grace review back to the originating
+-- conversational session.  This is deliberately separate from
+-- kanban_notify_subs: notify subscriptions are deleted when a task reaches a
+-- final state, while a Grace callback needs an auditable cursor and lease so
+-- it can survive gateway restarts and avoid duplicate agent turns.
+CREATE TABLE IF NOT EXISTS grace_loop_callbacks (
+    review_task_id       TEXT PRIMARY KEY,
+    execution_task_id    TEXT NOT NULL,
+    platform             TEXT NOT NULL,
+    chat_id              TEXT NOT NULL,
+    chat_type            TEXT,
+    thread_id            TEXT NOT NULL DEFAULT '',
+    user_id              TEXT,
+    session_key          TEXT,
+    session_id           TEXT,
+    message_id           TEXT,
+    notifier_profile     TEXT,
+    contract_fingerprint TEXT NOT NULL,
+    completion_mode      TEXT NOT NULL DEFAULT 'terminal',
+    state                TEXT NOT NULL DEFAULT 'pending',
+    last_event_id        INTEGER NOT NULL DEFAULT 0,
+    lease_event_id       INTEGER,
+    lease_owner          TEXT,
+    lease_expires        INTEGER,
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    attempt_event_id     INTEGER,
+    last_error           TEXT,
+    outcome_event_id     INTEGER,
+    outcome_kind         TEXT,
+    outcome_payload      TEXT,
+    created_at           INTEGER NOT NULL,
+    delivered_at         INTEGER
+);
+
+-- One-time, scope-bound confirmation for external ClawOps actions.  Grace
+-- first compiles the exact contract, then KJ confirms the returned token in a
+-- fresh authenticated turn.  The token is consumed atomically before task
+-- creation so one approval cannot authorize a second contract.
+CREATE TABLE IF NOT EXISTS grace_approval_challenges (
+    token                TEXT PRIMARY KEY,
+    contract_fingerprint TEXT NOT NULL,
+    request_instance_id  TEXT NOT NULL,
+    platform             TEXT NOT NULL,
+    chat_id              TEXT NOT NULL,
+    thread_id            TEXT NOT NULL DEFAULT '',
+    session_key          TEXT NOT NULL,
+    session_id           TEXT NOT NULL,
+    user_id_sha256       TEXT NOT NULL,
+    requested_message_id TEXT NOT NULL,
+    action_summary       TEXT NOT NULL,
+    approval_platform    TEXT NOT NULL,
+    approval_scope       TEXT NOT NULL,
+    origin_review_task_id TEXT,
+    origin_event_id      INTEGER,
+    state                TEXT NOT NULL DEFAULT 'pending',
+    created_at           INTEGER NOT NULL,
+    expires_at           INTEGER NOT NULL,
+    consumed_at          INTEGER,
+    approved_message_id  TEXT
+);
+
+-- Durable authorization and idempotency record for one exact Grace -> ClawOps
+-- delegation.  Authorization is committed before card creation; execution is
+-- kept blocked until the review card, callback, and subscriptions exist.
+-- Retries resume this same row and task ids instead of consuming another
+-- challenge or creating a second external action.
+CREATE TABLE IF NOT EXISTS grace_delegations (
+    delegation_id           TEXT PRIMARY KEY,
+    contract_fingerprint    TEXT NOT NULL UNIQUE,
+    request_instance_id     TEXT NOT NULL,
+    challenge_token         TEXT,
+    platform                TEXT NOT NULL,
+    chat_id                 TEXT NOT NULL,
+    thread_id               TEXT NOT NULL DEFAULT '',
+    session_key             TEXT NOT NULL,
+    session_id              TEXT NOT NULL,
+    user_id_sha256          TEXT,
+    approved_message_id     TEXT,
+    resolved_route          TEXT NOT NULL,
+    approval_required       INTEGER NOT NULL DEFAULT 0,
+    origin_review_task_id   TEXT,
+    origin_event_id         INTEGER,
+    state                   TEXT NOT NULL DEFAULT 'authorized',
+    build_owner             TEXT,
+    build_lease_expires     INTEGER,
+    execution_task_id       TEXT,
+    review_task_id          TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1274,6 +1378,14 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_grace_callbacks_due   ON grace_loop_callbacks(state, lease_expires);
+CREATE INDEX IF NOT EXISTS idx_grace_approval_pending
+    ON grace_approval_challenges(session_key, state, expires_at);
+CREATE INDEX IF NOT EXISTS idx_grace_delegation_tasks
+    ON grace_delegations(execution_task_id, review_task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grace_delegation_origin
+    ON grace_delegations(origin_review_task_id, origin_event_id)
+    WHERE origin_review_task_id IS NOT NULL AND origin_event_id IS NOT NULL;
 """
 
 
@@ -2028,6 +2140,92 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
 
+    grace_callback_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='grace_loop_callbacks'"
+    ).fetchone() is not None
+    if grace_callback_table_exists:
+        callback_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(grace_loop_callbacks)")
+        }
+        if "chat_type" not in callback_cols:
+            _add_column_if_missing(
+                conn, "grace_loop_callbacks", "chat_type", "chat_type TEXT"
+            )
+        for column, definition in (
+            (
+                "completion_mode",
+                "completion_mode TEXT NOT NULL DEFAULT 'terminal'",
+            ),
+            ("attempt_event_id", "attempt_event_id INTEGER"),
+            ("outcome_event_id", "outcome_event_id INTEGER"),
+            ("outcome_kind", "outcome_kind TEXT"),
+            ("outcome_payload", "outcome_payload TEXT"),
+        ):
+            if column not in callback_cols:
+                _add_column_if_missing(
+                    conn, "grace_loop_callbacks", column, definition
+                )
+
+    grace_challenge_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='grace_approval_challenges'"
+    ).fetchone() is not None
+    if grace_challenge_table_exists:
+        challenge_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(grace_approval_challenges)")
+        }
+        if "request_instance_id" not in challenge_cols:
+            _add_column_if_missing(
+                conn,
+                "grace_approval_challenges",
+                "request_instance_id",
+                "request_instance_id TEXT",
+            )
+        for column, definition in (
+            ("origin_review_task_id", "origin_review_task_id TEXT"),
+            ("origin_event_id", "origin_event_id INTEGER"),
+            ("approval_platform", "approval_platform TEXT"),
+            ("approval_scope", "approval_scope TEXT"),
+        ):
+            if column not in challenge_cols:
+                _add_column_if_missing(
+                    conn, "grace_approval_challenges", column, definition
+                )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_grace_challenge_origin "
+            "ON grace_approval_challenges("
+            "origin_review_task_id, origin_event_id"
+            ") WHERE origin_review_task_id IS NOT NULL "
+            "AND origin_event_id IS NOT NULL"
+        )
+
+    grace_delegation_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='grace_delegations'"
+    ).fetchone() is not None
+    if grace_delegation_table_exists:
+        delegation_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(grace_delegations)")
+        }
+        for column, definition in (
+            ("request_instance_id", "request_instance_id TEXT"),
+            ("build_owner", "build_owner TEXT"),
+            ("build_lease_expires", "build_lease_expires INTEGER"),
+        ):
+            if column not in delegation_cols:
+                _add_column_if_missing(
+                    conn, "grace_delegations", column, definition
+                )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_grace_delegation_request "
+            "ON grace_delegations(platform, session_key, request_instance_id) "
+            "WHERE request_instance_id IS NOT NULL"
+        )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -2093,7 +2291,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ("spawn_auto_blocked", "gave_up"),
     )
     for old, new in _EVENT_RENAMES:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
@@ -3169,11 +3367,31 @@ def _end_run(
     """
     now = int(time.time())
     row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        """
+        SELECT tasks.current_run_id, task_runs.metadata
+          FROM tasks
+          LEFT JOIN task_runs ON task_runs.id = tasks.current_run_id
+         WHERE tasks.id = ?
+        """,
+        (task_id,),
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    try:
+        prior_metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        prior_metadata = {}
+    if not isinstance(prior_metadata, dict):
+        prior_metadata = {}
+    # The per-run authorization digest is useful only while the run is active
+    # and historically final metadata has replaced it. Preserve just the
+    # immutable spawn audit across the terminal transition, then layer it on
+    # top so worker-supplied metadata cannot rewrite startup evidence.
+    spawn_audit = prior_metadata.get("worker_spawn")
+    merged_metadata = dict(metadata) if metadata else {}
+    if isinstance(spawn_audit, dict):
+        merged_metadata["worker_spawn"] = spawn_audit
     conn.execute(
         """
         UPDATE task_runs
@@ -3194,7 +3412,10 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            (
+                json.dumps(merged_metadata, ensure_ascii=False)
+                if merged_metadata else None
+            ),
             now,
             run_id,
         ),
@@ -3280,29 +3501,38 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       emits a ``"blocked"`` event row in ``task_events``.
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      repeated crashes / spawn failures / timeouts. This emits
+      ``"gave_up"``, not ``"blocked"``. Ordinary threshold failures may
+      recover automatically; deterministic/systemic failures whose limit was
+      forced stay blocked until an explicit repair and unblock.
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    ``"blocked"`` / ``"unblocked"`` / ``"gave_up"`` event for the task.
+    An explicit block is sticky until unblocked. A ``gave_up`` event with
+    ``limit_source=forced`` is also sticky because retrying the same worker
+    before repairing the runtime would reproduce the same failure.
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    Returns ``False`` when there is no such event at all (e.g. the task was
+    set to ``status='blocked'`` by direct DB manipulation), or when the latest
+    circuit-breaker event used the ordinary dispatcher threshold.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row:
+        return False
+    if row["kind"] == "blocked":
+        return True
+    if row["kind"] != "gave_up":
+        return False
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return payload.get("limit_source") == "forced"
 
 
 def recompute_ready(
@@ -3396,6 +3626,149 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _new_worker_auth() -> tuple[str, str]:
+    """Return a raw per-run credential and the JSON metadata persisted for it."""
+    token = secrets.token_urlsafe(32)
+    metadata = json.dumps(
+        {
+            "worker_auth_sha256": hashlib.sha256(
+                token.encode("utf-8")
+            ).hexdigest(),
+        },
+        ensure_ascii=False,
+    )
+    return token, metadata
+
+
+def _grace_loop_stage_header(body: str) -> str:
+    """Return the exact trusted first-line Grace Loop stage, if present."""
+    first_line = str(body or "").splitlines()[0].strip() if body else ""
+    if first_line == "GRACE_LOOP_CONTRACT_STAGE: execution":
+        return "execution"
+    if first_line == "GRACE_LOOP_CONTRACT_STAGE: grace_review":
+        return "review"
+    return ""
+
+
+def validate_kanban_worker_auth(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: str,
+    claim_lock: str,
+    worker_auth_token: str,
+) -> bool:
+    """Return whether a worker owns this exact active, unexpired task run."""
+    clean_task_id = str(task_id or "").strip()
+    clean_run_id = str(run_id or "").strip()
+    clean_lock = str(claim_lock or "").strip()
+    clean_token = str(worker_auth_token or "").strip()
+    if not all((clean_task_id, clean_run_id, clean_lock, clean_token)):
+        return False
+    try:
+        parsed_run_id = int(clean_run_id)
+    except (TypeError, ValueError):
+        return False
+
+    task = conn.execute(
+        """
+        SELECT id, status, current_run_id, claim_lock, claim_expires
+          FROM tasks
+         WHERE id = ?
+        """,
+        (clean_task_id,),
+    ).fetchone()
+    run = conn.execute(
+        """
+        SELECT id, task_id, status, claim_lock, claim_expires, metadata
+          FROM task_runs
+         WHERE id = ?
+        """,
+        (parsed_run_id,),
+    ).fetchone()
+    now = int(time.time())
+    if (
+        task is None
+        or task["status"] != "running"
+        or int(task["current_run_id"] or 0) != parsed_run_id
+        or str(task["claim_lock"] or "") != clean_lock
+        or int(task["claim_expires"] or 0) <= now
+        or run is None
+        or run["task_id"] != clean_task_id
+        or run["status"] != "running"
+        or str(run["claim_lock"] or "") != clean_lock
+        or int(run["claim_expires"] or 0) <= now
+    ):
+        return False
+    try:
+        metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    expected_digest = str(metadata.get("worker_auth_sha256") or "").strip()
+    actual_digest = hashlib.sha256(clean_token.encode("utf-8")).hexdigest()
+    if not expected_digest or not hmac.compare_digest(
+        expected_digest,
+        actual_digest,
+    ):
+        return False
+    return True
+
+
+def validate_grace_loop_worker_auth(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: str,
+    claim_lock: str,
+    worker_auth_token: str,
+) -> str:
+    """Return ``execution``/``review`` for an authenticated delegated run.
+
+    The task ``session_id`` is provenance for the logical Grace Loop stage, not
+    the dynamically-created CLI worker session. Runtime authority is therefore
+    bound to the claimed task/run/lock plus a one-time bearer credential whose
+    digest is stored on that run.
+    """
+    clean_task_id = str(task_id or "").strip()
+    if not validate_kanban_worker_auth(
+        conn,
+        task_id=clean_task_id,
+        run_id=run_id,
+        claim_lock=claim_lock,
+        worker_auth_token=worker_auth_token,
+    ):
+        return ""
+    task = conn.execute(
+        "SELECT body, assignee FROM tasks WHERE id = ?",
+        (clean_task_id,),
+    ).fetchone()
+    delegation = conn.execute(
+        """
+        SELECT state, execution_task_id, review_task_id
+          FROM grace_delegations
+         WHERE execution_task_id = ? OR review_task_id = ?
+        """,
+        (clean_task_id, clean_task_id),
+    ).fetchone()
+    if task is None or delegation is None or delegation["state"] != "queued":
+        return ""
+
+    stage = _grace_loop_stage_header(str(task["body"] or ""))
+    if (
+        delegation["execution_task_id"] == clean_task_id
+        and str(task["assignee"] or "").startswith("clawops-")
+        and stage == "execution"
+    ):
+        return "execution"
+    if (
+        delegation["review_task_id"] == clean_task_id
+        and str(task["assignee"] or "") == "default"
+        and stage == "review"
+    ):
+        return "review"
+    return ""
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3479,13 +3852,14 @@ def claim_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        worker_auth_token, worker_auth_metadata = _new_worker_auth()
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -3495,6 +3869,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                worker_auth_metadata,
             ),
         )
         run_id = run_cur.lastrowid
@@ -3508,6 +3883,8 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_auth_token = worker_auth_token
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -3561,13 +3938,14 @@ def claim_review_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        worker_auth_token, worker_auth_metadata = _new_worker_auth()
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -3577,6 +3955,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                worker_auth_metadata,
             ),
         )
         run_id = run_cur.lastrowid
@@ -3590,7 +3969,10 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_auth_token = worker_auth_token
+        return claimed
 
 
 def heartbeat_claim(
@@ -4703,6 +5085,53 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_reason.startswith("review-required:"):
+        review_row = conn.execute(
+            """
+            SELECT child.id AS review_task_id,
+                   execution.body AS execution_body,
+                   child.body AS review_body
+              FROM tasks AS execution
+              JOIN task_links AS link ON link.parent_id = execution.id
+              JOIN tasks AS child ON child.id = link.child_id
+              JOIN grace_delegations AS delegation
+                ON delegation.execution_task_id = execution.id
+               AND delegation.review_task_id = child.id
+               AND delegation.state = 'queued'
+             WHERE execution.id = ?
+             ORDER BY child.created_at, child.id
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if review_row is not None and (
+            _grace_loop_stage_header(review_row["execution_body"]) != "execution"
+            or _grace_loop_stage_header(review_row["review_body"]) != "review"
+        ):
+            review_row = None
+        if review_row is not None:
+            review_task_id = str(review_row["review_task_id"])
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "grace_loop_protocol_violation",
+                    {
+                        "attempted_action": "review-required block",
+                        "review_task_id": review_task_id,
+                        "resolution": "complete execution or state a genuine blocker",
+                    },
+                )
+            raise ValueError(
+                f"{task_id} already has dependent Grace review task "
+                f"{review_task_id}; review-required would deadlock that review. "
+                "If the contracted deliverables and verification are complete, "
+                "call kanban_complete and put later approvals in "
+                "metadata.approval_needed. Otherwise block with the exact missing "
+                "evidence, authority, capability, or human decision without the "
+                "review-required prefix."
+            )
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -4719,6 +5148,89 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+
+        # A rejected Grace review is a correction handoff, not a dependency on
+        # an already-completed execution. Re-open that execution atomically
+        # before parking the review in ``todo``. Otherwise ``recompute_ready``
+        # sees the completed parent and immediately promotes the review again,
+        # creating an unbounded review -> dependency_wait -> promoted loop.
+        if kind == "dependency":
+            grace_execution = conn.execute(
+                """
+                SELECT execution.id, execution.status,
+                       execution.body AS execution_body,
+                       review.body AS review_body
+                  FROM tasks AS review
+                  JOIN task_links AS link ON link.child_id = review.id
+                  JOIN tasks AS execution ON execution.id = link.parent_id
+                  JOIN grace_delegations AS delegation
+                    ON delegation.execution_task_id = execution.id
+                   AND delegation.review_task_id = review.id
+                   AND delegation.state = 'queued'
+                 WHERE review.id = ?
+                   AND execution.status = 'done'
+                 ORDER BY execution.created_at DESC, execution.id DESC
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if grace_execution is not None and (
+                _grace_loop_stage_header(
+                    grace_execution["execution_body"],
+                ) != "execution"
+                or _grace_loop_stage_header(
+                    grace_execution["review_body"],
+                ) != "review"
+            ):
+                grace_execution = None
+            if grace_execution is not None:
+                execution_task_id = str(grace_execution["id"])
+                correction_note = (
+                    "Grace 驗收未通過，執行卡已依原範圍退回修正。\n\n"
+                    f"阻擋原因：{str(reason or '').strip() or '未提供摘要'}"
+                )
+
+                reopened = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status               = 'ready',
+                           completed_at         = NULL,
+                           result               = NULL,
+                           claim_lock           = NULL,
+                           claim_expires        = NULL,
+                           worker_pid           = NULL,
+                           current_run_id       = NULL,
+                           consecutive_failures = 0,
+                           last_failure_error   = NULL,
+                           last_heartbeat_at    = NULL,
+                           block_kind           = NULL,
+                           block_recurrences    = 0
+                     WHERE id = ?
+                       AND status = 'done'
+                    """,
+                    (execution_task_id,),
+                )
+                if reopened.rowcount != 1:
+                    raise RuntimeError(
+                        f"failed to reopen Grace execution task {execution_task_id}"
+                    )
+                now = int(time.time())
+                conn.execute(
+                    """
+                    INSERT INTO task_comments (task_id, author, body, created_at)
+                    VALUES (?, 'Grace review', ?, ?)
+                    """,
+                    (execution_task_id, correction_note, now),
+                )
+                _append_event(
+                    conn,
+                    execution_task_id,
+                    "grace_correction_requested",
+                    {
+                        "review_task_id": task_id,
+                        "reason": reason,
+                    },
+                )
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
@@ -5003,7 +5515,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "last_heartbeat_at = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -7020,10 +7533,36 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "blocker_auth"
 
     # 3. Completed run within guard window — proof of recent success.
+    # A later Grace correction request intentionally re-opens that successful
+    # task, so the superseded completion must not guard the correction spawn.
+    # Once the correction itself completes, its newer completion has no later
+    # correction event and is protected by this guard as usual.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     if conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+        """
+        SELECT run.id
+          FROM task_runs AS run
+         WHERE run.task_id = ?
+           AND run.outcome = 'completed'
+           AND run.ended_at >= ?
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM task_events AS event
+                WHERE event.task_id = run.task_id
+                  AND event.kind = 'grace_correction_requested'
+                  AND event.id > COALESCE(
+                      (
+                          SELECT MAX(completed_event.id)
+                            FROM task_events AS completed_event
+                           WHERE completed_event.task_id = run.task_id
+                             AND completed_event.run_id = run.id
+                             AND completed_event.kind = 'completed'
+                      ),
+                      0
+                  )
+           )
+         LIMIT 1
+        """,
         (task_id, cutoff),
     ).fetchone():
         return "recent_success"
@@ -7474,6 +8013,16 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except WorkerAuthorizationError as exc:
+            blocked = block_task(
+                conn,
+                claimed.id,
+                reason=str(exc),
+                kind="capability",
+                expected_run_id=claimed.current_run_id,
+            )
+            if blocked:
+                result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -7555,6 +8104,16 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+        except WorkerAuthorizationError as exc:
+            blocked = block_task(
+                conn,
+                claimed.id,
+                reason=str(exc),
+                kind="capability",
+                expected_run_id=claimed.current_run_id,
+            )
+            if blocked:
+                result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -7830,6 +8389,232 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _compiled_contract_allowed_tools(body: Optional[str]) -> list[str]:
+    """Return the trusted Grace Loop contract's declared tool surface.
+
+    Only the first fenced JSON object in an execution-stage contract is
+    authoritative. Free-form prose is intentionally ignored so an ordinary
+    task cannot turn a tool name mentioned in its description into a startup
+    requirement.
+    """
+    text = str(body or "")
+    if _grace_loop_stage_header(text) != "execution":
+        return []
+    match = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if match is None:
+        return []
+    try:
+        contract = json.loads(match.group(1))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(contract, dict):
+        return []
+    assignment = (
+        ((contract.get("routing") or {}).get("resolved") or {}).get("assignment")
+        or {}
+    )
+    declared = assignment.get("allowed_tools") or []
+    if not isinstance(declared, list):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in declared:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+_WORKER_CAPABILITY_PROBE = r"""
+import json
+import sys
+
+payload = json.loads(sys.stdin.read())
+from hermes_cli.config import load_config
+from model_tools import get_tool_definitions
+from tools.registry import registry
+from toolsets import resolve_toolset, validate_toolset
+
+config = load_config()
+disabled = ((config.get("agent") or {}).get("disabled_toolsets") or [])
+definitions = get_tool_definitions(
+    enabled_toolsets=payload["toolsets"],
+    disabled_toolsets=disabled,
+    quiet_mode=True,
+)
+available = sorted(
+    definition["function"]["name"]
+    for definition in definitions
+    if isinstance(definition, dict)
+    and isinstance(definition.get("function"), dict)
+    and definition["function"].get("name")
+)
+available_set = set(available)
+declared = payload["declared_tools"]
+configured = set()
+for toolset in payload["toolsets"]:
+    if validate_toolset(toolset):
+        configured.update(resolve_toolset(toolset))
+registered = [
+    name for name in declared if registry.get_entry(name) is not None
+]
+required = [
+    name for name in declared
+    if name in configured or name in set(registered)
+]
+abstract = [name for name in declared if name not in set(required)]
+missing = [name for name in required if name not in available_set]
+details = {}
+for name in required:
+    entry = registry.get_entry(name)
+    details[name] = {
+        "registered": entry is not None,
+        "toolset": entry.toolset if entry is not None else None,
+        "check_fn": (
+            getattr(entry.check_fn, "__qualname__", None)
+            if entry is not None and entry.check_fn is not None
+            else None
+        ),
+        "available": name in available_set,
+    }
+print(json.dumps({
+    "ok": not missing,
+    "declared_tools": declared,
+    "required_runtime_tools": required,
+    "abstract_contract_tools": abstract,
+    "available_tools": available,
+    "missing_required_tools": missing,
+    "tool_checks": details,
+}, ensure_ascii=False))
+"""
+
+
+def _probe_worker_capabilities(
+    *,
+    declared_tools: list[str],
+    toolsets: list[str],
+    env: Mapping[str, str],
+    workspace: str,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """Resolve the exact new-worker schema in an isolated Python process.
+
+    The subprocess matters: tool availability caches are process-global and
+    profile-sensitive checks must not inherit a verdict previously computed
+    for the gateway's default profile.
+    """
+    payload = json.dumps(
+        {"declared_tools": declared_tools, "toolsets": toolsets},
+        ensure_ascii=False,
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _WORKER_CAPABILITY_PROBE],
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=max(1.0, float(timeout)),
+            cwd=workspace if os.path.isdir(workspace) else None,
+            env=dict(env),
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "declared_tools": declared_tools,
+            "required_runtime_tools": [],
+            "available_tools": [],
+            "missing_required_tools": declared_tools,
+            "probe_error": f"{type(exc).__name__}: {exc}",
+        }
+    if completed.returncode != 0:
+        return {
+            "ok": False,
+            "declared_tools": declared_tools,
+            "required_runtime_tools": [],
+            "available_tools": [],
+            "missing_required_tools": declared_tools,
+            "probe_error": (
+                completed.stderr.strip()[-2000:]
+                or f"capability probe exited rc={completed.returncode}"
+            ),
+        }
+    try:
+        result = json.loads(completed.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "declared_tools": declared_tools,
+            "required_runtime_tools": [],
+            "available_tools": [],
+            "missing_required_tools": declared_tools,
+            "probe_error": f"invalid capability probe output: {exc}",
+        }
+    if not isinstance(result, dict):
+        return {
+            "ok": False,
+            "declared_tools": declared_tools,
+            "required_runtime_tools": [],
+            "available_tools": [],
+            "missing_required_tools": declared_tools,
+            "probe_error": "capability probe output was not an object",
+        }
+    return result
+
+
+def _record_worker_spawn_audit(
+    task: Task,
+    *,
+    board: Optional[str],
+    audit: Mapping[str, Any],
+) -> None:
+    """Persist immutable startup evidence on the active run and event stream."""
+    if task.current_run_id is None:
+        return
+    with connect_closing(board=board) as conn:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? "
+                "AND ended_at IS NULL",
+                (int(task.current_run_id), task.id),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["worker_spawn"] = dict(audit)
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (
+                    json.dumps(metadata, ensure_ascii=False),
+                    int(task.current_run_id),
+                ),
+            )
+            _append_event(
+                conn,
+                task.id,
+                "worker_capability_preflight",
+                {
+                    "ok": bool(audit.get("ok")),
+                    "profile": task.assignee,
+                    "toolsets": list(audit.get("toolsets") or []),
+                    "required_runtime_tools": list(
+                        audit.get("required_runtime_tools") or []
+                    ),
+                    "missing_required_tools": list(
+                        audit.get("missing_required_tools") or []
+                    ),
+                    "probe_error": audit.get("probe_error"),
+                },
+                run_id=int(task.current_run_id),
+            )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -7855,6 +8640,43 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    with connect_closing(board=board) as auth_conn:
+        if task.worker_auth_token and not validate_kanban_worker_auth(
+            auth_conn,
+            task_id=task.id,
+            run_id=str(task.current_run_id or ""),
+            claim_lock=str(task.claim_lock or ""),
+            worker_auth_token=task.worker_auth_token,
+        ):
+            raise WorkerAuthorizationError(
+                "worker preflight failed: task/run/claim/auth is not active"
+            )
+        delegation = auth_conn.execute(
+            """
+            SELECT execution_task_id, review_task_id
+              FROM grace_delegations
+             WHERE execution_task_id = ? OR review_task_id = ?
+            """,
+            (task.id, task.id),
+        ).fetchone()
+        if delegation is not None:
+            expected_role = (
+                "execution"
+                if delegation["execution_task_id"] == task.id
+                else "review"
+            )
+            authorized_role = validate_grace_loop_worker_auth(
+                auth_conn,
+                task_id=task.id,
+                run_id=str(task.current_run_id or ""),
+                claim_lock=str(task.claim_lock or ""),
+                worker_auth_token=str(task.worker_auth_token or ""),
+            )
+            if authorized_role != expected_role:
+                raise WorkerAuthorizationError(
+                    "delegated worker preflight failed: task/run/claim/auth "
+                    f"did not prove the expected {expected_role} role"
+                )
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -7901,6 +8723,8 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if task.worker_auth_token:
+        env["HERMES_KANBAN_WORKER_AUTH_TOKEN"] = task.worker_auth_token
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -7966,6 +8790,36 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    declared_tools = _compiled_contract_allowed_tools(task.body)
+    if declared_tools:
+        capability = _probe_worker_capabilities(
+            declared_tools=declared_tools,
+            toolsets=worker_toolsets or [],
+            env=env,
+            workspace=workspace,
+        )
+        capability.update(
+            {
+                "checked_at": int(time.time()),
+                "profile": profile_arg,
+                "profile_home": env.get("HERMES_HOME"),
+                "toolsets": worker_toolsets or [],
+                "command": cmd,
+            }
+        )
+        _record_worker_spawn_audit(task, board=board, audit=capability)
+        if not capability.get("ok"):
+            missing = [
+                str(name)
+                for name in capability.get("missing_required_tools") or []
+            ]
+            detail = (
+                f"missing required worker tools: {', '.join(missing)}"
+                if missing else "worker capability probe failed"
+            )
+            if capability.get("probe_error"):
+                detail += f" ({capability['probe_error']})"
+            raise WorkerCapabilityError(detail)
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -8467,6 +9321,1760 @@ def remove_notify_sub(
             (task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Grace external-action approval challenges
+# ---------------------------------------------------------------------------
+
+def create_grace_approval_challenge(
+    conn: sqlite3.Connection,
+    *,
+    contract_fingerprint: str,
+    request_instance_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_key: str,
+    session_id: str,
+    user_id_sha256: str,
+    requested_message_id: str,
+    action_summary: str,
+    approval_platform: str,
+    approval_scope: str,
+    origin_review_task_id: str = "",
+    origin_event_id: Optional[int] = None,
+    callback_lease_owner: str = "",
+    ttl_seconds: int = 3600,
+) -> dict:
+    """Create or reuse one pending challenge for the exact compiled contract."""
+    required = {
+        "contract_fingerprint": contract_fingerprint,
+        "request_instance_id": request_instance_id,
+        "platform": platform,
+        "chat_id": chat_id,
+        "session_key": session_key,
+        "session_id": session_id,
+        "user_id_sha256": user_id_sha256,
+        "requested_message_id": requested_message_id,
+        "action_summary": action_summary,
+        "approval_platform": approval_platform,
+        "approval_scope": approval_scope,
+    }
+    missing = [
+        key for key, value in required.items() if not str(value or "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            "Grace approval challenge missing required field(s): "
+            + ", ".join(missing)
+        )
+    if bool(origin_review_task_id) != (origin_event_id is not None):
+        raise ValueError(
+            "origin_review_task_id and origin_event_id must be supplied together"
+        )
+    clean_origin_review_id = str(origin_review_task_id or "").strip()
+    clean_origin_event_id = (
+        int(origin_event_id) if origin_event_id is not None else None
+    )
+    now = int(time.time())
+    expires_at = now + max(60, min(int(ttl_seconds), 86400))
+    with write_txn(conn):
+        if callback_lease_owner:
+            if not clean_origin_review_id or clean_origin_event_id is None:
+                raise ValueError(
+                    "Callback lease owner requires a callback origin."
+                )
+            validate_accepted_grace_callback_origin(
+                conn,
+                review_task_id=clean_origin_review_id,
+                event_id=clean_origin_event_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                session_id=session_id,
+                lease_owner=callback_lease_owner,
+            )
+        if clean_origin_review_id and clean_origin_event_id is not None:
+            origin_challenge = conn.execute(
+                """
+                SELECT *
+                  FROM grace_approval_challenges
+                 WHERE origin_review_task_id = ?
+                   AND origin_event_id = ?
+                """,
+                (clean_origin_review_id, clean_origin_event_id),
+            ).fetchone()
+            if origin_challenge is not None:
+                origin_row = dict(origin_challenge)
+                fingerprint_matches = (
+                    origin_row.get("contract_fingerprint")
+                    == contract_fingerprint
+                )
+                request_matches = (
+                    not origin_row.get("request_instance_id")
+                    or origin_row.get("request_instance_id")
+                    == request_instance_id.strip()
+                )
+                platform_matches = (
+                    not origin_row.get("approval_platform")
+                    or origin_row.get("approval_platform")
+                    == approval_platform.strip()
+                )
+                scope_matches = (
+                    not origin_row.get("approval_scope")
+                    or origin_row.get("approval_scope")
+                    == approval_scope.strip()
+                )
+                if not (
+                    fingerprint_matches
+                    and request_matches
+                    and platform_matches
+                    and scope_matches
+                ):
+                    raise ValueError(
+                        "This Grace callback event already created another "
+                        "approval challenge."
+                    )
+                if (
+                    origin_row.get("state") == "pending"
+                    and int(origin_row.get("expires_at") or 0) > now
+                ):
+                    return origin_row
+                authorized = conn.execute(
+                    """
+                    SELECT 1
+                      FROM grace_delegations
+                     WHERE origin_review_task_id = ?
+                       AND origin_event_id = ?
+                     LIMIT 1
+                    """,
+                    (clean_origin_review_id, clean_origin_event_id),
+                ).fetchone()
+                if authorized is not None:
+                    raise ValueError(
+                        "This Grace callback event already authorized a "
+                        "delegation."
+                    )
+                replacement_token = secrets.token_hex(8)
+                conn.execute(
+                    """
+                    UPDATE grace_approval_challenges
+                       SET token = ?, contract_fingerprint = ?,
+                           request_instance_id = ?, platform = ?,
+                           chat_id = ?, thread_id = ?, session_key = ?,
+                           session_id = ?, user_id_sha256 = ?,
+                           requested_message_id = ?, action_summary = ?,
+                           approval_platform = ?, approval_scope = ?,
+                           state = 'pending', created_at = ?, expires_at = ?,
+                           consumed_at = NULL, approved_message_id = NULL
+                     WHERE origin_review_task_id = ?
+                       AND origin_event_id = ?
+                    """,
+                    (
+                        replacement_token,
+                        contract_fingerprint,
+                        request_instance_id.strip(),
+                        platform.strip().lower(),
+                        chat_id.strip(),
+                        (thread_id or "").strip(),
+                        session_key.strip(),
+                        session_id.strip(),
+                        user_id_sha256.strip(),
+                        requested_message_id.strip(),
+                        action_summary.strip(),
+                        approval_platform.strip(),
+                        approval_scope.strip(),
+                        now,
+                        expires_at,
+                        clean_origin_review_id,
+                        clean_origin_event_id,
+                    ),
+                )
+                replaced = conn.execute(
+                    "SELECT * FROM grace_approval_challenges WHERE token = ?",
+                    (replacement_token,),
+                ).fetchone()
+                return dict(replaced)
+        existing = conn.execute(
+            """
+            SELECT *
+             FROM grace_approval_challenges
+             WHERE contract_fingerprint = ?
+               AND request_instance_id = ?
+               AND platform = ?
+               AND chat_id = ?
+               AND thread_id = ?
+               AND session_key = ?
+               AND session_id = ?
+               AND user_id_sha256 = ?
+               AND origin_review_task_id IS ?
+               AND origin_event_id IS ?
+               AND state = 'pending'
+               AND expires_at > ?
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (
+                contract_fingerprint,
+                request_instance_id.strip(),
+                platform.strip().lower(),
+                chat_id.strip(),
+                (thread_id or "").strip(),
+                session_key.strip(),
+                session_id.strip(),
+                user_id_sha256,
+                clean_origin_review_id or None,
+                clean_origin_event_id,
+                now,
+            ),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing)
+        token = secrets.token_hex(8)
+        conn.execute(
+            """
+            INSERT INTO grace_approval_challenges (
+                token, contract_fingerprint, request_instance_id,
+                platform, chat_id, thread_id,
+                session_key, session_id, user_id_sha256, requested_message_id,
+                action_summary, approval_platform, approval_scope,
+                origin_review_task_id, origin_event_id,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                token,
+                contract_fingerprint,
+                request_instance_id.strip(),
+                platform.strip().lower(),
+                chat_id.strip(),
+                (thread_id or "").strip(),
+                session_key.strip(),
+                session_id.strip(),
+                user_id_sha256.strip(),
+                requested_message_id.strip(),
+                action_summary.strip(),
+                approval_platform.strip(),
+                approval_scope.strip(),
+                clean_origin_review_id or None,
+                clean_origin_event_id,
+                now,
+                expires_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM grace_approval_challenges WHERE token = ?",
+            (token,),
+        ).fetchone()
+    return dict(row)
+
+
+def consume_grace_approval_challenge(
+    conn: sqlite3.Connection,
+    *,
+    token: str,
+    contract_fingerprint: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_key: str,
+    session_id: str,
+    user_id_sha256: str,
+    approved_message_id: str,
+) -> Optional[dict]:
+    """Atomically consume one exact, unexpired challenge.
+
+    A fresh message is mandatory: the message that caused Grace to request the
+    challenge cannot also consume it.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_approval_challenges
+               SET state = 'consumed',
+                   consumed_at = ?,
+                   approved_message_id = ?
+             WHERE token = ?
+               AND contract_fingerprint = ?
+               AND platform = ?
+               AND chat_id = ?
+               AND thread_id = ?
+               AND session_key = ?
+               AND session_id = ?
+               AND user_id_sha256 = ?
+               AND state = 'pending'
+               AND expires_at > ?
+               AND requested_message_id <> ?
+            """,
+            (
+                now,
+                approved_message_id,
+                token.strip(),
+                contract_fingerprint.strip(),
+                platform.strip().lower(),
+                chat_id.strip(),
+                (thread_id or "").strip(),
+                session_key.strip(),
+                session_id.strip(),
+                user_id_sha256.strip(),
+                now,
+                approved_message_id.strip(),
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM grace_approval_challenges WHERE token = ?",
+            (token.strip(),),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_grace_approval_challenge(
+    conn: sqlite3.Connection,
+    token: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM grace_approval_challenges WHERE token = ?",
+        (token.strip(),),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Atomic/idempotent Grace delegation authorization
+# ---------------------------------------------------------------------------
+
+def reserve_grace_delegation(
+    conn: sqlite3.Connection,
+    *,
+    contract_fingerprint: str,
+    request_instance_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_key: str,
+    session_id: str,
+    resolved_route: Mapping[str, Any],
+    approval_required: bool,
+    challenge_token: str = "",
+    user_id_sha256: str = "",
+    approved_message_id: str = "",
+    origin_review_task_id: str = "",
+    origin_event_id: Optional[int] = None,
+    callback_lease_owner: str = "",
+) -> dict:
+    """Reserve one delegation and consume approval in the same transaction.
+
+    The deterministic row is the saga's commit point.  Later card writes are
+    idempotent and execution remains blocked until the saga is fully armed.
+    """
+    fingerprint = str(contract_fingerprint or "").strip()
+    clean_platform = str(platform or "").strip().lower()
+    clean_request_instance = str(request_instance_id or "").strip()
+    clean_chat_id = str(chat_id or "").strip()
+    clean_thread_id = str(thread_id or "").strip()
+    clean_session_key = str(session_key or "").strip()
+    clean_session_id = str(session_id or "").strip()
+    route_json = json.dumps(
+        dict(resolved_route or {}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    required = {
+        "contract_fingerprint": fingerprint,
+        "request_instance_id": clean_request_instance,
+        "platform": clean_platform,
+        "chat_id": clean_chat_id,
+        "session_key": clean_session_key,
+        "session_id": clean_session_id,
+        "resolved_route": route_json if route_json != "{}" else "",
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        raise ValueError(
+            "Grace delegation missing required field(s): " + ", ".join(missing)
+        )
+    if bool(origin_review_task_id) != (origin_event_id is not None):
+        raise ValueError(
+            "origin_review_task_id and origin_event_id must be supplied together"
+        )
+    delegation_id = "gd_" + fingerprint[:32]
+    now = int(time.time())
+    with write_txn(conn):
+        if callback_lease_owner:
+            if not origin_review_task_id or origin_event_id is None:
+                raise ValueError(
+                    "Callback lease owner requires a callback origin."
+                )
+            validate_accepted_grace_callback_origin(
+                conn,
+                review_task_id=origin_review_task_id,
+                event_id=int(origin_event_id),
+                platform=clean_platform,
+                chat_id=clean_chat_id,
+                thread_id=clean_thread_id,
+                session_id=clean_session_id,
+                lease_owner=callback_lease_owner,
+            )
+        if origin_review_task_id and origin_event_id is not None:
+            origin_row = conn.execute(
+                """
+                SELECT *
+                  FROM grace_delegations
+                 WHERE origin_review_task_id = ?
+                   AND origin_event_id = ?
+                """,
+                (origin_review_task_id.strip(), int(origin_event_id)),
+            ).fetchone()
+            if origin_row is not None:
+                existing_origin = dict(origin_row)
+                if existing_origin.get("contract_fingerprint") != fingerprint:
+                    raise ValueError(
+                        "This Grace callback event already reserved another "
+                        "continuation contract."
+                    )
+        existing_request = conn.execute(
+            """
+            SELECT *
+              FROM grace_delegations
+             WHERE platform = ?
+               AND session_key = ?
+               AND request_instance_id = ?
+            """,
+            (
+                clean_platform,
+                clean_session_key,
+                clean_request_instance,
+            ),
+        ).fetchone()
+        if existing_request is not None:
+            request_row = dict(existing_request)
+            if request_row.get("contract_fingerprint") != fingerprint:
+                raise ValueError(
+                    "This authenticated request instance already reserved "
+                    "another Grace delegation contract."
+                )
+        existing = conn.execute(
+            "SELECT * FROM grace_delegations WHERE contract_fingerprint = ?",
+            (fingerprint,),
+        ).fetchone()
+        if existing is not None:
+            row = dict(existing)
+            expected = {
+                "platform": clean_platform,
+                "chat_id": clean_chat_id,
+                "thread_id": clean_thread_id,
+                "session_key": clean_session_key,
+                "session_id": clean_session_id,
+                "resolved_route": route_json,
+                "approval_required": 1 if approval_required else 0,
+                "origin_review_task_id": origin_review_task_id or None,
+                "origin_event_id": (
+                    int(origin_event_id) if origin_event_id is not None else None
+                ),
+            }
+            if any(row.get(key) != value for key, value in expected.items()):
+                raise ValueError(
+                    "Existing Grace delegation is bound to another route, "
+                    "session, approval mode, or callback origin."
+                )
+            if approval_required:
+                if (
+                    row.get("challenge_token") != challenge_token.strip()
+                ):
+                    raise ValueError(
+                        "Existing Grace delegation was authorized by another challenge."
+                    )
+            return row
+
+        clean_token = challenge_token.strip()
+        clean_user_hash = user_id_sha256.strip()
+        clean_approved_message = approved_message_id.strip()
+        if approval_required:
+            if not clean_token or not clean_user_hash or not clean_approved_message:
+                raise ValueError(
+                    "Approval-required delegation needs a challenge token, "
+                    "authenticated owner hash, and fresh approval message."
+                )
+            cur = conn.execute(
+                """
+                UPDATE grace_approval_challenges
+                   SET state = 'consumed', consumed_at = ?,
+                       approved_message_id = ?
+                 WHERE token = ?
+                   AND contract_fingerprint = ?
+                   AND platform = ?
+                   AND chat_id = ?
+                   AND thread_id = ?
+                   AND session_key = ?
+                   AND session_id = ?
+                   AND user_id_sha256 = ?
+                   AND state = 'pending'
+                   AND expires_at > ?
+                   AND requested_message_id <> ?
+                """,
+                (
+                    now,
+                    clean_approved_message,
+                    clean_token,
+                    fingerprint,
+                    clean_platform,
+                    clean_chat_id,
+                    clean_thread_id,
+                    clean_session_key,
+                    clean_session_id,
+                    clean_user_hash,
+                    now,
+                    clean_approved_message,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(
+                    "Approval token is invalid, expired, already used, from the "
+                    "same message that requested it, or bound to another contract."
+                )
+
+        conn.execute(
+            """
+            INSERT INTO grace_delegations (
+                delegation_id, contract_fingerprint, request_instance_id,
+                challenge_token,
+                platform, chat_id, thread_id, session_key, session_id,
+                user_id_sha256, approved_message_id, resolved_route,
+                approval_required, origin_review_task_id, origin_event_id,
+                state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'authorized', ?, ?)
+            """,
+            (
+                delegation_id,
+                fingerprint,
+                clean_request_instance,
+                clean_token or None,
+                clean_platform,
+                clean_chat_id,
+                clean_thread_id,
+                clean_session_key,
+                clean_session_id,
+                clean_user_hash or None,
+                clean_approved_message or None,
+                route_json,
+                1 if approval_required else 0,
+                origin_review_task_id.strip() or None,
+                int(origin_event_id) if origin_event_id is not None else None,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM grace_delegations WHERE delegation_id = ?",
+            (delegation_id,),
+        ).fetchone()
+    return dict(row)
+
+
+def get_grace_delegation(
+    conn: sqlite3.Connection,
+    *,
+    delegation_id: str = "",
+    contract_fingerprint: str = "",
+) -> Optional[dict]:
+    if delegation_id:
+        row = conn.execute(
+            "SELECT * FROM grace_delegations WHERE delegation_id = ?",
+            (delegation_id.strip(),),
+        ).fetchone()
+    elif contract_fingerprint:
+        row = conn.execute(
+            "SELECT * FROM grace_delegations WHERE contract_fingerprint = ?",
+            (contract_fingerprint.strip(),),
+        ).fetchone()
+    else:
+        return None
+    return dict(row) if row is not None else None
+
+
+def claim_grace_delegation_build(
+    conn: sqlite3.Connection,
+    *,
+    delegation_id: str,
+    build_owner: str,
+    lease_seconds: int = 120,
+) -> bool:
+    """Acquire the single builder lease for an authorized delegation saga."""
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_delegations
+               SET state = 'building', build_owner = ?,
+                   build_lease_expires = ?, updated_at = ?
+             WHERE delegation_id = ?
+               AND (
+                   state = 'authorized'
+                   OR (
+                       state = 'building'
+                       AND (build_lease_expires IS NULL OR build_lease_expires <= ?)
+                   )
+               )
+            """,
+            (
+                build_owner.strip(),
+                now + max(30, int(lease_seconds)),
+                now,
+                delegation_id.strip(),
+                now,
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def release_grace_delegation_build(
+    conn: sqlite3.Connection,
+    *,
+    delegation_id: str,
+    build_owner: str,
+) -> bool:
+    """Return a failed saga to its resumable authorized state."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_delegations
+               SET state = 'authorized', build_owner = NULL,
+                   build_lease_expires = NULL, updated_at = ?
+             WHERE delegation_id = ?
+               AND state = 'building' AND build_owner = ?
+            """,
+            (int(time.time()), delegation_id.strip(), build_owner.strip()),
+        )
+    return cur.rowcount == 1
+
+
+def mark_grace_delegation_queued(
+    conn: sqlite3.Connection,
+    *,
+    delegation_id: str,
+    build_owner: str,
+    execution_task_id: str,
+    review_task_id: str,
+    callback_lease_owner: str = "",
+) -> dict:
+    """Atomically commit the delegation and arm its execution card."""
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM grace_delegations WHERE delegation_id = ?",
+            (delegation_id.strip(),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Unknown Grace delegation")
+        existing = dict(row)
+        if (
+            existing.get("state") != "building"
+            or existing.get("build_owner") != build_owner.strip()
+            or int(existing.get("build_lease_expires") or 0) <= now
+        ):
+            raise ValueError(
+                "Grace delegation builder lease is not active or has expired."
+            )
+        origin_review_id = str(
+            existing.get("origin_review_task_id") or ""
+        ).strip()
+        origin_event_raw = existing.get("origin_event_id")
+        if origin_review_id and origin_event_raw is not None:
+            if callback_lease_owner:
+                validate_accepted_grace_callback_origin(
+                    conn,
+                    review_task_id=origin_review_id,
+                    event_id=int(origin_event_raw),
+                    platform=str(existing.get("platform") or ""),
+                    chat_id=str(existing.get("chat_id") or ""),
+                    thread_id=str(existing.get("thread_id") or ""),
+                    session_id=str(existing.get("session_id") or ""),
+                    lease_owner=callback_lease_owner,
+                )
+            elif int(existing.get("approval_required") or 0) == 1:
+                validate_completed_approval_blocker(
+                    conn,
+                    review_task_id=origin_review_id,
+                    event_id=int(origin_event_raw),
+                    platform=str(existing.get("platform") or ""),
+                    chat_id=str(existing.get("chat_id") or ""),
+                    thread_id=str(existing.get("thread_id") or ""),
+                    session_id=str(existing.get("session_id") or ""),
+                )
+            else:
+                raise ValueError(
+                    "Callback continuation cannot be armed without its active "
+                    "lease or a delivered approval checkpoint."
+                )
+        for key, value in (
+            ("execution_task_id", execution_task_id),
+            ("review_task_id", review_task_id),
+        ):
+            if existing.get(key) and existing[key] != value:
+                raise ValueError(
+                    f"Grace delegation already references another {key}"
+                )
+        cur = conn.execute(
+            """
+            UPDATE grace_delegations
+               SET state = 'queued', execution_task_id = ?,
+                   review_task_id = ?, build_owner = NULL,
+                   build_lease_expires = NULL, updated_at = ?
+             WHERE delegation_id = ?
+               AND state = 'building' AND build_owner = ?
+               AND build_lease_expires > ?
+            """,
+            (
+                execution_task_id.strip(),
+                review_task_id.strip(),
+                now,
+                delegation_id.strip(),
+                build_owner.strip(),
+                now,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("Grace delegation builder lease changed before commit.")
+        execution = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (execution_task_id.strip(),),
+        ).fetchone()
+        if execution is None:
+            raise ValueError("Grace delegation execution card is missing.")
+        if execution["status"] == "blocked":
+            if execution["current_run_id"]:
+                raise ValueError(
+                    "Blocked Grace execution card unexpectedly has an active run."
+                )
+            undone_parent = conn.execute(
+                """
+                SELECT 1
+                  FROM task_links AS l
+                  JOIN tasks AS p ON p.id = l.parent_id
+                 WHERE l.child_id = ? AND p.status != 'done'
+                 LIMIT 1
+                """,
+                (execution_task_id.strip(),),
+            ).fetchone()
+            next_status = "todo" if undone_parent else "ready"
+            armed = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?, current_run_id = NULL,
+                       consecutive_failures = 0, last_failure_error = NULL,
+                       last_heartbeat_at = NULL
+                 WHERE id = ? AND status = 'blocked'
+                """,
+                (next_status, execution_task_id.strip()),
+            )
+            if armed.rowcount != 1:
+                raise ValueError(
+                    "Grace execution card changed before atomic arming."
+                )
+            _append_event(
+                conn,
+                execution_task_id.strip(),
+                "unblocked",
+                {"status": next_status} if next_status != "ready" else None,
+            )
+        elif execution["status"] not in {
+            "ready", "todo", "running", "done", "archived",
+        }:
+            raise ValueError(
+                "Grace execution card is in an unsafe state for saga commit: "
+                f"{execution['status']}"
+            )
+        updated = conn.execute(
+            "SELECT * FROM grace_delegations WHERE delegation_id = ?",
+            (delegation_id.strip(),),
+        ).fetchone()
+    return dict(updated)
+
+
+# ---------------------------------------------------------------------------
+# Grace Loop callbacks (terminal review -> originating Grace session)
+# ---------------------------------------------------------------------------
+
+def add_grace_loop_callback(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    execution_task_id: str,
+    platform: str,
+    chat_id: str,
+    chat_type: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    session_key: Optional[str] = None,
+    session_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    contract_fingerprint: str,
+    completion_mode: str = "terminal",
+) -> None:
+    """Persist the return path for a dependent Grace review.
+
+    Registration is idempotent on ``review_task_id``.  Existing routing is
+    never overwritten: a retried delegate call must not redirect an already
+    compiled review into a different chat or session.
+    """
+    required = {
+        "review_task_id": review_task_id,
+        "execution_task_id": execution_task_id,
+        "platform": platform,
+        "chat_id": chat_id,
+        "contract_fingerprint": contract_fingerprint,
+    }
+    missing = [name for name, value in required.items() if not str(value or "").strip()]
+    if missing:
+        raise ValueError(f"Grace callback missing required field(s): {', '.join(missing)}")
+    now = int(time.time())
+    normalized_chat_type = str(chat_type or "").strip().lower()
+    if not normalized_chat_type:
+        parts = str(session_key or "").split(":")
+        if len(parts) >= 5 and parts[0] == "agent":
+            normalized_chat_type = parts[3].strip().lower()
+    if not normalized_chat_type and thread_id:
+        normalized_chat_type = "group"
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO grace_loop_callbacks (
+                review_task_id, execution_task_id, platform, chat_id, chat_type,
+                thread_id, user_id, session_key, session_id, message_id,
+                notifier_profile, contract_fingerprint, completion_mode, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_task_id, execution_task_id, platform.strip().lower(),
+                chat_id.strip(), normalized_chat_type or None,
+                (thread_id or "").strip(),
+                (user_id or "").strip() or None,
+                (session_key or "").strip() or None,
+                (session_id or "").strip() or None,
+                (message_id or "").strip() or None,
+                (notifier_profile or "").strip() or None,
+                contract_fingerprint.strip(),
+                (
+                    completion_mode.strip()
+                    if completion_mode.strip() in {"terminal", "intermediate"}
+                    else "terminal"
+                ),
+                now,
+            ),
+        )
+
+
+def get_grace_loop_callback(
+    conn: sqlite3.Connection, review_task_id: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
+        (review_task_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def validate_active_grace_callback_origin(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+) -> dict:
+    """Return the active callback lease only for its exact originating lane."""
+    row = conn.execute(
+        """
+        SELECT *
+          FROM grace_loop_callbacks
+         WHERE review_task_id = ?
+           AND state = 'delivering'
+           AND lease_event_id = ?
+           AND platform = ?
+           AND chat_id = ?
+           AND thread_id = ?
+           AND session_id = ?
+           AND lease_expires > ?
+           AND ? = (
+               SELECT MAX(e2.id)
+                 FROM task_events AS e2
+                WHERE e2.id > grace_loop_callbacks.last_event_id
+                  AND (
+                      (
+                          e2.task_id = grace_loop_callbacks.review_task_id
+                          AND e2.kind IN (
+                              'completed', 'blocked', 'block_loop_detected',
+                              'gave_up', 'crashed', 'timed_out'
+                          )
+                      )
+                      OR
+                      (
+                          e2.task_id = grace_loop_callbacks.execution_task_id
+                          AND e2.kind IN (
+                              'blocked', 'block_loop_detected', 'gave_up',
+                              'crashed', 'timed_out'
+                          )
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM task_events AS e3
+                       WHERE e3.task_id = e2.task_id
+                         AND e3.id > e2.id
+                         AND e3.kind IN (
+                             'unblocked', 'promoted', 'claimed',
+                             'spawned', 'completed'
+                         )
+                  )
+           )
+        """,
+        (
+            review_task_id.strip(),
+            int(event_id),
+            platform.strip().lower(),
+            chat_id.strip(),
+            (thread_id or "").strip(),
+            session_id.strip(),
+            int(time.time()),
+            int(event_id),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            "Internal continuation is not bound to the active Grace callback lease."
+        )
+    return dict(row)
+
+
+def rebind_active_grace_callback_session(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+) -> dict:
+    """Move an active callback to a compression-rotated session.
+
+    The gateway's session context is allowed to rotate during an internal turn
+    when conversation compression creates a child session.  The callback lease
+    remains the authorization anchor: callers must still present the exact
+    active lease owner and route for the current event.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET session_id = ?
+             WHERE review_task_id = ?
+               AND state = 'delivering'
+               AND lease_event_id = ?
+               AND lease_owner = ?
+               AND platform = ?
+               AND chat_id = ?
+               AND thread_id = ?
+               AND lease_expires > ?
+               AND ? = (
+                   SELECT MAX(e2.id)
+                     FROM task_events AS e2
+                    WHERE e2.id > grace_loop_callbacks.last_event_id
+                      AND (
+                          (
+                              e2.task_id = grace_loop_callbacks.review_task_id
+                              AND e2.kind IN (
+                                  'completed', 'blocked', 'block_loop_detected',
+                                  'gave_up', 'crashed', 'timed_out'
+                              )
+                          )
+                          OR
+                          (
+                              e2.task_id = grace_loop_callbacks.execution_task_id
+                              AND e2.kind IN (
+                                  'blocked', 'block_loop_detected', 'gave_up',
+                                  'crashed', 'timed_out'
+                              )
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM task_events AS e3
+                           WHERE e3.task_id = e2.task_id
+                             AND e3.id > e2.id
+                             AND e3.kind IN (
+                                 'unblocked', 'promoted', 'claimed',
+                                 'spawned', 'completed'
+                             )
+                      )
+               )
+            """,
+            (
+                session_id.strip(),
+                review_task_id.strip(),
+                int(event_id),
+                lease_owner.strip(),
+                platform.strip().lower(),
+                chat_id.strip(),
+                (thread_id or "").strip(),
+                now,
+                int(event_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(
+                "Compression session rebind is not owned by this callback lease."
+            )
+    return validate_active_grace_callback_origin(
+        conn,
+        review_task_id=review_task_id,
+        event_id=event_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
+
+
+def validate_accepted_grace_callback_origin(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+) -> dict:
+    """Require the exact active lease for an accepted review continuation."""
+    callback = validate_active_grace_callback_origin(
+        conn,
+        review_task_id=review_task_id,
+        event_id=event_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
+    if callback.get("lease_owner") != lease_owner.strip():
+        raise ValueError(
+            "Internal continuation is not owned by this callback lease."
+        )
+    trigger = conn.execute(
+        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    review_run = conn.execute(
+        """
+        SELECT metadata
+          FROM task_runs
+         WHERE task_id = ? AND outcome = 'completed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (review_task_id.strip(),),
+    ).fetchone()
+    try:
+        metadata = (
+            json.loads(review_run["metadata"])
+            if review_run is not None and review_run["metadata"]
+            else {}
+        )
+    except (TypeError, ValueError):
+        metadata = {}
+    if (
+        trigger is None
+        or trigger["task_id"] != review_task_id.strip()
+        or trigger["kind"] != "completed"
+        or metadata.get("review_outcome") != "accepted"
+    ):
+        raise ValueError(
+            "Internal continuation requires an accepted Grace-review "
+            "completion event."
+        )
+    return callback
+
+
+def validate_completed_approval_blocker(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+) -> dict:
+    """Validate a fresh owner turn against a delivered approval checkpoint."""
+    row = conn.execute(
+        """
+        SELECT *
+          FROM grace_loop_callbacks
+         WHERE review_task_id = ?
+           AND state = 'delivered'
+           AND last_event_id = ?
+           AND outcome_event_id = ?
+           AND outcome_kind = 'approval_blocked'
+           AND platform = ?
+           AND chat_id = ?
+           AND thread_id = ?
+           AND session_id = ?
+        """,
+        (
+            review_task_id.strip(),
+            int(event_id),
+            int(event_id),
+            platform.strip().lower(),
+            chat_id.strip(),
+            (thread_id or "").strip(),
+            session_id.strip(),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            "Fresh approval turn is not bound to a delivered approval-blocked "
+            "callback on this board and session."
+        )
+    return dict(row)
+
+
+def record_grace_loop_callback_outcome(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+    outcome_kind: str,
+    payload: Mapping[str, Any],
+) -> dict:
+    """Persist the structured postcondition for one callback delivery."""
+    callback = validate_active_grace_callback_origin(
+        conn,
+        review_task_id=review_task_id,
+        event_id=event_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
+    if callback.get("lease_owner") != lease_owner.strip():
+        raise ValueError(
+            "Structured callback outcome is not owned by this callback lease."
+        )
+    trigger = conn.execute(
+        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    review_run = conn.execute(
+        """
+        SELECT metadata
+          FROM task_runs
+         WHERE task_id = ? AND outcome = 'completed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (review_task_id.strip(),),
+    ).fetchone()
+    try:
+        review_metadata = (
+            json.loads(review_run["metadata"])
+            if review_run is not None and review_run["metadata"]
+            else {}
+        )
+    except (TypeError, ValueError):
+        review_metadata = {}
+    if (
+        trigger is None
+        or trigger["task_id"] != review_task_id.strip()
+        or trigger["kind"] != "completed"
+        or review_metadata.get("review_outcome") != "accepted"
+    ):
+        raise ValueError(
+            "Structured callback outcomes are allowed only for an accepted "
+            "Grace-review completion event."
+        )
+    kind = str(outcome_kind or "").strip()
+    if kind not in {"closed", "continued", "approval_blocked"}:
+        raise ValueError(
+            "Callback outcome must be closed, continued, or approval_blocked."
+        )
+    clean_payload = dict(payload or {})
+    payload_json = json.dumps(
+        clean_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if callback.get("outcome_event_id") is not None:
+        if (
+            int(callback.get("outcome_event_id") or 0) == int(event_id)
+            and callback.get("outcome_kind") == kind
+            and callback.get("outcome_payload") == payload_json
+        ):
+            return callback
+        raise ValueError(
+            "Grace callback outcome is write-once and another outcome "
+            "is already recorded."
+        )
+    if kind == "closed":
+        if callback.get("completion_mode") == "intermediate":
+            raise ValueError(
+                "Intermediate callback cannot close the complete user outcome; "
+                "record a continued or approval_blocked postcondition."
+            )
+        if not str(clean_payload.get("summary") or "").strip():
+            raise ValueError("Closed callback outcome requires a summary.")
+    elif kind == "approval_blocked":
+        required = ("action", "platform", "scope", "exact_question")
+        missing = [
+            key for key in required
+            if not str(clean_payload.get(key) or "").strip()
+        ]
+        if missing:
+            raise ValueError(
+                "Approval-blocked callback outcome missing: "
+                + ", ".join(missing)
+            )
+    else:
+        execution_task_id = str(
+            clean_payload.get("execution_task_id") or ""
+        ).strip()
+        next_review_task_id = str(
+            clean_payload.get("review_task_id") or ""
+        ).strip()
+        delegation_id = str(clean_payload.get("delegation_id") or "").strip()
+        if not execution_task_id or not next_review_task_id or not delegation_id:
+            raise ValueError(
+                "Continued callback outcome requires delegation_id and both task ids."
+            )
+        delegation = get_grace_delegation(
+            conn, delegation_id=delegation_id,
+        )
+        if (
+            delegation is None
+            or delegation.get("state") != "queued"
+            or delegation.get("execution_task_id") != execution_task_id
+            or delegation.get("review_task_id") != next_review_task_id
+            or delegation.get("origin_review_task_id") != review_task_id
+            or int(delegation.get("origin_event_id") or 0) != int(event_id)
+            or delegation.get("platform") != platform.strip().lower()
+            or delegation.get("chat_id") != chat_id.strip()
+            or delegation.get("thread_id") != (thread_id or "").strip()
+            or delegation.get("session_id") != session_id.strip()
+        ):
+            raise ValueError(
+                "Continuation tasks are not the queued delegation created by "
+                "this exact callback."
+    )
+    with write_txn(conn):
+        current_callback = validate_active_grace_callback_origin(
+            conn,
+            review_task_id=review_task_id,
+            event_id=event_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+        if current_callback.get("lease_owner") != lease_owner.strip():
+            raise ValueError(
+                "Structured callback outcome lost its active callback lease."
+            )
+        origin_delegations = conn.execute(
+            """
+            SELECT *
+              FROM grace_delegations
+             WHERE origin_review_task_id = ?
+               AND origin_event_id = ?
+            """,
+            (review_task_id.strip(), int(event_id)),
+        ).fetchall()
+        origin_challenges = conn.execute(
+            """
+            SELECT *
+              FROM grace_approval_challenges
+             WHERE origin_review_task_id = ?
+               AND origin_event_id = ?
+               AND state = 'pending'
+               AND expires_at > ?
+            """,
+            (review_task_id.strip(), int(event_id), int(time.time())),
+        ).fetchall()
+        if kind == "closed" and (origin_delegations or origin_challenges):
+            raise ValueError(
+                "Closed callback outcome conflicts with a durable continuation "
+                "or pending approval challenge created by this callback."
+            )
+        if kind == "approval_blocked":
+            if len(origin_challenges) != 1 or origin_delegations:
+                raise ValueError(
+                    "Approval-blocked callback outcome requires exactly one "
+                    "pending challenge and no queued continuation for this callback."
+                )
+            challenge = origin_challenges[0]
+            if (
+                challenge["platform"] != platform.strip().lower()
+                or challenge["chat_id"] != chat_id.strip()
+                or challenge["thread_id"] != (thread_id or "").strip()
+                or challenge["session_id"] != session_id.strip()
+                or str(clean_payload.get("exact_question") or "").strip()
+                != f"核准 {challenge['token']}"
+                or str(clean_payload.get("action") or "").strip()
+                != str(challenge["action_summary"] or "").strip()
+                or str(clean_payload.get("platform") or "").strip()
+                != str(challenge["approval_platform"] or "").strip()
+                or json.dumps(
+                    clean_payload.get("scope"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                != str(challenge["approval_scope"] or "").strip()
+            ):
+                raise ValueError(
+                    "Approval-blocked callback outcome does not match the exact "
+                    "pending challenge created by this callback."
+                )
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET outcome_event_id = ?, outcome_kind = ?,
+                   outcome_payload = ?
+             WHERE review_task_id = ?
+               AND state = 'delivering'
+               AND lease_event_id = ?
+               AND lease_owner = ?
+               AND lease_expires > ?
+               AND outcome_event_id IS NULL
+               AND outcome_kind IS NULL
+               AND outcome_payload IS NULL
+            """,
+            (
+                int(event_id),
+                kind,
+                payload_json,
+                review_task_id.strip(),
+                int(event_id),
+                lease_owner.strip(),
+                int(time.time()),
+            ),
+        )
+        if cur.rowcount != 1:
+            existing = conn.execute(
+                """
+                SELECT * FROM grace_loop_callbacks
+                 WHERE review_task_id = ?
+                   AND state = 'delivering'
+                   AND lease_event_id = ?
+                   AND lease_owner = ?
+                   AND lease_expires > ?
+                """,
+                (
+                    review_task_id.strip(),
+                    int(event_id),
+                    lease_owner.strip(),
+                    int(time.time()),
+                ),
+            ).fetchone()
+            if (
+                existing is None
+                or int(existing["outcome_event_id"] or 0) != int(event_id)
+                or existing["outcome_kind"] != kind
+                or existing["outcome_payload"] != payload_json
+            ):
+                raise ValueError(
+                    "Grace callback outcome is write-once and another outcome "
+                    "is already recorded."
+                )
+            return dict(existing)
+        row = conn.execute(
+            "SELECT * FROM grace_loop_callbacks WHERE review_task_id = ?",
+            (review_task_id.strip(),),
+        ).fetchone()
+    return dict(row)
+
+
+def grace_loop_callback_has_outcome(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM grace_loop_callbacks
+         WHERE review_task_id = ?
+           AND state = 'delivering'
+           AND lease_event_id = ?
+           AND lease_owner = ?
+           AND outcome_event_id = ?
+           AND outcome_kind IN ('closed', 'continued', 'approval_blocked')
+           AND outcome_payload IS NOT NULL
+        """,
+        (
+            review_task_id.strip(),
+            int(event_id),
+            lease_owner,
+            int(event_id),
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def escalate_grace_loop_callback(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+    error: str,
+) -> bool:
+    """Park an unverifiable callback without falsely advancing its cursor."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET state = 'attention', lease_event_id = NULL,
+                   lease_owner = NULL, lease_expires = NULL,
+                   last_error = ?
+             WHERE review_task_id = ?
+               AND lease_event_id = ? AND lease_owner = ?
+            """,
+            (str(error)[:2000], review_task_id, int(event_id), lease_owner),
+        )
+    return cur.rowcount == 1
+
+
+def list_due_grace_loop_callbacks(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+) -> list[dict]:
+    """Return the latest unseen execution-block or terminal-review event.
+
+    Execution blockers wake Grace so she can ask for the exact missing decision
+    or report a capability failure. A blocked review can later be resumed and
+    accepted, so superseded blocker events are coalesced to the latest relevant
+    state instead of asking KJ for a decision that is no longer needed.
+    """
+    now_i = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        """
+        SELECT c.*, e.id AS event_id, e.task_id AS event_task_id,
+               e.kind AS event_kind, e.payload AS event_payload,
+               CASE
+                   WHEN e.task_id = c.execution_task_id THEN 'execution'
+                   ELSE 'grace_review'
+               END AS event_stage
+          FROM grace_loop_callbacks AS c
+          JOIN grace_delegations AS d
+            ON d.execution_task_id = c.execution_task_id
+           AND d.review_task_id = c.review_task_id
+           AND d.state = 'queued'
+          JOIN task_events AS e
+            ON e.id = (
+               SELECT MAX(e2.id)
+                 FROM task_events AS e2
+                WHERE e2.id > c.last_event_id
+                  AND (
+                      (
+                          e2.task_id = c.review_task_id
+                          AND e2.kind IN (
+                              'completed', 'blocked', 'block_loop_detected',
+                              'gave_up', 'crashed', 'timed_out'
+                          )
+                      )
+                      OR
+                      (
+                          e2.task_id = c.execution_task_id
+                          AND e2.kind IN (
+                              'blocked', 'block_loop_detected', 'gave_up',
+                              'crashed', 'timed_out'
+                          )
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM task_events AS e3
+                       WHERE e3.task_id = e2.task_id
+                         AND e3.id > e2.id
+                         AND e3.kind IN (
+                             'unblocked', 'promoted', 'claimed',
+                             'spawned', 'completed'
+                         )
+                  )
+           )
+         WHERE c.state != 'attention'
+           AND (c.lease_expires IS NULL OR c.lease_expires <= ?)
+         ORDER BY e.id
+        """,
+        (now_i,),
+    ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["event_payload"] = (
+                json.loads(item["event_payload"]) if item.get("event_payload") else {}
+            )
+        except (TypeError, ValueError):
+            item["event_payload"] = {}
+        result.append(item)
+    return result
+
+
+def claim_grace_loop_callback(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+    lease_seconds: int = 120,
+) -> bool:
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET state = 'delivering', lease_event_id = ?, lease_owner = ?,
+                   lease_expires = ?, last_error = NULL,
+                   outcome_event_id = CASE
+                       WHEN outcome_event_id = ? THEN outcome_event_id
+                       ELSE NULL
+                   END,
+                   outcome_kind = CASE
+                       WHEN outcome_event_id = ? THEN outcome_kind
+                       ELSE NULL
+                   END,
+                   outcome_payload = CASE
+                       WHEN outcome_event_id = ? THEN outcome_payload
+                       ELSE NULL
+                   END
+             WHERE review_task_id = ?
+               AND last_event_id < ?
+               AND (lease_expires IS NULL OR lease_expires <= ?)
+               AND EXISTS (
+                   SELECT 1
+                     FROM grace_delegations AS d
+                    WHERE d.execution_task_id =
+                              grace_loop_callbacks.execution_task_id
+                      AND d.review_task_id =
+                              grace_loop_callbacks.review_task_id
+                      AND d.state = 'queued'
+               )
+               AND ? = (
+                   SELECT MAX(e2.id)
+                     FROM task_events AS e2
+                    WHERE e2.id > grace_loop_callbacks.last_event_id
+                      AND (
+                          (
+                              e2.task_id = grace_loop_callbacks.review_task_id
+                              AND e2.kind IN (
+                                  'completed', 'blocked', 'block_loop_detected',
+                                  'gave_up', 'crashed', 'timed_out'
+                              )
+                          )
+                          OR
+                          (
+                              e2.task_id = grace_loop_callbacks.execution_task_id
+                              AND e2.kind IN (
+                                  'blocked', 'block_loop_detected', 'gave_up',
+                                  'crashed', 'timed_out'
+                              )
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM task_events AS e3
+                           WHERE e3.task_id = e2.task_id
+                             AND e3.id > e2.id
+                             AND e3.kind IN (
+                                 'unblocked', 'promoted', 'claimed',
+                                 'spawned', 'completed'
+                             )
+                      )
+               )
+            """,
+            (
+                int(event_id), lease_owner,
+                now + max(30, int(lease_seconds)),
+                int(event_id), int(event_id), int(event_id),
+                review_task_id, int(event_id), now, int(event_id),
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def renew_grace_loop_callback_lease(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+    lease_seconds: int = 120,
+) -> bool:
+    """Extend only the still-active callback owner's unexpired lease."""
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET lease_expires = ?
+             WHERE review_task_id = ?
+               AND state = 'delivering'
+               AND lease_event_id = ?
+               AND lease_owner = ?
+               AND lease_expires > ?
+            """,
+            (
+                now + max(30, int(lease_seconds)),
+                review_task_id.strip(),
+                int(event_id),
+                lease_owner,
+                now,
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def record_grace_loop_delivery_attempt(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+) -> int:
+    """Count one real adapter delivery attempt for the active callback lease."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET attempts = CASE
+                       WHEN attempt_event_id = ? THEN attempts + 1
+                       ELSE 1
+                   END,
+                   attempt_event_id = ?
+             WHERE review_task_id = ?
+               AND lease_event_id = ? AND lease_owner = ?
+            """,
+            (
+                int(event_id),
+                int(event_id),
+                review_task_id,
+                int(event_id),
+                lease_owner,
+            ),
+        )
+        if cur.rowcount != 1:
+            return 0
+        row = conn.execute(
+            "SELECT attempts FROM grace_loop_callbacks WHERE review_task_id = ?",
+            (review_task_id,),
+        ).fetchone()
+    return int(row["attempts"]) if row is not None else 0
+
+
+def finish_grace_loop_callback(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+    error: Optional[str] = None,
+) -> bool:
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET state = 'delivered', last_event_id = ?,
+                   lease_event_id = NULL, lease_owner = NULL,
+                   lease_expires = NULL, attempts = 0,
+                   attempt_event_id = NULL,
+                   last_error = ?, delivered_at = ?
+             WHERE review_task_id = ?
+               AND state = 'delivering'
+               AND lease_event_id = ? AND lease_owner = ?
+               AND lease_expires > ?
+               AND ? = (
+                   SELECT MAX(e2.id)
+                     FROM task_events AS e2
+                    WHERE e2.id > grace_loop_callbacks.last_event_id
+                      AND (
+                          (
+                              e2.task_id = grace_loop_callbacks.review_task_id
+                              AND e2.kind IN (
+                                  'completed', 'blocked', 'block_loop_detected',
+                                  'gave_up', 'crashed', 'timed_out'
+                              )
+                          )
+                          OR
+                          (
+                              e2.task_id = grace_loop_callbacks.execution_task_id
+                              AND e2.kind IN (
+                                  'blocked', 'block_loop_detected', 'gave_up',
+                                  'crashed', 'timed_out'
+                              )
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM task_events AS e3
+                           WHERE e3.task_id = e2.task_id
+                             AND e3.id > e2.id
+                             AND e3.kind IN (
+                                 'unblocked', 'promoted', 'claimed',
+                                 'spawned', 'completed'
+                             )
+                      )
+               )
+            """,
+            (
+                int(event_id), str(error or "").strip() or None, now,
+                review_task_id, int(event_id), lease_owner, now,
+                int(event_id),
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def release_grace_loop_callback(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+    error: str,
+) -> bool:
+    """Release a failed delivery so a later notifier tick can retry it."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE grace_loop_callbacks
+               SET state = 'pending', lease_event_id = NULL,
+                   lease_owner = NULL, lease_expires = NULL,
+                   last_error = ?
+             WHERE review_task_id = ?
+               AND lease_event_id = ? AND lease_owner = ?
+            """,
+            (str(error)[:2000], review_task_id, int(event_id), lease_owner),
+        )
+    return cur.rowcount == 1
 
 
 def unseen_events_for_sub(

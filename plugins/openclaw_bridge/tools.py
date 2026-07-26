@@ -28,7 +28,7 @@ class OpenClawBridgeConfig:
     timeout_seconds: int = 30
 
 
-OPENCLAW_DELEGATE_SCHEMA = {
+OPENCLAW_DELEGATE_PARAMETERS = {
     "type": "object",
     "properties": {
         "objective": {"type": "string"},
@@ -44,6 +44,11 @@ OPENCLAW_DELEGATE_SCHEMA = {
         "openclaw_task_id": {"type": "string"},
     },
     "required": ["objective"],
+}
+
+OPENCLAW_DELEGATE_SCHEMA = {
+    "description": "Diagnostic OpenClaw bridge only; not a real execution fallback.",
+    "parameters": OPENCLAW_DELEGATE_PARAMETERS,
 }
 
 
@@ -513,11 +518,7 @@ def handle_openclaw_dry_run(raw_args: str) -> str:
 
 
 def pre_gateway_dispatch(*, event: Any, **_kwargs: Any) -> dict[str, str] | None:
-    """Conservatively rewrite explicit ClawOps/OpenClaw bridge requests.
-
-    This intentionally avoids broad intent detection. Hermes should not send
-    ordinary chat to OpenClaw just because the text mentions it.
-    """
+    """Keep only explicit diagnostic commands; natural language always reaches Grace."""
     text = str(getattr(event, "text", "") or "").strip()
     if not text or text.startswith("/"):
         return None
@@ -530,17 +531,6 @@ def pre_gateway_dispatch(*, event: Any, **_kwargs: Any) -> dict[str, str] | None
             rest = text.split(":", 1)[1]
         rest = rest.strip() or "OpenClaw bridge dry-run"
         return {"action": "rewrite", "text": f"/openclaw-dry-run {rest}"}
-
-    clawops_prefixes = ("clawops:", "clawops ")
-    if lowered.startswith(clawops_prefixes):
-        _, _, rest = text.partition(" ")
-        if ":" in text.split(" ", 1)[0]:
-            rest = text.split(":", 1)[1]
-        rest = rest.strip() or "ClawOps runtime task"
-        return {"action": "rewrite", "text": f"/clawops {rest}"}
-
-    if _should_route_external_browser_work_to_clawops(text):
-        return {"action": "rewrite", "text": f"/clawops {text}"}
 
     return None
 

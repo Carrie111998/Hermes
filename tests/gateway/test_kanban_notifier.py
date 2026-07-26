@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
 from pathlib import Path
+import time
 
 
 from gateway.config import Platform
+from gateway.kanban_watchers import _loop_task_context
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -10,9 +13,20 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.documents = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    def extract_local_files(self, text):
+        return [], text
+
+    async def send_document(self, chat_id, file_path, metadata=None):
+        self.documents.append({
+            "chat_id": chat_id,
+            "file_path": file_path,
+            "metadata": metadata or {},
+        })
 
 
 class DisconnectedAdapters(dict):
@@ -20,6 +34,71 @@ class DisconnectedAdapters(dict):
 
     def get(self, key, default=None):
         return None
+
+
+def _insert_loop_delegation(conn, execution_id, review_id):
+    now = int(time.time())
+    fingerprint = hashlib.sha256(
+        f"{execution_id}:{review_id}".encode("utf-8"),
+    ).hexdigest()
+    conn.execute(
+        """
+        INSERT INTO grace_delegations (
+            delegation_id, contract_fingerprint, request_instance_id,
+            platform, chat_id, thread_id, session_key, session_id,
+            resolved_route, approval_required, state,
+            execution_task_id, review_task_id, created_at, updated_at
+        ) VALUES (?, ?, ?, 'telegram', 'chat-1', '2', ?, ?, '{}', 0,
+                  'queued', ?, ?, ?, ?)
+        """,
+        (
+            f"gd_{execution_id}",
+            fingerprint,
+            f"gri_{execution_id}",
+            f"loop:{execution_id}",
+            f"loop-session:{execution_id}",
+            execution_id,
+            review_id,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+
+
+def test_loop_task_context_requires_durable_binding_and_exact_header(tmp_path):
+    db_path = tmp_path / "loop-context.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        ordinary_id = kb.create_task(
+            conn,
+            title="ordinary",
+            body="ordinary evidence\nGRACE_LOOP_CONTRACT_STAGE: execution",
+            assignee="worker",
+        )
+        assert _loop_task_context(conn, kb.get_task(conn, ordinary_id)) == {}
+
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+            assignee="clawops-content",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            body=(
+                "GRACE_LOOP_CONTRACT_STAGE: grace_review\n"
+                "evidence mentions GRACE_LOOP_CONTRACT_STAGE: execution"
+            ),
+            assignee="default",
+            parents=(execution_id,),
+        )
+        _insert_loop_delegation(conn, execution_id, review_id)
+        assert (
+            _loop_task_context(conn, kb.get_task(conn, review_id))["stage"]
+            == "grace_review"
+        )
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
@@ -67,6 +146,70 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def test_kanban_notifier_reports_claimed_and_spawned_progress(tmp_path, monkeypatch):
+    db_path = tmp_path / "progress.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="progress test", assignee="clawops-test")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="claimed")
+        kb._append_event(conn, tid, kind="spawned", payload={"pid": 4321})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 2
+    assert "已啟動" in adapter.sent[0]["text"]
+    assert "執行中" in adapter.sent[1]["text"]
+    assert "pid=4321" in adapter.sent[1]["text"]
+
+
+def test_kanban_notifier_delivers_loop_breaker_triage_to_original_chat(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "triage-notify.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="brand decision", assignee="clawops-browser")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-2",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            kind="block_loop_detected",
+            payload={
+                "reason": "Shopee 品牌查無結果；請決定是否申請新增品牌。",
+                "kind": "needs_input",
+                "recurrences": 2,
+                "limit": 2,
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "chat-1"
+    assert adapter.sent[0]["metadata"]["thread_id"] == "topic-2"
+    assert "需要你確認" in adapter.sent[0]["text"]
+    assert "申請新增品牌" in adapter.sent[0]["text"]
 
 
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
@@ -123,6 +266,63 @@ def test_kanban_notifier_completed_message_preserves_long_summary(tmp_path, monk
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
     assert "Listed on Marketplace and at least 1 group" in text
+
+
+def test_accepted_grace_review_delivers_parent_execution_artifact(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "accepted-artifact.db"
+    artifact_path = tmp_path / "verified-report.txt"
+    artifact_path.write_text("verified", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        execution_id = kb.create_task(
+            conn,
+            title="execution",
+            assignee="clawops-content",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _insert_loop_delegation(conn, execution_id, review_id)
+        kb.add_notify_sub(
+            conn,
+            task_id=review_id,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="execution complete",
+            metadata={"artifacts": [str(artifact_path)]},
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="review accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "已完成驗收" in adapter.sent[0]["text"]
+    assert len(adapter.documents) == 1
+    delivered_path = Path(adapter.documents[0]["file_path"])
+    assert delivered_path.name == artifact_path.name
+    assert delivered_path.read_text(encoding="utf-8") == "verified"
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):

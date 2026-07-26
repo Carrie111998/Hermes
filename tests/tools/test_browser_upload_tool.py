@@ -61,6 +61,10 @@ def test_success_invokes_upload_helper(monkeypatch, tmp_path):
             files=[str(image)],
             selector='input[type="file"][accept*="image"]',
             target_url_contains="facebook.com",
+            page_index=1,
+            input_index=2,
+            verify_text_contains="1/9",
+            verify_timeout_ms=4321,
             timeout=12,
             settle_ms=1234,
         )
@@ -70,6 +74,10 @@ def test_success_invokes_upload_helper(monkeypatch, tmp_path):
     assert captured["payload"]["files"] == [str(image.resolve())]
     assert captured["payload"]["selector"] == 'input[type="file"][accept*="image"]'
     assert captured["payload"]["targetUrlContains"] == "facebook.com"
+    assert captured["payload"]["pageIndex"] == 1
+    assert captured["payload"]["inputIndex"] == 2
+    assert captured["payload"]["verifyTextContains"] == "1/9"
+    assert captured["payload"]["verifyTimeoutMs"] == 4321
     assert captured["payload"]["settleMs"] == 1234
     assert captured["timeout"] == 12
 
@@ -102,3 +110,15 @@ def test_check_requires_cdp_and_node(monkeypatch):
 
     monkeypatch.setattr(browser_upload_tool, "_resolve_cdp_endpoint", lambda: "")
     assert browser_upload_tool._browser_upload_files_check() is False
+
+
+def test_helper_script_fails_closed_on_ambiguous_pages_and_inputs():
+    script = browser_upload_tool._playwright_node_script()
+    assert "Multiple pages" in script
+    assert "provide page_index" in script
+    assert "Multiple file inputs" in script
+    assert "provide input_index" in script
+    assert "Upload postcondition was not observed" in script
+    assert "verification marker was already present before upload" in script
+    assert "selectedInput" in script
+    assert "locator.evaluate((selectedInput, inputIndex)" in script

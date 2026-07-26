@@ -251,7 +251,7 @@ def test_openclaw_delegate_handler_accepts_registry_keyword_args(monkeypatch):
 def test_plugin_registers_tool_command_and_gateway_hook():
     from plugins.openclaw_bridge import register
 
-    calls = {"tools": [], "commands": [], "hooks": []}
+    calls = {"tools": [], "commands": [], "hooks": [], "middleware": []}
 
     class Ctx:
         def register_tool(self, **kwargs):
@@ -263,49 +263,45 @@ def test_plugin_registers_tool_command_and_gateway_hook():
         def register_hook(self, name, _handler):
             calls["hooks"].append(name)
 
+        def register_middleware(self, name, _handler):
+            calls["middleware"].append(name)
+
     register(Ctx())
 
     assert calls == {
-        "tools": ["openclaw_delegate"],
+        "tools": [
+            "clawops_delegate",
+            "grace_callback_outcome",
+            "openclaw_delegate",
+        ],
         "commands": ["openclaw-dry-run"],
         "hooks": ["pre_gateway_dispatch"],
+        "middleware": ["tool_execution"],
     }
 
 
-def test_pre_gateway_dispatch_routes_clawops_requests_to_runtime_queue():
+def test_pre_gateway_dispatch_keeps_clawops_requests_with_grace():
     from types import SimpleNamespace
 
     from plugins.openclaw_bridge.tools import pre_gateway_dispatch
 
     event = SimpleNamespace(text="ClawOps: check bridge wiring")
-    assert pre_gateway_dispatch(event=event) == {
-        "action": "rewrite",
-        "text": "/clawops check bridge wiring",
-    }
+    assert pre_gateway_dispatch(event=event) is None
 
     spaced = SimpleNamespace(text="ClawOps check queue callback")
-    assert pre_gateway_dispatch(event=spaced) == {
-        "action": "rewrite",
-        "text": "/clawops check queue callback",
-    }
+    assert pre_gateway_dispatch(event=spaced) is None
 
 
-def test_pre_gateway_dispatch_routes_facebook_publish_work_to_clawops():
+def test_pre_gateway_dispatch_keeps_facebook_execution_with_grace():
     from types import SimpleNamespace
 
     from plugins.openclaw_bridge.tools import pre_gateway_dispatch
 
     event = SimpleNamespace(text="請繼續 #7 咖啡器材新舊交流團的刊登流程，只允許點 Next，不要送出")
-    assert pre_gateway_dispatch(event=event) == {
-        "action": "rewrite",
-        "text": "/clawops 請繼續 #7 咖啡器材新舊交流團的刊登流程，只允許點 Next，不要送出",
-    }
+    assert pre_gateway_dispatch(event=event) is None
 
     upload = SimpleNamespace(text="Facebook 社團商品表單照片上傳後檢查 Next 是否解除鎖定")
-    assert pre_gateway_dispatch(event=upload) == {
-        "action": "rewrite",
-        "text": "/clawops Facebook 社團商品表單照片上傳後檢查 Next 是否解除鎖定",
-    }
+    assert pre_gateway_dispatch(event=upload) is None
 
 
 def test_pre_gateway_dispatch_does_not_route_facebook_explanation_to_clawops():
@@ -330,6 +326,86 @@ def test_pre_gateway_dispatch_keeps_openclaw_requests_as_bridge_preview():
 
     normal = SimpleNamespace(text="請說明 OpenClaw 是什麼")
     assert pre_gateway_dispatch(event=normal) is None
+
+
+def test_pre_gateway_dispatch_never_auto_routes_execution_work(monkeypatch):
+    from types import SimpleNamespace
+
+    from plugins.openclaw_bridge.tools import pre_gateway_dispatch
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "openclaw_bridge": {
+                "auto_route_clawops": {
+                    "enabled": True,
+                    "platforms": ["telegram"],
+                }
+            }
+        },
+    )
+    source = SimpleNamespace(platform="telegram")
+    event = SimpleNamespace(
+        text="請檢查 Hermes gateway log 並修正錯誤",
+        source=source,
+    )
+
+    assert pre_gateway_dispatch(event=event) is None
+
+
+def test_pre_gateway_dispatch_auto_route_keeps_advice_with_grace(monkeypatch):
+    from types import SimpleNamespace
+
+    from plugins.openclaw_bridge.tools import pre_gateway_dispatch
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "openclaw_bridge": {
+                "auto_route_clawops": {
+                    "enabled": True,
+                    "platforms": ["telegram"],
+                }
+            }
+        },
+    )
+    source = SimpleNamespace(platform="telegram")
+
+    advice = SimpleNamespace(
+        text="目前系統回覆緩慢，是否因為 GPT-5.5？請提出解決方案",
+        source=source,
+    )
+    explanation = SimpleNamespace(
+        text="請說明如何修正 gateway timeout",
+        source=source,
+    )
+
+    assert pre_gateway_dispatch(event=advice) is None
+    assert pre_gateway_dispatch(event=explanation) is None
+
+
+def test_pre_gateway_dispatch_auto_route_respects_platform_allowlist(monkeypatch):
+    from types import SimpleNamespace
+
+    from plugins.openclaw_bridge.tools import pre_gateway_dispatch
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "openclaw_bridge": {
+                "auto_route_clawops": {
+                    "enabled": True,
+                    "platforms": ["telegram"],
+                }
+            }
+        },
+    )
+    event = SimpleNamespace(
+        text="請檢查 Hermes gateway log 並修正錯誤",
+        source=SimpleNamespace(platform="feishu"),
+    )
+
+    assert pre_gateway_dispatch(event=event) is None
 
 
 def test_openclaw_dry_run_slash_does_not_enqueue_kanban_by_default(monkeypatch):

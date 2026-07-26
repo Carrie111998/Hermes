@@ -36,6 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
@@ -61,6 +62,22 @@ _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+_SESSION_MESSAGE_TEXT: ContextVar = ContextVar(
+    "HERMES_SESSION_MESSAGE_TEXT", default=_UNSET
+)
+# Security provenance for task-scoped external approvals.  Internal gateway
+# callbacks deliberately reuse the originating route and user id, so user_id
+# alone cannot prove that the current turn is a fresh human authorization.
+_SESSION_INTERNAL: ContextVar = ContextVar("HERMES_SESSION_INTERNAL", default=_UNSET)
+_SESSION_OWNER_USER_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_OWNER_USER_ID", default=_UNSET
+)
+_GRACE_CALLBACK_BOARD: ContextVar = ContextVar(
+    "HERMES_GRACE_CALLBACK_BOARD", default=_UNSET
+)
+_GRACE_CALLBACK_LEASE_OWNER: ContextVar = ContextVar(
+    "HERMES_GRACE_CALLBACK_LEASE_OWNER", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -100,6 +117,11 @@ _VAR_MAP = {
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
+    "HERMES_SESSION_MESSAGE_TEXT": _SESSION_MESSAGE_TEXT,
+    "HERMES_SESSION_INTERNAL": _SESSION_INTERNAL,
+    "HERMES_SESSION_OWNER_USER_ID": _SESSION_OWNER_USER_ID,
+    "HERMES_GRACE_CALLBACK_BOARD": _GRACE_CALLBACK_BOARD,
+    "HERMES_GRACE_CALLBACK_LEASE_OWNER": _GRACE_CALLBACK_LEASE_OWNER,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -132,6 +154,11 @@ def set_session_vars(
     session_key: str = "",
     session_id: str = "",
     message_id: str = "",
+    message_text: str = "",
+    internal: bool = False,
+    owner_user_id: str = "",
+    grace_callback_board: str = "",
+    grace_callback_lease_owner: str = "",
     cwd: str = "",
     async_delivery: bool = True,
 ) -> list:
@@ -161,6 +188,11 @@ def set_session_vars(
         _SESSION_KEY.set(session_key),
         _SESSION_ID.set(session_id),
         _SESSION_MESSAGE_ID.set(message_id),
+        _SESSION_MESSAGE_TEXT.set(message_text),
+        _SESSION_INTERNAL.set("true" if internal else "false"),
+        _SESSION_OWNER_USER_ID.set(owner_user_id),
+        _GRACE_CALLBACK_BOARD.set(grace_callback_board),
+        _GRACE_CALLBACK_LEASE_OWNER.set(grace_callback_lease_owner),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -194,6 +226,11 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_KEY,
         _SESSION_ID,
         _SESSION_MESSAGE_ID,
+        _SESSION_MESSAGE_TEXT,
+        _SESSION_INTERNAL,
+        _SESSION_OWNER_USER_ID,
+        _GRACE_CALLBACK_BOARD,
+        _GRACE_CALLBACK_LEASE_OWNER,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -233,6 +270,16 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+@contextmanager
+def override_session_message_text(message_text: str):
+    """Temporarily replace only the current task's session message text."""
+    token = _SESSION_MESSAGE_TEXT.set(str(message_text or ""))
+    try:
+        yield
+    finally:
+        _SESSION_MESSAGE_TEXT.reset(token)
 
 
 def async_delivery_supported() -> bool:

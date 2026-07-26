@@ -38,6 +38,562 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _bind_queued_grace_delegation(
+    conn: sqlite3.Connection,
+    execution_task_id: str,
+    review_task_id: str,
+    *,
+    suffix: str,
+) -> None:
+    """Attach callback unit tests to the queued delegation they require."""
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO grace_delegations (
+            delegation_id, contract_fingerprint, request_instance_id,
+            platform, chat_id, thread_id, session_key, session_id,
+            resolved_route, approval_required, state,
+            execution_task_id, review_task_id, created_at, updated_at
+        ) VALUES (?, ?, ?, 'telegram', 'chat-1', '2', ?, ?, '{}', 0,
+                  'queued', ?, ?, ?, ?)
+        """,
+        (
+            f"gd-test-{suffix}",
+            (suffix.encode().hex() + "0" * 64)[:64],
+            f"request-test-{suffix}",
+            "agent:main:telegram:group:chat-1:2",
+            "grace-session-1",
+            execution_task_id,
+            review_task_id,
+            now,
+            now,
+        ),
+    )
+
+
+def test_delegation_commit_rejects_expired_builder_lease(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn, title="execution", initial_status="blocked",
+        )
+        review_id = kb.create_task(conn, title="review")
+        delegation = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="d" * 64,
+            request_instance_id="gri-build-lease",
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            resolved_route={"assignment": {"agent": "clawops"}},
+            approval_required=False,
+        )
+        assert kb.claim_grace_delegation_build(
+            conn,
+            delegation_id=delegation["delegation_id"],
+            build_owner="builder-1",
+        )
+        conn.execute(
+            """
+            UPDATE grace_delegations
+               SET build_lease_expires = 0
+             WHERE delegation_id = ?
+            """,
+            (delegation["delegation_id"],),
+        )
+        with pytest.raises(ValueError, match="expired"):
+            kb.mark_grace_delegation_queued(
+                conn,
+                delegation_id=delegation["delegation_id"],
+                build_owner="builder-1",
+                execution_task_id=execution_id,
+                review_task_id=review_id,
+            )
+        assert kb.get_task(conn, execution_id).status == "blocked"
+        assert kb.get_grace_delegation(
+            conn, delegation_id=delegation["delegation_id"],
+        )["state"] == "building"
+
+
+def test_delegation_request_instance_rejects_changed_contract(tmp_path):
+    db_path = tmp_path / "request-instance.db"
+    common = {
+        "request_instance_id": "gri-same-message",
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": "2",
+        "session_key": "agent:main:telegram:group:chat-1:2",
+        "session_id": "grace-session-1",
+        "resolved_route": {"assignment": {"agent": "clawops"}},
+        "approval_required": False,
+    }
+    with kb.connect_closing(db_path) as conn:
+        first = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="a" * 64,
+            **common,
+        )
+        replay = kb.reserve_grace_delegation(
+            conn,
+            contract_fingerprint="a" * 64,
+            **common,
+        )
+        assert replay["delegation_id"] == first["delegation_id"]
+        with pytest.raises(ValueError, match="request instance"):
+            kb.reserve_grace_delegation(
+                conn,
+                contract_fingerprint="b" * 64,
+                **common,
+            )
+
+
+def test_callback_lease_renewal_and_outcome_are_owner_fenced(tmp_path):
+    db_path = tmp_path / "callback.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="owner-fenced",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        assert not kb.renew_grace_loop_callback_lease(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-b",
+        )
+        assert kb.renew_grace_loop_callback_lease(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        with pytest.raises(ValueError, match="not owned"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=callback["event_id"],
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-b",
+                outcome_kind="closed",
+                payload={"summary": "done"},
+            )
+
+
+def test_active_callback_session_can_rebind_only_with_current_lease(tmp_path):
+    db_path = tmp_path / "callback-session-rotation.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-before-compression",
+            contract_fingerprint="e" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="session-rebind",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        event_id = callback["event_id"]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="owner-a",
+        )
+        with pytest.raises(ValueError, match="not owned"):
+            kb.rebind_active_grace_callback_session(
+                conn,
+                review_task_id=review_id,
+                event_id=event_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-after-compression",
+                lease_owner="owner-b",
+            )
+        rebound = kb.rebind_active_grace_callback_session(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-after-compression",
+            lease_owner="owner-a",
+        )
+        assert rebound["session_id"] == "grace-session-after-compression"
+        recorded = kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-after-compression",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "done after compression"},
+        )
+        assert recorded["outcome_kind"] == "closed"
+
+
+def test_intermediate_callback_cannot_record_closed_outcome(tmp_path):
+    db_path = tmp_path / "intermediate-callback.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            contract_fingerprint="e" * 64,
+            completion_mode="intermediate",
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="intermediate",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        event_id = callback["event_id"]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=event_id,
+            lease_owner="owner-a",
+        )
+        with pytest.raises(ValueError, match="Intermediate callback cannot close"):
+            kb.record_grace_loop_callback_outcome(
+                conn,
+                review_task_id=review_id,
+                event_id=event_id,
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_id="grace-session-1",
+                lease_owner="owner-a",
+                outcome_kind="closed",
+                payload={"summary": "stage complete"},
+            )
+
+
+def test_callback_finish_rejects_a_superseded_trigger_event(tmp_path):
+    db_path = tmp_path / "callback-stale-finish.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            contract_fingerprint="d" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="stale-finish",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, review_id, "promoted")
+        assert not kb.finish_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner="owner-a",
+        )
+        stored = kb.get_grace_loop_callback(conn, review_id)
+    assert stored["state"] == "delivering"
+    assert stored["last_event_id"] == 0
+
+
+def test_new_callback_generation_clears_the_previous_structured_outcome(tmp_path):
+    db_path = tmp_path / "callback-new-generation.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            contract_fingerprint="c" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="new-generation",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        first = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=first["event_id"],
+            lease_owner="owner-a",
+        )
+        kb.record_grace_loop_callback_outcome(
+            conn,
+            review_task_id=review_id,
+            event_id=first["event_id"],
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            session_id="grace-session-1",
+            lease_owner="owner-a",
+            outcome_kind="closed",
+            payload={"summary": "first generation"},
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, review_id, "promoted")
+            kb._append_event(conn, review_id, "completed")
+            conn.execute(
+                "UPDATE grace_loop_callbacks SET lease_expires = 0 "
+                "WHERE review_task_id = ?",
+                (review_id,),
+            )
+        second = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert second["event_id"] > first["event_id"]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=second["event_id"],
+            lease_owner="owner-b",
+        )
+        stored = kb.get_grace_loop_callback(conn, review_id)
+    assert stored["outcome_event_id"] is None
+    assert stored["outcome_kind"] is None
+    assert stored["outcome_payload"] is None
+
+
+def test_review_worker_terminal_failure_is_a_callback_trigger(tmp_path):
+    db_path = tmp_path / "callback-review-crash.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        assert kb.complete_task(conn, execution_id, summary="done")
+        review_id = kb.create_task(
+            conn, title="review", parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            contract_fingerprint="b" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="review-crash",
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, review_id, "crashed")
+        due = kb.list_due_grace_loop_callbacks(conn)
+    assert len(due) == 1
+    assert due[0]["event_stage"] == "grace_review"
+    assert due[0]["event_kind"] == "crashed"
+
+
+def test_callback_attempt_budget_resets_for_a_new_trigger_event(tmp_path):
+    db_path = tmp_path / "callback-attempt-event.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            contract_fingerprint="f" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="attempt-reset",
+        )
+        assert kb.block_task(conn, execution_id, reason="needs input")
+        blocked_event = kb.list_due_grace_loop_callbacks(conn)[0]
+        for expected, owner in enumerate(("owner-a", "owner-b"), start=1):
+            assert kb.claim_grace_loop_callback(
+                conn,
+                review_task_id=review_id,
+                event_id=blocked_event["event_id"],
+                lease_owner=owner,
+            )
+            assert kb.record_grace_loop_delivery_attempt(
+                conn,
+                review_task_id=review_id,
+                event_id=blocked_event["event_id"],
+                lease_owner=owner,
+            ) == expected
+            assert kb.release_grace_loop_callback(
+                conn,
+                review_task_id=review_id,
+                event_id=blocked_event["event_id"],
+                lease_owner=owner,
+                error="transient",
+            )
+
+        assert kb.unblock_task(conn, execution_id)
+        assert kb.complete_task(conn, execution_id, summary="done")
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        accepted_event = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert accepted_event["event_id"] != blocked_event["event_id"]
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=accepted_event["event_id"],
+            lease_owner="owner-c",
+        )
+        assert kb.record_grace_loop_delivery_attempt(
+            conn,
+            review_task_id=review_id,
+            event_id=accepted_event["event_id"],
+            lease_owner="owner-c",
+        ) == 1
+
+
+def test_callback_claim_rejects_a_superseded_event(tmp_path):
+    db_path = tmp_path / "callback-superseded-claim.db"
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(conn, title="execution")
+        review_id = kb.create_task(
+            conn,
+            title="review",
+            parents=(execution_id,),
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            contract_fingerprint="f" * 64,
+        )
+        _bind_queued_grace_delegation(
+            conn, execution_id, review_id, suffix="superseded",
+        )
+        assert kb.block_task(conn, execution_id, reason="old blocker")
+        stale = kb.list_due_grace_loop_callbacks(conn)[0]
+
+        assert kb.unblock_task(conn, execution_id)
+        assert kb.complete_task(conn, execution_id, summary="done")
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="accepted",
+            metadata={"review_outcome": "accepted"},
+        )
+        current = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert current["event_id"] != stale["event_id"]
+        assert not kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=stale["event_id"],
+            lease_owner="stale-owner",
+        )
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=current["event_id"],
+            lease_owner="current-owner",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -1197,6 +1753,22 @@ def test_unblock_resets_failure_counters(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
+
+
+def test_unblock_clears_previous_run_heartbeat(kanban_home):
+    """A retry must not inherit stale liveness from the blocked run."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        assert kb.heartbeat_worker(conn, t, note="old run")
+        assert kb.get_task(conn, t).last_heartbeat_at is not None
+        assert kb.block_task(conn, t, reason="retry later")
+
+        assert kb.unblock_task(conn, t)
+
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.last_heartbeat_at is None
 
 
 def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):

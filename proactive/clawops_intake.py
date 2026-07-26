@@ -8,11 +8,18 @@ work and report results back through the existing kanban notifier.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
+import time
 from typing import Any, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
-from proactive.hubops_routing import route_clawops_objective
+from proactive.hubops_routing import (
+    resolved_route_binding,
+    route_clawops_objective,
+    route_requires_owner_approval,
+)
+from proactive.loop_contract import validate_loop_contract
 
 
 DEFAULT_ASSIGNEE = "default"
@@ -82,6 +89,28 @@ IMAGE_CONTENT_TERMS = (
     "image_gen",
     "visual asset",
 )
+LEGAL_COMPLIANCE_TERMS = (
+    "legal",
+    "compliance",
+    "合規",
+    "法務",
+    "法律",
+    "法規",
+    "律師",
+    "合約",
+    "契約",
+    "條款",
+    "個資",
+    "隱私",
+    "資安",
+    "廣告法",
+    "平台規範",
+    "平台合規",
+    "privacy",
+    "contract",
+    "terms of service",
+    "platform policy",
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +121,7 @@ class ClawOpsTask:
     title: str
     body: str
     board: Optional[str] = None
+    risk_authorization: Optional[dict[str, Any]] = None
 
 
 def resolve_clawops_assignee(config: Optional[Mapping[str, Any]] = None) -> str:
@@ -125,6 +155,14 @@ def create_clawops_task(
     priority: int = 0,
     max_runtime_seconds: int = DEFAULT_MAX_RUNTIME_SECONDS,
     config: Optional[Mapping[str, Any]] = None,
+    contract: Optional[Mapping[str, Any]] = None,
+    authorize_contract_risk: bool = False,
+    delegation_id: str = "",
+    delegation_build_owner: str = "",
+    resolved_route: Optional[Mapping[str, Any]] = None,
+    idempotency_key: str = "",
+    initial_status: str = "running",
+    session_id: Optional[str] = None,
 ) -> ClawOpsTask:
     """Create a Hermes-owned ClawOps task in the existing kanban queue."""
     clean_objective = (objective or "").strip()
@@ -132,9 +170,81 @@ def create_clawops_task(
         raise ValueError("objective is required")
 
     enriched_source = infer_clawops_metadata(clean_objective, source=source)
-    hubops_envelope = _route_hubops_if_requested(clean_objective, enriched_source)
+    normalized_contract = (
+        validate_loop_contract(contract) if contract is not None else None
+    )
+    contract = normalized_contract
+    contract_fingerprint = (
+        _contract_fingerprint(normalized_contract)
+        if normalized_contract is not None
+        else ""
+    )
+    hubops_envelope = _route_hubops_if_requested(
+        clean_objective,
+        enriched_source,
+        contract_fingerprint=contract_fingerprint,
+    )
     if hubops_envelope and hubops_envelope.get("status") == "blocked":
         raise ValueError(str(hubops_envelope.get("blocked_reason") or "HubOps routing blocked this task."))
+
+    bound_route = dict(
+        resolved_route
+        or (
+            contract.get("routing", {}).get("resolved")
+            if isinstance(contract, Mapping)
+            else {}
+        )
+        or {}
+    )
+    if hubops_envelope:
+        fresh_route = resolved_route_binding(hubops_envelope)
+        if bound_route and json.dumps(
+            bound_route, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ) != json.dumps(
+            fresh_route, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ):
+            raise ValueError(
+                "Resolved ClawOps route changed after contract authorization."
+            )
+        if not bound_route:
+            bound_route = fresh_route
+
+    approval_required = bool(
+        hubops_envelope and route_requires_owner_approval(hubops_envelope)
+    )
+    delegation: Optional[dict[str, Any]] = None
+    if contract is None or not contract_fingerprint or not delegation_id.strip():
+        raise ValueError(
+            "Every ClawOps execution requires a validated Loop Contract and "
+            "reserved Grace delegation."
+        )
+    with kb.connect_closing(board=board) as conn:
+        delegation = kb.get_grace_delegation(
+            conn, delegation_id=delegation_id,
+        )
+    if delegation is None:
+        raise ValueError("Reserved Grace delegation was not found.")
+    expected_route_json = json.dumps(
+        bound_route,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    state_authorized = (
+        delegation.get("state") == "building"
+        and delegation.get("build_owner") == delegation_build_owner.strip()
+        and int(delegation.get("build_lease_expires") or 0) > int(time.time())
+    )
+    if (
+        delegation.get("contract_fingerprint") != contract_fingerprint
+        or delegation.get("resolved_route") != expected_route_json
+        or not state_authorized
+        or bool(delegation.get("approval_required")) != approval_required
+    ):
+        raise ValueError(
+            "Reserved Grace delegation does not authorize this exact "
+            "contract, route, or approval class."
+        )
 
     assigned_worker = ""
     runtime_profile = ""
@@ -151,7 +261,29 @@ def create_clawops_task(
         else runtime_profile or assigned_worker or configured_assignee
     )
     title = _title_from_objective(clean_objective)
-    body = _body_from_objective(clean_objective, source=enriched_source, hubops_envelope=hubops_envelope)
+    risk_authorization = (
+        dict(hubops_envelope.get("risk_authorization") or {})
+        if hubops_envelope else {}
+    )
+    if risk_authorization and not (
+        delegation and bool(delegation.get("approval_required"))
+    ):
+        raise ValueError(
+            "Scoped risk authorization requires an approved Grace delegation."
+        )
+    if contract is not None:
+        from proactive.grace_task_compiler import render_execution_body
+        execution_contract = json.loads(json.dumps(dict(contract), ensure_ascii=False))
+        if risk_authorization:
+            execution_contract["authorization"] = risk_authorization
+        body = render_execution_body(execution_contract)
+        if hubops_envelope:
+            body += "\n" + "\n".join(_hubops_routing_contract(hubops_envelope))
+            body += "\n" + "\n".join(
+                _scoped_worker_capability_contract(hubops_envelope)
+            )
+    else:
+        body = _body_from_objective(clean_objective, source=enriched_source, hubops_envelope=hubops_envelope)
 
     with kb.connect_closing(board=board) as conn:
         task_id = kb.create_task(
@@ -163,6 +295,14 @@ def create_clawops_task(
             priority=priority,
             workspace_kind="scratch",
             max_runtime_seconds=max_runtime_seconds,
+            goal_mode=contract is not None,
+            goal_max_turns=(
+                int(contract.get("stop_rules", {}).get("max_iterations", 6))
+                if contract is not None else None
+            ),
+            initial_status=initial_status,
+            session_id=(session_id or "").strip() or None,
+            idempotency_key=idempotency_key.strip() or None,
         )
         row = kb.get_task(conn, task_id)
         status = str(row.status if row else "ready")
@@ -174,6 +314,7 @@ def create_clawops_task(
         title=title,
         body=body,
         board=board,
+        risk_authorization=risk_authorization or None,
     )
 
 
@@ -263,6 +404,8 @@ def _body_from_objective(
 def _route_hubops_if_requested(
     objective: str,
     source: Optional[Mapping[str, Any]],
+    *,
+    contract_fingerprint: str = "",
 ) -> Optional[dict[str, Any]]:
     if not source or not any(key in source for key in ("project", "task_type", "risk_level", "approved")):
         return None
@@ -272,7 +415,15 @@ def _route_hubops_if_requested(
         task_type=str(source.get("task_type") or "ops"),
         risk_level=str(source.get("risk_level") or "low"),
         approved=_read_bool(source.get("approved")),
+        contract_fingerprint=contract_fingerprint,
     )
+
+
+def _contract_fingerprint(contract: Mapping[str, Any]) -> str:
+    """Bind a risk elevation to one immutable compiled Loop Contract."""
+    from proactive.loop_contract import contract_fingerprint
+
+    return contract_fingerprint(contract)
 
 
 def infer_clawops_metadata(
@@ -310,6 +461,8 @@ def _infer_project(haystack: str) -> str:
         return "ingrids_marketing"
     if any(term in haystack for term in ("openclaw", "hermes", "bridge", "health", "runtime", "kanban", "hubops", "clawops")):
         return "hub_ops"
+    if any(term in haystack for term in LEGAL_COMPLIANCE_TERMS):
+        return "hub_ops"
     return "hub_ops"
 
 
@@ -320,6 +473,8 @@ def _infer_task_type(haystack: str, project: str) -> str:
         if any(term in haystack for term in ("列出", "清單", "狀態", "已經有刊登", "已刊登", "目前刊登")):
             return "browser_ops"
         return "browser_publish" if any(term in haystack for term in ("發佈", "發布", "刊登", "post", "publish", "listing")) else "browser_ops"
+    if any(term in haystack for term in LEGAL_COMPLIANCE_TERMS):
+        return "legal_compliance"
     if any(term in haystack for term in ("health", "bridge", "runtime", "修正", "fix", "deploy", "部署")):
         return "devops"
     if project == "ingrids_marketing":
@@ -358,9 +513,35 @@ def _hubops_routing_contract(envelope: Mapping[str, Any]) -> list[str]:
         f"- assigned_worker: {assignment.get('assigned_worker', '')}",
         f"- runtime_profile: {assignment.get('runtime_profile', '')}",
         f"- risk_level_limit: {assignment.get('risk_level_limit', '')}",
+        f"- effective_risk_level_limit: {assignment.get('effective_risk_level_limit', '')}",
         f"- approval_required: {assignment.get('approval_required', '')}",
         f"- approval_checklist: {envelope.get('approval_checklist', '')}",
         f"- output_schema: {envelope.get('output_schema', {})}",
+    ]
+
+
+def _scoped_worker_capability_contract(envelope: Mapping[str, Any]) -> list[str]:
+    """Render deterministic tool-use rules for compiled browser contracts."""
+    assignment = envelope.get("assignment")
+    assignment = assignment if isinstance(assignment, Mapping) else {}
+    allowed_tools = [str(item) for item in assignment.get("allowed_tools") or []]
+    if "browser_upload_files" not in allowed_tools:
+        return []
+    return [
+        "",
+        "Scoped browser capability contract:",
+        f"- HubOps-authorized tools for this worker include: {', '.join(allowed_tools)}.",
+        "- For a local file required by a browser form, call browser_upload_files before "
+        "trying OS keystrokes, clipboard injection, a local HTTP server, or page-created "
+        "File/DataTransfer objects.",
+        "- Select the exact browser tab and exact input[type=file]. If multiple matching "
+        "tabs or inputs exist, supply page_index and input_index or a narrower selector; "
+        "never guess silently.",
+        "- Supply verify_text_contains when the page exposes a visible post-upload count "
+        "or success marker. Treat the upload as successful only when that postcondition "
+        "is visible (for example, a product-image count changing from 0/9 to 1/9).",
+        "- browser_upload_files only populates the file input. It never authorizes a final "
+        "Publish/Post/Submit; the Loop Contract approval and verification gates still apply.",
     ]
 
 

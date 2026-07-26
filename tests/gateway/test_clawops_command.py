@@ -38,7 +38,7 @@ def test_clawops_command_is_registered_with_alias():
 
 
 @pytest.mark.asyncio
-async def test_clawops_command_creates_task_and_subscription(tmp_path, monkeypatch):
+async def test_clawops_command_rejects_raw_text_without_creating_task(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_CLAWOPS_ASSIGNEE", "clawops-test")
@@ -47,27 +47,13 @@ async def test_clawops_command_creates_task_and_subscription(tmp_path, monkeypat
         _make_event("/clawops verify Codex runtime health")
     )
 
-    with kb.connect_closing(db_path) as conn:
-        rows = conn.execute("SELECT * FROM tasks ORDER BY created_at ASC").fetchall()
-        task_id = rows[0]["id"]
-        subs = kb.list_notify_subs(conn, task_id)
-
-    assert "ClawOps task queued" in result
-    assert "Assigned Agent: `clawops-test`" in result
-    assert "Hermes -> kanban queue -> ClawOps worker -> Hermes summary" in result
-    assert len(rows) == 1
-    assert rows[0]["status"] == "ready"
-    assert rows[0]["assignee"] == "clawops-test"
-    assert rows[0]["created_by"] == "hermes-clawops-intake"
-    assert len(subs) == 1
-    assert subs[0]["platform"] == "telegram"
-    assert subs[0]["chat_id"] == "chat-1"
-    assert subs[0]["user_id"] == "kj"
-    assert subs[0]["notifier_profile"] == "main"
+    assert "不會建立任務" in result
+    assert "clawops_delegate" in result
+    assert not db_path.exists()
 
 
 @pytest.mark.asyncio
-async def test_clawops_command_routes_secondhand_facebook_work_to_browser_worker(tmp_path, monkeypatch):
+async def test_clawops_command_never_routes_secondhand_raw_text(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.delenv("HERMES_CLAWOPS_ASSIGNEE", raising=False)
@@ -76,20 +62,12 @@ async def test_clawops_command_routes_secondhand_facebook_work_to_browser_worker
         _make_event("/clawops 繼續追加 Facebook 社團群組發佈，再10個。之前發佈文案 Hermes 已經傳給 KJ 確認過；後續自動發佈")
     )
 
-    with kb.connect_closing(db_path) as conn:
-        row = conn.execute("SELECT * FROM tasks ORDER BY created_at ASC").fetchone()
-
-    assert row is not None
-    assert row["assignee"] == "clawops-browser"
-    assert "Assigned Agent: `clawops-browser`" in result
-    assert "assigned_agent: secondhand_commerce" in row["body"]
-    assert "assigned_worker: clawops.browser" in row["body"]
-    assert "runtime_profile: clawops-browser" in row["body"]
+    assert "不會建立任務" in result
+    assert not db_path.exists()
 
 
 @pytest.mark.asyncio
 async def test_clawops_command_requires_objective():
     result = await _make_runner()._handle_clawops_command(_make_event("/clawops"))
 
-    assert "Usage:" in result
-    assert "/clawops <objective>" in result
+    assert "原文派工已停用" in result

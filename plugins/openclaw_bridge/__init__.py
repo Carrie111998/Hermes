@@ -6,15 +6,50 @@ from plugins.openclaw_bridge.tools import (
     handle_openclaw_dry_run,
     pre_gateway_dispatch,
 )
+from plugins.openclaw_bridge.clawops_delegate import (
+    CLAWOPS_DELEGATE_SCHEMA,
+    GRACE_CALLBACK_OUTCOME_SCHEMA,
+    handle_clawops_delegate,
+    handle_grace_callback_outcome,
+)
+from proactive.grace_execution_policy import enforce_grace_execution_boundary
 
 
 def register(ctx) -> None:
+    ctx.register_middleware("tool_execution", enforce_grace_execution_boundary)
+    ctx.register_tool(
+        name="clawops_delegate",
+        toolset="openclaw",
+        schema=CLAWOPS_DELEGATE_SCHEMA,
+        handler=handle_clawops_delegate,
+        description=(
+            "After Grace has fully understood an execution request, compile and delegate a "
+            "complete Loop Contract to ClawOps. Never pass raw user text as the instruction. "
+            "Questions and explanations must be answered by Grace without this tool."
+        ),
+        emoji="GC",
+    )
+    ctx.register_tool(
+        name="grace_callback_outcome",
+        toolset="openclaw",
+        schema=GRACE_CALLBACK_OUTCOME_SCHEMA,
+        handler=handle_grace_callback_outcome,
+        description=(
+            "Inside a Grace Loop callback, record whether the originating "
+            "outcome closed, continued through a queued delegation, or is "
+            "blocked on one exact approval question."
+        ),
+        emoji="GO",
+    )
     ctx.register_tool(
         name="openclaw_delegate",
         toolset="openclaw",
         schema=OPENCLAW_DELEGATE_SCHEMA,
         handler=handle_openclaw_delegate,
-        description="Delegate an approved execution-only task to OpenClaw and return results to Hermes.",
+        description=(
+            "Diagnostic dry-run bridge only. Never use this as an execution fallback when "
+            "clawops_delegate validation fails."
+        ),
         emoji="OC",
     )
     ctx.register_command(

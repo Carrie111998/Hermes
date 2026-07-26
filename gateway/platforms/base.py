@@ -1690,6 +1690,9 @@ class MessageEvent:
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
+    # Trusted, process-local orchestration metadata for internal events. Never
+    # populated from a platform payload or persisted as user conversation.
+    internal_context: Optional[Dict[str, Any]] = None
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -4887,6 +4890,15 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            completion_future = (
+                getattr(event, "internal_context", None) or {}
+            ).get("processing_completion_future")
+            if (
+                completion_future is not None
+                and hasattr(completion_future, "done")
+                and not completion_future.done()
+            ):
+                completion_future.set_result(bool(processing_ok))
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -4962,6 +4974,18 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
+            # Resolve the process-local completion handshake on every exit.
+            # The callback watcher then validates the durable structured
+            # outcome instead of mistaking background dispatch for completion.
+            completion_future = (
+                getattr(event, "internal_context", None) or {}
+            ).get("processing_completion_future")
+            if (
+                completion_future is not None
+                and hasattr(completion_future, "done")
+                and not completion_future.done()
+            ):
+                completion_future.set_result(False)
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

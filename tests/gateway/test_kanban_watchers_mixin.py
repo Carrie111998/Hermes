@@ -15,6 +15,7 @@ from gateway.kanban_watchers import (
     GatewayKanbanWatchersMixin,
     _format_blocked_notification,
     _format_completed_notification,
+    _format_human_triage_notification,
 )
 
 KANBAN_METHODS = [
@@ -92,6 +93,41 @@ def test_blocked_notification_uses_platform_budget_instead_of_160_char_cutoff():
 
     assert msg.endswith("directly.")
     assert "`external_capability_unavailable`" in msg
+
+
+def test_loop_breaker_notification_explicitly_requests_human_decision():
+    msg = _format_human_triage_notification(
+        task_id="t_brand",
+        tag="@clawops-browser ",
+        reason="Shopee 必填品牌顯示查無結果；請決定是否申請新增品牌。",
+        platform_limit=4096,
+    )
+
+    assert "需要你確認" in msg
+    assert "Shopee 必填品牌" in msg
+    assert "申請新增品牌" in msg
+    assert "。。" not in msg
+
+
+def test_loop_breaker_notification_localizes_legacy_operator_reason():
+    msg = _format_human_triage_notification(
+        task_id="t_brand",
+        tag="@clawops-browser ",
+        reason=(
+            "human-triage-required: Shopee requires an explicit brand selection; "
+            "automatic re-specification must not resume or rewrite this repeated "
+            "needs_input blocker."
+        ),
+        platform_limit=4096,
+    )
+
+    assert msg == (
+        "🛑 @clawops-browser 任務 t_brand 需要你確認："
+        "蝦皮要求明確選擇品牌；為避免越權，系統不會自動改寫或重新執行"
+        "這項重複出現的人工確認事項。"
+    )
+    assert "human-triage-required" not in msg
+    assert "needs_input" not in msg
 
 
 def test_completed_notification_surfaces_multiline_publish_result_in_chat():
