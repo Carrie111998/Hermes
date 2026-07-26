@@ -276,7 +276,7 @@ def test_sidebar_skill_waits_for_new_task_indexing_before_rename() -> None:
     assert "session_sidebar_bind" in create_step
     assert "`read_thread`" in create_step
     assert "same thread ID" in create_step
-    assert "status is `idle`" in create_step
+    assert "authenticated quiescent registration" in create_step
     assert "60 seconds" in create_step
     assert "`native_task_not_indexed`" in create_step
     assert create_step.index("session_sidebar_bind") > create_step.index(
@@ -285,6 +285,24 @@ def test_sidebar_skill_waits_for_new_task_indexing_before_rename() -> None:
     assert create_step.index("`read_thread`") > create_step.index(
         "session_sidebar_bind"
     )
+
+
+def test_sidebar_skill_accepts_only_authenticated_completed_notloaded_tasks() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "authenticated quiescent registration" in skill
+    assert "literal `idle`" in skill
+    assert "top-level status is `notLoaded`" in skill
+    assert "at least one returned turn" in skill
+    assert "every returned turn has status `completed`" in skill
+    assert (
+        "no active turn, approval request, user-input request, or system error"
+        in skill
+    )
+    assert "Never treat `notLoaded` as globally equivalent to `idle`" in skill
+    assert "Missing turns" in skill
+    assert "incomplete turn" in skill
+    assert "exact signed marker" in skill
 
 
 def test_sidebar_skill_reserves_the_create_boundary_before_native_creation() -> None:
