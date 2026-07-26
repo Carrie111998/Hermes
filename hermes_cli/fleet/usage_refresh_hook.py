@@ -120,8 +120,11 @@ class UsageRefreshHook:
             # Spawn the refresh as a task so concurrent calls can coalesce
             async def _do_refresh():
                 try:
+                    # refresh_fn is a sync function; run it in thread
                     result = await asyncio.to_thread(refresh_fn)
-                    return {"ok": result.ok if hasattr(result, "ok") else True}
+                    # Result has .ok attribute (UsageRefreshReport) or is dict/MagicMock
+                    ok = result.ok if hasattr(result, "ok") else result.get("ok", True) if isinstance(result, dict) else True
+                    return {"ok": ok}
                 except Exception as exc:
                     logger.exception("Usage refresh failed: %s", exc)
                     return {"ok": False, "error": type(exc).__name__}
