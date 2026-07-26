@@ -2447,16 +2447,21 @@ def _persist_branch_seed(session: dict) -> None:
 def _session_db(session: dict):
     """Yield the SessionDB that owns this session's row (profile-aware).
 
-    Mirrors :func:`_ensure_session_db_row`: a remote/profile session persists
-    into its own profile's ``state.db``; default sessions persist into the
-    gateway launch home's ``state.db``. Yields None when the db is unavailable.
+    Mirrors :func:`_ensure_session_db_row` / :func:`_session_db_for_immediate_use`:
+    a remote/profile session persists into its own profile's ``state.db`` (a
+    fresh handle we close on exit); everything else borrows the shared
+    ``_get_db()`` handle (left open). Yields None when the db is unavailable.
     """
     db, close_db = None, False
-    db_home = Path(session.get("profile_home") or _hermes_home)
-    try:
-        db, close_db = _open_session_db(db_home), True
-    except Exception:
-        logger.debug("failed to open session db for session", exc_info=True)
+    profile_home = session.get("profile_home")
+    if profile_home:
+        try:
+            db = _open_session_db(Path(profile_home))
+            close_db = db is not None
+        except Exception:
+            logger.debug("failed to open session db for session", exc_info=True)
+    else:
+        db = _get_db()
     try:
         yield db
     finally:
