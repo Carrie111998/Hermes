@@ -10,7 +10,7 @@ import { Input } from '@/components/ui/input'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tip } from '@/components/ui/tooltip'
-import { useI18n } from '@/i18n'
+import { useI18n, type Translations } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Download, Loader2, PawPrint, Pencil, Trash2 } from '@/lib/icons'
 import { selectableCardClass } from '@/lib/selectable-card'
@@ -35,9 +35,19 @@ import {
   setPetEnabled,
   setPetScale
 } from '@/store/pet-gallery'
+import { $profilePets, type ProfileConnection } from '@/store/pet-multi'
+import {
+  $petRoster,
+  PINNED_HARD_CAP,
+  PINNED_SOFT_CAP,
+  setPetRosterEntries,
+  setPetRosterMode,
+  setProfilePetEnabled
+} from '@/store/pet-roster'
+import { $profiles } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
 
-import { ListRow, SectionHeading } from './primitives'
+import { ListRow, Pill, SectionHeading } from './primitives'
 
 /**
  * Appearance opt-in for the floating petdex mascot. A thin view over the shared
@@ -125,6 +135,8 @@ export function PetSettings() {
           {copy.restartHint}
         </p>
       )}
+
+      <MultiPetModeSection />
 
       <div className="mt-2">
         <ListRow
@@ -369,6 +381,177 @@ export function PetSettings() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  )
+}
+
+/**
+ * Multi-pet mode toggle + pinned roster panel (Layer 9). The mode toggle is
+ * always visible; the roster panel only renders in `pinned` mode. The gallery
+ * picker below stays active in both modes — it configures the ACTIVE profile's
+ * pet (per-profile pet selection is a future feature).
+ */
+function MultiPetModeSection() {
+  const { t } = useI18n()
+  const copy = t.settings.appearance.pet.multiPet
+  const roster = useStore($petRoster)
+
+  return (
+    <div className="mt-4">
+      <ListRow
+        action={
+          <SegmentedControl
+            onChange={id => setPetRosterMode(id === 'pinned' ? 'pinned' : 'follow-active')}
+            options={[
+              { id: 'follow-active', label: copy.followActive },
+              { id: 'pinned', label: copy.pinned }
+            ]}
+            value={roster.mode}
+          />
+        }
+        description={copy.modeDesc}
+        title={copy.modeTitle}
+      />
+      {roster.mode === 'pinned' && <RosterPanel />}
+    </div>
+  )
+}
+
+const CONNECTION_TONE: Record<ProfileConnection, 'muted' | 'primary' | 'warn'> = {
+  connecting: 'warn',
+  offline: 'muted',
+  open: 'primary',
+  'reauth-required': 'warn'
+}
+
+type MultiPetCopy = Translations['settings']['appearance']['pet']['multiPet']
+
+function connectionLabel(copy: MultiPetCopy, connection: ProfileConnection): string {
+  switch (connection) {
+    case 'connecting':
+      return copy.connectionConnecting
+    case 'offline':
+      return copy.connectionOffline
+    case 'reauth-required':
+      return copy.connectionReauth
+    default:
+      return copy.connectionOnline
+  }
+}
+
+/**
+ * The pinned roster: one row per profile, ordered with roster entries first
+ * (stored order) then catalog profiles not yet pinned (discovery). Each row
+ * shows the profile's live connection state and an Enable/Remove action.
+ * Removing an available profile just disables it (re-enable later); removing an
+ * unavailable one (deleted/renamed) deletes the row entirely.
+ */
+function RosterPanel() {
+  const { t } = useI18n()
+  const copy = t.settings.appearance.pet.multiPet
+  const roster = useStore($petRoster)
+  const profilePets = useStore($profilePets)
+  const profiles = useStore($profiles)
+
+  // Catalog profiles not yet in the roster — surfaced as disabled rows so a
+  // newly created profile shows up here without a separate "add" flow.
+  const inRoster = new Set(roster.entries.map(e => e.profile))
+  const discovered = profiles.filter(p => !inRoster.has(p.name)).map(p => p.name)
+
+  const enabledCount = roster.entries.filter(e => e.enabled && !e.unavailable).length
+  const atHardCap = enabledCount >= PINNED_HARD_CAP
+
+  // setProfilePetEnabled refuses an enable past the hard cap (returns false);
+  // the notice below explains why the 9th profile can't be pinned.
+  const setEnabled = (profile: string, enabled: boolean) => void setProfilePetEnabled(profile, enabled)
+  const removeEntry = (profile: string) => setPetRosterEntries(roster.entries.filter(e => e.profile !== profile))
+
+  return (
+    <div className="mt-1">
+      <ListRow description={copy.rosterDesc} title={copy.rosterTitle} />
+
+      {enabledCount >= PINNED_SOFT_CAP && (
+        <p
+          className={cn(
+            'mb-2 rounded-lg border px-3 py-2 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height)',
+            atHardCap
+              ? 'border-(--ui-red)/40 bg-(--ui-red)/10 text-(--ui-red)'
+              : 'border-(--ui-yellow)/40 bg-(--ui-yellow)/10 text-(--ui-text-secondary)'
+          )}
+        >
+          {atHardCap ? copy.hardCapNotice(PINNED_HARD_CAP) : copy.softCapWarning(enabledCount)}
+        </p>
+      )}
+
+      <div className="grid gap-1">
+        {roster.entries.map(entry => {
+          const connection = profilePets.get(entry.profile)?.connection ?? 'open'
+          const unavailable = entry.unavailable === true
+
+          return (
+            <div
+              className="flex items-center gap-3 rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2"
+              key={entry.profile}
+            >
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-2">
+                  <span className="truncate text-[length:var(--conversation-text-font-size)] font-medium">
+                    {entry.profile}
+                  </span>
+                  {unavailable ? (
+                    <Pill tone="muted">{copy.unavailable}</Pill>
+                  ) : (
+                    <Pill tone={CONNECTION_TONE[connection]}>{connectionLabel(copy, connection)}</Pill>
+                  )}
+                </span>
+                <span className="block truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+                  {unavailable ? copy.unavailableDesc : copy.profilePet(entry.profile)}
+                </span>
+              </span>
+              {unavailable || entry.enabled ? (
+                <Button onClick={() => (unavailable ? removeEntry(entry.profile) : setEnabled(entry.profile, false))} size="sm" type="button" variant="ghost">
+                  {copy.removeAction}
+                </Button>
+              ) : (
+                <Button
+                  disabled={atHardCap}
+                  onClick={() => setEnabled(entry.profile, true)}
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                >
+                  {copy.enableAction}
+                </Button>
+              )}
+            </div>
+          )
+        })}
+
+        {discovered.map(name => (
+          <div
+            className="flex items-center gap-3 rounded-lg border border-dashed border-(--ui-stroke-tertiary) px-3 py-2"
+            key={name}
+          >
+            <span className="min-w-0 flex-1">
+              <span className="truncate text-[length:var(--conversation-text-font-size)] font-medium text-(--ui-text-secondary)">
+                {name}
+              </span>
+              <span className="block truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+                {copy.profilePet(name)}
+              </span>
+            </span>
+            <Button
+              disabled={atHardCap}
+              onClick={() => setEnabled(name, true)}
+              size="sm"
+              type="button"
+              variant="secondary"
+            >
+              {copy.enableAction}
+            </Button>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
