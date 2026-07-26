@@ -138,6 +138,10 @@ metadata:
 
 Skills can declare environment variables they need. When a skill is loaded via `skill_view`, its required vars are automatically registered for passthrough into sandboxed execution environments (terminal, execute_code).
 
+### Metadata Hygiene
+
+Use `metadata.hermes.related_skills` for soft cross-references and discovery hints. Use `required_environment_variables` for API keys, tokens, and other secrets needed at load time. Keep the skill body honest about any additional runtime expectations — if a skill only makes sense alongside another tool or companion skill, say so explicitly in the instructions rather than relying on hidden conventions.
+
 ```yaml
 required_environment_variables:
   - name: TENOR_API_KEY
