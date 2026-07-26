@@ -109,6 +109,15 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
 
 
+def test_active_profile_resolution_ignores_notifier_profile_cache(monkeypatch):
+    """General auth routing must use the live active profile, not notifier state."""
+    runner, default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "dev"
+    runner._kanban_notifier_profile = "stale-notifier-profile"
+
+    assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
+
+
 def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
     """Ingress adapter lookup must use the stamped profile's adapter map."""
     runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)

@@ -1208,6 +1208,17 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            try:
+                from gateway.session_context import get_session_env
+
+                session_profile = get_session_env("HERMES_SESSION_PROFILE", "")
+            except Exception:
+                session_profile = os.environ.get("HERMES_SESSION_PROFILE", "")
+            created_by = (
+                session_profile
+                or os.environ.get("HERMES_PROFILE")
+                or "worker"
+            )
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1234,7 +1245,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=created_by,
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)

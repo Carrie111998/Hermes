@@ -697,6 +697,89 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     assert tid_good in adapter.sent[0]["text"]
 
 
+def test_kanban_notifier_isolates_post_claim_formatting_failure(tmp_path, monkeypatch):
+    """Malformed event payloads rewind their claim without aborting later subs."""
+    db_path = tmp_path / "post-claim-isolation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid_bad = kb.create_task(conn, title="bad payload", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid_bad, platform="telegram", chat_id="chat-bad",
+        )
+        kb._append_event(
+            conn,
+            tid_bad,
+            kind="timed_out",
+            payload={"limit_seconds": "not-an-integer"},
+        )
+
+        tid_good = kb.create_task(conn, title="good payload", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid_good, platform="telegram", chat_id="chat-good",
+        )
+        kb.complete_task(conn, tid_good, summary="done")
+    finally:
+        conn.close()
+
+    original_list = kb.list_notify_subs
+
+    def bad_first(conn, task_id=None):
+        subs = original_list(conn, task_id)
+        return sorted(subs, key=lambda sub: 0 if sub["task_id"] == tid_bad else 1)
+
+    monkeypatch.setattr(kb, "list_notify_subs", bad_first)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert tid_good in adapter.sent[0]["text"]
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid_bad,
+            platform="telegram",
+            chat_id="chat-bad",
+            kinds=["timed_out"],
+        )
+    finally:
+        conn.close()
+    assert [event.kind for event in remaining] == ["timed_out"]
+
+
+def test_terminal_event_does_not_unsubscribe_requeued_task(tmp_path, monkeypatch):
+    """A stale completion notification cannot drop a now-active subscription."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "requeued-terminal.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="requeued", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1",
+        )
+        kb.complete_task(conn, task_id, summary="first run")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                (task_id,),
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, task_id=task_id)) == 1
+    finally:
+        conn.close()
+
+
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 
