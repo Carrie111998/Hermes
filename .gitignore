@@ -129,6 +129,10 @@ apps/shared/src/**/*.js
 apps/shared/src/**/*.js.map
 apps/shared/src/**/*.d.ts
 apps/desktop/release/
+# Local rebuild scratch / corrupted install leftovers (not packaged releases)
+apps/desktop/release-rebuild/
+node_modules.broken-*
+**/node_modules.broken-*
 *.tsbuildinfo
 
 # Web UI assets — synced from @nous-research/ui at build time via
