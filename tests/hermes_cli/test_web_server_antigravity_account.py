@@ -36,7 +36,7 @@ def _qualification(**patch):
 
 def _doctor_for(monkeypatch, qualification):
     class Doctor:
-        def qualify(self, profiles):
+        def qualify(self, profiles, *, allow_live_probe=True):
             assert [profile.lane_id for profile in profiles] == ["antigravity"]
             return {"antigravity": qualification}
 

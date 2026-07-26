@@ -726,7 +726,26 @@ def test_live_proof_cache_prevents_repeated_probe_within_ttl(tmp_path, monkeypat
         (profile_map()["antigravity"],)
     )["antigravity"]
 
-    assert first.qualified and second.qualified
+    def unexpected_command(argv):
+        raise AssertionError(f"cache-only qualification ran command: {argv}")
+
+    def unexpected_process(argv, **_kwargs):
+        raise AssertionError(f"cache-only qualification ran provider: {argv}")
+
+    cached_only = FleetQualificationDoctor(
+        which=lambda _: "C:/tools/agy.exe",
+        command=unexpected_command,
+        run_process=unexpected_process,
+        environment={},
+        now=lambda: NOW,
+        proof_cache_dir=home / "fleet" / "evidence" / "agy",
+    ).qualify(
+        (profile_map()["antigravity"],),
+        allow_live_probe=False,
+    )["antigravity"]
+
+    assert first.qualified and second.qualified and cached_only.qualified
+    assert cached_only.models == (CANONICAL_MODEL_ID,)
     assert len(calls) == 1
     cache_files = list((home / "fleet" / "evidence" / "agy").glob("*.json"))
     assert cache_files

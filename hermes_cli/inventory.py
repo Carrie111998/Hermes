@@ -112,15 +112,16 @@ def load_picker_context() -> ConfigContext:
 
 
 
-def _antigravity_parent_provider_row() -> dict | None:
-    """Expose Antigravity Gemini models as parent-selectable when lane is qualified."""
+def _antigravity_parent_provider_row(*, force_fresh: bool = False) -> dict | None:
+    """Expose only cache-proven Antigravity parent models unless refreshed."""
     try:
         from hermes_cli.fleet.adapters.live_routes import _AGY_MODEL_LABELS
         from hermes_cli.fleet.live import FleetQualificationDoctor
         from hermes_cli.fleet.profiles import profile_map
 
         qualification = FleetQualificationDoctor().qualify(
-            (profile_map()["antigravity"],)
+            (profile_map()["antigravity"],),
+            allow_live_probe=bool(force_fresh),
         )["antigravity"]
     except Exception:
         return None
@@ -310,7 +311,11 @@ def build_models_payload(
                     row["models"] = filtered
                     row["total_models"] = len(filtered)
 
-    antigravity_row = _antigravity_parent_provider_row()
+    antigravity_row = (
+        _antigravity_parent_provider_row(force_fresh=True)
+        if refresh
+        else _antigravity_parent_provider_row()
+    )
     if antigravity_row is not None:
         rows = [antigravity_row] + [
             r
