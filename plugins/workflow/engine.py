@@ -1859,6 +1859,17 @@ class WorkflowEngine:
                     f"Declared input '{inp_name}' is never referenced in any node task"
                 )
 
+        # Check for undeclared inputs used in node tasks
+        declared_input_names = {i.get("name", "") for i in raw.get("inputs", [])}
+        bare_refs_in_tasks = set(re.findall(r"(?<!\.)\{([A-Za-z_][A-Za-z0-9_\-]*)\}(?!\.)", all_task_text))
+        for ref in bare_refs_in_tasks:
+            if ref in ("context", "run_id", "date", "inputs"):
+                continue
+            if ref not in declared_input_names and ref not in workflow.nodes:
+                result["issues"].append(
+                    f"Node tasks reference '{{{ref}}}' which is not a declared input"
+                )
+
         # Check that all declared attachments are actually used
         for att in raw.get("attachments", []):
             att_name = att.get("name", "")
