@@ -247,3 +247,7 @@ sillytavern.db
 sillytavern_py/
 .stpy_verify.py
 fix_config2.py
+
+# Local Buzz credentials
+vendor/buzz/.env
+vendor/buzz/deploy/compose/.env
