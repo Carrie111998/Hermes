@@ -14,6 +14,8 @@ from .types import (
     CapacitySnapshot,
     Confidence,
     Freshness,
+    HealthRead,
+    LaneHealth,
     MeasurementKind,
     ReasonCode,
 )
@@ -95,6 +97,39 @@ def _optional_identifier(value: object, field: str) -> str | None:
     return value.strip()
 
 
+def _health_read(
+    row: dict[str, Any],
+    *,
+    read_at: datetime,
+    max_age: timedelta,
+    future_tolerance: timedelta,
+    source_id: str,
+) -> HealthRead | None:
+    status_raw = row.get("health_status")
+    checked_raw = row.get("health_checked_at")
+    if status_raw is None and checked_raw is None:
+        return None
+    if status_raw is None or checked_raw is None:
+        raise ValueError(
+            "health_status and health_checked_at must be supplied together"
+        )
+    status = LaneHealth(str(status_raw).strip().upper())
+    captured_at = _parse_timestamp(checked_raw)
+    if captured_at > read_at + future_tolerance:
+        raise ValueError("health_checked_at is in the future")
+    expires_at = captured_at + max_age
+    return HealthRead(
+        status=status,
+        captured_at=captured_at,
+        read_at=read_at,
+        expires_at=expires_at,
+        freshness=(
+            Freshness.FRESH if read_at <= expires_at else Freshness.STALE
+        ),
+        source_id=source_id,
+    )
+
+
 class BridgeUsageAdapter:
     """Normalize the native Hermes-home usage JSON without mutating it.
 
@@ -140,6 +175,7 @@ class BridgeUsageAdapter:
         except (OSError, ValueError) as exc:
             return CapacityRead(None, ReasonCode.CAPACITY_INVALID, str(exc))
 
+        health: HealthRead | None = None
         try:
             document = json.loads(raw, object_pairs_hook=_unique_object)
             if not isinstance(document, dict):
@@ -154,9 +190,6 @@ class BridgeUsageAdapter:
                 )
             if document.get("schema_version") != "1":
                 raise ValueError("unsupported bridge schema")
-            captured_at = _parse_timestamp(document.get("captured_at"))
-            if captured_at > read_at + self.future_tolerance:
-                raise ValueError("capture timestamp is in the future")
             lanes = document.get("lanes")
             if not isinstance(lanes, dict):
                 raise ValueError("lanes must be an object")
@@ -169,6 +202,18 @@ class BridgeUsageAdapter:
                 )
             if not isinstance(lane, dict):
                 raise ValueError("lane evidence must be an object")
+            digest = hashlib.sha256(raw).hexdigest()
+            source_id = f"bridge_file:{self.path}#{digest}"
+            health = _health_read(
+                lane,
+                read_at=read_at,
+                max_age=self.max_age,
+                future_tolerance=self.future_tolerance,
+                source_id=source_id,
+            )
+            captured_at = _parse_timestamp(document.get("captured_at"))
+            if captured_at > read_at + self.future_tolerance:
+                raise ValueError("capture timestamp is in the future")
             used = _percentage(lane.get("used_pct"))
             remaining = _percentage(lane.get("remaining_pct"))
             if abs((used + remaining) - _TOTAL) > _QUANTUM:
@@ -192,7 +237,6 @@ class BridgeUsageAdapter:
             freshness = (
                 Freshness.FRESH if read_at <= expires_at else Freshness.STALE
             )
-            digest = hashlib.sha256(raw).hexdigest()
             snapshot = CapacitySnapshot(
                 lane_id=lane_id,
                 used_pct=used,
@@ -200,7 +244,7 @@ class BridgeUsageAdapter:
                 reserved_pct=reserved,
                 effective_remaining_pct=effective,
                 source_kind="bridge_file",
-                source_id=f"bridge_file:{self.path}#{digest}",
+                source_id=source_id,
                 captured_at=captured_at,
                 read_at=read_at,
                 expires_at=expires_at,
@@ -215,9 +259,15 @@ class BridgeUsageAdapter:
             reason = (
                 None if freshness is Freshness.FRESH else ReasonCode.CAPACITY_STALE
             )
-            return CapacityRead(snapshot, reason)
+            return CapacityRead(
+                snapshot,
+                reason,
+                health=health,
+            )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            return CapacityRead(None, ReasonCode.CAPACITY_INVALID, str(exc))
+            return CapacityRead(
+                None, ReasonCode.CAPACITY_INVALID, str(exc), health=health
+            )
 
     def _read_plans(
         self,
@@ -228,10 +278,8 @@ class BridgeUsageAdapter:
         read_at: datetime,
         reserved_pct: Decimal,
     ) -> CapacityRead:
+        health: HealthRead | None = None
         try:
-            root_checked_at = _parse_timestamp(document.get("checked_at"))
-            if root_checked_at > read_at + self.future_tolerance:
-                raise ValueError("checked_at is in the future")
             plans = document.get("plans")
             if not isinstance(plans, list):
                 raise ValueError("plans must be an array")
@@ -248,6 +296,18 @@ class BridgeUsageAdapter:
                 return CapacityRead(
                     None, ReasonCode.CAPACITY_MISSING, f"{lane_id}: no bridge plan"
                 )
+            digest = hashlib.sha256(raw).hexdigest()
+            source_id = f"bridge_plans:{self.path}#{digest}"
+            health = _health_read(
+                matched,
+                read_at=read_at,
+                max_age=self.max_age,
+                future_tolerance=self.future_tolerance,
+                source_id=source_id,
+            )
+            root_checked_at = _parse_timestamp(document.get("checked_at"))
+            if root_checked_at > read_at + self.future_tolerance:
+                raise ValueError("checked_at is in the future")
             used = _plan_percentage(matched.get("weekly_pct_used"))
             remaining = (_TOTAL - used).quantize(_QUANTUM)
             row_time = matched.get("checked_at")
@@ -265,7 +325,6 @@ class BridgeUsageAdapter:
             stale = missing_row_time or read_at > expires_at
             freshness = Freshness.STALE if stale else Freshness.FRESH
             confidence = Confidence.LOW if missing_row_time else Confidence.HIGH
-            digest = hashlib.sha256(raw).hexdigest()
             overage_raw = matched.get("overage_disabled")
             if overage_raw is not None and not isinstance(overage_raw, bool):
                 raise ValueError("overage_disabled must be a boolean when set")
@@ -278,7 +337,7 @@ class BridgeUsageAdapter:
                     Decimal("0"), remaining - reserved
                 ).quantize(_QUANTUM),
                 source_kind="bridge_plans",
-                source_id=f"bridge_plans:{self.path}#{digest}",
+                source_id=source_id,
                 captured_at=captured_at,
                 read_at=read_at,
                 expires_at=expires_at,
@@ -306,6 +365,9 @@ class BridgeUsageAdapter:
                     if missing_row_time
                     else ""
                 ),
+                health=health,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            return CapacityRead(None, ReasonCode.CAPACITY_INVALID, str(exc))
+            return CapacityRead(
+                None, ReasonCode.CAPACITY_INVALID, str(exc), health=health
+            )

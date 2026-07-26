@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Mapping, MutableMapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from .capacity import BridgeUsageAdapter
 from .config import FleetConfig
@@ -13,6 +13,7 @@ from .state import FleetStore
 from .types import (
     AdapterRequest,
     AdapterResult,
+    CapacityRead,
     FleetRunResult,
     LaneInputs,
     LaneProfile,
@@ -45,6 +46,8 @@ class FleetService:
         capacity_source: BridgeUsageAdapter,
         now: Callable[[], datetime] | None = None,
         owner_uuid: str | None = None,
+        require_verified_health: bool = False,
+        lane_selector: Callable[..., object] | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -56,18 +59,36 @@ class FleetService:
         self.capacity_source = capacity_source
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.owner_uuid = owner_uuid or str(uuid.uuid4())
+        self.require_verified_health = require_verified_health
+        self.lane_selector = lane_selector
 
     def _inputs(
         self,
         at: datetime,
         *,
         purpose: RoutePurpose = RoutePurpose.TASK_WORKER,
+        lane_id: str | None = None,
     ) -> tuple[LaneInputs, ...]:
         candidates: list[LaneInputs] = []
         for profile in self.profiles:
+            if lane_id is not None and profile.lane_id != lane_id:
+                continue
             lane_config = self.config.lanes[profile.lane_id]
             active, reserved = self.store.lane_usage(profile.lane_id, now=at)
             cooldown = self.store.cooldown(profile.lane_id, now=at)
+            capacity = (
+                self.capacity_source.read(
+                    profile.lane_id,
+                    now=at,
+                    reserved_pct=reserved,
+                )
+                if lane_config.enabled
+                else CapacityRead(
+                    None,
+                    ReasonCode.CAPACITY_MISSING,
+                    f"{profile.lane_id}: disabled; live usage not fetched",
+                )
+            )
             candidates.append(
                 LaneInputs(
                     profile=profile,
@@ -78,11 +99,7 @@ class FleetService:
                         else profile.supports_parent_session
                     ),
                     qualification=self.qualifications.get(profile.lane_id),
-                    capacity=self.capacity_source.read(
-                        profile.lane_id,
-                        now=at,
-                        reserved_pct=reserved,
-                    ),
+                    capacity=capacity,
                     active_leases=active,
                     active_reserved_pct=reserved,
                     max_concurrency=lane_config.max_concurrency,
@@ -91,11 +108,12 @@ class FleetService:
                     rotation_without_fresh_capacity=(
                         self.config.rotation_without_fresh_capacity
                     ),
+                    require_verified_health=self.require_verified_health,
                 )
             )
         return tuple(candidates)
 
-    def inspect(self, task: TaskSpec) -> tuple:
+    def inspect(self, task: TaskSpec, *, lane_id: str | None = None) -> tuple:
         at = self._now().astimezone(timezone.utc)
         return tuple(
             evaluate_lane(
@@ -104,10 +122,10 @@ class FleetService:
                 now=at,
                 minimum_confidence=self.config.minimum_confidence,
             )
-            for candidate in self._inputs(at)
+            for candidate in self._inputs(at, lane_id=lane_id)
         )
 
-    def inspect_parent(self, task: TaskSpec) -> tuple:
+    def inspect_parent(self, task: TaskSpec, *, lane_id: str | None = None) -> tuple:
         at = self._now().astimezone(timezone.utc)
         return tuple(
             evaluate_lane(
@@ -118,16 +136,60 @@ class FleetService:
                 purpose=RoutePurpose.DESKTOP_PARENT,
             )
             for candidate in self._inputs(
-                at, purpose=RoutePurpose.DESKTOP_PARENT
+                at, purpose=RoutePurpose.DESKTOP_PARENT, lane_id=lane_id
             )
         )
 
-    def plan(self, task: TaskSpec) -> RouteDecision:
-        evaluations = self.inspect(task)
+    def _select_route(
+        self, evaluations: tuple, *, rotation_index: int
+    ) -> RouteDecision:
+        if self.lane_selector is None:
+            return select_lane(evaluations, rotation_index=rotation_index)
+
+        eligible = tuple(item for item in evaluations if item.eligible)
+        if not eligible:
+            return select_lane(evaluations, rotation_index=rotation_index)
+
+        cyclic = eligible[rotation_index % len(eligible)]
+        selector_config: dict[str, Any] = {
+            "fleet": {
+                "switch_delta_pct": float(self.config.switch_delta_pct),
+                "lanes": {
+                    item.lane_id: {
+                        "enabled": item.eligible,
+                        "provider": item.profile.provider_id,
+                        "model": item.selected_model
+                        or next(iter(item.profile.ordered_models), ""),
+                        "reserve_floor_pct": float(
+                            self.config.lanes[item.lane_id].reserve_floor_pct
+                        ),
+                    }
+                    for item in evaluations
+                },
+            }
+        }
+        selected = self.lane_selector(
+            config=selector_config,
+            current_provider=cyclic.profile.provider_id,
+            is_heavy=True,
+            now=self._now().astimezone(timezone.utc).timestamp(),
+            usage_by_lane={
+                item.lane_id: 100.0
+                - float(item.capacity.effective_remaining_pct)
+                for item in eligible
+                if item.capacity is not None
+            },
+        )
         return select_lane(
             evaluations,
+            rotation_index=rotation_index,
+            selected_lane_id=str(getattr(selected, "lane", "") or ""),
+        )
+
+    def plan(self, task: TaskSpec) -> RouteDecision:
+        return self._select_route(
+            self.inspect(task),
             rotation_index=self.store.rotation_cursor(),
-            switch_delta=self.config.switch_delta_pct,
         )
 
     def preview_parent(self, task: TaskSpec) -> RouteDecision:
@@ -157,6 +219,7 @@ class FleetService:
         session_id: str,
         task: TaskSpec,
         preferred_lane_id: str | None = None,
+        preferred_provider_id: str | None = None,
         preferred_model_id: str | None = None,
     ) -> ParentAdmission:
         existing = self.store.read_parent_pin(profile_id, lineage_root_id)
@@ -175,6 +238,7 @@ class FleetService:
             ),
             now=at,
             preferred_lane_id=preferred_lane_id,
+            preferred_provider_id=preferred_provider_id,
             preferred_model_id=preferred_model_id,
         )
 
@@ -215,12 +279,31 @@ class FleetService:
                 adapter_result=None,
             )
 
+        candidates = self._inputs(at)
+        selected_lane_id = None
+        if self.store.read_pin(task.task_id) is None:
+            evaluations = tuple(
+                evaluate_lane(
+                    candidate,
+                    task,
+                    now=at,
+                    minimum_confidence=self.config.minimum_confidence,
+                )
+                for candidate in candidates
+            )
+            selected_lane_id = self._select_route(
+                evaluations,
+                rotation_index=self.store.rotation_cursor(),
+            ).lane_id
+
         acquisition = self.store.acquire(
             task,
-            self._inputs(at),
+            candidates,
             owner_uuid=self.owner_uuid,
             ttl_seconds=self.config.lease_ttl_seconds,
             now=at,
+            selected_lane_id=selected_lane_id,
+            enforce_selected_lane=self.lane_selector is not None,
         )
         if acquisition.reason is not ReasonCode.MET or acquisition.lease is None:
             return FleetRunResult(

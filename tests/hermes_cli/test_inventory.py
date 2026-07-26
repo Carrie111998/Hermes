@@ -197,20 +197,31 @@ def test_build_models_payload_returns_expected_shape():
 
 
 def test_build_models_payload_does_not_call_provider_model_ids():
-    """``build_models_payload`` is a thin shape adapter — it delegates the
-    actual curation to ``list_authenticated_providers`` (which DOES call
-    ``cached_provider_model_ids`` internally for live discovery, with disk
-    caching). ``build_models_payload`` itself must not call the live fetcher
-    directly; the test pins that boundary.
+    """The payload adapter must not call live model or Antigravity probes.
+
+    ``list_authenticated_providers`` owns ordinary model curation. Antigravity
+    listing may read its sanitized proof cache, but opening a default picker
+    must not run version/catalog commands or a live backend prompt.
     """
     rows = [{"slug": "nous", "name": "Nous", "models": ["hermes-4-405b"],
              "total_models": 1, "is_current": False, "is_user_defined": False,
              "source": "built-in"}]
     ctx = _empty_ctx()
-    with _list_auth_returning(rows), \
-         patch("hermes_cli.models.provider_model_ids") as mock_pm:
+    with (
+        _list_auth_returning(rows),
+        patch("hermes_cli.models.provider_model_ids") as mock_pm,
+        patch(
+            "hermes_cli.fleet.live.FleetQualificationDoctor._external_executable",
+            return_value="C:/local-only/agy.exe",
+        ),
+        patch(
+            "hermes_cli.fleet.live.FleetQualificationDoctor._external_receipt",
+            side_effect=AssertionError("default inventory invoked Antigravity provider"),
+        ) as live_receipt,
+    ):
         build_models_payload(ctx)
     mock_pm.assert_not_called()
+    live_receipt.assert_not_called()
 
 
 def test_build_models_payload_uses_cached_nous_tier_by_default():

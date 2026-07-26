@@ -3048,6 +3048,21 @@ async def get_health():
     }
 
 
+@app.get("/api/fleet/status")
+def get_fleet_status(profile: Optional[str] = None):
+    """Return the profile-scoped, shared Fleet doctor payload.
+
+    Keep this handler synchronous so FastAPI runs the potentially blocking
+    qualification and usage probes in its worker pool. The shared inspection
+    serializer is the contract consumed by both CLI and Desktop.
+    """
+    from hermes_cli.fleet import inspection
+
+    with _config_profile_scope(profile):
+        service = inspection.build_fleet_service()
+        return inspection.build_inspection_payload(service, command="doctor")
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
@@ -6713,18 +6728,20 @@ async def get_model_options(
     Models" control. Normal opens leave it false to stay on the 1h cache.
     """
     try:
-        from hermes_cli.inventory import build_model_options_payload, load_picker_context
+        from hermes_cli.inventory import build_models_payload, load_picker_context
 
         def _build_payload_scoped() -> dict:
             # Keep the profile override inside the worker thread so the full
             # sync picker build (config load, pricing, refresh probes) runs
             # off the event loop under the requested profile.
             with _profile_scope(profile):
-                return build_model_options_payload(
+                return build_models_payload(
                     load_picker_context(),
                     explicit_only=bool(explicit_only),
                     include_unconfigured=bool(include_unconfigured),
                     refresh=bool(refresh),
+                    probe_custom_providers=bool(refresh),
+                    probe_current_custom_provider=not bool(refresh),
                 )
 
         return await run_in_threadpool(_build_payload_scoped)
@@ -7543,7 +7560,6 @@ _CREDENTIAL_PROBES: dict[str, tuple[str, str]] = {
     "OPENROUTER_API_KEY": ("https://openrouter.ai/api/v1/key", "bearer"),
     "OPENAI_API_KEY": ("https://api.openai.com/v1/models", "bearer"),
     "XAI_API_KEY": ("https://api.x.ai/v1/models", "bearer"),
-    "GEMINI_API_KEY": ("https://generativelanguage.googleapis.com/v1beta/models", "query"),
 }
 
 
@@ -9945,6 +9961,50 @@ def _copilot_acp_status() -> Dict[str, Any]:
     }
 
 
+def _antigravity_status() -> Dict[str, Any]:
+    """Report only a live, exact Antigravity consumer-subscription route."""
+
+    try:
+        from hermes_cli.fleet.live import FleetQualificationDoctor
+        from hermes_cli.fleet.profiles import profile_map
+
+        profile = profile_map()["antigravity"]
+        qualification = FleetQualificationDoctor().qualify((profile,)).get(
+            "antigravity"
+        )
+        if qualification is None:
+            return {"logged_in": False, "source": None}
+        expires_at = qualification.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if (
+            qualification.qualified is not True
+            or expires_at <= datetime.now(timezone.utc)
+            or qualification.auth_kind != "cli_subscription"
+            or qualification.auth_source != "antigravity:agy-live-receipt"
+            or qualification.provider_id != "antigravity-subscription"
+            or "gemini-3.1-pro-high" not in qualification.models
+            or not qualification.executable
+            or qualification.subscription_only_proven is not True
+            or qualification.paid_fallback_absent is not True
+            or qualification.parent_session_proven is not True
+        ):
+            return {"logged_in": False, "source": None}
+    except Exception:
+        return {"logged_in": False, "source": None}
+
+    return {
+        "logged_in": True,
+        "source": "antigravity_subscription",
+        "source_label": (
+            "Live Antigravity consumer subscription · Gemini 3.1 Pro High"
+        ),
+        "token_preview": None,
+        "expires_at": qualification.expires_at,
+        "has_refresh_token": False,
+    }
+
+
 # Explicit, hand-tuned OAuth/account provider cards. These carry the bits that
 # can't be derived from the unified provider catalog: the OAuth ``flow`` shape,
 # the per-provider ``status_fn``, the ``cli_command`` fallback, and curated
@@ -10006,6 +10066,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "cli_command": "hermes auth add xai-oauth",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/guides/xai-grok-oauth",
         "status_fn": None,  # dispatched via auth.get_xai_oauth_auth_status
+    },
+    {
+        "id": "antigravity-subscription",
+        "name": "Antigravity · Gemini 3.1 Pro High",
+        "flow": "external",
+        "cli_command": "agy",
+        "docs_url": "",
+        "status_fn": _antigravity_status,
     },
     {
         "id": "copilot-acp",
