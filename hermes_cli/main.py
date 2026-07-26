@@ -7543,7 +7543,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
                 # so we can actually delete the file.
                 abs_path = cwd / line
                 try:
-                    os.remove(r"\\?\" + str(abs_path))
+                    os.remove(r"\\?" + "\\" + str(abs_path))
                     removed_any = True
                 except OSError:
                     pass

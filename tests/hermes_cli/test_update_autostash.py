@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import sys
 
 from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
@@ -65,6 +66,8 @@ def test_stash_local_changes_if_needed_returns_specific_stash_commit(monkeypatch
             return SimpleNamespace(stdout=" M hermes_cli/main.py\n?? notes.txt\n", returncode=0)
         if cmd[-2:] == ["ls-files", "--unmerged"]:
             return SimpleNamespace(stdout="", returncode=0)
+        if cmd[-3:] == ["ls-files", "--others", "--exclude-standard"]:
+            return SimpleNamespace(stdout="", returncode=0)
         if cmd[1:4] == ["stash", "push", "--include-untracked"]:
             return SimpleNamespace(stdout="Saved working directory\n", returncode=0)
         if cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
@@ -77,11 +80,14 @@ def test_stash_local_changes_if_needed_returns_specific_stash_commit(monkeypatch
 
     assert stash_ref == "abc123"
     assert calls[1][0][-2:] == ["ls-files", "--unmerged"]
+    # On Windows there's an extra ls-files --others --exclude-standard call
+    # before the pre-push probe.
+    offset = 1 if sys.platform == "win32" else 0
     # Pre-push probe of refs/stash (baseline for detecting a fresh entry),
     # then the push, then the post-push probe.
-    assert calls[2][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
-    assert calls[3][0][1:4] == ["stash", "push", "--include-untracked"]
-    assert calls[4][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
+    assert calls[2 + offset][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
+    assert calls[3 + offset][0][1:4] == ["stash", "push", "--include-untracked"]
+    assert calls[4 + offset][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
 
 
 def test_resolve_stash_selector_returns_matching_entry(monkeypatch, tmp_path):
@@ -313,6 +319,8 @@ def test_stash_local_changes_if_needed_raises_when_stash_ref_missing(monkeypatch
         if cmd[-2:] == ["status", "--porcelain"]:
             return SimpleNamespace(stdout=" M hermes_cli/main.py\n", returncode=0)
         if cmd[-2:] == ["ls-files", "--unmerged"]:
+            return SimpleNamespace(stdout="", returncode=0)
+        if cmd[-3:] == ["ls-files", "--others", "--exclude-standard"]:
             return SimpleNamespace(stdout="", returncode=0)
         if cmd[1:4] == ["stash", "push", "--include-untracked"]:
             return SimpleNamespace(stdout="Saved working directory\n", returncode=0)
@@ -1017,6 +1025,8 @@ def test_stash_push_failure_without_stash_entry_still_raises(monkeypatch, tmp_pa
             return SimpleNamespace(stdout=" M x.py\n", returncode=0)
         if cmd[-2:] == ["ls-files", "--unmerged"]:
             return SimpleNamespace(stdout="", returncode=0)
+        if cmd[-3:] == ["ls-files", "--others", "--exclude-standard"]:
+            return SimpleNamespace(stdout="", returncode=0)
         if cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
             return SimpleNamespace(stdout="", returncode=1)
         if cmd[1:4] == ["stash", "push", "--include-untracked"]:
@@ -1043,6 +1053,8 @@ def test_stash_push_failure_with_preexisting_stash_unchanged_still_raises(
         if cmd[-2:] == ["status", "--porcelain"]:
             return SimpleNamespace(stdout=" M x.py\n", returncode=0)
         if cmd[-2:] == ["ls-files", "--unmerged"]:
+            return SimpleNamespace(stdout="", returncode=0)
+        if cmd[-3:] == ["ls-files", "--others", "--exclude-standard"]:
             return SimpleNamespace(stdout="", returncode=0)
         if cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
             return SimpleNamespace(stdout="oldref456\n", returncode=0)
