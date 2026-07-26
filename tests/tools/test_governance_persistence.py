@@ -152,13 +152,15 @@ def unattended(monkeypatch, tmp_path):
     monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "deny")
 
 
-def test_unattended_tool_and_terminal_requests_are_parked(unattended):
+def test_cron_denials_are_blocked_and_left_reviewable(unattended):
     tool = approval.request_tool_approval(
         "send_message", "daily", rule_key="daily",
         args={"target": "discord:#ops", "text": "hello"}, risk_class="external",
     )
     command = approval.check_dangerous_command("rm -rf ./cache", "local")
-    assert tool["status"] == command["status"] == "approval_required"
+    assert tool.get("status") != "approval_required"
+    assert command.get("status") != "approval_required"
+    assert tool["approved"] is command["approved"] is False
     rows = ApprovalStore().list_requests(status="pending")
     assert {(row["tool_name"], row["source"]) for row in rows} == {
         ("send_message", "plugin"), ("terminal", "terminal")

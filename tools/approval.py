@@ -3116,6 +3116,12 @@ def request_tool_approval(
                 )
             except (KeyError, ValueError):
                 pass
+        elif env_var_enabled("HERMES_CRON_SESSION"):
+            # cron_mode: deny is a terminal block for this invocation, even
+            # though its durable inbox row remains pending for later review.
+            # Do not advertise approval_required: there is no listener waiting
+            # to resume this cron run.
+            pass
         elif result.get("status") == "approval_required" or (
             not _is_interactive_cli() and not _is_gateway_approval_context()
         ):
