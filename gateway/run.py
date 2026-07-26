@@ -9614,6 +9614,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            # Shutdown acceptance closes before any observer or adapter await.
+            # Every retained participant delivery is invalid at this point,
+            # including sessions with no currently running host agent.
+            self._revoke_all_gateway_deliveries()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -12945,6 +12949,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_key: str,
     ) -> bool:
+        """Run ordinary-message hooks in the already-resolved profile scope."""
+
+        async def _run_scoped() -> bool:
+            native_events = event.metadata.get("_gateway_native_events", ())
+            if native_events:
+                if not isinstance(native_events, tuple) or not all(
+                    isinstance(item, MessageEvent) for item in native_events
+                ):
+                    logger.warning(
+                        "invalid native-event batch metadata; suppressing normal dispatch"
+                    )
+                    return True
+                suppressed = False
+                for native_event in native_events:
+                    # Every authorized native Discord ingress crosses the hook
+                    # independently. Continue through the batch even after one
+                    # terminal result so no constituent identity disappears.
+                    suppressed = (
+                        await self._run_gateway_message_hook_scoped(
+                            native_event,
+                            source,
+                            session_key,
+                        )
+                        or suppressed
+                    )
+                return suppressed
+            return await self._run_gateway_message_hook_scoped(
+                event,
+                source,
+                session_key,
+            )
+
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await _run_scoped()
+        return await _run_scoped()
+
+    async def _run_gateway_message_hook_scoped(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> bool:
         """Return True when an ordinary user-message hook suppresses dispatch."""
         result_marker = "_hermes_gateway_message_hook_result"
         prior_result = getattr(event, result_marker, None)
@@ -12972,6 +13020,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(source)
         delivery_platform = source.platform
         delivery_chat_id = str(source.chat_id)
+        delivery_message_id = str(event.message_id or "")
         delivery_metadata = self._thread_metadata_for_source(source, event.message_id)
         delivery_via_relay = (
             getattr(source, "delivered_via_upstream_relay", False) is True
@@ -13003,12 +13052,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=metadata,
             )
 
+        async def _reply_to_source(content: str):
+            if adapter is None or not delivery_message_id:
+                return SendResult(success=False)
+            metadata = dict(delivery_metadata) if delivery_metadata else None
+            if delivery_via_relay:
+                send_for_platform: Any = getattr(adapter, "send_for_platform", None)
+                if not callable(send_for_platform):
+                    return SendResult(success=False)
+                return await send_for_platform(
+                    delivery_platform,
+                    delivery_chat_id,
+                    content,
+                    reply_to=delivery_message_id,
+                    metadata=metadata,
+                )
+            return await adapter.send(
+                delivery_chat_id,
+                content,
+                reply_to=delivery_message_id,
+                metadata=metadata,
+            )
+
+        async def _react_to_source(reaction: str, operation: str):
+            if adapter is None or delivery_via_relay or not delivery_message_id:
+                return SendResult(success=False)
+            react: Any = getattr(adapter, "react", None)
+            if not callable(react):
+                return SendResult(success=False)
+            return await react(
+                delivery_chat_id,
+                delivery_message_id,
+                reaction,
+                operation=operation,
+            )
+
         def _stop_after_terminal_result(result: Any) -> bool:
             if not isinstance(result, dict):
                 return True
             decision = str(result.get("decision", "")).strip().lower()
             return decision not in {"continue", "pass"}
 
+        # A newly accepted ordinary ingress supersedes every previously issued
+        # capability for this session before the new one becomes visible.
+        self._revoke_gateway_deliveries(session_key)
+        delivery = GatewayDelivery(
+            _send_to_source,
+            reply_callback=_reply_to_source,
+            react_callback=_react_to_source,
+        )
+        self._register_gateway_delivery(session_key, delivery)
         setattr(event, result_marker, "pending")
         try:
             results = await invoke_hook_async(
@@ -13018,15 +13111,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source,
                     session_key=session_key,
                 ),
-                delivery=GatewayDelivery(_send_to_source),
+                delivery=delivery,
                 raise_exceptions=True,
                 stop_when=_stop_after_terminal_result,
             )
         except asyncio.CancelledError:
+            delivery._revoke()
             if getattr(event, result_marker, None) == "pending":
                 delattr(event, result_marker)
             raise
         except Exception as exc:
+            delivery._revoke()
             logger.warning(
                 "gateway_message hook failed; suppressing normal dispatch (%s)",
                 type(exc).__name__,
@@ -13035,6 +13130,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         for result in results:
             if not isinstance(result, dict):
+                delivery._revoke()
                 logger.warning(
                     "gateway_message hook returned invalid terminal result type %s; "
                     "suppressing normal dispatch",
@@ -13046,12 +13142,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return _finish(True)
             if decision in {"continue", "pass"}:
                 continue
+            delivery._revoke()
             logger.warning(
                 "gateway_message hook returned an invalid decision; "
                 "suppressing normal dispatch"
             )
             return _finish(True)
+        delivery._revoke()
         return _finish(False)
+
+    def _register_gateway_delivery(self, session_key: str, delivery: Any) -> None:
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if deliveries is None:
+            deliveries = {}
+            self._gateway_deliveries_by_session = deliveries
+        deliveries.setdefault(str(session_key), set()).add(delivery)
+
+    def _revoke_gateway_deliveries(self, session_key: str) -> None:
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if not deliveries:
+            return
+        for delivery in deliveries.pop(str(session_key), ()):
+            try:
+                delivery._revoke()
+            except Exception:
+                logger.debug("gateway delivery revocation failed", exc_info=True)
+
+    def _revoke_all_gateway_deliveries(self) -> None:
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if not deliveries:
+            return
+        for session_key in tuple(deliveries):
+            self._revoke_gateway_deliveries(session_key)
 
     async def _notify_gateway_session_cancel(
         self,
@@ -13060,11 +13182,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         reason: str,
     ) -> None:
-        """Best-effort async notification for an explicit session boundary."""
+        """Invalidate effects, then best-effort notify an explicit boundary."""
         from gateway.message_hooks import GatewayMessageRoute
         from hermes_cli.plugins import invoke_hook_async
 
-        try:
+        # Invalidation is authoritative and synchronous. The bounded plugin
+        # observer below cannot delay it or keep a stale route capability live.
+        self._revoke_gateway_deliveries(session_key)
+        async def _invoke_cancel_observer() -> None:
             await asyncio.wait_for(
                 invoke_hook_async(
                     "gateway_session_cancel",
@@ -13077,6 +13202,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 timeout=GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS,
             )
+
+        try:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    await _invoke_cancel_observer()
+            else:
+                await _invoke_cancel_observer()
         except asyncio.CancelledError:
             raise
         except TimeoutError:

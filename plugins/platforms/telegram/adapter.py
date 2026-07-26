@@ -9432,6 +9432,27 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, _redact_telegram_error_text(e))
             return False
 
+    async def react(
+        self,
+        chat_id: str,
+        message_id: str,
+        reaction: str,
+        *,
+        operation: str = "add",
+    ) -> SendResult:
+        """Apply one reaction to an exact Telegram message."""
+        if operation not in {"add", "remove"}:
+            return SendResult(success=False, error="Reaction is unavailable")
+        succeeded = (
+            await self._set_reaction(chat_id, message_id, reaction)
+            if operation == "add"
+            else await self._clear_reactions(chat_id, message_id)
+        )
+        return SendResult(
+            success=succeeded,
+            message_id=str(message_id) if succeeded else None,
+        )
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():

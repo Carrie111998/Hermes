@@ -3119,6 +3119,17 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    async def react(
+        self,
+        chat_id: str,
+        message_id: str,
+        reaction: str,
+        *,
+        operation: str = "add",
+    ) -> SendResult:
+        """Apply one route-bound reaction when the adapter supports it."""
+        return SendResult(success=False, error="Reactions are unavailable")
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close

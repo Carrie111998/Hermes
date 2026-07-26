@@ -51,6 +51,48 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_text_batch_retains_each_native_event_identity_and_mentions():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    adapter._text_batch_delay_seconds = 99
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chat",
+        chat_type="group",
+        user_id="7",
+    )
+    first = MessageEvent(
+        text="ordinary",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+        metadata={"mentioned_user_ids": (), "mentions_room": False},
+    )
+    second = MessageEvent(
+        text="@bot",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m2",
+        metadata={"mentioned_user_ids": ("9",), "mentions_room": False},
+    )
+
+    adapter._enqueue_text_event(first)
+    adapter._enqueue_text_event(second)
+    merged = next(iter(adapter._pending_text_batches.values()))
+    native_events = merged.metadata["_gateway_native_events"]
+
+    assert [(item.message_id, item.text) for item in native_events] == [
+        ("m1", "ordinary"),
+        ("m2", "@bot"),
+    ]
+    assert native_events[0].metadata["mentioned_user_ids"] == ()
+    assert native_events[1].metadata["mentioned_user_ids"] == ("9",)
+
+    for task in adapter._pending_text_batch_tasks.values():
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_cancel_background_tasks_awaits_pending_text_batch_before_clearing():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
     flushed = asyncio.Event()

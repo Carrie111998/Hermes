@@ -94,6 +94,52 @@ def test_message_snapshot_marks_unattested_mentions_unknown():
     assert normalized_event.mentions_room is None
 
 
+def test_message_hook_snapshot_bounds_oversized_fields_and_declares_gaps():
+    event = _event()
+    event.text = "x" * 2_000_000
+    event.reply_to_text = "r" * 100_000
+    event.message_id = "m" * 5_000
+    event.media_urls = [f"https://example.invalid/{index}/" + "u" * 5_000 for index in range(50)]
+    event.media_types = ["t" * 500 for _ in range(50)]
+    event.metadata["mentioned_user_ids"] = [f"user-{index}" for index in range(500)]
+
+    snapshot = GatewayMessageEvent.from_event(event)
+
+    assert len(snapshot.text.encode("utf-8")) <= 65_536
+    assert len((snapshot.reply_to_text or "").encode("utf-8")) <= 16_384
+    assert len((snapshot.message_id or "").encode("utf-8")) <= 512
+    assert len(snapshot.media_urls) <= 16
+    assert all(len(item.encode("utf-8")) <= 4_096 for item in snapshot.media_urls)
+    assert len(snapshot.media_types) <= 16
+    assert len(snapshot.mentioned_user_ids or ()) <= 128
+    assert {
+        "text-overflow",
+        "reply-text-overflow",
+        "message-id-overflow",
+        "media-count-overflow",
+        "media-url-overflow",
+        "media-type-overflow",
+        "mention-count-overflow",
+    }.issubset(set(snapshot.coverage_gaps))
+
+
+def test_route_snapshot_bounds_oversized_fields_and_declares_gaps():
+    source = _source()
+    source.chat_id = "c" * 5_000
+    source.user_name = "u" * 10_000
+
+    route = GatewayMessageRoute.from_source(source, session_key="s" * 10_000)
+
+    assert len(route.session_key.encode("utf-8")) <= 2_048
+    assert len(route.chat_id.encode("utf-8")) <= 512
+    assert len((route.user_name or "").encode("utf-8")) <= 4_096
+    assert {
+        "session-key-overflow",
+        "chat-id-overflow",
+        "user-name-overflow",
+    }.issubset(set(route.coverage_gaps))
+
+
 def test_route_snapshot_fills_resolved_active_profile_when_source_is_unset(monkeypatch):
     source = _source()
     source.profile = None
@@ -159,7 +205,10 @@ async def test_route_delivery_reports_raised_send_as_unknown_without_native_deta
     assert not hasattr(receipt, "error")
 
 
-def test_route_delivery_does_not_expose_native_send_callback():
+@pytest.mark.asyncio
+async def test_route_delivery_does_not_expose_native_send_callback():
+    import gateway.message_hooks as message_hooks
+
     async def send_native(_content: str):
         return SendResult(success=True, message_id="out-1")
 
@@ -167,6 +216,18 @@ def test_route_delivery_does_not_expose_native_send_callback():
 
     assert not hasattr(delivery, "_send_callback")
     assert not hasattr(delivery, "__dict__")
+    assert not hasattr(message_hooks, "_DELIVERY_SEND_CALLBACKS")
+    assert send_native not in vars(message_hooks).values()
+    channels = list(message_hooks._DELIVERY_CHANNELS.values())
+    assert channels
+    await asyncio.sleep(0)
+    assert all(not channel.queue._getters for channel in channels)
+    assert all(
+        not any(callable(value) for value in (channel.queue, channel.revoked, channel.consumed))
+        for channel in channels
+    )
+    assert delivery.send.__func__.__closure__ is None
+    delivery._revoke()
 
 
 def _runner_for_dispatch():
@@ -263,6 +324,261 @@ async def test_continue_hook_decisions_reach_cold_agent_dispatch(monkeypatch, de
     await runner._handle_message(_event())
 
     runner._handle_message_with_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_route_multiplexed_hook_runs_inside_resolved_profile_scope(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.config import get_hermes_home
+
+    runner, _adapter = _runner_for_dispatch()
+    runner.config.multiplex_profiles = True
+    default_home = tmp_path / "default"
+    work_home = tmp_path / "profiles" / "work"
+    default_home.mkdir(parents=True)
+    work_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(
+        runner,
+        "_resolve_profile_home_for_source",
+        lambda _source: work_home,
+    )
+    observed = {}
+
+    async def hook(_name, **kwargs):
+        observed["home"] = get_hermes_home()
+        observed["profile"] = kwargs["route"].profile
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    await runner._handle_message(_event())
+
+    assert observed == {"home": work_home, "profile": "work"}
+
+
+@pytest.mark.asyncio
+async def test_route_multiplexed_cancel_hook_runs_inside_resolved_profile_scope(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli.config import get_hermes_home
+
+    runner, _adapter = _runner_for_dispatch()
+    runner.config.multiplex_profiles = True
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        runner,
+        "_resolve_profile_home_for_source",
+        lambda _source: profile_home,
+    )
+    observed_homes = []
+
+    async def hook(name, **_kwargs):
+        if name == "gateway_session_cancel":
+            observed_homes.append(get_hermes_home())
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+    source = _source()
+    source.profile = "work"
+
+    await runner._notify_gateway_session_cancel(
+        build_session_key(source, profile="work"),
+        source,
+        reason="stop",
+    )
+
+    assert observed_homes == [profile_home.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_route_delivery_reply_is_bound_to_ingress_message(monkeypatch):
+    runner, adapter = _runner_for_dispatch()
+    receipts = []
+
+    async def hook(name, **kwargs):
+        if name == "gateway_message":
+            receipts.append(await kwargs["delivery"].reply("threaded"))
+            return [{"decision": "handled"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+    event = _event()
+    event.message_id = "in-1"
+
+    await runner._handle_message(event)
+
+    assert receipts == [GatewayDeliveryReceipt(status="sent", message_id="out-1")]
+    adapter.send.assert_awaited_once_with(
+        "channel-1",
+        "threaded",
+        reply_to="in-1",
+        metadata={"thread_id": "thread-1"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_route_delivery_reaction_is_bound_to_ingress_message(monkeypatch):
+    runner, adapter = _runner_for_dispatch()
+    adapter.react = AsyncMock(
+        return_value=SendResult(success=True, message_id="in-1")
+    )
+    receipts = []
+
+    async def hook(name, **kwargs):
+        if name == "gateway_message":
+            receipts.append(
+                await kwargs["delivery"].react("👍", operation="add")
+            )
+            return [{"decision": "handled"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+    event = _event()
+    event.message_id = "in-1"
+
+    await runner._handle_message(event)
+
+    assert receipts == [GatewayDeliveryReceipt(status="sent", message_id="in-1")]
+    adapter.react.assert_awaited_once_with(
+        "channel-1",
+        "in-1",
+        "👍",
+        operation="add",
+    )
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_cancel_revokes_retained_delivery_before_observer(monkeypatch):
+    runner, adapter = _runner_for_dispatch()
+    retained = []
+    cancel_observed_revoked = []
+
+    async def hook(name, **kwargs):
+        if name == "gateway_message":
+            retained.append(kwargs["delivery"])
+            return [{"decision": "handled"}]
+        if name == "gateway_session_cancel":
+            cancel_observed_revoked.append(
+                (await retained[0].send("too late")).status
+            )
+            return []
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    event = _event()
+    await runner._handle_message(event)
+    session_key = build_session_key(event.source)
+    await runner._notify_gateway_session_cancel(
+        session_key,
+        event.source,
+        reason="stop",
+    )
+
+    assert cancel_observed_revoked == ["failed"]
+    assert (await retained[0].send("still too late")).status == "failed"
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_revokes_retained_delivery_without_active_agent(monkeypatch):
+    runner, adapter = _runner_for_dispatch()
+    retained = []
+
+    async def hook(name, **kwargs):
+        if name == "gateway_message":
+            retained.append(kwargs["delivery"])
+            return [{"decision": "handled"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+    await runner._handle_message(_event())
+
+    runner._revoke_all_gateway_deliveries()
+
+    assert (await retained[0].send("after drain")).status == "failed"
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_ingress_revokes_prior_retained_delivery(monkeypatch):
+    runner, adapter = _runner_for_dispatch()
+    retained = []
+
+    async def hook(name, **kwargs):
+        if name == "gateway_message":
+            retained.append(kwargs["delivery"])
+            return [{"decision": "handled"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    first = _event()
+    first.message_id = "m1"
+    second = _event()
+    second.message_id = "m2"
+    await runner._handle_message(first)
+    await runner._handle_message(second)
+
+    assert len(retained) == 2
+    assert (await retained[0].send("superseded")).status == "failed"
+    assert (await retained[1].send("current")).status == "sent"
+    adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_text_batch_invokes_hook_once_per_native_event(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    first = _event()
+    first.message_id = "m1"
+    first.text = "ordinary"
+    first.metadata["mentioned_user_ids"] = ()
+    second = _event()
+    second.message_id = "m2"
+    second.text = "@bot"
+    second.metadata["mentioned_user_ids"] = ("9",)
+    merged = _event()
+    merged.message_id = "m1"
+    merged.text = "ordinary\n@bot"
+    merged.metadata.update(
+        {
+            "mentioned_user_ids": ("9",),
+            "_gateway_native_events": (first, second),
+        }
+    )
+    observed = []
+
+    async def hook(_name, **kwargs):
+        observed.append(
+            (
+                kwargs["event"].message_id,
+                kwargs["event"].text,
+                kwargs["event"].mentioned_user_ids,
+            )
+        )
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    await runner._handle_message(merged)
+
+    assert observed == [
+        ("m1", "ordinary", ()),
+        ("m2", "@bot", ("9",)),
+    ]
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

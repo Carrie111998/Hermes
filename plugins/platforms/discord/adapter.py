@@ -2830,6 +2830,34 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] remove_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
+    async def react(
+        self,
+        chat_id: str,
+        message_id: str,
+        reaction: str,
+        *,
+        operation: str = "add",
+    ) -> SendResult:
+        """Apply one reaction to an exact Discord message."""
+        if not self._client or operation not in {"add", "remove"}:
+            return SendResult(success=False, error="Reaction is unavailable")
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(chat_id))
+            message = await channel.fetch_message(int(message_id))
+            succeeded = (
+                await self._add_reaction(message, reaction)
+                if operation == "add"
+                else await self._remove_reaction(message, reaction)
+            )
+            return SendResult(
+                success=succeeded,
+                message_id=str(message_id) if succeeded else None,
+            )
+        except Exception:
+            return SendResult(success=False, error="Reaction failed")
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
@@ -7635,6 +7663,30 @@ class DiscordAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
+    def _native_gateway_event_snapshot(self, event: MessageEvent) -> MessageEvent:
+        """Retain one bounded-to-hook native identity before agent-text batching."""
+        return MessageEvent(
+            text=str(event.text or ""),
+            message_type=event.message_type,
+            source=event.source,
+            raw_message=None,
+            message_id=event.message_id,
+            media_urls=list(event.media_urls),
+            media_types=list(event.media_types),
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_text=event.reply_to_text,
+            reply_to_author_id=event.reply_to_author_id,
+            reply_to_author_name=event.reply_to_author_name,
+            reply_to_is_own_message=event.reply_to_is_own_message,
+            metadata={
+                "mentioned_user_ids": tuple(
+                    event.metadata.get("mentioned_user_ids", ())
+                ),
+                "mentions_room": event.metadata.get("mentions_room"),
+            },
+            timestamp=event.timestamp,
+        )
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -7645,10 +7697,16 @@ class DiscordAdapter(BasePlatformAdapter):
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._pending_text_batches[key] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
