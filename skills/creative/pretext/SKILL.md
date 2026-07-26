@@ -1,6 +1,6 @@
 ---
 name: pretext
-description: Build creative browser demos with DOM-free text layout.
+description: "Use when building creative browser demos with DOM-free text layout — ASCII art, kinetic typography, gen art."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
