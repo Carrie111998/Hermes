@@ -6,6 +6,7 @@ Status: PROPOSED. Dependency-ordered implementation plan; no row below is comple
 - [ ] T001 Validate every schema/envelope against spec/data-model/contracts. Depends: none. Acceptance: no contradictions, `unknown` semantics present everywhere. Test: contract documentation consistency review.
 - [ ] T002 Add contract fixtures for provider/product/surface/account/entitlement/billing/quota/model/endpoint/variant/region. Depends: T001. Acceptance: same model in separate pools produces distinct route_id. Test: unit/property route canonicalization.
 - [ ] T003 Add sanitized observation fixtures with missing plan/quota/reset/price. Depends: T001. Acceptance: every datum has source/captured_at/valid_until/freshness/confidence/is_estimated; absence remains unknown. Test: contract serialization/property.
+- [ ] T004 Add AC-01 unknown-capacity policy regression. Depends: T001,T003. Acceptance: high-risk unknown fails closed without reservation/dispatch; lower-risk unknown persists a policy disposition plus evidence before continuation; neither branch treats unknown as healthy, zero or unlimited. Tests: unit/property + decision serialization.
 
 ## Wave 1 — pure domain model and policy
 - [ ] T101 Implement immutable TaskEnvelope/Route/Observation/Decision/Execution DTOs. Depends: T001-T003. Acceptance: model identity absent from task except audited justification; no secret-bearing fields. Tests: unit + contract redaction.
