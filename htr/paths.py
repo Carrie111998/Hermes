@@ -84,6 +84,32 @@ def approval_outcome_path(approval_id: str, base_dir: Path | None = None) -> Pat
     return approval_control_dir(approval_id, base_dir) / "outcome.json"
 
 
+RECONCILIATION_DIR_NAME = "reconciliation"
+
+
+def control_reconciliation_root(base_dir: Path | None = None) -> Path:
+    return control_root(base_dir) / RECONCILIATION_DIR_NAME
+
+
+def reconciliation_case_dir(case_id: str, base_dir: Path | None = None) -> Path:
+    _validate_path_component(case_id, "case_id")
+    if not validate_id(case_id, "reconciliation"):
+        raise ValueError(f"invalid case_id format: {case_id!r}")
+    return control_reconciliation_root(base_dir) / case_id
+
+
+def reconciliation_open_path(case_id: str, base_dir: Path | None = None) -> Path:
+    return reconciliation_case_dir(case_id, base_dir) / "open.json"
+
+
+def reconciliation_observation_path(case_id: str, base_dir: Path | None = None) -> Path:
+    return reconciliation_case_dir(case_id, base_dir) / "observation.json"
+
+
+def reconciliation_decision_path(case_id: str, base_dir: Path | None = None) -> Path:
+    return reconciliation_case_dir(case_id, base_dir) / "decision.json"
+
+
 def reports_dir(run_id: str, base_dir: Path | None = None) -> Path:
     return run_root(run_id, base_dir) / "reports"
 

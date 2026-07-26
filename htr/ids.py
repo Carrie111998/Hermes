@@ -18,6 +18,7 @@ IdKind = Literal[
     "verification",
     "heal_cycle",
     "approval",
+    "reconciliation",
 ]
 
 ID_PREFIXES: dict[IdKind, str] = {
@@ -31,10 +32,11 @@ ID_PREFIXES: dict[IdKind, str] = {
     "verification": "ver_",
     "heal_cycle": "heal_",
     "approval": "apr_",
+    "reconciliation": "rcn_",
 }
 
 _ID_BODY_RE = re.compile(
-    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr)_(\d{8})_([a-f0-9]{6})$"
+    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn)_(\d{8})_([a-f0-9]{6})$"
 )
 
 
@@ -114,3 +116,7 @@ def new_heal_cycle_id() -> str:
 
 def new_approval_id() -> str:
     return generate_id("approval")
+
+
+def new_reconciliation_case_id() -> str:
+    return generate_id("reconciliation")

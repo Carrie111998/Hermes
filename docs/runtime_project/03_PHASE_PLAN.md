@@ -2,7 +2,7 @@
 
 **Baseline:** Architecture Baseline v1.0
 **Date:** 2026-07-18
-**Updated:** 2026-07-22 (Task 25 closed at `c6a9e305`; Task 26A checkpoint approved — read-only reconciliation inspection complete; Task 26B/26C not started/not approved; entire Task 26 not complete)
+**Updated:** 2026-07-25 (Task 26B checkpoint approved and complete; Task 26C not started; Task 27/28 not started; entire Task 26 not complete)
 
 ---
 
@@ -56,9 +56,9 @@ Phase 2 defines controlled runtime integration and safe-automation progression.
 1. **Immutable finalization:** valid `run_final_closure_record` → original run sealed against all normal committed HTR mutation APIs (Task 22 ✅).
 2. **Recovery/Successor Run:** remediation via linked successor run; original never reopened/unlocked/edited (Task 27+).
 
-**Write-path gate:** Task 22 seal ✅; Task 23 write barrier ✅; Task 24 approval control ✅; Task 25 human-gated invoke pilot ✅ (`c6a9e305`). **Task 26A** adds **read-only** reconciliation inspection only — no case persistence, marker disposition, retry, repair, or Recovery Run.
+**Write-path gate:** Task 22 seal ✅; Task 23 write barrier ✅; Task 24 approval control ✅; Task 25 human-gated invoke pilot ✅ (`c6a9e305`). **Task 26A** read-only reconciliation inspection ✅ (closed). **Task 26B** durable reconciliation case control records ✅ (checkpoint approved and complete) — grants reconciliation posture only; all six non-permission booleans remain `false`; marker disposition, retry, repair, invoke, Recovery Run creation, and outcome rewrite **remain prohibited**. **Task 26C** not started and not approved.
 
-**Accepted progression:** observe (✅) → action plan (✅ Task 21) → immutable seal (✅ Task 22) → write barrier (✅ Task 23) → approval (✅ Task 24) → human-gated invoke (✅ Task 25 `c6a9e305`) → read-only reconciliation inspection (**Task 26A — checkpoint approved; complete**) → durable reconciliation cases (Task 26B — not started) → marker disposition protocol (Task 26C — not started) → Recovery/Successor protocol → bounded repair → …
+**Accepted progression:** observe (✅) → action plan (✅ Task 21) → immutable seal (✅ Task 22) → write barrier (✅ Task 23) → approval (✅ Task 24) → human-gated invoke (✅ Task 25 `c6a9e305`) → read-only reconciliation inspection (**Task 26A — closed**) → durable reconciliation cases (**Task 26B — checkpoint approved and complete**) → marker disposition protocol (**Task 26C — not started; not approved**) → Recovery/Successor protocol (**Task 27 — not started**) → bounded repair (**Task 28 — not started**) → …
 
 **Historical note:** Phase 1 (Task 17.1) documented chain-terminal closure without global API hard lock; Policy C is forward-looking Phase 2 enforcement.
 

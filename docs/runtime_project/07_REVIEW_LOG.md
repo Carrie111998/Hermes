@@ -2,13 +2,65 @@
 
 ---
 
+## 2026-07-25 — Task 26B: Durable reconciliation cases (checkpoint approved)
+
+**Implementer:** Cursor (isolated candidate tree; parent `8de2b29b`)
+**Scope:** `htr/reconciliation_cases.py` (NEW), `htr/paths.py`, `htr/ids.py`, `htr/state.py`, `htr/__init__.py`, `tests/htr/test_reconciliation_cases.py` (NEW), runtime docs
+**Production Runtime modified:** Yes — reconciliation case control API only (no lifecycle/marker/approval mutation)
+**Marker mutation:** No — 26B does not acquire execution marker or call `begin_run_write`
+**Task 26A:** Closed (checkpoint approved)
+**Task 26C:** Not started and not approved
+**Task 27/28:** Not started
+**Entire Task 26:** Not complete
+**Verification:** `tests/htr/test_reconciliation_cases.py` — **176 passed**; full tracked HTR suite **1862 passed** (29 files; baseline 1686 + 176); 0 failed; 0 FLAKY; 0 retries
+
+### Contract
+
+- Public APIs: `generate_reconciliation_case_id`, `open_reconciliation_case`, `record_reconciliation_observation`, `record_reconciliation_decision`, `load_reconciliation_case`
+- Storage: `{runs_root}/.control/reconciliation/{case_id}/` with immutable O_EXCL records
+- Observation persists proven Task 26A inspection projection; decision-time revalidation with drift detection
+- Policy-derived decision classes; consumed outcome never `completion_verified_by_reconciliation`
+- **Decisions grant reconciliation posture only**; all six non-permission booleans remain `false`
+- Write metadata: `ReconciliationWriteMetadata`; durability failures raise `ReconciliationDurabilityError`
+
+### Explicitly not implemented
+
+- Marker disposition protocol (Task 26C — not started; not approved)
+- Retry, repair, invoke, Recovery/Successor Runs, outcome rewrite, CLI
+
+---
+
+## 2026-07-23 — Task 26B: Durable reconciliation cases (isolated candidate implementation — superseded by checkpoint entry above)
+
+**Implementer:** Cursor (isolated candidate tree `/home/unaliu/task26b-candidate/`; parent `8de2b29b`)
+**Scope:** `htr/reconciliation_cases.py` (NEW), `htr/paths.py`, `htr/ids.py`, `htr/state.py`, `htr/__init__.py`, `tests/htr/test_reconciliation_cases.py` (NEW), runtime docs
+**Production Runtime modified:** Yes — reconciliation case control API only (no lifecycle/marker/approval mutation)
+**Marker mutation:** No — 26B does not acquire execution marker or call `begin_run_write`
+**Task 26C:** Not started
+**Verification:** `tests/htr/test_reconciliation_cases.py` — **28 passed**; full tracked HTR suite **1714 passed** (29 files; baseline 1686 + 28)
+
+### Contract
+
+- Public APIs: `generate_reconciliation_case_id`, `open_reconciliation_case`, `record_reconciliation_observation`, `record_reconciliation_decision`, `load_reconciliation_case`
+- Storage: `{runs_root}/.control/reconciliation/{case_id}/` with immutable O_EXCL records
+- Observation persists proven Task 26A inspection projection; decision-time revalidation with drift detection
+- Policy-derived decision classes; consumed outcome never `completion_verified_by_reconciliation`
+- Write metadata: `ReconciliationWriteMetadata`; durability failures raise `ReconciliationDurabilityError`
+
+### Explicitly not implemented
+
+- Marker disposition protocol (Task 26C)
+- Retry, repair, Recovery/Successor Runs, CLI
+
+---
+
 ## 2026-07-22 — Task 26A: Read-only execution reconciliation inspection (checkpoint approved)
 
 **Implementer:** Cursor (isolated candidate tree; parent Task 25 `c6a9e305`)
 **Scope:** `htr/reconciliation_inspection.py`, `htr/state.py`, `htr/__init__.py`, `tests/htr/test_reconciliation_inspection.py`, runtime docs
 **Production Runtime modified:** Yes — read-only inspection API only
 **Marker mutation:** No — strictly read-only; no bootstrap/acquire/disposition
-**Task 26B/26C:** Not started
+**Task 26B/26C:** Task 26B checkpoint approved and complete; Task 26C not started and not approved
 **Verification:** `tests/htr/test_reconciliation_inspection.py` — **34 passed**; full tracked HTR suite **1657 passed** (28 files; baseline 1623 + 34)
 
 ### Contract

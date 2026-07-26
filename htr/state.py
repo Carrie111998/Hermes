@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 RunStatus = str
 TaskStatus = str
@@ -380,6 +380,132 @@ class RunCompletionReconciliationInspection:
     recovery_protocol_required: bool
     observed_at: str | None
 
+
+ERROR_CODE_RECONCILIATION_VALIDATION: Final = "RECONCILIATION_VALIDATION_FAILED"
+ERROR_CODE_RECONCILIATION_CONFLICT: Final = "RECONCILIATION_CONFLICT"
+ERROR_CODE_RECONCILIATION_STATE: Final = "RECONCILIATION_ILLEGAL_STATE"
+ERROR_CODE_RECONCILIATION_DURABILITY: Final = "RECONCILIATION_DURABILITY_FAILED"
+
+
+class ReconciliationStateError(HTRStateError):
+    """Base error for Task 26B reconciliation case operations."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = ERROR_CODE_RECONCILIATION_STATE,
+        case_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.case_id = case_id
+
+
+class ReconciliationValidationError(ReconciliationStateError):
+    """Raised when reconciliation inputs or derived validation fail."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_RECONCILIATION_VALIDATION, **kwargs)
+
+
+class ReconciliationConflictError(ReconciliationStateError):
+    """Raised when an immutable reconciliation record conflicts with existing evidence."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_RECONCILIATION_CONFLICT, **kwargs)
+
+
+DurabilityStage = Literal[
+    "record_write",
+    "record_fsync",
+    "case_dir_fsync",
+    "control_dir_fsync",
+    "parent_dir_fsync",
+]
+
+ExactReplayStatus = Literal["yes", "no", "indeterminate"]
+
+ReconciliationRecordName = Literal["open.json", "observation.json", "decision.json"]
+
+
+class ReconciliationDurabilityError(ReconciliationStateError):
+    """Raised when reconciliation control-record durability cannot be confirmed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        record_may_have_committed: bool,
+        exact_replay_status: ExactReplayStatus,
+        durability_stage: DurabilityStage,
+        case_id: str,
+        record_name: ReconciliationRecordName,
+    ) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_RECONCILIATION_DURABILITY,
+            case_id=case_id,
+        )
+        self.record_may_have_committed = record_may_have_committed
+        self.exact_replay_status = exact_replay_status
+        self.durability_stage = durability_stage
+        self.record_name = record_name
+
+
+@dataclass(frozen=True)
+class ReconciliationWriteMetadata:
+    exact_replay: bool
+    exact_replay_status: ExactReplayStatus
+    record_may_have_committed: bool
+    durability_indeterminate: bool
+
+
+@dataclass(frozen=True)
+class ReconciliationCaseOpenRecord:
+    case_id: str
+    case_open_digest: str
+    approval_id: str
+    approval_issue_digest: str
+    run_id: str
+    bound_api: str
+    event_id: str
+    htr_runs_root_path_digest: str
+    htr_project_dir_path_digest: str
+    opened_by: str
+    scope_reason: str
+    opened_at: str
+
+
+@dataclass(frozen=True)
+class ReconciliationObservationRecord:
+    case_id: str
+    observation_digest: str
+    case_open_digest: str
+    observed_by: str
+    observed_at: str
+    inspection_semantic_digest: str
+
+
+@dataclass(frozen=True)
+class ReconciliationDecisionRecord:
+    case_id: str
+    decision_digest: str
+    case_open_digest: str
+    observation_digest: str
+    decided_by: str
+    decided_at: str
+    requested_decision_class: str
+    decision_class: str
+    derived_rationale_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReconciliationCaseBundle:
+    case_id: str
+    open_record: ReconciliationCaseOpenRecord
+    observation_record: ReconciliationObservationRecord | None
+    decision_record: ReconciliationDecisionRecord | None
 
 
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:

@@ -1,12 +1,30 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-22 (Task 25 closed at `c6a9e305`; Task 26A checkpoint approved — read-only reconciliation inspection complete; Task 26B/26C not started/not approved; entire Task 26 not complete)
+**Last updated:** 2026-07-25 (Task 26B checkpoint approved and complete; Task 26C not started; Task 27/28 not started; entire Task 26 not complete)
 
 ---
 
 ## Active Task
 
-**None** — Task 26 umbrella incomplete. Task 26B/26C **not started/not approved**. Retry, repair, and marker disposition **remain prohibited**.
+**None** — Task 26 umbrella incomplete. Task 26C **not started and not approved**. Task 27/28 **not started**. Retry, repair, invoke, Recovery Run creation, outcome rewrite, and marker disposition **remain prohibited**.
+
+---
+
+## Completed (checkpointed)
+
+### Task 26B — Durable reconciliation cases
+
+**Status:** ✅ Checkpoint approved and complete (parent `8de2b29b`)
+**Depends on:** Task 26A (read-only inspection — closed)
+
+**Delivered:**
+
+- `htr/reconciliation_cases.py` — `generate_reconciliation_case_id`, `open_reconciliation_case`, `record_reconciliation_observation`, `record_reconciliation_decision`, `load_reconciliation_case`
+- Control store: `{runs_root}/.control/reconciliation/{case_id}/` with immutable O_EXCL records (`open.json`, `observation.json`, `decision.json`)
+- 26B-local inspection projection builder + policy-derived decision classes; **decisions grant reconciliation posture only**; six boolean non-permission invariants (all `false`)
+- `tests/htr/test_reconciliation_cases.py` — comprehensive matrix (golden projection, idempotency, policy, concurrency, durability, boundaries)
+
+**Explicitly not implemented:** Task 26C marker disposition (not started; not approved); retry; repair; invoke; Recovery/Successor Runs; outcome rewrite; CLI
 
 ---
 
@@ -14,7 +32,7 @@
 
 ### Task 26A — Read-only execution reconciliation inspection
 
-**Status:** ✅ Checkpoint approved — read-only reconciliation inspection complete (parent Task 25 `c6a9e305`)
+**Status:** ✅ Checkpoint approved — read-only reconciliation inspection complete (closed; parent Task 25 `c6a9e305`)
 **Depends on:** Task 25 `c6a9e305`
 
 **Delivered:**

@@ -1,14 +1,14 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
-**Generated:** 2026-07-22
-**Task:** Task 26A — Read-only execution reconciliation inspection (checkpoint approved)
-**Status:** Task 25 checkpointed `c6a9e305`; **Task 26A checkpoint approved** — read-only reconciliation inspection complete; **Task 26B/26C not started/not approved**; retry, repair, and marker disposition remain prohibited; **entire Task 26 not complete**; general lifecycle invoke remains disabled outside Task 25 pilot API
+**Generated:** 2026-07-25
+**Task:** Task 26B — Durable reconciliation cases (checkpoint approved)
+**Status:** Task 25 checkpointed `c6a9e305`; Task 26A **closed** (checkpoint approved); **Task 26B checkpoint approved and complete** (parent `8de2b29b`); **Task 26C not started and not approved**; **Task 27/28 not started**; retry, repair, invoke, Recovery Run creation, outcome rewrite, and marker disposition remain prohibited; **entire Task 26 not complete**
 
 ---
 
 ## 1. One-paragraph state
 
-Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 19 (`57a1ed651`) delivered read-only observe. Task 20 (`2fa580b5`) accepted **Policy C** (docs). Task 21 delivered read-only derived action plans. Task 22 enforces Policy C immutable seal at all 25 public/run-aware mutation boundaries. Task 23 adds a run-scoped durable write barrier for those same 25 mutators. **Task 24** (`af4868054`) adds authoritative approval control. **Task 24.1** (`40f4d016`) repaired the execution-lock contention test harness. **Task 25** (`c6a9e305`) adds `invoke_approved_run_completion` for approved `complete_run_manually` only. **Task 26A** (checkpoint approved) adds read-only `inspect_run_completion_reconciliation` — derived evidence only; no case persistence, marker disposition, retry, or Recovery Run. **Task 26B/26C not started.**
+Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 19 (`57a1ed651`) delivered read-only observe. Task 20 (`2fa580b5`) accepted **Policy C** (docs). Task 21 delivered read-only derived action plans. Task 22 enforces Policy C immutable seal at all 25 public/run-aware mutation boundaries. Task 23 adds a run-scoped durable write barrier for those same 25 mutators. **Task 24** (`af4868054`) adds authoritative approval control. **Task 24.1** (`40f4d016`) repaired the execution-lock contention test harness. **Task 25** (`c6a9e305`) adds `invoke_approved_run_completion` for approved `complete_run_manually` only. **Task 26A** (closed) adds read-only `inspect_run_completion_reconciliation`. **Task 26B** (checkpoint approved and complete) adds durable reconciliation case control records at `.control/reconciliation/` — decisions grant reconciliation posture only; all six non-permission booleans remain `false`; no marker disposition, retry, repair, invoke, Recovery Run creation, or outcome rewrite. **Task 26C not started and not approved.** **Task 27/28 not started.**
 
 ---
 
@@ -68,8 +68,9 @@ Unchanged. Terminal: `run_final_closure_record` / `run_final_closure_recorded`. 
 
 ```
 19 observe ✅ → 21 action plan ✅ → 22 immutable seal ✅ → 23 write barrier ✅ → 24 approval ✅
-→ 25 human-gated invoke ✅ (checkpoint pending) → 26 reconciliation (next) → 27 Recovery/Successor
-→ 28 bounded repair → 29 artifact inspect → 30 multi-project → 31 learning
+→ 25 human-gated invoke ✅ → 26A read-only inspection ✅ (closed) → 26B durable cases ✅ (checkpoint approved)
+→ 26C marker disposition (not started; not approved) → 27 Recovery/Successor (not started)
+→ 28 bounded repair (not started) → 29 artifact inspect → 30 multi-project → 31 learning
 ```
 
 ---
@@ -92,7 +93,7 @@ Task 24.1 completed at **`40f4d016`**. Task 25 formal Git-only result: **1623 pa
 
 ## 8. Before broader Phase 2 invoke
 
-Task 25 covers re-observe + stale rejection + single-API invoke + post-verification for `complete_run_manually` only. **Task 26 reconciliation has not started.** General, unattended, and multi-API lifecycle invocation remain disabled.
+Task 25 covers re-observe + stale rejection + single-API invoke + post-verification for `complete_run_manually` only. **Task 26B checkpoint approved and complete** — durable reconciliation cases grant posture only; **Task 26C not started**; **Task 27/28 not started**; entire Task 26 incomplete. General, unattended, and multi-API lifecycle invocation remain disabled.
 
 ---
 
