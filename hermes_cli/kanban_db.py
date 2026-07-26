@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -1246,6 +1247,48 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Generic immutable acceptance evidence for any durable delegation terminal
+-- outcome.  Kept separate from PASS/workflow-specific receipt tables.
+CREATE TABLE IF NOT EXISTS delegation_receipts (
+    receipt_id       TEXT PRIMARY KEY,
+    logical_key      TEXT NOT NULL UNIQUE,
+    input_digest     TEXT NOT NULL,
+    delegation_id    TEXT NOT NULL,
+    execution_id     TEXT NOT NULL,
+    result_digest    TEXT NOT NULL,
+    terminal_status  TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    task_id          TEXT NOT NULL,
+    continuation_id  TEXT NOT NULL UNIQUE,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delegation_continuations (
+    continuation_id  TEXT PRIMARY KEY,
+    logical_key      TEXT NOT NULL UNIQUE,
+    receipt_id       TEXT NOT NULL UNIQUE,
+    task_id          TEXT NOT NULL,
+    state            TEXT NOT NULL CHECK (state = 'accepted'),
+    created_at       INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS delegation_receipts_immutable_update
+BEFORE UPDATE ON delegation_receipts BEGIN
+    SELECT RAISE(ABORT, 'delegation receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS delegation_receipts_immutable_delete
+BEFORE DELETE ON delegation_receipts BEGIN
+    SELECT RAISE(ABORT, 'delegation receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS delegation_continuations_immutable_update
+BEFORE UPDATE ON delegation_continuations BEGIN
+    SELECT RAISE(ABORT, 'delegation continuation is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS delegation_continuations_immutable_delete
+BEFORE DELETE ON delegation_continuations BEGIN
+    SELECT RAISE(ABORT, 'delegation continuation is immutable');
+END;
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1308,6 +1351,84 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Task-2 workflow acceptance state.  These records are additive and immutable:
+-- ordinary task status/result fields remain backwards compatible, while a
+-- workflow verifier edge consults only these kernel-created records.
+CREATE TABLE IF NOT EXISTS accepted_handoffs (
+    id                         TEXT PRIMARY KEY,
+    workflow_step_attempt_id   TEXT NOT NULL UNIQUE,
+    implementation_task_id     TEXT NOT NULL,
+    implementation_run_id      INTEGER NOT NULL,
+    implementation_event_id    INTEGER NOT NULL,
+    verifier_task_id            TEXT NOT NULL UNIQUE,
+    verifier_role               TEXT NOT NULL,
+    artifact_manifest_json      TEXT NOT NULL,
+    artifact_manifest_digest    TEXT NOT NULL,
+    source_revision             TEXT NOT NULL,
+    baseline_manifest_digest    TEXT,
+    acceptance_contract_hash    TEXT NOT NULL,
+    route_gate_json             TEXT,
+    created_at                  INTEGER NOT NULL,
+    UNIQUE (implementation_task_id, implementation_run_id, implementation_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS verifier_pass_receipts (
+    id                          TEXT PRIMARY KEY,
+    verifier_task_id            TEXT NOT NULL UNIQUE,
+    verifier_run_id             INTEGER NOT NULL UNIQUE,
+    verifier_role               TEXT NOT NULL,
+    accepted_handoff_id         TEXT NOT NULL UNIQUE,
+    workflow_step_attempt_id    TEXT NOT NULL,
+    parent_run_id               INTEGER NOT NULL,
+    parent_event_id             INTEGER NOT NULL,
+    artifact_manifest_digest    TEXT NOT NULL,
+    recomputed_manifest_digest  TEXT NOT NULL,
+    source_revision             TEXT NOT NULL,
+    baseline_manifest_digest    TEXT,
+    acceptance_contract_hash    TEXT NOT NULL,
+    predecessor_versions_json   TEXT NOT NULL,
+    route_telemetry_json        TEXT,
+    outcome                     TEXT NOT NULL CHECK (outcome = 'PASS'),
+    receipt_version             INTEGER NOT NULL CHECK (receipt_version > 0),
+    created_at                  INTEGER NOT NULL
+);
+
+-- Exact parent/link/status/result/receipt state captured atomically with claim.
+-- The JSON is canonical and content-addressed so direct SQL changes are caught
+-- even when they bypass a version-incrementing application path.
+CREATE TABLE IF NOT EXISTS task_run_prerequisite_sets (
+    run_id          INTEGER PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    snapshot_json   TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS accepted_handoffs_immutable_update
+BEFORE UPDATE ON accepted_handoffs BEGIN
+    SELECT RAISE(ABORT, 'accepted handoff is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS accepted_handoffs_immutable_delete
+BEFORE DELETE ON accepted_handoffs BEGIN
+    SELECT RAISE(ABORT, 'accepted handoff is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS verifier_pass_receipts_immutable_update
+BEFORE UPDATE ON verifier_pass_receipts BEGIN
+    SELECT RAISE(ABORT, 'verifier PASS receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS verifier_pass_receipts_immutable_delete
+BEFORE DELETE ON verifier_pass_receipts BEGIN
+    SELECT RAISE(ABORT, 'verifier PASS receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS task_run_prerequisite_sets_immutable_update
+BEFORE UPDATE ON task_run_prerequisite_sets BEGIN
+    SELECT RAISE(ABORT, 'prerequisite snapshot is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS task_run_prerequisite_sets_immutable_delete
+BEFORE DELETE ON task_run_prerequisite_sets BEGIN
+    SELECT RAISE(ABORT, 'prerequisite snapshot is immutable');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1318,6 +1439,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_verifier     ON accepted_handoffs(verifier_task_id);
+CREATE INDEX IF NOT EXISTS idx_verifier_receipts_task ON verifier_pass_receipts(verifier_task_id, receipt_version);
+CREATE INDEX IF NOT EXISTS idx_prerequisite_task      ON task_run_prerequisite_sets(task_id, run_id);
 """
 
 
@@ -2761,6 +2885,137 @@ def write_txn(conn: sqlite3.Connection):
         _check_file_length_invariant(conn)
 
 
+def record_delegation_receipt(
+    conn: sqlite3.Connection,
+    *,
+    logical_key: str,
+    input_digest: str,
+    delegation_id: str,
+    execution_id: str,
+    result_digest: str,
+    terminal_status: str,
+    result: dict[str, Any],
+    task_id: str,
+    expected_run_id: Optional[int] = None,
+    expected_claim_token: Optional[str] = None,
+    expected_workflow_id: Optional[str] = None,
+    expected_step_key: Optional[str] = None,
+    expected_lane: Optional[str] = None,
+    allow_legacy_running_task: bool = False,
+) -> dict[str, Any]:
+    """Create or validate one receipt/event/continuation atomic unit."""
+    key_bytes = logical_key.encode("utf-8")
+    receipt_id = "dr_" + hashlib.sha256(b"receipt\0" + key_bytes).hexdigest()[:24]
+    continuation_id = "dc_" + hashlib.sha256(b"continuation\0" + key_bytes).hexdigest()[:24]
+    result_json = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    expected = (
+        receipt_id, logical_key, input_digest, delegation_id, execution_id,
+        result_digest, terminal_status, result_json, task_id, continuation_id,
+    )
+    with write_txn(conn):
+        if allow_legacy_running_task:
+            return {
+                "status": "conflict",
+                "reason": "legacy task state is not receipt authority",
+            }
+        if (
+            expected_run_id is None
+            or not expected_claim_token
+            or not expected_workflow_id
+            or not expected_step_key
+            or not expected_lane
+        ):
+            return {"status": "conflict", "reason": "complete worker authority is required"}
+        authority = conn.execute(
+            """SELECT t.id
+                 FROM tasks AS t
+                 JOIN task_runs AS r
+                   ON r.id=t.current_run_id AND r.task_id=t.id
+                WHERE t.id=? AND t.status='running'
+                  AND t.current_run_id=? AND t.claim_lock=?
+                  AND r.status='running' AND r.ended_at IS NULL
+                  AND r.claim_lock=?
+                  AND t.workflow_template_id=?
+                  AND t.current_step_key=?
+                  AND t.assignee=?""",
+            (
+                task_id,
+                int(expected_run_id),
+                expected_claim_token,
+                expected_claim_token,
+                expected_workflow_id,
+                expected_step_key,
+                expected_lane,
+            ),
+        ).fetchone()
+        if authority is None:
+            return {"status": "conflict", "reason": "worker authority is stale or mismatched"}
+        row = conn.execute(
+            """SELECT receipt_id, logical_key, input_digest, delegation_id,
+                      execution_id, result_digest, terminal_status, result_json,
+                      task_id, continuation_id
+               FROM delegation_receipts WHERE logical_key=?""",
+            (logical_key,),
+        ).fetchone()
+        if row is not None:
+            if tuple(row) != expected:
+                return {"status": "conflict", "reason": "immutable receipt identity mismatch"}
+            continuation = conn.execute(
+                """SELECT continuation_id, logical_key, receipt_id, task_id, state
+                   FROM delegation_continuations WHERE logical_key=?""",
+                (logical_key,),
+            ).fetchone()
+            events = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='delegation_receipted'",
+                (task_id,),
+            ).fetchall()
+            matching_events = sum(
+                json.loads(payload or "{}").get("logical_key") == logical_key
+                for (payload,) in events
+            )
+            if tuple(continuation or ()) != (
+                continuation_id, logical_key, receipt_id, task_id, "accepted"
+            ) or matching_events != 1:
+                return {"status": "conflict", "reason": "partial receipt atomic unit"}
+            return {
+                "status": "replayed", "receipt_id": receipt_id,
+                "continuation_id": continuation_id,
+            }
+
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO delegation_receipts
+               (receipt_id, logical_key, input_digest, delegation_id,
+                execution_id, result_digest, terminal_status, result_json,
+                task_id, continuation_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*expected, now),
+        )
+        payload = json.dumps(
+            {
+                "logical_key": logical_key, "receipt_id": receipt_id,
+                "delegation_id": delegation_id, "execution_id": execution_id,
+                "result_digest": result_digest, "continuation_id": continuation_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'delegation_receipted', ?, ?)",
+            (task_id, payload, now),
+        )
+        conn.execute(
+            """INSERT INTO delegation_continuations
+               (continuation_id, logical_key, receipt_id, task_id, state, created_at)
+               VALUES (?, ?, ?, ?, 'accepted', ?)""",
+            (continuation_id, logical_key, receipt_id, task_id, now),
+        )
+        return {
+            "status": "committed", "receipt_id": receipt_id,
+            "continuation_id": continuation_id,
+        }
+
+
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
@@ -2825,6 +3080,8 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3120,8 +3377,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3146,12 +3404,23 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
+                    )
+                if (
+                    task_status not in {"blocked", "triage"}
+                    and not _prerequisites_satisfied(conn, task_id)
+                ):
+                    task_status = "todo"
+                    conn.execute(
+                        "UPDATE tasks SET status = 'todo' WHERE id = ?",
+                        (task_id,),
                     )
                 _append_event(
                     conn,
@@ -3363,10 +3632,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             (parent_id, child_id),
         )
         # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
+        if not _prerequisites_satisfied(conn, child_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -3888,6 +4154,166 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+def _canonical_json(value: Any) -> str:
+    """Serialize a kernel record deterministically for hashing/comparison."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _workflow_verifier_edge(
+    conn: sqlite3.Connection, parent_id: str, child_id: str,
+) -> bool:
+    """Return whether ``parent -> child`` is a workflow verification edge."""
+    row = conn.execute(
+        """
+        SELECT p.workflow_template_id AS parent_workflow,
+               p.current_step_key AS parent_step,
+               c.workflow_template_id AS child_workflow
+          FROM tasks AS p
+          JOIN tasks AS c ON c.id = ?
+         WHERE p.id = ?
+        """,
+        (child_id, parent_id),
+    ).fetchone()
+    return bool(
+        row
+        and row["parent_workflow"]
+        and row["parent_workflow"] == row["child_workflow"]
+        and row["parent_step"] == "verify"
+    )
+
+
+def _valid_verifier_receipt(
+    conn: sqlite3.Connection, verifier_task_id: str,
+) -> Optional[sqlite3.Row]:
+    """Return the immutable, internally consistent current PASS receipt."""
+    return conn.execute(
+        """
+        SELECT r.*
+          FROM verifier_pass_receipts AS r
+          JOIN accepted_handoffs AS h ON h.id = r.accepted_handoff_id
+          JOIN tasks AS verifier ON verifier.id = r.verifier_task_id
+         WHERE r.verifier_task_id = ?
+           AND r.outcome = 'PASS'
+           AND verifier.status IN ('done', 'archived')
+           AND verifier.current_step_key = 'verify'
+           AND h.verifier_task_id = r.verifier_task_id
+           AND h.workflow_step_attempt_id = r.workflow_step_attempt_id
+           AND h.implementation_run_id = r.parent_run_id
+           AND h.implementation_event_id = r.parent_event_id
+           AND h.artifact_manifest_digest = r.artifact_manifest_digest
+           AND r.artifact_manifest_digest = r.recomputed_manifest_digest
+           AND h.source_revision = r.source_revision
+           AND h.acceptance_contract_hash = r.acceptance_contract_hash
+           AND COALESCE(h.baseline_manifest_digest, '') =
+               COALESCE(r.baseline_manifest_digest, '')
+         LIMIT 1
+        """,
+        (verifier_task_id,),
+    ).fetchone()
+
+
+def _prerequisites_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Kernel eligibility predicate for ordinary and verifier dependencies."""
+    parents = conn.execute(
+        """
+        SELECT p.id, p.status
+          FROM task_links AS l
+          JOIN tasks AS p ON p.id = l.parent_id
+         WHERE l.child_id = ?
+         ORDER BY p.id
+        """,
+        (task_id,),
+    ).fetchall()
+    for parent in parents:
+        if parent["status"] not in ("done", "archived"):
+            return False
+        if _workflow_verifier_edge(conn, parent["id"], task_id):
+            if _valid_verifier_receipt(conn, parent["id"]) is None:
+                return False
+    return True
+
+
+def _prerequisite_snapshot(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    """Return exact current graph/state/receipt versions for ``task_id``."""
+    rows = conn.execute(
+        """
+        SELECT p.id, p.status, p.result, p.workflow_template_id, p.current_step_key
+          FROM task_links AS l
+          JOIN tasks AS p ON p.id = l.parent_id
+         WHERE l.child_id = ?
+         ORDER BY p.id
+        """,
+        (task_id,),
+    ).fetchall()
+    snapshot: list[dict] = []
+    for parent in rows:
+        is_verifier = _workflow_verifier_edge(conn, parent["id"], task_id)
+        receipt = _valid_verifier_receipt(conn, parent["id"]) if is_verifier else None
+        result_value = parent["result"]
+        snapshot.append(
+            {
+                "parent_id": parent["id"],
+                "status": parent["status"],
+                "result_digest": (
+                    _sha256_text(str(result_value)) if result_value is not None else None
+                ),
+                "workflow_template_id": parent["workflow_template_id"],
+                "step_key": parent["current_step_key"],
+                "verification_dependency": is_verifier,
+                "receipt_id": receipt["id"] if receipt else None,
+                "receipt_version": int(receipt["receipt_version"]) if receipt else None,
+                "accepted_handoff_id": receipt["accepted_handoff_id"] if receipt else None,
+            }
+        )
+    return snapshot
+
+
+def _capture_prerequisite_snapshot(
+    conn: sqlite3.Connection, task_id: str, run_id: int, *, created_at: int,
+) -> None:
+    snapshot_json = _canonical_json(_prerequisite_snapshot(conn, task_id))
+    conn.execute(
+        """
+        INSERT INTO task_run_prerequisite_sets
+            (run_id, task_id, snapshot_json, snapshot_digest, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (run_id, task_id, snapshot_json, _sha256_text(snapshot_json), created_at),
+    )
+
+
+def _captured_prerequisites_are_current(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> bool:
+    captured = conn.execute(
+        "SELECT snapshot_json, snapshot_digest FROM task_run_prerequisite_sets "
+        "WHERE run_id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if captured is None:
+        # Additive rollout compatibility is safe only for ordinary legacy DAG
+        # runs. A pre-existing workflow run with predecessors has no frozen
+        # version baseline and therefore must fail closed at terminal time.
+        workflow = conn.execute(
+            "SELECT workflow_template_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        has_parents = conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,),
+        ).fetchone()
+        return not bool(
+            workflow and workflow["workflow_template_id"] and has_parents
+        )
+    current_json = _canonical_json(_prerequisite_snapshot(conn, task_id))
+    return (
+        captured["snapshot_json"] == current_json
+        and captured["snapshot_digest"] == _sha256_text(current_json)
+        and _prerequisites_satisfied(conn, task_id)
+    )
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
@@ -3974,13 +4400,7 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if _prerequisites_satisfied(conn, task_id):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4041,13 +4461,7 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        if not _prerequisites_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -4055,7 +4469,7 @@ def claim_task(
             )
             _append_event(
                 conn, task_id, "claim_rejected",
-                {"reason": "parents_not_done"},
+                {"reason": "prerequisites_not_current"},
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -4118,10 +4532,15 @@ def claim_task(
                 now,
             ),
         )
-        run_id = run_cur.lastrowid
+        run_id = int(run_cur.lastrowid or 0)
+        if run_id <= 0:
+            raise RuntimeError("failed to create task run")
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
+        )
+        _capture_prerequisite_snapshot(
+            conn, task_id, int(run_id), created_at=now,
         )
         _append_event(
             conn, task_id, "claimed",
@@ -4151,9 +4570,8 @@ def claim_review_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
 
-    Unlike ``claim_task`` (which handles ``ready -> running``), this
-    does NOT check parent dependencies — the task already passed that
-    gate on its original ``todo -> ready -> running`` transition.
+    Parent state is revalidated because a workflow prerequisite may have been
+    reopened or superseded while the task waited in review.
 
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
@@ -4162,6 +4580,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _prerequisites_satisfied(conn, task_id):
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "prerequisites_not_current", "source_status": "review"},
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4200,10 +4624,15 @@ def claim_review_task(
                 now,
             ),
         )
-        run_id = run_cur.lastrowid
+        run_id = int(run_cur.lastrowid or 0)
+        if run_id <= 0:
+            raise RuntimeError("failed to create review run")
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
+        )
+        _capture_prerequisite_snapshot(
+            conn, task_id, run_id, created_at=now,
         )
         _append_event(
             conn, task_id, "claimed",
@@ -4627,6 +5056,372 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _canonical_artifact_manifest(manifest: Iterable[dict]) -> tuple[str, str]:
+    """Validate and content-address a frozen-workspace-relative manifest."""
+    normalized: list[dict] = []
+    seen: set[str] = set()
+    for raw in manifest:
+        if not isinstance(raw, dict):
+            raise ValueError("artifact manifest entries must be objects")
+        path = str(raw.get("path") or "").strip().replace("\\", "/")
+        parts = tuple(part for part in path.split("/") if part not in ("", "."))
+        if (
+            not path
+            or path.startswith("/")
+            or any(part == ".." for part in parts)
+            or ":" in parts[0]
+        ):
+            raise ValueError("artifact paths must be frozen-workspace-relative")
+        canonical_path = "/".join(parts)
+        if canonical_path in seen:
+            raise ValueError(f"duplicate artifact path: {canonical_path}")
+        seen.add(canonical_path)
+        kind = str(raw.get("type") or "").strip().lower()
+        if kind not in {"file", "symlink", "missing"}:
+            raise ValueError(f"unsupported artifact type for {canonical_path}: {kind!r}")
+        size = raw.get("size")
+        digest = raw.get("sha256")
+        target = raw.get("target")
+        if kind == "file":
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise ValueError(f"invalid artifact size for {canonical_path}")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(f"invalid artifact SHA-256 for {canonical_path}")
+            entry = {"path": canonical_path, "type": kind, "size": size, "sha256": digest}
+        elif kind == "symlink":
+            if not isinstance(target, str) or not target:
+                raise ValueError(f"symlink target required for {canonical_path}")
+            entry = {"path": canonical_path, "type": kind, "target": target}
+        else:
+            entry = {"path": canonical_path, "type": kind}
+        normalized.append(entry)
+    if not normalized:
+        raise ValueError("artifact manifest must contain at least one entry")
+    normalized.sort(key=lambda entry: entry["path"])
+    canonical = _canonical_json(normalized)
+    return canonical, _sha256_text(canonical)
+
+
+def record_accepted_handoff(
+    conn: sqlite3.Connection,
+    *,
+    workflow_step_attempt_id: str,
+    implementation_task_id: str,
+    implementation_run_id: int,
+    implementation_event_id: int,
+    verifier_task_id: str,
+    verifier_role: str,
+    artifact_manifest: Iterable[dict],
+    source_revision: str,
+    baseline_manifest_digest: Optional[str],
+    acceptance_contract_hash: str,
+    route_gate: Optional[dict] = None,
+) -> str:
+    """Persist one immutable implementation handoff for one step attempt.
+
+    This is acceptance state, not the cross-database delivery bridge from Task
+    3. The caller supplies already-durable source identities; the kernel binds
+    them once to the predeclared verifier and canonical evidence contract.
+    """
+    step_attempt = str(workflow_step_attempt_id).strip()
+    role = str(verifier_role).strip()
+    if not step_attempt or not role or not source_revision or not acceptance_contract_hash:
+        raise ValueError("step attempt, verifier role, revision, and contract are required")
+    manifest_json, manifest_digest = _canonical_artifact_manifest(artifact_manifest)
+    route_gate_json = _canonical_json(route_gate) if route_gate is not None else None
+    now = int(time.time())
+    handoff_id = "ah_" + secrets.token_hex(16)
+    with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM accepted_handoffs WHERE workflow_step_attempt_id = ?",
+            (step_attempt,),
+        ).fetchone():
+            raise sqlite3.IntegrityError(
+                "one accepted handoff is allowed per workflow step attempt"
+            )
+        evidence = conn.execute(
+            """
+            SELECT t.status AS task_status, r.task_id AS run_task,
+                   r.outcome AS run_outcome, e.task_id AS event_task,
+                   e.run_id AS event_run, e.kind AS event_kind
+              FROM tasks AS t
+              JOIN task_runs AS r ON r.id = ?
+              JOIN task_events AS e ON e.id = ?
+             WHERE t.id = ?
+            """,
+            (int(implementation_run_id), int(implementation_event_id), implementation_task_id),
+        ).fetchone()
+        verifier = conn.execute(
+            "SELECT assignee, current_step_key, workflow_template_id FROM tasks WHERE id = ?",
+            (verifier_task_id,),
+        ).fetchone()
+        implementation = conn.execute(
+            "SELECT workflow_template_id FROM tasks WHERE id = ?",
+            (implementation_task_id,),
+        ).fetchone()
+        if not evidence or not verifier or not implementation:
+            raise ValueError("handoff source or verifier task does not exist")
+        if not (
+            evidence["task_status"] in ("done", "archived")
+            and evidence["run_task"] == implementation_task_id
+            and evidence["run_outcome"] == "completed"
+            and evidence["event_task"] == implementation_task_id
+            and int(evidence["event_run"] or 0) == int(implementation_run_id)
+            and evidence["event_kind"] == "completed"
+            and verifier["current_step_key"] == "verify"
+            and verifier["assignee"] == role
+            and verifier["workflow_template_id"]
+            and verifier["workflow_template_id"] == implementation["workflow_template_id"]
+        ):
+            raise ValueError("handoff source/run/event or verifier authority is not exact")
+        conn.execute(
+            """
+            INSERT INTO accepted_handoffs (
+                id, workflow_step_attempt_id, implementation_task_id,
+                implementation_run_id, implementation_event_id,
+                verifier_task_id, verifier_role, artifact_manifest_json,
+                artifact_manifest_digest, source_revision,
+                baseline_manifest_digest, acceptance_contract_hash,
+                route_gate_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                handoff_id, step_attempt, implementation_task_id,
+                int(implementation_run_id), int(implementation_event_id),
+                verifier_task_id, role, manifest_json, manifest_digest,
+                str(source_revision), baseline_manifest_digest,
+                str(acceptance_contract_hash), route_gate_json, now,
+            ),
+        )
+        _append_event(
+            conn,
+            verifier_task_id,
+            "accepted_handoff",
+            {
+                "accepted_handoff_id": handoff_id,
+                "workflow_step_attempt_id": step_attempt,
+                "artifact_manifest_digest": manifest_digest,
+            },
+        )
+    return handoff_id
+
+
+def _record_verifier_rework_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    now: int,
+) -> None:
+    """Deterministically persist a failed verifier gate as REWORK."""
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
+    conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'blocked', result = ?, completed_at = NULL,
+               claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+         WHERE id = ? AND status IN ('ready', 'running', 'blocked')
+        """,
+        (f"REWORK: {reason}", task_id),
+    )
+    if run_id is not None:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'blocked', outcome = 'rework', ended_at = ?,
+                   summary = ?, claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND task_id = ? AND ended_at IS NULL
+            """,
+            (now, reason, run_id, task_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        )
+    _append_event(
+        conn, task_id, "verifier_rework", {"reason": reason}, run_id=run_id,
+    )
+
+
+def _route_telemetry_matches(route_gate_json: Optional[str], telemetry: Optional[dict]) -> bool:
+    if route_gate_json is None:
+        return True
+    if not isinstance(telemetry, dict):
+        return False
+    try:
+        gate = json.loads(route_gate_json)
+    except (TypeError, ValueError):
+        return False
+    requested_provider = gate.get("requested_provider")
+    requested_model = gate.get("requested_model")
+    return bool(
+        requested_provider
+        and requested_model
+        and telemetry.get("requested_provider") == requested_provider
+        and telemetry.get("requested_model") == requested_model
+        and telemetry.get("actual_provider") == requested_provider
+        and telemetry.get("actual_model") == requested_model
+        and telemetry.get("fallback_index") == 0
+        and telemetry.get("fallback_reason") in (None, "")
+    )
+
+
+def record_verifier_pass(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    expected_claim_token: str,
+    verifier_role: str,
+    accepted_handoff_id: str,
+    artifact_manifest: Iterable[dict],
+    source_revision: str,
+    baseline_manifest_digest: Optional[str],
+    acceptance_contract_hash: str,
+    route_telemetry: Optional[dict] = None,
+) -> Optional[str]:
+    """Validate the full verifier predicate and atomically mint one PASS receipt."""
+    manifest_json, recomputed_digest = _canonical_artifact_manifest(artifact_manifest)
+    del manifest_json  # digest is the independently recomputed comparison value
+    now = int(time.time())
+    receipt_id = "vpr_" + secrets.token_hex(16)
+    mismatch_reason: Optional[str] = None
+    run_id = int(expected_run_id)
+    with write_txn(conn):
+        task = conn.execute(
+            """
+            SELECT assignee, current_step_key, workflow_template_id
+              FROM tasks
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+               AND claim_lock = ?
+               AND EXISTS (
+                   SELECT 1 FROM task_runs AS r
+                    WHERE r.id = tasks.current_run_id AND r.task_id = tasks.id
+                      AND r.status = 'running' AND r.ended_at IS NULL
+                      AND r.claim_lock = ?
+               )
+            """,
+            (task_id, run_id, expected_claim_token, expected_claim_token),
+        ).fetchone()
+        handoff = conn.execute(
+            "SELECT * FROM accepted_handoffs WHERE id = ? AND verifier_task_id = ?",
+            (accepted_handoff_id, task_id),
+        ).fetchone()
+        if task is None:
+            return None
+        if handoff is None:
+            mismatch_reason = "accepted_handoff_mismatch"
+        elif task["current_step_key"] != "verify":
+            mismatch_reason = "verifier_step_mismatch"
+        elif task["assignee"] != verifier_role or handoff["verifier_role"] != verifier_role:
+            mismatch_reason = "verifier_role_mismatch"
+        elif handoff["artifact_manifest_digest"] != recomputed_digest:
+            mismatch_reason = "artifact_manifest_mismatch"
+        elif handoff["source_revision"] != source_revision:
+            mismatch_reason = "source_revision_mismatch"
+        elif (handoff["baseline_manifest_digest"] or None) != (baseline_manifest_digest or None):
+            mismatch_reason = "baseline_manifest_mismatch"
+        elif handoff["acceptance_contract_hash"] != acceptance_contract_hash:
+            mismatch_reason = "acceptance_contract_mismatch"
+        elif not _captured_prerequisites_are_current(conn, task_id, run_id):
+            mismatch_reason = "predecessor_versions_stale"
+        elif not _route_telemetry_matches(handoff["route_gate_json"], route_telemetry):
+            mismatch_reason = "route_telemetry_mismatch"
+        if mismatch_reason is not None:
+            _record_verifier_rework_in_txn(
+                conn, task_id, reason=mismatch_reason, now=now,
+            )
+            return None
+        assert handoff is not None
+
+        captured = conn.execute(
+            "SELECT snapshot_json FROM task_run_prerequisite_sets WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        predecessor_versions_json = captured["snapshot_json"] if captured else "[]"
+        conn.execute(
+            """
+            INSERT INTO verifier_pass_receipts (
+                id, verifier_task_id, verifier_run_id, verifier_role,
+                accepted_handoff_id, workflow_step_attempt_id,
+                parent_run_id, parent_event_id, artifact_manifest_digest,
+                recomputed_manifest_digest, source_revision,
+                baseline_manifest_digest, acceptance_contract_hash,
+                predecessor_versions_json, route_telemetry_json,
+                outcome, receipt_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PASS', 1, ?)
+            """,
+            (
+                receipt_id, task_id, run_id, verifier_role,
+                accepted_handoff_id, handoff["workflow_step_attempt_id"],
+                int(handoff["implementation_run_id"]),
+                int(handoff["implementation_event_id"]),
+                handoff["artifact_manifest_digest"], recomputed_digest,
+                source_revision, baseline_manifest_digest,
+                acceptance_contract_hash, predecessor_versions_json,
+                _canonical_json(route_telemetry) if route_telemetry is not None else None,
+                now,
+            ),
+        )
+        updated = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'done', result = 'PASS', completed_at = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL, block_recurrences = 0
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (now, task_id, run_id),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("verifier terminal CAS lost after authority validation")
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'done', outcome = 'completed', ended_at = ?,
+                   summary = 'PASS', claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND task_id = ? AND status = 'running' AND ended_at IS NULL
+            """,
+            (now, run_id, task_id),
+        )
+        conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+        _append_event(
+            conn,
+            task_id,
+            "verifier_pass",
+            {
+                "receipt_id": receipt_id,
+                "accepted_handoff_id": accepted_handoff_id,
+                "receipt_version": 1,
+                "artifact_manifest_digest": recomputed_digest,
+            },
+            run_id=run_id,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "completed",
+            {"result_len": 4, "summary": "PASS", "authority_mode": "kernel_verifier"},
+            run_id=run_id,
+        )
+    recompute_ready(conn)
+    _clear_failure_counter(conn, task_id)
+    _cleanup_workspace(conn, task_id)
+    return receipt_id
+
+
+class CompletionAuthority(str, Enum):
+    """Explicit authority used for a terminal task completion."""
+
+    WORKER = "worker"
+    ORCHESTRATOR = "orchestrator"
+    LEGACY = "legacy"
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4636,6 +5431,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_token: Optional[str] = None,
+    authority_mode: CompletionAuthority = CompletionAuthority.LEGACY,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4659,6 +5456,11 @@ def complete_task(
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
 
+    ``authority_mode`` explicitly distinguishes worker, orchestrator, and
+    backwards-compatible direct-kernel completion. Worker authority requires
+    the exact current run and claim on both the task and active run row. Legacy
+    callers that pass ``expected_claim_token`` retain the worker-style guard.
+
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
     Any suspected phantom references are recorded as a
@@ -4666,31 +5468,112 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
-
-    # Gate: verify created_cards BEFORE the main write txn. A rejected
-    # completion still needs an auditable event, so we emit it in a
-    # tiny dedicated txn, then raise. The caller is responsible for
-    # surfacing HallucinatedCardsError to the worker; this function
-    # never mutates task state on a phantom-card rejection.
-    if created_cards:
-        verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
+    authority_mode = CompletionAuthority(authority_mode)
+    worker_authority = (
+        authority_mode is CompletionAuthority.WORKER
+        or (
+            authority_mode is CompletionAuthority.LEGACY
+            and expected_claim_token is not None
         )
-        if phantom_cards:
+    )
+
+    # PASS-looking prose/metadata is never receipt authority. For an opted-in
+    # verifier task, process the attempted terminal action as deterministic
+    # REWORK while preserving ``True`` as the legacy command's "handled"
+    # signal. Only ``record_verifier_pass`` can mint the immutable receipt.
+    if isinstance(metadata, dict) and metadata.get("verifier_outcome") == "PASS":
+        verifier_row = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            verifier_row
+            and verifier_row["workflow_template_id"]
+            and verifier_row["current_step_key"] == "verify"
+        ):
             with write_txn(conn):
-                _append_event(
-                    conn, task_id, "completion_blocked_hallucination",
-                    {
-                        "phantom_cards": phantom_cards,
-                        "verified_cards": verified_cards,
-                        "summary_preview": (
-                            (summary or result or "").strip().splitlines()[0][:200]
-                            if (summary or result)
-                            else None
-                        ),
-                    },
+                _record_verifier_rework_in_txn(
+                    conn,
+                    task_id,
+                    reason="kernel_verifier_receipt_required",
+                    now=now,
                 )
-            raise HallucinatedCardsError(phantom_cards, task_id)
+            return True
+
+    # A worker must prove exact task/run/task-claim/run-row-claim authority
+    # under BEGIN IMMEDIATE before its phantom-card rejection audit can write.
+    # The later terminal UPDATE retains the same predicate as a final CAS.
+    if created_cards:
+        hallucination_error: Optional[HallucinatedCardsError] = None
+        if worker_authority:
+            with write_txn(conn):
+                if expected_run_id is None or int(expected_run_id) <= 0:
+                    return False
+                current_authority = conn.execute(
+                    """
+                    SELECT 1
+                      FROM tasks
+                     WHERE id = ?
+                       AND status = 'running'
+                       AND current_run_id = ?
+                       AND claim_lock = ?
+                       AND EXISTS (
+                           SELECT 1
+                             FROM task_runs AS active_run
+                            WHERE active_run.id = tasks.current_run_id
+                              AND active_run.task_id = tasks.id
+                              AND active_run.status = 'running'
+                              AND active_run.ended_at IS NULL
+                              AND active_run.claim_lock = ?
+                       )
+                    """,
+                    (
+                        task_id, int(expected_run_id),
+                        expected_claim_token, expected_claim_token,
+                    ),
+                ).fetchone()
+                if current_authority is None:
+                    return False
+                verified_cards, phantom_cards = _verify_created_cards(
+                    conn, task_id, created_cards
+                )
+                if phantom_cards:
+                    _append_event(
+                        conn, task_id, "completion_blocked_hallucination",
+                        {
+                            "phantom_cards": phantom_cards,
+                            "verified_cards": verified_cards,
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                    hallucination_error = HallucinatedCardsError(
+                        phantom_cards, task_id
+                    )
+            if hallucination_error is not None:
+                raise hallucination_error
+        else:
+            verified_cards, phantom_cards = _verify_created_cards(
+                conn, task_id, created_cards
+            )
+            if phantom_cards:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_hallucination",
+                        {
+                            "phantom_cards": phantom_cards,
+                            "verified_cards": verified_cards,
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
 
@@ -4698,7 +5581,71 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
-        if expected_run_id is None:
+        if worker_authority:
+            if expected_run_id is None or int(expected_run_id) <= 0:
+                return False
+            current_authority = conn.execute(
+                """
+                SELECT 1 FROM tasks
+                 WHERE id = ? AND status = 'running' AND current_run_id = ?
+                   AND claim_lock = ?
+                   AND EXISTS (
+                       SELECT 1 FROM task_runs AS active_run
+                        WHERE active_run.id = tasks.current_run_id
+                          AND active_run.task_id = tasks.id
+                          AND active_run.status = 'running'
+                          AND active_run.ended_at IS NULL
+                          AND active_run.claim_lock = ?
+                   )
+                """,
+                (
+                    task_id, int(expected_run_id), expected_claim_token,
+                    expected_claim_token,
+                ),
+            ).fetchone()
+            if current_authority is None:
+                return False
+            if not _captured_prerequisites_are_current(
+                conn, task_id, int(expected_run_id),
+            ):
+                _record_verifier_rework_in_txn(
+                    conn,
+                    task_id,
+                    reason="predecessor_versions_stale",
+                    now=now,
+                )
+                return False
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                   AND claim_lock = ?
+                   AND EXISTS (
+                       SELECT 1
+                         FROM task_runs AS active_run
+                        WHERE active_run.id = tasks.current_run_id
+                          AND active_run.task_id = tasks.id
+                          AND active_run.status = 'running'
+                          AND active_run.ended_at IS NULL
+                          AND active_run.claim_lock = ?
+                   )
+                """,
+                (
+                    result, now, task_id, int(expected_run_id),
+                    expected_claim_token, expected_claim_token,
+                ),
+            )
+        elif expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4773,6 +5720,7 @@ def complete_task(
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            "authority_mode": authority_mode.value,
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards

@@ -168,9 +168,15 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert task.claim_lock is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
     return tid
 
 
@@ -642,9 +648,15 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        goal_task = kb.get_task(conn, goal_task_id)
+        assert goal_task is not None
+        assert goal_task.current_run_id is not None
+        assert goal_task.claim_lock is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(goal_task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", goal_task.claim_lock)
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -700,9 +712,15 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        goal_task = kb.get_task(conn, goal_task_id)
+        assert goal_task is not None
+        assert goal_task.current_run_id is not None
+        assert goal_task.claim_lock is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(goal_task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", goal_task.claim_lock)
 
     # No judge reachable. judge_goal must not even be consulted; if it were,
     # this stub would reject — so reaching "done" proves the probe short-circuit.
@@ -1959,6 +1977,394 @@ def test_worker_complete_own_task_still_works(worker_env):
     assert d.get("ok") is True and d.get("task_id") == worker_env
 
 
+CLAIM_TOKEN_MAX_BYTES = 512
+
+
+def _completion_authority_state(kb, task_id):
+    """Snapshot every task, run, claim-bearing, and event field for a task."""
+    with kb.connect() as conn:
+        task = dict(conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone())
+        runs = [
+            dict(row) for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,)
+            )
+        ]
+        events = [
+            dict(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+            )
+        ]
+    return {"task": task, "runs": runs, "events": events}
+
+
+def _assert_completion_rejected_without_mutation(response, before, after):
+    violations = []
+    if response.get("ok") is True:
+        violations.append(f"completion succeeded: {response}")
+    if after != before:
+        violations.append(
+            "task/run/claim/event state changed: "
+            f"before={before!r}, after={after!r}"
+        )
+    assert not violations, "; ".join(violations)
+
+
+def test_canonical_worker_marker_without_nonempty_task_scope_cannot_complete_explicit_task(
+    monkeypatch, worker_env
+):
+    """A declared canonical worker cannot downgrade to orchestrator authority."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task is not None
+    assert task.current_run_id is not None
+    assert task.claim_lock is not None
+
+    monkeypatch.setenv("KANBAN_WORKER", "1")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("KANBAN_TASK_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("KANBAN_CLAIM_TOKEN", task.claim_lock)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+
+    before = _completion_authority_state(kb, worker_env)
+    response = json.loads(kt._handle_complete({
+        "task_id": worker_env,
+        "summary": "must not become orchestrator",
+    }))
+    after = _completion_authority_state(kb, worker_env)
+
+    _assert_completion_rejected_without_mutation(response, before, after)
+
+
+def test_empty_legacy_task_scope_cannot_complete_explicit_task(
+    monkeypatch, worker_env
+):
+    """An empty compatibility task marker is invalid worker scope, not manual."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("KANBAN_WORKER", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "")
+    monkeypatch.delenv("KANBAN_TASK_RUN_ID", raising=False)
+    monkeypatch.delenv("KANBAN_CLAIM_TOKEN", raising=False)
+
+    before = _completion_authority_state(kb, worker_env)
+    response = json.loads(kt._handle_complete({
+        "task_id": worker_env,
+        "summary": "empty scope must fail closed",
+    }))
+    after = _completion_authority_state(kb, worker_env)
+
+    _assert_completion_rejected_without_mutation(response, before, after)
+
+
+def test_worker_complete_accepts_canonical_run_and_claim_aliases(
+    monkeypatch, worker_env
+):
+    """Canonical run/claim names identify a valid task-scoped worker."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task is not None
+    assert task.current_run_id is not None
+    assert task.claim_lock is not None
+
+    monkeypatch.setenv("KANBAN_WORKER", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_env)
+    monkeypatch.setenv("KANBAN_TASK_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("KANBAN_CLAIM_TOKEN", task.claim_lock)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+
+    response = json.loads(kt._handle_complete({
+        "task_id": worker_env,
+        "summary": "canonical worker completion",
+    }))
+
+    assert response.get("ok") is True, response
+    with kb.connect() as conn:
+        completed = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "completed"
+        ]
+    assert len(completed) == 1
+    assert (completed[0].payload or {})["authority_mode"] == "worker"
+
+
+@pytest.mark.parametrize(
+    "conflicting_identity",
+    [
+        pytest.param("run-id", id="run-id"),
+        pytest.param("claim-token", id="claim-token"),
+    ],
+)
+def test_worker_complete_rejects_conflicting_canonical_and_legacy_identity_without_mutation(
+    monkeypatch, worker_env, conflicting_identity
+):
+    """Compatibility aliases must agree; conflicts cannot select one silently."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task is not None
+    assert task.current_run_id is not None
+    assert task.claim_lock is not None
+
+    monkeypatch.setenv("KANBAN_WORKER", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_env)
+    monkeypatch.setenv("KANBAN_TASK_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("KANBAN_CLAIM_TOKEN", task.claim_lock)
+    if conflicting_identity == "run-id":
+        monkeypatch.setenv("KANBAN_TASK_RUN_ID", str(task.current_run_id + 1))
+    else:
+        monkeypatch.setenv(
+            "KANBAN_CLAIM_TOKEN", "syntactically-valid-conflicting-claim"
+        )
+
+    before = _completion_authority_state(kb, worker_env)
+    response = json.loads(kt._handle_complete({
+        "task_id": worker_env,
+        "summary": "conflicting identity must fail closed",
+    }))
+    after = _completion_authority_state(kb, worker_env)
+
+    _assert_completion_rejected_without_mutation(response, before, after)
+
+
+@pytest.mark.parametrize(
+    ("run_authority", "claim_authority"),
+    [
+        pytest.param("stale", "current", id="stale-run-current-claim"),
+        pytest.param("current", "wrong", id="current-run-wrong-claim"),
+        pytest.param("stale", "stale", id="stale-run-stale-claim"),
+    ],
+)
+def test_worker_complete_with_phantom_card_rejects_stale_authority_without_mutation(
+    monkeypatch, worker_env, run_authority, claim_authority
+):
+    """Unauthorized phantom-card attempts cannot write before authority CAS."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        stale_task = kb.get_task(conn, worker_env)
+        stale_run = kb.latest_run(conn, worker_env)
+        assert stale_task is not None and stale_task.claim_lock is not None
+        assert stale_run is not None
+        kb._set_worker_pid(conn, worker_env, 98765)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        assert kb.detect_crashed_workers(conn) == [worker_env]
+        current_task = kb.claim_task(
+            conn, worker_env, claimer="deterministic-current-claim"
+        )
+        current_run = kb.latest_run(conn, worker_env)
+        assert current_task is not None and current_task.claim_lock is not None
+        assert current_run is not None
+        assert current_run.id != stale_run.id
+        assert current_task.claim_lock != stale_task.claim_lock
+
+    run_id = stale_run.id if run_authority == "stale" else current_run.id
+    if claim_authority == "current":
+        claim_token = current_task.claim_lock
+    elif claim_authority == "stale":
+        claim_token = stale_task.claim_lock
+    else:
+        claim_token = "syntactically-valid-wrong-claim"
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_token)
+
+    before = _completion_authority_state(kb, worker_env)
+    response = json.loads(kt._handle_complete({
+        "summary": "obsolete worker completion",
+        "created_cards": ["t_deadbeefcafe"],
+    }))
+    after = _completion_authority_state(kb, worker_env)
+
+    assert response.get("ok") is not True
+    assert after == before, (
+        "stale or mixed worker authority mutated task/run/claim/events; "
+        f"event kinds changed from {[e['kind'] for e in before['events']]} "
+        f"to {[e['kind'] for e in after['events']]}"
+    )
+
+
+def test_worker_completion_event_records_worker_authority(worker_env):
+    """Successful tool-path worker completion is durably attributable."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    response = json.loads(kt._handle_complete({"summary": "worker complete"}))
+    assert response.get("ok") is True
+    with kb.connect() as conn:
+        completed = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "completed"
+        ]
+    assert len(completed) == 1
+    payload = completed[0].payload or {}
+    assert payload["authority_mode"] == "worker"
+
+
+def test_orchestrator_completion_event_records_orchestrator_authority(
+    monkeypatch, tmp_path
+):
+    """Explicit orchestrator completion is durably distinct from a worker."""
+    monkeypatch.delenv("KANBAN_WORKER", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("KANBAN_TASK_RUN_ID", raising=False)
+    monkeypatch.delenv("KANBAN_CLAIM_TOKEN", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="explicit orchestrator completion")
+
+    response = json.loads(kt._handle_complete({
+        "task_id": task_id,
+        "summary": "orchestrator complete",
+    }))
+    assert response.get("ok") is True
+    with kb.connect() as conn:
+        completed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        ]
+    assert len(completed) == 1
+    payload = completed[0].payload or {}
+    assert payload["authority_mode"] == "orchestrator"
+
+
+@pytest.mark.parametrize(
+    "malformed_claim",
+    [
+        pytest.param("padded", id="padded"),
+        pytest.param("control-character", id="control-character"),
+        pytest.param("over-limit", id="over-512-byte-limit"),
+    ],
+)
+def test_worker_complete_rejects_malformed_claim_token_without_mutation(
+    monkeypatch, worker_env, malformed_claim
+):
+    """Malformed claims are parse rejections, never orchestrator authority."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert task is not None and task.claim_lock is not None
+    if malformed_claim == "padded":
+        claim_token = f" {task.claim_lock} "
+    elif malformed_claim == "control-character":
+        claim_token = f"{task.claim_lock}\x1fblocked"
+    else:
+        claim_token = "x" * (CLAIM_TOKEN_MAX_BYTES + 1)
+        assert len(claim_token.encode("utf-8")) == 513
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_token)
+
+    before = _completion_authority_state(kb, worker_env)
+    response = json.loads(kt._handle_complete({"summary": "must be rejected"}))
+    after = _completion_authority_state(kb, worker_env)
+
+    assert response.get("ok") is not True
+    assert after == before
+    assert "claim token" in response.get("error", ""), response
+
+
+@pytest.mark.parametrize(
+    ("run_identity", "claim_identity"),
+    [
+        pytest.param(None, "current", id="missing-run-id"),
+        pytest.param("not-an-integer", "current", id="malformed-run-id"),
+        pytest.param("current", None, id="missing-claim-token"),
+        pytest.param("current", "other-host:999999", id="invalid-claim-token"),
+    ],
+)
+def test_worker_complete_fails_closed_without_current_run_and_claim_identity(
+    monkeypatch, worker_env, run_identity, claim_identity
+):
+    """Worker completion requires both identities and leaves no terminal trace."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        before = kb.get_task(conn, worker_env)
+        before_events = [event.id for event in kb.list_events(conn, worker_env)]
+        before_run = kb.latest_run(conn, worker_env)
+    assert before is not None
+    assert before.current_run_id is not None
+    assert before.claim_lock is not None
+    assert before_run is not None
+
+    # HERMES_KANBAN_TASK is the existing worker-context marker. The two
+    # dispatcher-provided values below are the current source names for the
+    # contract's KANBAN_TASK_RUN_ID and KANBAN_CLAIM_TOKEN identities.
+    monkeypatch.setenv("KANBAN_WORKER", "1")
+    if run_identity is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv(
+            "HERMES_KANBAN_RUN_ID",
+            str(before.current_run_id) if run_identity == "current" else run_identity,
+        )
+    if claim_identity is None:
+        monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+    else:
+        monkeypatch.setenv(
+            "HERMES_KANBAN_CLAIM_LOCK",
+            before.claim_lock if claim_identity == "current" else claim_identity,
+        )
+
+    response = json.loads(kt._handle_complete({"summary": "must be rejected"}))
+
+    with kb.connect() as conn:
+        after = kb.get_task(conn, worker_env)
+        after_events = [event.id for event in kb.list_events(conn, worker_env)]
+        after_run = kb.latest_run(conn, worker_env)
+    assert after is not None
+    assert after_run is not None
+
+    violations = []
+    if response.get("ok") is True:
+        violations.append(f"completion succeeded: {response}")
+    if after.status != "running":
+        violations.append(f"task status changed: running -> {after.status}")
+    if after.current_run_id != before.current_run_id:
+        violations.append(
+            f"current run changed: {before.current_run_id} -> {after.current_run_id}"
+        )
+    if after.claim_lock != before.claim_lock:
+        violations.append(f"claim changed: {before.claim_lock!r} -> {after.claim_lock!r}")
+    if after_events != before_events:
+        violations.append(f"events changed: {before_events} -> {after_events}")
+    if after_run.status != before_run.status or after_run.outcome != before_run.outcome:
+        violations.append(
+            "run became terminal: "
+            f"status {before_run.status!r} -> {after_run.status!r}, "
+            f"outcome {before_run.outcome!r} -> {after_run.outcome!r}"
+        )
+
+    assert not violations, "; ".join(violations)
+
+
 def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     """A retried worker cannot complete the task using an old run token."""
     from hermes_cli import kanban_db as kb
@@ -1982,7 +2388,10 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
 
         kb.claim_task(conn, worker_env)
         run2 = kb.latest_run(conn, worker_env)
+        task2 = kb.get_task(conn, worker_env)
         assert run2.id != run1.id
+        assert task2 is not None
+        assert task2.claim_lock is not None
     finally:
         conn.close()
 
@@ -2001,6 +2410,7 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run2.id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task2.claim_lock)
     out = kt._handle_complete({"summary": "current completion"})
     d = json.loads(out)
     assert d.get("ok") is True
