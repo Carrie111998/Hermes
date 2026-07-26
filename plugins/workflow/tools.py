@@ -86,23 +86,37 @@ def _capture_session_for_engine() -> dict:
     """
     try:
         from gateway.session_context import get_session_env
+        from pathlib import Path as _P
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        _cv_profile = get_session_env("HERMES_SESSION_PROFILE", "")
+        _env_profile = os.environ.get("HERMES_PROFILE")
+        _hermes_home = os.environ.get("HERMES_HOME", "")
+        _derived = (_P(_hermes_home).name
+                    if "profiles/" in _hermes_home else "default")
+        from pathlib import Path as _P
+        _dbg = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session_debug.log"
+        _dbg.parent.mkdir(parents=True, exist_ok=True)
+        _dbg.write_text(f"cv_profile={_cv_profile!r} env_profile={_env_profile!r} hermes_home={_hermes_home!r} derived={_derived!r}\n")
+        _profile = _cv_profile or _env_profile or _derived
+        _session_key = get_session_env("HERMES_SESSION_KEY", "")
+        # Rebuild session_key with profile if it's missing from ContextVar
+        if _profile and _profile != "default" and "agent:main:" in _session_key:
+            _session_key = _session_key.replace("agent:main:", f"agent:{_profile}:")
         if platform and chat_id:
             return {
                 "platform": platform,
                 "chat_id": chat_id,
                 "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
                 "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
-                "profile": get_session_env("HERMES_SESSION_PROFILE", "")
-                         or os.environ.get("HERMES_PROFILE")
-                         or (Path(os.environ.get("HERMES_HOME", "")).name
-                             if "profiles/" in os.environ.get("HERMES_HOME", "")
-                             else "default"),
-                "session_key": get_session_env("HERMES_SESSION_KEY", ""),
+                "profile": _profile,
+                "session_key": _session_key,
             }
-    except Exception:
-        pass
+    except Exception as e:
+        from pathlib import Path as _P
+        _dbg = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session_debug.log"
+        _dbg.parent.mkdir(parents=True, exist_ok=True)
+        _dbg.write_text(f"capture failed: {e}\n")
     return {}
 
 
