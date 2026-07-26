@@ -18,6 +18,20 @@ from unittest.mock import patch
 import pytest
 
 
+class _NoTrigramCursor(sqlite3.Cursor):
+    """Simulate a runtime where FTS5 exists but trigram does not."""
+
+    def execute(self, sql, parameters=()):
+        if "tokenize='trigram'" in sql:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
+
+class _NoTrigramConnection(sqlite3.Connection):
+    def cursor(self, factory=None):
+        return super().cursor(factory or _NoTrigramCursor)
+
+
 @pytest.fixture
 def db_path(tmp_path):
     return tmp_path / "state.db"
@@ -1163,6 +1177,156 @@ def test_missing_current_table_with_pending_gap_rebuilds_shared_indexes(
                 )
     finally:
         restored.close()
+
+
+@pytest.mark.parametrize(
+    "missing_tables",
+    [
+        ("messages_fts",),
+        ("messages_fts_trigram",),
+        ("messages_fts", "messages_fts_trigram"),
+    ],
+)
+def test_missing_tables_with_pending_gap_and_no_trigram_fail_closed(
+    db_path, monkeypatch, missing_tables
+):
+    """An incapable runtime must not expose or strand a partial trigram index."""
+    import hermes_state
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("no-trigram-gap", "test")
+    row_ids = [
+        seeded.append_message(
+            "no-trigram-gap", "user", content=f"row{index} staleoldtoken"
+        )
+        for index in range(1, 4)
+    ]
+    seeded.close()
+
+    real_connect = sqlite3.connect
+    with real_connect(str(db_path)) as conn:
+        for table in ("messages_fts", "messages_fts_trigram"):
+            conn.execute(f"INSERT INTO {table}({table}) VALUES('delete-all')")
+        conn.execute(
+            "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
+            "SELECT id, content, tool_name, tool_calls FROM messages WHERE id=?",
+            (row_ids[0],),
+        )
+        conn.execute(
+            "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE id=? AND role <> 'tool'",
+            (row_ids[0],),
+        )
+        conn.executemany(
+            "INSERT INTO state_meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                ("fts_rebuild_high_water", str(row_ids[-1])),
+                ("fts_rebuild_progress", str(row_ids[0])),
+            ),
+        )
+        for table in missing_tables:
+            conn.execute(f"DROP TABLE {table}")
+        conn.commit()
+
+    def connect_without_trigram(*args, **kwargs):
+        kwargs["factory"] = _NoTrigramConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", connect_without_trigram)
+    incapable = SessionDB(db_path=db_path)
+    try:
+        assert incapable._trigram_available is False
+        with incapable._lock:
+            trigram_triggers = incapable._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchall()
+            stale = incapable._conn.execute(
+                "SELECT value FROM state_meta WHERE key='fts_trigram_stale'"
+            ).fetchone()
+            assert trigram_triggers == []
+            assert stale is not None
+
+        # Continue any retained standard-only partial backfill safely.
+        for _ in range(10):
+            if not incapable.fts_rebuild_step():
+                break
+        gap_id = row_ids[1]
+        deleted_id = row_ids[2]
+        incapable._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET content='gap freshnewtoken' WHERE id=?",
+                (gap_id,),
+            )
+        )
+        incapable._execute_write(
+            lambda conn: conn.execute("DELETE FROM messages WHERE id=?", (deleted_id,))
+        )
+        above_id = incapable.append_message(
+            "no-trigram-gap", "user", content="abovehighwater token"
+        )
+        with incapable._lock:
+            markers = incapable._conn.execute(
+                "SELECT key FROM state_meta WHERE key IN "
+                "('fts_rebuild_high_water', 'fts_rebuild_progress')"
+            ).fetchall()
+            assert markers == []
+            stale_hits = incapable._conn.execute(
+                "SELECT rowid FROM messages_fts "
+                "WHERE messages_fts MATCH 'staleoldtoken'"
+            ).fetchall()
+            fresh_hits = incapable._conn.execute(
+                "SELECT rowid FROM messages_fts "
+                "WHERE messages_fts MATCH 'freshnewtoken'"
+            ).fetchall()
+            above_hits = incapable._conn.execute(
+                "SELECT rowid FROM messages_fts "
+                "WHERE messages_fts MATCH 'abovehighwater'"
+            ).fetchall()
+            assert gap_id not in [row[0] for row in stale_hits]
+            assert deleted_id not in [row[0] for row in stale_hits]
+            assert [row[0] for row in fresh_hits] == [gap_id]
+            assert [row[0] for row in above_hits] == [above_id]
+            incapable._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) "
+                "VALUES('integrity-check', 1)"
+            )
+    finally:
+        incapable.close()
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", real_connect)
+    capable = SessionDB(db_path=db_path)
+    try:
+        assert capable._trigram_available is True
+        with capable._lock:
+            assert capable._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key='fts_trigram_stale'"
+            ).fetchone() is None
+            for table in ("messages_fts", "messages_fts_trigram"):
+                assert [
+                    row[0]
+                    for row in capable._conn.execute(
+                        f"SELECT rowid FROM {table} "
+                        f"WHERE {table} MATCH 'freshnewtoken'"
+                    ).fetchall()
+                ] == [gap_id]
+                capable._conn.execute(
+                    f"INSERT INTO {table}({table}, rank) "
+                    "VALUES('integrity-check', 1)"
+                )
+            capable._conn.execute(
+                "UPDATE messages SET role='tool' WHERE id=?", (gap_id,)
+            )
+            capable._conn.commit()
+            assert capable._conn.execute(
+                "SELECT rowid FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'freshnewtoken'"
+            ).fetchall() == []
+    finally:
+        capable.close()
 
 
 def test_cjk_schema_ensure_keeps_writer_out_until_triggers_exist(

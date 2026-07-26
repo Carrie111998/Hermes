@@ -329,13 +329,17 @@ _wal_fallback_warned_lock = threading.Lock()
 _wal_reset_bug_warned_paths: set[str] = set()
 _wal_reset_bug_warned_lock = threading.Lock()
 
+_FTS_TRIGRAM_TRIGGERS = (
+    "messages_fts_trigram_insert",
+    "messages_fts_trigram_delete",
+    "messages_fts_trigram_update",
+)
+
 _FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
-    "messages_fts_trigram_insert",
-    "messages_fts_trigram_delete",
-    "messages_fts_trigram_update",
+    *_FTS_TRIGRAM_TRIGGERS,
 )
 
 
@@ -1534,6 +1538,10 @@ _FTS_CJK_TRIGGERS = (
 # on are missing from the cjk index, so it must not serve reads until
 # `hermes sessions optimize-storage` rebuilds it on a capable host.
 FTS_CJK_STALE_KEY = "fts_cjk_stale"
+# A runtime without the trigram tokenizer drops trigram maintenance triggers
+# and records this breadcrumb. The next capable open must rebuild the index
+# from canonical messages before serving it again.
+FTS_TRIGRAM_STALE_KEY = "fts_trigram_stale"
 
 
 def fts5_cjk_so_path() -> Path:
@@ -2539,14 +2547,32 @@ class SessionDB:
                 pass
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _mark_trigram_stale(cursor: sqlite3.Cursor) -> None:
+        """Disable trigram writes until a tokenizer-capable full rebuild."""
+        cursor.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (FTS_TRIGRAM_STALE_KEY,),
+        )
+        for trigger in _FTS_TRIGRAM_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    @staticmethod
+    def _named_trigger_count(
+        cursor: sqlite3.Cursor,
+        names: tuple[str, ...],
+    ) -> int:
+        placeholders = ",".join("?" for _ in names)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            names,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+
+    @staticmethod
+    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
+        return SessionDB._named_trigger_count(cursor, _FTS_TRIGGERS)
 
     @staticmethod
     def _migrate_broad_fts_update_triggers(
@@ -3201,14 +3227,18 @@ class SessionDB:
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
-                conn.execute(
-                    "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
-                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
-                    "FROM messages m "
-                    "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
-                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
-                    (lo, hi),
-                )
+                if self._trigram_available:
+                    conn.execute(
+                        "INSERT INTO messages_fts_trigram"
+                        "(rowid, content, tool_name, tool_calls) "
+                        "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                        "FROM messages m "
+                        "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                        "AND NOT EXISTS ("
+                        "SELECT 1 FROM messages_fts_trigram_docsize d "
+                        "WHERE d.id = m.id)",
+                        (lo, hi),
+                    )
             conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_rebuild_high_water', 'fts_rebuild_progress')"
@@ -3455,10 +3485,8 @@ class SessionDB:
             return True
         was_stale = self._execute_write(_do)
         if was_stale:
-            # Recreate outside the write transaction — _ensure_fts_cjk_schema
-            # uses executescript(), which implicitly commits any pending
-            # transaction and must not run inside _execute_write's BEGIN
-            # IMMEDIATE. Sets fresh backfill markers on a populated DB.
+            # Recreate under the normal write lock. The ensure helper preserves
+            # caller transaction ownership and uses a savepoint for partial DDL.
             with self._lock:
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
@@ -4243,8 +4271,17 @@ class SessionDB:
                     base_ddl + "\n" + trigram_ddl,
                     locked_ddl_resolver=_authoritative_trigger_ddl,
                 )
+                base_triggers_need_repair = (
+                    self._named_trigger_count(cursor, _FTS_TRIGGERS[:3]) < 3
+                )
                 triggers_need_repair = (
                     self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                )
+                trigram_stale = bool(
+                    cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ?",
+                        (FTS_TRIGRAM_STALE_KEY,),
+                    ).fetchone()
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", base_ddl
@@ -4254,14 +4291,24 @@ class SessionDB:
                         cursor, "messages_fts_trigram", trigram_ddl
                     )
                     self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
+                    needs_base_rebuild = base_triggers_need_repair
+                    needs_full_rebuild = triggers_need_repair or trigram_stale
+                    if not trigram_enabled:
+                        self._mark_trigram_stale(cursor)
+                    if needs_base_rebuild or (trigram_enabled and needs_full_rebuild):
+                        include_trigram = trigram_enabled
                         if legacy_layout == "external":
                             self._rebuild_fts_indexes(
-                                cursor, include_trigram=trigram_enabled
+                                cursor, include_trigram=include_trigram
                             )
                         else:
                             self._rebuild_legacy_fts_indexes(
-                                cursor, include_trigram=trigram_enabled
+                                cursor, include_trigram=include_trigram
+                            )
+                        if include_trigram:
+                            cursor.execute(
+                                "DELETE FROM state_meta WHERE key = ?",
+                                (FTS_TRIGRAM_STALE_KEY,),
                             )
             else:
                 base_table_missing = (
@@ -4278,8 +4325,17 @@ class SessionDB:
                     migration_ddl,
                     locked_ddl_resolver=_authoritative_trigger_ddl,
                 )
+                base_triggers_need_repair = (
+                    self._named_trigger_count(cursor, _FTS_TRIGGERS[:3]) < 3
+                )
                 triggers_need_repair = (
                     self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                )
+                trigram_stale = bool(
+                    cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ?",
+                        (FTS_TRIGRAM_STALE_KEY,),
+                    ).fetchone()
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", FTS_SQL
@@ -4293,20 +4349,33 @@ class SessionDB:
                         cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
                     self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
+                    if not trigram_enabled:
+                        # The optional tokenizer cannot safely maintain either
+                        # an existing partial index or dangling triggers for a
+                        # missing table. Disable writes to trigram and force a
+                        # complete rebuild on the next capable open.
+                        self._mark_trigram_stale(cursor)
+                        if base_table_missing or base_triggers_need_repair:
+                            self._rebuild_fts_indexes(
+                                cursor,
+                                include_trigram=False,
+                            )
+                    elif (
+                        triggers_need_repair
+                        or base_table_missing
+                        or trigram_table_missing
+                        or trigram_stale
+                    ):
+                        # Shared progress markers govern both current indexes.
+                        # Any repair or stale trigram breadcrumb therefore
+                        # converges both indexes and retires gating together.
                         self._rebuild_fts_indexes(
                             cursor,
-                            include_trigram=trigram_enabled,
+                            include_trigram=True,
                         )
-                    elif base_table_missing or trigram_table_missing:
-                        # The progress/high-water pair gates writes for BOTH
-                        # current indexes. A full repair of only one table while
-                        # retaining those shared markers leaves already indexed
-                        # gap rows frozen at stale terms. Rebuild every available
-                        # current index atomically and retire the shared markers.
-                        self._rebuild_fts_indexes(
-                            cursor,
-                            include_trigram=trigram_enabled,
+                        cursor.execute(
+                            "DELETE FROM state_meta WHERE key = ?",
+                            (FTS_TRIGRAM_STALE_KEY,),
                         )
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
