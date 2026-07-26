@@ -366,6 +366,22 @@ export function setProfilePetInfo(profile: string, info: PetInfo): void {
 }
 
 /**
+ * Record the durable session id a profile's pet is reacting to (Layer 9). Set
+ * alongside `bindSessionStoredId` when a session event carries a stored id, so
+ * the overlay's mail icon can resume the correct conversation for a background
+ * profile (not just the active one). No-op until the profile has a slice.
+ */
+export function setProfileSourceDurableSessionId(profile: string, storedSessionId: string): void {
+  const key = normalizeProfileKey(profile)
+
+  if (!$profilePets.get().has(key)) {
+    return
+  }
+
+  updateProfilePet(key, prev => ({ ...prev, sourceDurableSessionId: storedSessionId }))
+}
+
+/**
  * Project a profile's gateway connection state into its pet slice (Layer 8). The
  * gateway registry reports every profile's socket state here (via the boot-wired
  * onProfileState callback) so a dead/reauth pinned profile shows an offline pet

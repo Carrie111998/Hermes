@@ -32,6 +32,7 @@ import {
   completeTool,
   markProfilePetUnread,
   setProfilePetReplyText,
+  setProfileSourceDurableSessionId,
   setSessionAwaitingInput,
   setSessionBusy,
   setSessionReasoning,
@@ -439,6 +440,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (runningChanged && sessionId && observedPet && eventProfile) {
           if (payload?.stored_session_id) {
             bindSessionStoredId(eventProfile, sessionId, payload.stored_session_id)
+            // Record the durable id so the overlay mail icon can resume this
+            // profile's conversation (background profiles, not just active).
+            setProfileSourceDurableSessionId(eventProfile, payload.stored_session_id)
           }
 
           if (payload!.running) {

@@ -10,6 +10,7 @@ import {
   clearProfilePetUnread,
   removeSessionActivity,
   replaceSessionRuntimeId,
+  setProfileSourceDurableSessionId,
   setSessionAwaitingInput,
   setSessionBusy,
   setSessionReasoning,
@@ -153,5 +154,18 @@ describe('per-profile unread (source-session scoped)', () => {
     // Focusing session A clears it.
     clearProfilePetUnread('default', 'session-a')
     expect(getProfilePet('default')?.unread).toBe(false)
+  })
+})
+
+describe('sourceDurableSessionId (overlay openApp)', () => {
+  it('records the durable id on an existing slice and is a no-op before one exists', () => {
+    // No slice yet → no-op (doesn't conjure an empty profile into existence).
+    setProfileSourceDurableSessionId('apollo', 'stored-1')
+    expect(getProfilePet('apollo')).toBeUndefined()
+
+    // Once the profile has a slice (e.g. unread marked), the durable id sticks.
+    markProfilePetUnread('apollo', 'rt-1')
+    setProfileSourceDurableSessionId('apollo', 'stored-1')
+    expect(getProfilePet('apollo')?.sourceDurableSessionId).toBe('stored-1')
   })
 })
