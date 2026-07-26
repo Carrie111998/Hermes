@@ -1118,6 +1118,56 @@ class TestInstallSmokeSkippedWhenDisabled:
         assert res["enabled"] is True
 
 
+# ── cmd_remove must drop the plugin from enabled/disabled sets ──────────────
+
+
+class TestRemoveCleansEnabledSet:
+    """`hermes plugins remove` must not leave a stale enabled/disabled entry.
+
+    Regression: cmd_remove deleted the directory but never updated
+    plugins.enabled / plugins.disabled, so a removed plugin's name survived
+    in config and a later gateway start would try to enable a missing plugin.
+    """
+
+    def _make_good_repo(self, tmp_path) -> str:
+        import subprocess
+
+        repo_root = tmp_path / "rmrepo"
+        repo_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo_root)],
+            check=True,
+            capture_output=True,
+        )
+        (repo_root / "plugin.yaml").write_text("name: rm-plugin\nversion: 1.0.0\n")
+        subprocess.run(
+            ["git", "-C", str(repo_root), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-q", "--allow-empty", "-m", "x"],
+            check=True,
+            capture_output=True,
+        )
+        return f"file://{repo_root}"
+
+    def test_remove_drops_from_enabled_set(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+
+        pc.dashboard_install_plugin(self._make_good_repo(tmp_path), force=True, enable=True)
+        assert "rm-plugin" in pc._get_enabled_set()
+
+        pc.cmd_remove("rm-plugin")
+        assert "rm-plugin" not in pc._get_enabled_set()
+        assert "rm-plugin" not in pc._get_disabled_set()
+        assert not (plugins_dir / "rm-plugin").exists()
+
+
 # ── _smoke_test_plugin_load: install-time load verification ────────────────
 
 

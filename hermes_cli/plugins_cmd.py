@@ -783,6 +783,18 @@ def cmd_remove(name: str) -> None:
     shutil.rmtree(target)
     _display_removed(name, plugins_dir)
 
+    # Drop the removed plugin from the enabled/disabled allow-/deny-lists so
+    # stale config doesn't survive the removal (e.g. a later gateway start
+    # trying to enable a plugin that no longer exists on disk).
+    enabled = _get_enabled_set()
+    disabled = _get_disabled_set()
+    if name in enabled:
+        enabled.discard(name)
+        _save_enabled_set(enabled)
+    if name in disabled:
+        disabled.discard(name)
+        _save_disabled_set(disabled)
+
 
 def _get_disabled_set() -> set:
     """Read the disabled plugins set from config.yaml.
