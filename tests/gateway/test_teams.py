@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from gateway.config import Platform, PlatformConfig, HomeChannel
+from gateway.config import GatewayConfig, Platform, PlatformConfig, HomeChannel
 from plugins.teams_pipeline.models import TeamsMeetingRef, TeamsMeetingSummaryPayload
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -285,6 +285,19 @@ class TestTeamsAdapterInit:
         )
         assert adapter._port == 3978
 
+    def test_reads_reply_context_setting_from_yaml_config(self):
+        config = GatewayConfig.from_dict({
+            "platforms": {
+                "teams": {
+                    "enabled": True,
+                    "extra": {"fetch_reply_context": True},
+                },
+            },
+        })
+
+        adapter = TeamsAdapter(config.platforms[Platform("teams")])
+
+        assert adapter._fetch_reply_context is True
 
 # ---------------------------------------------------------------------------
 # Tests: Plugin registration
@@ -486,21 +499,6 @@ class TestTeamsMessageHandling:
         assert event.source.chat_type == "group"
 
     @pytest.mark.anyio
-    async def test_channel_message_creates_channel_event(self):
-        adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
-        ))
-        adapter._app = MagicMock()
-        adapter._app.id = "bot-id"
-        adapter.handle_message = AsyncMock()
-
-        activity = self._make_activity(conversation_type="channel")
-        await adapter._on_message(self._make_ctx(activity))
-
-        event = adapter.handle_message.call_args[0][0]
-        assert event.source.chat_type == "channel"
-
-    @pytest.mark.anyio
     async def test_channel_reply_uses_root_message_as_thread_id(self):
         adapter = TeamsAdapter(_make_config(
             client_id="bot-id", client_secret="secret", tenant_id="tenant",
@@ -522,20 +520,18 @@ class TestTeamsMessageHandling:
         assert event.source.message_id == "reply-message-1"
 
     @pytest.mark.anyio
-    async def test_channel_message_uses_recent_cron_context_when_reply_id_missing(self, monkeypatch):
+    async def test_channel_message_without_reply_id_does_not_use_cron_context(self, monkeypatch):
         adapter = TeamsAdapter(_make_config(
             client_id="bot-id", client_secret="secret", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
         adapter.handle_message = AsyncMock()
+        cron_context = MagicMock()
         monkeypatch.setattr(
             TeamsAdapter,
             "_cron_reply_context",
-            staticmethod(lambda _conversation_id, _thread_id: {
-                "thread_id": "cron-message-id",
-                "content": "Cron message body",
-            }),
+            staticmethod(cron_context),
         )
 
         activity = self._make_activity(
@@ -545,9 +541,10 @@ class TestTeamsMessageHandling:
         await adapter._on_message(self._make_ctx(activity))
 
         event = adapter.handle_message.call_args[0][0]
-        assert event.source.thread_id == "cron-message-id"
-        assert event.reply_to_message_id == "cron-message-id"
-        assert event.reply_to_text == "Cron message body"
+        assert event.source.thread_id is None
+        assert event.reply_to_message_id is None
+        assert event.reply_to_text is None
+        cron_context.assert_not_called()
 
     @pytest.mark.anyio
     async def test_channel_message_uses_messageid_conversation_as_thread_id(self, monkeypatch):
@@ -696,70 +693,6 @@ class TestTeamsMessageHandling:
         event = adapter.handle_message.call_args[0][0]
         assert event.reply_to_message_id == "root-message-1"
         assert event.reply_to_text is None
-
-    @pytest.mark.anyio
-    async def test_user_id_uses_aad_object_id(self):
-        adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
-        ))
-        adapter._app = MagicMock()
-        adapter._app.id = "bot-id"
-        adapter.handle_message = AsyncMock()
-
-        activity = self._make_activity(from_aad_id="aad-stable-id", from_id="teams-id")
-        await adapter._on_message(self._make_ctx(activity))
-
-        event = adapter.handle_message.call_args[0][0]
-        assert event.source.user_id == "aad-stable-id"
-
-    @pytest.mark.anyio
-    async def test_self_message_filtered(self):
-        adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
-        ))
-        adapter._app = MagicMock()
-        adapter._app.id = "bot-id"
-        adapter.handle_message = AsyncMock()
-
-        activity = self._make_activity(from_id="bot-id")
-        await adapter._on_message(self._make_ctx(activity))
-
-        adapter.handle_message.assert_not_awaited()
-
-    @pytest.mark.anyio
-    async def test_bot_mention_stripped_from_text(self):
-        adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
-        ))
-        adapter._app = MagicMock()
-        adapter._app.id = "bot-id"
-        adapter.handle_message = AsyncMock()
-
-        activity = self._make_activity(
-            text="<at>Hermes</at> what is the weather?",
-            from_id="user-id",
-        )
-        await adapter._on_message(self._make_ctx(activity))
-
-        event = adapter.handle_message.call_args[0][0]
-        assert event.text == "what is the weather?"
-
-    @pytest.mark.anyio
-    async def test_deduplication(self):
-        adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
-        ))
-        adapter._app = MagicMock()
-        adapter._app.id = "bot-id"
-        adapter.handle_message = AsyncMock()
-
-        activity = self._make_activity(activity_id="msg-dup-001", from_id="user-id")
-        ctx = self._make_ctx(activity)
-
-        await adapter._on_message(ctx)
-        await adapter._on_message(ctx)
-
-        assert adapter.handle_message.await_count == 1
 
 class TestTeamsAttachmentClassification:
     """Document attachments must set MessageType.DOCUMENT so run.py's

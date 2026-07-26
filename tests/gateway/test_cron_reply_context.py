@@ -27,28 +27,12 @@ def test_records_and_finds_exact_thread_context(tmp_path, monkeypatch):
     assert record["job_id"] == "job-1"
 
 
-def test_falls_back_to_latest_chat_context(tmp_path, monkeypatch):
+def test_message_without_reply_id_does_not_borrow_latest_context(tmp_path, monkeypatch):
     store = tmp_path / "cron_reply_contexts.json"
     monkeypatch.setattr(crc, "_STORE_PATH", store)
 
     crc.record_cron_reply_context("teams", "conv-1", "Old", thread_id="old")
-    records = crc._load_records()
-    records["teams::conv-1::old"]["updated_at"] = time.time() - 60
-    records["teams::conv-1::new"] = {
-        "platform": "teams",
-        "chat_id": "conv-1",
-        "thread_id": "new",
-        "message_id": "new",
-        "job_id": "job-new",
-        "content": "New",
-        "updated_at": time.time(),
-    }
-    crc._write_records(records)
-
-    record = crc.find_cron_reply_context("teams", "conv-1")
-
-    assert record is not None
-    assert record["content"] == "New"
+    assert crc.find_cron_reply_context("teams", "conv-1") is None
 
 
 def test_explicit_unknown_thread_does_not_borrow_latest_context(tmp_path, monkeypatch):
@@ -99,4 +83,46 @@ def test_ignores_stale_context(tmp_path, monkeypatch):
     records["teams::conv-1::old"]["updated_at"] = time.time() - 10_000
     crc._write_records(records)
 
-    assert crc.find_cron_reply_context("teams", "conv-1", max_age_seconds=60) is None
+    assert crc.find_cron_reply_context(
+        "teams",
+        "conv-1",
+        thread_id="old",
+        max_age_seconds=60,
+    ) is None
+
+
+def test_record_prunes_expired_contexts(tmp_path, monkeypatch):
+    store = tmp_path / "cron_reply_contexts.json"
+    monkeypatch.setattr(crc, "_STORE_PATH", store)
+
+    crc.record_cron_reply_context("teams", "conv-1", "Old", thread_id="old")
+    records = crc._load_records()
+    records["teams::conv-1::old"]["updated_at"] = (
+        time.time() - crc._DEFAULT_MAX_AGE_SECONDS - 1
+    )
+    crc._write_records(records)
+
+    crc.record_cron_reply_context("teams", "conv-1", "New", thread_id="new")
+
+    assert set(crc._load_records()) == {"teams::conv-1::new"}
+
+
+def test_record_caps_context_store_to_newest_records(tmp_path, monkeypatch):
+    store = tmp_path / "cron_reply_contexts.json"
+    monkeypatch.setattr(crc, "_STORE_PATH", store)
+    monkeypatch.setattr(crc, "_MAX_RECORDS", 3)
+
+    for index in range(5):
+        monkeypatch.setattr(crc.time, "time", lambda index=index: 1_000 + index)
+        crc.record_cron_reply_context(
+            "teams",
+            "conv-1",
+            f"Message {index}",
+            thread_id=f"thread-{index}",
+        )
+
+    assert set(crc._load_records()) == {
+        "teams::conv-1::thread-2",
+        "teams::conv-1::thread-3",
+        "teams::conv-1::thread-4",
+    }

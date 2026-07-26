@@ -18,7 +18,7 @@ Configuration in config.yaml:
           client_secret: "your-secret"      # or TEAMS_CLIENT_SECRET env var
           tenant_id: "your-tenant-id"       # or TEAMS_TENANT_ID env var
           port: 3978                        # or TEAMS_PORT env var
-          fetch_reply_context: false         # Graph fallback; see plugin.yaml
+          fetch_reply_context: false         # Graph fallback for channel replies
 """
 
 from __future__ import annotations
@@ -788,10 +788,10 @@ class TeamsAdapter(BasePlatformAdapter):
         self._client_id = extra.get("client_id") or os.getenv("TEAMS_CLIENT_ID", "")
         self._client_secret = extra.get("client_secret") or _get_scoped_secret("TEAMS_CLIENT_SECRET", "")
         self._tenant_id = extra.get("tenant_id") or os.getenv("TEAMS_TENANT_ID", "")
-        fetch_reply_context = extra.get("fetch_reply_context")
-        if fetch_reply_context is None:
-            fetch_reply_context = os.getenv("TEAMS_FETCH_REPLY_CONTEXT", "")
-        self._fetch_reply_context = _parse_bool(fetch_reply_context, default=False)
+        self._fetch_reply_context = _parse_bool(
+            extra.get("fetch_reply_context"),
+            default=False,
+        )
         self._port = _coerce_port(
             extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT))
         )
@@ -972,14 +972,13 @@ class TeamsAdapter(BasePlatformAdapter):
         thread_id = self._teams_thread_id(activity)
         if not thread_id:
             thread_id = self._thread_id_from_conversation_id(conv.id)
-        cron_reply_context = self._cron_reply_context(conv.id, thread_id)
+        cron_reply_context = (
+            self._cron_reply_context(conv.id, thread_id)
+            if thread_id
+            else None
+        )
         reply_to_text = None
         if cron_reply_context:
-            if not thread_id:
-                thread_id = (
-                    cron_reply_context.get("thread_id")
-                    or cron_reply_context.get("message_id")
-                )
             reply_to_text = cron_reply_context.get("content")
         elif thread_id and chat_type == "channel" and self._fetch_reply_context:
             reply_to_text = await self._fetch_parent_message_text(activity, thread_id)
