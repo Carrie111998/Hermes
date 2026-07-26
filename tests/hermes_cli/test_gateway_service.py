@@ -239,6 +239,15 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
 
+        # Prevent os._exit() from killing the pytest process (#71719).
+        # run_gateway() calls _hard_exit_after_gateway_teardown() on every
+        # exit path, which routes to gateway.run._exit_after_graceful_shutdown
+        # -> os._exit().  In a test, we just want run_gateway() to return.
+        monkeypatch.setattr(
+            "gateway.run._exit_after_graceful_shutdown",
+            lambda code=0: None,
+        )
+
         gateway_cli.run_gateway()
 
         assert unit_path.read_text(encoding="utf-8") == "new unit\n"
