@@ -1826,12 +1826,12 @@ class MatrixAdapter(BasePlatformAdapter):
         }
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
+            event_id = await self._send_with_rate_limit_retry(
+                chat_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
             )
-            return SendResult(success=True, message_id=str(event_id))
+            return SendResult(success=True, message_id=event_id)
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
 
@@ -3799,12 +3799,12 @@ class MatrixAdapter(BasePlatformAdapter):
         msg_content = self._build_text_message_content(text, msgtype=msgtype)
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
+            event_id = await self._send_with_rate_limit_retry(
+                chat_id,
                 EventType.ROOM_MESSAGE,
                 msg_content,
             )
-            return SendResult(success=True, message_id=str(event_id))
+            return SendResult(success=True, message_id=event_id)
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
 
