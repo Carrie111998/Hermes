@@ -457,3 +457,85 @@ class TestBrowserToolRouting:
         assert check_browser_requirements() is True
 
 
+class TestGetHumanize:
+    """Test suite for _get_humanize() config resolution."""
+
+    def test_default_when_no_config(self):
+        """Returns 1.0 when browser.camofox block is missing or empty."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config", return_value={}):
+            assert _get_humanize() == 1.0
+
+    def test_default_when_humanize_not_set(self):
+        """Returns 1.0 when humanize key is absent from config block."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"managed_persistence": True}):
+            assert _get_humanize() == 1.0
+
+    def test_reads_configured_value(self):
+        """Returns the configured float value when present."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": 0.5}):
+            assert _get_humanize() == 0.5
+
+    def test_reads_zero(self):
+        """Returns 0.0 when configured (disables humanization)."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": 0.0}):
+            assert _get_humanize() == 0.0
+
+    def test_reads_one(self):
+        """Returns 1.0 when explicitly configured."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": 1.0}):
+            assert _get_humanize() == 1.0
+
+    def test_clamps_above_one(self):
+        """Values above 1.0 are clamped to 1.0."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": 2.5}):
+            assert _get_humanize() == 1.0
+
+    def test_clamps_below_zero(self):
+        """Values below 0.0 are clamped to 0.0."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": -0.3}):
+            assert _get_humanize() == 0.0
+
+    def test_handles_non_numeric_value(self):
+        """Non-numeric config values fall back to default 1.0."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": "fast"}):
+            assert _get_humanize() == 1.0
+
+    def test_handles_none_value(self):
+        """None config value falls back to default 1.0."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": None}):
+            assert _get_humanize() == 1.0
+
+    def test_integer_value_converted_to_float(self):
+        """Integer config values are converted to float."""
+        from tools.browser_camofox import _get_humanize
+
+        with patch("tools.browser_camofox._get_camofox_config",
+                   return_value={"humanize": 1}):
+            assert _get_humanize() == 1.0
+            assert isinstance(_get_humanize(), float)

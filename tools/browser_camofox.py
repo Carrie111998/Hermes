@@ -172,6 +172,22 @@ def _get_camofox_config() -> Dict[str, Any]:
     return camofox_cfg if isinstance(camofox_cfg, dict) else {}
 
 
+def _get_humanize() -> float:
+    """Return the ``humanize`` value from config, defaulting to 1.0.
+
+    Controls Camofox behavioral humanization (mouse curves, click delays,
+    smooth scrolling, character-by-character typing).  0.0 = off (fastest,
+    most detectable), 1.0 = maximum (slowest, least detectable).
+    """
+    try:
+        val = _get_camofox_config().get("humanize")
+        if val is not None:
+            return max(0.0, min(1.0, float(val)))
+    except (ValueError, TypeError):
+        pass
+    return 1.0
+
+
 def _managed_persistence_enabled() -> bool:
     """Return whether Hermes-managed persistence is enabled for Camofox.
 
@@ -662,7 +678,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
 
         data = _post(
             f"/tabs/{session['tab_id']}/click",
-            {"userId": session["user_id"], "ref": clean_ref},
+            {"userId": session["user_id"], "ref": clean_ref, "humanize": _get_humanize()},
         )
         return json.dumps({
             "success": True,
@@ -688,7 +704,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
 
         _post(
             f"/tabs/{session['tab_id']}/type",
-            {"userId": session["user_id"], "ref": clean_ref, "text": text},
+            {"userId": session["user_id"], "ref": clean_ref, "text": text, "humanize": _get_humanize()},
         )
         from agent.display import (
             redact_browser_typed_text_for_display,
@@ -723,7 +739,7 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
 
         _post(
             f"/tabs/{session['tab_id']}/scroll",
-            {"userId": session["user_id"], "direction": direction},
+            {"userId": session["user_id"], "direction": direction, "humanize": _get_humanize()},
         )
         return json.dumps({"success": True, "scrolled": direction})
     except Exception as e:
@@ -759,7 +775,7 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
 
         _post(
             f"/tabs/{session['tab_id']}/press",
-            {"userId": session["user_id"], "key": key},
+            {"userId": session["user_id"], "key": key, "humanize": _get_humanize()},
         )
         return json.dumps({"success": True, "pressed": key})
     except Exception as e:
