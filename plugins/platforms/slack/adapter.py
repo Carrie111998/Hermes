@@ -2158,6 +2158,9 @@ class SlackAdapter(BasePlatformAdapter):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
 
             self._app.action("hermes_feedback")(self._handle_feedback_action)
+            self._app.action("hermes_interactive_reply")(
+                self._handle_interactive_reply_action
+            )
 
             # Register Block Kit action handlers for clarify buttons
             # (interactive multiple-choice prompts; see tools/clarify_gateway.py).
@@ -6973,6 +6976,128 @@ class SlackAdapter(BasePlatformAdapter):
             user_id,
             channel_id,
             message.get("ts", ""),
+        )
+
+    async def _handle_interactive_reply_action(self, ack, body, action) -> None:
+        """Relay one validated generic reply click through normal message handling."""
+        await ack()
+
+        if not isinstance(body, dict) or not isinstance(action, dict):
+            return
+        if action.get("action_id") != "hermes_interactive_reply":
+            return
+
+        message = body.get("message") or {}
+        channel = body.get("channel") or {}
+        user = body.get("user") or {}
+        if not all(isinstance(value, dict) for value in (message, channel, user)):
+            return
+
+        channel_id = str(channel.get("id") or "")
+        message_ts = str(message.get("ts") or "")
+        user_id = str(user.get("id") or "")
+        button_token = str(action.get("value") or "")
+        if not channel_id or not message_ts or not user_id or not button_token:
+            return
+
+        accepted = self._interactive_reply_store.consume(
+            button_token, channel_id, message_ts
+        )
+        if accepted is None:
+            return
+
+        team_id = self._event_team_id({}, body)
+        if not team_id:
+            team_id = self._channel_team.get(channel_id, "")
+        if team_id:
+            self._remember_channel_team(channel_id, team_id)
+
+        user_name = await self._resolve_user_name(
+            user_id, chat_id=channel_id, team_id=team_id
+        )
+        channel_name = await self._resolve_channel_name(
+            channel_id, team_id=team_id
+        )
+        thread_ts = accepted.thread_ts
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=channel_name,
+            chat_type="dm" if channel_id.startswith("D") else "group",
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=thread_ts,
+            scope_id=str(team_id) if team_id else None,
+        )
+
+        from gateway.platforms.base import (
+            resolve_channel_prompt,
+            resolve_channel_skills,
+        )
+
+        channel_prompt = resolve_channel_prompt(
+            self.config.extra, channel_id, None
+        )
+        identity_prompt = self._build_identity_prompt(team_id)
+        if identity_prompt:
+            channel_prompt = (
+                f"{identity_prompt}\n\n{channel_prompt}".strip()
+                if channel_prompt
+                else identity_prompt
+            )
+        auto_skill = resolve_channel_skills(
+            self.config.extra, channel_id, None
+        )
+
+        # Consumption is already durable and one-time. Removing the clicked
+        # card's action block is only a presentation update: a Slack API
+        # failure must neither restore the record nor suppress the user turn.
+        original_blocks = message.get("blocks") or []
+        updated_blocks = [
+            block
+            for block in original_blocks
+            if not (
+                isinstance(block, dict)
+                and block.get("type") == "actions"
+                and any(
+                    isinstance(element, dict)
+                    and element.get("action_id") == "hermes_interactive_reply"
+                    for element in (block.get("elements") or [])
+                )
+            )
+        ]
+        try:
+            await self._get_client(
+                channel_id, team_id=team_id or None
+            ).chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text=str(message.get("text") or "Interactive reply selected"),
+                blocks=sanitize_blocks(updated_blocks),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Failed to update consumed interactive reply card: %s",
+                exc,
+            )
+
+        await self.handle_message(
+            MessageEvent(
+                text=f"Slack button action: {accepted.action_id}",
+                source=source,
+                raw_message=body,
+                message_id=message_ts,
+                reply_to_message_id=(
+                    thread_ts if thread_ts != message_ts else None
+                ),
+                channel_prompt=channel_prompt,
+                auto_skill=auto_skill,
+                internal=False,
+                metadata={
+                    "slack_team_id": team_id,
+                    "slack_channel_id": channel_id,
+                    "slack_thread_ts": thread_ts,
+                },
+            )
         )
 
     async def _handle_approval_action(self, ack, body, action) -> None:
