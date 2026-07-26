@@ -6,12 +6,20 @@ from pathlib import Path
 
 import pytest
 
+import gateway.failure_successors as failure_successors_module
 import gateway.worker_bridge_watchers as worker_bridge_watchers
 from gateway.failure_successors import (
     create_failure_successors,
     resolve_failure_successor_settings,
 )
 from gateway.worker_bridge_watchers import GatewayWorkerBridgeWatchersMixin
+
+
+@pytest.fixture(autouse=True)
+def _clear_reported_skips():
+    failure_successors_module._reported_skips.clear()
+    yield
+    failure_successors_module._reported_skips.clear()
 
 
 class FakeBridge:
@@ -285,3 +293,42 @@ def test_task_still_in_auto_repair_is_excluded():
     bridge = FakeBridge([_task(auto_repair=2, repair_attempts=1)])
 
     assert create_failure_successors(bridge, _settings()) == 0
+
+
+class RejectingBridge(FakeBridge):
+    """Rejects creation for one parent, e.g. its workspace was deleted."""
+
+    def __init__(self, tasks: list[dict], reject_parent: str):
+        super().__init__(tasks)
+        self.reject_parent = reject_parent
+
+    def create_task(self, spec):
+        if spec.get("parent_task_id") == self.reject_parent:
+            raise ValueError("repository does not exist: C:/gone")
+        return super().create_task(spec)
+
+
+def test_unservable_parent_does_not_abort_pass_for_other_tasks(caplog):
+    bridge = RejectingBridge(
+        [_task(task_id="dead-repo"), _task(task_id="failed-2")],
+        reject_parent="dead-repo",
+    )
+
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        assert create_failure_successors(bridge, _settings()) == 1
+
+    assert len(bridge.created_specs) == 1
+    assert bridge.created_specs[0]["parent_task_id"] == "failed-2"
+    skips = [r for r in caplog.records if "successor skipped" in r.getMessage()]
+    assert len(skips) == 1 and "dead-repo" in skips[0].getMessage()
+
+
+def test_unservable_parent_warns_once_across_passes(caplog):
+    bridge = RejectingBridge([_task(task_id="dead-repo")], reject_parent="dead-repo")
+
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        assert create_failure_successors(bridge, _settings()) == 0
+        assert create_failure_successors(bridge, _settings()) == 0
+
+    skips = [r for r in caplog.records if "successor skipped" in r.getMessage()]
+    assert len(skips) == 1

@@ -7,6 +7,11 @@ from typing import Any
 
 logger = logging.getLogger("gateway.run")
 
+# Parents whose successor creation already failed this process, so a parent
+# that can never produce a successor (e.g. its workspace repository was
+# deleted) warns once instead of flooding the error log every watcher tick.
+_reported_skips: set[str] = set()
+
 DEFAULT_FAILURE_SUCCESSORS_ENABLED = True
 DEFAULT_FAILURE_SUCCESSOR_MAX_CHAIN = 2
 
@@ -132,7 +137,20 @@ def create_failure_successors(bridge: Any, settings: dict) -> int:
                 "metadata": successor_metadata,
             }
         )
-        bridge.create_task(successor_spec)
+        try:
+            bridge.create_task(successor_spec)
+        except Exception as exc:
+            # One unservable parent must not abort the pass for every other
+            # failed task; record it once and move on.
+            if task_id not in _reported_skips:
+                _reported_skips.add(task_id)
+                logger.warning(
+                    "worker-bridge failure successor skipped for %s: %s",
+                    task_id,
+                    exc,
+                )
+            continue
+        _reported_skips.discard(task_id)
         successor_parents.add(task_id)
         created += 1
         logger.info(
