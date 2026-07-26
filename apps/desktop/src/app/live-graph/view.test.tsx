@@ -2386,6 +2386,8 @@ describe('LiveGraphCanvas', () => {
   })
 
   it('fills workflow selection from the full snapshot and reveals a task selected from its inbox', async () => {
+    const nowSeconds = Math.floor(Date.now() / 1000)
+
     const workflowInboxGraph: LiveGraphSnapshot = {
       edges: [
         ...graph.edges,
@@ -2397,10 +2399,19 @@ describe('LiveGraphCanvas', () => {
         }
       ],
       nodes: [
-        ...graph.nodes,
+        ...graph.nodes.map(node =>
+          node.id === 'task:default:board:task'
+            ? {
+                ...node,
+                createdAt: nowSeconds - 3 * 60 * 60,
+                startedAt: nowSeconds - 2 * 60 * 60
+              }
+            : node
+        ),
         {
           board: 'board',
-          createdAt: 2,
+          completedAt: nowSeconds - 5 * 60 * 60,
+          createdAt: nowSeconds - 8 * 60 * 60,
           entityId: 'completed',
           id: 'task:default:board:completed',
           kind: 'task',
@@ -2436,6 +2447,11 @@ describe('LiveGraphCanvas', () => {
     expect(within(inbox).queryByText('Same ids on another board')).toBeNull()
     expect(inbox.querySelectorAll('[data-live-graph-task-card]')).toHaveLength(1)
     expect(inbox.querySelectorAll('[data-live-graph-completed-task]')).toHaveLength(1)
+    expect(within(inbox).queryByText('P2')).toBeNull()
+    expect(
+      Array.from(inbox.querySelectorAll('[data-live-graph-task-age]')).map(element => element.textContent)
+    ).toEqual(['2h ago', '5h ago'])
+    expect(inbox.querySelector('[data-live-graph-task-age] .codicon')).toBeNull()
 
     fireEvent.click(within(inbox).getByRole('button', { name: 'View task: Verify live app' }))
 

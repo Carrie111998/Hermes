@@ -1,9 +1,10 @@
 import { AnimatePresence, LayoutGroup, motion, useReducedMotion } from 'motion/react'
-import { memo, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { useI18n } from '@/i18n'
+import { formatAgo } from '@/lib/time'
 
 import {
   LIVE_GRAPH_ATTENTION_STATUSES,
@@ -15,6 +16,7 @@ import {
 
 const COMPLETED_PAGE_SIZE = 10
 const COMPLETED_PAGE_INCREMENT = 25
+const TASK_AGE_REFRESH_INTERVAL_MS = 60_000
 
 type WorkflowInboxFilter = 'active' | 'all' | 'attention' | 'completed'
 
@@ -75,7 +77,46 @@ function taskSort(left: LiveGraphNode, right: LiveGraphNode): number {
 }
 
 function completedTaskSort(left: LiveGraphNode, right: LiveGraphNode): number {
-  return (right.createdAt ?? 0) - (left.createdAt ?? 0) || left.label.localeCompare(right.label)
+  return (
+    (right.completedAt ?? right.createdAt ?? 0) - (left.completedAt ?? left.createdAt ?? 0) ||
+    left.label.localeCompare(right.label)
+  )
+}
+
+interface TaskLifecycleTiming {
+  timestampMs: number
+}
+
+function taskTimestampMs(value: number | undefined): number | null {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return null
+  }
+
+  const timestampMs = value < 1_000_000_000_000 ? value * 1000 : value
+
+  return timestampMs <= 8_640_000_000_000_000 ? timestampMs : null
+}
+
+function taskLifecycleTiming(task: LiveGraphNode): TaskLifecycleTiming | null {
+  const completedAt = taskTimestampMs(task.completedAt)
+  const status = normalizeLiveGraphStatus(task.status)
+
+  if (
+    completedAt !== null &&
+    (status === 'closed' || status === 'completed' || status === 'failed' || status === 'interrupted')
+  ) {
+    return { timestampMs: completedAt }
+  }
+
+  const startedAt = taskTimestampMs(task.startedAt)
+
+  if (startedAt !== null) {
+    return { timestampMs: startedAt }
+  }
+
+  const createdAt = taskTimestampMs(task.createdAt)
+
+  return createdAt === null ? null : { timestampMs: createdAt }
 }
 
 function TaskStatus({ status }: { status: string }) {
@@ -96,16 +137,18 @@ function TaskStatus({ status }: { status: string }) {
 }
 
 interface TaskCardProps {
+  nowMs: number
   onSelect: () => void
   reducedMotion: boolean
   task: LiveGraphNode
 }
 
-function TaskCard({ onSelect, reducedMotion, task }: TaskCardProps) {
+function TaskCard({ nowMs, onSelect, reducedMotion, task }: TaskCardProps) {
   const { t } = useI18n()
   const assignee = clean(task.assignee) || t.liveGraph.unassigned
   const currentTool = clean(task.currentTool)
   const supportingText = clean(task.summary) || clean(task.detail) || clean(task.result)
+  const timing = taskLifecycleTiming(task)
 
   return (
     <motion.article
@@ -153,11 +196,15 @@ function TaskCard({ onSelect, reducedMotion, task }: TaskCardProps) {
               </span>
             </>
           ) : null}
-          {task.priority !== undefined && (
-            <span className="ml-auto shrink-0 rounded-sm bg-(--ui-bg-elevated) px-1 py-0.5 font-mono">
-              P{task.priority}
-            </span>
-          )}
+          {timing ? (
+            <time
+              className="ml-auto shrink-0"
+              data-live-graph-task-age
+              dateTime={new Date(timing.timestampMs).toISOString()}
+            >
+              {formatAgo(timing.timestampMs, t.agents, nowMs)}
+            </time>
+          ) : null}
         </span>
       </button>
     </motion.article>
@@ -165,13 +212,16 @@ function TaskCard({ onSelect, reducedMotion, task }: TaskCardProps) {
 }
 
 interface CompletedTaskRowProps {
+  nowMs: number
   onSelect: () => void
   reducedMotion: boolean
   task: LiveGraphNode
 }
 
-function CompletedTaskRow({ onSelect, reducedMotion, task }: CompletedTaskRowProps) {
+function CompletedTaskRow({ nowMs, onSelect, reducedMotion, task }: CompletedTaskRowProps) {
   const { t } = useI18n()
+  const timing = taskLifecycleTiming(task)
+  const timingLabel = timing ? formatAgo(timing.timestampMs, t.agents, nowMs) : ''
 
   return (
     <motion.div
@@ -190,6 +240,15 @@ function CompletedTaskRow({ onSelect, reducedMotion, task }: CompletedTaskRowPro
       >
         <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="checklist" />
         <span className="min-w-0 flex-1 truncate text-[0.6875rem] text-(--ui-text-secondary)">{task.label}</span>
+        {timing ? (
+          <time
+            className="shrink-0 text-[0.625rem] text-(--ui-text-quaternary)"
+            data-live-graph-task-age
+            dateTime={new Date(timing.timestampMs).toISOString()}
+          >
+            {timingLabel}
+          </time>
+        ) : null}
       </button>
     </motion.div>
   )
@@ -203,7 +262,14 @@ export const LiveGraphWorkflowInbox = memo(function LiveGraphWorkflowInbox({
   const { t } = useI18n()
   const reducedMotion = Boolean(useReducedMotion())
   const [filter, setFilter] = useState<WorkflowInboxFilter>('all')
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const [visibleCompletedCount, setVisibleCompletedCount] = useState(COMPLETED_PAGE_SIZE)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), TASK_AGE_REFRESH_INTERVAL_MS)
+
+    return () => window.clearInterval(timer)
+  }, [])
 
   const { activeTasks, attentionTasks, completedTasks } = useMemo(() => {
     const active: LiveGraphNode[] = []
@@ -316,6 +382,7 @@ export const LiveGraphWorkflowInbox = memo(function LiveGraphWorkflowInbox({
                   {attentionTasks.map(task => (
                     <TaskCard
                       key={task.id}
+                      nowMs={nowMs}
                       onSelect={() => onSelectTask(task.id)}
                       reducedMotion={reducedMotion}
                       task={task}
@@ -353,6 +420,7 @@ export const LiveGraphWorkflowInbox = memo(function LiveGraphWorkflowInbox({
                   {activeTasks.map(task => (
                     <TaskCard
                       key={task.id}
+                      nowMs={nowMs}
                       onSelect={() => onSelectTask(task.id)}
                       reducedMotion={reducedMotion}
                       task={task}
@@ -387,6 +455,7 @@ export const LiveGraphWorkflowInbox = memo(function LiveGraphWorkflowInbox({
                   {visibleCompletedTasks.map(task => (
                     <CompletedTaskRow
                       key={task.id}
+                      nowMs={nowMs}
                       onSelect={() => onSelectTask(task.id)}
                       reducedMotion={reducedMotion}
                       task={task}

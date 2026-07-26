@@ -9,6 +9,7 @@ export type LiveGraphEdgeKind = 'contains' | 'delegated_to' | 'depends_on' | 'pr
 export interface LiveGraphNode {
   assignee?: string
   board?: string
+  completedAt?: number
   createdAt?: number
   currentTool?: string
   detail?: string
@@ -21,6 +22,7 @@ export interface LiveGraphNode {
   priority?: number
   revision?: number
   result?: string
+  startedAt?: number
   status?: string
   summary?: string
   workflowId?: string
@@ -461,6 +463,7 @@ export function buildSessionLiveGraph(input: SessionLiveGraphInput): LiveGraphSn
       putNode({
         ...(clean(task.assignee) ? { assignee: clean(task.assignee) } : {}),
         board,
+        ...(typeof task.completed_at === 'number' ? { completedAt: task.completed_at } : {}),
         ...(typeof task.created_at === 'number' ? { createdAt: task.created_at } : {}),
         ...(currentTool ? { currentTool } : {}),
         ...(clean(task.body) ? { detail: clean(task.body) } : {}),
@@ -471,6 +474,7 @@ export function buildSessionLiveGraph(input: SessionLiveGraphInput): LiveGraphSn
         ...(typeof task.priority === 'number' && Number.isFinite(task.priority) ? { priority: task.priority } : {}),
         revision,
         ...(clean(task.result) ? { result: clean(task.result) } : {}),
+        ...(typeof task.started_at === 'number' ? { startedAt: task.started_at } : {}),
         status: normalizedStatus(task.status),
         ...(clean(task.latest_summary) ? { summary: clean(task.latest_summary) } : {}),
         workflowId

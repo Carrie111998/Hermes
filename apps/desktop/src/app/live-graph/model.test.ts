@@ -73,11 +73,13 @@ describe('buildSessionLiveGraph', () => {
             {
               assignee: 'builder',
               body: 'Implement the selected task inspector.',
+              completed_at: 303,
               created_at: 101,
               id: 'task-1',
               latest_summary: 'Inspector wiring is complete.',
               priority: 2,
               result: 'Focused tests passed.',
+              started_at: 202,
               status: 'done',
               title: 'Show task details'
             }
@@ -89,11 +91,13 @@ describe('buildSessionLiveGraph', () => {
     expect(graph.nodes.find(node => node.kind === 'task')).toMatchObject({
       assignee: 'builder',
       board: 'alpha',
+      completedAt: 303,
       createdAt: 101,
       detail: 'Implement the selected task inspector.',
       entityId: 'task-1',
       priority: 2,
       result: 'Focused tests passed.',
+      startedAt: 202,
       summary: 'Inspector wiring is complete.',
       workflowId: 'workflow-1'
     })
