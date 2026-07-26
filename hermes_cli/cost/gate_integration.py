@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hermes_cli.cost import caps, ledger, telegram_alert
+from hermes_cli.cost import ledger, telegram_alert
 
 
 logger = logging.getLogger(__name__)
@@ -102,65 +102,6 @@ def _send_bridge_hard_alert_telegram(
         bridge_caps=bridge_caps,
         db_path=db_path,
     )
-
-
-def send_task_cap_kill_alert(
-    *,
-    task_id: str,
-    lane: str,
-    projected_total: float,
-    task_cap_aud: float,
-    db_path: str | Path | None = None,
-) -> bool:
-    """Send one hourly-deduplicated alert after a task-cap kill commits."""
-    from hermes_cli.programme import gate as programme_gate
-    from hermes_cli.side_effects import api as side_effects
-
-    state = programme_gate.get_state(db_path).state
-    message = (
-        "⚠️ TASK CAP HIT\n"
-        f"task_id: {task_id}\n"
-        f"lane: {lane}\n"
-        f"projected: {projected_total:.2f} AUD\n"
-        f"cap: {task_cap_aud:.2f} AUD\n"
-        f"programme_state: {state}\n"
-        "(task marked FAILED, kill_switch row inserted)"
-    )
-    bucket = _hour_bucket(f"task_cap_kill:{task_id}")
-    reservation = side_effects.reserve(
-        task_id=str(task_id),
-        lane="platform",
-        action_type="telegram.send",
-        payload={"target": "telegram", "message": message},
-        idempotency_key=bucket,
-        db_path=db_path,
-    )
-    if reservation.already_done is not None:
-        return False
-    if reservation.already_in_flight is not None:
-        return False
-    if reservation.reserved_id is None:
-        return False
-
-    row_id = reservation.reserved_id
-    side_effects.mark_in_flight(reserved_id=row_id, db_path=db_path)
-    try:
-        telegram_alert.send_bridge_alert(message)
-    except Exception as exc:
-        side_effects.fail(
-            reserved_id=row_id,
-            error_class=type(exc).__name__,
-            error_message=str(exc),
-            db_path=db_path,
-        )
-        raise
-    side_effects.confirm(
-        reserved_id=row_id,
-        external_ref=None,
-        result_summary="task cap kill alert delivered",
-        db_path=db_path,
-    )
-    return True
 
 
 def send_task_cost_advisory(
@@ -294,7 +235,7 @@ def on_call_complete(
     ``enforce_programme_cap`` remains accepted for API compatibility but is
     intentionally inert.
     """
-    entry = ledger.record_call(
+    ledger.record_call(
         task_id=task_id,
         lane=lane,
         vendor=vendor,
@@ -314,25 +255,10 @@ def on_call_complete(
         session_id=session_id,
         enforce_programme_cap=enforce_programme_cap,
     )
-    if not entry.transitioned_to_paused or entry.breach_reason is None:
-        return
-
-    # Notification is deliberately outside the SQLite transaction. The
-    # durable state transition is authoritative even if Telegram is down, and
-    # a transport failure must never retry a paid provider call.
-    try:
-        telegram_alert.send_cost_alert(
-            entry.breach_reason,
-            caps.daily_spend_aud(),
-            ledger.format_ledger_tail(5),
-        )
-    except Exception:
-        logger.exception("Cost gate paused programme but Telegram alert failed")
 
 
 __all__ = [
     "on_call_complete",
     "record_bridge_turn",
-    "send_task_cap_kill_alert",
     "send_task_cost_advisory",
 ]

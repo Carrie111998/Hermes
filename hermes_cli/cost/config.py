@@ -4,8 +4,8 @@ Routing-doctrine configuration is intentionally deferred to CS-05.  These
 constants are kept in one module so tests and future configuration plumbing
 can replace values without changing the ledger or threshold evaluator.
 
-Normal runtime behavior treats these values as advisory. Explicit operator
-kill controls and opt-in hard enforcement remain separate mechanisms.
+Runtime behavior treats these values as advisory. Explicit operator kill
+controls remain a separate mechanism.
 """
 
 from hermes_cli.cost.vendors import ALLOWED_LANES, VENDORS

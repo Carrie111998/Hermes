@@ -172,12 +172,26 @@ def test_scenario_cascade_exhausted_writes_sentinel_provider_model(
     assert tuple(row) == ("__all_failed__", "__none__")
 
 
-def test_scenario_cap_hit_halts_at_stage_4_with_PerTaskCapExceeded(
+def test_scenario_cost_advisory_records_threshold_and_continues(
     db_path: Path,
 ) -> None:
-    result = _run(db_path, "cap_hit")
-    assert len(result.stages) == 4
-    assert result.stages[-1].outcome == "PerTaskCapExceeded"
+    result = _run(db_path, "cost_advisory")
+    llm_call = _stage(result, "llm_call")
+    cost_ledger = _stage(result, "cost_ledger")
+    leaf_verdict = _stage(result, "leaf_verdict")
+
+    assert result.overall == "PASS"
+    assert len(result.stages) == 9
+    assert llm_call.outcome == "success"
+    assert llm_call.details["cost_advisory"]["advisory_only"] is True
+    assert cost_ledger.details["breached_cap"] == "per_task"
+    assert cost_ledger.details["transitioned_to_paused"] is False
+    assert cost_ledger.details["advisory_only"] is True
+    assert leaf_verdict.outcome == "success"
+    assert _rows(
+        db_path,
+        "SELECT state FROM programme_state WHERE id = 1",
+    )[0]["state"] == "RUNNING"
 
 
 def test_scenario_kill_switch_halts_at_stage_4_with_KillSwitchTripped(

@@ -6759,6 +6759,7 @@ class AIAgent:
             reset_conversation_context,
             set_conversation_context,
         )
+        from hermes_cli.cost.kill_switch import KillSwitchTripped
         # Publish the conversation id for ambient Nous Portal tagging. Every
         # LLM call made inside this turn — main loop, compression, vision,
         # web_extract, session_search, MoA slots, background-review forks
@@ -6802,17 +6803,7 @@ class AIAgent:
                         _programme_ingress_admitted=True,
                         _session_rotation_checked=True,
                     )
-                except Exception as exc:
-                    from hermes_cli.cost.kill_switch import (
-                        KillSwitchTripped,
-                        PerTaskCapExceeded,
-                    )
-
-                    if not isinstance(
-                        exc,
-                        (KillSwitchTripped, PerTaskCapExceeded),
-                    ):
-                        raise
+                except KillSwitchTripped as exc:
                     logger.error(
                         "Task termination fence tripped",
                         extra={
@@ -6831,10 +6822,6 @@ class AIAgent:
                             canonical_strategy_hash,
                         )
 
-                        killed_by_cap = isinstance(
-                            exc,
-                            PerTaskCapExceeded,
-                        )
                         attempt = (
                             attempts_at_current_rung(exc.task_id, rung_id) + 1
                         )
@@ -6849,16 +6836,8 @@ class AIAgent:
                                 attempt_number=attempt,
                                 rung_id=rung_id,
                                 model_used=str(self.model or "unknown"),
-                                outcome=(
-                                    "killed_by_cap"
-                                    if killed_by_cap
-                                    else "killed_by_operator"
-                                ),
-                                failure_class=(
-                                    "cost_cap"
-                                    if killed_by_cap
-                                    else "operator"
-                                ),
+                                outcome="killed_by_operator",
+                                failure_class="operator",
                                 confidence=1.0,
                                 strategy_hash=canonical_strategy_hash(
                                     strategy_payload

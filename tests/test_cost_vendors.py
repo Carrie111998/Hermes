@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli.cost import caps, ledger, ratecards, recorders, vendors
+from hermes_cli.cost.kill_switch import KillSwitchTripped, PerTaskCapExceeded
 from hermes_cli.verdict import schema as verdict_schema
 
 
@@ -409,8 +410,21 @@ def test_aux_perplexity_call_writes_ledger_row_when_wired(cost_db):
     assert (row["vendor"], row["lane"]) == ("perplexity", "dayroute")
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("ledger unavailable"),
+        PerTaskCapExceeded(
+            task_id="t-aux",
+            current_total=0.9,
+            projected_total=1.1,
+            cap=1.0,
+        ),
+    ],
+    ids=["accounting-error", "deprecated-cap-exception"],
+)
 def test_aux_perplexity_call_ledger_failure_is_non_fatal(
-    cost_db, monkeypatch, caplog
+    cost_db, monkeypatch, caplog, failure
 ):
     from agent.aux_accounting import (
         record_aux_usage,
@@ -419,7 +433,7 @@ def test_aux_perplexity_call_ledger_failure_is_non_fatal(
     )
 
     def fail(**kwargs):
-        raise RuntimeError("ledger unavailable")
+        raise failure
 
     monkeypatch.setattr(recorders, "record_perplexity_call", fail)
     session = _SessionUsage()
@@ -440,4 +454,37 @@ def test_aux_perplexity_call_ledger_failure_is_non_fatal(
     finally:
         reset_accounting_context(token)
     assert session.calls == 1
-    assert "RuntimeError: ledger unavailable" in caplog.text
+    assert f"{type(failure).__name__}: {failure}" in caplog.text
+
+
+def test_aux_perplexity_call_operator_kill_is_fatal(cost_db, monkeypatch):
+    from agent.aux_accounting import (
+        record_aux_usage,
+        reset_accounting_context,
+        set_accounting_context,
+    )
+
+    failure = KillSwitchTripped(task_id="t-aux", reason="operator")
+
+    def fail(**kwargs):
+        raise failure
+
+    monkeypatch.setattr(recorders, "record_perplexity_call", fail)
+    session = _SessionUsage()
+    token = set_accounting_context(
+        session,
+        "session-1",
+        task_id="t-aux",
+        lane="platform",
+    )
+    try:
+        with pytest.raises(KillSwitchTripped) as raised:
+            record_aux_usage(
+                _aux_response(),
+                "web_search",
+                provider="perplexity",
+                base_url="https://api.perplexity.ai",
+            )
+    finally:
+        reset_accounting_context(token)
+    assert raised.value is failure

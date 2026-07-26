@@ -6,7 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from hermes_cli.cost.kill_switch import KillSwitchTripped, PerTaskCapExceeded
+from hermes_cli.cost import config as cost_config
+from hermes_cli.cost.kill_switch import KillSwitchTripped
 
 
 @dataclass
@@ -47,13 +48,6 @@ class MockLLMCall:
                 "ts": time.time(),
             }
         )
-        if self.scenario == "cap_hit":
-            raise PerTaskCapExceeded(
-                task_id=self.task_id,
-                current_total=0.99,
-                projected_total=1.01,
-                cap=1.00,
-            )
         if self.scenario == "kill_switch":
             raise KillSwitchTripped(task_id=self.task_id, reason="test")
         if self.scenario == "fallback_success" and attempt == 0:
@@ -65,11 +59,23 @@ class MockLLMCall:
                 else "mocked fallback timeout after 800ms"
             )
         self.provider_switches = max(0, int(attempt))
-        return {
+        response = {
             "text": "synthetic smoke response",
             "output_tokens": 80 if attempt else 100,
             "latency_ms": 800 if attempt else 400,
+            "amount_aud": 0.01,
         }
+        if self.scenario == "cost_advisory":
+            threshold = float(cost_config.PER_TASK_CAP_AUD)
+            response["amount_aud"] = threshold + 0.01
+            response["billing_vendor"] = "openrouter"
+            response["cost_advisory"] = {
+                "threshold": "per_task",
+                "threshold_aud": threshold,
+                "projected_total_aud": threshold + 0.01,
+                "advisory_only": True,
+            }
+        return response
 
 
 __all__ = ["MockLLMCall", "NoOpTelegramBucket"]

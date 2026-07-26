@@ -3773,7 +3773,6 @@ def run_conversation(
                 from hermes_cli.cost.errors import SubscriptionBridgeHaltedError
                 from hermes_cli.cost.kill_switch import (
                     KillSwitchTripped,
-                    PerTaskCapExceeded,
                 )
 
                 if isinstance(
@@ -3781,7 +3780,6 @@ def run_conversation(
                     (
                         SubscriptionBridgeHaltedError,
                         KillSwitchTripped,
-                        PerTaskCapExceeded,
                     ),
                 ):
                     raise
@@ -7286,7 +7284,6 @@ def run_conversation(
             from hermes_cli.cost.errors import SubscriptionBridgeHaltedError
             from hermes_cli.cost.kill_switch import (
                 KillSwitchTripped,
-                PerTaskCapExceeded,
             )
 
             if isinstance(
@@ -7294,7 +7291,6 @@ def run_conversation(
                 (
                     SubscriptionBridgeHaltedError,
                     KillSwitchTripped,
-                    PerTaskCapExceeded,
                 ),
             ):
                 raise

@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from hermes_cli.cost import caps, ledger, telegram_alert
+from hermes_cli.cost import gate_integration
 from hermes_cli.cost.gate_integration import on_call_complete
 from hermes_cli.programme import gate as programme_gate
 from hermes_cli.programme import init as programme_init
@@ -82,6 +83,10 @@ def _breaching_call(
 
 def test_daily_spend_aud_zero_when_empty(cost_env):
     assert caps.daily_spend_aud() == 0.0
+
+
+def test_cost_gate_has_no_task_cap_kill_alert_api(cost_env):
+    assert not hasattr(gate_integration, "send_task_cap_kill_alert")
 
 
 def test_daily_spend_aud_sums_today(cost_env):

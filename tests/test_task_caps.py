@@ -733,7 +733,7 @@ def test_conversation_loop_terminates_on_KillSwitchTripped_with_leaf_verdict_kil
     assert recorded[0].failure_class == "operator"
 
 
-def test_conversation_loop_terminates_on_PerTaskCapExceeded_with_leaf_verdict_killed_by_cap(
+def test_conversation_wrapper_does_not_record_legacy_cap_exception_as_termination(
     monkeypatch,
 ):
     exception = PerTaskCapExceeded(
@@ -744,23 +744,15 @@ def test_conversation_loop_terminates_on_PerTaskCapExceeded_with_leaf_verdict_ki
     )
     recorded, raised = _run_fenced_conversation(monkeypatch, exception)
     assert raised is exception
-    assert len(recorded) == 1
-    assert recorded[0].outcome == "killed_by_cap"
-    assert recorded[0].failure_class == "cost_cap"
+    assert recorded == []
 
 
-def test_conversation_loop_does_not_swallow_kill_or_cap_exceptions(
+def test_conversation_wrapper_does_not_swallow_operator_kill(
     monkeypatch,
 ):
-    exceptions = (
-        KillSwitchTripped(task_id="operator-task", reason="operator"),
-        PerTaskCapExceeded(
-            task_id="cap-task",
-            current_total=0.05,
-            projected_total=0.11,
-            cap=0.10,
-        ),
+    exception = KillSwitchTripped(
+        task_id="operator-task",
+        reason="operator",
     )
-    for exception in exceptions:
-        _recorded, raised = _run_fenced_conversation(monkeypatch, exception)
-        assert raised is exception
+    _recorded, raised = _run_fenced_conversation(monkeypatch, exception)
+    assert raised is exception

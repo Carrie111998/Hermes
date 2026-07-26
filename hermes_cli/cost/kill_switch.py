@@ -34,6 +34,8 @@ class KillSwitchTripped(Exception):
 
 
 class PerTaskCapExceeded(Exception):
+    """Deprecated import-compatible signal from the former hard cost cap."""
+
     def __init__(
         self,
         *,

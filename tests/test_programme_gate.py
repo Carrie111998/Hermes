@@ -26,6 +26,10 @@ def test_migration_creates_default_running_state(programme_env):
     assert gate.get_state().state == "RUNNING"
 
 
+def test_programme_gate_has_no_cost_threshold_pause_api(programme_env):
+    assert not hasattr(gate, "pause_for_cost_breach_in_transaction")
+
+
 def test_admit_task_when_running(programme_env):
     assert gate.admit_task("t_test") == (True, "admitted")
 

@@ -221,12 +221,9 @@ def _record_perplexity_aux_cost(
             session_id=session_id,
         )
     except Exception as exc:
-        from hermes_cli.cost.kill_switch import (
-            KillSwitchTripped,
-            PerTaskCapExceeded,
-        )
+        from hermes_cli.cost.kill_switch import KillSwitchTripped
 
-        if isinstance(exc, (KillSwitchTripped, PerTaskCapExceeded)):
+        if isinstance(exc, KillSwitchTripped):
             raise
         logger.warning(
             "Perplexity auxiliary cost recording failed (non-fatal): %s: %s",
@@ -388,11 +385,8 @@ def record_aux_usage(
             session_id=session_id,
         )
     except Exception as exc:
-        from hermes_cli.cost.kill_switch import (
-            KillSwitchTripped,
-            PerTaskCapExceeded,
-        )
+        from hermes_cli.cost.kill_switch import KillSwitchTripped
 
-        if isinstance(exc, (KillSwitchTripped, PerTaskCapExceeded)):
+        if isinstance(exc, KillSwitchTripped):
             raise
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

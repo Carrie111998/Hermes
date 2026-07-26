@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from hermes_constants import get_default_hermes_root
-from hermes_cli.cost import ledger, turns_ledger
+from hermes_cli.cost import gate_integration, ledger, turns_ledger
 from hermes_cli.cost.errors import ProgrammeGatePausedAtIngress
-from hermes_cli.cost.kill_switch import KillSwitchTripped, PerTaskCapExceeded
+from hermes_cli.cost.kill_switch import KillSwitchTripped
 from hermes_cli.programme import init as programme_init
 from hermes_cli.programme.ingress import admit_new_turn
 from hermes_cli.routing import facade, route_context
@@ -42,7 +42,7 @@ VALID_SCENARIOS = frozenset(
         "success",
         "fallback_success",
         "cascade_exhausted",
-        "cap_hit",
+        "cost_advisory",
         "kill_switch",
         "gate_paused",
     }
@@ -230,6 +230,26 @@ def _intercept_doctrine_alert(
 
 
 @contextmanager
+def _intercept_cost_advisory(
+    bucket: NoOpTelegramBucket,
+) -> Iterator[None]:
+    previous_advisory = gate_integration.send_task_cost_advisory
+
+    def _capture_advisory(**payload: Any) -> bool:
+        bucket.send(
+            key="task_cost_advisory:smoke_test",
+            payload=dict(payload),
+        )
+        return True
+
+    gate_integration.send_task_cost_advisory = _capture_advisory
+    try:
+        yield
+    finally:
+        gate_integration.send_task_cost_advisory = previous_advisory
+
+
+@contextmanager
 def _route_environment(context: dict[str, Any]) -> Iterator[None]:
     previous_env = os.environ.get("HERMES_ROUTE_CONTEXT_JSON")
     route_context._reset_for_tests()
@@ -270,7 +290,7 @@ def _attempt_calls(
                 attempt=attempt,
             )
             break
-        except (PerTaskCapExceeded, KillSwitchTripped):
+        except KillSwitchTripped:
             raise
         except TimeoutError as exc:
             entry = {
@@ -436,20 +456,6 @@ def run_smoke_turn(
                     route,
                     fallbacks,
                 )
-            except PerTaskCapExceeded as exc:
-                _stage(
-                    result.stages,
-                    "llm_call",
-                    "PerTaskCapExceeded",
-                    {
-                        "error": str(exc),
-                        "attempts": mock.calls,
-                        "tokens_before_exception": 20,
-                    },
-                    started,
-                )
-                result.overall = "FAIL"
-                return result
             except KillSwitchTripped as exc:
                 _stage(
                     result.stages,
@@ -468,6 +474,21 @@ def run_smoke_turn(
             cascade_exhausted = response is None
             if cascade_exhausted:
                 chosen_provider, chosen_model = "__all_failed__", "__none__"
+            cost_advisory = (
+                dict(response.get("cost_advisory") or {})
+                if response is not None
+                else {}
+            )
+            call_amount_aud = (
+                float(response.get("amount_aud", 0.01))
+                if response is not None
+                else 0.01
+            )
+            billing_vendor = (
+                str(response.get("billing_vendor") or chosen_provider)
+                if response is not None
+                else "openrouter"
+            )
             next_admit_blocked = False
             if normalized_scenario == "gate_paused":
                 conn = programme_init.connect(working)
@@ -510,6 +531,7 @@ def run_smoke_turn(
                     ),
                     "next_admit_blocked": next_admit_blocked,
                     "current_turn_continued": True,
+                    "cost_advisory": cost_advisory,
                 },
                 started,
             )
@@ -522,6 +544,7 @@ def run_smoke_turn(
                     history[0]["failure_class"] if history else None
                 ),
                 "failure_history": history,
+                "cost_advisory": cost_advisory,
             }
             strategy_hash = canonical_strategy_hash(raw_meta)
             verdict_id = record_verdict(
@@ -537,7 +560,7 @@ def run_smoke_turn(
                     ),
                     confidence=0.0 if cascade_exhausted else 1.0,
                     strategy_hash=strategy_hash,
-                    cost_aud=0.01,
+                    cost_aud=call_amount_aud,
                     input_tokens=20,
                     output_tokens=(
                         int(response["output_tokens"]) if response else 0
@@ -573,31 +596,37 @@ def run_smoke_turn(
             )
 
             started = time.perf_counter()
-            cost = ledger.record_call(
-                task_id=task_id,
-                lane=accounting_lane,
-                vendor=chosen_provider if not cascade_exhausted else "openrouter",
-                model_slug=chosen_model,
-                attempt_number=max(1, len(mock.calls)),
-                rung_id="r0_baseline",
-                input_tokens=20,
-                output_tokens=(
-                    int(response["output_tokens"]) if response else 0
-                ),
-                latency_ms=(
-                    int(response["latency_ms"]) if response else 2_000
-                ),
-                amount_aud=0.01,
-                raw_response_meta={
-                    "vendor": "mock_vendor",
-                    "scenario": normalized_scenario,
-                },
-                profile="smoke_test",
-                route="smoke_test",
-                session_id=session_id,
-                enforce_task_cap=False,
-                db_path=working,
-            )
+            with _intercept_cost_advisory(bucket):
+                cost = ledger.record_call(
+                    task_id=task_id,
+                    lane=accounting_lane,
+                    vendor=(
+                        billing_vendor
+                        if not cascade_exhausted
+                        else "openrouter"
+                    ),
+                    model_slug=chosen_model,
+                    attempt_number=max(1, len(mock.calls)),
+                    rung_id="r0_baseline",
+                    input_tokens=20,
+                    output_tokens=(
+                        int(response["output_tokens"]) if response else 0
+                    ),
+                    latency_ms=(
+                        int(response["latency_ms"]) if response else 2_000
+                    ),
+                    amount_aud=call_amount_aud,
+                    raw_response_meta={
+                        "vendor": "mock_vendor",
+                        "scenario": normalized_scenario,
+                        "cost_advisory": cost_advisory,
+                    },
+                    profile="smoke_test",
+                    route="smoke_test",
+                    session_id=session_id,
+                    enforce_task_cap=False,
+                    db_path=working,
+                )
             _stage(
                 result.stages,
                 "cost_ledger",
@@ -610,6 +639,12 @@ def run_smoke_turn(
                     "requested_lane": normalized_lane,
                     "profile": cost.profile,
                     "route": cost.route,
+                    "breached_cap": cost.breached_cap,
+                    "breach_reason": cost.breach_reason,
+                    "transitioned_to_paused": cost.transitioned_to_paused,
+                    "advisory_only": bool(
+                        cost.breached_cap and not cost.transitioned_to_paused
+                    ),
                 },
                 started,
             )
@@ -624,7 +659,7 @@ def run_smoke_turn(
                     mode="single",
                     strategy_payload=raw_meta,
                     parent_verdict_id=verdict_id,
-                    expected_cost_aud=0.01,
+                    expected_cost_aud=call_amount_aud,
                     issued_by="smoke_test",
                 ),
                 db_path=working,

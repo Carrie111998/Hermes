@@ -157,31 +157,6 @@ def _write_state(
     )
 
 
-def pause_for_cost_breach_in_transaction(
-    conn: sqlite3.Connection,
-    reason: str,
-) -> tuple[ProgrammeState, bool]:
-    """Pause once using the caller's ledger transaction.
-
-    The returned boolean is true only for the transaction that performed the
-    RUNNING/DRAINING/HALTED -> PAUSED transition. Notification transports use
-    it after commit so concurrent paid calls cannot emit duplicate alerts.
-    """
-    current = _read_state(conn)
-    if current.state == "PAUSED":
-        return current, False
-    return (
-        _write_state(
-            conn,
-            state="PAUSED",
-            reason=reason,
-            changed_by="cost_gate",
-            task_count_at_change=_inflight_count(conn),
-        ),
-        True,
-    )
-
-
 def set_state(
     state: str,
     reason: str | None = None,
@@ -262,7 +237,6 @@ __all__ = [
     "get_state",
     "inflight_count",
     "is_halt_signalled",
-    "pause_for_cost_breach_in_transaction",
     "set_state",
     "signal_in_flight_stop",
 ]
