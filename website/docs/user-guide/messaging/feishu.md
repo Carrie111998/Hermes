@@ -96,7 +96,7 @@ Hermes can turn a Feishu/Lark bot custom-menu click into a normal inbound text m
 5. No special home-chat configuration is required. Hermes routes the click to the clicking user's P2P session using the operator's Open ID.
 6. Publish a new app version after saving the menu and event subscription.
 
-When a user clicks the item, Hermes resolves the clicking user's identity and processes the event key through the same direct-message admission and message-handling path as a text message. User allowlists and pairing therefore still apply, and replies return to the clicking user's P2P chat. Feishu event IDs are used for deduplication so a retried delivery does not execute the command twice.
+When a user clicks the item, Hermes resolves the clicking user's identity, immediately sends a short acknowledgement (for example, `Received: Status — checking...`), and then processes the event key through the same direct-message admission and message-handling path as a text message. User allowlists and pairing therefore still apply, and the final result returns to the clicking user's P2P chat. Feishu event IDs are used for deduplication so a retried delivery does not send a second acknowledgement or execute the command twice. If the acknowledgement cannot be delivered, Hermes logs the delivery error and still attempts the requested command.
 
 :::tip
 Use slash-command strings as event keys when you want deterministic command behavior. Other text is also accepted and is handled as though the user sent that text in a direct message.
