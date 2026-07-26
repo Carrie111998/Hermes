@@ -1,5 +1,5 @@
 import type { AppendMessage } from '@assistant-ui/react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 
@@ -205,6 +205,18 @@ describe('renderRpcResult', () => {
       expect(renderRpcResult({ calls: 12, input: 1_234_567, output: 89_012, total: 1_323_579 }, 'usage')).toBe(
         'Usage: 12 calls · 1,234,567 in / 89,012 out · 1,323,579 total'
       )
+    })
+
+    it('pins English usage copy to en-US number formatting', () => {
+      const localeSpy = vi.spyOn(Number.prototype, 'toLocaleString').mockImplementation(function (this: number) {
+        return String(this)
+      })
+
+      renderRpcResult({ calls: 12, input: 1_234, output: 56, total: 1_290 }, 'usage')
+
+      expect(localeSpy).toHaveBeenCalledTimes(4)
+      expect(localeSpy.mock.calls).toEqual([['en-US'], ['en-US'], ['en-US'], ['en-US']])
+      localeSpy.mockRestore()
     })
 
     it('appends credits_lines when present', () => {
