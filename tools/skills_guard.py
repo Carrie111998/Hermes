@@ -565,6 +565,41 @@ INVISIBLE_CHARS = {
 # Scanning functions
 # ---------------------------------------------------------------------------
 
+# Windows PowerShell's Out-File and Set-Content default to UTF-16LE with a
+# BOM, and editors on Windows routinely save .ps1/.bat with a UTF-8 BOM, so a
+# perfectly ordinary script can arrive in any of these encodings. Decoding as
+# UTF-8 only would treat a UTF-16 script as an unreadable binary and skip it
+# entirely — the scanner would advertise coverage it does not have.
+# Longest BOM first: the UTF-32LE mark starts with the UTF-16LE one.
+_BOM_ENCODINGS = (
+    (b'\x00\x00\xfe\xff', 'utf-32-be'),
+    (b'\xff\xfe\x00\x00', 'utf-32-le'),
+    (b'\xef\xbb\xbf', 'utf-8'),
+    (b'\xfe\xff', 'utf-16-be'),
+    (b'\xff\xfe', 'utf-16-le'),
+)
+
+
+def _decode_text(raw: bytes):
+    """Decode a candidate text file, honouring a leading BOM.
+
+    Returns the decoded text, or None when the bytes are not text at all so
+    the caller can skip a genuine binary. The BOM itself is dropped rather
+    than decoded to U+FEFF, which would otherwise trip the invisible-unicode
+    check on every BOM-marked file.
+    """
+    for bom, encoding in _BOM_ENCODINGS:
+        if raw.startswith(bom):
+            try:
+                return raw[len(bom):].decode(encoding)
+            except UnicodeDecodeError:
+                return None
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+
+
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     """
     Scan a single file for threat patterns and invisible unicode characters.
@@ -593,8 +628,10 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
         return []
 
     try:
-        content = file_path.read_text(encoding='utf-8')
-    except (UnicodeDecodeError, OSError):
+        content = _decode_text(file_path.read_bytes())
+    except OSError:
+        return []
+    if content is None:
         return []
 
     findings = []
