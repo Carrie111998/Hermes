@@ -512,11 +512,9 @@ def test_guard_evaluation_and_structured_report_keep_same_usage_identity():
     assert payload["enforcement_outcome"] == "not_asserted"
 
     rendered = format_kill_report(evaluation)
-    assert "bound-session" in rendered
-    assert "provenance: mixed" in rendered
-    assert "known components: 1" in rendered
-    assert "unknown components: 1" in rendered
-    assert "enforcement outcome: not asserted" in rendered
+    assert "bound-session" not in rendered
+    assert "Usage provenance: mixed" in rendered
+    assert "Input tokens: 10" in rendered
+    assert "Interrupt request accepted: no" in rendered
     assert "turn aborted" not in rendered
-    assert "lease released" not in rendered
-    assert "No human action required" not in rendered
+    assert "lease released" not in rendered.lower()

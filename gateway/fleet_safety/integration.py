@@ -25,13 +25,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.usage_provenance import UsageProvenance, usage_aggregate_from_mapping
+from hermes_constants import get_hermes_home
 
 from gateway.fleet_safety.deadloop_guard import (
+    GuardOutcome,
     GuardThresholds,
     RunawayGuard,
     SessionObservation,
 )
 from gateway.fleet_safety.enforcer import GuardEnforcer, KillActions
+from gateway.fleet_safety.extension_lifecycle import ExtensionRegistry
 from gateway.fleet_safety.wallet_cap import (
     RoutingRequest,
     WalletCap,
@@ -58,6 +61,23 @@ logger = logging.getLogger(__name__)
 # token-rate detector meaningful from call-count data alone. Configurable via
 # ``fleet_safety.deadloop_guard.assumed_context_tokens``.
 DEFAULT_ASSUMED_CONTEXT_TOKENS = 160_000
+_EXTENSION_REGISTRIES: dict[str, ExtensionRegistry] = {}
+
+
+def _extension_state_path(config: dict) -> str:
+    configured = config.get("extension_state_path")
+    if configured:
+        return str(Path(configured).expanduser())
+    return str(get_hermes_home() / "fleet_safety" / "extensions.json")
+
+
+def _get_extension_registry(config: dict) -> ExtensionRegistry:
+    path = _extension_state_path(config)
+    registry = _EXTENSION_REGISTRIES.get(path)
+    if registry is None:
+        registry = ExtensionRegistry(path)
+        _EXTENSION_REGISTRIES[path] = registry
+    return registry
 
 
 def _load_full_config() -> dict:
@@ -78,17 +98,60 @@ def _load_fleet_safety_config() -> dict:
 # --------------------------------------------------------------------------
 
 
-def _get_or_create_guard(runner: Any, thresholds: GuardThresholds) -> RunawayGuard:
+def _get_or_create_guard(
+    runner: Any,
+    thresholds: GuardThresholds,
+    registry: Optional[ExtensionRegistry] = None,
+) -> RunawayGuard:
+    if registry is None:
+        path = getattr(runner, "_deadloop_extension_registry_path", None)
+        registry = _get_extension_registry(
+            {"extension_state_path": path} if path else {}
+        )
     guard = getattr(runner, "_deadloop_guard", None)
     if guard is None:
-        guard = RunawayGuard(thresholds)
+        guard = RunawayGuard(thresholds, extension_registry=registry)
         try:
             runner._deadloop_guard = guard
         except Exception:
             pass
     else:
         guard.thresholds = thresholds  # pick up live config changes each tick
+        guard.extension_registry = registry
     return guard
+
+
+def deny_active_extensions(
+    runner_or_session: Any,
+    session_ids: Optional[List[str]] = None,
+    *,
+    now: Optional[float] = None,
+) -> int:
+    """Persist exact STOP denial for active checkpoints.
+
+    The ``(runner, session_ids)`` form is used by gateway STOP routing. The
+    one-argument session-id form remains available to small integrations.
+    """
+
+    if session_ids is None:
+        ids = [str(runner_or_session)]
+        registries = tuple(_EXTENSION_REGISTRIES.values())
+    else:
+        ids = [str(value) for value in session_ids if str(value).strip()]
+        guard = getattr(runner_or_session, "_deadloop_guard", None)
+        registry = getattr(guard, "extension_registry", None)
+        registries = (registry,) if registry is not None else ()
+    denied = 0
+    decision_at = time.time() if now is None else float(now)
+    for session_id in ids:
+        per_session = 0
+        for registry in registries:
+            per_session += len(
+                registry.deny_active_for_session(session_id, now=decision_at)
+            )
+        if per_session:
+            denied += 1
+    return denied
 
 
 def _collect_observations(
@@ -122,6 +185,7 @@ def _collect_observations(
         attempt_seq = summary.get("attempt_seq")
         failure_seq = summary.get("failure_seq")
         progress_seq = summary.get("progress_seq")
+        no_progress_streak = summary.get("no_progress_streak")
         turn_generation = summary.get("turn_generation")
         is_non_retryable = bool(summary.get("is_non_retryable_failure", False))
         last_error_code = summary.get("last_error_code")
@@ -171,6 +235,11 @@ def _collect_observations(
                 ),
                 attempt_seq=(int(attempt_seq) if attempt_seq is not None else None),
                 progress_seq=(int(progress_seq) if progress_seq is not None else None),
+                no_progress_streak=(
+                    int(no_progress_streak)
+                    if no_progress_streak is not None
+                    else None
+                ),
                 failure_seq=(int(failure_seq) if failure_seq is not None else None),
                 failure_streak=int(summary.get("failure_streak", 0) or 0),
                 is_non_retryable_failure=is_non_retryable,
@@ -244,36 +313,12 @@ class _LiveKillActions(KillActions):
             evict = getattr(self._runner, "_evict_cached_agent", None)
             if callable(evict):
                 evict(session_key)
-
-            # ``AIAgent.interrupt`` is cooperative. Keep the generation-owned
-            # running slot and turn lease until the worker actually drains;
-            # otherwise a new turn can overlap a still-executing tool.
-            try:
-                timeout = float(
-                    getattr(self._runner, "_guard_interrupt_drain_timeout_s", 2.5)
-                )
-            except (TypeError, ValueError, OverflowError):
-                timeout = 2.5
-            deadline = time.monotonic() + max(0.0, min(timeout, 30.0))
-            running = getattr(self._runner, "_running_agents", {})
-            while running.get(session_key) is agent and time.monotonic() < deadline:
-                time.sleep(0.05)
-            if running.get(session_key) is agent:
-                return False
-
-            invalidate = getattr(
-                self._runner, "_invalidate_session_run_generation_if_current", None
-            )
-            if callable(invalidate):
-                invalidate(
-                    session_key,
-                    generation,
-                    reason="deadloop_guard_drained",
-                )
-            self.interrupt_pending = False
+            # Acceptance is not termination. The generation-owned running slot
+            # and turn lease remain until the worker's normal unwind removes
+            # them; housekeeping must never publish a reusable slot early.
             return True
         except Exception as e:
-            logger.warning("dead-loop guard: interrupt failed for %s: %s", session_id, e)
+            logger.warning("fleet-safety guard: interrupt failed for %s: %s", session_id, e)
             return False
 
     def release_lease(self, session_id: str) -> bool:
@@ -292,7 +337,7 @@ class _LiveKillActions(KillActions):
         # 1) Always log at ERROR — guaranteed to surface in errors.log and the
         #    desktop/gateway log views. A kill is never silent even if no
         #    messaging channel is reachable.
-        logger.error("FLEET-SAFETY DEAD-LOOP KILL\n%s", text)
+        logger.warning("FLEET-SAFETY NOTICE\n%s", text)
         # 2) Best-effort delivery only to the originating route. Broadcasting
         #    session/provider details to unrelated home channels crosses tenant
         #    and project boundaries.
@@ -370,7 +415,8 @@ def run_guard_tick(runner: Any, loop: Any = None, now: Optional[float] = None) -
                 raise ValueError("assumed context must be positive")
         except (TypeError, ValueError, OverflowError):
             assumed = DEFAULT_ASSUMED_CONTEXT_TOKENS
-        guard = _get_or_create_guard(runner, thresholds)
+        registry = _get_extension_registry(guard_cfg)
+        guard = _get_or_create_guard(runner, thresholds, registry)
 
         observations, mapping = _collect_observations(runner, now, assumed)
 
@@ -392,15 +438,18 @@ def run_guard_tick(runner: Any, loop: Any = None, now: Optional[float] = None) -
             if trip is None:
                 continue
             result = enforcer.enforce(trip)
+            if trip.extension_event_id and result.notified:
+                guard.mark_extension_notice_delivered(trip.extension_event_id)
             logger.warning(
                 "dead-loop guard tripped on %s (%s): interrupted=%s lease_released=%s "
                 "notified=%s errors=%s",
                 trip.session_id, trip.reason.value, result.interrupted,
                 result.lease_released, result.notified, result.errors,
             )
-            # Stop tracking a killed session — it's been reported once and the
-            # loop is being torn down; a stale latched entry would just linger.
-            guard.forget(trip.session_id)
+            # Continuation notices keep accumulating progress and resource
+            # deltas. Only a verified hard stop tears down the guard state.
+            if trip.outcome is GuardOutcome.VERIFIED_HARD_STOP:
+                guard.forget(trip.session_id)
     except Exception as e:  # pragma: no cover - defensive top-level guard
         logger.debug("dead-loop guard tick error: %s", e)
 

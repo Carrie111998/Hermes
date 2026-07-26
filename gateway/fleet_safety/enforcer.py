@@ -1,4 +1,4 @@
-"""Kill-and-report orchestration for a tripped session.
+"""Notify-or-stop orchestration for a fleet-safety evaluation.
 
 The enforcer turns a :class:`~gateway.fleet_safety.deadloop_guard.Trip` into
 three side effects, in a fixed order, through an injected :class:`KillActions`
@@ -20,8 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol
 
-from gateway.fleet_safety.deadloop_guard import Trip
-from gateway.fleet_safety.report import format_kill_report
+from gateway.fleet_safety.deadloop_guard import GuardOutcome, Trip
+from gateway.fleet_safety.report import format_continuation_report, format_kill_report
 
 
 class KillActions(Protocol):
@@ -45,6 +45,7 @@ class KillActions(Protocol):
 class EnforcementResult:
     session_id: str
     reason: str
+    stop_requested: bool = False
     interrupted: bool = False
     interrupt_pending: bool = False
     lease_released: bool = False
@@ -54,13 +55,12 @@ class EnforcementResult:
 
     @property
     def killed(self) -> bool:
-        """Whether the targeted worker is confirmed stopped.
+        """Interrupt acceptance is not confirmation that a worker terminated."""
+        return False
 
-        Releasing a turn lease only makes the slot reusable; it does not stop
-        generation and therefore must never manufacture a successful-kill
-        claim.
-        """
-        return self.interrupted
+    @property
+    def terminated(self) -> bool:
+        return False
 
 
 class GuardEnforcer:
@@ -71,31 +71,36 @@ class GuardEnforcer:
         result = EnforcementResult(
             session_id=trip.session_id,
             reason=trip.reason.value,
-            report=format_kill_report(trip),
         )
-        kill_reason = f"dead-loop guard: {trip.reason.value} — {trip.detail}"
+
+        if trip.outcome is GuardOutcome.CONTINUATION_NOTICE:
+            result.report = format_continuation_report(trip)
+            try:
+                result.notified = bool(self._actions.notify(result.report))
+            except Exception as e:
+                result.errors.append(f"notify failed: {e}")
+            return result
+
+        stop_reason = f"fleet-safety stop: {trip.reason.value} — {trip.detail}"
 
         try:
-            result.interrupted = bool(self._actions.interrupt(trip.session_id, kill_reason))
+            result.stop_requested = bool(
+                self._actions.interrupt(trip.session_id, stop_reason)
+            )
+            # Backward-compatible field name: this means the cooperative
+            # interrupt request was accepted, not that execution terminated.
+            result.interrupted = result.stop_requested
             result.interrupt_pending = bool(
                 getattr(self._actions, "interrupt_pending", False)
             )
         except Exception as e:  # never let a kill failure escape into housekeeping
             result.errors.append(f"interrupt failed: {e}")
 
-        if result.interrupted:
-            try:
-                result.lease_released = bool(self._actions.release_lease(trip.session_id))
-            except Exception as e:
-                result.errors.append(f"release_lease failed: {e}")
-
-        result.report = (
-            f"{result.report}\n"
-            "enforcement receipt: "
-            f"hard_killed={str(result.killed).lower()}; "
-            f"execution_stopped={str(result.interrupted).lower()}; "
-            f"interrupt_pending={str(result.interrupt_pending).lower()}; "
-            f"turn_lease_released={str(result.lease_released).lower()}"
+        # The enforcer never releases a lease directly. The gateway worker's
+        # generation-safe unwind owns that lifecycle transition.
+        result.report = format_kill_report(
+            trip,
+            interrupt_request_accepted=result.stop_requested,
         )
 
         # Report even if the interrupt/lease steps failed — a kill that could

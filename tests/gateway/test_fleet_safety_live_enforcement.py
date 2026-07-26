@@ -64,7 +64,7 @@ def _runner(agent: _Agent, generation: int):
     return runner, released, held, evicted
 
 
-def test_live_hard_stop_detaches_exact_run_invalidates_generation_and_releases_exact_lease():
+def test_live_hard_stop_requests_exact_run_and_leaves_generation_lease_to_unwind():
     agent = _Agent("session-1", 1)
     runner, released, held, evicted = _runner(agent, 1)
     agent.on_interrupt = lambda: runner._running_agents.pop("route-key", None)
@@ -76,16 +76,18 @@ def test_live_hard_stop_detaches_exact_run_invalidates_generation_and_releases_e
 
     result = GuardEnforcer(actions).enforce(_trip())
 
-    assert result.killed is True
+    assert result.stop_requested is True
+    assert result.killed is False
     assert agent.interrupt_reasons == [
-        "dead-loop guard: wall_clock_runtime_exceeded — runtime limit exceeded"
+        "fleet-safety stop: wall_clock_runtime_exceeded — runtime limit exceeded"
     ]
     assert "route-key" not in runner._running_agents
-    assert runner._session_run_generation["route-key"] == 2
-    assert released == [("route-key", 1)]
+    assert runner._session_run_generation["route-key"] == 1
+    assert released == []
     assert evicted == ["route-key"]
+    assert ("route-key", 1) in held
     assert ("route-key", 2) in held
-    assert "hard_killed=true" in result.report
+    assert "Interrupt request accepted: yes" in result.report
 
 
 def test_stale_guard_observation_cannot_interrupt_or_release_newer_run():
@@ -110,7 +112,7 @@ def test_stale_guard_observation_cannot_interrupt_or_release_newer_run():
     assert evicted == []
     assert ("route-key", 1) in held
     assert ("route-key", 2) in held
-    assert "hard_killed=false" in result.report
+    assert "Interrupt request accepted: no" in result.report
 
 
 def test_cooperative_interrupt_keeps_slot_and_lease_until_worker_drains():
@@ -131,7 +133,8 @@ def test_cooperative_interrupt_keeps_slot_and_lease_until_worker_drains():
     assert ("route-key", 1) in held
     assert released == []
     assert evicted == ["route-key"]
-    assert "interrupt_pending=true" in result.report
+    assert "Interrupt request accepted: yes" in result.report
+    assert "Lease: retained until generation-safe gateway unwind" in result.report
 
 
 def test_interrupt_exception_still_targets_origin_and_keeps_lease():

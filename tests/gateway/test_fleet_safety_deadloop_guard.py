@@ -9,6 +9,7 @@ disable, and pruning.
 import pytest
 
 from gateway.fleet_safety.deadloop_guard import (
+    GuardOutcome,
     GuardThresholds,
     RunawayGuard,
     SessionObservation,
@@ -45,6 +46,8 @@ def test_token_rate_trips_within_window():
     trip = g.observe(_obs(tokens=5_000_000, calls=30), now=300.0)
     assert trip is not None
     assert trip.reason is TripReason.TOKEN_RATE
+    assert trip.outcome is GuardOutcome.CONTINUATION_NOTICE
+    assert trip.is_hard_stop is False
     assert "tokens" in trip.detail
     assert trip.estimated_tokens == 5_000_000
 
@@ -96,6 +99,7 @@ def test_call_rate_trips():
     trip = g.observe(_obs(calls=101), now=120.0)
     assert trip is not None
     assert trip.reason is TripReason.CALL_RATE
+    assert trip.outcome is GuardOutcome.CONTINUATION_NOTICE
 
 
 # -- (b) repeated non-retryable error ----------------------------------------
@@ -110,6 +114,8 @@ def test_repeated_non_retryable_error_trips_on_kth():
     trip = g.observe(_obs(error=400), now=2.0)           # count 3 → trip
     assert trip is not None
     assert trip.reason is TripReason.REPEATED_ERROR
+    assert trip.outcome is GuardOutcome.VERIFIED_HARD_STOP
+    assert trip.is_hard_stop is True
     assert "400" in trip.detail
 
 
@@ -145,6 +151,8 @@ def test_wall_clock_trips_past_cap():
     trip = g.observe(_obs(started_at=0.0), now=3600.1)
     assert trip is not None
     assert trip.reason is TripReason.WALL_CLOCK
+    assert trip.outcome is GuardOutcome.CONTINUATION_NOTICE
+    assert trip.is_hard_stop is False
     assert trip.runtime_seconds == pytest.approx(3600.1)
 
 
@@ -163,6 +171,8 @@ def test_no_progress_trips_when_context_huge_and_state_frozen():
     trip = g.observe(_obs(context=160_000, state="frozen", calls=4), now=180.0)
     assert trip is not None
     assert trip.reason is TripReason.NO_PROGRESS
+    assert trip.outcome is GuardOutcome.VERIFIED_HARD_STOP
+    assert trip.is_hard_stop is True
 
 
 def test_no_progress_resets_when_state_changes():
@@ -187,10 +197,46 @@ def test_no_progress_ignored_when_context_small():
         assert g.observe(_obs(context=1000, state="frozen"), now=float(i)) is None
 
 
+def test_producer_no_progress_streak_is_poll_idempotent_and_hard_stops_at_limit():
+    th = GuardThresholds(
+        no_progress_samples=3,
+        max_runtime_seconds=1e9,
+        max_tokens_per_window=10**15,
+        max_calls_per_window=10**9,
+    )
+    guard = RunawayGuard(th)
+    base = dict(
+        session_id="producer-streak",
+        started_at=0.0,
+        api_call_count=2,
+        tokens_used=100,
+        attempt_seq=2,
+        progress_seq=0,
+        no_progress_streak=2,
+    )
+    for now in range(10):
+        assert guard.observe(SessionObservation(**base), now=float(now)) is None
+
+    trip = guard.observe(
+        SessionObservation(
+            **{
+                **base,
+                "api_call_count": 3,
+                "attempt_seq": 3,
+                "no_progress_streak": 3,
+            }
+        ),
+        now=10.0,
+    )
+    assert trip is not None
+    assert trip.reason is TripReason.NO_PROGRESS
+    assert trip.outcome is GuardOutcome.VERIFIED_HARD_STOP
+
+
 # -- latching / priority / disable / pruning ---------------------------------
 
 
-def test_trip_latches_and_reports_once():
+def test_continuation_notice_deduplicates_for_same_threshold_episode():
     th = GuardThresholds(max_runtime_seconds=100, max_tokens_per_window=10**15,
                          max_calls_per_window=10**9)
     g = RunawayGuard(th)

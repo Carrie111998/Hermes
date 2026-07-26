@@ -11179,6 +11179,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # _interrupt_requested.  Force-clean _running_agents so the session
             # is unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
+                from gateway.fleet_safety.integration import deny_active_extensions
+
+                _stop_agent = self._running_agents.get(_quick_key)
+                _extension_session_id = str(
+                    getattr(_stop_agent, "session_id", None) or _quick_key
+                )
+                deny_active_extensions(self, [_extension_session_id])
                 await self._interrupt_and_clear_session(
                     _quick_key,
                     source,

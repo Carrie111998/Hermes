@@ -1079,12 +1079,14 @@ class GatewaySlashCommandsMixin:
         The session is preserved so the user can continue the conversation.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
+        from gateway.fleet_safety.integration import deny_active_extensions
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
+            deny_active_extensions(self, [session_key])
             # Force-clean the sentinel so the session is unlocked.
             await self._interrupt_and_clear_session(
                 session_key,
@@ -1095,6 +1097,10 @@ class GatewaySlashCommandsMixin:
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:
+            extension_session_id = str(
+                getattr(agent, "session_id", None) or session_key
+            )
+            deny_active_extensions(self, [extension_session_id])
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             await self._interrupt_and_clear_session(
@@ -1113,6 +1119,14 @@ class GatewaySlashCommandsMixin:
         # agent(s) that share this thread, gated on authorization.
         sibling_keys = self._sibling_thread_run_keys(source, session_key)
         if sibling_keys and self._is_user_authorized(source):
+            extension_session_ids = [
+                str(
+                    getattr(self._running_agents.get(key), "session_id", None)
+                    or key
+                )
+                for key in sibling_keys
+            ]
+            deny_active_extensions(self, extension_session_ids)
             for sibling_key in sibling_keys:
                 await self._interrupt_and_clear_session(
                     sibling_key,

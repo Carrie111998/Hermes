@@ -39,6 +39,7 @@ from agent.usage_provenance import (
     aggregate_usage,
     usage_aggregate_from_mapping,
 )
+from gateway.fleet_safety.extension_lifecycle import ExtensionRegistry
 
 
 class TripReason(str, enum.Enum):
@@ -49,6 +50,15 @@ class TripReason(str, enum.Enum):
     CALL_RATE = "model_call_rate_exceeded"
     REPEATED_ERROR = "repeated_non_retryable_error"
     NO_PROGRESS = "huge_context_no_forward_progress"
+    EXTENSION_DENIED = "extension_denied_by_user"
+
+
+class GuardOutcome(str, enum.Enum):
+    """Whether an evaluation is informational or requests a safety stop."""
+
+    NO_ACTION = "no_action"
+    CONTINUATION_NOTICE = "continuation_notice"
+    VERIFIED_HARD_STOP = "verified_hard_stop"
 
 
 @dataclass(frozen=True)
@@ -121,6 +131,7 @@ class SessionObservation:
     error_code: Optional[int] = None        # non-retryable status on the latest call, else None
     attempt_seq: Optional[int] = None       # distinct terminal attempts observed
     progress_seq: Optional[int] = None
+    no_progress_streak: Optional[int] = None
     failure_seq: Optional[int] = None       # distinct failed terminal attempts
     failure_streak: int = 0
     is_non_retryable_failure: bool = False
@@ -137,6 +148,15 @@ class SessionObservation:
     model: str = ""
     effort: str = ""
     turn_generation: Optional[int] = None   # monotonic telemetry turn epoch
+    usage_quality: str = "unknown"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    cost: float = 0.0
+    cost_status: str = "unknown"
+    cost_source: str = "none"
 
     def __post_init__(self) -> None:
         bound_session_id = str(self.session_id or "").strip()
@@ -170,6 +190,21 @@ class SessionObservation:
             UsageProvenance.coerce(self.token_count_provenance),
         )
         object.__setattr__(self, "usage", usage)
+        if self.usage_quality == "unknown" and usage.provenance is not UsageProvenance.UNKNOWN:
+            object.__setattr__(self, "usage_quality", usage.provenance.value)
+        for field_name in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+        ):
+            if int(getattr(self, field_name, 0) or 0) == 0:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    int(getattr(usage, field_name, 0) or 0),
+                )
         # Identity is bound by the runtime, not by terminal payloads.
         object.__setattr__(self, "terminal_session_id", bound_session_id)
 
@@ -190,6 +225,23 @@ class GuardEvaluationResult:
     last_state: Optional[str]
     usage: UsageAggregate | dict | None = None
     token_count_provenance: UsageProvenance | str = UsageProvenance.ESTIMATED
+    outcome: GuardOutcome = GuardOutcome.VERIFIED_HARD_STOP
+    is_hard_stop: bool = True
+    notice_text: str = ""
+    extension_event_id: str = ""
+    extension_grant_size: int = 0
+    extension_expires_at: float = 0.0
+    extension_revision: int = 0
+    trip_reason: Optional[TripReason] = None
+    usage_quality: str = "unknown"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    cost: float = 0.0
+    cost_status: str = "unknown"
+    cost_source: str = "none"
 
     def __post_init__(self) -> None:
         bound_session_id = str(self.session_id or "").strip()
@@ -212,6 +264,22 @@ class GuardEvaluationResult:
             "token_count_provenance",
             UsageProvenance.coerce(self.token_count_provenance),
         )
+        object.__setattr__(self, "trip_reason", self.trip_reason or self.reason)
+        if self.usage_quality == "unknown" and self.usage.provenance is not UsageProvenance.UNKNOWN:
+            object.__setattr__(self, "usage_quality", self.usage.provenance.value)
+        for field_name in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+        ):
+            if int(getattr(self, field_name, 0) or 0) == 0:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    int(getattr(self.usage, field_name, 0) or 0),
+                )
 
     @property
     def usage_provenance(self) -> UsageProvenance:
@@ -253,6 +321,7 @@ class _SessionState:
     state_initialized: bool = False
     stalled_samples: int = 0
     tripped: bool = False   # latched — a killed session is not re-reported every tick
+    notice_latched: bool = False
 
 
 class RunawayGuard:
@@ -266,9 +335,19 @@ class RunawayGuard:
     its state.
     """
 
-    def __init__(self, thresholds: Optional[GuardThresholds] = None) -> None:
+    def __init__(
+        self,
+        thresholds: Optional[GuardThresholds] = None,
+        *,
+        extension_registry: Optional[ExtensionRegistry] = None,
+    ) -> None:
         self.thresholds = thresholds or GuardThresholds()
+        self.extension_registry = extension_registry
         self._sessions: Dict[str, _SessionState] = {}
+
+    def mark_extension_notice_delivered(self, event_id: str) -> None:
+        if self.extension_registry is not None and event_id:
+            self.extension_registry.mark_notice_delivered(event_id)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -311,7 +390,7 @@ class RunawayGuard:
         self._update_progress(st, obs)
 
         trip = self._evaluate(st, obs, now)
-        if trip is not None:
+        if trip is not None and trip.is_hard_stop:
             st.tripped = True
         return trip
 
@@ -329,6 +408,7 @@ class RunawayGuard:
         st.state_initialized = False
         st.stalled_samples = 0
         st.tripped = False
+        st.notice_latched = False
 
     def _update_samples(self, st: _SessionState, obs: SessionObservation, now: float) -> None:
         if st.samples:
@@ -398,6 +478,12 @@ class RunawayGuard:
             st.repeated_error_count = 1
 
     def _update_progress(self, st: _SessionState, obs: SessionObservation) -> None:
+        if obs.no_progress_streak is not None:
+            # Producer terminal-event telemetry is authoritative. Repeated
+            # housekeeping polls carry the same streak and therefore cannot
+            # manufacture additional no-progress evidence.
+            st.stalled_samples = max(0, int(obs.no_progress_streak))
+            return
         huge = obs.context_tokens >= self.thresholds.huge_context_tokens
         made_progress = not st.state_initialized or obs.state_hash != st.last_state_hash
         st.last_state_hash = obs.state_hash
@@ -412,7 +498,12 @@ class RunawayGuard:
     def _window_deltas(self, st: _SessionState) -> tuple:
         """(calls, tokens) accumulated across the retained window."""
         if len(st.samples) < 2:
-            return 0, 0
+            if not st.samples:
+                return 0, 0
+            # Counters are turn-scoped. On the first housekeeping sample they
+            # are the only conservative evidence available, and the entire
+            # observed turn is inside the current detector epoch.
+            return max(0, st.samples[-1][1]), max(0, st.samples[-1][2])
         first = st.samples[0]
         last = st.samples[-1]
         calls = max(0, last[1] - first[1])
@@ -426,10 +517,22 @@ class RunawayGuard:
         runtime = max(0.0, now - obs.started_at)
         calls_in_window, tokens_in_window = self._window_deltas(st)
 
-        def _mk(reason: TripReason, detail: str) -> GuardEvaluationResult:
+        def _mk(
+            reason: TripReason,
+            detail: str,
+            *,
+            outcome: GuardOutcome = GuardOutcome.VERIFIED_HARD_STOP,
+            is_hard_stop: bool = True,
+            notice_text: str = "",
+            extension_event_id: str = "",
+            extension_grant_size: int = 0,
+            extension_expires_at: float = 0.0,
+            extension_revision: int = 0,
+        ) -> GuardEvaluationResult:
             return GuardEvaluationResult(
                 session_id=obs.session_id,
                 reason=reason,
+                trip_reason=reason,
                 detail=detail,
                 estimated_tokens=int(obs.tokens_used),
                 estimated_calls=int(obs.api_call_count),
@@ -440,26 +543,27 @@ class RunawayGuard:
                 last_state=obs.state_hash,
                 usage=obs.usage,
                 token_count_provenance=obs.token_count_provenance,
+                outcome=outcome,
+                is_hard_stop=is_hard_stop,
+                notice_text=notice_text,
+                extension_event_id=extension_event_id,
+                extension_grant_size=extension_grant_size,
+                extension_expires_at=extension_expires_at,
+                extension_revision=extension_revision,
+                usage_quality=obs.usage_quality,
+                input_tokens=obs.input_tokens,
+                output_tokens=obs.output_tokens,
+                cache_read_tokens=obs.cache_read_tokens,
+                cache_write_tokens=obs.cache_write_tokens,
+                reasoning_tokens=obs.reasoning_tokens,
+                cost=obs.cost,
+                cost_status=obs.cost_status,
+                cost_source=obs.cost_source,
             )
 
-        # Priority order: the most unambiguous / cheapest-to-justify first.
-        if runtime > t.max_runtime_seconds:
-            return _mk(
-                TripReason.WALL_CLOCK,
-                f"turn ran {runtime / 60:.1f} min (cap {t.max_runtime_seconds / 60:.0f} min)",
-            )
-        if tokens_in_window > t.max_tokens_per_window:
-            return _mk(
-                TripReason.TOKEN_RATE,
-                f"{tokens_in_window:,} tokens in {t.window_seconds / 60:.0f} min "
-                f"(cap {t.max_tokens_per_window:,})",
-            )
-        if calls_in_window > t.max_calls_per_window:
-            return _mk(
-                TripReason.CALL_RATE,
-                f"{calls_in_window} model calls in {t.window_seconds / 60:.0f} min "
-                f"(cap {t.max_calls_per_window})",
-            )
+        # Only verified no-progress or repeated non-retryable failures request a
+        # safety stop. Resource volume and elapsed time open a renewable,
+        # default-continue checkpoint instead.
         if st.repeated_error_count >= t.repeated_error_limit:
             return _mk(
                 TripReason.REPEATED_ERROR,
@@ -470,6 +574,78 @@ class RunawayGuard:
             return _mk(
                 TripReason.NO_PROGRESS,
                 f"{obs.context_tokens:,}-token context re-sent {st.stalled_samples}x "
-                f"with no forward progress",
+                "with producer-verified no forward progress",
             )
-        return None
+
+        reasons: list[str] = []
+        primary_reason: Optional[TripReason] = None
+        if runtime > t.max_runtime_seconds:
+            primary_reason = TripReason.WALL_CLOCK
+            reasons.append(
+                f"runtime {runtime / 60:.1f}m > {t.max_runtime_seconds / 60:.0f}m"
+            )
+        if tokens_in_window > t.max_tokens_per_window:
+            primary_reason = primary_reason or TripReason.TOKEN_RATE
+            reasons.append(
+                f"tokens {tokens_in_window:,} > {t.max_tokens_per_window:,}/"
+                f"{t.window_seconds / 60:.0f}m ({obs.usage_quality})"
+            )
+        if calls_in_window > t.max_calls_per_window:
+            primary_reason = primary_reason or TripReason.CALL_RATE
+            reasons.append(
+                f"calls {calls_in_window} > {t.max_calls_per_window}/"
+                f"{t.window_seconds / 60:.0f}m"
+            )
+
+        if primary_reason is None:
+            st.notice_latched = False
+            return None
+
+        detail = ", ".join(reasons)
+        event_id = ""
+        grant_size = 0
+        expires_at = 0.0
+        revision = 0
+        if self.extension_registry is not None:
+            record, should_notify = self.extension_registry.request(
+                session_id=obs.session_id,
+                checkpoint_key=f"{obs.started_at:.6f}:{primary_reason.value}",
+                now=now,
+                duration_seconds=t.window_seconds,
+                grant_size=t.max_calls_per_window,
+            )
+            event_id = record.event_id
+            grant_size = record.grant_size
+            expires_at = record.expires_at
+            revision = record.revision
+            if not record.should_continue:
+                return _mk(
+                    TripReason.EXTENSION_DENIED,
+                    "extension denied by user; cooperative interruption requested",
+                    extension_event_id=event_id,
+                    extension_grant_size=grant_size,
+                    extension_expires_at=expires_at,
+                    extension_revision=revision,
+                )
+            if not should_notify:
+                return None
+        else:
+            if st.notice_latched:
+                return None
+            st.notice_latched = True
+
+        notice = (
+            f"Extension checkpoint: {detail}.\n"
+            "Continuing by default. Send STOP or /stop to cancel."
+        )
+        return _mk(
+            primary_reason,
+            detail,
+            outcome=GuardOutcome.CONTINUATION_NOTICE,
+            is_hard_stop=False,
+            notice_text=notice,
+            extension_event_id=event_id,
+            extension_grant_size=grant_size,
+            extension_expires_at=expires_at,
+            extension_revision=revision,
+        )

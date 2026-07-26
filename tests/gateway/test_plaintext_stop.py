@@ -120,7 +120,13 @@ def test_plaintext_stop_does_not_match_prose_substrings_or_slash_commands(raw):
     assert event.text == original
 
 
-def test_exact_plaintext_stop_follows_existing_active_run_hard_stop_route():
+def test_exact_plaintext_stop_follows_existing_active_run_hard_stop_route(monkeypatch):
+    denied = []
+    monkeypatch.setattr(
+        "gateway.fleet_safety.integration.deny_active_extensions",
+        lambda _runner, session_ids: denied.append(list(session_ids)) or len(session_ids),
+    )
+
     async def _exercise():
         runner = object.__new__(GatewayRunner)
         session_key = "agent:main:telegram:dm:chat-1"
@@ -167,6 +173,7 @@ def test_exact_plaintext_stop_follows_existing_active_run_hard_stop_route():
     event, sent, calls, session_key = asyncio.run(_exercise())
 
     assert event.text == "/stop"
+    assert denied == [[session_key]]
     assert len(calls) == 1
     assert calls[0][0] == session_key
     assert calls[0][2:] == (_INTERRUPT_REASON_STOP, "stop_command")
