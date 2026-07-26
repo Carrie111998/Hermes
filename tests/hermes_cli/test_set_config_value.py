@@ -19,7 +19,7 @@ def _isolated_hermes_home(tmp_path):
 
 
 def _read_env(tmp_path):
-    return (tmp_path / ".env").read_text()
+    return (tmp_path / ".env").read_text(encoding="utf-8")
 
 
 def _read_config(tmp_path):
@@ -357,7 +357,7 @@ class TestListNavigation:
     """
 
     def _write_config(self, tmp_path, body):
-        (tmp_path / "config.yaml").write_text(body)
+        (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
 
     def test_indexed_set_preserves_sibling_list_entries(self, _isolated_hermes_home):
         """Setting custom_providers.0.api_key must not destroy entry 1."""
@@ -715,7 +715,7 @@ class TestDisplaySkinTouch:
         skins = _isolated_hermes_home / "skins"
         skins.mkdir()
         skin_file = skins / "synthwave.yaml"
-        skin_file.write_text("name: synthwave\ncolors:\n  background: '#1a1030'\n")
+        skin_file.write_text("name: synthwave\ncolors:\n  background: '#1a1030'\n", encoding="utf-8")
         # Age the file so an mtime bump is unambiguous even on coarse clocks.
         _os.utime(skin_file, (1_000_000_000, 1_000_000_000))
 
@@ -736,7 +736,7 @@ class TestDisplaySkinTouch:
         skins = _isolated_hermes_home / "skins"
         skins.mkdir()
         body = "name: neon\ncolors:\n  ui_accent: '#ff33aa'\n"
-        (skins / "neon.yaml").write_text(body)
+        (skins / "neon.yaml").write_text(body, encoding="utf-8")
 
         set_config_value("display.skin", "neon")
         assert (skins / "neon.yaml").read_text() == body
