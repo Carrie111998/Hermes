@@ -4,6 +4,17 @@ import { persistBoolean, storedBoolean } from '@/lib/storage'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $busy } from '@/store/session'
 
+import {
+  clearProfilePetReplyText,
+  clearProfilePetUnread,
+  markProfilePetUnread,
+  mergeProfileActivity,
+  $profilePets,
+  replaceProfileActivity,
+  setProfilePetInfo,
+  setProfilePetReplyText
+} from './pet-multi'
+
 /**
  * Petdex mascot state for the desktop floating pet.
  *
@@ -89,8 +100,20 @@ export function derivePetState(activity: PetActivity): PetState {
   return 'idle'
 }
 
-export const $petInfo = atom<PetInfo>({ enabled: false })
-export const $petActivity = atom<PetActivity>({})
+// Backwards compat: the foreground (active-profile) pet atoms are computed
+// views over that profile's slice of the per-profile store. Existing components
+// (PetSprite/PetBubble/floating-pet) read these unchanged; in follow-active mode
+// only the active profile is ever populated, so behavior is identical to the old
+// standalone atoms.
+export const $petInfo = computed(
+  [$profilePets, $activeGatewayProfile],
+  (pets, active): PetInfo => pets.get(normalizeProfileKey(active))?.info ?? { enabled: false }
+)
+
+export const $petActivity = computed(
+  [$profilePets, $activeGatewayProfile],
+  (pets, active): PetActivity => pets.get(normalizeProfileKey(active))?.activity ?? {}
+)
 
 /** Pet installed + enabled with a loaded spritesheet (ready to show/react). */
 export const $petActive = computed($petInfo, info => info.enabled && Boolean(info.spritesheetBase64))
@@ -113,9 +136,13 @@ export function petProfile(): string {
  * the app isn't focused, and off when the user opens the app via the mail icon
  * (or returns to the window). No persistence — it's a glance hint, not state.
  */
-export const $petUnread = atom(false)
-export const markPetUnread = () => $petUnread.set(true)
-export const clearPetUnread = () => $petUnread.set(false)
+export const $petUnread = computed(
+  [$profilePets, $activeGatewayProfile],
+  (pets, active): boolean => pets.get(normalizeProfileKey(active))?.unread ?? false
+)
+
+export const markPetUnread = () => markProfilePetUnread(petProfile())
+export const clearPetUnread = () => clearProfilePetUnread(petProfile())
 
 /**
  * Latest agent reply text for the overlay's speech bubble. Set alongside
@@ -126,22 +153,23 @@ export const clearPetUnread = () => $petUnread.set(false)
  * Capped at 200 chars at write time; the overlay further truncates to ~120 for
  * display with an ellipsis.
  */
-export const $petReplyText = atom<string | null>(null)
+export const $petReplyText = computed(
+  [$profilePets, $activeGatewayProfile],
+  (pets, active): string | null => pets.get(normalizeProfileKey(active))?.replyText ?? null
+)
 
-const REPLY_TEXT_MAX = 200
+export const setPetReplyText = (text: string) => setProfilePetReplyText(petProfile(), text)
 
-export const setPetReplyText = (text: string) => {
-  const trimmed = text.trim()
-  if (!trimmed) return
-  // Skip [SILENT] replies - they're internal control signals, not user-facing.
-  if (/^\[SILENT\]/i.test(trimmed)) return
-  $petReplyText.set(trimmed.length > REPLY_TEXT_MAX ? trimmed.slice(0, REPLY_TEXT_MAX) : trimmed)
-}
+export const clearPetReplyText = () => clearProfilePetReplyText(petProfile())
 
-export const clearPetReplyText = () => $petReplyText.set(null)
+/** Steady activity flags (toolRunning / reasoning) set + cleared by the stream.
+ *  Merges into the active profile's slice (the legacy global awaitingInput sync
+ *  writes through here). */
+export const setPetActivity = (next: Partial<PetActivity>) => mergeProfileActivity(petProfile(), next)
 
-/** Steady activity flags (toolRunning / reasoning) set + cleared by the stream. */
-export const setPetActivity = (next: Partial<PetActivity>) => $petActivity.set({ ...$petActivity.get(), ...next })
+/** Wholesale-replace the active profile's activity (the overlay pushes a full
+ *  snapshot). */
+export const replacePetActivity = (next: PetActivity) => replaceProfileActivity(petProfile(), next)
 
 let flashTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -158,7 +186,7 @@ export const flashPetActivity = (next: Partial<PetActivity>, ms = 1600) => {
   flashTimer = setTimeout(() => setPetActivity({ celebrate: false, error: false, justCompleted: false }), ms)
 }
 
-export const setPetInfo = (info: PetInfo) => $petInfo.set(info)
+export const setPetInfo = (info: PetInfo) => setProfilePetInfo(petProfile(), info)
 
 /**
  * Resolve the live activity state from the dedicated activity atom, falling back

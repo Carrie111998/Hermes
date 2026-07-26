@@ -6,8 +6,10 @@ import {
   $petMotion,
   $petReplyText,
   $petState,
+  clearPetReplyText,
   derivePetState,
   flashPetActivity,
+  replacePetActivity,
   setPetActivity,
   setPetReplyText
 } from './pet'
@@ -44,18 +46,18 @@ describe('derivePetState', () => {
 
 describe('roam motion', () => {
   it('only reports at-rest when the agent-driven state is plain idle', () => {
-    $petActivity.set({})
+    replacePetActivity({})
     expect($petAtRest.get()).toBe(true)
 
-    $petActivity.set({ busy: true })
+    replacePetActivity({ busy: true })
     expect($petAtRest.get()).toBe(false)
 
-    $petActivity.set({})
+    replacePetActivity({})
     expect($petAtRest.get()).toBe(true)
   })
 
   it('shows the roam pose while wandering, but never overrides real activity', () => {
-    $petActivity.set({})
+    replacePetActivity({})
     $petMotion.set('run')
     expect($petState.get()).toBe('run')
 
@@ -64,16 +66,16 @@ describe('roam motion', () => {
     expect($petState.get()).toBe('jump')
 
     // Activity wins over a wander in progress.
-    $petActivity.set({ reasoning: true, busy: true })
+    replacePetActivity({ reasoning: true, busy: true })
     expect($petState.get()).toBe('review')
 
     // Back at rest, the wander resumes its pose; clearing it returns to idle.
-    $petActivity.set({})
+    replacePetActivity({})
     expect($petState.get()).toBe('jump')
     $petMotion.set(null)
     expect($petState.get()).toBe('idle')
 
-    $petActivity.set({})
+    replacePetActivity({})
   })
 })
 
@@ -99,13 +101,13 @@ describe('replyText', () => {
   })
 
   it('skips empty / whitespace-only text', () => {
-    $petReplyText.set(null)
+    clearPetReplyText()
     setPetReplyText('   ')
     expect($petReplyText.get()).toBeNull()
   })
 
   it('skips [SILENT] replies', () => {
-    $petReplyText.set(null)
+    clearPetReplyText()
     setPetReplyText('[SILENT] heartbeat sent')
     expect($petReplyText.get()).toBeNull()
   })

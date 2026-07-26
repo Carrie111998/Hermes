@@ -6,7 +6,7 @@ import { PetBubble } from '@/components/pet/pet-bubble'
 import { PetSprite } from '@/components/pet/pet-sprite'
 import { type PetZoomAnchor, usePetZoomGesture } from '@/components/pet/use-pet-zoom-gesture'
 import { Mail } from '@/lib/icons'
-import { $petActivity, $petInfo, setPetInfo } from '@/store/pet'
+import { $petInfo, replacePetActivity, setPetInfo } from '@/store/pet'
 import { overlayWindowSize } from '@/store/pet-overlay'
 import { setAwaitingResponse, setBusy } from '@/store/session'
 
@@ -93,7 +93,7 @@ export function PetOverlayApp() {
   useEffect(() => {
     const off = window.hermesDesktop?.petOverlay?.onState(payload => {
       setPetInfo(payload.info)
-      $petActivity.set(payload.activity ?? {})
+      replacePetActivity(payload.activity ?? {})
       setBusy(Boolean(payload.busy))
       setAwaitingResponse(Boolean(payload.awaiting))
       setUnread(Boolean(payload.unread))
