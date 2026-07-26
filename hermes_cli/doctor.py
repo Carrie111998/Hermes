@@ -10,8 +10,17 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_cli.config import (
+    get_project_root,
+    get_hermes_home,
+    get_env_path,
+    get_compatible_custom_providers,
+    get_custom_provider_extra_headers,
+    get_custom_provider_tls_settings,
+    load_config,
+)
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.fallback_config import resolve_entry_api_key
 from hermes_constants import display_hermes_home
 from hermes_constants import agent_browser_runnable
 
@@ -193,6 +202,79 @@ def _section(title: str) -> None:
     """Print a doctor section banner: blank line + bold cyan ◆ title."""
     print()
     print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
+
+
+def _custom_provider_connectivity_result(
+    entry: dict,
+    custom_providers: list[dict] | None,
+) -> tuple[str, list[tuple[str, str, str]], list[str]]:
+    """Probe one custom provider's OpenAI-compatible /models endpoint."""
+    if not isinstance(entry, dict):
+        return "", [], []
+
+    name = str(entry.get("name") or entry.get("provider_key") or "").strip()
+    base_url = str(entry.get("base_url") or "").strip()
+    if not name or not base_url:
+        return "", [], []
+
+    label = f"{name} API"
+    api_key = resolve_entry_api_key(entry) or ""
+    if not api_key:
+        return label, [
+            (color("⚠", Colors.YELLOW), label.ljust(20), color("(not configured)", Colors.DIM)),
+        ], []
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": _HERMES_USER_AGENT,
+    }
+    if custom_providers is not None:
+        try:
+            headers.update(get_custom_provider_extra_headers(base_url, custom_providers=custom_providers))
+        except Exception:
+            pass
+
+    request_kwargs: dict[str, object] = {
+        "headers": headers,
+        "timeout": 5,
+    }
+    try:
+        tls = get_custom_provider_tls_settings(base_url, custom_providers=custom_providers)
+        if tls.get("ssl_ca_cert"):
+            request_kwargs["verify"] = tls["ssl_ca_cert"]
+        elif "ssl_verify" in tls:
+            request_kwargs["verify"] = tls["ssl_verify"]
+    except Exception:
+        pass
+
+    url = base_url.rstrip("/") + "/models"
+    try:
+        import httpx
+
+        response = httpx.get(url, **request_kwargs)
+        if response.status_code == 200:
+            return label, [(color("✓", Colors.GREEN), label.ljust(20), "")], []
+        if response.status_code in {401, 403}:
+            return label, [
+                (color("✗", Colors.RED), label.ljust(20), color("(invalid API key)", Colors.DIM)),
+            ], [f"Check the API key for custom provider '{name}'"]
+        if response.status_code == 404:
+            return label, [
+                (color("⚠", Colors.YELLOW), label.ljust(20), color("(endpoint not found)", Colors.DIM)),
+            ], [f"Custom provider '{name}' did not expose {url}"]
+        return label, [
+            (color("⚠", Colors.YELLOW), label.ljust(20), color(f"(HTTP {response.status_code})", Colors.DIM)),
+        ], []
+    except Exception as exc:
+        msg = str(exc)
+        lowered = msg.lower()
+        if "ssl" in lowered or "certificate" in lowered or "tls" in lowered:
+            detail = f"(SSL certificate error: {msg})"
+        else:
+            detail = f"({msg})"
+        return label, [
+            (color("✗", Colors.RED), label.ljust(20), color(detail, Colors.DIM)),
+        ], [f"Check connectivity for custom provider '{name}'"]
 
 
 def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None:
@@ -2361,7 +2443,21 @@ def run_doctor(args):
     _probes.append(("AWS Bedrock", _probe_bedrock))
     _probes.append(("Azure Foundry (Entra ID)", _probe_azure_entra))
 
-    # Print a single status line so users see something happening, then
+    # Probe user-defined custom providers from config.yaml so doctor can spot
+    # broken local/forked endpoints before the first session starts.
+    try:
+        _doctor_cfg = load_config()
+        _doctor_custom_providers = get_compatible_custom_providers(_doctor_cfg)
+    except Exception:
+        _doctor_custom_providers = []
+    for _entry in _doctor_custom_providers:
+        _label, _lines, _issues = _custom_provider_connectivity_result(
+            _entry,
+            _doctor_custom_providers,
+        )
+        if not _label:
+            continue
+        _probes.append((_label, lambda l=_label, lines=_lines, issues=_issues: _ConnectivityResult(l, lines, issues)))
     # fan out. ``\r`` clears it once the first real result line lands.
     print(f"  {color(f'Running {len(_probes)} connectivity checks in parallel…', Colors.DIM)}",
           end="", flush=True)

@@ -13,7 +13,7 @@ import pytest
 import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
-from hermes_cli.doctor import _has_provider_env_config
+from hermes_cli.doctor import _has_provider_env_config, _custom_provider_connectivity_result
 
 
 class TestDoctorPlatformHints:
@@ -49,6 +49,39 @@ class TestProviderEnvDetection:
     def test_returns_false_when_no_provider_settings(self):
         content = "TERMINAL_ENV=local\n"
         assert not _has_provider_env_config(content)
+
+
+class TestCustomProviderDoctorProbe:
+    def test_reports_reachable_custom_provider(self, monkeypatch):
+        entry = {"name": "pengcc8", "base_url": "https://example.com/v1", "api_key": "sk-test"}
+        fake_httpx = types.SimpleNamespace(get=lambda *a, **kw: types.SimpleNamespace(status_code=200))
+        monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+        label, lines, issues = _custom_provider_connectivity_result(entry, [entry])
+
+        assert label == "pengcc8 API"
+        assert any("pengcc8 API" in part for row in lines for part in row)
+        assert issues == []
+
+    def test_reports_invalid_custom_provider_key(self, monkeypatch):
+        entry = {"name": "ccmax", "base_url": "https://example.com/v1", "api_key": "sk-test"}
+        fake_httpx = types.SimpleNamespace(get=lambda *a, **kw: types.SimpleNamespace(status_code=401))
+        monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+        label, lines, issues = _custom_provider_connectivity_result(entry, [entry])
+
+        assert label == "ccmax API"
+        assert any("invalid API key" in part for row in lines for part in row)
+        assert issues == ["Check the API key for custom provider 'ccmax'"]
+
+    def test_reports_not_configured_when_key_missing(self):
+        entry = {"name": "nope", "base_url": "https://example.com/v1"}
+
+        label, lines, issues = _custom_provider_connectivity_result(entry, [entry])
+
+        assert label == "nope API"
+        assert any("not configured" in part for row in lines for part in row)
+        assert issues == []
 
 
 class TestDoctorToolAvailabilitySummary:
