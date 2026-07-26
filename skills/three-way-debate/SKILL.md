@@ -1,6 +1,6 @@
 ---
 name: three-way-debate
-description: Use when the user wants multiple perspectives on a decision, strategy, or idea — triggers a structured 3-way debate between Radical (激进派/破局者), Conservative (保守派/守成者), and Neutral (中立派/仲裁者) agents who argue, rebut, and converge on a concrete recommendation with confidence rating and reversal conditions. Trigger on phrases like "辩论一下", "三方视角", "激进保守", "多角度看", "帮我分析利弊". Skip for fact queries, code syntax, translations. Supports Chinese (default) and English (--lang en). All output in Chinese unless --lang en is specified.
+description: Structured 3-way debate for complex decisions.
 ---
 
 # 三方辩论 (Three-Way Debate)
@@ -46,21 +46,25 @@ Default: Chinese. Pass `--lang en` for English debate and output.
 
 默认使用 **standard**。用户可用 `--quick` / `--deep` 指定。
 
-## 辩论流程
+## 辩论流程（适配 Hermes 异步 delegate_task）
+
+delegate_task 在 Hermes 中是**异步的**——子智能体结果通过消息注入回会话。因此辩论是两阶段串行：
 
 ```
 用户提问 → 适用性判定 → 选复杂度
-  │
-  ├─ 第1轮：开篇陈词（3子智能体并行）
-  │   三方各自独立陈述，每人按字数限制输出
-  │   输出格式：立场 / 关键理由(2-3条) / 最大风险 / 对其他方的质疑
-  │
-  ├─ 第2轮：交叉质询 + 自我修正（3子智能体并行）
-  │   每个子智能体回应质疑 + 修正自己立场 + 给出决策阈值
-  │
-  └─ 第3轮：最终裁决（主智能体综合）
-       置信度 / 推荐方案 / 止损条件 / 反转信号
+  
+  阶段A: 主智能体调用 delegate_task(tasks=[激进派, 保守派, 中立派])
+         → 3个子智能体并行执行
+         → 结果以消息形式注入回当前会话
+
+  阶段B: 主智能体收到结果后，调用 delegate_task(tasks=[交叉质询×3])
+         → 3个子智能体并行执行  
+         → 结果以消息形式注入回当前会话
+
+  阶段C: 主智能体收到全部结果后，亲自综合、输出最终裁决
 ```
+
+**关键**：不要在同一个 tool call 中期待同步返回。每个 delegate_task 调用后，等待结果消息到达再进行下一步。
 
 ## 三方人格定义
 
@@ -147,20 +151,11 @@ You are the Neutral — arbitrator, analyst.
 
 1. 检查适用性（启动/跳过条件）
 2. 选复杂度（默认 standard）
-3. 子智能体必须为 **leaf** 类型，不允许继续委托
+3. 子智能体必须为 **leaf** 类型
 
-**编排规则（铁律）：**
-- 第1轮和第2轮使用 `delegate_task` 并行执行
-- 子智能体为 leaf，只完成指定视角，不得继续委托
-- 第3轮由主智能体亲自综合，不再委托
-- 主智能体必须显式引用三方关键观点，不能只给独立判断
-- 每方只能代表当前角色发言，不得替其他角色总结，不得提前裁决
+### Step 2: 阶段A — 开篇陈词（首次 delegate_task）
 
----
-
-### Step 2: 第1轮 — 开篇陈词（并行）
-
-用 `delegate_task` 并行派发 3 个子智能体。
+用 `delegate_task` 并行派发 3 个子智能体。**这是唯一的 tool call**——等结果消息回话再继续。
 
 **子智能体输出格式（结构化）：**
 ```
@@ -175,73 +170,33 @@ You are the Neutral — arbitrator, analyst.
 决策阈值：[满足什么条件会改变判断]
 ```
 
-**delegate_task 调用示例：**
-```python
-delegate_task(tasks=[
-  {"goal": "激进派对「{议题}」开篇陈词",
-   "context": "{激进派人设}\n\n问题：{用户问题}\n\n按格式输出：立场/理由/风险/质疑/决策阈值。用中文。{字数限制}"},
-  {"goal": "保守派对「{议题}」开篇陈词",
-   "context": "{保守派人设}\n\n问题：{用户问题}\n\n按格式输出...用中文。"},
-  {"goal": "中立派对「{议题}」开篇陈词",
-   "context": "{中立派人设}\n\n问题：{用户问题}\n\n按格式输出...用中文。"},
-])
+**delegate_task 调用示例（用 Python 脚本生成）：**
+```bash
+python ~/.hermes/skills/three-way-debate/scripts/run_debate.py "议题" --mode standard --lang zh
 ```
+然后用输出的 JSON 中的 `round_1` 数组作为 delegate_task 的 tasks 参数。
 
----
+quick 模式在阶段A后直接跳到 Step 4（跳过阶段B）。
 
-### Step 3: 第2轮 — 交叉质询 + 自我修正（并行）
+### Step 3: 阶段B — 交叉质询 + 自我修正（第二次 delegate_task）
 
-收集第1轮三方输出，构建质询上下文。再用 `delegate_task` 并行派发 3 个子智能体。
+收到阶段A的三方结果消息后，用脚本生成第2轮任务再调用 delegate_task。
 
-**三方各自的任务：**
-
-**激进派**：收到保守派和中立派的第1轮立场
-→ 回应保守派的质疑 + 指出自己第1轮最脆弱的假设 + 修正或强化立场 + 更新决策阈值
-
-**保守派**：收到激进派和中立派的第1轮立场
-→ 回应激进派的质疑 + 指出在什么条件下愿意接受更激进方案 + 修正或强化立场 + 更新决策阈值
-
-**中立派**：收到激进派和保守派的第1轮立场 + **自己的第1轮判断**
-→ 审查双方论据 + 审查自己第1轮的判断是否仍然成立 + 指出证据缺口和权重变化 + 给出临时倾向 + 更新决策阈值
-
-**质询 prompt 模板（以激进派为例）：**
+**脚本命令**：
+```bash
+python ~/.hermes/skills/three-way-debate/scripts/run_debate.py "议题" \
+  --mode standard --lang zh \
+  --round1-radical "激进派第1轮输出..." \
+  --round1-conservative "保守派第1轮输出..." \
+  --round1-neutral "中立派第1轮输出..."
 ```
-【你的第1轮立场】
-{激进派全部输出}
+然后用输出的 JSON 中的 `round_2` 数组作为 delegate_task 的 tasks 参数。
 
-【保守派的第1轮立场】
-{保守派全部输出}
+### Step 4: 最终裁决（主智能体亲自综合）
 
-【中立派的第1轮立场】
-{中立派全部输出}
+收到阶段B的三方结果后，综合阶段A和阶段B的全部观点，给出最终结论。
 
-请以激进派身份回应：
-1. 反驳保守派你最不认同的1个核心论据
-2. 指出你自己第1轮中最脆弱的假设是什么
-3. 修正或强化你的立场
-
-输出格式：
-立场：[支持/反对/折中/暂缓]
-回应质疑：[针对保守派的反驳]
-自我修正：[我的假设弱点 + 修正]
-决策阈值：[更新后的判断条件]
-
-{字数限制}。犀利直接。用中文。
-```
-
-**中立派的质询 prompt 额外要求：**
-```
-同时审查你自己第1轮的判断：
-- 听取了双方论据后，你的原判决是否仍然成立？
-- 当前最缺什么数据导致无法确定？
-- 在什么条件下，哪一派的观点更正确？
-```
-
----
-
-### Step 4: 第3轮 — 最终裁决（主智能体亲自综合）
-
-综合第1轮和第2轮的全部观点，给出最终结论。**不和稀泥，必须有明确倾向。**
+**不和稀泥，必须有明确倾向。**
 
 ```
 ## 🏛️ 三方辩论 — 最终裁决
@@ -292,18 +247,24 @@ delegate_task(tasks=[
 
 ```bash
 # 生成第1轮子智能体 prompt（JSON 格式，可直接用于 delegate_task）
-python ~/.hermes/skills/three-way-debate/scripts/run_debate.py "议题" [--mode quick|standard|deep]
+python ~/.hermes/skills/three-way-debate/scripts/run_debate.py "议题" [--mode quick|standard|deep] [--lang zh|en]
+
+# 生成第2轮子智能体 prompt（需要第1轮输出作为参数）
+python ~/.hermes/skills/three-way-debate/scripts/run_debate.py "议题" \
+  --mode standard --lang zh \
+  --round1-radical "激进派输出" --round1-conservative "保守派输出" --round1-neutral "中立派输出"
 ```
 
-脚本支持 `--mode` 参数控制复杂度。详见 `scripts/run_debate.py`。
+脚本支持 `--mode` 和 `--lang` 参数。详见 `scripts/run_debate.py`。
 
 ## 注意事项
 
-- **并行优先**：第1轮和第2轮各3子智能体并行，不要串行
-- **子智能体 language**：context 末尾明确要求"用中文回复"
+- **异步串行**：每次 delegate_task 调用后，等待结果消息到达再继续下一步
+- **子智能体 language**：context 末尾明确要求"用中文回复"（或英文模式用 "Respond in English"）
 - **上下文完整**：子智能体不知道其他人在说什么，prompt 必须包含所有需要的上下文
 - **角色隔离**：每方只能代表当前角色，不得替其他方总结或提前裁决
 - **字数自适应**：按复杂度选择字数限制，不要固定 200-400 字
+- **叶子节点**：子智能体用 leaf 类型，不继续委托
 
 ## 常见问题
 
@@ -319,4 +280,5 @@ python ~/.hermes/skills/three-way-debate/scripts/run_debate.py "议题" [--mode 
 ## 参考
 
 - `references/design-notes.md` — 设计决策、与 LeSingh1/debate-skill 及 ai-expert-consultation 的对比
+- `references/publishing.md` — 发布到 Hermes 技能商店的实战流程与踩坑记录
 - `scripts/run_debate.py` — 子智能体 prompt 生成器，支持复杂度模式
