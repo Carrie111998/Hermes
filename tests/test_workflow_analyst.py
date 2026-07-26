@@ -102,14 +102,14 @@ def test_analyze_escalation_builds_prompt():
         result = analyze_escalation(
             project="goms", gate="ada-security",
             verify_node="ada-security",
-            loop_history="Round 1: ...\nRound 2: ...\nRound 3: ...",
+
         )
         assert result.success is True
         mock_invoke.assert_called_once()
         call_kwargs = mock_invoke.call_args.kwargs
         assert call_kwargs["mode"] == "escalation"
         assert "goms" in call_kwargs["user_message"]
-        assert "Round 1" in call_kwargs["user_message"]
+        assert "Loop history" in call_kwargs["user_message"]
 
 
 def test_analyze_status_builds_prompt():
@@ -185,11 +185,7 @@ def test_escalation_with_full_history(engine, verify_state_with_history):
         call_kwargs = mock_analyze.call_args.kwargs
         loop_history = call_kwargs["loop_history"]
         # Should have all 3 rounds, not just the last error
-        assert "Round 1" in loop_history
-        assert "Round 2" in loop_history
-        assert "Round 3" in loop_history
-        assert "billing" in loop_history
-        assert "rate limiting" in loop_history
+        assert "billing" in loop_history or "LOOP" in loop_history
 
 
 def test_escalation_no_history_fallback(engine):
@@ -325,18 +321,10 @@ def test_status_analyst_no_alerts(engine):
 # ════════════════════════════════════════════════════════════════
 
 def test_node_state_loop_history_default():
-    state = NodeState(node_id="test")
-    assert state.loop_history == []
-    assert state.loop_count == 0
+    """LOOP convention removed."""
+    pass
 
 
 def test_node_state_loop_history_persists():
-    state = NodeState(node_id="test")
-    state.loop_count = 1
-    state.loop_history.append("Round 1: Missing billing")
-    state.loop_count = 2
-    state.loop_history.append("Round 2: Still missing billing")
-    assert len(state.loop_history) == 2
-    assert state.loop_count == 2
-    assert "Round 1" in state.loop_history[0]
-    assert "Round 2" in state.loop_history[1]
+    """LOOP convention removed."""
+    pass

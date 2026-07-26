@@ -265,8 +265,7 @@ def test_state_save_and_load(engine):
 
     states = {
         "a": NodeState(node_id="a", status="done", kanban_card_id="card-123",
-                       started_at="2026-06-07T00:00:00Z", attempts=1,
-                       loop_count=0),
+                       started_at="2026-06-07T00:00:00Z", attempts=1)
     }
     results = {"a": "done"}
     layers = [["a"]]
@@ -403,8 +402,8 @@ nodes:
 # ── LOOP count tests ───────────────────────────────────────────────
 
 def test_max_revision_loops_constant():
-    """MAX_REVISION_LOOPS should be 3."""
-    assert WorkflowEngine.MAX_REVISION_LOOPS == 3
+    """LOOP convention removed — reviews convention only."""
+    pass
 
 
 # ── WorkflowNode tests ─────────────────────────────────────────────
@@ -436,7 +435,7 @@ def test_node_state_defaults():
     assert state.status == "pending"
     assert state.kanban_card_id is None
     assert state.attempts == 0
-    assert state.loop_count == 0
+    # loop_count removed — reviews convention only
 
 
 # ── Synthetic gate node tests ──────────────────────────────────────
@@ -2276,35 +2275,21 @@ nodes:
 
 class TestLoopZones:
 
-    def test_find_loop_zones_identifies_verify_layer(self, engine):
-        """Layers containing nodes with revision dependents are flagged."""
-        wf = Workflow(name="test-loop-zones")
+    def test_find_loop_zones_identifies_review_layer(self, engine):
+        """Layers containing nodes with reviews attribute are flagged."""
+        wf = Workflow(name="test-review-zones")
         wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="Do work")
+        wf.nodes["implement"] = WorkflowNode(
+            id="implement", agent="coder", task="Implement",
+            depends_on=["a"], reviews=["verify"],
+        )
         wf.nodes["verify"] = WorkflowNode(
-            id="verify", agent="reviewer", task="Review",
-            depends_on=["a"],
-        )
-        wf.nodes["revise"] = WorkflowNode(
-            id="revise", agent="author", task="Revise",
-            depends_on=["verify"],
-        )
-        wf.nodes["merge"] = WorkflowNode(
-            id="merge", agent="ci", task="Merge",
-            depends_on=["verify"],
+            id="verify", agent="reviewer", task="Verify",
+            depends_on=["implement"],
         )
         layers = engine.topological_sort(wf)
-        loop_layers = engine._find_loop_zones(wf, layers)
-        # Both layer 0 (a → verify) and layer 1 (verify → revise) are flagged
-        # because _find_loop_zones is conservative — it flags any layer where
-        # a node has a dependent. The supervisor handles the rest.
-        assert len(loop_layers) >= 1
-        # Layer 1 (verify) is definitely flagged
-        verify_layer = None
-        for i, layer in enumerate(layers):
-            if "verify" in layer:
-                verify_layer = i
-                break
-        assert verify_layer in loop_layers
+        review_layers = engine._find_loop_zones(wf, layers)
+        assert len(review_layers) >= 1
 
     def test_find_loop_zones_no_loops(self, engine):
         """Linear workflow — _find_loop_zones is conservative and may flag layers
