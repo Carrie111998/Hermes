@@ -854,6 +854,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
+        # The synthesized branches below (deadline timeout / user-interrupt
+        # cancel / thread-missing) have no tool output to classify, so they
+        # never bind ``is_error`` — but the activity-log suffix at the bottom of
+        # this loop reads it unconditionally. Without this reset the first entry
+        # of a batch that hits one of those branches raises NameError and the
+        # whole batch's results are discarded, and a later entry would inherit
+        # the previous tool's verdict. They are failures by construction; the
+        # real-result branch overwrites this with _detect_tool_failure's answer.
+        is_error = True
         # A worker can finish and write results[i] in the window between the
         # deadline snapshot (timed_out_indices, taken from not_done) and this
         # loop. Prefer that real result over a fabricated timeout message — the

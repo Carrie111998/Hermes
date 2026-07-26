@@ -118,6 +118,43 @@ def test_concurrent_preflight_interrupt_skips_all(monkeypatch):
     agent._invoke_tool.assert_not_called()
 
 
+def test_concurrent_batch_deadline_still_records_every_tool_result(monkeypatch):
+    """A tool still running at the batch deadline leaves ``results[i] is None``,
+    so the post-execution loop takes one of the synthesized branches. Those
+    branches bind no ``is_error`` — which the activity-log suffix at the bottom
+    of the same loop reads unconditionally. The resulting NameError escapes
+    before any tool_result is appended, so the whole batch is lost, including
+    the siblings that finished successfully.
+
+    The same shape fires on a mid-batch user interrupt; the deadline is the
+    deterministic way to reach it.
+    """
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.2")
+    agent = _make_agent(monkeypatch)
+
+    def _invoke(function_name, *args, **kwargs):
+        if function_name == "tool_slow":
+            time.sleep(1.5)
+        return '{"ok": true}'
+
+    agent._invoke_tool = MagicMock(side_effect=_invoke)
+
+    msg = _FakeAssistantMsg(
+        [
+            _FakeToolCall("tool_slow", call_id="tc_slow"),
+            _FakeToolCall("tool_fast", call_id="tc_fast"),
+        ]
+    )
+    messages = []
+
+    agent._execute_tool_calls_concurrent(msg, messages, "test_task")
+
+    # One tool_result per tool_call, even when the first one hit the deadline:
+    # the fast tool's real output must not be discarded along with it.
+    assert len(messages) == 2
+    assert "timed out" in messages[0]["content"]
+
+
 
 
 def test_clear_interrupt_clears_worker_tids(monkeypatch):
