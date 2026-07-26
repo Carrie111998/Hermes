@@ -1240,27 +1240,23 @@ def try_recover_primary_transport(
             except Exception:
                 pass
 
-        # Rebuild from primary snapshot
-        rt = agent._primary_runtime
-        agent._client_kwargs = dict(rt["client_kwargs"])
-        agent.model = rt["model"]
-        agent.provider = rt["provider"]
-        agent.requested_provider = rt.get("requested_provider", agent.provider)
-        agent.base_url = rt["base_url"]
-        agent.api_mode = rt["api_mode"]
+        # Rebuild the live primary runtime in place.  ``_primary_runtime`` is a
+        # primary snapshot that may predate a credential-pool rotation. Restoring
+        # it here would retry a stale key while ``_credential_pool_entry_id``
+        # continues to identify the healthy replacement, so a subsequent
+        # 401/402/429 could quarantine the wrong entry. Fallback runtimes are
+        # rejected above, therefore the live fields already describe the primary
+        # route we need to recover.
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
-        agent.api_key = rt["api_key"]
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
-            agent._anthropic_api_key = rt["anthropic_api_key"]
-            agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
-                rt["anthropic_api_key"], rt["anthropic_base_url"],
+                agent._anthropic_api_key,
+                agent._anthropic_base_url,
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
-            agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
         elif (agent.provider or "").strip().lower() == "moa":
             # MoA is a virtual provider with empty client_kwargs — rebuilding
@@ -1272,7 +1268,7 @@ def try_recover_primary_transport(
             agent.client = build_moa_facade(agent, agent.model)
         else:
             agent.client = agent._create_openai_client(
-                dict(rt["client_kwargs"]),
+                dict(agent._client_kwargs),
                 reason="primary_recovery",
                 shared=True,
             )
