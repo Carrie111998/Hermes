@@ -5536,9 +5536,9 @@ class TestRunConversation:
         without ASCII punctuation should not be reclassified as truncated.
         """
         self._setup_agent(agent)
-        # Use a non-localhost IP for sglang to avoid matching the
-        # localhost/127.0.0.1 Ollama signature heuristic (#60928).
-        agent.base_url = "http://192.168.1.100:60000/v1"
+        # Loopback (127.0.0.1) with no Ollama/:11434 signature must NOT
+        # trigger the heuristic — it could be sglang/vLLM/LM Studio.
+        agent.base_url = "http://127.0.0.1:60000/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5-fp8"
 
@@ -5688,11 +5688,11 @@ class TestRunConversation:
         must NOT be treated as an Ollama backend. provider='zai' on
         a non-localhost address with no :11434 signature reports stop
         correctly and the response should be delivered as-is.
-
-        Uses a non-localhost IP (192.168.1.1) to avoid matching the
-        localhost Ollama signature heuristic (#60928)."""
+        """
+        # Loopback (localhost) with no Ollama/:11434 signature and
+        # provider='zai' must NOT be treated as an Ollama backend.
         self._setup_agent(agent)
-        agent.base_url = "http://192.168.1.1:8000/v1"
+        agent.base_url = "http://localhost:8000/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "zai"
         agent.model = "glm-5-turbo"
@@ -6349,6 +6349,109 @@ class TestRunConversation:
         assert second_call["max_tokens"] <= 65471  # 65535 - 64
         assert agent.context_compressor.context_length == 131_072
         mock_compress.assert_not_called()
+
+    def test_length_continuation_exhausted_uses_newline_join(self, agent):
+        """Exhausted length continuations must join parts with ``\\n`` so
+        MEDIA tags are not fused to adjacent text (#60928)."""
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.1:cloud"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        # 4 truncated responses needed to exhaust max_length_continuations.
+        # None end with terminal punctuation so the heuristic fires each time.
+        parts = [
+            "Phase one MEDIA:/tmp/p1.ogg",
+            "Phase two MEDIA:/tmp/p2.ogg",
+            "Phase three MEDIA:/tmp/p3.ogg",
+            "Phase four MEDIA:/tmp/p4.ogg",
+        ]
+        truncated_responses = [
+            _mock_response(content=p, finish_reason="stop") for p in parts
+        ]
+
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            *truncated_responses,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 5
+        # All four parts must be present in the partial response
+        for p in parts:
+            assert p in result["final_response"]
+        # Without \n.join, "oggPhase" would appear — verify newline separation
+        assert "\n" in result["final_response"]
+        assert "oggPhase" not in result["final_response"]
+
+    def test_length_continuation_complete_uses_newline_join(self, agent):
+        """When the final response completes after length continuations,
+        accumulated parts must be joined with ``\\n`` so MEDIA tags are
+        not fused (#60928)."""
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.1:cloud"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        # Two truncated parts — neither ends with terminal punctuation
+        truncated_1 = _mock_response(
+            content="First batch MEDIA:/tmp/batch1.ogg",
+            finish_reason="stop",
+        )
+        truncated_2 = _mock_response(
+            content="Second batch MEDIA:/tmp/batch2.ogg",
+            finish_reason="stop",
+        )
+        # Final response ends with period — natural ending stops heuristic
+        final_stop = _mock_response(
+            content=" and the final answer is ready.",
+            finish_reason="stop",
+        )
+
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            truncated_1,
+            truncated_2,
+            final_stop,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 4
+        # Both truncated parts must be present
+        assert "First batch MEDIA:/tmp/batch1.ogg" in result["final_response"]
+        assert "Second batch MEDIA:/tmp/batch2.ogg" in result["final_response"]
+        # Without \n.join, "oggSecond" would appear — verify newline separation
+        assert "\n" in result["final_response"]
+        assert "oggSecond" not in result["final_response"]
+        # Final continuation piece should flow naturally
+        assert " and the final answer is ready." in result["final_response"]
 
 
 class TestHookPayloadSanitizesSimpleNamespace:
