@@ -1192,7 +1192,7 @@ function Install-ManagedRipgrep {
         "x86_64-pc-windows-msvc"
     }
 
-    $rgVersion = "14.1.1"
+    $rgVersion = "15.2.0"
     $zipName   = "ripgrep-$rgVersion-$arch.zip"
     $assetUrl  = "https://github.com/BurntSushi/ripgrep/releases/download/$rgVersion/$zipName"
     $zipPath   = Join-Path $env:TEMP $zipName
@@ -1275,7 +1275,7 @@ function Install-ManagedRtk {
         $arch = "aarch64-pc-windows-msvc"
     }
 
-    $rtkVersion = "0.43.0"
+    $rtkVersion = "0.44.0"
     $zipName   = "rtk-$arch.zip"
     $assetUrl  = "https://github.com/rtk-ai/rtk/releases/download/v$rtkVersion/$zipName"
     $zipPath   = Join-Path $env:TEMP $zipName

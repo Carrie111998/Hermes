@@ -27,7 +27,7 @@ from hermes_constants import get_hermes_home, get_managed_tools_dir
 # Constants
 # ---------------------------------------------------------------------------
 
-RTK_VERSION = "0.43.0"
+RTK_VERSION = "0.44.0"
 """The rtk version we ship / look for. Keep in sync with install scripts."""
 
 RTK_REPO = "rtk-ai/rtk"
