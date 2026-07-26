@@ -7,6 +7,7 @@ correct handling of stale/partial failures.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import unittest
 from unittest import mock
@@ -192,51 +193,79 @@ class TestUsageRefreshHookIntegration(unittest.TestCase):
         asyncio.run(run())
 
 
-class TestSecurityAndSemantics(unittest.TestCase):
-    """Tests for DEFECT #1 (credential leakage) and DEFECT #2 (coalesced timeout semantics)."""
+def test_credential_canary_not_leaked(caplog):
+    """CANARY REGRESSION TEST for DEFECT #1: Verify credentials are NOT leaked in results or logs.
 
-    def test_credential_canary_not_leaked(self):
-        """CANARY REGRESSION TEST for DEFECT #1: Verify credentials are NOT leaked in results.
+    Hermes proved credential leakage via TWO paths:
+    1. Raw exception text in result["detail"] (now sanitized)
+    2. Raw exception in logger.exception() appending full traceback (now using logger.error + exc_info=False)
 
-        Hermes proved credential leakage: exceptions containing secrets were propagated
-        raw through error_detail → result → logs. This test verifies the fix.
+    This test verifies both paths are fixed.
 
-        Setup: refresh that raises exception containing credential pattern.
-        Assert: credential does NOT appear in returned result dict or detail string.
-        """
-        hook = UsageRefreshHook(min_interval_seconds=0.1, timeout_seconds=1.0)
+    Setup: refresh that raises exception containing credential patterns.
+    Assert: credential does NOT appear in:
+      - returned result dict or detail string
+      - ANY captured log record (message + formatted output)
+    """
+    hook = UsageRefreshHook(min_interval_seconds=0.1, timeout_seconds=1.0)
 
-        def failing_with_secret():
-            # Synthetic canary credential matching the pattern in redaction logic
-            raise RuntimeError(
-                "Failed to authenticate; credential=SYNTHETIC_CREDENTIAL_CANARY_7f4c "
-                "authorization=Bearer sk_live_secret123 api_key=key_abc_xyz"
-            )
+    def failing_with_secret():
+        # Synthetic canary credential matching the pattern in redaction logic
+        raise RuntimeError(
+            "Failed to authenticate; credential=SYNTHETIC_CREDENTIAL_CANARY_7f4c "
+            "authorization=Bearer sk_live_secret123 api_key=key_abc_xyz"
+        )
 
-        hook.refresh_fn = failing_with_secret
+    hook.refresh_fn = failing_with_secret
 
-        async def run():
+    async def run():
+        with caplog.at_level(logging.DEBUG):
             result = await hook.refresh_if_needed()
 
-            # Result must be a dict (no raw exception object exposure)
-            assert isinstance(result, dict), "Result is not a dict"
+        # Result must be a dict (no raw exception object exposure)
+        assert isinstance(result, dict), "Result is not a dict"
 
-            # Verify credential canary is NOT in any result field
-            result_str = str(result)
-            assert (
-                "SYNTHETIC_CREDENTIAL_CANARY_7f4c" not in result_str
-            ), "Credential canary leaked in result"
-            assert (
-                "sk_live_secret123" not in result_str
-            ), "Secret key leaked in result"
-            assert (
-                "key_abc_xyz" not in result_str
-            ), "API key leaked in result"
+        # ============ ASSERTION 1: Verify credential NOT in result dict ============
+        result_str = str(result)
+        assert (
+            "SYNTHETIC_CREDENTIAL_CANARY_7f4c" not in result_str
+        ), "Credential canary leaked in result dict"
+        assert (
+            "sk_live_secret123" not in result_str
+        ), "Secret key leaked in result dict"
+        assert (
+            "key_abc_xyz" not in result_str
+        ), "API key leaked in result dict"
 
-            # Detail should mention the exception type but scrub the message
-            assert "RuntimeError" in result.get("detail", ""), "Exception type missing"
+        # Detail should mention the exception type but scrub the message
+        assert "RuntimeError" in result.get("detail", ""), "Exception type missing"
 
-        asyncio.run(run())
+        # ============ ASSERTION 2: Verify credential NOT in ANY log record ============
+        # Capture all log records at any level (DEBUG, ERROR, etc.)
+        for record in caplog.records:
+            # Check both the log message and the formatted output
+            assert (
+                "SYNTHETIC_CREDENTIAL_CANARY_7f4c" not in record.message
+            ), f"Canary leaked in log message: {record.message}"
+            assert (
+                "SYNTHETIC_CREDENTIAL_CANARY_7f4c" not in record.getMessage()
+            ), f"Canary leaked in formatted log: {record.getMessage()}"
+            assert (
+                "sk_live_secret123" not in record.message
+            ), f"Secret key leaked in log message: {record.message}"
+            assert (
+                "sk_live_secret123" not in record.getMessage()
+            ), f"Secret key leaked in formatted log: {record.getMessage()}"
+
+    asyncio.run(run())
+
+
+class TestSecurityAndSemantics(unittest.TestCase):
+    """Tests for DEFECT #2 (coalesced timeout semantics).
+
+    Note: test_credential_canary_not_leaked is a standalone pytest function above
+    (outside this class) so it can use the caplog fixture.
+    """
 
     def test_coalesced_waiter_timeout_returns_coalesced(self):
         """DEFECT #2: Verify coalesced callers return reason='coalesced' even on timeout.

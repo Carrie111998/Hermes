@@ -171,9 +171,10 @@ class UsageRefreshHook:
                         )
                         return {"ok": ok}
                     except Exception as exc:
-                        logger.exception("Usage refresh failed: %s", exc)
                         # Sanitize to prevent credential leakage (DEFECT #1 fix)
+                        # Log ONLY the sanitized form (not raw exception with logger.exception)
                         sanitized_error = _sanitize_error_message(exc)
+                        logger.error("Usage refresh failed: %s", sanitized_error, exc_info=False)
                         return {
                             "ok": False,
                             "error": type(exc).__name__,
@@ -274,9 +275,10 @@ class UsageRefreshHook:
             # Clear task on failure so next caller can retry
             if task_to_await is self._refresh_in_progress:
                 self._refresh_in_progress = None
-            logger.exception("Usage refresh failed: %s", exc)
-            # DEFECT #1 (security): sanitize exception details
+            # DEFECT #1 (security): sanitize exception details before logging
+            # Log ONLY the sanitized form (not raw exception with logger.exception)
             sanitized_error = _sanitize_error_message(exc)
+            logger.error("Usage refresh failed: %s", sanitized_error, exc_info=False)
             return {
                 "ok": False,
                 "refreshed": False,
