@@ -74,18 +74,6 @@ h1, h2, h3, h4, p { margin: 0; }
   flex: 1 1 auto;
   min-width: 0;
 }
-.ifz-app-scrim {
-  display: none;
-  position: fixed;
-  inset: 0;
-  background: rgba(9, 12, 24, 0.5);
-  z-index: 80;
-  border: 0;
-  padding: 0;
-  cursor: pointer;
-}
-.ifz-app.nav-open .ifz-app-scrim { display: block; }
-
 /* ---------- Sidebar ---------- */
 .ifz-sidebar {
   width: 232px;
@@ -184,20 +172,6 @@ h1, h2, h3, h4, p { margin: 0; }
   justify-content: center;
   padding: 0 5px;
 }
-.ifz-sidebar-footer {
-  padding: 12px 16px;
-  font-size: var(--fs-xs);
-  color: var(--sidebar-faint);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.ifz-mock-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  background: var(--warning);
-  flex-shrink: 0;
-}
 
 /* ---------- Main column ---------- */
 .ifz-main {
@@ -208,28 +182,37 @@ h1, h2, h3, h4, p { margin: 0; }
   width: 100%;
 }
 
-.ifz-topbar {
-  height: auto;
-  min-height: 64px;
+/* Ask, workspace, theme and account, at the foot of the rail. */
+.ifz-sidebar-foot {
+  margin-top: auto;
   flex-shrink: 0;
   display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) 10px calc(var(--space-3) + env(safe-area-inset-bottom, 0px));
+}
+.ifz-sidebar-account {
+  display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 14px var(--space-6);
-  background: var(--bg);
+  gap: var(--space-2);
   min-width: 0;
 }
-.ifz-topbar-title {
-  font-family: var(--font-display);
-  font-size: var(--fs-lg);
-  font-weight: 650;
-  color: var(--text-strong);
-  letter-spacing: -0.01em;
-  white-space: nowrap;
+.ifz-sidebar-account .ifz-company-chip {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--sidebar-text);
+}
+.ifz-sidebar-account .ifz-company-chip span:last-child {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.ifz-topbar-spacer { flex: 1; }
+.ifz-sidebar-account .ifz-iconbtn {
+  color: var(--sidebar-text);
+  flex-shrink: 0;
+}
+.ifz-sidebar-account .ifz-iconbtn:hover { background: var(--sidebar-2); }
+
 .ifz-company-chip {
   display: inline-flex;
   align-items: center;
@@ -272,7 +255,6 @@ h1, h2, h3, h4, p { margin: 0; }
   transition: background 0.15s ease, color 0.15s ease;
 }
 .ifz-iconbtn:hover { background: var(--surface-2); color: var(--text); }
-.ifz-menu-btn { display: none; }
 
 .ifz-usermenu { position: relative; }
 .ifz-usermenu-pop {
@@ -1729,16 +1711,7 @@ h1, h2, h3, h4, p { margin: 0; }
   margin: 3px 0;
   border-radius: var(--radius-md);
 }
-.ifz-sidebar-footer {
-  padding: 18px 20px 24px;
-}
 .ifz-main {
-  background: var(--bg);
-}
-.ifz-topbar {
-  height: auto;
-  min-height: 64px;
-  padding: 14px var(--space-6);
   background: var(--bg);
 }
 .ifz-page {
@@ -2288,6 +2261,14 @@ h1, h2, h3, h4, p { margin: 0; }
   background: var(--surface-3);
   box-shadow: inset 0 1px var(--surface-2);
 }
+/* The bar is --surface-3, and so is the global .ifz-btn:hover. Without this the
+   secondary actions lose their silhouette the moment you point at them. */
+.ifz-review-actions .ifz-btn:not(.primary):not(.danger):hover:not(:disabled) {
+  background: var(--surface);
+}
+.ifz-review-actions .ifz-btn:disabled:hover {
+  background: var(--surface-2);
+}
 .ifz-review-primary-action,
 .ifz-review-secondary-actions > div {
   display: flex;
@@ -2456,21 +2437,80 @@ h1, h2, h3, h4, p { margin: 0; }
   }
 }
 
-/* ---------- Responsive shell ---------- */
+/* ---------- Responsive shell ----------
+   Four destinations fit a bottom tab bar, so small screens get the native
+   pattern instead of a drawer: navigation is always visible and thumb-reachable,
+   and the account cluster pins to the top. The same element serves both
+   layouts — there is no second copy of these controls in the DOM. */
 @media (max-width: 900px) {
-  .ifz-menu-btn { display: inline-flex; }
+  .ifz-app { flex-direction: column; }
   .ifz-sidebar {
     position: fixed;
     left: 0;
-    top: 0;
+    right: 0;
     bottom: 0;
-    width: min(280px, 86vw);
+    top: auto;
+    width: 100%;
+    height: auto;
+    flex-direction: row;
     z-index: 90;
-    transform: translateX(-105%);
-    transition: transform 0.22s ease;
+    padding: 0;
+    overflow: visible;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
-  .ifz-app.nav-open .ifz-sidebar { transform: translateX(0); }
-  .ifz-page { padding: var(--space-4); }
+  /* The wordmark is chrome the tab bar does not need. */
+  .ifz-sidebar > .ifz-logo { display: none; }
+  .ifz-nav {
+    flex: 1 1 auto;
+    flex-direction: row;
+    padding: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ifz-nav::-webkit-scrollbar { display: none; }
+  /* Admin adds six more entries; they scroll rather than squashing the four
+     that matter. */
+  .ifz-nav-group-label { display: none; }
+  .ifz-nav-item {
+    flex: 1 0 auto;
+    min-width: 72px;
+    min-height: 52px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    padding: 7px 6px;
+    font-size: var(--fs-xs);
+    text-align: center;
+  }
+  .ifz-nav-item.active { background: var(--sidebar-2); }
+  .ifz-nav-badge { position: absolute; top: 4px; right: 50%; margin-right: -20px; }
+
+  /* Fixed positioning takes this out of the bottom bar and pins it top-right. */
+  .ifz-sidebar-foot {
+    position: fixed;
+    top: 0;
+    right: 0;
+    left: 0;
+    margin: 0;
+    flex-direction: row;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 8px 12px calc(8px + env(safe-area-inset-top, 0px));
+    background: var(--bg);
+    z-index: 60;
+  }
+  .ifz-sidebar-foot .ifz-ask-trigger { margin-right: auto; }
+  .ifz-sidebar-account .ifz-company-chip { color: var(--text); flex: 0 1 auto; }
+  .ifz-sidebar-account .ifz-iconbtn { color: var(--text); }
+  .ifz-sidebar-account .ifz-iconbtn:hover { background: var(--surface-2); }
+
+  /* Reserve room for both fixed bars so content is never hidden behind them. */
+  .ifz-main { padding-top: 52px; }
+  .ifz-page {
+    padding: var(--space-4);
+    padding-bottom: calc(var(--space-4) + 64px + env(safe-area-inset-bottom, 0px));
+  }
   .ifz-page-actions,
   .ifz-filters {
     width: 100%;
@@ -2486,16 +2526,11 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 
 @media (max-width: 480px) {
-  .ifz-topbar {
-    gap: var(--space-2);
+  .ifz-sidebar-foot {
     padding-inline: 12px;
   }
-  .ifz-topbar-title {
-    display: none;
-  }
-  .ifz-topbar-spacer {
-    min-width: 0;
-  }
+  /* The workspace name is the first thing to go when width runs out; the avatar
+     still identifies it, and the name stays available to screen readers. */
   .ifz-company-chip {
     position: relative;
     padding: 6px;
@@ -2511,6 +2546,7 @@ h1, h2, h3, h4, p { margin: 0; }
     white-space: nowrap;
     border: 0;
   }
+  .ifz-nav-item { min-width: 64px; }
 }
 
 /* Reduced motion */
@@ -2884,6 +2920,10 @@ h1, h2, h3, h4, p { margin: 0; }
   line-height: 1.55;
 }
 .ifz-today-map {
+  /* renderMiniMap is async, so this box is empty for a tick. Reserve the height
+     or the action panel grows under the button the user just pressed — and
+     render() re-runs on every work-status change during a search. */
+  height: 174px;
   max-height: 174px;
   margin: 20px -8px 16px;
   overflow: hidden;
@@ -3023,6 +3063,20 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 .ifz-ask-trigger:active {
   transform: translateY(1px);
+}
+/* Inside the blue rail Ask reads as a translucent surface rather than a chip
+   borrowed from the page background. */
+.ifz-sidebar-foot .ifz-ask-trigger {
+  width: 100%;
+  min-height: var(--touch-min);
+  background: var(--sidebar-2);
+  color: var(--sidebar-text-strong);
+}
+.ifz-sidebar-foot .ifz-ask-trigger:hover { background: var(--sidebar-active); }
+.ifz-sidebar-foot .ifz-ask-trigger kbd {
+  margin-left: auto;
+  background: transparent;
+  color: var(--sidebar-faint);
 }
 .ifz-ask-trigger kbd {
   padding: 3px 5px;
@@ -3585,6 +3639,11 @@ h1, h2, h3, h4, p { margin: 0; }
     "footer footer";
   column-gap: clamp(24px, 4vw, 52px);
   padding: 0 22px 22px 52px;
+}
+/* Only on a real open. render() rebuilds this panel on every run-poll tick, so
+   an unconditional animation made an expanded company strobe several times a
+   second while research was in flight. */
+.ifz-company-panel.is-revealing {
   animation: ifz-company-reveal .18s ease both;
 }
 @keyframes ifz-company-reveal {

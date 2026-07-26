@@ -151,6 +151,13 @@ export async function mount(root, ctx) {
 
   function render({ focus = null } = {}) {
     if (disposed) return;
+    // render() rebuilds the card on every state change, including busy toggles
+    // and refusal banners. Without this, pressing Approve halfway down a long
+    // email snaps the reader back to the top — at exactly the moment they were
+    // reading. Only restored when it is still the same email.
+    const previousId = host.querySelector('.ifz-review-card')?.dataset.messageId || null;
+    const previousBodyScroll = host.querySelector('.ifz-review-email-body')?.scrollTop || 0;
+    const previousContextScroll = host.querySelector('.ifz-review-context')?.scrollTop || 0;
     rebuildQueue();
     const message = queue[currentIndex] || null;
     const waiting = baseQueue();
@@ -291,6 +298,12 @@ export async function mount(root, ctx) {
     });
     card.setAttribute('aria-describedby', 'ifz-review-help');
     host.replaceChildren(...[header, help, live, pauseBanner, card].filter(Boolean));
+    if (previousId && previousId === message.id) {
+      const body = host.querySelector('.ifz-review-email-body');
+      if (body) body.scrollTop = previousBodyScroll;
+      const context = host.querySelector('.ifz-review-context');
+      if (context) context.scrollTop = previousContextScroll;
+    }
     if (focus) focusAfterRender(focus);
   }
 

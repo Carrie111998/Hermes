@@ -523,7 +523,9 @@ export function companyRow(lead, contacts = [], handlers = {}) {
   if (handlers.expanded) {
     const blocked = lead.do_not_contact || lead.status === 'do_not_contact';
     const panel = el('div', {
-      class: 'ifz-company-panel',
+      // The reveal animation is opt-in: this panel is rebuilt on every re-render,
+      // including run-poll ticks, so it must only animate on an actual open.
+      class: `ifz-company-panel${handlers.revealing ? ' is-revealing' : ''}`,
       id: panelId,
     },
     handlers.loading

@@ -1,4 +1,7 @@
-/* App chrome: sidebar + topbar. Mounted once; pages render into shell.pageRoot. */
+/* App chrome: one rail. Mounted once; pages render into shell.pageRoot.
+   Desktop is a left sidebar carrying navigation, Ask, workspace, theme and
+   account. Small screens turn the same element into a bottom tab bar with the
+   account cluster pinned top-right — see the .ifz-sidebar rules in app.css. */
 
 import {
   el, icon, button, input, isApprovalActionable, runSentence,
@@ -186,7 +189,6 @@ export function mountShell(root) {
     logoNode(),
     navHost);
 
-  const titleNode = el('div', { class: 'ifz-topbar-title', id: 'ifz-page-title' }, 'Today');
   const themeBtn = el('button', { class: 'ifz-iconbtn', type: 'button', title: 'Toggle theme', 'aria-label': 'Toggle theme' });
   function paintThemeIcon() {
     themeBtn.replaceChildren(icon(document.documentElement.classList.contains('dark') ? 'sun' : 'moon', 15));
@@ -450,44 +452,14 @@ export function mountShell(root) {
   });
   menuHost.append(avatarBtn);
 
-  const menuBtn = el('button', {
-    class: 'ifz-iconbtn ifz-menu-btn',
-    type: 'button',
-    'aria-label': 'Open navigation',
-    'aria-controls': 'ifz-sidebar',
-    'aria-expanded': 'false',
-  }, icon('menu', 18));
+  // No hamburger: four destinations fit a bottom tab bar on small screens, so
+  // the drawer, its scrim, focus trap, inert handling and body-scroll lock are
+  // all gone. Nothing to open means nothing to close.
 
-  const mq = window.matchMedia('(min-width: 901px)');
   let appFrame = null;
-  function setNavOpen(open, { restoreFocus = false } = {}) {
-    if (!appFrame) return;
-    const drawerOpen = !mq.matches && Boolean(open);
-    appFrame.classList.toggle('nav-open', drawerOpen);
-    menuBtn.setAttribute('aria-expanded', drawerOpen ? 'true' : 'false');
-    menuBtn.setAttribute('aria-label', drawerOpen ? 'Close navigation' : 'Open navigation');
-    document.body.style.overflow = drawerOpen ? 'hidden' : '';
-    sidebar.inert = !mq.matches && !drawerOpen;
-    if (sidebar.inert) sidebar.setAttribute('aria-hidden', 'true');
-    else sidebar.removeAttribute('aria-hidden');
-    if (drawerOpen) {
-      requestAnimationFrame(() => {
-        sidebar.querySelector('.ifz-nav-item[aria-current="page"], .ifz-nav-item')?.focus();
-      });
-    } else if (restoreFocus) {
-      menuBtn.focus();
-    }
-  }
-  function closeNav(restoreFocus = false) { setNavOpen(false, { restoreFocus }); }
-  function toggleNav() { setNavOpen(!appFrame?.classList.contains('nav-open')); }
-  menuBtn.addEventListener('click', toggleNav);
-
-  const scrim = el('button', {
-    class: 'ifz-app-scrim',
-    type: 'button',
-    'aria-label': 'Close navigation',
-    onclick: () => closeNav(true),
-  });
+  // Kept so callers (main.js appPage) need no change; navigation is always
+  // visible now, so there is nothing to close.
+  function closeNav() {}
 
   const initialCompanyName = session?.company?.name || db.company?.name || '';
   const companyAvatar = el('span', { class: 'ifz-avatar', 'aria-hidden': 'true' }, initialCompanyName.slice(0, 1).toUpperCase() || '—');
@@ -498,23 +470,27 @@ export function mountShell(root) {
     companyNameNode.textContent = name || (isAdmin ? 'No workspace selected' : 'Workspace');
   });
 
-  const topbar = el('header', { class: 'ifz-topbar' },
-    menuBtn,
-    titleNode,
-    el('div', { class: 'ifz-topbar-spacer' }),
+  /* One chrome region, not two. The page title used to be printed here and
+     again by each page's own pageHead() — it now lives only in document.title.
+     Ask, workspace, theme and account are all "you and your workspace", so they
+     belong at the foot of the rail rather than floating above the content.
+     On small screens CSS pins this cluster to the top while the nav itself
+     becomes a bottom tab bar. */
+  const sidebarFoot = el('div', { class: 'ifz-sidebar-foot' },
     askTrigger,
-    el('span', { class: 'ifz-company-chip' },
-      companyAvatar,
-      companyNameNode),
-    themeBtn,
-    menuHost);
+    el('div', { class: 'ifz-sidebar-account' },
+      el('span', { class: 'ifz-company-chip' },
+        companyAvatar,
+        companyNameNode),
+      themeBtn,
+      menuHost));
+  sidebar.append(sidebarFoot);
 
   const pageRoot = el('div', { class: 'ifz-page', id: 'ifz-main', tabindex: '-1' });
-  const main = el('main', { class: 'ifz-main' }, topbar, pageRoot);
+  const main = el('main', { class: 'ifz-main' }, pageRoot);
 
-  appFrame = el('div', { class: 'ifz-app' }, scrim, sidebar, main);
+  appFrame = el('div', { class: 'ifz-app' }, sidebar, main);
   root.replaceChildren(appFrame);
-  setNavOpen(false);
 
   const onShellKeydown = (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -526,18 +502,14 @@ export function mountShell(root) {
       closeAsk();
       return;
     }
-    if (e.key === 'Escape' && appFrame.classList.contains('nav-open')) closeNav(true);
   };
   document.addEventListener('keydown', onShellKeydown);
 
-  // Close drawer when resizing to desktop
-  const onMq = () => setNavOpen(false);
-  mq.addEventListener?.('change', onMq);
-
   _shell = {
     pageRoot,
+    // The visible title is each page's own pageHead(); this only names the
+    // browser tab, so the name is not printed twice on every screen.
     setTitle(t) {
-      titleNode.textContent = t;
       document.title = `${t} · interfaze-agent`;
     },
     setActiveNav(path) {
@@ -556,7 +528,6 @@ export function mountShell(root) {
       unsubscribeCompany();
       document.removeEventListener('ifz:approval-count', onApprovalCount);
       document.removeEventListener('keydown', onShellKeydown);
-      mq.removeEventListener?.('change', onMq);
       closeAsk({ restoreFocus: false });
       closeMenu();
     },

@@ -180,6 +180,34 @@ def test_phase5_cutover_collapses_nav_and_keeps_every_legacy_bookmark_alive():
     assert "export async function mount" not in lead_map.text
 
 
+def test_shell_is_one_chrome_region_with_no_drawer():
+    """Four destinations need one bar, not two. The page title lives in each
+    page's own pageHead(), and small screens get a bottom tab bar rather than a
+    drawer — so the scrim, focus trap and body-scroll lock are all gone."""
+    _, client = make_client()
+    shell = client.get("/js/shell.js").text
+    css = client.get("/css/app.css").text
+
+    # The second chrome region and the drawer apparatus are gone.
+    for removed in ("ifz-topbar", "ifz-app-scrim", "nav-open", "ifz-menu-btn",
+                    "setNavOpen", "toggleNav"):
+        assert removed not in shell, f"{removed} still in shell.js"
+    for removed in (".ifz-topbar", ".ifz-app-scrim", ".nav-open", ".ifz-menu-btn"):
+        assert removed not in css, f"{removed} still in app.css"
+
+    # The page name is not printed twice: setTitle only names the browser tab.
+    assert "document.title" in shell
+    assert "ifz-topbar-title" not in shell
+
+    # Ask, workspace, theme and account moved into the rail.
+    assert "ifz-sidebar-foot" in shell and ".ifz-sidebar-foot" in css
+
+    # Small screens turn the same element into a bottom tab bar, and both fixed
+    # bars reserve room so content is never hidden behind them.
+    assert "env(safe-area-inset-bottom" in css
+    assert ".ifz-main { padding-top" in css or "padding-top: 52px" in css
+
+
 def test_api_routes_win_over_static_mount():
     _, client = make_client()
     assert client.get("/health").json()["service"] == "interfaze-agent"

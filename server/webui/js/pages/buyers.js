@@ -118,6 +118,9 @@ export async function mount(root, ctx) {
     stateFilter: ctx.query.state || '',
     stageFilter: ctx.query.stage || '',
     expandedLeadId: ctx.query.buyer || ctx.query.company || ctx.query.lead || '',
+    // Set for exactly one render, when a company is opened by hand, so the
+    // reveal animation does not replay on every background refresh.
+    revealLeadId: '',
     highlightedContactId: ctx.query.contact || ctx.query.person || '',
     mapOpen: ctx.query.map === '1',
     busy: new Set(),
@@ -639,6 +642,7 @@ export async function mount(root, ctx) {
       const feedback = state.feedback.get(model.lead.id);
       return companyRow(model.lead, model.contacts, {
         expanded: state.expandedLeadId === model.lead.id,
+        revealing: state.revealLeadId === model.lead.id,
         highlightedContactId: state.highlightedContactId,
         research: model.research,
         currentScore: model.currentScore,
@@ -718,6 +722,8 @@ export async function mount(root, ctx) {
       search?.focus({ preventScroll: true });
       search?.setSelectionRange(state.q.length, state.q.length);
     }
+    // Consumed: the next render is a refresh, not an open.
+    state.revealLeadId = '';
   }
 
   async function loadBuyerDetails(leadId, { force = false } = {}) {
@@ -745,6 +751,7 @@ export async function mount(root, ctx) {
 
   function toggleBuyer(leadId) {
     const opening = state.expandedLeadId !== leadId;
+    state.revealLeadId = opening ? leadId : '';
     state.expandedLeadId = opening ? leadId : '';
     state.highlightedContactId = opening ? state.highlightedContactId : '';
     syncUrl();
