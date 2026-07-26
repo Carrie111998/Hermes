@@ -1002,6 +1002,69 @@ def test_subprocess_env_strips_unrelated_secrets(hermes_home, monkeypatch):
     assert env.get("OPENROUTER_API_KEY") == "sk-or-real"
 
 
+def test_bitwarden_refresh_forwards_normalized_source_config(
+    hermes_home, monkeypatch,
+):
+    """The proxy refresh path must resolve the same aliases and endpoint as startup."""
+
+    ip.write_mappings([_sample_mapping("OPENROUTER_API_KEY")])
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+
+    import agent.secret_sources.bitwarden as bw
+
+    captured = {}
+
+    def fake_fetch(**kwargs):
+        captured.update(kwargs)
+        return {"OPENROUTER_API_KEY": "sk-rotated"}, []
+
+    monkeypatch.setattr(bw, "fetch_bitwarden_secrets", fake_fetch)
+    bw_cfg = {
+        "project_id": "proj",
+        "access_token_env": "BWS_ACCESS_TOKEN",
+        "server_url": " https://vault.bitwarden.eu ",
+        "key_map": {123: "OPENROUTER_API_KEY"},
+    }
+
+    env = ip._build_proxy_subprocess_env(
+        refresh_from_bitwarden=True,
+        bitwarden_config=bw_cfg,
+    )
+
+    assert captured["server_url"] == "https://vault.bitwarden.eu"
+    assert captured["key_map"] == {"123": "OPENROUTER_API_KEY"}
+    assert env["OPENROUTER_API_KEY"] == "sk-rotated"
+
+
+@pytest.mark.parametrize("raw_key_map", [None, [], "not-a-map", 7])
+def test_bitwarden_refresh_treats_legacy_non_mapping_key_map_as_empty(
+    hermes_home, monkeypatch, raw_key_map,
+):
+    ip.write_mappings([_sample_mapping("OPENROUTER_API_KEY")])
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "tok")
+
+    import agent.secret_sources.bitwarden as bw
+
+    captured = {}
+
+    def fake_fetch(**kwargs):
+        captured.update(kwargs)
+        return {"OPENROUTER_API_KEY": "sk-rotated"}, []
+
+    monkeypatch.setattr(bw, "fetch_bitwarden_secrets", fake_fetch)
+
+    ip._build_proxy_subprocess_env(
+        refresh_from_bitwarden=True,
+        bitwarden_config={
+            "project_id": "proj",
+            "access_token_env": "BWS_ACCESS_TOKEN",
+            "key_map": raw_key_map,
+        },
+    )
+
+    assert captured["key_map"] == {}
+
+
 def test_subprocess_env_strips_proxy_recursion_vars(hermes_home, monkeypatch):
     """HTTPS_PROXY etc. in the parent env would otherwise recurse iron-proxy
     through itself (or send its traffic through a corporate proxy)."""

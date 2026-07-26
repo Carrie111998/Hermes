@@ -2161,11 +2161,24 @@ def _build_proxy_subprocess_env(
             access_token = parent.get(access_token_name, "").strip()
             project_id = bitwarden_config.get("project_id", "")
             if access_token and project_id:
+                raw_key_map = bitwarden_config.get("key_map")
+                key_map = (
+                    {
+                        str(source): str(target)
+                        for source, target in raw_key_map.items()
+                    }
+                    if isinstance(raw_key_map, dict)
+                    else {}
+                )
                 secrets, warnings = bw.fetch_bitwarden_secrets(
                     access_token=access_token,
                     project_id=project_id,
                     cache_ttl_seconds=0,
                     use_cache=False,
+                    server_url=str(
+                        bitwarden_config.get("server_url", "") or ""
+                    ).strip(),
+                    key_map=key_map,
                 )
                 # Only inject env names we have a mapping for — extra
                 # secrets in the BW project shouldn't leak into the proxy
