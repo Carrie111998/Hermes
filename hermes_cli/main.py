@@ -5314,19 +5314,21 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
-_DASHBOARD_FLAG_ARITY_CACHE: dict[str, bool] | None = None
+_SERVER_CMDLINE_FLAG_ARITY_CACHE: dict[str, bool] | None = None
+
+_SERVER_SUBCOMMANDS = frozenset({"dashboard", "serve"})
 
 
-def _dashboard_global_flag_arity() -> dict[str, bool]:
+def _server_cmdline_flag_arity() -> dict[str, bool]:
     """Map of top-level flags to whether they consume a value token.
 
     Built by introspecting the real top-level parser (same approach as
     ``hermes_cli.relaunch``) plus the pre-argparse ``--profile``/``-p``
-    flags, so the dashboard cmdline matcher below never drifts out of
+    flags, so the server cmdline matcher below never drifts out of
     sync with the CLI's actual global options.
     """
-    global _DASHBOARD_FLAG_ARITY_CACHE
-    if _DASHBOARD_FLAG_ARITY_CACHE is None:
+    global _SERVER_CMDLINE_FLAG_ARITY_CACHE
+    if _SERVER_CMDLINE_FLAG_ARITY_CACHE is None:
         from hermes_cli._parser import (
             PRE_ARGPARSE_INHERITED_FLAGS,
             build_top_level_parser,
@@ -5338,19 +5340,19 @@ def _dashboard_global_flag_arity() -> dict[str, bool]:
             takes_value = action.nargs != 0  # store_true/false set nargs=0
             for opt in action.option_strings:
                 flags[opt] = takes_value
-        _DASHBOARD_FLAG_ARITY_CACHE = flags
-    return _DASHBOARD_FLAG_ARITY_CACHE
+        _SERVER_CMDLINE_FLAG_ARITY_CACHE = flags
+    return _SERVER_CMDLINE_FLAG_ARITY_CACHE
 
 
-def _is_dashboard_cmdline(command: str) -> bool:
-    """Return True when *command* is a ``hermes dashboard`` invocation.
+def _is_server_cmdline(command: str) -> bool:
+    """Return True when *command* is a ``hermes dashboard`` or ``hermes serve`` invocation.
 
     Tokenizes instead of substring-matching so global flags between the
     entrypoint and the subcommand are still detected — e.g.
     ``python -m hermes_cli.main --profile work dashboard`` (#44035).
-    Only known top-level flags may appear before ``dashboard``; the first
-    unrecognized token bails out, so cmdlines that merely *mention*
-    dashboard (``hermes -z "fix my dashboard"``) never match.
+    Only known top-level flags may appear before the subcommand; the first
+    unrecognized token bails out, so cmdlines that merely *mention* a
+    server subcommand (``hermes -z "fix my dashboard"``) never match.
     """
     tokens = [t.strip('"') for t in command.split()]
 
@@ -5368,15 +5370,25 @@ def _is_dashboard_cmdline(command: str) -> bool:
     if entry_idx is None:
         return False
 
-    flag_arity = _dashboard_global_flag_arity()
+    # Reject shell-wrapped cmdlines like ``sh -c hermes dashboard --status``
+    # whose parent shell is the real process (#44035).
+    if entry_idx > 0 and tokens[entry_idx - 1] == "-c":
+        return False
+
+    flag_arity = _server_cmdline_flag_arity()
     i = entry_idx + 1
     while i < len(tokens):
         tok = tokens[i]
-        if tok == "dashboard":
+        if tok in _SERVER_SUBCOMMANDS:
             return True
         if not tok.startswith("-"):
             return False  # a different subcommand or free-text argument
         if "=" in tok:  # --profile=work
+            flag_name = tok.split("=", 1)[0]
+            arity = flag_arity.get(flag_name)
+            if arity is not True:
+                # Unknown flag or boolean flag with =value — bail out.
+                return False
             i += 1
             continue
         if tok not in flag_arity:
@@ -5389,10 +5401,10 @@ def _find_stale_dashboard_pids(
     *,
     exclude_pids: set[int] | None = None,
 ) -> list[int]:
-    """Return PIDs of ``hermes dashboard`` processes other than ourselves.
+    """Return PIDs of ``hermes dashboard``/``hermes serve`` processes other than ourselves.
 
-    ``hermes dashboard`` is a long-lived server process commonly started and
-    forgotten.  When ``hermes update`` replaces files on disk, the running
+    ``hermes dashboard`` and ``hermes serve`` are long-lived server processes
+    commonly started and forgotten.  When ``hermes update`` replaces files on disk, the running
     process keeps the old Python backend in memory while the JS bundle on
     disk is updated, causing a silent frontend/backend mismatch (e.g. new
     auth headers the old backend doesn't recognise → every API call 401s).
@@ -5447,7 +5459,7 @@ def _find_stale_dashboard_pids(
                         pid = int(pid_str)
                     except ValueError:
                         continue
-                    if _is_dashboard_cmdline(current_cmd) and pid != self_pid:
+                    if _is_server_cmdline(current_cmd) and pid != self_pid:
                         dashboard_pids.append(pid)
         else:
             # Linux / macOS: scan the process table via ps and match with
@@ -5475,7 +5487,7 @@ def _find_stale_dashboard_pids(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if _is_dashboard_cmdline(command) and pid != self_pid:
+                    if _is_server_cmdline(command) and pid != self_pid:
                         dashboard_pids.append(pid)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -5615,8 +5627,8 @@ def _format_time_ago(iso_ts: str) -> str:
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
 ) -> None:
-    """Kill running ``hermes dashboard`` processes.
-
+    """Kill running ``hermes dashboard``/``hermes serve`` processes.
+ 
     Called at the end of ``hermes update`` (default ``reason``) and also
     from ``hermes dashboard --stop`` (which overrides ``reason``).  The
     dashboard has no service manager, so after a code update the running
@@ -10248,7 +10260,7 @@ def _render_distribution_plan(plan) -> None:
 
 
 def _report_dashboard_status() -> int:
-    """Print ``hermes dashboard`` PIDs and return the count.
+    """Print ``hermes dashboard``/``hermes serve`` PIDs and return the count.
 
     Uses the same detection logic as ``_find_stale_dashboard_pids`` (the
     current process is excluded, but since ``hermes dashboard --status``

@@ -280,6 +280,18 @@ class TestGlobalFlagsBeforeSubcommand:
         """Unknown flags have unknown arity — bail out rather than guess."""
         assert self._scan("hermes --some-future-flag dashboard") == []
 
+    def test_unknown_equals_flag_before_dashboard_not_matched(self):
+        """Equals-form unknown flags must also be rejected (#44165 review)."""
+        assert self._scan("hermes --future-flag=x dashboard") == []
+
+    def test_profile_flag_before_serve_matched(self):
+        """``hermes serve`` with --profile before subcommand must be detected."""
+        assert self._scan("hermes --profile work serve --port 9119") == [10000]
+
+    def test_shell_wrapper_not_matched(self):
+        """``sh -c hermes dashboard --status`` is the shell, not hermes."""
+        assert self._scan("sh -c hermes dashboard --status") == []
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX kill semantics")
 class TestKillStaleDashboardPosix:
