@@ -29,6 +29,53 @@ def check_mark(ok: bool) -> str:
         return color("✓", Colors.GREEN)
     return color("✗", Colors.RED)
 
+
+def _is_resolved_api_key(api_key: str) -> bool:
+    """True iff ``api_key`` looks like a real secret, not a `${VAR}` placeholder
+    that failed to expand. Mirrors the placeholder guard in
+    ``hermes_cli.auth.get_auth_status`` so ``hermes status`` doesn't
+    over-report custom pool providers as configured when their env var
+    is unset.
+    """
+    if not api_key:
+        return False
+    if api_key.startswith("${") and api_key.endswith("}"):
+        return False
+    return True
+
+
+def _emit_custom_pool_status() -> None:
+    """Print configured custom-pool providers under the API-Key Providers
+    block. ``hermes auth add`` (--pool custom:) stores credentials under
+    ``custom_providers: [...]`` in config.yaml; the built-in loop above
+    only consults env-var-backed providers, so without this helper users
+    with custom pool providers see nothing under "API-Key Providers".
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return
+    custom = cfg.get("custom_providers") or []
+    if not isinstance(custom, list) or not custom:
+        return
+
+    from agent.credential_pool import _get_custom_provider_config  # lazy import
+
+    for entry in custom:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or ""
+        if not name:
+            continue
+        # Lazy lookup via the same code path get_auth_status uses, so
+        # both commands agree on which providers are configured.
+        cp_config = _get_custom_provider_config(f"custom:{name}") or {}
+        api_key = cp_config.get("api_key") or ""
+        configured = _is_resolved_api_key(api_key)
+        label = "configured" if configured else "missing api_key / env"
+        # Truncate names to keep alignment with the hardcoded rows.
+        print(f"  {name[:24]:<24} {check_mark(configured)} {label} (custom pool)")
+
 def redact_key(key: str) -> str:
     """Redact an API key for display.
 
@@ -386,6 +433,11 @@ def show_status(args):
         configured = bool(key_val)
         label = "configured" if configured else "not configured (run: hermes model)"
         print(f"  {pname:<16} {check_mark(configured)} {label}")
+
+    # Custom pool providers (hermes auth add ...) — these store api_key in
+    # custom_providers: [...] in config.yaml, not in env vars. Show them
+    # alongside built-in API-key providers so users can confirm status.
+    _emit_custom_pool_status()
 
     # LM Studio reachability — only probe when it's the active provider so
     # users with foreign configs don't see noise. Auth rejection vs. silent
