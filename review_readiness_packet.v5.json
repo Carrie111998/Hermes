@@ -1,0 +1,237 @@
+{
+  "packet_schema": "review_readiness_packet.v5",
+  "generated_at": "2026-07-26T17:21:40.955439+00:00",
+  "original_request_ref": "Current Hermes chat: after New API usage audit, Allen requested fixing (1) Pro controller under-utilizing Flash workers and (2) unreliable/ambiguous subtask dispatch lifecycle.",
+  "risk_tier": "L2",
+  "l2_trigger_ids": [
+    "multi_or_unknown_blast_radius"
+  ],
+  "material_uncertainty": null,
+  "objective": "Provide an opt-in, runtime-enforced Pro-to-Flash dispatch gate and precise Kanban dispatch diagnostics without changing the model roster or enabling live behavior.",
+  "commit_chain": {
+    "227c547": "227c547ca5bdb0fa01faa2d2ea0c047696f8e351",
+    "4f6cb18": "4f6cb1859e89455fec0661772e5808f331618200",
+    "89bc084": "89bc0847b23fcfe252c03a2b239f6ab7fa40f189",
+    "73c51e1": "73c51e12648da6dc5e1de9a5769b407526019065",
+    "3a97b43": "3a97b432a0308250f610fb7325054451c9d4611a",
+    "f9e01e3": "f9e01e3e97a35726552aa29f88a4509ccd111f54",
+    "65d2d33": "65d2d33726c57f1af873e255f5560813f8f8c775",
+    "08820ad": "08820ada2242f0a8a875b288cda3b58d0bd17c5c",
+    "a3a6bbe": "a3a6bbe974a548b727ae7cada2d3644cedb38fe9"
+  },
+  "acceptance_criteria": {
+    "AC-1": {
+      "description": "When dual opt-in is enabled, substantial/stateful controller tool calls require a durable worker-terra Flash route or bounded durable exemption; read-only framing remains allowed.",
+      "evidence_refs": [
+        "E-1",
+        "E-2"
+      ],
+      "negative_path_refs": [
+        "N-1",
+        "N-2"
+      ]
+    },
+    "AC-2": {
+      "description": "A route binds assignee worker-terra, model deepseek-v4-flash and provider new-api to the task fields used by _default_spawn; conflicts and route/assignee mismatch fail before write.",
+      "evidence_refs": [
+        "E-1",
+        "E-3"
+      ],
+      "negative_path_refs": [
+        "N-3"
+      ]
+    },
+    "AC-3": {
+      "description": "Authorization is isolated per session/turn and derives from durable task/event readback, including exact dispatch_exempted keyword and explicit board.",
+      "evidence_refs": [
+        "E-1",
+        "E-2"
+      ],
+      "negative_path_refs": [
+        "N-4",
+        "N-5"
+      ]
+    },
+    "AC-4": {
+      "description": "Plugin activation uses the supported discovery/PluginContext/invoke_hook path and requires both plugins.enabled and kanban.enforce_dispatch_routing.",
+      "evidence_refs": [
+        "E-2"
+      ],
+      "negative_path_refs": [
+        "N-2"
+      ]
+    },
+    "AC-5": {
+      "description": "Dispatcher diagnostics distinguish fresh normal wait, expired/no tick, exact capacity wait, exact nonspawnable task, and stale claim using persisted task-level signals.",
+      "evidence_refs": [
+        "E-1",
+        "E-4"
+      ],
+      "negative_path_refs": [
+        "N-6"
+      ]
+    },
+    "AC-6": {
+      "description": "Created/ready is never described as running; dispatch uses exact model/provider argv; duplicate idempotency identity does not create duplicate route topology.",
+      "evidence_refs": [
+        "E-1",
+        "E-3"
+      ],
+      "negative_path_refs": [
+        "N-7"
+      ]
+    },
+    "AC-7": {
+      "description": "Candidate remains isolated and disabled by default; no live config, service, database, merge, deploy or model roster change occurred.",
+      "evidence_refs": [
+        "E-5",
+        "E-6"
+      ],
+      "negative_path_refs": [
+        "N-8"
+      ]
+    }
+  },
+  "non_goals": [
+    "Automatic Flash-to-Pro quality escalation",
+    "Changing controller default from DeepSeek V4 Pro",
+    "Changing generic delegate_task model/provider",
+    "Repairing live ruoyu-cost-router catalog variant mismatch",
+    "Live activation, gateway restart, merge, deploy, publication or promotion"
+  ],
+  "artifact_refs": {
+    "hermes_cli/kanban_enforcement.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/hermes_cli/kanban_enforcement.py",
+      "sha256": "dcc686db84cd4d57231b80bf382396d6f087fd0f8fcbb54d5bf800b18fea6cff"
+    },
+    "hermes_cli/kanban_db.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/hermes_cli/kanban_db.py",
+      "sha256": "1864be4e4aab30c2d95a4599eafaa7d679baf09262da67e7ee7987804a237091"
+    },
+    "hermes_cli/kanban_diagnostics.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/hermes_cli/kanban_diagnostics.py",
+      "sha256": "835ea30a0d293a361d27a56b6fcc1f35d0adc24c744643a0d01f8adde70cdf6e"
+    },
+    "tools/kanban_tools.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tools/kanban_tools.py",
+      "sha256": "008e285ebc0a5c0539afceed45dc38b9d8bc188cfdf8d333f747b0a8648d839c"
+    },
+    "agent/prompt_builder.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/agent/prompt_builder.py",
+      "sha256": "71001a8bd76b8e5956b6fbe01b700ad69f53eadbeab6ed736696b425d97e64a1"
+    },
+    "plugins/kanban-enforcement/__init__.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/plugins/kanban-enforcement/__init__.py",
+      "sha256": "fa40eca1f224aa0168595e5fe58a9989fd7b2c74d7b27c194763109b8f307c5b"
+    },
+    "plugins/kanban-enforcement/plugin.yaml": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/plugins/kanban-enforcement/plugin.yaml",
+      "sha256": "a4070907c9bdfec92a187fcada714a6cacb179e8b3d27d845c0fbdb8b90470ee"
+    },
+    "tests/hermes_cli/test_kanban_enforcement.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/hermes_cli/test_kanban_enforcement.py",
+      "sha256": "b872baa22bdf3c2a8561db1aad04157e8721b325d7e51c4a0f25f923daffba47"
+    },
+    "tests/hermes_cli/test_kanban_enforcement_integration.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/hermes_cli/test_kanban_enforcement_integration.py",
+      "sha256": "40547274cf2be609455d40d8a4413e691a527dde9cb7dd97e53eac47265a40cb"
+    },
+    "tests/hermes_cli/test_kanban_diagnostics.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/hermes_cli/test_kanban_diagnostics.py",
+      "sha256": "20a06d0030e027cb6fa76fc65a52515ef82d9c214aca36d93fdbf26cdb888f17"
+    },
+    "tests/hermes_cli/test_kanban_db.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/hermes_cli/test_kanban_db.py",
+      "sha256": "e2709b4c01d1caa0470d95654500045750bfaebdaa1d3785e6a705b0781990ad"
+    },
+    "tests/tools/test_kanban_tools.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/tools/test_kanban_tools.py",
+      "sha256": "9beaa02a5f367a6a25629cc97566ea72609b411568c8de7dd1fa0d0f40921bbf"
+    },
+    "tests/plugins/test_kanban_model_override.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-utilization-v1/tests/plugins/test_kanban_model_override.py",
+      "sha256": "5eb95ad96590272fa4ad6fa1615ba685a1a74fec584df04076c778ca2b4f7c8b"
+    }
+  },
+  "evidence_refs": {
+    "E-1": {
+      "command": "env -u HERMES_DELEGATED_CHILD_CONTEXT /home/allen/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/test_kanban_enforcement.py tests/hermes_cli/test_kanban_enforcement_integration.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_db.py tests/tools/test_kanban_tools.py tests/plugins/test_kanban_model_override.py -q",
+      "executed_at": "2026-07-26T17:19:38+00:00",
+      "exit_code": 0,
+      "result": "552 passed",
+      "freshness": "post-final-code-commit a3a6bbe"
+    },
+    "E-2": {
+      "command": "project-venv pytest tests/hermes_cli/test_kanban_enforcement_integration.py -v as part of E-1",
+      "executed_at": "2026-07-26T17:19:38+00:00",
+      "exit_code": 0,
+      "result": "real SQLite route/exemption, explicit-board post hook, and real discover_plugins+invoke_hook dual-opt-in paths passed",
+      "freshness": "post-final-code-commit"
+    },
+    "E-3": {
+      "command": "tests TestDispatchDecisionSpawnArgv, TestRouteBinding, TestRouteAssigneeMatch, TestDispatchIdempotency in E-1",
+      "executed_at": "2026-07-26T17:19:38+00:00",
+      "exit_code": 0,
+      "result": "binding/spawn/conflict/idempotency paths passed",
+      "freshness": "post-final-code-commit"
+    },
+    "E-4": {
+      "command": "tests/hermes_cli/test_kanban_diagnostics.py in E-1",
+      "executed_at": "2026-07-26T17:19:38+00:00",
+      "exit_code": 0,
+      "result": "exact task-level tick classifications and old-schema migration tests passed",
+      "freshness": "post-final-code-commit"
+    },
+    "E-5": {
+      "command": "git status --porcelain=v1",
+      "executed_at": "2026-07-26T17:21:40.955439+00:00",
+      "exit_code": 0,
+      "result": "clean before packet creation",
+      "freshness": "packet-generation"
+    },
+    "E-6": {
+      "command": "git show --check a3a6bbe and artifact SHA-256 generation",
+      "executed_at": "2026-07-26T17:21:40.955439+00:00",
+      "exit_code": 0,
+      "result": "commit check clean; digests in artifact_refs",
+      "freshness": "packet-generation"
+    }
+  },
+  "negative_path_evidence": {
+    "N-1": "Known substantial and unknown tools block without route/exemption when enabled; cron/process action-specific read-only vs stateful cases tested.",
+    "N-2": "Plugin disabled or config gate false produces no blocking hook result; enabled+gate true blocks terminal via real invoke_hook.",
+    "N-3": "Missing assignee, route/assignee mismatch, explicit model/provider conflict and malformed decision reject before durable write.",
+    "N-4": "Interleaved sessions cannot share authorization; turn advance/session cleanup expires only the intended state.",
+    "N-5": "Wrong board, wrong event kind, missing event, forged exemption keyword and mismatched durable task fail authorization.",
+    "N-6": "Fresh task below two intervals receives no expired-tick diagnostic; aggregate skip for other tasks does not flag current task; exact IDs required.",
+    "N-7": "Same idempotency key returns one task and one dispatch event; exemption spawn omits model/provider flags.",
+    "N-8": "Plugin is standalone opt-in and kanban.enforce_dispatch_routing defaults false; live ~/.hermes was not modified."
+  },
+  "attack_surface_menu": [
+    "prompt-cache stability",
+    "tool-hook registration and enablement",
+    "session authorization isolation",
+    "durable board/task/event source-of-truth",
+    "model/provider spawn binding",
+    "dispatcher tick persistence and migration",
+    "diagnostic false positives and operator commands",
+    "idempotency and duplicate execution"
+  ],
+  "coverage_gaps": [
+    "No real live Gateway activation or restart was performed; candidate remains isolated.",
+    "No full daemon subprocess lifecycle smoke with a real Hermes child binary; _default_spawn argv and dispatcher DB paths are covered by tests.",
+    "Live ruoyu-cost-router variant-name mismatch remains a separate blocker for that plugin path and is not repaired here.",
+    "Branch is based on a shallow/diverged origin history (ahead/behind); merge/rebase compatibility is not yet assessed.",
+    "Worker usage report /tmp/flash_dispatch_v5_usage.json recorded completed=false, failed=false despite process exit 0; controller therefore relied on independent source/test evidence, not worker completion metadata."
+  ],
+  "packet_check": {
+    "status": "pass",
+    "checked_at": "2026-07-26T17:22:29.935600+00:00",
+    "missing_fields": [],
+    "unresolvable_refs": [],
+    "artifact_count": 13,
+    "criterion_count": 7,
+    "evidence_count": 6,
+    "negative_path_count": 8
+  }
+}
