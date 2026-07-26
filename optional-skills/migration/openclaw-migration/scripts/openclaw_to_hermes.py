@@ -332,7 +332,7 @@ def sha256_file(path: Path) -> str:
 
 
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="replace")
+    return path.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")
 
 
 def normalize_text(text: str) -> str:
@@ -395,11 +395,14 @@ def parse_env_file(path: Path) -> Dict[str, str]:
     try:
         # errors="replace" means read_text() cannot raise UnicodeDecodeError;
         # OSError covers races like the file disappearing or being unreadable.
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # Strip a leading UTF-8 BOM so Windows-exported OpenClaw .env files
+        # still resolve keys like TELEGRAM_WEBHOOK_SECRET (not \ufeffTELEGRAM_...).
+        text = path.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")
+        lines = text.splitlines()
     except OSError:
         return {}
     for raw_line in lines:
-        line = raw_line.strip()
+        line = raw_line.strip().lstrip("\ufeff")
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
@@ -1309,17 +1312,20 @@ class Migrator:
             self.record("command-allowlist", source, destination, "migrated", "Would merge patterns", added_patterns=added)
 
     def load_openclaw_config(self) -> Dict[str, Any]:
-        # Check current name and legacy config filenames
-        for name in ("openclaw.json", "clawdbot.json", "moltbot.json"):
-            config_path = self.source_root / name
-            if config_path.exists():
-                try:
-                    # errors="replace" means read_text() cannot raise
-                    # UnicodeDecodeError; OSError covers unreadable/vanished files.
-                    data = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
-                    return data if isinstance(data, dict) else {}
-                except (json.JSONDecodeError, OSError):
-                    continue
+        # Prefer openclaw_config_path() so nested homes (``.openclaw-desktop``,
+        # ``.openclaw``) and legacy filenames are found the same way as the
+        # rest of the migrator. Strip a leading UTF-8 BOM — Windows-exported
+        # OpenClaw JSON often carries one and json.loads rejects it.
+        config_path = self.openclaw_config_path()
+        if config_path.exists():
+            try:
+                text = config_path.read_text(encoding="utf-8", errors="replace").lstrip(
+                    "\ufeff"
+                )
+                data = json.loads(text)
+                return data if isinstance(data, dict) else {}
+            except (json.JSONDecodeError, OSError):
+                pass
         return {}
 
     def load_openclaw_env(self) -> Dict[str, str]:

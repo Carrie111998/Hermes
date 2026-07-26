@@ -2902,7 +2902,7 @@ class TestWebServerEndpoints:
             def get_connected_platforms(self):
                 return []
 
-        monkeypatch.setattr(web_server, "get_running_pid", lambda: None)
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: None)
         monkeypatch.setattr(web_server, "read_runtime_status", lambda: None)
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", "")
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))

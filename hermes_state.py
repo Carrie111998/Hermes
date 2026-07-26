@@ -5668,8 +5668,17 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+    def get_session_by_title(
+        self,
+        title: str,
+        source: str = None,
+        user_id: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title. Returns session dict or None.
+
+        Optional ``source`` / ``user_id`` narrow the match the same way
+        ``resolve_session_by_title`` does (gateway resume + desktop).
+        """
         where_clauses = ["title = ?"]
         params = [title]
         order_clause = ""

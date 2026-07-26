@@ -4116,7 +4116,12 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+        def close(self):
+            return None
+
+    # Launch-home rows go through _open_session_db (not the process-global
+    # _get_db handle) so a stale SessionDB cannot leak across HERMES_HOME rebinds.
+    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
     server._ensure_session_db_row({"session_key": "k1", "source": "desktop", "cwd": str(tmp_path)})
@@ -4361,8 +4366,11 @@ def test_session_title_rejects_empty_title_with_specific_error_code(monkeypatch)
         def get_session_title(self, _key):
             return ""
 
+        def close(self):
+            return None
+
     server._sessions["sid"] = _session()
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -4386,8 +4394,11 @@ def test_session_title_set_maps_valueerror_to_user_error(monkeypatch):
         def set_session_title(self, _key, _title):
             raise ValueError("Title already in use")
 
+        def close(self):
+            return None
+
     server._sessions["sid"] = _session()
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -4412,8 +4423,11 @@ def test_session_title_set_errors_when_row_lookup_fails_after_noop(monkeypatch):
         def set_session_title(self, _key, _title):
             return False
 
+        def close(self):
+            return None
+
     server._sessions["sid"] = _session()
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -7031,7 +7045,10 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
                 "updated_at": 1_700_000_060,
             }
 
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+        def close(self):
+            return None
+
+    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _DB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -7411,7 +7428,10 @@ def test_session_info_includes_session_title(monkeypatch):
             assert key == "session-key"
             return "Dashboard title"
 
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+        def close(self):
+            return None
+
+    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
 
     info = server._session_info(
         types.SimpleNamespace(tools=[], model="test/model", provider="openai-codex"),
@@ -10323,9 +10343,12 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
         def get_session_title(self, key):
             return {"key-a": "Research", "key-b": "Implement"}.get(key, "")
 
+        def close(self):
+            return None
+
     previous_sessions = dict(server._sessions)
     server._sessions.clear()
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _DB())
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "find docs"}],
@@ -10597,7 +10620,7 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
             ]
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _DB())
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
 
     resp = server.handle_request({
         "id": "1",
@@ -10615,7 +10638,7 @@ def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
         def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _DB())
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
 
     resp = server.handle_request({
         "id": "1",
@@ -10635,7 +10658,7 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
         def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             raise RuntimeError("db locked")
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _BrokenDB())
+    monkeypatch.setattr(server, "_get_db", lambda: _BrokenDB())
 
     resp = server.handle_request({
         "id": "1",

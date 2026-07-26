@@ -209,8 +209,9 @@ def test_profile_pinned_heartbeat_updates_owner_store_only(tmp_path, monkeypatch
         heartbeat_seen.set()
         return updated
 
-    def blocking_script(_script_path: str, *, job=None):
+    def blocking_script(_script_path: str, *, job=None, workdir=None):
         assert job is claimed_job
+        assert workdir is None or isinstance(workdir, str)
         assert heartbeat_seen.wait(2)
         return True, "done"
 

@@ -1,43 +1,46 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""Bridge between Hermes OAuth token and gws CLI.
 
+Refreshes the token if expired, then executes gws with the valid access token.
+"""
 import json
 import os
 import subprocess
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+# Ensure sibling modules (_hermes_home) are importable when run standalone.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 from _hermes_home import get_hermes_home
-
-TOKEN_REFRESH_TIMEOUT_SECONDS = 30
 
 
 def get_token_path() -> Path:
     return get_hermes_home() / "google_token.json"
 
 
-def _parse_expiry(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+def _normalize_authorized_user_payload(payload: dict) -> dict:
+    normalized = dict(payload)
+    if not normalized.get("type"):
+        normalized["type"] = "authorized_user"
+    return normalized
 
 
-def _token_is_current(data: dict) -> bool:
-    expiry = _parse_expiry(data.get("expiry"))
-    if expiry is None:
-        return True
-    return expiry > datetime.now(timezone.utc) + timedelta(minutes=1)
+def refresh_token(token_data: dict) -> dict:
+    """Refresh the access token using the refresh token."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
 
+    required_keys = ["client_id", "client_secret", "refresh_token", "token_uri"]
+    missing = [k for k in required_keys if k not in token_data]
+    if missing:
+        print(f"ERROR: google_token.json is missing required fields: {', '.join(missing)}", file=sys.stderr)
+        print("Please re-authenticate by running the Google Workspace setup script.", file=sys.stderr)
+        sys.exit(1)
 
     params = urllib.parse.urlencode({
         "client_id": token_data["client_id"],
@@ -72,6 +75,7 @@ def _token_is_current(data: dict) -> bool:
 
 
 def get_valid_token() -> str:
+    """Return a valid access token, refreshing if needed."""
     token_path = get_token_path()
     if not token_path.exists():
         print("ERROR: No Google token found. Run setup.py --auth-url first.", file=sys.stderr)
@@ -97,9 +101,10 @@ def main():
 
     access_token = get_valid_token()
     env = os.environ.copy()
-    env["GOOGLE_WORKSPACE_CLI_TOKEN"] = token
-    proc = subprocess.run(["gws", *sys.argv[1:]], env=env)
-    raise SystemExit(proc.returncode)
+    env["GOOGLE_WORKSPACE_CLI_TOKEN"] = access_token
+
+    result = subprocess.run(["gws"] + sys.argv[1:], env=env)
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":

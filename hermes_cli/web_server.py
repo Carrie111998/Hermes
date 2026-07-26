@@ -3176,6 +3176,18 @@ async def get_status(profile: Optional[str] = None):
             if profile_dir
             else get_running_pid_cached()
         )
+        # PID file can be missing after a crash/restart race while the gateway
+        # process is still alive. Fall back to a process scan so Desktop /
+        # dashboard status stays truthful (fork: 1f147e98bf).
+        if gateway_pid is None:
+            try:
+                from hermes_cli.gateway import find_gateway_pids
+
+                pids = find_gateway_pids()
+                if pids:
+                    gateway_pid = pids[0]
+            except Exception:
+                gateway_pid = None
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
