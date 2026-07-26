@@ -34,8 +34,10 @@ from typing import Any, Callable, Optional
 from agent.codex_responses_adapter import _format_responses_error
 from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
+    DEFAULT_CODEX_BIN,
     CodexAppServerClient,
     CodexAppServerError,
+    resolve_codex_bin,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
 
@@ -275,7 +277,7 @@ class CodexAppServerSession:
         self,
         *,
         cwd: Optional[str] = None,
-        codex_bin: str = "codex",
+        codex_bin: str = DEFAULT_CODEX_BIN,
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
@@ -284,7 +286,7 @@ class CodexAppServerSession:
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
-        self._codex_bin = codex_bin
+        self._codex_bin = resolve_codex_bin(codex_bin)
         self._codex_home = codex_home
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(

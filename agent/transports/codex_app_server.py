@@ -31,6 +31,41 @@ from tools.environments.local import hermes_subprocess_env
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
 
+# Sentinel for "caller did not specify a binary". Distinguishes an explicit
+# ``codex_bin="codex"`` (respect it verbatim) from the default (resolve it).
+DEFAULT_CODEX_BIN = "codex"
+
+
+def resolve_codex_bin(codex_bin: str = DEFAULT_CODEX_BIN) -> str:
+    """Resolve the codex CLI to a launchable path.
+
+    ``npm i -g @openai/codex`` installs ``codex``/``codex.cmd``/``codex.ps1``
+    on Windows and no bare ``codex.exe``. ``subprocess.run``/``Popen`` with a
+    list argument call ``CreateProcess``, which does NOT consult ``PATHEXT``,
+    so a bare ``"codex"`` raises ``FileNotFoundError`` even though the CLI is
+    installed and ``shutil.which("codex")`` finds it (#48510).
+
+    ``find_hermes_node_executable`` searches the Hermes-managed Node dirs
+    directly (not just inherited ``PATH``) and its candidate order —
+    ``["codex.cmd", "codex.exe", "codex"]`` — deliberately excludes ``.ps1``,
+    which PowerShell's execution policy blocks by default. That also fixes
+    gateway/service/Kanban-worker contexts where ``PATH`` is minimal (#61360).
+
+    An explicitly supplied path is returned untouched. Falls back to the input
+    when nothing resolves, so the caller still gets the original error message.
+    """
+    if codex_bin != DEFAULT_CODEX_BIN:
+        return codex_bin
+    try:
+        from hermes_constants import find_hermes_node_executable
+
+        resolved = find_hermes_node_executable(codex_bin)
+        if resolved:
+            return resolved
+    except Exception:  # pragma: no cover - defensive, never block spawn
+        pass
+    return codex_bin
+
 
 @dataclass
 class CodexAppServerError(RuntimeError):
@@ -70,12 +105,12 @@ class CodexAppServerClient:
 
     def __init__(
         self,
-        codex_bin: str = "codex",
+        codex_bin: str = DEFAULT_CODEX_BIN,
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
     ) -> None:
-        self._codex_bin = codex_bin
+        self._codex_bin = codex_bin = resolve_codex_bin(codex_bin)
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
         # legitimately needs LLM provider credentials (inherit_credentials=True)
@@ -385,11 +420,13 @@ def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:
 
 
 def check_codex_binary(
-    codex_bin: str = "codex", min_version: tuple[int, int, int] = MIN_CODEX_VERSION
+    codex_bin: str = DEFAULT_CODEX_BIN,
+    min_version: tuple[int, int, int] = MIN_CODEX_VERSION,
 ) -> tuple[bool, str]:
     """Verify codex CLI is installed and meets minimum version.
 
     Returns (ok, message). Used by setup wizard and runtime startup."""
+    codex_bin = resolve_codex_bin(codex_bin)
     try:
         proc = subprocess.run(
             [codex_bin, "--version"],
