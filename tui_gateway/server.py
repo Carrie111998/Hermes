@@ -13083,6 +13083,8 @@ def _config_set(rid, params: dict) -> dict:
                     os.environ.pop("HERMES_YOLO_MODE", None)
                     nv = "0"
             return _ok(rid, {"key": key, "value": nv, "scope": "session"})
+        except _ManagedConfigWriteError:
+            raise
         except Exception as e:
             return _err(rid, 5001, str(e))
 
@@ -13192,6 +13194,8 @@ def _config_set(rid, params: dict) -> dict:
                     _session_info(session["agent"], session),
                 )
             return _ok(rid, {"key": key, "value": arg})
+        except _ManagedConfigWriteError:
+            raise
         except Exception as e:
             return _err(rid, 5001, str(e))
 
@@ -13400,8 +13404,8 @@ def _config_set(rid, params: dict) -> dict:
                 if info is not None:
                     resp["info"] = info
             return _ok(rid, resp)
-        except _ManagedConfigWriteError as e:
-            return _err(rid, 4030, str(e))
+        except _ManagedConfigWriteError:
+            raise
         except Exception as e:
             return _err(rid, 5001, str(e))
 

@@ -186,6 +186,30 @@ def test_tui_config_set_refuses_managed_skin(homes, monkeypatch):
     assert "skin: user" in disk
 
 
+def test_tui_config_set_reasoning_managed_returns_4030(homes, monkeypatch):
+    """Inner except Exception must not swallow managed refusals into 5001."""
+    home, managed = homes
+    _seed(
+        home,
+        managed,
+        user="agent:\n  reasoning_effort: low\n",
+        mgd="agent:\n  reasoning_effort: high\n",
+    )
+    import tui_gateway.server as ts
+
+    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
+    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
+    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+
+    resp = ts._methods["config.set"](
+        1, {"key": "reasoning", "value": "medium", "scope": "global"}
+    )
+    assert resp.get("error", {}).get("code") == 4030
+    assert "managed" in resp["error"]["message"].lower()
+
+
 def test_logging_config_honors_managed(homes, monkeypatch):
     home, managed = homes
     _seed(home, managed, user="logging:\n  level: INFO\n", mgd="logging:\n  level: DEBUG\n")
