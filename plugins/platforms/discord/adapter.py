@@ -7530,6 +7530,8 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
         )
+        from gateway.owner_commands import _stamp_direct_human_event
+        _stamp_direct_human_event(event)
 
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.

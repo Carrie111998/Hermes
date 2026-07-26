@@ -9086,7 +9086,7 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        return MessageEvent(
+        event = MessageEvent(
             text=message.text or "",
             message_type=msg_type,
             source=source,
@@ -9099,6 +9099,9 @@ class TelegramAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             timestamp=message.date,
         )
+        from gateway.owner_commands import _stamp_direct_human_event
+        _stamp_direct_human_event(event)
+        return event
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 

@@ -10004,6 +10004,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
+            _owner_input_rewritten = False
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
@@ -10033,11 +10034,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if isinstance(_new_text, str):
                         event = dataclasses.replace(event, text=_new_text)
                         source = event.source
+                        _owner_input_rewritten = True
                     break
                 if _action == "allow":
                     break
 
         if is_internal:
+            _owner_input_rewritten = False
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -10090,6 +10093,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Owner commands are consumed only after ordinary authorization and
+        # before any session/model dispatch. Authorization exists only in the
+        # immutable request passed directly to the synchronous callback.
+        from gateway.owner_commands import OwnerConfig, _handle_owner_command
+        _owner_handled, _owner_response = _handle_owner_command(
+            event,
+            getattr(self.config, "owner_config", None) or OwnerConfig(),
+            getattr(self, "_owner_command_callback", None),
+            session_key=self._session_key_for_source(source),
+            rewritten=_owner_input_rewritten,
+        )
+        if _owner_handled:
+            return _owner_response
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher

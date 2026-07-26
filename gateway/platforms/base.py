@@ -1819,6 +1819,11 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Private, process-local HMAC provenance envelope used only by the owner-
+    # command boundary. ``init=False`` prevents callers from supplying it via
+    # the public constructor; it is also absent from persistence.
+    _owner_provenance: object = field(default=None, init=False, repr=False, compare=False)
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     

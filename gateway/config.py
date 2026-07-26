@@ -19,6 +19,7 @@ from enum import Enum
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from utils import is_truthy_value
+from gateway.owner_commands import OwnerConfig, _load_owner_config
 
 logger = logging.getLogger(__name__)
 
@@ -900,6 +901,10 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Dedicated owner identity set. It is secret-scoped, bounded, and omitted
+    # from to_dict() so owner IDs are never returned through config surfaces.
+    owner_config: OwnerConfig = field(default_factory=OwnerConfig, repr=False)
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1152,6 +1157,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            owner_config=_load_owner_config(_getenv("HERMES_OWNER_PRINCIPALS")),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:

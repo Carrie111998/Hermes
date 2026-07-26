@@ -4265,6 +4265,14 @@ OPTIONAL_ENV_VARS = {
     },
 
     # ── Messaging platforms ──
+    "HERMES_OWNER_PRINCIPALS": {
+        "description": "Private comma-separated owner principals (platform:user-id) for owner-only gateway commands",
+        "prompt": "Owner principals",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
     "TELEGRAM_BOT_TOKEN": {
         "description": "Complete Telegram bot token created by @BotFather (numeric bot ID followed by a colon and secret)",
         "prompt": "Telegram bot token",
