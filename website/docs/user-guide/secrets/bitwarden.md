@@ -110,6 +110,7 @@ secrets:
       max_stale_seconds: 0
     override_existing: true
     auto_install: true
+    key_map: {}
 ```
 
 | Key | Default | What it does |
@@ -123,6 +124,7 @@ secrets:
 | `encrypted_cache.max_stale_seconds` | `0` | When encrypted caching is enabled, allow that cache to be used only after network/timeout failures, up to this age. Authentication failures never use stale secrets. A successful encrypted write removes the legacy plaintext `cache/bws_cache.json`. |
 | `override_existing` | `true` | When true, Bitwarden values overwrite anything already in env (so rotation in the web app actually takes effect). Flip to `false` if you want `.env` / shell exports to win locally. |
 | `auto_install` | `true` | When true, `bws` is auto-downloaded into `~/.hermes/bin/` on first use. |
+| `key_map` | `{}` | Optional mapping from a human-readable Bitwarden secret name to a valid environment variable name, for example `{"AcqLens Test Login": "ACQLENS_TEST_LOGIN"}`. Values remain in Bitwarden and are never written to config. |
 
 ## Failure modes
 

@@ -82,7 +82,9 @@ _BWS_RUN_TIMEOUT = 30
 
 # In-process cache so repeated load_hermes_dotenv() calls (CLI startup,
 # gateway hot-reload, test suites) don't re-fetch from BSM.
-_CacheKey = Tuple[str, str, str]  # (access_token_fingerprint, project_id, server_url)
+_CacheKey = Tuple[str, ...]
+# Legacy entries have (access_token_fingerprint, project_id, server_url).
+# Mapped entries append key_map_fingerprint so aliases never cross cache keys.
 _CACHE: Dict[_CacheKey, _CachedFetch] = {}
 
 # Disk-persisted cache so back-to-back CLI invocations (e.g. `hermes chat -q ...`
@@ -104,8 +106,7 @@ _ENCRYPTED_CACHE_INFO = b"hermes-bws-encrypted-cache-v1"
 
 def _cache_key_str(cache_key: _CacheKey) -> str:
     """Serialize a cache key to a stable string for JSON storage."""
-    token_fp, project_id, server_url = cache_key
-    return f"{token_fp}|{project_id}|{server_url}"
+    return "|".join(cache_key)
 
 
 _DISK_CACHE: DiskCache = DiskCache(
@@ -503,6 +504,7 @@ def fetch_bitwarden_secrets(
     home_path: Optional[Path] = None,
     encrypted_cache_enabled: bool = False,
     encrypted_cache_max_stale_seconds: float = 0,
+    key_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull the secrets for ``project_id`` from Bitwarden Secrets Manager.
 
@@ -532,7 +534,23 @@ def fetch_bitwarden_secrets(
     if not project_id:
         raise RuntimeError("Bitwarden project_id is empty")
 
-    cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
+    normalized_key_map = {
+        str(source): str(target)
+        for source, target in (key_map or {}).items()
+    }
+    key_map_fp = hashlib.sha256(
+        json.dumps(normalized_key_map, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    base_cache_key = (
+        _token_fingerprint(access_token),
+        project_id,
+        server_url or "",
+    )
+    cache_key = (
+        (*base_cache_key, key_map_fp)
+        if normalized_key_map
+        else base_cache_key
+    )
     if use_cache and cache_ttl_seconds > 0:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
@@ -563,7 +581,13 @@ def fetch_bitwarden_secrets(
         )
 
     try:
-        secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
+        secrets, warnings = _run_bws_list(
+            bws,
+            access_token,
+            project_id,
+            server_url,
+            normalized_key_map,
+        )
     except RuntimeError as exc:
         # Live fetch failed. Fall back to a stale disk cache ONLY for
         # transport-level failures (network down, DNS error, transient BWS
@@ -664,7 +688,11 @@ def _summarize_bws_stderr(raw: str) -> str:
 
 
 def _run_bws_list(
-    bws: Path, access_token: str, project_id: str, server_url: str = ""
+    bws: Path,
+    access_token: str,
+    project_id: str,
+    server_url: str = "",
+    key_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
     env = os.environ.copy()
@@ -728,12 +756,23 @@ def _run_bws_list(
         value = item.get("value")
         if not isinstance(key, str) or not isinstance(value, str):
             continue
-        if not _is_valid_env_name(key):
+        mapped_key = (key_map or {}).get(key, key)
+        if key in (key_map or {}) and not _is_valid_env_name(mapped_key):
+            warnings.append(
+                f"Skipping secret {key!r}: mapped env-var name {mapped_key!r} is invalid"
+            )
+            continue
+        if not _is_valid_env_name(mapped_key):
             warnings.append(
                 f"Skipping secret {key!r}: not a valid env-var name"
             )
             continue
-        secrets[key] = value
+        if mapped_key in secrets:
+            warnings.append(
+                f"Skipping secret {key!r}: env-var name {mapped_key!r} is already claimed"
+            )
+            continue
+        secrets[mapped_key] = value
     return secrets, warnings
 
 
@@ -754,6 +793,7 @@ def apply_bitwarden_secrets(
     home_path: Optional[Path] = None,
     encrypted_cache_enabled: bool = False,
     encrypted_cache_max_stale_seconds: float = 0,
+    key_map: Optional[Dict[str, str]] = None,
 ) -> FetchResult:
     """Pull secrets from BSM and set them on ``os.environ``.
 
@@ -807,6 +847,7 @@ def apply_bitwarden_secrets(
             home_path=home_path,
             encrypted_cache_enabled=encrypted_cache_enabled,
             encrypted_cache_max_stale_seconds=encrypted_cache_max_stale_seconds,
+            key_map=key_map,
         )
     except RuntimeError as exc:
         result.error = str(exc)
@@ -898,6 +939,10 @@ class BitwardenSource(SecretSource):
                 "description": "Region / self-hosted endpoint (empty = US Cloud)",
                 "default": "",
             },
+            "key_map": {
+                "description": "Map Bitwarden secret names to environment variable names",
+                "default": {},
+            },
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
@@ -957,6 +1002,7 @@ class BitwardenSource(SecretSource):
                 home_path=home_path,
                 encrypted_cache_enabled=encrypted_enabled,
                 encrypted_cache_max_stale_seconds=encrypted_max_stale,
+                key_map=cfg.get("key_map") if isinstance(cfg.get("key_map"), dict) else {},
             )
         except RuntimeError as exc:
             result.error = str(exc)

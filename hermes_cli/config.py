@@ -3413,6 +3413,9 @@ DEFAULT_CONFIG = {
             # as BWS_SERVER_URL.  Prompted for during
             # `hermes secrets bitwarden setup`.
             "server_url": "",
+            # Optional aliases for human-readable Bitwarden secret names.
+            # Example: {"AcqLens Test Login": "ACQLENS_TEST_LOGIN"}
+            "key_map": {},
         },
         "onepassword": {
             # Master switch.  When false, the op CLI is never invoked —
