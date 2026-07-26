@@ -103,7 +103,7 @@ def test_helper_failure_returns_error(monkeypatch, tmp_path):
     assert result["stderr"] == "stack trace"
 
 
-def test_check_requires_node_but_not_startup_cdp(monkeypatch):
+def test_check_keeps_schema_available_for_call_time_checks(monkeypatch):
     monkeypatch.setattr(browser_upload_tool, "_resolve_cdp_endpoint", lambda: "http://127.0.0.1:9222")
     monkeypatch.setattr(browser_upload_tool, "_node_command", lambda: "/usr/bin/node")
     assert browser_upload_tool._browser_upload_files_check() is True
@@ -112,7 +112,7 @@ def test_check_requires_node_but_not_startup_cdp(monkeypatch):
     assert browser_upload_tool._browser_upload_files_check() is True
 
     monkeypatch.setattr(browser_upload_tool, "_node_command", lambda: None)
-    assert browser_upload_tool._browser_upload_files_check() is False
+    assert browser_upload_tool._browser_upload_files_check() is True
 
 
 def test_helper_script_fails_closed_on_ambiguous_pages_and_inputs():

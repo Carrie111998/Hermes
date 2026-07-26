@@ -39,7 +39,12 @@ def _resolve_cdp_endpoint() -> str:
 
 
 def _node_command() -> Optional[str]:
-    return shutil.which("node")
+    try:
+        from hermes_constants import find_node_executable
+
+        return find_node_executable("node")
+    except Exception:
+        return shutil.which("node")
 
 
 def _normalise_files(files: Iterable[str]) -> List[str]:
@@ -387,13 +392,13 @@ BROWSER_UPLOAD_FILES_SCHEMA: Dict[str, Any] = {
 
 
 def _browser_upload_files_check() -> bool:
-    # Tool schemas are fixed when an agent is initialized, while the CDP
-    # endpoint is commonly established later by browser_navigate. Hiding this
-    # tool when no endpoint exists at startup makes it permanently unavailable
-    # for the rest of that worker turn, even after the browser is connected.
-    # Node.js is the stable installation prerequisite; endpoint readiness is a
-    # call-time condition handled by browser_upload_files with a concrete error.
-    return bool(_node_command())
+    # Tool schemas are fixed when an agent is initialized, while both the CDP
+    # endpoint and the effective Node PATH can settle later in the worker
+    # startup sequence. Hiding this tool on a transient check failure makes it
+    # permanently unavailable for the rest of that turn. Keep the schema
+    # visible and let browser_upload_files report a concrete call-time error
+    # for a missing endpoint or Node executable.
+    return True
 
 
 registry.register(
