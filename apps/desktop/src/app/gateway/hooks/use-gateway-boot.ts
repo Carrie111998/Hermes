@@ -21,7 +21,8 @@ import {
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
   setPrimaryGateway,
-  touchSecondaryGateways
+  touchSecondaryGateways,
+  updateGatewayKeepSet
 } from '@/store/gateway'
 import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
@@ -433,6 +434,9 @@ export function useGatewayBoot({
         }
       }
 
+      // Publish the live-work keep-set so the lease prune (triggered by a lease
+      // release) never drops a profile with a running/needs-input session.
+      updateGatewayKeepSet(keep)
       pruneSecondaryGateways(keep)
     }
 

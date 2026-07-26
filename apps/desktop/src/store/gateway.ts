@@ -1,8 +1,13 @@
-import { type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@hermes/shared'
+import {
+  type ConnectionState,
+  type GatewayEvent,
+  isGatewayReauthRequired,
+  resolveGatewayWsUrl
+} from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { HermesGateway } from '@/hermes'
-import { setGatewayState } from '@/store/session'
+import { setConnection, setGatewayState } from '@/store/session'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
 // Concurrent sessions across profiles need concurrent sockets: the renderer's
@@ -36,6 +41,10 @@ interface Secondary {
   // While true the entry auto-reconnects on drop; pruning flips it off so a
   // deliberate close doesn't trigger the backoff loop.
   wantOpen: boolean
+  // Why the auto-reconnect loop stopped, or null while it may retry.
+  // 'reauth' never auto-retries (only explicit post-sign-in retryProfileGateway
+  // clears it); 'attempt-limit' (Layer 8) is reset by a wake/manual retry.
+  retryStopped: 'attempt-limit' | 'reauth' | null
 }
 
 // ── HMR-stable module state ─────────────────────────────────────────────────
@@ -56,6 +65,26 @@ interface GatewayRegistryState {
   activeKey: string
   secondaries: Map<string, Secondary>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
+  // ── Lease + reconnect-ownership state (all HMR-migrated in gatewayState) ──
+  // profile -> refcount. A profile with a positive refcount is spared by the
+  // idle prune even when it has no live work (roster streaming / a background
+  // submit holds it open).
+  leasedProfiles: Map<string, number>
+  // profile -> in-flight open promise, so concurrent lease/request opens for the
+  // same profile spawn a single socket.
+  profileOpens: Map<string, Promise<void>>
+  // Leases acquired before the registry is configured (boot); drained by
+  // configureGatewayRegistry.
+  pendingLeases: Set<string>
+  leasePruneTimer: ReturnType<typeof setTimeout> | null
+  // The most recent working/attention keep-set from use-gateway-boot, folded
+  // into the lease prune so live work is never dropped.
+  lastKnownKeepSet: Set<string>
+  // profile -> stored OAuth reauth error. The active hook drains its own entry
+  // (takeGatewayReauthError); Layer 8 reads background entries for offline state.
+  reauthErrors: Map<string, unknown>
+  // In-flight primary reconnect, shared by concurrent callers (dedup).
+  primaryReconnect: Promise<HermesGateway | null> | null
 }
 
 const STATE_KEY = Symbol.for('hermes.desktop.gatewayRegistryState')
@@ -70,7 +99,14 @@ function createRegistryState(): GatewayRegistryState {
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
     // methods without the instance threaded down through props.
-    $gateway: atom<HermesGateway | null>(null)
+    $gateway: atom<HermesGateway | null>(null),
+    leasedProfiles: new Map<string, number>(),
+    profileOpens: new Map<string, Promise<void>>(),
+    pendingLeases: new Set<string>(),
+    leasePruneTimer: null,
+    lastKnownKeepSet: new Set<string>(),
+    reauthErrors: new Map<string, unknown>(),
+    primaryReconnect: null
   }
 }
 
@@ -84,7 +120,30 @@ function createRegistryState(): GatewayRegistryState {
 function gatewayState(): GatewayRegistryState {
   if (import.meta.hot) {
     const store = globalThis as unknown as { [STATE_KEY]?: GatewayRegistryState }
-    store[STATE_KEY] ??= createRegistryState()
+    const existing = store[STATE_KEY]
+
+    if (existing) {
+      // Field-level migration: an HMR container created by a prior version of
+      // this module lacks the lease/reconnect-ownership fields (and old live
+      // Secondary entries lack retryStopped). Add them in place so the hot
+      // update keeps the live sockets AND gains the new state. `??=` never
+      // clobbers a field a newer container already initialized.
+      existing.leasedProfiles ??= new Map()
+      existing.profileOpens ??= new Map()
+      existing.pendingLeases ??= new Set()
+      existing.leasePruneTimer ??= null
+      existing.lastKnownKeepSet ??= new Set()
+      existing.reauthErrors ??= new Map()
+      existing.primaryReconnect ??= null
+
+      for (const entry of existing.secondaries.values()) {
+        entry.retryStopped ??= null
+      }
+
+      return existing
+    }
+
+    store[STATE_KEY] = createRegistryState()
 
     return store[STATE_KEY]
   }
@@ -101,6 +160,18 @@ export const $gateway = g.$gateway
 
 export function configureGatewayRegistry(cfg: RegistryConfig): void {
   g.config = cfg
+
+  // Drain any leases acquired before the registry existed (boot ordering): the
+  // roster controller can lease a profile before the gateway effect wires the
+  // event handler. Open them now that a registry is present.
+  if (g.pendingLeases.size > 0) {
+    const pending = [...g.pendingLeases]
+    g.pendingLeases.clear()
+
+    for (const key of pending) {
+      void ensureSecondaryOpen(key).catch(() => undefined)
+    }
+  }
 }
 
 /**
@@ -173,7 +244,10 @@ async function openSecondary(entry: Secondary): Promise<void> {
 }
 
 function scheduleReconnect(entry: Secondary): void {
-  if (entry.reconnecting || entry.reconnectTimer !== null || !entry.wantOpen) {
+  // A reauth stop never auto-retries: the ticket can never succeed until the
+  // user signs in again, so looping the backoff just spins silently. Only an
+  // explicit post-sign-in retryProfileGateway clears it.
+  if (entry.reconnecting || entry.reconnectTimer !== null || !entry.wantOpen || entry.retryStopped === 'reauth') {
     return
   }
 
@@ -187,7 +261,7 @@ function scheduleReconnect(entry: Secondary): void {
 }
 
 async function reconnectSecondary(entry: Secondary): Promise<void> {
-  if (entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway)) {
+  if (entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway) || entry.retryStopped === 'reauth') {
     return
   }
 
@@ -196,12 +270,20 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   try {
     await openSecondary(entry)
     entry.reconnectAttempt = 0
-  } catch {
-    // Transport failure → fall through to the backoff below.
+    entry.retryStopped = null
+    g.reauthErrors.delete(entry.profile)
+  } catch (error) {
+    // OAuth reauth: store the error and stop the loop (never auto-retries).
+    // Transport failure → fall through to the bounded backoff below.
+    if (isGatewayReauthRequired(error)) {
+      g.reauthErrors.set(entry.profile, error)
+      entry.retryStopped = 'reauth'
+      clearTimer(entry)
+    }
   } finally {
     entry.reconnecting = false
 
-    if (entry.wantOpen && !isOpen(entry.gateway)) {
+    if (entry.wantOpen && !isOpen(entry.gateway) && entry.retryStopped !== 'reauth') {
       scheduleReconnect(entry)
     }
   }
@@ -218,7 +300,8 @@ function createSecondary(profile: string): Secondary {
     reconnectTimer: null,
     reconnectAttempt: 0,
     reconnecting: false,
-    wantOpen: true
+    wantOpen: true,
+    retryStopped: null
   }
 
   entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile }))
@@ -313,10 +396,16 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
 }
 
 // Wake signal (sleep/network/visibility): nudge every live secondary back open.
+// Resets an attempt-limit stop (a fresh wake gets a full retry budget) but never
+// clears a reauth stop — reconnectSecondary refuses to auto-retry reauth.
 export function reconnectSecondaryGateways(): void {
   for (const entry of g.secondaries.values()) {
     if (!entry.wantOpen || isOpen(entry.gateway)) {
       continue
+    }
+
+    if (entry.retryStopped === 'attempt-limit') {
+      entry.retryStopped = null
     }
 
     entry.reconnectAttempt = 0
@@ -349,9 +438,21 @@ function disposeSecondary(entry: Secondary): void {
 
 // Close + evict secondaries whose profile is neither active nor in `keep`
 // (profiles with a running / needs-input session). Bounds cost to live work.
+// Leased profiles (positive refcount) are always spared: a lease is an explicit
+// "keep this socket alive" independent of live work (roster streaming, a
+// background submit). The active profile is spared by the caller's keep-set
+// union AND here, so a lease release can never drop the foreground socket.
 export function pruneSecondaryGateways(keep: Set<string>): void {
+  const effective = new Set(keep)
+
+  for (const [key, count] of g.leasedProfiles) {
+    if (count > 0) {
+      effective.add(key)
+    }
+  }
+
   for (const [key, entry] of [...g.secondaries]) {
-    if (key === g.activeKey || keep.has(key)) {
+    if (key === g.activeKey || effective.has(key)) {
       continue
     }
 
@@ -366,6 +467,372 @@ export function closeSecondaryGateways(): void {
   }
 
   g.secondaries.clear()
+}
+
+// ── Profile-specific RPC + reconnect ownership + leases ────────────────────
+// One routing rule for every profile-owned gateway operation: resolve the
+// connection through the registry (primary socket or a per-profile secondary),
+// NEVER through whichever gateway happens to be active. A lease keeps a socket
+// alive; it is not permission to route.
+
+const isTransientConnectionError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return /not connected|connection closed/i.test(message)
+}
+
+/** The registry's own primary profile key — read at emit time, not snapshotted.
+ *  Primary events are tagged with this (Layer 4) so a gateway rebuild while a
+ *  secondary is active never mis-tags them with the secondary's profile. */
+export function primaryProfileKey(): string {
+  return g.primaryProfile
+}
+
+/** Non-destructive read of a profile's stored reauth error (Layer 8 status). */
+export function gatewayReauthError(profile: string): unknown | null {
+  return g.reauthErrors.get(normKey(profile)) ?? null
+}
+
+/** Drain a profile's stored reauth error (the active hook surfaces it once). */
+export function takeGatewayReauthError(profile: string): unknown | null {
+  const key = normKey(profile)
+  const error = g.reauthErrors.get(key) ?? null
+  g.reauthErrors.delete(key)
+
+  return error
+}
+
+/**
+ * Recover a dropped PRIMARY gateway. Extracted from use-gateway-request's
+ * ensureGatewayOpen so a NON-active primary can be recovered (e.g. a leased
+ * background profile that happens to be the window's primary backend) without
+ * publishing its connection as the foreground one.
+ *
+ * - profile is a parameter, not `$activeGatewayProfile`
+ * - `setConnection` fires ONLY when this profile is the active one
+ * - concurrent callers share `g.primaryReconnect` (dedup)
+ * - reauth errors are stored per profile; cleared on success
+ */
+export async function reconnectPrimaryGateway(profile: string): Promise<HermesGateway | null> {
+  const key = normKey(profile)
+  const gateway = g.primaryGateway
+
+  if (!gateway) {
+    return null
+  }
+
+  if (isOpen(gateway)) {
+    return gateway
+  }
+
+  if (g.primaryReconnect) {
+    return g.primaryReconnect
+  }
+
+  g.primaryReconnect = (async () => {
+    const desktop = window.hermesDesktop
+
+    if (!desktop) {
+      return null
+    }
+
+    try {
+      const conn = await desktop.getConnection(key)
+
+      // A background reconnect must not publish its connection as the
+      // foreground one — only the active profile mirrors into composer state.
+      if (key === g.activeKey) {
+        setConnection(conn)
+      }
+
+      // Re-mint the WS URL: OAuth tickets are single-use, so the cached
+      // conn.wsUrl ticket is dead on every reconnect after boot.
+      const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+      await gateway.connect(wsUrl)
+      g.reauthErrors.delete(key)
+
+      return gateway
+    } catch (error) {
+      if (isGatewayReauthRequired(error)) {
+        g.reauthErrors.set(key, error)
+      }
+
+      if (key === g.activeKey) {
+        setConnection(null)
+      }
+
+      return null
+    } finally {
+      g.primaryReconnect = null
+    }
+  })()
+
+  return g.primaryReconnect
+}
+
+/**
+ * Open (or join an in-flight open of) a secondary profile's socket, deduped via
+ * `g.profileOpens` so concurrent lease/request opens spawn a single socket.
+ * Classifies reauth (store + stop) vs transport failure (bounded backoff).
+ * Resolves once the socket is open; rejects if it could not be opened.
+ */
+async function ensureSecondaryOpen(key: string): Promise<HermesGateway> {
+  const entry = g.secondaries.get(key) ?? createSecondary(key)
+  entry.wantOpen = true
+
+  if (isOpen(entry.gateway)) {
+    return entry.gateway
+  }
+
+  let pending = g.profileOpens.get(key)
+
+  if (!pending) {
+    pending = (async () => {
+      try {
+        await openSecondary(entry)
+        entry.reconnectAttempt = 0
+        entry.retryStopped = null
+        g.reauthErrors.delete(key)
+      } catch (error) {
+        if (isGatewayReauthRequired(error)) {
+          g.reauthErrors.set(key, error)
+          entry.retryStopped = 'reauth'
+          clearTimer(entry)
+        } else {
+          // Retryable transport failure enters the bounded backoff immediately.
+          scheduleReconnect(entry)
+        }
+
+        throw error
+      } finally {
+        g.profileOpens.delete(key)
+      }
+    })()
+
+    g.profileOpens.set(key, pending)
+  }
+
+  await pending
+
+  if (!isOpen(entry.gateway)) {
+    throw new Error(`gateway for profile "${key}" is not connected`)
+  }
+
+  return entry.gateway
+}
+
+/**
+ * Route a gateway RPC to a specific profile WITHOUT changing the active
+ * gateway. Primary → `g.primaryGateway` (recover via reconnectPrimaryGateway);
+ * secondary → its own socket (open/recover via the bounded secondary path).
+ * NEVER falls back to the active gateway — a failure surfaces as a clear error.
+ */
+export async function requestGatewayForProfile<T>(
+  profile: string,
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs?: number,
+  signal?: AbortSignal
+): Promise<T> {
+  const key = normKey(profile)
+
+  if (key === g.primaryProfile) {
+    const gateway = g.primaryGateway
+
+    if (!gateway) {
+      throw new Error('Hermes gateway unavailable')
+    }
+
+    try {
+      return await gateway.request<T>(method, params, timeoutMs, signal)
+    } catch (error) {
+      if (!isTransientConnectionError(error)) {
+        throw error
+      }
+
+      const recovered = await reconnectPrimaryGateway(key)
+
+      if (!recovered) {
+        const reauthError = takeGatewayReauthError(key)
+
+        if (reauthError) {
+          throw reauthError
+        }
+
+        throw error
+      }
+
+      return recovered.request<T>(method, params, timeoutMs, signal)
+    }
+  }
+
+  const gateway = await ensureSecondaryOpen(key)
+
+  try {
+    return await gateway.request<T>(method, params, timeoutMs, signal)
+  } catch (error) {
+    if (!isTransientConnectionError(error)) {
+      throw error
+    }
+
+    const entry = g.secondaries.get(key)
+
+    if (entry) {
+      await reconnectSecondary(entry)
+    }
+
+    const recovered = g.secondaries.get(key)?.gateway
+
+    if (!recovered || !isOpen(recovered)) {
+      const reauthError = takeGatewayReauthError(key)
+
+      if (reauthError) {
+        throw reauthError
+      }
+
+      throw error
+    }
+
+    return recovered.request<T>(method, params, timeoutMs, signal)
+  }
+}
+
+/**
+ * Manual/wake retry of a profile's gateway. Resets an attempt-limit stop and
+ * clears a stored reauth error (callers invoke this AFTER successful sign-in),
+ * then nudges a reconnect. Primary and secondary both handled.
+ */
+export function retryProfileGateway(profile: string): void {
+  const key = normKey(profile)
+
+  if (key === g.primaryProfile) {
+    g.reauthErrors.delete(key)
+    void reconnectPrimaryGateway(key)
+
+    return
+  }
+
+  const entry = g.secondaries.get(key)
+
+  if (!entry) {
+    return
+  }
+
+  entry.retryStopped = null
+  entry.reconnectAttempt = 0
+  g.reauthErrors.delete(key)
+  clearTimer(entry)
+  void reconnectSecondary(entry)
+}
+
+// ── Leases ─────────────────────────────────────────────────────────────────
+// A lease keeps a profile's socket alive independent of live work. Refcounted:
+// the roster holds a persistent lease per enabled pinned profile; a background
+// submit takes a temporary one via withProfileGatewayLease. Release at zero
+// schedules a debounced prune (the keep-set union still spares live work).
+
+/** Debounced 50ms prune after a lease release; coalesces a release burst. */
+function scheduleLeasePrune(): void {
+  if (g.leasePruneTimer !== null) {
+    return
+  }
+
+  g.leasePruneTimer = setTimeout(() => {
+    g.leasePruneTimer = null
+    pruneSecondaryGateways(new Set(g.lastKnownKeepSet))
+  }, 50)
+}
+
+/**
+ * Acquire (or bump) a lease on `profile`'s socket and open it. Pre-boot leases
+ * are queued and drained by configureGatewayRegistry. Stays synchronous;
+ * callers needing readiness await requestGatewayForProfile.
+ */
+export function leaseProfileGateway(profile: string): void {
+  const key = normKey(profile)
+  g.leasedProfiles.set(key, (g.leasedProfiles.get(key) ?? 0) + 1)
+
+  if (!g.config) {
+    g.pendingLeases.add(key)
+
+    return
+  }
+
+  void ensureSecondaryOpen(key).catch(() => undefined)
+}
+
+/**
+ * Release one reference on `profile`'s lease. No-op when absent or already zero
+ * (refcounts never go negative — React StrictMode cleanup and repeated catalog
+ * refreshes are safe). At zero, schedules a prune unless the profile is active.
+ */
+export function releaseProfileGateway(profile: string): void {
+  const key = normKey(profile)
+  const count = g.leasedProfiles.get(key)
+
+  if (!count) {
+    return
+  }
+
+  if (count > 1) {
+    g.leasedProfiles.set(key, count - 1)
+
+    return
+  }
+
+  g.leasedProfiles.delete(key)
+
+  if (key !== g.activeKey) {
+    scheduleLeasePrune()
+  }
+}
+
+/** The only temporary-lease pattern: acquire, run, release in `finally`. */
+export async function withProfileGatewayLease<T>(profile: string, run: () => Promise<T>): Promise<T> {
+  leaseProfileGateway(profile)
+
+  try {
+    return await run()
+  } finally {
+    releaseProfileGateway(profile)
+  }
+}
+
+/** use-gateway-boot publishes its working/attention keep-set here on every
+ *  recompute, before pruning, so the lease prune never drops live work. */
+export function updateGatewayKeepSet(keep: ReadonlySet<string>): void {
+  g.lastKnownKeepSet = new Set(keep)
+}
+
+/**
+ * Test-only: reset the registry's mutable routing/lease state so cases don't
+ * leak active-key, secondary sockets, or leases into one another (the container
+ * is module-global and otherwise lives for the whole file). Closes live
+ * secondaries and clears timers; the stable `$gateway` atom identity is kept.
+ * Not used by production code.
+ */
+export function __resetGatewayRegistryForTests(): void {
+  for (const entry of g.secondaries.values()) {
+    disposeSecondary(entry)
+  }
+
+  g.secondaries.clear()
+  g.leasedProfiles.clear()
+  g.profileOpens.clear()
+  g.pendingLeases.clear()
+  g.lastKnownKeepSet.clear()
+  g.reauthErrors.clear()
+
+  if (g.leasePruneTimer !== null) {
+    clearTimeout(g.leasePruneTimer)
+    g.leasePruneTimer = null
+  }
+
+  g.primaryReconnect = null
+  g.primaryGateway = null
+  g.primaryProfile = 'default'
+  g.activeKey = 'default'
+  g.config = null
 }
 
 // Self-accept so editing this module (or a fan-out that lands here) is an
