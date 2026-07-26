@@ -6,6 +6,7 @@ the _send_update_notification startup hook (sends results after restart).
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -260,7 +261,12 @@ class TestHandleUpdateCommand:
 
     @pytest.mark.asyncio
     async def test_spawns_setsid(self, tmp_path):
-        """Uses setsid when available."""
+        """Uses setsid when available.
+
+        Pins the POSIX spawn contract, so force that branch rather than
+        letting the host platform decide — otherwise this silently stops
+        exercising the bash/setsid chain when the suite runs on Windows.
+        """
         runner = _make_runner()
         event = _make_event()
 
@@ -276,6 +282,7 @@ class TestHandleUpdateCommand:
         mock_popen = MagicMock()
         with patch("gateway.run._hermes_home", hermes_home), \
              patch("gateway.run.__file__", fake_file), \
+             patch("sys.platform", "linux"), \
              patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
              patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)
@@ -288,8 +295,50 @@ class TestHandleUpdateCommand:
         assert "Starting Hermes update" in result
 
     @pytest.mark.asyncio
+    async def test_windows_spawns_python_helper_not_bash(self, tmp_path):
+        """Windows has no bash/setsid, so the update runs via a Python helper.
+
+        This branch had no coverage at all, which is why the POSIX-only
+        assertions above went unnoticed on Windows.
+        """
+        runner = _make_runner()
+        event = _make_event()
+
+        fake_root = tmp_path / "project"
+        fake_root.mkdir()
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway").mkdir()
+        (fake_root / "gateway" / "run.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        mock_popen = MagicMock()
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", str(fake_root / "gateway" / "run.py")), \
+             patch("sys.platform", "win32"), \
+             patch("shutil.which", side_effect=lambda x: f"C:\\bin\\{x}.exe"), \
+             patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(event)
+
+        argv = mock_popen.call_args[0][0]
+        assert argv[0] == sys.executable
+        assert argv[1] == "-c"
+        # The helper receives the marker paths, then the real update argv.
+        assert str(hermes_home / ".update_output.txt") in argv
+        assert str(hermes_home / ".update_exit_code") in argv
+        assert argv[-2:] == ["update", "--gateway"]
+        # No POSIX shell anywhere in the spawn.
+        assert not any("bash" in str(a) or "setsid" in str(a) for a in argv)
+        assert "PYTHONUNBUFFERED" in argv[2]
+        assert "Starting Hermes update" in result
+
+    @pytest.mark.asyncio
     async def test_fallback_when_no_setsid(self, tmp_path):
-        """Falls back to start_new_session=True when setsid is not available."""
+        """Falls back to start_new_session=True when setsid is not available.
+
+        POSIX-branch contract; the platform is forced so the assertion holds
+        wherever the suite runs.
+        """
         runner = _make_runner()
         event = _make_event()
 
@@ -313,6 +362,7 @@ class TestHandleUpdateCommand:
 
         with patch("gateway.run._hermes_home", hermes_home), \
              patch("gateway.run.__file__", fake_file), \
+             patch("sys.platform", "linux"), \
              patch("shutil.which", side_effect=which_no_setsid), \
              patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)

@@ -211,7 +211,11 @@ class TestUpdateCommandGatewayFlag:
 
     @pytest.mark.asyncio
     async def test_spawns_with_gateway_flag(self, tmp_path):
-        """The spawned update command includes --gateway and PYTHONUNBUFFERED."""
+        """The spawned update command includes --gateway and PYTHONUNBUFFERED.
+
+        Asserts on the POSIX bash command string, so pin the platform instead
+        of depending on the host the suite happens to run on.
+        """
         runner = _make_runner()
         event = _make_event()
 
@@ -227,6 +231,7 @@ class TestUpdateCommandGatewayFlag:
         mock_popen = MagicMock()
         with patch("gateway.run._hermes_home", hermes_home), \
              patch("gateway.run.__file__", fake_file), \
+             patch("sys.platform", "linux"), \
              patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
              patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)
