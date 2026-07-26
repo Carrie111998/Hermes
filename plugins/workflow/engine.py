@@ -1690,6 +1690,8 @@ class WorkflowEngine:
         - No cycles in DAG
         - All agents referenced exist (best-effort)
         - Required fields present on all nodes
+        - Reviews references resolve to valid node IDs
+        - max_retries values are positive integers
         """
         result = {"valid": True, "issues": [], "layers": 0, "nodes": 0}
 
@@ -1765,42 +1767,37 @@ class WorkflowEngine:
                     f"Node '{nid}': agent '{node.agent}' profile not found at {agent_profile}"
                 )
 
-        # Check revision loop pairs
-        gate_patterns = ("verify", "security", "review")
+        # Check reviews references
         for nid, node in workflow.nodes.items():
-            if "revise" in nid.lower():
-                revise_node = nid
-                # Find the gate node this revise node depends on
-                gate_nodes = [d for d in node.depends_on
-                             if any(p in d.lower() for p in gate_patterns)]
-                if not gate_nodes:
+            for review_entry in (node.reviews or []):
+                if isinstance(review_entry, dict):
+                    rev_id = review_entry.get("review", "")
+                    if rev_id and rev_id not in workflow.nodes:
+                        result["issues"].append(
+                            f"Node '{nid}' reviews unknown node '{rev_id}'"
+                        )
+                    max_retries = review_entry.get("max_retries")
+                    if max_retries is not None and (not isinstance(max_retries, int) or max_retries < 1):
+                        result["issues"].append(
+                            f"Node '{nid}' review '{rev_id}' has invalid max_retries={max_retries}"
+                        )
+                elif isinstance(review_entry, str):
+                    if review_entry not in workflow.nodes:
+                        result["issues"].append(
+                            f"Node '{nid}' reviews unknown node '{review_entry}'"
+                        )
+                else:
                     result["issues"].append(
-                        f"Revision node '{nid}' should depend on a gate node "
-                        f"(verify/security/review), got: {node.depends_on}"
+                        f"Node '{nid}' has invalid review entry: {review_entry}"
                     )
 
-        # Check gate→revision pairs: each gate node that IS referenced by
-        # a revision node's depends_on should have a dependent. This catches
-        # misconfigured LOOP pairs without flagging post-merge tasks.
-        verify_patterns = ("verify", "security", "review")
-        revision_nodes = [nid for nid in workflow.nodes if "revise" in nid.lower()]
-        referenced_gates = set()
-        for rnid in revision_nodes:
-            for dep in workflow.nodes[rnid].depends_on:
-                if any(p in dep.lower() for p in verify_patterns):
-                    referenced_gates.add(dep)
-
-        for gate_id in referenced_gates:
-            has_dependent = any(
-                gate_id in other.depends_on
-                for other_id, other in workflow.nodes.items()
-                if other_id != gate_id
-            )
-            if not has_dependent:
-                result["issues"].append(
-                    f"Gate node '{gate_id}' is referenced by a revision node "
-                    f"but has no dependents — LOOP detection will find no revision node"
-                )
+        # Check max_retries values
+        for nid, node in workflow.nodes.items():
+            if node.max_retries is not None:
+                if not isinstance(node.max_retries, int) or node.max_retries < 1:
+                    result["issues"].append(
+                        f"Node '{nid}' has invalid max_retries={node.max_retries}"
+                    )
 
         # incomplete_branch rule (adapted from itechmeat/hermes-workflows).
         # Catches non-terminal nodes that rely on the implicit default

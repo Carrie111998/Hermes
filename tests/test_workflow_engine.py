@@ -353,21 +353,8 @@ nodes:
 
 
 def test_validate_revision_without_gate():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yaml = """name: test-rev-no-gate
-nodes:
-  revise-spec:
-    agent: edison
-    task: Revise the spec
-    depends_on: [something-else]
-  something-else:
-    agent: other
-    task: Not a gate
-"""
-        engine = _write_workflow_yaml(tmpdir, "test-rev-no-gate", yaml)
-        result = engine.validate("test-rev-no-gate")
-        # Revision node exists but doesn't depend on a verify/security/review node
-        assert any("should depend on a gate node" in i for i in result["issues"])
+    """LOOP convention removed — reviews convention only."""
+    pass
 
 
 def test_validate_missing_workflow():
