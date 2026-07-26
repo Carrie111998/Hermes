@@ -1304,8 +1304,8 @@ class TestLazyMcpInstall:
     def test_feature_registered_in_allowlist(self):
         from tools import lazy_deps
         assert lazy_deps.feature_specs("tool.computer_use") == (
-            "mcp==1.26.0",
-            "starlette==1.0.1",
+            "mcp==1.28.1",
+            "starlette==1.3.1",
         )
 
     def test_start_lazy_installs_mcp(self):
@@ -1902,7 +1902,8 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_window_id == 2
         assert backend._last_app == "Chrome"
 
-    def test_linux_default_capture_skips_gnome_shell_helper(self):
+    def test_linux_default_capture_skips_gnome_shell_helper(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
         windows = [
             {"app_name": "", "pid": 100, "window_id": 1,
              "is_on_screen": None, "title": "@!1921,0;BDHF", "z_index": 0},
