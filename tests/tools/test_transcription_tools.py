@@ -11,7 +11,7 @@ import struct
 import subprocess
 import types
 import wave
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
@@ -1613,7 +1613,8 @@ class TestGroqSttLanguageConfig:
         monkeypatch.setattr("tools.transcription_tools._HAS_OPENAI", True)
 
         from tools.transcription_tools import _transcribe_groq
-        with patch("tools.transcription_tools.OpenAI") as mock_openai:
+        with patch("openai.OpenAI") as mock_openai, \
+             patch("builtins.open", mock_open(read_data=b"fake audio data")):
             mock_client = mock_openai.return_value
             mock_client.audio.transcriptions.create.return_value = "bonjour"
             result = _transcribe_groq("/tmp/test.wav", "whisper-1")
@@ -1631,7 +1632,8 @@ class TestGroqSttLanguageConfig:
         monkeypatch.setattr("tools.transcription_tools._HAS_OPENAI", True)
 
         from tools.transcription_tools import _transcribe_groq
-        with patch("tools.transcription_tools.OpenAI") as mock_openai:
+        with patch("openai.OpenAI") as mock_openai, \
+             patch("builtins.open", mock_open(read_data=b"fake audio data")):
             mock_client = mock_openai.return_value
             mock_client.audio.transcriptions.create.return_value = "guten tag"
             result = _transcribe_groq("/tmp/test.wav", "whisper-1")
@@ -1648,7 +1650,8 @@ class TestGroqSttLanguageConfig:
         monkeypatch.setattr("tools.transcription_tools._HAS_OPENAI", True)
 
         from tools.transcription_tools import _transcribe_groq
-        with patch("tools.transcription_tools.OpenAI") as mock_openai:
+        with patch("openai.OpenAI") as mock_openai, \
+             patch("builtins.open", mock_open(read_data=b"fake audio data")):
             mock_client = mock_openai.return_value
             mock_client.audio.transcriptions.create.return_value = "hello"
             result = _transcribe_groq("/tmp/test.wav", "whisper-1")
@@ -1665,7 +1668,8 @@ class TestGroqSttLanguageConfig:
         monkeypatch.setattr("tools.transcription_tools._HAS_OPENAI", True)
 
         from tools.transcription_tools import _transcribe_groq
-        with patch("tools.transcription_tools.OpenAI") as mock_openai:
+        with patch("openai.OpenAI") as mock_openai, \
+             patch("builtins.open", mock_open(read_data=b"fake audio data")):
             mock_client = mock_openai.return_value
             mock_client.audio.transcriptions.create.return_value = "hello from null-guard"
             result = _transcribe_groq("/tmp/test.wav", "whisper-1")
