@@ -10,6 +10,11 @@ export const RU_FIELD_LABELS: Record<string, string> = defineFieldCopy({
     personality: 'Стиль общения',
     showReasoning: 'Блоки рассуждений'
   },
+  desktop: {
+    repoScanEnabled: 'Автоматический поиск репозиториев',
+    repoScanRoots: 'Папки для поиска репозиториев',
+    repoScanExcludePaths: 'Исключённые папки'
+  },
   agent: {
     maxTurns: 'Максимум ходов агента',
     imageInputMode: 'Вложения изображений',
@@ -19,7 +24,7 @@ export const RU_FIELD_LABELS: Record<string, string> = defineFieldCopy({
   },
   terminal: {
     cwd: 'Рабочая директория',
-    backend: 'Среда выполнения команд',
+    backend: 'Терминальный бэкенд',
     timeout: 'Время ожидания команды',
     persistentShell: 'Постоянная командная оболочка',
     envPassthrough: 'Передача переменных окружения',
@@ -99,7 +104,12 @@ export const RU_FIELD_LABELS: Record<string, string> = defineFieldCopy({
     },
     xai: {
       voiceId: 'Голос xAI (Grok)',
-      language: 'Язык xAI'
+      language: 'Язык xAI',
+      speed: 'Скорость воспроизведения xAI',
+      autoSpeechTags: 'Автоматические аудиотеги xAI',
+      optimizeStreamingLatency: 'Оптимизация задержки xAI',
+      sampleRate: 'Частота дискретизации xAI',
+      bitRate: 'Битрейт xAI'
     },
     minimax: {
       model: 'Модель синтеза речи MiniMax',
@@ -123,6 +133,10 @@ export const RU_FIELD_LABELS: Record<string, string> = defineFieldCopy({
     },
     piper: {
       voice: 'Голос Piper'
+    },
+    deepinfra: {
+      model: 'Модель синтеза речи DeepInfra',
+      voice: 'Голос DeepInfra'
     }
   },
   memory: {
@@ -163,6 +177,11 @@ export const RU_FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     personality: 'Стиль общения ассистента по умолчанию для новых сессий.',
     showReasoning: 'Показывать разделы с рассуждениями, если их передаёт бэкенд.'
   },
+  desktop: {
+    repoScanEnabled: 'Искать локальные Git-репозитории для отображения в разделе «Проекты».',
+    repoScanRoots: 'Папки, в которых выполняется поиск. Оставьте поле пустым, чтобы искать в домашней папке.',
+    repoScanExcludePaths: 'Папки, которые вместе со всем содержимым исключаются из поиска репозиториев.'
+  },
   timezone:
     'Используется, когда Hermes требуется местное время. Оставьте поле пустым, чтобы использовать часовой пояс системы.',
   agent: {
@@ -190,7 +209,7 @@ export const RU_FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     redactSecrets: 'По возможности скрывать обнаруженные секреты в данных, доступных модели.'
   },
   checkpoints: {
-    enabled: 'Создавать точки восстановления перед изменением файлов.'
+    enabled: 'Создавать контрольные точки перед изменением файлов.'
   },
   memory: {
     memoryEnabled: 'Сохранять долговременные сведения, которые могут пригодиться в будущих сессиях.',
@@ -208,7 +227,13 @@ export const RU_FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   tts: {
     xai: {
       voiceId: 'Идентификатор голоса xAI, например eve, или пользовательского голоса.',
-      language: 'Код языка речи, например en.'
+      language: 'Код языка речи, например en.',
+      speed: 'Скорость воспроизведения: 0.7 — медленнее, 1.0 — обычно, 1.5 — быстрее.',
+      autoSpeechTags:
+        'Разрешить языковой модели добавлять в текст перед синтезом выразительные аудиотеги [laughing] и [sighs].',
+      optimizeStreamingLatency: 'Баланс задержки и качества: 0 — максимальное качество, 2 — минимальная задержка.',
+      sampleRate: 'Частота дискретизации звука в Гц. Чем выше значение, тем лучше качество и больше размер файлов.',
+      bitRate: 'Битрейт MP3 в бит/с. Применяется только при выборе кодека mp3.'
     },
     neutts: {
       device: 'Локальное устройство для инференса NeuTTS.'
