@@ -160,3 +160,53 @@ async def test_adapter_send_posts_one_button_control_after_long_reply(tmp_path, 
     assert control["text"] == "Interactive reply options"
     assert control["blocks"][-1]["type"] == "actions"
     assert control["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"
+
+@pytest.mark.asyncio
+async def test_adapter_send_fails_when_long_reply_control_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    client.chat_postMessage = AsyncMock(
+        side_effect=[
+            {"ts": "111.001"},
+            {"ts": "111.002"},
+            {"ok": False, "error": "invalid_blocks"},
+        ]
+    )
+    content = "x" * (adapter.MAX_MESSAGE_LENGTH + 1)
+
+    result = await adapter.send("C1", content + "\n[[slack_buttons: Enroll:enroll]]")
+
+    assert result.success is False
+    assert result.error == "Slack interactive control failed: invalid_blocks"
+
+@pytest.mark.asyncio
+async def test_adapter_slash_and_long_controls_are_single_and_opaque(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+
+    slash_adapter, slash_client = _make_adapter()
+    slash_client.chat_postEphemeral = AsyncMock(
+        return_value={"ok": True, "message_ts": "222.333"}
+    )
+    slash_adapter._pop_slash_context = MagicMock(return_value={"user_id": "U1"})
+    slash_adapter._clear_thread_status_quietly = AsyncMock()
+    await slash_adapter.send("C1", "Lead\n[[slack_buttons: Enroll:enroll]]")
+    slash_actions = [
+        block
+        for call in slash_client.chat_postEphemeral.await_args_list
+        for block in call.kwargs.get("blocks", [])
+        if block["type"] == "actions"
+    ]
+
+    long_adapter, long_client = _make_adapter()
+    content = "x" * (long_adapter.MAX_MESSAGE_LENGTH + 1)
+    await long_adapter.send("C1", content + "\n[[slack_buttons: Enroll:enroll]]")
+    long_actions = [
+        block
+        for call in long_client.chat_postMessage.await_args_list
+        for block in call.kwargs.get("blocks", [])
+        if block["type"] == "actions"
+    ]
+
+    for actions in (slash_actions, long_actions):
+        assert len(actions) == 1
+        assert actions[0]["elements"][0]["value"] != "enroll"

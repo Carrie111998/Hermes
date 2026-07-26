@@ -222,3 +222,33 @@ def test_standalone_media_send_posts_the_same_action_block(
     assert "[[slack_buttons:" not in posted["text"]
     assert posted["blocks"][-1]["type"] == "actions"
     assert posted["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"
+    actions = [block for block in posted["blocks"] if block["type"] == "actions"]
+    assert len(actions) == 1
+    assert actions[0]["elements"][0]["value"] != "enroll"
+
+
+def test_standalone_missing_media_caption_keeps_interactive_directive_literal(
+    monkeypatch, _standalone_send, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    client = _MediaClient()
+    monkeypatch.setattr(
+        sys.modules["slack_sdk.web.async_client"],
+        "AsyncWebClient",
+        lambda **kwargs: client,
+    )
+    message = "Lead ready\n[[slack_buttons: Enroll:enroll]]"
+
+    result = asyncio.run(
+        _standalone_send(
+            SimpleNamespace(enabled=True, token="good-token", extra={}),
+            "C123",
+            message,
+            media_files=[(str(tmp_path / "missing.txt"), False)],
+            caption="Lead attachment unavailable",
+        )
+    )
+
+    assert result["success"] is True
+    assert client.post_calls[0]["text"].endswith(message)
+    assert "blocks" not in client.post_calls[0]

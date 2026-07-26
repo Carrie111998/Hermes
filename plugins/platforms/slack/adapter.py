@@ -2690,13 +2690,15 @@ class SlackAdapter(BasePlatformAdapter):
                 last_result = await self._get_client(
                     chat_id, team_id=team_id
                 ).chat_postMessage(**control_kwargs)
+                if isinstance(last_result, dict) and not last_result.get("ok", True):
+                    error = last_result.get("error", "unknown")
+                    raise RuntimeError(f"Slack interactive control failed: {error}")
                 sent_ts = last_result.get("ts") if last_result else None
-                if sent_ts:
-                    self._interactive_reply_store.bind_message(
-                        prepared_interactive.card_id, sent_ts
-                    )
-                else:
-                    self._interactive_reply_store.discard(prepared_interactive.card_id)
+                if not sent_ts:
+                    raise RuntimeError("Slack interactive control returned no timestamp")
+                self._interactive_reply_store.bind_message(
+                    prepared_interactive.card_id, sent_ts
+                )
                 prepared_interactive = None
 
             # Clear Slack Assistant status as soon as the final message is posted.
@@ -8886,9 +8888,12 @@ async def _standalone_send(
                 if caption_pending:
                     # Keep caption deliverable even when the file is missing.
                     try:
+                        fallback_text = formatted_caption
+                        if interactive:
+                            fallback_text = f"{formatted_caption}\n{message}"
                         fallback_kwargs: Dict[str, Any] = {
                             "channel": chat_id,
-                            "text": formatted_caption,
+                            "text": fallback_text,
                             "mrkdwn": True,
                         }
                         if thread_id:
