@@ -58,10 +58,10 @@ delegate_task(tasks=[
         "goal": "Research practical quantum computing applications",
         "context": "Focus on: error correction breakthroughs, real-world use cases, key companies"
     }
-])
+], wait=True)
 ```
 
-All three run concurrently. Each subagent searches the web independently and returns a summary. The parent agent then synthesizes them into a coherent briefing.
+All three run concurrently. `wait=True` keeps the parent in the current turn until every summary is available, then the parent synthesizes them into a coherent briefing. Omit it when the research is optional background work that can return in a later turn.
 
 ---
 

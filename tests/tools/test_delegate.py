@@ -71,6 +71,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("wait", props)
+        # ``background`` remains a direct-Python implementation detail. The
+        # model-facing contract uses the positive, materiality-based ``wait``
+        # barrier instead of exposing two inverse switches.
+        self.assertNotIn("background", props)
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -115,6 +120,10 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {max_children}", tasks_desc)
         # role parameter description names the spawn-depth limit.
         self.assertIn(f"max_spawn_depth={max_depth}", role_desc)
+        # The lifecycle contract tells the model when the coordinator must
+        # wait instead of finalizing before material worker results arrive.
+        self.assertIn("wait=true", desc)
+        self.assertIn("final answer depends", desc)
         # The misleading "default 3" / "default 2" wording is gone from
         # every dynamic surface (model-facing).
         for surface in (desc, tasks_desc, role_desc):

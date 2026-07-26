@@ -3458,12 +3458,12 @@ def _build_top_level_description() -> str:
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and the completed result re-enters "
-        "the conversation as a new message. A "
-        "batch returns one handle, runs N subagents concurrently, and delivers "
-        "one consolidated result after ALL of them finish. Do NOT wait or poll; "
-        "just continue with other work after dispatching.\n\n"
+        "By default, both modes run in the background: delegate_task returns "
+        "immediately and the completed result re-enters the conversation as a "
+        "new message. Set wait=true when your final answer depends on the "
+        "workers' results. In wait mode, workers still run concurrently, but "
+        "the parent waits for every worker and receives one consolidated result "
+        "in the current turn before continuing.\n\n"
         "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
         "one append-only human-readable log file per task (under "
         "cache/delegation/live/<delegation_id>/). Each child streams its "
@@ -3481,10 +3481,10 @@ def _build_top_level_description() -> str:
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
         "- Durable long-running work that must outlive the current turn -> "
         "use cronjob (action='create') or terminal(background=True, "
-        "notify_on_complete=True) instead. Background delegations are NOT "
+        "notify_on_complete=True) instead. Delegations are NOT "
         "durable: if the parent session is closed (/new) or the process exits "
         "before a subagent finishes, that subagent's work is discarded, and "
-        "/stop cancels every running background subagent.\n\n"
+        "/stop cancels every active subagent.\n\n"
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
@@ -3650,16 +3650,14 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
-            "background": {
+            "wait": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
+                    "Wait for every worker and return the consolidated result "
+                    "in the current turn before the parent continues. Use this "
+                    "when the final answer depends on delegated findings. "
+                    "Defaults to false (background execution). Nested "
+                    "orchestrator delegations wait automatically."
                 ),
             },
         },
@@ -3675,18 +3673,17 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
+    Top-level delegations default to background execution. ``wait=true``
+    selects the existing synchronous aggregate path so every worker result is
+    available before the parent continues. Delegations from an orchestrator
+    subagent (depth > 0) always wait for their workers. The live path is
+    ``run_agent._dispatch_delegate_task``; this helper mirrors it for the rare
     case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
+    keep the historical synchronous default and ``background`` argument.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    wait_requested = args.get("wait") is True
+    return not (is_subagent or wait_requested)
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

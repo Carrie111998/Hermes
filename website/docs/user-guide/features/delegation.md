@@ -8,7 +8,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
-Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
+Top-level model calls run in the background by default. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. When the parent's answer depends on delegated findings, `wait=true` keeps the parent in the current turn until every worker finishes and returns one consolidated result. An orchestrator subagent waits for its own workers automatically.
 
 ## Single Task
 
@@ -28,7 +28,7 @@ delegate_task(tasks=[
     {"goal": "Research topic A", "context": "Focus on recent primary sources"},
     {"goal": "Research topic B", "context": "Compare the leading explanations"},
     {"goal": "Fix the build", "context": "Project root: /home/user/project"}
-])
+], wait=True)
 ```
 
 ## How Subagent Context Works
@@ -115,7 +115,7 @@ delegate_task(
 
 ## Batch Mode Details
 
-When a top-level agent provides a `tasks` array, Hermes returns one background handle, runs the subagents in parallel, and posts one consolidated result after every child finishes. An orchestrator subagent waits for its batch in the current turn so it can synthesize the results.
+When a top-level agent provides a `tasks` array, Hermes runs the subagents in parallel. By default it returns one background handle and posts one consolidated result after every child finishes. With `wait=true`, it blocks the parent until the whole batch finishes and returns that consolidated result inline. An orchestrator subagent always waits for its batch in the current turn so it can synthesize the results.
 
 - **Maximum concurrency:** 3 tasks by default (configurable via `delegation.max_concurrent_children` or the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var; floor of 1, no hard ceiling). Batches larger than the limit return a tool error rather than being silently truncated.
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
