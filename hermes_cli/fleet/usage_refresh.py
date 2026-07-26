@@ -83,8 +83,34 @@ def _read_console_attestation(path: Path) -> dict[str, tuple[float, str]]:
     return out
 
 
+def _is_attestation_stale(checked_at_str: str | None, *, max_age_hours: int = 24) -> bool:
+    """Check if an attestation timestamp is stale.
+
+    Args:
+        checked_at_str: ISO format timestamp string or None
+        max_age_hours: Maximum age in hours before considered stale
+
+    Returns:
+        True if stale or unparseable; False if fresh
+    """
+    if not checked_at_str or not isinstance(checked_at_str, str):
+        return True
+    try:
+        attested_at = datetime.fromisoformat(checked_at_str.replace("Z", "+00:00"))
+        age = _utc_now() - attested_at
+        return age > timedelta(hours=max_age_hours)
+    except (ValueError, TypeError):
+        return True
+
+
 def _probe_console_lane_health(lane_id: str) -> tuple[bool | None, str]:
-    """Return (healthy, detail) without inventing usage percentages."""
+    """Return (healthy, detail) without inventing usage percentages.
+
+    Returns:
+        (True, detail) if healthy
+        (False, detail) if unhealthy
+        (None, detail) if unavailable to probe
+    """
     if lane_id == "grok":
         try:
             from hermes_cli.auth import get_xai_oauth_auth_status
@@ -404,8 +430,40 @@ def refresh_usage_document(
             plans.append(row)
         prior_pct = _clamp_pct(row.get("weekly_pct_used"))
         attested = lane_id in attestation
+        attested_fresh = False
         if attested:
             attested_pct, attested_checked_at = attestation[lane_id]
+            # Check for stale attestation (>24h old) — grok/antigravity only,
+            # never use stale evidence for capacity routing.
+            if _is_attestation_stale(attested_checked_at, max_age_hours=24):
+                # Attestation is stale; keep prior values but mark as stale
+                prior_checked = row.get("checked_at")
+                health_state, health_detail = _probe_console_lane_health(lane_id)
+                health_observed = health_state is not None
+                if health_observed:
+                    any_console_health_evidence = True
+                    row["health_status"] = "UP" if health_state else "DOWN"
+                    row["health_checked_at"] = stamp
+                    health_summary = (
+                        f"console health probe {'ok' if health_state else 'down'}; "
+                        f"{health_detail}; attestation stale (>{24}h)"
+                    )
+                else:
+                    health_summary = f"console health probe unavailable; attestation stale (>24h)"
+                results.append(
+                    LaneRefreshResult(
+                        lane_id=lane_id,
+                        updated=health_observed,
+                        weekly_pct_used=prior_pct,
+                        checked_at=(
+                            str(prior_checked) if isinstance(prior_checked, str) else None
+                        ),
+                        detail=health_summary,
+                    )
+                )
+                continue
+
+            attested_fresh = True
             row["weekly_pct_used"] = attested_pct
             row["checked_at"] = attested_checked_at
             row["measurement_kind"] = "measured"
@@ -432,7 +490,7 @@ def refresh_usage_document(
         results.append(
             LaneRefreshResult(
                 lane_id=lane_id,
-                updated=attested or health_observed,
+                updated=attested_fresh or health_observed,
                 weekly_pct_used=prior_pct,
                 checked_at=(
                     str(prior_checked) if isinstance(prior_checked, str) else None

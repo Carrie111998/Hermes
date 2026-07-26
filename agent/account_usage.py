@@ -749,27 +749,18 @@ def redeem_codex_reset_credit(
 
 
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
-    token = (resolve_anthropic_token() or "").strip()
-    if not token:
-        return None
-    if not _is_oauth_token(token):
-        return AccountUsageSnapshot(
-            provider="anthropic",
-            source="oauth_usage_api",
-            fetched_at=_utc_now(),
-            unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.",
-        )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/2.1.0",
-    }
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
-        response.raise_for_status()
-    payload = response.json() or {}
+    """Fetch Anthropic OAuth usage — DISABLED for CLI-based lanes.
+
+    Claude Code (claude_code lane) uses the CLI executable path, not the OAuth API.
+    The OAuth usage endpoint (api.anthropic.com/api/oauth/usage) is policy-restricted
+    and not available for third-party tools. Usage qualification for claude_code is
+    determined by the CLI executable's own health check instead.
+
+    Returns None to defer the usage decision to the lane's CLI health probe.
+    """
+    # API path is disabled entirely for now per GOAL A requirements.
+    # All Anthropic usage qualification flows through the CLI executable.
+    return None
     windows: list[AccountUsageWindow] = []
     mapping = (
         ("five_hour", "Current session"),

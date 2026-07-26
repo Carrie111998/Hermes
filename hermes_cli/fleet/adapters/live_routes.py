@@ -636,9 +636,14 @@ def live_adapters(
 ) -> dict[str, object]:
     qualifications = qualifications or {}
     antigravity = qualifications.get("antigravity")
+    claude_code_qual = qualifications.get("claude_code")
     return {
         "chatgpt_codex": NativeProviderAdapter(native_runner),
-        "claude_code": NativeProviderAdapter(native_runner),
+        "claude_code": ClaudeCodeAdapter(
+            claude_code_qual.executable
+            if claude_code_qual and claude_code_qual.qualified and claude_code_qual.executable
+            else "claude"
+        ),
         "grok": NativeProviderAdapter(native_runner),
         "antigravity": AntigravityAdapter(
             antigravity.executable
