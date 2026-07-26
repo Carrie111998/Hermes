@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import stat
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -169,3 +170,21 @@ async def test_failed_callback_survives_and_replays_after_restart(tmp_path):
     assert not list((tmp_path / "outbox").glob("*.json"))
     replayed = restarted._send_completion_callback.await_args.args[1]
     assert replayed == entry["body"]
+
+
+@pytest.mark.asyncio
+async def test_retained_callbacks_retry_periodically_without_restart():
+    adapter = make_adapter(callback_config())
+    adapter._callback_replay_interval = 0.01
+    adapter._replay_completion_callbacks = AsyncMock()
+    task = asyncio.create_task(adapter._completion_callback_replay_loop())
+    try:
+        for _ in range(100):
+            if adapter._replay_completion_callbacks.await_count >= 2:
+                break
+            await asyncio.sleep(0.002)
+        assert adapter._replay_completion_callbacks.await_count >= 2
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

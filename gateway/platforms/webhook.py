@@ -226,6 +226,13 @@ class WebhookAdapter(BasePlatformAdapter):
             script_timeout_seconds=self._script_timeout_seconds
         )
         self._callback_replay_task: Optional[asyncio.Task] = None
+        self._callback_replay_interval: int = int(
+            config.extra.get("callback_replay_interval_seconds", 60)
+        )
+        if not 10 <= self._callback_replay_interval <= 3600:
+            raise ValueError(
+                "[webhook] callback_replay_interval_seconds must be 10..3600"
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -321,7 +328,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
         self._mark_connected()
         self._callback_replay_task = asyncio.create_task(
-            self._replay_completion_callbacks()
+            self._completion_callback_replay_loop()
         )
         self._background_tasks.add(self._callback_replay_task)
         self._callback_replay_task.add_done_callback(self._background_tasks.discard)
@@ -336,6 +343,12 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        if self._callback_replay_task:
+            self._callback_replay_task.cancel()
+            await asyncio.gather(
+                self._callback_replay_task, return_exceptions=True
+            )
+            self._callback_replay_task = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -1006,11 +1019,19 @@ class WebhookAdapter(BasePlatformAdapter):
         body = self._completion_callback_body(event, status)
         if body is None:
             return
+        path: Optional[Path] = None
         try:
             path = self._spool_completion_callback(
                 self._delivery_info[event.source.chat_id]["route_name"], body
             )
-            if await self._send_completion_callback(event.source.chat_id, body):
+        except Exception:
+            logger.exception(
+                "[webhook] Failed to persist completion callback delivery=%s status=%s",
+                body.get("delivery_id"),
+                status,
+            )
+        try:
+            if await self._send_completion_callback(event.source.chat_id, body) and path:
                 path.unlink(missing_ok=True)
         except Exception:
             logger.exception(
@@ -1102,6 +1123,16 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         return False
 
+    async def _completion_callback_replay_loop(self) -> None:
+        while True:
+            try:
+                await self._replay_completion_callbacks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[webhook] Completion callback replay loop failed")
+            await asyncio.sleep(self._callback_replay_interval)
+
     async def _replay_completion_callbacks(self) -> None:
         outbox = self._callback_outbox_dir()
         if not outbox.exists():
@@ -1134,8 +1165,11 @@ class WebhookAdapter(BasePlatformAdapter):
                     "delivery_id": body["delivery_id"],
                     "route_name": route_name,
                 }
-                if await self._send_completion_callback(session_chat_id, body):
-                    path.unlink(missing_ok=True)
+                try:
+                    if await self._send_completion_callback(session_chat_id, body):
+                        path.unlink(missing_ok=True)
+                finally:
+                    self._delivery_info.pop(session_chat_id, None)
             except Exception:
                 logger.exception(
                     "[webhook] Failed to replay callback spool %s", path

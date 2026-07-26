@@ -148,7 +148,9 @@ five-minute timestamp window and use `(delivery_id,status)` as an idempotency ke
 `running` is best effort. Before a terminal callback is sent, Hermes atomically writes it beneath
 `~/.hermes/webhook_callback_outbox/` with directory mode 0700 and file mode 0600. Only a 2xx
 response removes it; non-2xx responses, timeout, process exit, or restart leave it available for
-replay. The spool contains the callback body and route name but never the callback URL or secret.
+replay. Hermes retries retained entries every 60 seconds while the gateway is running; set global
+`platforms.webhook.extra.callback_replay_interval_seconds` to 10–3600 to adjust this. The spool
+contains the callback body and route name but never the callback URL or secret.
 Redirects are not followed, preventing signature forwarding to a different host.
 
 ### Payload Filters
