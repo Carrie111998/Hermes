@@ -31,6 +31,11 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
+    MEMORY_RETRIEVAL_GUIDANCE,
+    PLANNING_AND_SELF_REVIEW_GUIDANCE,
+    AUTONOMOUS_EXECUTION_GUIDANCE,
+    MULTIMODAL_VERIFICATION_GUIDANCE,
+    EDITING_VERIFICATION_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -53,6 +58,35 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_memory_retrieval_guidance_encourages_proactive_recall(self):
+        assert "Proactively recall relevant memory" in MEMORY_RETRIEVAL_GUIDANCE
+        assert "memory" in MEMORY_RETRIEVAL_GUIDANCE
+        assert "session_search" in MEMORY_RETRIEVAL_GUIDANCE
+        assert "consolidate" in MEMORY_RETRIEVAL_GUIDANCE
+
+    def test_planning_and_self_review_has_three_step_checklist(self):
+        assert "(1)" in PLANNING_AND_SELF_REVIEW_GUIDANCE
+        assert "(2)" in PLANNING_AND_SELF_REVIEW_GUIDANCE
+        assert "(3)" in PLANNING_AND_SELF_REVIEW_GUIDANCE
+        assert "re-read" in PLANNING_AND_SELF_REVIEW_GUIDANCE
+        assert "verify" in PLANNING_AND_SELF_REVIEW_GUIDANCE
+
+    def test_autonomous_execution_guidance_encourages_action(self):
+        assert "act immediately" in AUTONOMOUS_EXECUTION_GUIDANCE
+        assert "execution over deliberation" in AUTONOMOUS_EXECUTION_GUIDANCE
+        assert "retry" in AUTONOMOUS_EXECUTION_GUIDANCE
+
+    def test_multimodal_verification_guidance_mentions_visual_tools(self):
+        assert "browser_vision" in MULTIMODAL_VERIFICATION_GUIDANCE
+        assert "vision_analyze" in MULTIMODAL_VERIFICATION_GUIDANCE
+        assert "verify" in MULTIMODAL_VERIFICATION_GUIDANCE
+
+    def test_editing_verification_guidance_mentions_read_back(self):
+        assert "read the file back" in EDITING_VERIFICATION_GUIDANCE
+        assert "patch" in EDITING_VERIFICATION_GUIDANCE
+        assert "write_file" in EDITING_VERIFICATION_GUIDANCE
+        assert "tests" in EDITING_VERIFICATION_GUIDANCE
 
 
 # =========================================================================

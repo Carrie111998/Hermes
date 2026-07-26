@@ -141,6 +141,8 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+    monkeypatch.setattr(system_prompt, "PLANNING_AND_SELF_REVIEW_GUIDANCE", "PLAN_REVIEW")
+    monkeypatch.setattr(system_prompt, "AUTONOMOUS_EXECUTION_GUIDANCE", "AUTONOMOUS")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
     expected_profile = (
@@ -153,6 +155,8 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        "PLAN_REVIEW",
+        "AUTONOMOUS",
         "STEER",
         "CODING_STABLE",
         "WORKSPACE",
@@ -182,7 +186,8 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    # Stable prefix now includes IDENTITY + HELP + PLAN_REVIEW + AUTONOMOUS + STEER + CODING_STABLE
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:6])
 
 
 class TestTelegramRichMessagesHint:
@@ -226,3 +231,59 @@ class TestTelegramRichMessagesHint:
             stable = _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
         assert "lean into it" not in stable
+
+
+class TestGuidanceWiring:
+    """Verify the five enrichment guidance blocks are injected correctly."""
+
+    def test_universal_guidance_always_present(self):
+        """PLANNING_AND_SELF_REVIEW and AUTONOMOUS_EXECUTION are universal."""
+        agent = _make_agent(valid_tool_names=[])
+        stable = _stable_prompt(agent)
+        assert "Before starting non-trivial work" in stable
+        assert "act immediately" in stable
+
+    def test_memory_retrieval_gated_on_memory_tool(self):
+        agent = _make_agent(valid_tool_names=["memory"])
+        stable = _stable_prompt(agent)
+        assert "Proactively recall relevant memory" in stable
+
+    def test_memory_retrieval_gated_on_session_search(self):
+        agent = _make_agent(valid_tool_names=["session_search"])
+        stable = _stable_prompt(agent)
+        assert "Proactively recall relevant memory" in stable
+
+    def test_memory_retrieval_absent_without_tools(self):
+        agent = _make_agent(valid_tool_names=["read_file"])
+        stable = _stable_prompt(agent)
+        assert "Proactively recall relevant memory" not in stable
+
+    def test_multimodal_verification_gated_on_browser_vision(self):
+        agent = _make_agent(valid_tool_names=["browser_vision"])
+        stable = _stable_prompt(agent)
+        assert "browser_vision" in stable and "vision_analyze" in stable
+
+    def test_multimodal_verification_gated_on_vision_analyze(self):
+        agent = _make_agent(valid_tool_names=["vision_analyze"])
+        stable = _stable_prompt(agent)
+        assert "browser_vision" in stable or "vision_analyze" in stable
+
+    def test_multimodal_verification_absent_without_vision_tools(self):
+        agent = _make_agent(valid_tool_names=["read_file"])
+        stable = _stable_prompt(agent)
+        assert "visual content" not in stable
+
+    def test_editing_verification_gated_on_patch(self):
+        agent = _make_agent(valid_tool_names=["patch"])
+        stable = _stable_prompt(agent)
+        assert "read the file back" in stable
+
+    def test_editing_verification_gated_on_write_file(self):
+        agent = _make_agent(valid_tool_names=["write_file"])
+        stable = _stable_prompt(agent)
+        assert "read the file back" in stable
+
+    def test_editing_verification_absent_without_editing_tools(self):
+        agent = _make_agent(valid_tool_names=["read_file"])
+        stable = _stable_prompt(agent)
+        assert "read the file back" not in stable

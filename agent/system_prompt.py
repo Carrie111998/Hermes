@@ -31,12 +31,17 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    EDITING_VERIFICATION_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
+    MEMORY_RETRIEVAL_GUIDANCE,
+    MULTIMODAL_VERIFICATION_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
+    PLANNING_AND_SELF_REVIEW_GUIDANCE,
+    AUTONOMOUS_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
@@ -238,8 +243,26 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
+    # Tool-gated behavioral enrichment: proactive recall, visual
+    # verification, editing verification. Each block is only injected
+    # when the tools it references are actually loaded for this session.
+    if "memory" in agent.valid_tool_names or "session_search" in agent.valid_tool_names:
+        tool_guidance.append(MEMORY_RETRIEVAL_GUIDANCE)
+    if any(name in agent.valid_tool_names for name in
+           ("browser_vision", "vision_analyze")):
+        tool_guidance.append(MULTIMODAL_VERIFICATION_GUIDANCE)
+    if any(name in agent.valid_tool_names for name in
+           ("patch", "write_file")):
+        tool_guidance.append(EDITING_VERIFICATION_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+
+    # Universal behavioral guidance: planning + self-review and autonomous
+    # execution discipline. Applied to ALL models — these address cross-model
+    # failure modes (stopping after a stub, fabricating results, asking for
+    # permission instead of acting) that are not model-family specific.
+    stable_parts.append(PLANNING_AND_SELF_REVIEW_GUIDANCE)
+    stable_parts.append(AUTONOMOUS_EXECUTION_GUIDANCE)
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).

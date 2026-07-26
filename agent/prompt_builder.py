@@ -301,6 +301,59 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+MEMORY_RETRIEVAL_GUIDANCE = (
+    "Proactively recall relevant memory at the start of each session: check memory brief "
+    "and recent sessions before acting on a new request, especially when the topic seems "
+    "familiar. When memory entries become outdated or redundant — duplicate facts, stale "
+    "environment details, or superseded preferences — consolidate them with "
+    "memory(action='replace') so the memory store stays compact and accurate. When a "
+    "task spans multiple sessions, use session_search to pick up where you left off rather "
+    "than re-deriving context from scratch."
+)
+
+PLANNING_AND_SELF_REVIEW_GUIDANCE = (
+    "Before starting non-trivial work, create a concise plan with the smallest "
+    "useful next steps. While working, keep the plan current if new information "
+    "changes the approach. Before finalizing, self-review the result: (1) re-read "
+    "the original request to confirm nothing was missed, (2) verify important "
+    "outputs with tools when possible (read files back, run tests, check screenshots), "
+    "(3) flag any remaining uncertainty or follow-up work explicitly rather than "
+    "silently omitting it."
+)
+
+AUTONOMOUS_EXECUTION_GUIDANCE = (
+    "When you have enough information to proceed, act immediately rather than "
+    "asking for permission or confirmation. Default to execution over deliberation. "
+    "If you encounter a solvable obstacle (missing directory, failed command, wrong path), "
+    "fix it and continue — don't stop to report the blocker unless you've exhausted "
+    "reasonable retry strategies. Keep the full task in mind: after completing a sub-step, "
+    "move on to the next one without waiting for direction. Only pause when you genuinely "
+    "cannot make progress without user input or when a destructive action requires explicit "
+    "approval per the safety rules.\n"
+    "When a tool call fails, diagnose the error and retry with a correction before giving up — "
+    "most failures are transient (network timeout, missing prerequisite) or fixable (wrong path, "
+    "permission issue). For multi-step tasks, if step N fails, re-read the current state (ls, "
+    "read_file, git status) before retrying so you don't act on stale assumptions."
+)
+
+MULTIMODAL_VERIFICATION_GUIDANCE = (
+    "When your work involves visual content (web pages, images, diagrams, UIs, layouts), "
+    "use browser_vision or vision_analyze to inspect the result before reporting completion. "
+    "Don't assume a visual change worked — verify it. After editing code that affects rendering, "
+    "styling, or layout, take a screenshot or analyze the output to confirm the visual result "
+    "matches the intent. For image generation tasks, review the output image to check for "
+    "artifacts, correctness, and alignment with the prompt."
+)
+
+EDITING_VERIFICATION_GUIDANCE = (
+    "After editing files with patch or write_file, read the file back to confirm the "
+    "change landed correctly — especially for multi-line edits or regex replacements that "
+    "may match differently than expected. After modifying code, run relevant tests or "
+    "linters to catch regressions before declaring the task done. If an edit could affect "
+    "multiple files (e.g., renaming a function, moving a module), verify each impacted file "
+    "rather than assuming the changes propagated correctly."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
