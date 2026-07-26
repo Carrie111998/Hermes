@@ -277,3 +277,34 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test
 # here; dropped during salvage to avoid two assertions of the same contract.
 # ---------------------------------------------------------------------------
+
+
+def test_initially_blocked_task_stays_parked_across_recompute(
+    kanban_home: Path,
+) -> None:
+    """An operator-created blocked task is a durable hold, not dispatcher work.
+
+    The creating API must leave sticky lifecycle evidence. Otherwise the next
+    recompute tick silently changes a raw ``blocked`` row to ``ready``.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="operator parked gate",
+            initial_status="blocked",
+        )
+
+        event_kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        ]
+        assert event_kinds == ["created", "blocked"]
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert kb.list_tasks(conn, status="ready") == []

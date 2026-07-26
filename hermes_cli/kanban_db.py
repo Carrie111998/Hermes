@@ -3172,6 +3172,20 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # A task explicitly parked in ``blocked`` at creation is an
+                # operator hold. Record the same durable lifecycle signal as
+                # ``block_task`` so ``recompute_ready`` cannot auto-promote it
+                # before its owner deliberately unblocks it.
+                if task_status == "blocked":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial-status: created-blocked",
+                            "source": "create_task",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
