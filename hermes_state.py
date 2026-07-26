@@ -11368,16 +11368,89 @@ class SqliteSessionDB(SessionStoreBackend):
 # or depend on the ABC (SessionStoreBackend).
 SessionDB = SqliteSessionDB
 class AsyncSessionDB:
-    """Async door onto a SessionStoreBackend: offloads each call via asyncio.to_thread so a blocking backend (e.g. SQLite) never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
+    """Async facade for the session store backend.
 
-    def __init__(self, db: "SessionStoreBackend") -> None:
-        self._db = db
+    Resolves the configured backend (``state.backend`` in config.yaml) at init
+    time and provides async access to all ``SessionStoreBackend`` methods.
+    Accepts an explicit backend instance for backward compatibility (tests,
+    legacy callers that already constructed a ``SessionDB``).
+
+    Backend resolution order:
+
+    1. Explicit ``db`` argument (backward compat).
+    2. ``state.backend`` config key → ``"sqlite"`` (default) or
+       ``"postgresql"``.
+    3. ``STATE_DATABASE_URL`` env var overrides ``state.database_url`` for
+       non-sqlite backends.
+
+    SQLite calls are offloaded via ``asyncio.to_thread`` to keep the event
+    loop free.  PostgreSQL calls (when available) are async-native and
+    forwarded directly without thread offloading.
+    """
+
+    def __init__(self, db: "Optional[SessionStoreBackend]" = None) -> None:
+        self._db: SessionStoreBackend
+        self._async_native: bool = False
+
+        if db is not None:
+            # Explicit instance — bypass config resolution (backward compat).
+            self._db = db
+            return
+
+        # ── Resolve backend from config ─────────────────────────────────
+        try:
+            from hermes_cli.config import load_config_readonly
+            cfg = load_config_readonly()
+        except Exception:
+            # Config unavailable — fall back to default SQLite.
+            cfg = {}
+
+        state_cfg = cfg.get("state", {})
+        backend = str(state_cfg.get("backend", "sqlite")).lower()
+
+        if backend == "sqlite":
+            self._db = SqliteSessionDB()
+            # SQLite is sync — all calls are offloaded via asyncio.to_thread.
+            self._async_native = False
+
+        elif backend == "postgresql":
+            # PR 3 will implement PostgresSessionDB.
+            # For now, surface a clear error with setup instructions.
+            database_url = (
+                os.getenv("STATE_DATABASE_URL")
+                or str(state_cfg.get("database_url", ""))
+            )
+            if not database_url:
+                raise ValueError(
+                    "state.backend is 'postgresql' but no database_url is "
+                    "configured. Set state.database_url in config.yaml or "
+                    "STATE_DATABASE_URL in .env to a PostgreSQL connection "
+                    "string (postgresql://user:pass@host:5432/dbname)."
+                )
+            raise NotImplementedError(
+                "PostgreSQL session store backend is not yet available. "
+                "It will be implemented in a follow-up PR "
+                "(hermes-session-store-backend). For now, set "
+                "state.backend to 'sqlite' in config.yaml."
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown state backend: {backend!r}. "
+                "Supported values: 'sqlite', 'postgresql'."
+            )
 
     def __getattr__(self, name: str):
         attr = getattr(self._db, name)
         if not callable(attr):
             return attr
 
+        if self._async_native:
+            # Async-native backend (e.g. PostgreSQL) — return directly.
+            return attr
+
+        # Sync backend (SQLite) — offload to a thread so blocking I/O
+        # never freezes the event loop.
         async def _offloaded(*args, **kwargs):
             return await asyncio.to_thread(attr, *args, **kwargs)
 

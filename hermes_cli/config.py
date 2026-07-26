@@ -3323,8 +3323,34 @@ DEFAULT_CONFIG = {
         # HERMES_SEARCH_SLOW_MS (internal carrier).
         "search_slow_ms": 1000,
     },
+    # Persistent state-store backend selection.  Supported values:
+    #   "sqlite" (default) — single-file SQLite state.db in the Hermes
+    #     data directory; battle-tested, zero dependencies.
+    #   "postgresql" — async PostgreSQL connection pool (requires
+    #     asyncpg and a running PostgreSQL instance).  Provides
+    #     incremental-backup compatibility (pgBackRest, WAL shipping)
+    #     and single-DB multi-tenancy for multiplex deployments.
+    # Backends other than "sqlite" require the corresponding optional
+    # dependency (e.g. hermes install --extras postgres).
+    "state": {
+        # Backend identifier — one of "sqlite", "postgresql".
+        # Future backends (MySQL, SQL Server, etc.) register their own
+        # value and implement SessionStoreBackend.
+        "backend": "sqlite",
+        # Connection string for non-sqlite backends.  Format:
+        #   postgresql://user:pass@host:5432/dbname
+        # Ignored when backend="sqlite".  Override via STATE_DATABASE_URL
+        # in .env for production deployments (secrets stay out of
+        # config.yaml).
+        "database_url": "",
+        # Minimum connections kept warm in the pool (postgresql only).
+        "pool_min_size": 2,
+        # Maximum connections allowed in the pool (postgresql only).
+        "pool_max_size": 10,
+    },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
+
     # Each hint is shown once per install and then latched here so it
     # never fires again.  Users can wipe the section to re-see all hints.
     "onboarding": {
@@ -4875,6 +4901,13 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Prefill messages file path",
         "url": None,
         "password": False,
+        "category": "setting",
+    },
+    "STATE_DATABASE_URL": {
+        "description": "PostgreSQL connection string for the session state store (postgresql://user:pass@host:5432/dbname)",
+        "prompt": "Session state database URL",
+        "url": None,
+        "password": True,
         "category": "setting",
     },
     "HERMES_EPHEMERAL_SYSTEM_PROMPT": {
