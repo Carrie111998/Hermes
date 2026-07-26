@@ -7818,7 +7818,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Enable faulthandler at gateway start so that SIGUSR2 (or an
         # internal watchdog) can dump all thread and task stacks to stderr
         # for post-mortem diagnosis of event-loop freezes (#70344).
-        faulthandler.enable()
+        # Guard against sys.stderr being None on Windows when spawned
+        # as a subprocess without a TTY (avoids RuntimeError).
+        if sys.stderr is not None:
+            faulthandler.enable()
         # Also dump stacks to a rotating file for off-line analysis when
         # the gateway is running under a service manager that doesn't
         # capture stderr.
