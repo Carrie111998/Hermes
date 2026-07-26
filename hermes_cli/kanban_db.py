@@ -1411,6 +1411,33 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Dispatcher tick history — one row per successful dispatch pass.
+-- Used by diagnostics to surface "dispatcher not running" and "tick
+-- stalled" signals for operators.  The most recent tick per board is
+-- the one with the highest ``id``.
+CREATE TABLE IF NOT EXISTS dispatcher_ticks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    board       TEXT NOT NULL DEFAULT 'default',
+    started_at  INTEGER NOT NULL,
+    finished_at INTEGER NOT NULL,
+    reclaimed   INTEGER NOT NULL DEFAULT 0,
+    promoted    INTEGER NOT NULL DEFAULT 0,
+    spawned     INTEGER NOT NULL DEFAULT 0,
+    skipped_nonspawnable INTEGER NOT NULL DEFAULT 0,
+    skipped_capacity     INTEGER NOT NULL DEFAULT 0,
+    stale_claims_reclaimed INTEGER NOT NULL DEFAULT 0,
+    auto_blocked INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    -- Exact task IDs per skip reason (JSON arrays).  Enables precise
+    -- per-task matching in diagnostics rather than applying aggregate
+    -- counts to every ready task (FD-013).
+    skipped_nonspawnable_ids TEXT,
+    skipped_capacity_ids     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispatcher_ticks_board
+    ON dispatcher_ticks(board, finished_at);
 """
 
 
@@ -2616,6 +2643,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
+
+    # dispatcher_ticks — new per-task skip ID columns (FD-013).
+    # Existing boards with the old schema get NULL for these columns.
+    dt_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='dispatcher_ticks'"
+    ).fetchone() is not None
+    if dt_exists:
+        dt_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(dispatcher_ticks)")
+        }
+        if "skipped_nonspawnable_ids" not in dt_cols:
+            _add_column_if_missing(
+                conn, "dispatcher_ticks",
+                "skipped_nonspawnable_ids", "skipped_nonspawnable_ids TEXT",
+            )
+        if "skipped_capacity_ids" not in dt_cols:
+            _add_column_if_missing(
+                conn, "dispatcher_ticks",
+                "skipped_capacity_ids", "skipped_capacity_ids TEXT",
+            )
 
     _rebuild_drifted_tables(conn)
 
@@ -3986,6 +4034,92 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+
+
+def _record_dispatcher_tick(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    started_at: int,
+    finished_at: int,
+    result: "DispatchResult",
+    error: Optional[str] = None,
+) -> int:
+    """Record a dispatcher tick in the dispatcher_ticks table.
+
+    Stores both aggregate counts and exact per-reason task ID lists.
+    Returns the new row id.  Called from _dispatch_once_locked after a
+    successful tick pass so diagnostics can surface dispatcher health
+    signals with per-task precision (FD-013).
+    """
+    now = int(time.time())
+    # Build JSON arrays of per-reason task IDs.
+    skipped_nonspawnable_json = json.dumps(
+        list(result.skipped_nonspawnable) if result.skipped_nonspawnable else [],
+    )
+    skipped_capacity_json = json.dumps(
+        [
+            [tid, assignee, count]
+            for tid, assignee, count in (result.skipped_per_profile_capped or [])
+        ],
+    )
+    cur = conn.execute(
+        """INSERT INTO dispatcher_ticks (
+            board, started_at, finished_at,
+            reclaimed, promoted, spawned,
+            skipped_nonspawnable, skipped_capacity,
+            stale_claims_reclaimed, auto_blocked,
+            error, skipped_nonspawnable_ids, skipped_capacity_ids
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            board,
+            started_at,
+            finished_at,
+            result.reclaimed,
+            result.promoted,
+            len(result.spawned),
+            len(result.skipped_nonspawnable),
+            len(result.skipped_per_profile_capped),
+            len(result.stale),
+            len(result.auto_blocked),
+            error,
+            skipped_nonspawnable_json,
+            skipped_capacity_json,
+        ),
+    )
+    return cur.lastrowid or 0
+
+
+def get_latest_dispatcher_tick(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> Optional[sqlite3.Row]:
+    """Return the most recent dispatcher tick row, or None."""
+    board_slug = board or get_current_board()
+    return conn.execute(
+        """SELECT * FROM dispatcher_ticks
+           WHERE board = ?
+           ORDER BY id DESC LIMIT 1""",
+        (board_slug,),
+    ).fetchone()
+
+
+def get_dispatcher_ticks_since(
+    conn: sqlite3.Connection,
+    since: int,
+    *,
+    board: Optional[str] = None,
+) -> list[sqlite3.Row]:
+    """Return dispatcher tick rows since ``since`` (unix timestamp)."""
+    board_slug = board or get_current_board()
+    rows = conn.execute(
+        """SELECT * FROM dispatcher_ticks
+           WHERE board = ? AND finished_at > ?
+           ORDER BY id ASC""",
+        (board_slug, since),
+    ).fetchall()
+    return list(rows)
 
 
 def _end_run(
@@ -8335,6 +8469,7 @@ def _dispatch_once_locked(
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
+    _tick_started_at = int(time.time())
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
@@ -8688,6 +8823,21 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # Record the dispatcher tick for diagnostics.
+    _tick_finished_at = int(time.time())
+    if not dry_run:
+        try:
+            _record_dispatcher_tick(
+                conn,
+                board=board or get_current_board(),
+                started_at=_tick_started_at,
+                finished_at=_tick_finished_at,
+                result=result,
+            )
+        except Exception:
+            pass  # Tick recording failure must not block dispatch.
+
     return result
 
 

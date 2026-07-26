@@ -1000,6 +1000,323 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+# ---------------------------------------------------------------------------
+# Dispatcher reliability rules (board-level diagnostics)
+# ---------------------------------------------------------------------------
+
+
+def _rule_dispatcher_no_recent_tick(
+    task, events, runs, now, cfg, dispatcher_ticks=None
+) -> list[Diagnostic]:
+    """Dispatcher hasn't ticked recently — workers may be stalled.
+
+    Fires when the most recent tick is older than
+    ``cfg["dispatcher_tick_stale_seconds"]`` (default 180, 3× typical 60s
+    interval) AND at least one task is in ``ready`` with an assignee
+    (work that should be picked up).
+
+    Task-age gating:
+    - Fresh tasks (created < 2× interval ago): NOT flagged — normal wait.
+    - Tasks waiting >= 3 intervals: flagged at 'error'/'critical'.
+    """
+    threshold = float(cfg.get("dispatcher_tick_stale_seconds", 180))
+    status = _task_field(task, "status")
+    # Only fire for tasks that should be picked up.
+    if status != "ready":
+        return []
+    assignee = (_task_field(task, "assignee") or "").strip()
+    if not assignee:
+        return []
+
+    if dispatcher_ticks is None:
+        return []
+
+    # Determine task age — fresh tasks should not be flagged.
+    created_at = int(_task_field(task, "created_at", 0) or 0)
+    if created_at:
+        task_age = now - created_at
+        # Tasks younger than 2× interval are still in normal wait window.
+        if task_age < threshold * 2:
+            return []
+
+    # Find the most recent tick.
+    if not dispatcher_ticks:
+        # No ticks at all — dispatcher may not be running.
+        last_tick_ts = 0
+    else:
+        last_tick_ts = max(
+            _task_field(t, "finished_at", 0) or 0 for t in dispatcher_ticks
+        )
+
+    if last_tick_ts == 0:
+        # No tick has ever been recorded, and this task is aged enough.
+        age_str = "never"
+        severity = "critical"
+    else:
+        age_seconds = now - last_tick_ts
+        if age_seconds < threshold:
+            return []
+        age_str = f"{age_seconds / 60:.0f}m" if age_seconds < 3600 else f"{age_seconds / 3600:.1f}h"
+        severity = "critical" if age_seconds >= threshold * 3 else "error"
+
+    return [Diagnostic(
+        kind="dispatcher_no_recent_tick",
+        severity=severity,
+        title=f"Dispatcher last tick: {age_str} ago",
+        detail=(
+            f"The dispatcher's most recent tick was {age_str} ago. "
+            f"Ready tasks with assignees (like this one) are accumulating "
+            f"but no worker is being spawned. Check that the dispatcher "
+            f"is running: `systemctl --user status hermes-gateway.service` "
+            f"(when dispatch_in_gateway is enabled) or inspect "
+            f"`journalctl --user -u hermes-gateway.service` for errors."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Check gateway dispatcher status",
+                payload={"command": "systemctl --user status hermes-gateway.service"},
+                suggested=True,
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Run one dispatch pass",
+                payload={"command": "hermes kanban dispatch"},
+            ),
+        ],
+        first_seen_at=last_tick_ts or now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "last_tick_at": last_tick_ts,
+            "age_seconds": now - last_tick_ts if last_tick_ts else None,
+            "threshold_seconds": int(threshold),
+        },
+    )]
+
+
+def _rule_dispatcher_stale_claim(
+    task, events, runs, now, cfg, dispatcher_ticks=None
+) -> list[Diagnostic]:
+    """Task's claim has expired — dispatcher will reclaim on next tick.
+
+    Fires when a task is ``running`` but its ``claim_expires`` is in the
+    past, meaning the worker hasn't reported a heartbeat in time.
+    """
+    status = _task_field(task, "status")
+    if status != "running":
+        return []
+
+    claim_expires = _task_field(task, "claim_expires")
+    if not claim_expires or int(claim_expires) >= now:
+        return []
+
+    # Check if there's an active run (running status without a run is
+    # a different problem — the stale-claims reaper handles it).
+    has_active_run = any(
+        _task_field(r, "status") == "running" for r in (runs or [])
+    ) if runs else False
+
+    age_seconds = now - int(claim_expires)
+    age_str = f"{age_seconds / 60:.0f}m" if age_seconds < 3600 else f"{age_seconds / 3600:.1f}h"
+
+    return [Diagnostic(
+        kind="dispatcher_stale_claim",
+        severity="warning",
+        title=f"Claim expired {age_str} ago — worker may be dead",
+        detail=(
+            f"This task's claim expired {age_str} ago. The dispatcher "
+            f"will reclaim it on the next tick and reassign. If this "
+            f"happens repeatedly, the worker may be crashing or hanging. "
+            f"Check the worker output: `hermes kanban tail {_task_field(task, 'id')}`"
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="reclaim",
+                label="Reclaim now",
+                suggested=True,
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Check task events",
+                payload={"command": f"hermes kanban tail {_task_field(task, 'id')}"},
+            ),
+        ],
+        first_seen_at=int(claim_expires),
+        last_seen_at=now,
+        count=1,
+        data={
+            "claim_expires": int(claim_expires),
+            "age_seconds": age_seconds,
+            "has_active_run": has_active_run,
+        },
+    )]
+
+
+def _rule_dispatcher_capacity_wait(
+    task, events, runs, now, cfg, dispatcher_ticks=None
+) -> list[Diagnostic]:
+    """Task is ready but the assignee profile is at capacity.
+
+    Uses exact per-task ID matching from ``skipped_capacity_ids`` JSON
+    column.  Only fires when THIS specific task ID appears in the most
+    recent tick's capacity-skipped list (FD-013).
+    """
+    status = _task_field(task, "status")
+    if status != "ready":
+        return []
+
+    assignee = (_task_field(task, "assignee") or "").strip()
+    if not assignee:
+        return []
+
+    if dispatcher_ticks is None or not dispatcher_ticks:
+        return []
+
+    task_id = _task_field(task, "id")
+    if not task_id:
+        return []
+
+    # Check the most recent tick for capacity skips that include this task.
+    last_tick = max(dispatcher_ticks, key=lambda t: _task_field(t, "id", 0))
+    cap_ids_raw = _task_field(last_tick, "skipped_capacity_ids")
+    skipped_cap_ids = _parse_json_list(cap_ids_raw)
+
+    # Check if this exact task ID is in the skipped list.
+    task_matched = False
+    for entry in skipped_cap_ids:
+        if isinstance(entry, list) and len(entry) >= 2 and entry[0] == task_id:
+            task_matched = True
+            break
+
+    if not task_matched:
+        return []
+
+    skipped_cap = _task_field(last_tick, "skipped_capacity", 0) or 0
+
+    return [Diagnostic(
+        kind="dispatcher_capacity_wait",
+        severity="warning",
+        title=f"Profile at capacity — task deferred",
+        detail=(
+            f"The dispatcher skipped this task (assignee={assignee}) "
+            f"because its profile was at capacity. It will be picked "
+            f"up when a slot frees. Consider raising "
+            f"`kanban.max_in_progress_per_profile` or adding more profiles."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="reassign",
+                label="Reassign to different profile",
+                payload={"current_assignee": assignee},
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Run diagnostics for this task",
+                payload={"command": f"hermes kanban diagnostics --task {task_id}"},
+            ),
+        ],
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "assignee": assignee,
+            "task_id": task_id,
+            "total_skipped_this_tick": skipped_cap,
+        },
+    )]
+
+
+def _rule_dispatcher_nonspawnable_assignee(
+    task, events, runs, now, cfg, dispatcher_ticks=None
+) -> list[Diagnostic]:
+    """Task's assignee is not a spawnable Hermes profile.
+
+    Uses exact per-task ID matching from ``skipped_nonspawnable_ids`` JSON
+    column.  Only fires when THIS specific task ID appears in the most
+    recent tick's nonspawnable-skipped list, AND the task has been ready
+    for longer than the normal dispatch interval (FD-013).
+    """
+    status = _task_field(task, "status")
+    if status != "ready":
+        return []
+
+    assignee = (_task_field(task, "assignee") or "").strip()
+    if not assignee:
+        return []
+
+    if dispatcher_ticks is None or not dispatcher_ticks:
+        return []
+
+    task_id = _task_field(task, "id")
+    if not task_id:
+        return []
+
+    # Check the most recent tick for nonspawnable skips that include this task.
+    last_tick = max(dispatcher_ticks, key=lambda t: _task_field(t, "id", 0))
+    nonspawn_ids_raw = _task_field(last_tick, "skipped_nonspawnable_ids")
+    nonspawn_ids = _parse_json_list(nonspawn_ids_raw)
+
+    if task_id not in nonspawn_ids:
+        return []
+
+    # Check the task's ready age — only fire after 2+ tick intervals.
+    ready_threshold = float(cfg.get("dispatcher_tick_stale_seconds", 180)) * 2
+    created_at = int(_task_field(task, "created_at", 0) or 0)
+    if created_at and (now - created_at) < ready_threshold:
+        return []
+
+    skipped_nonspawnable = _task_field(last_tick, "skipped_nonspawnable", 0) or 0
+
+    return [Diagnostic(
+        kind="dispatcher_nonspawnable_assignee",
+        severity="error",
+        title=f"Assignee '{assignee}' not spawnable",
+        detail=(
+            f"Task {task_id} with assignee={assignee!r} was skipped by "
+            f"the dispatcher because the assignee is not a Hermes profile. "
+            f"Common causes: assignee is a Claude Code lane, a typo, or a "
+            f"deleted profile. Reassign to a valid profile."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="reassign",
+                label="Reassign to valid profile",
+                payload={"current_assignee": assignee},
+                suggested=True,
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="List available profiles",
+                payload={"command": "hermes profile list"},
+            ),
+        ],
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "assignee": assignee,
+            "task_id": task_id,
+            "total_skipped_this_tick": skipped_nonspawnable,
+        },
+    )]
+
+
+def _parse_json_list(raw: Any) -> list:
+    """Parse a JSON list from a column value, returning [] on failure."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return []
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1011,6 +1328,10 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_dispatcher_no_recent_tick,
+    _rule_dispatcher_stale_claim,
+    _rule_dispatcher_capacity_wait,
+    _rule_dispatcher_nonspawnable_assignee,
 ]
 
 
@@ -1025,6 +1346,10 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "dispatcher_no_recent_tick",
+    "dispatcher_stale_claim",
+    "dispatcher_capacity_wait",
+    "dispatcher_nonspawnable_assignee",
 )
 
 
@@ -1040,6 +1365,11 @@ DEFAULT_CONFIG = {
     # signal is dominated by tasks that are about to be claimed on the
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
+    # Dispatcher-tick staleness threshold: 180s = 3× typical 60s interval.
+    "dispatcher_tick_stale_seconds": 180,
+    # Block-cycle threshold: 3 cycles in 24h triggers a warning.
+    "block_cycle_threshold": 3,
+    "block_cycle_window_seconds": 24 * 3600,
 }
 
 
@@ -1095,9 +1425,14 @@ def compute_task_diagnostics(
     *,
     now: Optional[int] = None,
     config: Optional[dict] = None,
+    dispatcher_ticks: Optional[list] = None,
 ) -> list[Diagnostic]:
     """Run every rule against a single task's state and return a
     severity-sorted list of active diagnostics.
+
+    ``dispatcher_ticks`` is an optional list of dispatcher tick rows
+    (from ``dispatcher_ticks`` table) used by dispatcher-reliability
+    rules.  Pass ``None`` to skip those rules (backward-compatible).
 
     Sorting: critical first, then error, then warning; ties broken by
     most-recent ``last_seen_at``.
@@ -1117,7 +1452,14 @@ def compute_task_diagnostics(
     out: list[Diagnostic] = []
     for rule in _RULES:
         try:
-            out.extend(rule(task, events, runs, now_ts, cfg))
+            # Pass dispatcher_ticks only to rules that accept it.
+            import inspect as _inspect
+            sig = _inspect.signature(rule)
+            if "dispatcher_ticks" in sig.parameters:
+                out.extend(rule(task, events, runs, now_ts, cfg,
+                                dispatcher_ticks=dispatcher_ticks))
+            else:
+                out.extend(rule(task, events, runs, now_ts, cfg))
         except Exception:
             # A broken rule must never crash the dashboard. Rule bugs
             # get caught in tests; in production we'd rather drop the

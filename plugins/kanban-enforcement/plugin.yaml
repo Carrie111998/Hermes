@@ -1,0 +1,10 @@
+name: kanban-enforcement
+version: 1.0.0
+description: "Opt-in pre-execution gate — blocks substantial worker tool calls until a dispatch route or exemption is established."
+author: "Hermes Agent"
+hooks:
+  - pre_tool_call
+  - post_tool_call
+  - post_llm_call
+  - on_session_start
+  - on_session_end

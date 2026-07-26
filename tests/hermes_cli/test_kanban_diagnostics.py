@@ -9,6 +9,7 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -772,4 +773,305 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("warning", "error") is False
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher reliability diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _tick(**overrides):
+    """Create a minimal dispatcher tick row dict."""
+    base = {
+        "id": 1,
+        "board": "default",
+        "started_at": int(time.time()) - 120,
+        "finished_at": int(time.time()) - 60,
+        "reclaimed": 0,
+        "promoted": 0,
+        "spawned": 0,
+        "skipped_nonspawnable": 0,
+        "skipped_capacity": 0,
+        "stale_claims_reclaimed": 0,
+        "auto_blocked": 0,
+        "error": None,
+        "skipped_nonspawnable_ids": None,
+        "skipped_capacity_ids": None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestDispatcherNoRecentTick:
+    """_rule_dispatcher_no_recent_tick fires when tick is stale."""
+
+    def test_fires_when_no_ticks(self):
+        """No ticks at all — dispatcher hasn't run."""
+        task = _task(status="ready", assignee="worker-terra")
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=[],
+        )
+        assert len(diags) == 1
+        assert diags[0].kind == "dispatcher_no_recent_tick"
+        assert diags[0].severity == "critical"
+
+    def test_fires_when_tick_stale(self):
+        """Last tick older than threshold."""
+        task = _task(status="ready", assignee="worker-terra")
+        now_ts = int(time.time())
+        stale_ts = now_ts - 200  # older than 180s threshold
+        ticks = [_tick(id=1, finished_at=stale_ts)]
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, [], [], now_ts, {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 1
+        assert diags[0].kind == "dispatcher_no_recent_tick"
+
+    def test_no_fire_when_tick_recent(self):
+        """Recent tick — no diagnostic."""
+        task = _task(status="ready", assignee="worker-terra")
+        now_ts = int(time.time())
+        recent_ts = now_ts - 30  # within 180s
+        ticks = [_tick(id=1, finished_at=recent_ts)]
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, [], [], now_ts, {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_for_non_ready_task(self):
+        """Only fires for ready tasks."""
+        task = _task(status="running", assignee="worker-terra")
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=[],
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_for_unassigned_task(self):
+        """Doesn't fire for tasks with no assignee."""
+        task = _task(status="ready", assignee="")
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=[],
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_for_fresh_task_within_wait_window(self):
+        """Fresh task (created < 2×threshold ago) is NOT flagged — normal wait."""
+        now_ts = int(time.time())
+        threshold = 180
+        # Task created 200s ago — within 2×threshold (360s).
+        task = _task(
+            id="t_fresh",
+            status="ready",
+            assignee="worker-terra",
+            created_at=now_ts - 200,
+        )
+        ticks = []
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, [], [], now_ts,
+            {"dispatcher_tick_stale_seconds": threshold},
+            dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0, "fresh task should not trigger diagnostic"
+
+    def test_fires_for_aged_task_beyond_wait_window(self):
+        """Task aged >= 2×threshold triggers diagnostic."""
+        now_ts = int(time.time())
+        threshold = 180
+        # Task created 400s ago — beyond 2×threshold (360s).
+        task = _task(
+            id="t_aged",
+            status="ready",
+            assignee="worker-terra",
+            created_at=now_ts - 400,
+        )
+        ticks = []
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, [], [], now_ts,
+            {"dispatcher_tick_stale_seconds": threshold},
+            dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 1
+        assert diags[0].severity == "critical"  # no ticks at all + aged
+
+
+class TestDispatcherStaleClaim:
+    """_rule_dispatcher_stale_claim fires when claim is expired."""
+
+    def test_fires_when_claim_expired(self):
+        now_ts = int(time.time())
+        task = _task(
+            status="running",
+            assignee="worker-terra",
+            claim_expires=now_ts - 120,
+        )
+        diags = kd._rule_dispatcher_stale_claim(
+            task, [], [], now_ts, {},
+        )
+        assert len(diags) == 1
+        assert diags[0].kind == "dispatcher_stale_claim"
+        assert diags[0].severity == "warning"
+
+    def test_no_fire_when_claim_valid(self):
+        now_ts = int(time.time())
+        task = _task(
+            status="running",
+            assignee="worker-terra",
+            claim_expires=now_ts + 300,
+        )
+        diags = kd._rule_dispatcher_stale_claim(
+            task, [], [], now_ts, {},
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_for_non_running_task(self):
+        now_ts = int(time.time())
+        task = _task(
+            status="ready",
+            assignee="worker-terra",
+            claim_expires=now_ts - 120,
+        )
+        diags = kd._rule_dispatcher_stale_claim(
+            task, [], [], now_ts, {},
+        )
+        assert len(diags) == 0
+
+
+class TestDispatcherCapacityWait:
+    """_rule_dispatcher_capacity_wait fires when this specific task is capacity-skipped."""
+
+    def test_fires_when_capacity_skip_matches_task_id(self):
+        task = _task(id="t_cap_test", status="ready", assignee="worker-terra")
+        ticks = [_tick(
+            skipped_capacity=3,
+            skipped_capacity_ids=json.dumps([["t_cap_test", "worker-terra", 3]]),
+        )]
+        diags = kd._rule_dispatcher_capacity_wait(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 1
+        assert diags[0].kind == "dispatcher_capacity_wait"
+
+    def test_no_fire_when_different_task_id_skipped(self):
+        """Only fires when THIS task's ID is in skipped_capacity_ids."""
+        task = _task(id="t_other", status="ready", assignee="worker-terra")
+        ticks = [_tick(
+            skipped_capacity=3,
+            skipped_capacity_ids=json.dumps([["t_cap_test", "worker-terra", 3]]),
+        )]
+        diags = kd._rule_dispatcher_capacity_wait(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0, "different task ID should not trigger diagnostic"
+
+    def test_no_fire_when_no_skips(self):
+        task = _task(status="ready", assignee="worker-terra")
+        ticks = [_tick(skipped_capacity=0)]
+        diags = kd._rule_dispatcher_capacity_wait(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_for_non_ready_task(self):
+        task = _task(id="t_cap_test", status="running", assignee="worker-terra")
+        ticks = [_tick(
+            skipped_capacity=3,
+            skipped_capacity_ids=json.dumps([["t_cap_test", "worker-terra", 3]]),
+        )]
+        diags = kd._rule_dispatcher_capacity_wait(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
+
+class TestDispatcherNonspawnableAssignee:
+    """_rule_dispatcher_nonspawnable_assignee fires for invalid assignees with exact task matching."""
+
+    def test_fires_when_nonspawnable_matches_task_id_and_aged(self):
+        now_ts = int(time.time())
+        task = _task(
+            id="t_ns_test",
+            status="ready",
+            assignee="typo-profile",
+            created_at=now_ts - 500,  # older than 2*threshold (360s with default 180)
+        )
+        ticks = [_tick(
+            skipped_nonspawnable=2,
+            skipped_nonspawnable_ids=json.dumps(["t_ns_test", "t_other_ns"]),
+        )]
+        diags = kd._rule_dispatcher_nonspawnable_assignee(
+            task, [], [], now_ts, {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 1
+        assert diags[0].kind == "dispatcher_nonspawnable_assignee"
+        assert diags[0].severity == "error"
+
+    def test_no_fire_when_different_task_id_nonspawnable(self):
+        """Only fires when THIS task's ID is in skipped_nonspawnable_ids."""
+        now_ts = int(time.time())
+        task = _task(
+            id="t_other", status="ready", assignee="worker-terra",
+            created_at=now_ts - 500,
+        )
+        ticks = [_tick(
+            skipped_nonspawnable=2,
+            skipped_nonspawnable_ids=json.dumps(["t_ns_test"]),
+        )]
+        diags = kd._rule_dispatcher_nonspawnable_assignee(
+            task, [], [], now_ts, {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_when_no_nonspawnable_skips(self):
+        now_ts = int(time.time())
+        task = _task(
+            status="ready", assignee="worker-terra", created_at=now_ts - 300,
+        )
+        ticks = [_tick(skipped_nonspawnable=0)]
+        diags = kd._rule_dispatcher_nonspawnable_assignee(
+            task, [], [], now_ts, {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_when_too_recent(self):
+        """Don't fire if task created too recently (< 2*threshold)."""
+        now_ts = int(time.time())
+        task = _task(
+            id="t_ns_test", status="ready", assignee="typo-profile",
+            created_at=now_ts - 30,
+        )
+        ticks = [_tick(
+            skipped_nonspawnable=2,
+            skipped_nonspawnable_ids=json.dumps(["t_ns_test"]),
+        )]
+        diags = kd._rule_dispatcher_nonspawnable_assignee(
+            task, [], [], now_ts, {}, dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
+
+class TestDispatcherTickIntegration:
+    """Integration: compute_task_diagnostics with dispatcher_ticks."""
+
+    def test_dispatcher_ticks_passed_to_compute(self):
+        """dispatcher_ticks are forwarded to rules that accept them."""
+        now_ts = int(time.time())
+        task = _task(status="ready", assignee="worker-terra")
+        ticks = []  # No ticks — should trigger dispatcher_no_recent_tick
+        diags = kd.compute_task_diagnostics(
+            task, [], [], now=now_ts, dispatcher_ticks=ticks,
+        )
+        kinds = {d.kind for d in diags}
+        assert "dispatcher_no_recent_tick" in kinds
+
+    def test_dispatcher_ticks_none_is_backward_compatible(self):
+        """dispatcher_ticks=None skips dispatcher rules."""
+        now_ts = int(time.time())
+        task = _task(status="ready", assignee="worker-terra")
+        diags = kd.compute_task_diagnostics(
+            task, [], [], now=now_ts, dispatcher_ticks=None,
+        )
+        kinds = {d.kind for d in diags}
+        assert "dispatcher_no_recent_tick" not in kinds, (
+            "dispatcher rules should not fire when dispatcher_ticks=None"
+        )
     assert kd.severity_at_or_above("warning", None) is True
