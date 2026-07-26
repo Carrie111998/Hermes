@@ -182,6 +182,33 @@ def test_resolve_folds_forward_slash_toplevel_into_backslash_common_root(monkeyp
     assert info["repo_root"] == info["worktree_root"] == "C:\\Users\\x\\repo"
 
 
+def test_resolve_preserves_distinct_worktree_root(monkeypatch):
+    # A genuine linked worktree is a *distinct* location; normalization must
+    # collapse only redundant segments, never fold a real worktree into the
+    # main checkout — otherwise it would wrongly classify as main (issue #71837).
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "/home/u/repo/../repo-wt")
+    monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "/home/u/repo")
+
+    info = git_probe.resolve("/home/u/repo-wt")
+
+    assert info == {"repo_root": "/home/u/repo", "worktree_root": "/home/u/repo-wt"}
+    assert info["worktree_root"] != info["repo_root"]
+
+
+def test_resolve_returns_none_when_not_a_repo(monkeypatch):
+    # When git cannot resolve a repo root the resolver must short-circuit to
+    # None rather than building a bogus lane for a non-repo cwd (issue #71837).
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "")
+
+    assert git_probe.resolve("/tmp/not-a-repo") is None
+
+
 def test_create_list_roundtrip(tmp_path):
     created = _call("projects.create", {"name": "Demo", "folders": [str(tmp_path)], "use": True})
     assert created["project"]["slug"] == "demo"
