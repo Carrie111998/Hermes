@@ -8798,6 +8798,31 @@ def _default_spawn(
             env=env,
             workspace=workspace,
         )
+        if capability.get("ok"):
+            verified_tools = [
+                str(name)
+                for name in capability.get("required_runtime_tools") or []
+                if str(name).strip()
+            ]
+            if verified_tools:
+                prompt += (
+                    "\n\nRUNTIME_CAPABILITY_ATTESTATION: The isolated startup "
+                    "preflight verified that these tools are present in this "
+                    "worker's callable schema: "
+                    + ", ".join(verified_tools)
+                    + ". Prior attempt summaries or blocker reports that claim "
+                    "one of these tools is absent are stale capability evidence. "
+                    "Do not block by inferring that a verified tool is missing. "
+                    "When the contracted operation reaches the point where the "
+                    "tool is needed, invoke it. Block only if that actual tool "
+                    "call returns a concrete error, and preserve the exact error "
+                    "in the blocker evidence."
+                )
+                # The query is the final argv item. Updating it after the
+                # capability probe places the attestation in the worker's
+                # highest-salience user turn instead of burying it among prior
+                # attempts and workspace blocker reports.
+                cmd[-1] = prompt
         capability.update(
             {
                 "checked_at": int(time.time()),

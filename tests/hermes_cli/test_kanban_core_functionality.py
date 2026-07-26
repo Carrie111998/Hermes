@@ -3104,6 +3104,11 @@ def test_default_spawn_records_passing_capability_preflight(
         assert audit["ok"] is True
         assert audit["toolsets"] == ["file"]
         assert audit["command"] == captured["cmd"]
+        query = captured["cmd"][-1]
+        assert "RUNTIME_CAPABILITY_ATTESTATION" in query
+        assert "read_file" in query
+        assert "Prior attempt summaries or blocker reports" in query
+        assert "actual tool call returns a concrete error" in query
     finally:
         conn.close()
 
