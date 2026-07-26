@@ -1573,6 +1573,92 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+def _doctrine_cascade_limit_reached(agent) -> bool:
+    """Fold the CS-10b provider-switch cap into normal chain exhaustion."""
+    try:
+        from hermes_cli.fallback_config import get_max_cascade_switches
+        from hermes_cli.routing.route_context import (
+            failure_history_snapshot,
+            get_route_context,
+            mark_cascade_exhausted,
+        )
+
+        if get_route_context() is None:
+            return False
+        if len(failure_history_snapshot()) < get_max_cascade_switches():
+            return False
+        pending = getattr(agent, "_doctrine_fallback_failure", None) or {}
+        mark_cascade_exhausted(pending.get("failure_class"))
+        agent._fallback_index = len(agent._fallback_chain)
+        return True
+    except Exception:
+        logger.warning(
+            "Doctrine cascade-cap check failed open",
+            exc_info=True,
+        )
+        return False
+
+
+def _mark_doctrine_chain_exhausted(agent, reason) -> None:
+    try:
+        from hermes_cli.routing.route_context import (
+            get_route_context,
+            mark_cascade_exhausted,
+        )
+
+        if get_route_context() is None:
+            return
+        pending = getattr(agent, "_doctrine_fallback_failure", None) or {}
+        failure_class = pending.get("failure_class")
+        if not failure_class and reason is not None:
+            failure_class = getattr(reason, "value", str(reason))
+        mark_cascade_exhausted(failure_class)
+    except Exception:
+        logger.warning(
+            "Doctrine cascade-exhaustion marker failed open",
+            exc_info=True,
+        )
+
+
+def _record_doctrine_provider_switch(
+    agent,
+    *,
+    old_provider: str,
+    old_model: str,
+    reason,
+) -> None:
+    pending = getattr(agent, "_doctrine_fallback_failure", None) or {}
+    try:
+        from hermes_cli.routing.route_context import (
+            append_failure,
+            get_route_context,
+        )
+
+        if get_route_context() is None:
+            return
+        failure_class = pending.get("failure_class")
+        if not failure_class and reason is not None:
+            failure_class = getattr(reason, "value", str(reason))
+        append_failure(
+            provider=old_provider,
+            model=old_model,
+            failure_class=str(failure_class or "unknown"),
+            latency_ms=int(pending.get("latency_ms") or 0),
+            error_repr=str(pending.get("error_repr") or ""),
+            transition_reason=str(
+                pending.get("transition_reason") or "provider_switch"
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "Doctrine provider-switch instrumentation failed open",
+            exc_info=True,
+        )
+    finally:
+        if hasattr(agent, "_doctrine_fallback_failure"):
+            agent._doctrine_fallback_failure = None
+
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -1586,6 +1672,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if _doctrine_cascade_limit_reached(agent):
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1611,6 +1699,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 _existing_cooldown,
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
+        if agent._fallback_chain:
+            _mark_doctrine_chain_exhausted(agent, reason)
         return False
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
@@ -1934,6 +2024,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
+        )
+        _record_doctrine_provider_switch(
+            agent,
+            old_provider=old_provider,
+            old_model=old_model,
+            reason=reason,
         )
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would

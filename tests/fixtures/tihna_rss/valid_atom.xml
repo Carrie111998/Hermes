@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Synthetic Tihna Research</title>
+  <entry>
+    <title>Binaural stimulation and attention in a controlled cohort</title>
+    <id>tag:example.test,2026:paper-1</id>
+    <link href="https://example.test/papers/paper-1"/>
+    <updated>2026-07-25T10:00:00Z</updated>
+    <author><name>Research Group</name></author>
+    <summary type="html">&lt;p&gt;A synthetic controlled study reports how binaural auditory stimulation affected sustained attention across a carefully screened adult cohort. The fixture is intentionally descriptive enough to pass the one hundred character minimum.&lt;/p&gt;</summary>
+    <category term="binaural"/>
+  </entry>
+  <entry>
+    <title>Wearable EEG entrainment protocol enters pilot validation</title>
+    <id>tag:example.test,2026:paper-2</id>
+    <link href="https://example.test/papers/paper-2"/>
+    <updated>2026-07-24T09:00:00Z</updated>
+    <summary>A synthetic pilot combines wearable EEG sensing with a paced auditory entrainment protocol and reports early feasibility observations. This text is long enough for the hardened feed filter.</summary>
+  </entry>
+</feed>

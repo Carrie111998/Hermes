@@ -1666,6 +1666,8 @@ def run_kanban_goal_loop(
     run_turn,
     task_status_fn,
     block_fn,
+    halt_signalled_fn=None,
+    halt_fn=None,
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
@@ -1691,7 +1693,8 @@ def run_kanban_goal_loop(
     ephemeral, so the turn budget lives in a local counter. It is fully
     decoupled from the CLI for testability: callers inject ``run_turn``
     (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
+    (reason: str -> None). ``halt_signalled_fn`` and ``halt_fn`` form the
+    cooperative operator-stop checkpoint between worker attempts.
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
@@ -1732,6 +1735,21 @@ def run_kanban_goal_loop(
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
+
+        # The previous leaf attempt has ended and no new one has begun. This
+        # is the safe cooperative checkpoint for an operator HALT.
+        if halt_signalled_fn is not None and halt_signalled_fn():
+            _log(
+                f"kanban goal loop: task {task_id} halted by operator "
+                f"after {turns_used} turn(s)"
+            )
+            if halt_fn is not None:
+                halt_fn()
+            return {
+                "outcome": "blocked_by_worker",
+                "turns_used": turns_used,
+                "reason": "halted by operator",
+            }
 
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish

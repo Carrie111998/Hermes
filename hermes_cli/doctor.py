@@ -189,6 +189,30 @@ def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
 
 
+_PRE_CS01_WIP_DEBT_LINE = (
+    "pre-CS01 WIP debt: 7 tests quarantined "
+    "(docs/known_debt/PRE_CS01_WIP_DEBT.md)"
+)
+
+
+def _report_pre_cs01_wip_debt() -> None:
+    """Report quarantined WIP debt without affecting doctor health."""
+    check_info(_PRE_CS01_WIP_DEBT_LINE)
+
+
+def _report_lane_manifest_audit() -> None:
+    """Report lane-control audit history without changing doctor health."""
+    try:
+        from hermes_cli.lanes.enable import audit_summary
+
+        check_info(audit_summary())
+    except Exception as exc:
+        check_info(
+            "lane_manifest_audit: unavailable "
+            f"({type(exc).__name__}: {exc})"
+        )
+
+
 def _section(title: str) -> None:
     """Print a doctor section banner: blank line + bold cyan ◆ title."""
     print()
@@ -2620,6 +2644,29 @@ def run_doctor(args):
         pass
     except Exception:
         pass
+
+    _section("Business-Lane Framework")
+    try:
+        from hermes_cli.lanes.health import check_framework
+
+        lanes_ok, lanes_detail = check_framework()
+        if lanes_ok:
+            check_ok("business-lane framework OK", lanes_detail)
+        else:
+            check_fail("business-lane framework FAILED", lanes_detail)
+            issues.append(
+                "Repair lane_manifest.yaml or missing CS-01 through CS-14 "
+                "schemas before enabling a lane"
+            )
+    except Exception as _lane_error:
+        check_fail(
+            "business-lane framework FAILED",
+            f"{type(_lane_error).__name__}: {_lane_error}",
+        )
+        issues.append("Repair the business-lane framework installation")
+
+    _report_pre_cs01_wip_debt()
+    _report_lane_manifest_audit()
 
     print()
     remaining_issues = issues + manual_issues

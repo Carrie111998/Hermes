@@ -6682,8 +6682,43 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        rung_id: str = "r0_baseline",
+        lane: Optional[str] = None,
+        route: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        from hermes_cli.programme.ingress import (
+            admit_new_turn,
+            resolve_turn_attribution,
+        )
+
+        resolved_route, resolved_profile = resolve_turn_attribution(
+            route=route,
+            profile=profile,
+            platform=getattr(self, "platform", None),
+            task_id_hint=task_id,
+        )
+        admit_new_turn(
+            route=resolved_route,
+            profile=resolved_profile,
+            session_id=getattr(self, "session_id", None),
+            task_id_hint=task_id,
+        )
+
+        from agent.conversation_loop import prepare_session_rotation
+
+        conversation_history = prepare_session_rotation(
+            self,
+            user_message=user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            lane=lane,
+            profile=resolved_profile,
+            route=resolved_route,
+        )
+
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
@@ -6704,7 +6739,12 @@ class AIAgent:
         # dimension) — the fix for aux spend being invisible in analytics
         # (issue #23270).
         acct_token = set_accounting_context(
-            getattr(self, "_session_db", None), getattr(self, "session_id", None)
+            getattr(self, "_session_db", None),
+            getattr(self, "session_id", None),
+            task_id=task_id,
+            lane=lane or getattr(self, "lane", None),
+            profile=resolved_profile,
+            route=resolved_route,
         )
         from agent.auxiliary_client import scoped_runtime_main
 
@@ -6714,17 +6754,98 @@ class AIAgent:
         # which may be observed from another thread.
         with scoped_runtime_main({}):
             try:
-                return run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    moa_config=moa_config,
-                )
+                try:
+                    return run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        moa_config=moa_config,
+                        rung_id=rung_id,
+                        profile=resolved_profile,
+                        route=resolved_route,
+                        _programme_ingress_admitted=True,
+                        _session_rotation_checked=True,
+                    )
+                except Exception as exc:
+                    from hermes_cli.cost.kill_switch import (
+                        KillSwitchTripped,
+                        PerTaskCapExceeded,
+                    )
+
+                    if not isinstance(
+                        exc,
+                        (KillSwitchTripped, PerTaskCapExceeded),
+                    ):
+                        raise
+                    logger.error(
+                        "Task termination fence tripped",
+                        extra={
+                            "task_id": exc.task_id,
+                            "exception_type": type(exc).__name__,
+                            "exception_message": str(exc),
+                        },
+                    )
+                    try:
+                        from hermes_cli.verdict import (
+                            LeafVerdict,
+                            attempts_at_current_rung,
+                            record_verdict,
+                        )
+                        from hermes_cli.verdict.types import (
+                            canonical_strategy_hash,
+                        )
+
+                        killed_by_cap = isinstance(
+                            exc,
+                            PerTaskCapExceeded,
+                        )
+                        attempt = (
+                            attempts_at_current_rung(exc.task_id, rung_id) + 1
+                        )
+                        strategy_payload = {
+                            "mode": "task_termination",
+                            "task_id": exc.task_id,
+                            "exception": type(exc).__name__,
+                        }
+                        record_verdict(
+                            LeafVerdict(
+                                task_id=exc.task_id,
+                                attempt_number=attempt,
+                                rung_id=rung_id,
+                                model_used=str(self.model or "unknown"),
+                                outcome=(
+                                    "killed_by_cap"
+                                    if killed_by_cap
+                                    else "killed_by_operator"
+                                ),
+                                failure_class=(
+                                    "cost_cap"
+                                    if killed_by_cap
+                                    else "operator"
+                                ),
+                                confidence=1.0,
+                                strategy_hash=canonical_strategy_hash(
+                                    strategy_payload
+                                ),
+                                error_class=type(exc).__name__,
+                                error_message=str(exc),
+                                raw_meta=strategy_payload,
+                            ),
+                            profile=resolved_profile,
+                            route=resolved_route,
+                            session_id=getattr(self, "session_id", None),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist task termination verdict for %s",
+                            exc.task_id,
+                        )
+                    raise
             finally:
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)

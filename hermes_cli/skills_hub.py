@@ -1765,8 +1765,25 @@ def skills_command(args) -> None:
             _console.print("Usage: hermes skills tap [list|add|remove]\n")
             return
         do_tap(tap_action, repo=repo)
+    elif action == "lint-log":
+        from hermes_cli.skills.cli import lint_log
+
+        lint_log(
+            skill_name=getattr(args, "skill_name", None),
+            category=getattr(args, "category", None),
+            since=getattr(args, "since", None),
+            limit=getattr(args, "limit", 50),
+        )
+    elif action == "lint-check":
+        from hermes_cli.skills.cli import lint_check
+
+        lint_check(args.file)
+    elif action == "lint-stats":
+        from hermes_cli.skills.cli import lint_stats
+
+        lint_stats()
     else:
-        _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
+        _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap|lint-log|lint-check|lint-stats]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
 
 

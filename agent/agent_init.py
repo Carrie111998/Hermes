@@ -1363,6 +1363,16 @@ def init_agent(
         agent._fallback_chain = [fallback_model]
     else:
         agent._fallback_chain = []
+    from hermes_cli.routing.route_context import get_route_context
+
+    _route_context = get_route_context()
+    if _route_context and _route_context.get("fallback_chain"):
+        agent._fallback_chain = [
+            dict(entry) for entry in _route_context["fallback_chain"]
+        ]
+        agent._fallback_source = "doctrine"
+    else:
+        agent._fallback_source = "profile"
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)

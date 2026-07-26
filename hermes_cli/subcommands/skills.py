@@ -307,6 +307,35 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     tap_rm = tap_subparsers.add_parser("remove", help="Remove a tap")
     tap_rm.add_argument("name", help="Tap name to remove")
 
+    skills_lint_log = skills_subparsers.add_parser(
+        "lint-log",
+        help="Show skill routing-intent findings stripped at write time",
+    )
+    skills_lint_log.add_argument("--skill", dest="skill_name")
+    skills_lint_log.add_argument(
+        "--category",
+        choices=[
+            "model_slug",
+            "provider_directive",
+            "mode_directive",
+            "cost_directive",
+            "transport_pin",
+        ],
+    )
+    skills_lint_log.add_argument("--since", help="Earliest ISO-8601 timestamp")
+    skills_lint_log.add_argument("--limit", type=int, default=50)
+
+    skills_lint_check = skills_subparsers.add_parser(
+        "lint-check",
+        help="Inspect a skill file without changing it",
+    )
+    skills_lint_check.add_argument("file", help="Path to a SKILL.md file")
+
+    skills_subparsers.add_parser(
+        "lint-stats",
+        help="Summarize stripped routing intent from the last 7 days",
+    )
+
     # config sub-action: interactive enable/disable
     skills_subparsers.add_parser(
         "config",

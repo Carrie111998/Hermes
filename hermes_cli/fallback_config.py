@@ -6,6 +6,19 @@ import os
 from typing import Any
 
 
+max_cascade_switches: int = 3
+
+
+def get_max_cascade_switches(config: dict[str, Any] | None = None) -> int:
+    """Return the positive provider-switch cap for one doctrine cascade."""
+    raw = (config or {}).get("max_cascade_switches", max_cascade_switches)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return max_cascade_switches
+    return value if value > 0 else max_cascade_switches
+
+
 def _normalized_base_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
