@@ -453,6 +453,9 @@ export interface InputHandlerResult {
 }
 
 export interface GatewayEventHandlerContext {
+  clarify?: {
+    persistedAbandoned: Set<string>
+  }
   composer: {
     setInput: StateSetter<string>
   }
@@ -541,6 +544,7 @@ export interface AppLayoutActions {
   answerSecret: (value: string) => void
   answerSudo: (pw: string) => void
   clearSelection: () => void
+  expireClarify: (requestId: string) => void
   activateLiveSession: (id: string) => void
   closeLiveSession: (id: string) => Promise<null | SessionCloseResponse>
   newLiveSession: () => void
@@ -604,6 +608,7 @@ export interface AppOverlaysProps {
   completions: CompletionItem[]
   onApprovalChoice: (choice: string) => void
   onClarifyAnswer: (value: string) => void
+  onClarifyExpire: (requestId: string) => void
   onActiveSessionSelect: (sessionId: string) => void
   onActiveSessionClose: (sessionId: string) => Promise<null | SessionCloseResponse>
   onModelSelect: (value: string) => void

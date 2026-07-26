@@ -13705,6 +13705,59 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 
+def test_block_advertises_finite_clarify_timeout_to_client(monkeypatch):
+    """The renderer needs the deadline up front so it can warn before an
+    in-progress long-form answer is interrupted, rather than only reporting
+    the timeout after the draft has disappeared."""
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload: emitted.append((event, sid, dict(payload))))
+    monkeypatch.setattr(server.time, "time", lambda: 1_000.0)
+
+    assert server._block("clarify.request", "sid-warning", {"question": "Plan?", "choices": []}, timeout=0) == ""
+
+    request = next(item for item in emitted if item[0] == "clarify.request")
+    assert request[2]["expires_at_ms"] == 1_000_000
+
+
+def test_block_wait_uses_remaining_time_from_advertised_deadline(monkeypatch):
+    """Emission latency must consume the advertised response window rather
+    than letting the server wait beyond the deadline shown to the user."""
+    emitted = []
+    clock = {"monotonic": 50.0}
+    waits = []
+
+    def emit(event, sid, payload):
+        emitted.append((event, sid, dict(payload)))
+        clock["monotonic"] += 2.0
+
+    monkeypatch.setattr(server, "_emit", emit)
+    monkeypatch.setattr(server.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(server.threading.Event, "wait", lambda self, timeout=None: waits.append(timeout) or False)
+
+    assert server._block("clarify.request", "sid-latency", {"question": "Plan?", "choices": []}, timeout=10) == ""
+
+    request = next(item for item in emitted if item[0] == "clarify.request")
+    assert request[2]["expires_at_ms"] == 1_010_000
+    assert waits == [pytest.approx(8.0)]
+
+
+def test_block_omits_clarify_timeout_for_unlimited_wait(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload: emitted.append((event, sid, dict(payload))))
+
+    def answer_immediately(_timeout):
+        rid = next(iter(server._pending))
+        server._answers[rid] = "done"
+        return True
+
+    monkeypatch.setattr(server.threading.Event, "wait", lambda self, timeout=None: answer_immediately(timeout))
+    assert server._block("clarify.request", "sid-unlimited", {"question": "Plan?", "choices": []}, timeout=None) == "done"
+
+    request = next(item for item in emitted if item[0] == "clarify.request")
+    assert "expires_at_ms" not in request[2]
+
+
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [(0, None), (-1, None), (42, 42)],

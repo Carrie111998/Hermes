@@ -59,9 +59,13 @@ export function PromptZone({
   cols,
   onApprovalChoice,
   onClarifyAnswer,
+  onClarifyExpire,
   onSecretSubmit,
   onSudoSubmit
-}: Pick<AppOverlaysProps, 'cols' | 'onApprovalChoice' | 'onClarifyAnswer' | 'onSecretSubmit' | 'onSudoSubmit'>) {
+}: Pick<
+  AppOverlaysProps,
+  'cols' | 'onApprovalChoice' | 'onClarifyAnswer' | 'onClarifyExpire' | 'onSecretSubmit' | 'onSudoSubmit'
+>) {
   const overlay = useStore($overlayState)
   const theme = useStore($uiTheme)
 
@@ -123,13 +127,24 @@ export function PromptZone({
   }
 
   if (overlay.clarify) {
+    const clarify = overlay.clarify
+
     return (
       <PromptCell cols={cols} id="clarify">
         <ClarifyPrompt
           cols={cols}
+          key={clarify.requestId}
           onAnswer={onClarifyAnswer}
           onCancel={() => onClarifyAnswer('')}
-          req={overlay.clarify}
+          onDraftChange={draft =>
+            patchOverlayState(prev => {
+              const current = prev.clarify
+
+              return current?.requestId === clarify.requestId ? { ...prev, clarify: { ...current, draft } } : prev
+            })
+          }
+          onExpire={onClarifyExpire}
+          req={clarify}
           t={theme}
         />
       </PromptCell>

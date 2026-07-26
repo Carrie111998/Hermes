@@ -1,6 +1,7 @@
 import { Box, Text, useInput, wrapAnsi } from '@hermes/ink'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
+import { clarifyDeadlineExpired, clarifyTimeoutNotice } from '../lib/clarifyTimeout.js'
 import { isMac } from '../lib/platform.js'
 import type { Theme } from '../theme.js'
 import type { ApprovalReq, ClarifyReq, ConfirmReq } from '../types.js'
@@ -142,11 +143,43 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
   )
 }
 
-export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: ClarifyPromptProps) {
+export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, onDraftChange, onExpire, req, t }: ClarifyPromptProps) {
   const [sel, setSel] = useState(0)
-  const [custom, setCustom] = useState('')
   const [typing, setTyping] = useState(false)
+  const [nowMs, setNowMs] = useState(Date.now())
   const choices = req.choices ?? []
+  const custom = req.draft ?? ''
+
+  const submitAnswer = (answer: string) => {
+    if (clarifyDeadlineExpired(req.expiresAtMs)) {
+      onExpire(req.requestId)
+
+      return
+    }
+
+    onAnswer(answer)
+  }
+
+  const timeoutNotice = clarifyTimeoutNotice(
+    req.expiresAtMs === undefined ? undefined : Math.max(0, (req.expiresAtMs - nowMs) / 1000)
+  )
+
+  useEffect(() => {
+    if (req.expiresAtMs === undefined) {
+      return
+    }
+
+    setNowMs(Date.now())
+    const timer = setInterval(() => setNowMs(Date.now()), 1000)
+
+    return () => clearInterval(timer)
+  }, [req.expiresAtMs])
+
+  useEffect(() => {
+    if (req.expiresAtMs !== undefined && nowMs >= req.expiresAtMs) {
+      onExpire(req.requestId)
+    }
+  }, [nowMs, onExpire, req.expiresAtMs, req.requestId])
 
   const heading = (
     <Text bold>
@@ -175,13 +208,13 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
     }
 
     if (key.return) {
-      sel === choices.length ? setTyping(true) : choices[sel] && onAnswer(choices[sel]!)
+      sel === choices.length ? setTyping(true) : choices[sel] && submitAnswer(choices[sel]!)
     }
 
     const n = parseInt(ch)
 
     if (n >= 1 && n <= choices.length) {
-      onAnswer(choices[n - 1]!)
+      submitAnswer(choices[n - 1]!)
     }
   })
 
@@ -195,8 +228,8 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
           <TextInput
             color={t.color.text}
             columns={Math.max(20, cols - 6)}
-            onChange={setCustom}
-            onSubmit={onAnswer}
+            onChange={onDraftChange}
+            onSubmit={submitAnswer}
             value={custom}
           />
         </Box>
@@ -205,6 +238,7 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
           Enter send · Esc {choices.length ? 'back' : 'cancel'} ·{' '}
           {isMac ? 'Cmd+C copy · Cmd+V paste · Ctrl+C cancel' : 'Ctrl+C cancel'}
         </Text>
+        {timeoutNotice ? <Text color={timeoutNotice.urgent ? t.color.warn : t.color.muted}>{timeoutNotice.text}</Text> : null}
       </Box>
     )
   }
@@ -223,6 +257,7 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, req, t }: Clarify
       ))}
 
       <Text color={t.color.muted}>↑/↓ select · Enter confirm · 1-{choices.length} quick pick · Esc/Ctrl+C cancel</Text>
+      {timeoutNotice ? <Text color={timeoutNotice.urgent ? t.color.warn : t.color.muted}>{timeoutNotice.text}</Text> : null}
     </Box>
   )
 }
@@ -300,6 +335,8 @@ interface ClarifyPromptProps {
   cols?: number
   onAnswer: (s: string) => void
   onCancel: () => void
+  onDraftChange: (s: string) => void
+  onExpire: (requestId: string) => void
   req: ClarifyReq
   t: Theme
 }

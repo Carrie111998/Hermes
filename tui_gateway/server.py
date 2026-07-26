@@ -2729,9 +2729,19 @@ def _enable_gateway_prompts() -> None:
 def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
+    deadline_monotonic: float | None = None
     with _prompt_lock:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
+        # Finite clarify prompts advertise an authoritative deadline so
+        # interactive clients can warn before interrupting a long-form answer.
+        # Keeping the absolute deadline in the pending payload also prevents a
+        # reconnect/replay from accidentally restarting the visible countdown.
+        # Unlimited waits deliberately omit the field.
+        if event == "clarify.request" and timeout is not None:
+            timeout_seconds = max(0, float(timeout))
+            deadline_monotonic = time.monotonic() + timeout_seconds
+            payload["expires_at_ms"] = int((time.time() + timeout_seconds) * 1000)
         _pending_prompt_payloads[rid] = (event, dict(payload))
     answered = False
     answer = ""
@@ -2741,7 +2751,10 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
         # Natural Event semantics: None → wait forever (clarify configured with
         # clarify_timeout <= 0, released only by a real answer or
         # session.interrupt), 0 → return immediately, > 0 → bounded wait.
-        answered = ev.wait(timeout)
+        wait_timeout = timeout
+        if deadline_monotonic is not None:
+            wait_timeout = max(0.0, deadline_monotonic - time.monotonic())
+        answered = ev.wait(wait_timeout)
     finally:
         with _prompt_lock:
             _pending.pop(rid, None)

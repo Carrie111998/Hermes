@@ -109,6 +109,8 @@ export interface ConfirmReq {
 
 export interface ClarifyReq {
   choices: string[] | null
+  draft?: string
+  expiresAtMs?: number
   question: string
   requestId: string
 }

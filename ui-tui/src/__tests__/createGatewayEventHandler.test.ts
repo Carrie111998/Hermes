@@ -66,6 +66,104 @@ describe('createGatewayEventHandler', () => {
     patchUiState({ showReasoning: true })
   })
 
+  it('records a clarify deadline so the prompt can warn before timeout', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+    const before = Date.now()
+
+    onEvent({
+      payload: { choices: [], expires_at_ms: before + 90_000, question: 'Write a plan', request_id: 'clarify-deadline' },
+      type: 'clarify.request'
+    } as any)
+
+    const clarify = getOverlayState().clarify
+    expect(clarify).toMatchObject({ draft: '', requestId: 'clarify-deadline' })
+    expect(clarify?.expiresAtMs).toBe(before + 90_000)
+  })
+
+  it('keeps an in-progress clarify draft when a reconnect replays the same request', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    const payload = {
+      choices: [],
+      expires_at_ms: Date.now() + 90_000,
+      question: 'Write a plan',
+      request_id: 'clarify-replayed'
+    }
+
+    onEvent({ payload, type: 'clarify.request' } as any)
+    patchOverlayState(prev => ({
+      ...prev,
+      clarify: prev.clarify ? { ...prev.clarify, draft: 'carefully written answer' } : null
+    }))
+    onEvent({ payload, type: 'clarify.request' } as any)
+
+    expect(getOverlayState().clarify?.draft).toBe('carefully written answer')
+  })
+
+  it('ignores replay of a clarify request already expired locally', () => {
+    const ctx = buildCtx([])
+    ctx.clarify = { persistedAbandoned: new Set(['clarify-expired-locally']) }
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: {
+        choices: [],
+        expires_at_ms: Date.now() - 1,
+        question: 'Write a plan',
+        request_id: 'clarify-expired-locally'
+      },
+      type: 'clarify.request'
+    } as any)
+
+    expect(getOverlayState().clarify).toBeNull()
+  })
+
+  it('preserves an in-progress long-form clarify answer when the request expires', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: { choices: [], expires_at_ms: Date.now() + 60_000, question: 'Write a plan', request_id: 'clarify-draft' },
+      type: 'clarify.request'
+    } as any)
+    patchOverlayState(prev => ({
+      ...prev,
+      clarify: prev.clarify ? { ...prev.clarify, draft: 'my detailed implementation plan' } : null
+    }))
+
+    onEvent({ payload: { request_id: 'clarify-draft' }, type: 'clarify.expire' } as any)
+
+    expect(getOverlayState().clarify).toBeNull()
+    expect(appended).toContainEqual({
+      role: 'system',
+      text: expect.stringMatching(/ask Write a plan[\s\S]*timed out/)
+    })
+    expect(ctx.composer.setInput).toHaveBeenCalledOnce()
+    const restore = ctx.composer.setInput.mock.calls[0]![0]
+    expect(restore('existing composer text')).toBe(
+      'existing composer text\n\nmy detailed implementation plan'
+    )
+    expect(ctx.system.sys).toHaveBeenCalledWith(
+      'clarify response timed out — your in-progress draft was preserved in the composer'
+    )
+  })
+
+  it('ignores a stale clarify expiry instead of clearing a newer prompt', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: { choices: [], expires_at_ms: Date.now() + 60_000, question: 'New question', request_id: 'clarify-new' },
+      type: 'clarify.request'
+    } as any)
+    onEvent({ payload: { request_id: 'clarify-old' }, type: 'clarify.expire' } as any)
+
+    expect(getOverlayState().clarify?.requestId).toBe('clarify-new')
+    expect(ctx.composer.setInput).not.toHaveBeenCalled()
+  })
+
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
     const appended: Msg[] = []
 

@@ -643,10 +643,11 @@ export type GatewayEvent =
       type: 'tool.complete'
     }
   | {
-      payload: { choices: string[] | null; question: string; request_id: string }
+      payload: { choices: string[] | null; expires_at_ms?: number; question: string; request_id: string }
       session_id?: string
       type: 'clarify.request'
     }
+  | { payload: { request_id: string }; session_id?: string; type: 'clarify.expire' }
   | {
       payload: {
         allow_permanent?: boolean

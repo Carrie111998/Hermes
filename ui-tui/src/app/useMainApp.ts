@@ -31,6 +31,7 @@ import type {
 } from '../gatewayTypes.js'
 import { useGitBranch } from '../hooks/useGitBranch.js'
 import { useVirtualHistory } from '../hooks/useVirtualHistory.js'
+import { mergePreservedClarifyDraft } from '../lib/clarifyTimeout.js'
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage } from '../lib/messages.js'
 import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
@@ -47,7 +48,7 @@ import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type TranscriptRow } from './interfaces.js'
-import { $overlayState, patchOverlayState } from './overlayStore.js'
+import { $overlayState, getOverlayState, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { turnController } from './turnController.js'
@@ -226,6 +227,7 @@ export function useMainApp(gw: GatewayClient) {
   const clipboardPasteRef = useRef<(quiet?: boolean) => Promise<void> | void>(() => {})
   const submitRef = useRef<(value: string) => void>(() => {})
   const terminalHintsShownRef = useRef(new Set<string>())
+  const persistedAbandonedClarifyRef = useRef(new Set<string>())
   const historyItemsRef = useRef(historyItems)
   const lastUserMsgRef = useRef(lastUserMsg)
   const recoverSidRef = useRef<null | string>(null)
@@ -706,6 +708,36 @@ export function useMainApp(gw: GatewayClient) {
     [appendMessage, overlay.clarify, rpc]
   )
 
+  const expireClarify = useCallback(
+    (requestId: string) => {
+      const clarify = getOverlayState().clarify
+
+      if (!clarify || clarify.requestId !== requestId) {
+        return
+      }
+
+      persistedAbandonedClarifyRef.current.add(requestId)
+      appendMessage({
+        role: 'system',
+        text: formatAbandonedClarify(clarify.question, clarify.choices, 'timed out')
+      })
+      patchOverlayState({ clarify: null })
+      const currentUi = getUiState()
+
+      if (currentUi.status === 'waiting for input…') {
+        patchUiState({ status: currentUi.busy ? 'running…' : 'ready' })
+      }
+
+      const draft = clarify.draft ?? ''
+
+      if (draft) {
+        composerActions.setInput(current => mergePreservedClarifyDraft(current, draft))
+        sys('Clarify request timed out. Your unfinished response was preserved in the composer.')
+      }
+    },
+    [appendMessage, composerActions, sys]
+  )
+
   const paste = useCallback(
     (quiet = false) =>
       rpc<ClipboardPasteResponse>('clipboard.paste', { session_id: getUiState().sid }).then(r => {
@@ -791,6 +823,7 @@ export function useMainApp(gw: GatewayClient) {
   const onEvent = useMemo(
     () =>
       createGatewayEventHandler({
+        clarify: { persistedAbandoned: persistedAbandonedClarifyRef.current },
         composer: { setInput: composerActions.setInput },
         gateway,
         session: {
@@ -1103,6 +1136,7 @@ export function useMainApp(gw: GatewayClient) {
       answerSecret,
       answerSudo,
       clearSelection,
+      expireClarify,
       newLiveSession: () => session.newLiveSession(),
       newPromptSession,
       onModelSelect,
@@ -1126,6 +1160,7 @@ export function useMainApp(gw: GatewayClient) {
       answerSudo,
       clearSelection,
       closeLiveSession,
+      expireClarify,
       newPromptSession,
       onModelSelect,
       session

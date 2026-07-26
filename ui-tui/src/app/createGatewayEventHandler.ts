@@ -14,6 +14,7 @@ import type {
   SessionMostRecentResponse
 } from '../gatewayTypes.js'
 import { billingDialogCopy } from '../lib/billingDialog.js'
+import { mergePreservedClarifyDraft } from '../lib/clarifyTimeout.js'
 import { relativeLuminance } from '../lib/color.js'
 import { isTodoDone } from '../lib/liveProgress.js'
 import { openExternalUrl } from '../lib/openExternalUrl.js'
@@ -396,7 +397,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   // Request IDs of clarify prompts we've already flushed to the transcript as
   // an abandoned-prompt record, so the tool.complete and message.complete
   // paths can't both persist the same prompt twice.
-  const persistedAbandonedClarify = new Set<string>()
+  const persistedAbandonedClarify = ctx.clarify?.persistedAbandoned ?? new Set<string>()
 
   // When a clarify prompt is dismissed without an answer (the backend _block
   // timed out and returned an empty string), the live ClarifyPrompt overlay is
@@ -1094,13 +1095,58 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
-      case 'clarify.request':
+      case 'clarify.request': {
+        if (persistedAbandonedClarify.has(ev.payload.request_id)) {
+          return
+        }
+
+        const currentClarify = getOverlayState().clarify
+        const draft = currentClarify?.requestId === ev.payload.request_id ? (currentClarify.draft ?? '') : ''
+
         patchOverlayState({
-          clarify: { choices: ev.payload.choices, question: ev.payload.question, requestId: ev.payload.request_id }
+          clarify: {
+            choices: ev.payload.choices,
+            draft,
+            expiresAtMs:
+              typeof ev.payload.expires_at_ms === 'number' && Number.isFinite(ev.payload.expires_at_ms)
+                ? ev.payload.expires_at_ms
+                : undefined,
+            question: ev.payload.question,
+            requestId: ev.payload.request_id
+          }
         })
         setStatus('waiting for input…')
 
         return
+      }
+
+      case 'clarify.expire': {
+        const clarify = getOverlayState().clarify
+
+        // Late expiry events are possible after reconnects. Never let one
+        // dismiss or overwrite a newer question.
+        if (!clarify || clarify.requestId !== ev.payload.request_id) {
+          return
+        }
+
+        persistedAbandonedClarify.add(clarify.requestId)
+        appendMessage({
+          role: 'system',
+          text: formatAbandonedClarify(clarify.question, clarify.choices, 'timed out')
+        })
+        patchOverlayState({ clarify: null })
+        setStatus(statusFromBusy())
+
+        if (clarify.draft) {
+          setInput(current => mergePreservedClarifyDraft(current, clarify.draft ?? ''))
+          sys('clarify response timed out — your in-progress draft was preserved in the composer')
+        } else {
+          sys('clarify response timed out')
+        }
+
+        return
+      }
+
       case 'approval.request': {
         const description = String(ev.payload.description ?? 'dangerous command')
         // Only an explicit false (tirith warning) drops the permanent-allow option.
