@@ -768,9 +768,8 @@ class TestHookRegistration:
         pm = PluginManager()
         m = PluginManifest(name="kanban-enforcement", version="1.0.0",
                            source="bundled", kind="standalone")
-        ke._registered = False
-        ke.register_enforcement_hooks(PluginContext(manifest=m, manager=pm))
-        assert ke._registered is True
+        ctx = PluginContext(manifest=m, manager=pm)
+        ke.register_enforcement_hooks(ctx)
         for hook_name in ("pre_tool_call", "post_tool_call", "post_llm_call",
                           "on_session_start", "on_session_end"):
             assert hook_name in pm._hooks, f"{hook_name} should be registered"
@@ -780,11 +779,10 @@ class TestHookRegistration:
         pm = PluginManager()
         m = PluginManifest(name="kanban-enforcement", version="1.0.0",
                            source="bundled", kind="standalone")
-        ke._registered = False
-        ke.register_enforcement_hooks(PluginContext(manifest=m, manager=pm))
+        ctx = PluginContext(manifest=m, manager=pm)
+        ke.register_enforcement_hooks(ctx)
         pre = dict(pm._hooks)
-        ke.register_enforcement_hooks(PluginContext(manifest=m, manager=pm))
-        assert ke._registered is True
+        ke.register_enforcement_hooks(ctx)
         assert dict(pm._hooks) == pre, "no double-registration"
 
     def test_session_start_cleanup(self, enforcement_on):
