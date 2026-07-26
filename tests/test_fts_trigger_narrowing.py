@@ -32,6 +32,21 @@ class _NoTrigramConnection(sqlite3.Connection):
         return super().cursor(factory or _NoTrigramCursor)
 
 
+class _ExistingTableNoTrigramCursor(sqlite3.Cursor):
+    """Existing trigram catalog SQL parses, but tokenizer execution fails."""
+
+    def execute(self, sql, parameters=()):
+        normalized = " ".join(str(sql).lower().split())
+        if "temp._hermes_trigram_probe" in normalized:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
+
+class _ExistingTableNoTrigramConnection(sqlite3.Connection):
+    def cursor(self, factory=None):
+        return super().cursor(factory or _ExistingTableNoTrigramCursor)
+
+
 @pytest.fixture
 def db_path(tmp_path):
     return tmp_path / "state.db"
@@ -1468,6 +1483,370 @@ DROP TABLE IF EXISTS messages_fts;
         assert message_id > 0
     finally:
         database.close()
+
+
+def test_unindexed_modifier_cannot_spoof_current_fts_layout(db_path):
+    """PRAGMA-compatible columns with changed indexing semantics fail closed."""
+    from hermes_state import FTS_SQL, SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("unindexed", "test")
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TABLE messages_fts;
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    content,
+    tool_name UNINDEXED,
+    tool_calls,
+    content='messages',
+    content_rowid='id'
+);
+"""
+            + FTS_SQL
+        )
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+    database = SessionDB(db_path=db_path)
+    try:
+        assert database._fts_enabled is False
+        message_id = database.append_message(
+            "unindexed", "tool", content="", tool_name="requiredterm"
+        )
+        assert message_id > 0
+        with database._lock:
+            assert database._fts_trigger_count(database._conn.cursor()) == 0
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("legacy_layout", ["inline", "external"])
+def test_missing_legacy_trigram_table_is_rebuilt_even_with_dangling_triggers(
+    db_path, legacy_layout
+):
+    """A recreated legacy trigram table cannot be served empty."""
+    from hermes_state import (
+        LEGACY_EXTERNAL_FTS_SQL,
+        LEGACY_EXTERNAL_FTS_TRIGRAM_SQL,
+        LEGACY_FTS_SQL,
+        LEGACY_FTS_TRIGRAM_SQL,
+        SessionDB,
+    )
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("missing-legacy-trigram", "test")
+    seeded.append_message(
+        "missing-legacy-trigram", "user", content="historicaltrigramterm"
+    )
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+        )
+        if legacy_layout == "external":
+            ddl = LEGACY_EXTERNAL_FTS_SQL + "\n" + LEGACY_EXTERNAL_FTS_TRIGRAM_SQL
+            backfill = (
+                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');"
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                "VALUES('rebuild');"
+            )
+        else:
+            ddl = LEGACY_FTS_SQL + "\n" + LEGACY_FTS_TRIGRAM_SQL
+            backfill = (
+                "INSERT INTO messages_fts(rowid, content) "
+                "SELECT id, content FROM messages;"
+                "INSERT INTO messages_fts_trigram(rowid, content) "
+                "SELECT id, content FROM messages;"
+            )
+        conn.executescript(ddl + "\n" + backfill)
+        conn.execute("DROP TABLE messages_fts_trigram")
+        conn.commit()
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == legacy_layout
+
+    repaired = SessionDB(db_path=db_path)
+    try:
+        with repaired._lock:
+            hits = repaired._conn.execute(
+                "SELECT rowid FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'historicaltrigramterm'"
+            ).fetchall()
+            assert [row[0] for row in hits] == [1]
+    finally:
+        repaired.close()
+
+
+def test_ambiguous_present_tables_drop_every_fts_trigger_before_writes(db_path):
+    """Mixed storage semantics preserve tables but quarantine all writers."""
+    from hermes_state import (
+        LEGACY_EXTERNAL_FTS_TRIGRAM_SQL,
+        LEGACY_FTS_SQL,
+        SessionDB,
+    )
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("ambiguous-writes", "test")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+            + LEGACY_FTS_SQL
+            + "\n"
+            + LEGACY_EXTERNAL_FTS_TRIGRAM_SQL
+        )
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+    database = SessionDB(db_path=db_path)
+    try:
+        assert database._fts_enabled is False
+        message_id = database.append_message(
+            "ambiguous-writes", "user", content="write remains independent"
+        )
+        with database._lock:
+            database._conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+            database._conn.commit()
+            remaining = database._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'messages_fts%'"
+            ).fetchone()[0]
+            assert remaining == 0
+    finally:
+        database.close()
+
+
+def test_fts5_unavailable_drops_cjk_triggers_before_message_write(
+    db_path, monkeypatch
+):
+    """Whole-FTS failure quarantines CJK as well as standard/trigram surfaces."""
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("fts-disabled-cjk", "test")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+CREATE TRIGGER messages_fts_cjk_insert AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts_cjk(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER messages_fts_cjk_delete AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content)
+  VALUES ('delete', old.id, old.content);
+END;
+CREATE TRIGGER messages_fts_cjk_update AFTER UPDATE OF content ON messages BEGIN
+  INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content)
+  VALUES ('delete', old.id, old.content);
+  INSERT INTO messages_fts_cjk(rowid, content) VALUES (new.id, new.content);
+END;
+"""
+        )
+
+    monkeypatch.setattr(SessionDB, "_sqlite_supports_fts5", lambda self, cursor: False)
+    database = SessionDB(db_path=db_path)
+    try:
+        message_id = database.append_message(
+            "fts-disabled-cjk", "user", content="core write survives"
+        )
+        assert message_id > 0
+        with database._lock:
+            cjk_triggers = database._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'messages_fts_cjk_%'"
+            ).fetchone()[0]
+            assert cjk_triggers == 0
+    finally:
+        database.close()
+
+
+def test_missing_inline_standard_replaces_opposite_family_insert_delete_triggers(
+    db_path
+):
+    """Recreated inline storage never retains external special-delete bodies."""
+    from hermes_state import LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL, SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("opposite-family", "test")
+    seeded.append_message("opposite-family", "user", content="oldfamilyterm")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+            + LEGACY_FTS_SQL
+            + "\n"
+            + LEGACY_FTS_TRIGRAM_SQL
+        )
+        conn.execute("DROP TABLE messages_fts")
+        conn.executescript(
+            """
+DROP TRIGGER messages_fts_insert;
+DROP TRIGGER messages_fts_delete;
+CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content)
+  VALUES ('delete', old.id, old.content);
+END;
+"""
+        )
+        conn.commit()
+
+    repaired = SessionDB(db_path=db_path)
+    try:
+        with repaired._lock:
+            repaired._conn.execute(
+                "UPDATE messages SET content='newfamilyterm' WHERE id=1"
+            )
+            repaired._conn.commit()
+            old_hits = repaired._conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'oldfamilyterm'"
+            ).fetchall()
+            new_hits = repaired._conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'newfamilyterm'"
+            ).fetchall()
+            assert old_hits == []
+            assert [row[0] for row in new_hits] == [1]
+            repaired._conn.execute("DELETE FROM messages WHERE id=1")
+            repaired._conn.commit()
+            assert repaired._conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'newfamilyterm'"
+            ).fetchall() == []
+    finally:
+        repaired.close()
+
+
+def test_existing_trigram_table_uses_real_tokenizer_capability_probe(
+    db_path, monkeypatch
+):
+    """Catalog access cannot substitute for exercising tokenizer registration."""
+    import hermes_state
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("real-probe", "test")
+    seeded.append_message("real-probe", "user", content="existingtrigram")
+    seeded.close()
+    real_connect = sqlite3.connect
+
+    def connect_without_registered_trigram(*args, **kwargs):
+        kwargs["factory"] = _ExistingTableNoTrigramConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        hermes_state.sqlite3, "connect", connect_without_registered_trigram
+    )
+    incapable = SessionDB(db_path=db_path)
+    try:
+        assert incapable._trigram_available is False
+        message_id = incapable.append_message(
+            "real-probe", "user", content="writeafterprobe"
+        )
+        assert message_id > 1
+        with incapable._lock:
+            triggers = incapable._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchone()[0]
+            stale = incapable._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key='fts_trigram_stale'"
+            ).fetchone()
+            assert triggers == 0
+            assert stale is not None
+    finally:
+        incapable.close()
+
+
+def test_both_missing_with_current_view_replaces_surviving_legacy_triggers(
+    db_path
+):
+    """A proven current view may recover only after all old trigger bodies go."""
+    from hermes_state import LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL, SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("both-current-view", "test")
+    seeded.append_message("both-current-view", "user", content="oldviewterm")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+            + LEGACY_FTS_SQL
+            + "\n"
+            + LEGACY_FTS_TRIGRAM_SQL
+        )
+        conn.execute("DROP TABLE messages_fts")
+        conn.execute("DROP TABLE messages_fts_trigram")
+        conn.execute(
+            "CREATE VIEW messages_fts_trigram_src AS "
+            "SELECT id, role, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        conn.commit()
+
+    repaired = SessionDB(db_path=db_path)
+    try:
+        assert repaired._fts_enabled is True
+        with repaired._lock:
+            repaired._conn.execute(
+                "UPDATE messages SET content='newviewterm' WHERE id=1"
+            )
+            repaired._conn.commit()
+            for table in ("messages_fts", "messages_fts_trigram"):
+                assert repaired._conn.execute(
+                    f"SELECT rowid FROM {table} WHERE {table} MATCH 'oldviewterm'"
+                ).fetchall() == []
+                assert [
+                    row[0]
+                    for row in repaired._conn.execute(
+                        f"SELECT rowid FROM {table} WHERE {table} MATCH 'newviewterm'"
+                    ).fetchall()
+                ] == [1]
+    finally:
+        repaired.close()
 
 
 def test_cjk_schema_ensure_keeps_writer_out_until_triggers_exist(

@@ -2242,18 +2242,55 @@ class SessionDB:
                 return "ambiguous"
             arguments = tokens[args_start:args_end]
 
-            options = {}
-            for position in range(len(arguments) - 2):
-                tokens_at_position = arguments[position : position + 3]
-                if (
-                    tokens_at_position[0][0] == "value"
-                    and tokens_at_position[1][0] == "="
-                    and tokens_at_position[2][0] in ("value", "string")
-                ):
-                    key = tokens_at_position[0][1]
-                    if key in options:
+            # Split the FTS5 argument list at top-level commas and validate
+            # complete declarations. PRAGMA exposes only resulting names, so a
+            # declaration such as ``tool_name UNINDEXED`` otherwise spoofs the
+            # canonical column list while silently changing search semantics.
+            segments = []
+            segment = []
+            nested = 0
+            for token in arguments:
+                if token[0] == "(":
+                    nested += 1
+                elif token[0] == ")":
+                    nested -= 1
+                    if nested < 0:
                         return "ambiguous"
-                    options[key] = tokens_at_position[2][1]
+                if token[0] == "," and nested == 0:
+                    if not segment:
+                        return "ambiguous"
+                    segments.append(segment)
+                    segment = []
+                else:
+                    segment.append(token)
+            if nested != 0 or not segment:
+                return "ambiguous"
+            segments.append(segment)
+
+            expected_columns = (
+                ["content", "tool_name", "tool_calls"]
+                if columns == ["content", "tool_name", "tool_calls"]
+                else ["content"] if columns == ["content"] else None
+            )
+            if expected_columns is None or len(segments) < len(expected_columns):
+                return "ambiguous"
+            for declaration, expected_name in zip(segments, expected_columns):
+                if declaration != [("value", expected_name)]:
+                    return "ambiguous"
+
+            options = {}
+            for option in segments[len(expected_columns) :]:
+                if (
+                    len(option) != 3
+                    or option[0][0] != "value"
+                    or option[1][0] != "="
+                    or option[2][0] not in ("value", "string")
+                ):
+                    return "ambiguous"
+                key = option[0][1]
+                if key in options:
+                    return "ambiguous"
+                options[key] = option[2][1]
             if columns == ["content", "tool_name", "tool_calls"]:
                 expected_options = {
                     "content": (
@@ -2410,6 +2447,32 @@ class SessionDB:
             self._warn_fts5_unavailable(exc)
             return False
 
+    def _sqlite_supports_trigram(self, cursor: sqlite3.Cursor) -> bool:
+        """Exercise tokenizer registration independently of existing tables."""
+        probe = "_hermes_trigram_probe"
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS temp.{probe}")
+            cursor.execute(
+                f"CREATE VIRTUAL TABLE temp.{probe} "
+                "USING fts5(x, tokenize='trigram')"
+            )
+            cursor.execute(f"INSERT INTO temp.{probe}(x) VALUES ('capability probe')")
+            cursor.execute(
+                f"SELECT rowid FROM temp.{probe} "
+                f"WHERE {probe} MATCH 'capability'"
+            ).fetchone()
+            cursor.execute(f"DROP TABLE temp.{probe}")
+            return True
+        except sqlite3.OperationalError as exc:
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS temp.{probe}")
+            except sqlite3.OperationalError:
+                pass
+            if not self._is_trigram_unavailable_error(exc):
+                raise
+            self._warn_trigram_unavailable(exc)
+            return False
+
     def _ensure_fts_cjk_schema(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
 
@@ -2556,7 +2619,7 @@ class SessionDB:
 
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
-        for trigger in _FTS_TRIGGERS:
+        for trigger in _FTS_TRIGGERS + _FTS_CJK_TRIGGERS:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
@@ -3947,8 +4010,11 @@ class SessionDB:
                         cursor, "messages_fts_trigram"
                     )
                     if _fts_trigram_exists is False:
-                        if self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        if (
+                            self._sqlite_supports_trigram(cursor)
+                            and self._ensure_fts_schema(
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                            )
                         ):
                             cursor.execute(
                                 "INSERT INTO messages_fts_trigram(rowid, content) "
@@ -4274,18 +4340,16 @@ class SessionDB:
                 )
                 self._fts_enabled = False
                 self._trigram_available = False
-                # Preserve ambiguous live layouts for offline inspection, but
-                # remove maintenance triggers whose target table is absent so
-                # canonical message writes cannot fail.
-                if self._fts_table_probe(cursor, "messages_fts") is False:
-                    for trigger in _FTS_TRIGGERS[:3]:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-                if self._fts_table_probe(cursor, "messages_fts_trigram") is False:
-                    for trigger in _FTS_TRIGRAM_TRIGGERS:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                # No maintenance trigger is safe when table storage semantics
+                # are unproven. Preserve tables for inspection, but quarantine
+                # every FTS surface so canonical message writes remain safe.
+                self._drop_fts_triggers(cursor)
             elif legacy_layout is not None:
                 base_table_missing = (
                     self._fts_table_probe(cursor, "messages_fts") is False
+                )
+                trigram_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts_trigram") is False
                 )
                 if legacy_layout == "external":
                     base_ddl = LEGACY_EXTERNAL_FTS_SQL
@@ -4293,6 +4357,16 @@ class SessionDB:
                 else:
                     base_ddl = LEGACY_FTS_SQL
                     trigram_ddl = LEGACY_FTS_TRIGRAM_SQL
+
+                # A surviving name does not prove compatible INSERT/DELETE
+                # semantics. When recreating a table, replace its complete
+                # trigger family from the authoritatively proven layout.
+                if base_table_missing:
+                    for trigger in _FTS_TRIGGERS[:3]:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                if trigram_table_missing:
+                    for trigger in _FTS_TRIGRAM_TRIGGERS:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
 
                 self._migrate_broad_fts_update_triggers(
                     cursor,
@@ -4315,14 +4389,23 @@ class SessionDB:
                     cursor, "messages_fts", base_ddl
                 )
                 if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", trigram_ddl
+                    trigram_capable = self._sqlite_supports_trigram(cursor)
+                    trigram_enabled = (
+                        self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", trigram_ddl
+                        )
+                        if trigram_capable
+                        else False
                     )
                     self._trigram_available = trigram_enabled
                     needs_base_rebuild = (
                         base_table_missing or base_triggers_need_repair
                     )
-                    needs_full_rebuild = triggers_need_repair or trigram_stale
+                    needs_full_rebuild = (
+                        trigram_table_missing
+                        or triggers_need_repair
+                        or trigram_stale
+                    )
                     if not trigram_enabled:
                         self._mark_trigram_stale(cursor)
                     if needs_base_rebuild or (trigram_enabled and needs_full_rebuild):
@@ -4350,6 +4433,16 @@ class SessionDB:
                 migration_ddl = FTS_SQL + "\n" + FTS_TRIGRAM_SQL
                 if self._fts_cjk_loaded:
                     migration_ddl += "\n" + FTS_CJK_TRIGGER_SQL
+                # Missing current tables are data-loss repairs, not trigger
+                # narrowing. Replace the complete target trigger family before
+                # recreating storage so opposite-layout bodies cannot survive
+                # CREATE TRIGGER IF NOT EXISTS.
+                if base_table_missing:
+                    for trigger in _FTS_TRIGGERS[:3]:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                if trigram_table_missing:
+                    for trigger in _FTS_TRIGRAM_TRIGGERS:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                 self._migrate_broad_fts_update_triggers(
                     cursor,
                     migration_ddl,
@@ -4375,8 +4468,13 @@ class SessionDB:
                 # relative to the main FTS table; if it cannot be created,
                 # CJK search falls back to LIKE.
                 if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    trigram_capable = self._sqlite_supports_trigram(cursor)
+                    trigram_enabled = (
+                        self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        )
+                        if trigram_capable
+                        else False
                     )
                     self._trigram_available = trigram_enabled
                     if not trigram_enabled:
