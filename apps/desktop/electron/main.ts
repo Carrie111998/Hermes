@@ -159,7 +159,7 @@ import {
   redactSecrets,
   SshConnection
 } from './ssh-connection'
-import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
+import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight, shouldSuppressWcoOnWsl } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
@@ -744,10 +744,10 @@ function getTitleBarOverlayOptions() {
     return { height: macTitleBarOverlayHeight({ darwinMajor: DARWIN_MAJOR, titlebarHeight: TITLEBAR_HEIGHT }) }
   }
 
-  // WSLg paints WCO via the RDP host's own min/max/close, so requesting
-  // an Electron overlay there just leaves a dead gap. Plain Linux (KDE,
-  // GNOME) can use the native overlay — let it through.
-  if (!IS_WINDOWS && IS_WSL) {
+  // WSLg: the overlay is requested by default (#57614 — common WSLg builds
+  // paint NO RDP-host controls, leaving a dead frameless window).
+  // HERMES_DESKTOP_WSL_NO_WCO=1 opts back out. See shouldSuppressWcoOnWsl.
+  if (shouldSuppressWcoOnWsl({ isWindows: IS_WINDOWS, isWsl: IS_WSL, wslNoWcoEnv: process.env.HERMES_DESKTOP_WSL_NO_WCO })) {
     return false
   }
 
