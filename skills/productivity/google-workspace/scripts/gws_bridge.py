@@ -15,7 +15,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from _hermes_home import get_hermes_home
+from _hermes_home import atomic_write_json, get_hermes_home  # type: ignore[attr-defined]
 
 
 def get_token_path() -> Path:
@@ -68,8 +68,8 @@ def refresh_token(token_data: dict) -> dict:
         tz=timezone.utc,
     ).isoformat()
 
-    get_token_path().write_text(
-        json.dumps(_normalize_authorized_user_payload(token_data), indent=2), encoding="utf-8"
+    atomic_write_json(
+        get_token_path(), _normalize_authorized_user_payload(token_data)
     )
     return token_data
 
