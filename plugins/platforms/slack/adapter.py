@@ -1646,6 +1646,68 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         except Exception as e:
             return SendResult(success=False, error=str(e))
+    async def _post_slash_interactive_ephemeral(
+        self,
+        chat_id: str,
+        ctx: Dict[str, Any],
+        content: str,
+    ) -> "SendResult":
+        """Post a slash reply with one usable ephemeral interactive control."""
+        user_id = ctx.get("user_id", "")
+        interactive = parse_interactive_reply(content)
+        if not user_id or interactive is None:
+            return SendResult(success=False, error="interactive slash context unavailable")
+
+        visible_content = interactive.visible_content or "Interactive reply options"
+        formatted = self.format_message(visible_content)
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH) or [formatted]
+        client = self._get_client(chat_id)
+        prepared = None
+        try:
+            for chunk in chunks:
+                result = await client.chat_postEphemeral(
+                    channel=chat_id,
+                    user=user_id,
+                    text=chunk,
+                )
+                if not (isinstance(result, dict) and result.get("ok")):
+                    error = result.get("error", "unknown_error") if isinstance(result, dict) else "unexpected_response"
+                    return SendResult(success=False, error=f"chat.postEphemeral failed: {error}")
+
+            prepared = self._interactive_reply_store.create_card(
+                chat_id, None, interactive.buttons
+            )
+            control_result = await client.chat_postEphemeral(
+                channel=chat_id,
+                user=user_id,
+                text="Interactive reply options",
+                blocks=append_actions_block(
+                    [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "Interactive reply options",
+                            },
+                        }
+                    ],
+                    prepared,
+                ),
+            )
+            if not (isinstance(control_result, dict) and control_result.get("ok")):
+                error = control_result.get("error", "unknown_error") if isinstance(control_result, dict) else "unexpected_response"
+                return SendResult(success=False, error=f"chat.postEphemeral failed: {error}")
+            message_ts = control_result.get("message_ts") or control_result.get("ts")
+            if not message_ts:
+                return SendResult(success=False, error="chat.postEphemeral returned no message timestamp")
+            self._interactive_reply_store.bind_message(prepared.card_id, message_ts)
+            prepared = None
+            return SendResult(success=True, message_id=message_ts)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+        finally:
+            if prepared is not None:
+                self._interactive_reply_store.discard(prepared.card_id)
 
     def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
         """Nudge existing installs to reinstall when group-DM scopes are absent.
@@ -2472,26 +2534,21 @@ class SlackAdapter(BasePlatformAdapter):
             # the actual command reply ephemerally instead of posting publicly.
             slash_ctx = self._pop_slash_context(chat_id, team_id)
             if slash_ctx:
-                ephemeral_result = await self._send_slash_ephemeral(
-                    slash_ctx,
-                    content,
-                )
+                if parse_interactive_reply(content) is not None:
+                    ephemeral_result = await self._post_slash_interactive_ephemeral(
+                        chat_id, slash_ctx, content
+                    )
+                else:
+                    ephemeral_result = await self._send_slash_ephemeral(
+                        slash_ctx,
+                        content,
+                    )
                 if ephemeral_result.success:
-                    # Ephemeral replies do not count as thread replies, so
-                    # Slack never auto-clears the Assistant status for them.
-                    # Clear it explicitly or a command run inside an
-                    # assistant thread leaves "is thinking..." forever.
                     await self._clear_thread_status_quietly(chat_id, metadata)
                     return ephemeral_result
-                # response_url delivery failed (#19688): fall back to
-                # chat.postEphemeral — an independent API path that keeps
-                # the reply private ("Only visible to you"). We do NOT fall
-                # back to a public channel post: a slash reply the user
-                # expects to be ephemeral must never surface to the whole
-                # channel just because a delivery path failed.
                 logger.warning(
-                    "[Slack] response_url slash reply failed (%s); retrying "
-                    "via chat.postEphemeral",
+                    "[Slack] Interactive slash reply failed (%s); retrying "
+                    "with literal ephemeral content",
                     ephemeral_result.error,
                 )
                 fallback_result = await self._post_ephemeral_fallback(
@@ -2502,14 +2559,10 @@ class SlackAdapter(BasePlatformAdapter):
                 if fallback_result.success:
                     await self._clear_thread_status_quietly(chat_id, metadata)
                     return fallback_result
-                # Both ephemeral paths failed — surface the failure instead
-                # of leaking the reply publicly. The user still has the
-                # "Running /cmd…" ack; the error is logged and returned so
-                # the gateway can react (retry surfacing happens upstream).
                 logger.error(
                     "[Slack] Ephemeral slash reply failed on both "
-                    "response_url and chat.postEphemeral (%s); dropping "
-                    "rather than posting publicly",
+                    "interactive and fallback paths (%s); dropping rather "
+                    "than posting publicly",
                     fallback_result.error,
                 )
                 return fallback_result
@@ -2609,6 +2662,42 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                 else:
                     self._interactive_reply_store.discard(prepared_interactive.card_id)
+                prepared_interactive = None
+
+            if interactive and len(chunks) > 1:
+                prepared_interactive = self._interactive_reply_store.create_card(
+                    chat_id, thread_ts, interactive.buttons
+                )
+                control_kwargs = {
+                    "channel": chat_id,
+                    "text": "Interactive reply options",
+                    "mrkdwn": True,
+                    "blocks": append_actions_block(
+                        [
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": "Interactive reply options",
+                                },
+                            }
+                        ],
+                        prepared_interactive,
+                    ),
+                }
+                if thread_ts:
+                    control_kwargs["thread_ts"] = thread_ts
+                last_result = await self._get_client(
+                    chat_id, team_id=team_id
+                ).chat_postMessage(**control_kwargs)
+                sent_ts = last_result.get("ts") if last_result else None
+                if sent_ts:
+                    self._interactive_reply_store.bind_message(
+                        prepared_interactive.card_id, sent_ts
+                    )
+                else:
+                    self._interactive_reply_store.discard(prepared_interactive.card_id)
+                prepared_interactive = None
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -8735,6 +8824,7 @@ async def _standalone_send(
         client = _AsyncWebClient(token=token)
         _apply_slack_proxy(client, resolve_proxy_url())
         last_message_id = None
+        media_interactive_posted = False
 
         # Caption mode: skip a separate text post; comment rides the upload.
         text_to_send = "" if formatted_caption else (formatted or "")
@@ -8744,18 +8834,46 @@ async def _standalone_send(
                 "text": text_to_send,
                 "mrkdwn": True,
             }
+            interactive_store = None
+            prepared_interactive = None
+            if interactive:
+                interactive_store = InteractiveReplyStore()
+                prepared_interactive = interactive_store.create_card(
+                    chat_id, thread_id, interactive.buttons
+                )
+                post_kwargs["blocks"] = append_actions_block(
+                    [
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": text_to_send},
+                        }
+                    ],
+                    prepared_interactive,
+                )
             if thread_id:
                 post_kwargs["thread_ts"] = thread_id
             try:
                 post_resp = await client.chat_postMessage(**post_kwargs)
                 if isinstance(post_resp, dict) and not post_resp.get("ok", True):
+                    if prepared_interactive is not None:
+                        interactive_store.discard(prepared_interactive.card_id)
                     return {
                         "error": f"Slack API error: {post_resp.get('error', 'unknown')}"
                     }
                 last_message_id = (
                     post_resp.get("ts") if isinstance(post_resp, dict) else None
                 )
+                if prepared_interactive is not None:
+                    if last_message_id:
+                        interactive_store.bind_message(
+                            prepared_interactive.card_id, last_message_id
+                        )
+                        media_interactive_posted = True
+                    else:
+                        interactive_store.discard(prepared_interactive.card_id)
             except Exception as e:
+                if prepared_interactive is not None:
+                    interactive_store.discard(prepared_interactive.card_id)
                 return {"error": f"Slack send failed: {e}"}
 
         caption_pending = bool(formatted_caption)
@@ -8805,6 +8923,55 @@ async def _standalone_send(
                 warning = f"Failed to send media {media_path}: {e}"
                 logger.error("[Slack] %s", warning, exc_info=True)
                 warnings.append(warning)
+
+        if interactive and not media_interactive_posted and uploaded_any:
+            interactive_store = InteractiveReplyStore()
+            prepared_interactive = interactive_store.create_card(
+                chat_id, thread_id, interactive.buttons
+            )
+            control_kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": "Interactive reply options",
+                "mrkdwn": True,
+                "blocks": append_actions_block(
+                    [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "Interactive reply options",
+                            },
+                        }
+                    ],
+                    prepared_interactive,
+                ),
+            }
+            if thread_id:
+                control_kwargs["thread_ts"] = thread_id
+            try:
+                control_result = await client.chat_postMessage(**control_kwargs)
+                if not (
+                    isinstance(control_result, dict)
+                    and control_result.get("ok", True)
+                ):
+                    error = (
+                        control_result.get("error", "unknown")
+                        if isinstance(control_result, dict)
+                        else "unexpected_response"
+                    )
+                    return {"error": f"Slack API error: {error}"}
+                control_ts = control_result.get("ts")
+                if not control_ts:
+                    return {"error": "Slack interactive control returned no timestamp"}
+                interactive_store.bind_message(prepared_interactive.card_id, control_ts)
+                last_message_id = control_ts
+                media_interactive_posted = True
+                prepared_interactive = None
+            except Exception as e:
+                return {"error": f"Slack send failed: {e}"}
+            finally:
+                if prepared_interactive is not None:
+                    interactive_store.discard(prepared_interactive.card_id)
 
         if last_message_id is None and not uploaded_any and not text_to_send.strip():
             error = "No deliverable text or media remained after processing"

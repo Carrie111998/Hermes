@@ -127,3 +127,36 @@ async def test_adapter_send_posts_buttons_without_literal_directive(tmp_path, mo
     assert posted["text"]
     assert posted["blocks"][-1]["type"] == "actions"
     assert posted["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"
+
+@pytest.mark.asyncio
+async def test_adapter_send_posts_slash_reply_buttons_ephemerally(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    client.chat_postEphemeral = AsyncMock(
+        return_value={"ok": True, "message_ts": "222.333"}
+    )
+    adapter._pop_slash_context = MagicMock(return_value={"user_id": "U1"})
+    adapter._clear_thread_status_quietly = AsyncMock()
+
+    result = await adapter.send("C1", "Lead ready\n[[slack_buttons: Enroll:enroll]]")
+
+    assert result.success is True
+    posted = client.chat_postEphemeral.await_args.kwargs
+    assert "[[slack_buttons:" not in posted["text"]
+    assert posted["blocks"][-1]["type"] == "actions"
+    assert posted["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_posts_one_button_control_after_long_reply(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    content = "x" * (adapter.MAX_MESSAGE_LENGTH + 1)
+
+    await adapter.send("C1", content + "\n[[slack_buttons: Enroll:enroll]]")
+
+    assert client.chat_postMessage.await_count >= 2
+    control = client.chat_postMessage.await_args.kwargs
+    assert control["text"] == "Interactive reply options"
+    assert control["blocks"][-1]["type"] == "actions"
+    assert control["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"

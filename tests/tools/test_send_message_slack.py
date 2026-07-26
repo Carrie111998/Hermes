@@ -181,3 +181,44 @@ def test_standalone_send_posts_the_same_action_block(
     assert payload["text"]
     assert payload["blocks"][-1]["type"] == "actions"
     assert payload["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"
+
+class _MediaClient:
+    def __init__(self):
+        self.post_calls = []
+
+    async def chat_postMessage(self, **kwargs):
+        self.post_calls.append(kwargs)
+        return {"ok": True, "ts": "control-ts"}
+
+    async def files_upload_v2(self, **kwargs):
+        return {"ok": True, "file": {"timestamp": "upload-ts"}}
+
+
+def test_standalone_media_send_posts_the_same_action_block(
+    monkeypatch, _standalone_send, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    media_path = tmp_path / "lead.txt"
+    media_path.write_text("lead", encoding="utf-8")
+    client = _MediaClient()
+    monkeypatch.setattr(
+        sys.modules["slack_sdk.web.async_client"],
+        "AsyncWebClient",
+        lambda **kwargs: client,
+    )
+
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={})
+    result = asyncio.run(
+        _standalone_send(
+            pconfig,
+            "C123",
+            "Lead ready\n[[slack_buttons: Enroll:enroll]]",
+            media_files=[(str(media_path), False)],
+        )
+    )
+
+    assert result["success"] is True
+    posted = client.post_calls[0]
+    assert "[[slack_buttons:" not in posted["text"]
+    assert posted["blocks"][-1]["type"] == "actions"
+    assert posted["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"
