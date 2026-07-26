@@ -14,6 +14,7 @@ import { MOCK_REPLY } from './mock-server'
 
 const ACTIVE_PROMPT = 'E2E_QUEUE_TURN_BOUNDARY_ACTIVE'
 const QUEUED_PROMPT = 'E2E_QUEUE_TURN_BOUNDARY_QUEUED'
+const STEER_PROMPT = 'E2E_STEER_TURN_BOUNDARY_CORRECTION'
 
 async function send(page: Page, text: string): Promise<void> {
   const composer = page.locator('[contenteditable="true"]').first()
@@ -21,6 +22,43 @@ async function send(page: Page, text: string): Promise<void> {
   await composer.click()
   await composer.type(text, { delay: 5 })
   await page.keyboard.press('Enter')
+}
+
+async function steer(page: Page, text: string): Promise<void> {
+  const composer = page.locator('[contenteditable="true"]').first()
+
+  await composer.click()
+  await composer.type(text, { delay: 5 })
+  await page.keyboard.press('Enter')
+}
+
+async function queue(page: Page, text: string): Promise<void> {
+  const composer = page.locator('[contenteditable="true"]').first()
+
+  await composer.click()
+  await composer.type(text, { delay: 5 })
+  await page.keyboard.press('Control+Enter')
+}
+
+async function transcriptMessageOrder(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
+    if (!viewport) return []
+
+    return Array.from(viewport.querySelectorAll<HTMLElement>('[data-role="user"], [data-role="assistant"]'))
+      .map(message => message.textContent?.trim() ?? '')
+      .filter(Boolean)
+  })
+}
+
+function steerTurnOrder(messages: string[]): string[] {
+  return messages.flatMap(message => {
+    if (message.includes(ACTIVE_PROMPT)) return [ACTIVE_PROMPT]
+    if (message.includes(STEER_PROMPT)) return [STEER_PROMPT]
+    if (message.includes(MOCK_REPLY)) return [MOCK_REPLY]
+
+    return []
+  })
 }
 
 test.describe('queued prompt turn boundary', () => {
@@ -40,15 +78,10 @@ test.describe('queued prompt turn boundary', () => {
 
   test('submits a queued prompt only after the active turn completes', async () => {
     const { mock, page } = fixture!
-    const composer = page.locator('[contenteditable="true"]').first()
-    const queue = page.locator('[data-slot="composer-root"] button[aria-label="Queue message"]')
 
     await send(page, ACTIVE_PROMPT)
     await mock.waitForHeldStream()
-
-    await composer.click()
-    await composer.type(QUEUED_PROMPT, { delay: 5 })
-    await queue.click()
+    await queue(page, QUEUED_PROMPT)
     await expect(page.getByText('1 Queued')).toBeVisible()
 
     // The mock keeps the active SSE stream open, so a queued prompt has no
@@ -65,5 +98,22 @@ test.describe('queued prompt turn boundary', () => {
       { timeout: 60_000 }
     )
     await expect.poll(() => mock.receivedPrompts.filter(prompt => prompt === QUEUED_PROMPT)).toHaveLength(1)
+  })
+
+  test('places a steer prompt before the reply it redirects', async () => {
+    const { mock, page } = fixture!
+
+    await send(page, ACTIVE_PROMPT)
+    await mock.waitForHeldStream()
+    await steer(page, STEER_PROMPT)
+    mock.releaseHeldStream()
+
+    await page.waitForFunction(
+      expected => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
+      MOCK_REPLY,
+      { timeout: 60_000 }
+    )
+
+    expect(steerTurnOrder(await transcriptMessageOrder(page))).toEqual([ACTIVE_PROMPT, STEER_PROMPT, MOCK_REPLY])
   })
 })
