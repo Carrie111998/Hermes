@@ -3601,14 +3601,16 @@ def _save_custom_provider(
 ):
     """Save a custom endpoint to custom_providers in config.yaml.
 
-    Deduplicates by *name* — if an entry with the same display name already
-    exists, updates the model name, context_length, and api_mode but doesn't
-    add a duplicate entry.  Two providers sharing a base URL with *different*
-    names are treated as separate entries (#45481).
+    Deduplicates by *canonical slug* (custom:<normalized-name>) — if an entry
+    with the same canonical identity already exists, updates the model name,
+    context_length, and api_mode but doesn't add a duplicate entry. Two providers
+    sharing a base URL with *different* canonical identities are treated as
+    separate entries (#45481).
 
     Uses *name* when provided, otherwise auto-generates from the URL.
     """
     from hermes_cli.config import load_config, save_config
+    from hermes_cli.providers import custom_provider_slug
 
     cfg = load_config()
     providers = cfg.get("custom_providers") or []
@@ -3618,6 +3620,9 @@ def _save_custom_provider(
     # Use provided name or auto-generate from URL
     if not name:
         name = _auto_provider_name(base_url)
+
+    # Canonical identity used by the picker/resolver
+    canonical_slug = custom_provider_slug(name)
 
     def _update_entry(entry: dict) -> bool:
         """Apply model/context_length/api_mode updates to an existing entry.
@@ -3651,10 +3656,11 @@ def _save_custom_provider(
             changed = True
         return changed
 
-    # Deduplicate by name (#45481: matching only on base_url caused silent
-    # overwrites when two entries shared a URL but had different names).
+    # Deduplicate by canonical slug (#45533: matching only on raw name caused
+    # silent overwrites when two entries had names like "Foo Bar" and "foo-bar"
+    # which are distinct display names but produce the same picker slug).
     for entry in providers:
-        if isinstance(entry, dict) and entry.get("name") == name:
+        if isinstance(entry, dict) and custom_provider_slug(entry.get("name", "")) == canonical_slug:
             changed = _update_entry(entry)
             if changed:
                 cfg["custom_providers"] = providers
