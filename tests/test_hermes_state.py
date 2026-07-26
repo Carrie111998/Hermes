@@ -4649,6 +4649,53 @@ class TestListSessionsRich:
         # No messages, so last_active falls back to started_at
         assert sessions[0]["last_active"] == sessions[0]["started_at"]
 
+    def test_last_active_prefers_session_activity_heartbeat(self, db):
+        """Mid-turn agent heartbeats must advance last_active without new messages (#72016)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "hello")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp=? WHERE session_id=? AND role=?",
+                (1_700_000_000.0, "s1", "user"),
+            )
+            db._conn.commit()
+
+        before = db.list_sessions_rich()[0]["last_active"]
+        heartbeat = 1_700_000_500.0
+        db.touch_session_activity("s1", heartbeat)
+        after = db.list_sessions_rich()[0]["last_active"]
+        assert after == heartbeat
+        assert after > before
+
+        row = db.get_session("s1")
+        assert row["last_activity_at"] == heartbeat
+
+        # Never move last_activity_at backwards.
+        db.touch_session_activity("s1", heartbeat - 100)
+        assert db.get_session("s1")["last_activity_at"] == heartbeat
+
+    def test_list_gateway_sessions_last_active_uses_activity_heartbeat(self, db):
+        db.create_session(
+            "gw-1",
+            "telegram",
+            session_key="agent:main:telegram:dm:c1",
+            chat_id="c1",
+            chat_type="dm",
+        )
+        db.append_message("gw-1", "user", "ping")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp=? WHERE session_id=?",
+                (1_700_000_000.0, "gw-1"),
+            )
+            db._conn.commit()
+
+        heartbeat = 1_700_000_900.0
+        db.touch_session_activity("gw-1", heartbeat)
+        rows = db.list_gateway_sessions(active_only=True)
+        assert len(rows) == 1
+        assert rows[0]["last_active"] == heartbeat
+
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
         db.create_session("old", "cli")

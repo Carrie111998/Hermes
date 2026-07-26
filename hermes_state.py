@@ -212,6 +212,23 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
+def _sql_session_last_active(alias: str = "s") -> str:
+    """SQL expression for session recency used by list/status surfaces.
+
+    Preference order:
+      1. ``last_activity_at`` — mid-turn agent heartbeat (API/tool/compaction)
+      2. latest message timestamp
+      3. ``started_at``
+    """
+    return (
+        f"COALESCE("
+        f"{alias}.last_activity_at, "
+        f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
+        f"WHERE _act_m.session_id = {alias}.id), "
+        f"{alias}.started_at)"
+    )
+
+
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
@@ -1164,6 +1181,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    last_activity_at REAL,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -3984,13 +4002,9 @@ class SessionDB:
         filters on ``source``; ``active_only`` restricts to sessions that
         have not ended.
         """
-        query = """
+        query = f"""
             SELECT sessions.*,
-                   COALESCE(
-                       (SELECT MAX(m.timestamp) FROM messages m
-                        WHERE m.session_id = sessions.id),
-                       sessions.started_at
-                   ) AS last_active
+                   {_sql_session_last_active("sessions")} AS last_active
             FROM sessions
             WHERE session_key IS NOT NULL
               AND started_at = (
@@ -4810,6 +4824,33 @@ class SessionDB:
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def touch_session_activity(
+        self,
+        session_id: str,
+        ts: Optional[float] = None,
+    ) -> None:
+        """Stamp ``sessions.last_activity_at`` for mid-turn agent liveness.
+
+        Called (rate-limited) from ``AIAgent._touch_activity`` so gateway/CLI
+        session listings and ``hermes status`` observe API/tool/compaction
+        progress even when no new message row has been written yet (#72016).
+
+        Never moves the timestamp backwards. No-ops when ``session_id`` is
+        empty or the row does not exist.
+        """
+        if not session_id:
+            return
+        when = float(ts if ts is not None else time.time())
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET last_activity_at = ? "
+                "WHERE id = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
+                (when, session_id, when),
+            )
+
+        self._execute_write(_do)
 
     def update_session_meta(
         self,
@@ -5774,14 +5815,14 @@ class SessionDB:
         for _ in range(100):
             with self._lock:
                 cursor = self._conn.execute(
-                    """
+                    f"""
                     SELECT child.id
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY
                       CASE
@@ -5789,10 +5830,7 @@ class SessionDB:
                         WHEN child.ended_at IS NULL THEN 1
                         ELSE 2
                       END,
-                      COALESCE(
-                        (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = child.id),
-                        child.started_at
-                      ) DESC,
+                      {_sql_session_last_active("child")} DESC,
                       child.started_at DESC,
                       child.id DESC
                     LIMIT 1
@@ -5878,7 +5916,8 @@ class SessionDB:
 
         Returns dicts with keys: id, source, model, title, started_at, ended_at,
         message_count, preview (first 60 chars of first user message),
-        last_active (timestamp of last message).
+        last_active (timestamp of last agent activity heartbeat, else last
+        message, else started_at).
 
         Uses a single query with correlated subqueries instead of N+2 queries.
 
@@ -6047,6 +6086,7 @@ class SessionDB:
                     SELECT
                         root_id,
                         MAX(COALESCE(
+                            (SELECT last_activity_at FROM sessions ss WHERE ss.id = cur_id),
                             (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = cur_id),
                             (SELECT started_at FROM sessions ss WHERE ss.id = cur_id)
                         )) AS effective_last_active
@@ -6061,10 +6101,7 @@ class SessionDB:
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                        s.started_at
-                    ) AS last_active,
+                    {_sql_session_last_active("s")} AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
@@ -6086,10 +6123,7 @@ class SessionDB:
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                        s.started_at
-                    ) AS last_active
+                    {_sql_session_last_active("s")} AS last_active
                 FROM sessions s
                 {where_sql}
                 ORDER BY s.started_at DESC
@@ -6184,10 +6218,7 @@ class SessionDB:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
-                COALESCE(
-                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                    s.started_at
-                ) AS last_active
+                {_sql_session_last_active("s")} AS last_active
             FROM sessions s
             WHERE s.source = 'cron' AND s.id >= ? AND s.id < ?
             ORDER BY s.started_at DESC, s.id DESC
@@ -6222,10 +6253,7 @@ class SessionDB:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
-                COALESCE(
-                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                    s.started_at
-                ) AS last_active
+                {_sql_session_last_active("s")} AS last_active
             FROM sessions s
             WHERE s.id = ?
         """
@@ -8664,12 +8692,8 @@ class SessionDB:
         ordered by most-recently-used first.
         """
         select_with_last_active = (
-            "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
+            f"SELECT s.*, {_sql_session_last_active('s')} AS last_active "
             "FROM sessions s "
-            "LEFT JOIN ("
-            "SELECT session_id, MAX(timestamp) AS last_active "
-            "FROM messages GROUP BY session_id"
-            ") m ON m.session_id = s.id "
         )
         with self._lock:
             if source:
@@ -9821,11 +9845,7 @@ class SessionDB:
                 WHERE s.archived = 0
                   AND COALESCE(s.end_reason, '') <> 'compression'
                   {pin_clause}
-                  AND COALESCE(
-                        (SELECT MAX(m.timestamp) FROM messages m
-                         WHERE m.session_id = s.id),
-                        s.started_at
-                      ) < ?
+                  AND {_sql_session_last_active("s")} < ?
                 ORDER BY s.started_at ASC
                 """,
                 (cutoff,),
@@ -10401,10 +10421,7 @@ class SessionDB:
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
-                        COALESCE(
-                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                            s.started_at
-                        ) AS last_active
+                        {_sql_session_last_active("s")} AS last_active
                     FROM sessions s
                     WHERE s.source = 'telegram'
                       AND s.user_id = ?
@@ -10430,10 +10447,7 @@ class SessionDB:
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
-                        COALESCE(
-                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                            s.started_at
-                        ) AS last_active
+                        {_sql_session_last_active("s")} AS last_active
                     FROM sessions s
                     WHERE s.source = 'telegram'
                       AND s.user_id = ?

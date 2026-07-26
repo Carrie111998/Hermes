@@ -3438,6 +3438,11 @@ class AIAgent:
         so the dispatcher watchdog doesn't reclaim an actively-running
         worker as stale (#31752). Bridge is rate-limited (60s) and
         best-effort — it never raises into the agent loop.
+
+        Separately, rate-limits a durable ``sessions.last_activity_at``
+        stamp via SessionDB so ``hermes sessions list`` / ``hermes status``
+        observe mid-turn API/tool/compaction progress across process
+        boundaries (#72016).
         """
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
@@ -3451,7 +3456,31 @@ class AIAgent:
                 # covers import-time failures (kanban_tools unavailable,
                 # etc.) on niche deployment surfaces.
                 pass
+        self._persist_session_activity_if_due()
 
+    def _persist_session_activity_if_due(self) -> None:
+        """Best-effort durable activity heartbeat for SessionDB listings.
+
+        Rate-limited to one write per 60s per agent (same cadence as the
+        kanban auto-heartbeat). Fail-open: never raises into the agent loop.
+        """
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        if not session_id or session_db is None:
+            return
+        touch = getattr(session_db, "touch_session_activity", None)
+        if not callable(touch):
+            return
+        now_mono = time.monotonic()
+        last_mono = getattr(self, "_session_activity_last_persist_mono", 0.0)
+        if (now_mono - last_mono) < 60.0:
+            return
+        self._session_activity_last_persist_mono = now_mono
+        try:
+            touch(session_id, getattr(self, "_last_activity_ts", None))
+        except Exception:
+            # Never let durable heartbeat I/O break the agent loop.
+            pass
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
 
