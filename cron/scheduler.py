@@ -3162,12 +3162,18 @@ def run_job(
                 else str(delivery_target["thread_id"])
             )
 
-        # Model resolution precedence: per-job override > HERMES_MODEL env >
-        # config.yaml ``model:`` (string or ``{default: ...}``). The per-job
-        # value is intentionally re-read from storage every tick so a
+        # Default model resolution precedence: per-job override > HERMES_MODEL
+        # env > config.yaml ``model:`` (string or ``{default: ...}``). The
+        # per-job value is intentionally re-read from storage every tick so a
         # ``cronjob action=update model=...`` after a failed run takes effect
         # on the next tick — there is no in-memory cache.
+        #
+        # An operator can instead set cron.inference_source=global. That mode
+        # makes config.yaml the sole source and deliberately ignores per-job
+        # and HERMES_MODEL overrides.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        _cron_inference_source = "job_or_global"
+        _use_global_inference = False
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -3191,21 +3197,38 @@ def run_job(
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
-                if not job.get("model"):
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        # Mirror the CLI/oneshot resolution: prefer ``default``,
-                        # accept a ``model`` alias, overwrite only when truthy.
-                        _default = _model_cfg.get("default") or _model_cfg.get("model")
-                        if _default:
-                            model = _default
+                _cron_cfg = _cfg.get("cron")
+                if not isinstance(_cron_cfg, dict):
+                    _cron_cfg = {}
+                _cron_inference_source = str(
+                    _cron_cfg.get("inference_source") or "job_or_global"
+                ).strip().lower()
+                _use_global_inference = _cron_inference_source == "global"
+                if isinstance(_model_cfg, str):
+                    _global_model = _model_cfg
+                elif isinstance(_model_cfg, dict):
+                    # Mirror the CLI/oneshot resolution: prefer ``default`` and
+                    # accept the legacy ``model`` alias.
+                    _global_model = (
+                        _model_cfg.get("default") or _model_cfg.get("model")
+                    )
+                else:
+                    _global_model = ""
+                if _use_global_inference:
+                    model = _global_model or ""
+                elif not job.get("model") and _global_model:
+                    model = _global_model
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
         if not (isinstance(model, str) and model.strip()):
+            if _use_global_inference:
+                raise RuntimeError(
+                    f"Cron job '{job_name}' requires the global inference "
+                    "source, but config.yaml model.default is missing or empty."
+                )
             raise RuntimeError(
                 f"Cron job '{job_name}' has no model configured "
                 f"(job.model={job.get('model')!r}, "
@@ -3271,7 +3294,8 @@ def run_job(
         # job persisted before that guard — or written directly to the jobs store
         # — reaches this sink unchecked. Fail closed before resolution so no
         # off-host call is ever made with a stored key.
-        _guard_job_credential_exfil(job)
+        if not _use_global_inference:
+            _guard_job_credential_exfil(job)
 
         primary_model_for_drift = model
         configured_provider_for_drift = (
@@ -3280,8 +3304,14 @@ def run_job(
             else ""
         )
         primary_provider_for_drift = (
-            str(job.get("provider") or "").strip().lower()
-            or configured_provider_for_drift
+            (
+                configured_provider_for_drift
+                if _use_global_inference
+                else (
+                    str(job.get("provider") or "").strip().lower()
+                    or configured_provider_for_drift
+                )
+            )
             or None
         )
         try:
@@ -3291,14 +3321,16 @@ def run_job(
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                "requested": (
+                    None if _use_global_inference else job.get("provider")
+                ),
                 # Derive provider-specific api_mode from the model this job
-                # will actually run (per-job pin > env > config default), not
-                # the stale persisted default — mirrors the fallback path
-                # below, which already passes its fb_model.
+                # will actually run. Normal precedence is per-job pin > env >
+                # config default; global-source mode uses config only. This
+                # mirrors the fallback path below, which passes its fb_model.
                 "target_model": model,
             }
-            if job.get("base_url"):
+            if job.get("base_url") and not _use_global_inference:
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
             primary_provider_for_drift = (
@@ -3372,12 +3404,20 @@ def run_job(
         # fail closed: skip this run, make NO paid call, and deliver a loud,
         # actionable alert telling the user to pin the axis explicitly.
         #
+        # Operators that keep inference routing in a reviewed central config
+        # can explicitly set cron.inference_source=global. In that mode the
+        # current global provider/model is the desired route, per-job pins are
+        # ignored, and snapshots remain audit metadata. The default and every
+        # unknown value retain per-job precedence and fail closed on drift.
+        #
         # Back-compat: an axis with no snapshot (pre-existing jobs, no_agent, or
         # any axis whose creation-time resolution failed) behaves exactly as
         # before — the guard never engages for it. Pinned axes are unaffected.
         _drift: list[str] = []
         _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
-        if _provider_snapshot and not (job.get("provider") or "").strip():
+        if _provider_snapshot and (
+            _use_global_inference or not (job.get("provider") or "").strip()
+        ):
             _current_provider = str(
                 primary_provider_for_drift or runtime.get("provider") or ""
             ).strip().lower()
@@ -3386,13 +3426,22 @@ def run_job(
                     f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                 )
         _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
-        if _model_snapshot and not (job.get("model") or "").strip():
+        if _model_snapshot and (
+            _use_global_inference or not (job.get("model") or "").strip()
+        ):
             _current_model = str(primary_model_for_drift or "").strip().lower()
             if _current_model and _current_model != _model_snapshot:
                 _drift.append(
                     f"model '{_model_snapshot}' -> '{_current_model}'"
                 )
-        if _drift:
+        if _drift and _use_global_inference:
+            logger.info(
+                "Job '%s': following centrally managed global inference "
+                "config despite creation snapshot drift (%s).",
+                job_id,
+                "; ".join(_drift),
+            )
+        elif _drift:
             _changes = "; ".join(_drift)
             logger.warning(
                 "Job '%s': SKIPPED — global inference config drifted since "

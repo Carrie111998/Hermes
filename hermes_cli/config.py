@@ -2853,6 +2853,16 @@ DEFAULT_CONFIG = {
         # An unknown or unavailable provider falls back to the built-in, so cron
         # never loses its trigger.
         "provider": "",
+        # Where agent-backed cron jobs resolve their primary provider/model:
+        #   job_or_global — explicit per-job overrides win; otherwise use the
+        #                   global route and fail closed on snapshot drift
+        #                   (safe default).
+        #   global        — deliberately ignore all per-job provider/model
+        #                   overrides and resolve the current global route on
+        #                   every run. Use only when global config is a reviewed,
+        #                   operator-managed source of truth.
+        # Unknown values behave as job_or_global.
+        "inference_source": "job_or_global",
         # Chronos (NAS-mediated managed cron) settings. Only consulted when
         # provider == "chronos". All non-secret (URLs + the JWT audience): the
         # agent holds NO external-scheduler credentials. For hosted agents, NAS
