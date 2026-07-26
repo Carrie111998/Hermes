@@ -358,6 +358,10 @@ export interface Translations {
       colorModeDesc: string
       toolViewTitle: string
       toolViewDesc: string
+      chatLayoutTitle: string
+      chatLayoutDesc: string
+      chatLayoutStacked: string
+      chatLayoutBubbles: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
       terminalFontTitle: string
