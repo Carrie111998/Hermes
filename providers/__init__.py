@@ -69,8 +69,29 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
     """
     if not _discovered:
         _discover_providers()
-    canonical = _ALIASES.get(name, name)
+    canonical = _normalize_for_lookup(name)
     return _REGISTRY.get(canonical)
+
+
+def _normalize_for_lookup(name: str) -> str:
+    """Resolve a caller-supplied provider name to its registry key.
+
+    Mirrors the alias table for the common case, and additionally collapses
+    a *named* custom provider key (``custom:<name>``) down to ``custom``.
+    Such a qualified key is what survives on ``agent.provider`` after a
+    fallback activation (the resolution path keeps the pool/provider key),
+    so without this normalization the profile lookup returns None and the
+    request falls into the legacy unknown-provider path — silently dropping
+    the ``CustomProfile`` hooks (notably top-level ``reasoning_effort``)
+    even though the same model works as a primary (issue #72202).
+
+    Only the ``custom:`` prefix is case-folded (config-defined names are
+    arbitrary user strings); every other lookup keeps the original
+    case-sensitive alias-table semantics.
+    """
+    if (name or "").lower().startswith("custom:"):
+        name = "custom"
+    return _ALIASES.get(name, name)
 
 
 def list_providers() -> list[ProviderProfile]:

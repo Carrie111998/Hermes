@@ -22,6 +22,29 @@ class TestRegistry:
     def test_unknown_provider_returns_none(self):
         assert get_provider_profile("nonexistent-provider") is None
 
+    def test_named_custom_provider_resolves_to_custom_profile(self):
+        """A named custom provider key (``custom:<name>``) — e.g. one left
+        on ``agent.provider`` after fallback activation — must resolve to the
+        generic ``CustomProfile`` so its ``build_api_kwargs_extras`` hook
+        (which emits top-level ``reasoning_effort``) still runs. Without this,
+        the lookup returned None and the request fell into the legacy
+        unknown-provider path, silently dropping ``reasoning_effort`` on
+        fallback (issue #72202).
+        """
+        # Canonical name and alias resolve as before.
+        assert get_provider_profile("custom").name == "custom"
+        assert get_provider_profile("ollama").name == "custom"
+
+        # Named custom keys now resolve to the same CustomProfile regardless
+        # of case or the suffix after the colon.
+        for key in ("custom:cpa", "custom:CPA", "custom:my-endpoint"):
+            resolved = get_provider_profile(key)
+            assert resolved is not None, f"{key!r} should resolve, got None"
+            assert resolved.name == "custom", (
+                f"{key!r} should resolve to the custom profile, "
+                f"got {resolved.name!r}"
+            )
+
     def test_all_providers_have_name(self):
         get_provider_profile("nvidia")  # trigger discovery
         for name, profile in _REGISTRY.items():
