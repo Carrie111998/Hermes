@@ -568,9 +568,54 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypa
     assert result["final_response"] == "done"
     assert adapter.sent
     assert adapter.sent[0]["reply_to"] == "om_triggering_user_message"
-    assert adapter.sent[0]["metadata"] == {"thread_id": "topic_17585"}
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "topic_17585",
+        "reply_in_thread": True,
+    }
     assert adapter.edits
     assert adapter.edits[0]["message_id"] == "progress-1"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_feishu_progress_starts_thread_for_top_level_task(monkeypatch, tmp_path):
+    """A top-level Feishu task's tool progress must create its task thread."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.FEISHU)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-feishu-top-level-progress",
+        session_key="agent:main:feishu:dm:oc_chat",
+        event_message_id="om_triggering_user_message",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["reply_to"] == "om_triggering_user_message"
+    assert adapter.sent[0]["metadata"] == {"reply_in_thread": True}
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +915,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    event_message_id=None,
 ):
     if config_data:
         import yaml
@@ -915,6 +961,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id=event_message_id,
     )
     return adapter, result
 
@@ -1051,6 +1098,31 @@ async def test_run_agent_suppresses_interim_commentary_when_disabled(monkeypatch
 
     assert result.get("already_sent") is not True
     assert not any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_feishu_interim_commentary_starts_thread_for_top_level_task(monkeypatch, tmp_path):
+    """A top-level Feishu task's interim commentary must create its task thread."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-feishu-top-level-commentary",
+        config_data={"display": {"interim_assistant_messages": True}},
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="dm",
+        thread_id=None,
+        event_message_id="om_triggering_user_message",
+    )
+
+    assert result.get("already_sent") is not True
+    commentary = next(call for call in adapter.sent if call["content"] == "I'll inspect the repo first.")
+    assert commentary["reply_to"] == "om_triggering_user_message"
+    assert commentary["metadata"] == {
+        "reply_in_thread": True,
+        "reply_to_message_id": "om_triggering_user_message",
+    }
 
 
 @pytest.mark.asyncio
