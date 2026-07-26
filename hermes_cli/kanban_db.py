@@ -138,6 +138,29 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _assert_not_delegated_child_mutation() -> None:
+    """Reject Kanban state mutations from ``delegate_task`` child contexts.
+
+    The structured kanban tools and CLI dispatch layer both have fast-fail
+    guards for better UX, but neither is a trust boundary: a delegated child can
+    still shell out to the CLI or import this module directly. The actual
+    invariant belongs at the DB/filesystem mutation layer so every public
+    mutator that uses ``write_txn`` (tasks, runs, comments, attachments,
+    dispatcher claims, repair events, subscriptions, GC, etc.) and every board
+    metadata mutator fails closed before touching durable state.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        delegated = is_delegated_child_process_context()
+    except Exception:
+        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+    if delegated:
+        raise PermissionError(
+            "delegate_task child contexts cannot mutate Kanban tasks or boards"
+        )
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
@@ -468,6 +491,7 @@ def set_current_board(slug: str) -> Path:
     so that ``hermes kanban boards switch <typo>`` returns an error
     instead of silently pointing at nothing.
     """
+    _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -479,6 +503,7 @@ def set_current_board(slug: str) -> Path:
 
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
+    _assert_not_delegated_child_mutation()
     try:
         current_board_path().unlink()
     except FileNotFoundError:
@@ -681,6 +706,7 @@ def write_board_metadata(
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
     """
+    _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
     # Preserve existing DB-derived fields — they get re-computed each
@@ -796,6 +822,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     Returns a summary dict describing what happened (``{"slug", "action",
     "new_path"}``).
     """
+    _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -1339,10 +1366,20 @@ def _resolve_busy_timeout_ms() -> int:
 
 
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
-    """Open a Kanban SQLite connection with consistent lock waiting."""
+    """Open a Kanban SQLite connection with consistent lock waiting.
+
+    Uses ``connect_tracked`` so the live-connection registry knows this file
+    is open: while it is, byte-level probes of the same file are refused,
+    because an ``open()``/``close()`` would cancel this process's POSIX
+    advisory locks on the database (see ``hermes_cli.sqlite_safe_read``).
+    The registration is released automatically when the connection closes.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
     busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = sqlite3.connect(
-        str(path),
+    conn = connect_tracked(
+        path,
+        connect_fn=sqlite3.connect,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
@@ -1601,10 +1638,14 @@ def _validate_sqlite_header(path: Path) -> None:
         return
     if stat.st_size == 0:
         return
-    try:
-        with path.open("rb") as handle:
-            head = handle.read(64)
-    except OSError:
+    # Byte-level probe, so it must run BEFORE any connection to this path
+    # exists (connect() calls it under the init lock, ahead of _sqlite_connect).
+    # read_header_bytes_preopen refuses once a connection is live, because the
+    # close() would cancel this process's POSIX locks on the file.
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(path, length=64)
+    if head is None:
         return
     if head.startswith(_SQLITE_HEADER):
         return
@@ -1709,6 +1750,25 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+    # This reads the whole DB file to fingerprint it. That is a close()-on-a-
+    # database-file hazard (it cancels this process's POSIX advisory locks --
+    # see hermes_cli.sqlite_safe_read), so it must only run once the board has
+    # been taken out of service. Every caller reaches here on the corrupt/
+    # quarantine path after closing its probe connection, but another
+    # SessionDB/kanban connection elsewhere in the process would still be at
+    # risk -- so REFUSE rather than warn-and-proceed. Losing a forensic copy
+    # is strictly better than corrupting the live database we are trying to
+    # rescue.
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    if has_live_connection(resolved):
+        _log.error(
+            "refusing to quarantine %s: a connection to it is still open in "
+            "this process, and fingerprinting the file would cancel that "
+            "connection's POSIX locks. Close all connections first.",
+            resolved,
+        )
+        return None
     digest = hashlib.sha256()
     try:
         with resolved.open("rb") as handle:
@@ -2592,42 +2652,40 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
-    """Read the SQLite header page_count and compare against actual file size.
+    """Compare SQLite's own page accounting against the file size on disk.
 
     Raises sqlite3.DatabaseError if the file is shorter than the header claims
     (torn-extend corruption).
+
+    Both sides are read WITHOUT opening the database file. The header side
+    comes from ``PRAGMA page_count`` over the existing connection; the on-disk
+    side from ``stat()``. An earlier version read the header field with a bare
+    ``open(path,"rb")`` -- but ``close()`` cancels every POSIX advisory lock
+    this process holds on the file, so that probe silently dropped the locks
+    of concurrent writers (and of a running VACUUM) and let other processes
+    write into a database a writer still believed it owned. That is the
+    documented corruption route in sqlite.org/howtocorrupt.html section 2.2.
     """
+    from hermes_cli.sqlite_safe_read import file_length_matches_header
+
+    # In WAL mode a just-committed page can still live in the -wal file, so
+    # the main file legitimately lags its page count. Only enforce the
+    # invariant under a rollback journal, where every committed page must
+    # already be in the main file.
     try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        if row is None:
-            return
-        path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
-        if not path_str:
-            return  # in-memory or unnamed DB; skip
-        path = path_str
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
-            return  # new/empty DB; skip
-        actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
-            raise sqlite3.DatabaseError(
-                f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
-                f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
-                f"file_size={file_size}, page_size={page_size})"
-            )
-    except sqlite3.DatabaseError:
-        raise
-    except Exception:
-        pass  # I/O errors during check are non-fatal; let normal ops continue
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        journal_mode = str(row[0]).lower() if row and row[0] is not None else ""
+    except sqlite3.Error:
+        return
+    if journal_mode == "wal":
+        return
+
+    ok = file_length_matches_header(conn)
+    if ok is False:
+        raise sqlite3.DatabaseError(
+            "torn-extend detected: the database file is shorter than its "
+            "header page count claims"
+        )
 
 
 # SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
@@ -2674,6 +2732,7 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    _assert_not_delegated_child_mutation()
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -2768,6 +2827,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    project_source_task_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2796,6 +2856,12 @@ def create_task(
     model (and optionally its provider) without touching the profile's
     config — passed to the worker as ``-m <model> [--provider <name>]``.
     ``provider_override`` requires ``model_override``.
+
+    ``project_source_task_id`` is an internal cross-profile fallback for a
+    worker-created child. When the active profile cannot resolve ``project_id``
+    in its own projects.db, a matching canonical project-linked task in this
+    board can supply the repo and branch convention. Its literal worktree is
+    never reused; the new task still gets its own task-id-keyed path.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -2832,13 +2898,61 @@ def create_task(
     if project_id is not None:
         project_id = str(project_id).strip() or None
     if project_id:
-        try:
-            from hermes_cli import projects_db as _pdb
+        from hermes_cli import projects_db as _pdb
 
+        try:
             with _pdb.connect_closing() as _pconn:
                 project_obj = _pdb.get_project(_pconn, project_id)
         except Exception:
             project_obj = None
+        if project_obj is None and project_source_task_id:
+            # Worker profiles have their own projects.db, while the Kanban DB is
+            # intentionally shared. Recover routing only from a canonical
+            # project-linked source task in this same board. This carries the
+            # repo + project branch convention forward without copying or
+            # opening the creator profile's project store, and without reusing
+            # the source task's literal worktree path.
+            source_task = get_task(conn, str(project_source_task_id))
+            if (
+                source_task is not None
+                and source_task.project_id == project_id
+                and source_task.workspace_kind == "worktree"
+                and source_task.workspace_path
+            ):
+                source_path = Path(source_task.workspace_path)
+                if (
+                    source_path.is_absolute()
+                    and source_path.name == source_task.id
+                    and source_path.parent.name == ".worktrees"
+                ):
+                    project_slug = None
+                    if source_task.branch_name:
+                        prefix, separator, leaf = source_task.branch_name.partition("/")
+                        if separator and (
+                            leaf == source_task.id
+                            or leaf.startswith(f"{source_task.id}-")
+                        ):
+                            try:
+                                project_slug = _pdb.normalize_slug(prefix)
+                            except ValueError:
+                                project_slug = None
+                    if project_slug is None:
+                        try:
+                            project_slug = _pdb.normalize_slug(project_id)
+                        except ValueError:
+                            project_slug = None
+                    if project_slug:
+                        project_repo = str(source_path.parent.parent)
+                        project_obj = _pdb.Project(
+                            id=project_id,
+                            slug=project_slug,
+                            name=project_slug,
+                            created_at=0,
+                            primary_path=project_repo,
+                        )
+                        if workspace_kind == "scratch":
+                            workspace_kind = "worktree"
+
         if project_obj is None:
             # A project id/slug that doesn't resolve must not crash task
             # creation or persist a dangling reference — drop the link and
@@ -3048,7 +3162,10 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "tenant": tenant,
+                        "workspace_kind": workspace_kind,
+                        "workspace_path": workspace_path,
                         "branch_name": branch_name,
+                        "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -5126,7 +5243,7 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
         # Check if session exists and pane is dead before killing
         out = subprocess.run(
             ["tmux", "list-panes", "-t", session, "-F", "#{pane_dead}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         if out.stdout.strip() == "1":
             subprocess.run(
@@ -5861,6 +5978,15 @@ def decompose_triage_task(
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
+            elif child_ws_kind == "worktree":
+                # Never share one worktree checkout between siblings: the
+                # root's literal path would put every child in the same
+                # directory on the first-dispatched sibling's branch, with
+                # no lock — siblings can be promoted and dispatched
+                # concurrently. Leave the path unset so dispatch
+                # materializes a fresh <repo>/.worktrees/<child-id> per
+                # child from the board anchor.
+                child_ws_path = None
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
             else:
@@ -6043,7 +6169,7 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6065,7 +6191,7 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
         result = subprocess.run(
             ["git", "-C", str(repo_root), "show-ref", "--verify", f"refs/heads/{branch_name}"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6079,7 +6205,7 @@ def _git_common_dir(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6098,7 +6224,7 @@ def _git_dir(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6117,7 +6243,7 @@ def _git_current_branch(path: Path) -> Optional[str]:
         result = subprocess.run(
             ["git", "-C", str(path), "branch", "--show-current"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6174,7 +6300,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     result = subprocess.run(
         cmd,
         capture_output=True,
-        text=True,
+        text=True, encoding='utf-8', errors='replace',
         timeout=60,
         check=False,
     )
@@ -6238,6 +6364,24 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
+        if actual_branch == branch_name:
+            return requested_resolved, actual_branch
+        # The requested path is an existing checkout of a DIFFERENT
+        # task's branch. Decompose children inherit the root's
+        # workspace_path verbatim, so siblings all point here; reusing
+        # the checkout as-is would run this task on the other task's
+        # branch — silent cross-task provenance corruption, and unsafe
+        # when siblings run concurrently. Fall back to a fresh worktree
+        # of our own under the same repo.
+        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        if fallback_root is not None:
+            fallback = fallback_root / ".worktrees" / task.id
+            if fallback.resolve(strict=False) != requested_resolved:
+                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                return fallback.resolve(strict=False), branch_name
+        # No repo to anchor a fallback on (or the occupied path IS this
+        # task's own canonical worktree): keep the legacy reuse rather
+        # than failing dispatch.
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
@@ -6652,7 +6796,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 ["ps", "-o", "stat=", "-p", str(int(pid))],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=1,
                 check=False,
             )
