@@ -25,6 +25,7 @@ import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { mergeSessionsForPresentation, sessionsFeedShowsLoadMore } from '@/lib/cron-session-visibility'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { profileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
@@ -84,11 +85,13 @@ import {
 import { openRouteTile } from '@/store/route-tiles'
 import {
   $cronSessions,
+  $cronSessionsTruncated,
   $currentCwd,
   $gatewayState,
   $messagingPlatformTotals,
   $messagingSessions,
   $messagingTruncated,
+  $presentedSessions,
   $sessionProfileTotals,
   $sessions,
   $sessionsLoading,
@@ -227,15 +230,20 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreProfileSessions?: (profile: string) => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
-  onResumeSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   /** Create a brand-new session and open it as a tile on `dir`. */
   onNewSessionSplit: (dir: SplitDir) => void
-  onManageCronJob: (jobId: string) => void
-  onTriggerCronJob: (jobId: string) => void
+  onManageCronJob: (jobId: string, profile?: null | string) => void
+  onSetCronJobSessionsVisibility: (
+    jobId: string,
+    profile: null | string | undefined,
+    shown: boolean
+  ) => Promise<void> | void
+  onTriggerCronJob: (jobId: string, profile?: null | string) => void
 }
 
 export function ChatSidebar({
@@ -251,6 +259,7 @@ export function ChatSidebar({
   onNewSessionInWorkspace,
   onNewSessionSplit,
   onManageCronJob,
+  onSetCronJobSessionsVisibility,
   onTriggerCronJob
 }: ChatSidebarProps) {
   const { t } = useI18n()
@@ -294,6 +303,8 @@ export function ChatSidebar({
   const selectedSessionId = useStore($focusedStoredSessionId)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
+  const cronSessionsTruncated = useStore($cronSessionsTruncated)
+  const presentedSessions = useStore($presentedSessions)
   const cronJobs = useStore($cronJobs)
   const messagingSessions = useStore($messagingSessions)
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
@@ -385,12 +396,28 @@ export function ChatSidebar({
     [sessions, showAllProfiles, profileScope]
   )
 
+  const visiblePresentedSessions = useMemo(
+    () =>
+      showAllProfiles
+        ? presentedSessions
+        : presentedSessions.filter(s => normalizeProfileKey(s.profile) === profileScope),
+    [presentedSessions, profileScope, showAllProfiles]
+  )
+
+  const searchableSessions = useMemo(() => {
+    const visibleCron = showAllProfiles
+      ? cronSessions
+      : cronSessions.filter(s => normalizeProfileKey(s.profile) === profileScope)
+
+    return mergeSessionsForPresentation(visibleSessions, visibleCron)
+  }, [cronSessions, profileScope, showAllProfiles, visibleSessions])
+
   // Agent session order is pinned to creation time (started_at), NOT activity —
   // a new message must never float a session to the top. Position only changes
   // for a brand-new session or an explicit manual drag (agentOrderIds).
   const sortedSessions = useMemo(
-    () => [...visibleSessions].sort((a, b) => (b.started_at || 0) - (a.started_at || 0)),
-    [visibleSessions]
+    () => [...visiblePresentedSessions].sort((a, b) => (b.started_at || 0) - (a.started_at || 0)),
+    [visiblePresentedSessions]
   )
 
   const workingSessionIdSet = useMemo(() => new Set(workingSessionIds), [workingSessionIds])
@@ -475,7 +502,7 @@ export function ChatSidebar({
 
     const out = new Map<string, SessionInfo>()
 
-    for (const s of sortedSessions) {
+    for (const s of searchableSessions) {
       if (sessionMatchesSearch(s, trimmedQuery)) {
         out.set(s.id, s)
       }
@@ -491,7 +518,7 @@ export function ChatSidebar({
     }
 
     return [...out.values()]
-  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
+  }, [trimmedQuery, searchableSessions, serverMatches, sessionByAnyId])
 
   const unpinnedAgentSessions = useMemo(
     () => sortedSessions.filter(s => !pinnedRealIdSet.has(s.id)),
@@ -962,14 +989,19 @@ export function ChatSidebar({
   const loadedSessionCount = showAllProfiles ? sessions.length : visibleSessions.length
   const scopedProfileTotal = showAllProfiles ? undefined : sessionProfileTotals[profileScope]
 
-  const knownSessionTotal = Math.max(
+  const ordinarySessionTotal = Math.max(
     showAllProfiles ? sessionsTotal : (scopedProfileTotal ?? loadedSessionCount),
     loadedSessionCount
   )
 
-  const hasMoreSessions = knownSessionTotal > loadedSessionCount
+  const visibleCronCount = visiblePresentedSessions.filter(session => session.source === 'cron').length
+  const knownSessionTotal = ordinarySessionTotal + visibleCronCount
+  const ordinaryHasMoreSessions = ordinarySessionTotal > loadedSessionCount
 
-  const recentsMeta = countLabel(displayAgentSessions.length, knownSessionTotal)
+  const recentsMeta = cronSessionsTruncated
+    ? `${displayAgentSessions.length}+`
+    : countLabel(displayAgentSessions.length, knownSessionTotal)
+
   const displayRecentsCountRef = useRef(0)
   const loadedRecentsCountRef = useRef(0)
   displayRecentsCountRef.current = displayAgentSessions.length
@@ -1289,10 +1321,15 @@ export function ChatSidebar({
                   )
                 }
                 footer={
-                  // Hide "load more" only when workspace-grouped (those groups page
-                  // themselves). ALL-profiles now pages per-profile from each profile
-                  // header; the global footer only applies to non-ALL views.
-                  !showAllProfiles && !agentsGrouped && !showSessionSkeletons && hasMoreSessions ? (
+                  // Ordinary All-Profiles paging stays on each profile header,
+                  // but cron owns one shared bounded window.
+                  sessionsFeedShowsLoadMore({
+                    agentsGrouped,
+                    cronTruncated: cronSessionsTruncated,
+                    ordinaryHasMore: ordinaryHasMoreSessions,
+                    sessionsLoading: showSessionSkeletons,
+                    showAllProfiles
+                  }) ? (
                     <SidebarLoadMoreRow
                       loading={sessionsLoading || recentsLoadMorePending}
                       onClick={() => void onLoadMoreRecents()}
@@ -1477,6 +1514,7 @@ export function ChatSidebar({
                 label={s.cronJobs}
                 onManageJob={onManageCronJob}
                 onOpenRun={onResumeSession}
+                onSetSessionsVisibility={onSetCronJobSessionsVisibility}
                 onToggle={() => setSidebarCronOpen(!cronOpen)}
                 onTriggerJob={onTriggerCronJob}
                 open={cronOpen}

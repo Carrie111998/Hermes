@@ -3,7 +3,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { deleteSession, getSession, getSessionMessages, type SessionInfo, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
@@ -23,6 +23,7 @@ import {
 } from '@/store/projects'
 import {
   $activeSessionStoredIdRotation,
+  $cronSessions,
   $currentCwd,
   $currentFastMode,
   $currentModel,
@@ -90,6 +91,20 @@ import {
   toBranchMessages,
   upsertOptimisticSession
 } from './utils'
+
+function findCachedStoredSession(storedSessionId: string, profile?: string): SessionInfo | undefined {
+  const rows = [...$sessions.get(), ...$cronSessions.get()]
+
+  if (profile) {
+    const profileKey = normalizeProfileKey(profile)
+
+    return rows.find(
+      session => sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === profileKey
+    )
+  }
+
+  return rows.find(session => sessionMatchesStoredId(session, storedSessionId))
+}
 
 interface SessionActionsOptions {
   activeSessionId: string | null
@@ -535,10 +550,14 @@ export function useSessionActions({
   }, [navigate, selectedStoredSessionId])
 
   const resumeSession = useCallback(
-    async (storedSessionId: string, replaceRoute = false) => {
+    async (storedSessionId: string, replaceRoute = false, targetProfile?: string) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
-      const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
+
+      const resumedSameSelectedSession =
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        (!targetProfile || normalizeProfileKey(targetProfile) === normalizeProfileKey($activeGatewayProfile.get()))
+
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
 
       const isCurrentResume = () =>
@@ -584,6 +603,14 @@ export function useSessionActions({
           return null
         }
 
+        if (targetProfile && normalizeProfileKey(targetProfile) !== normalizeProfileKey($activeGatewayProfile.get())) {
+          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+          sessionStateByRuntimeIdRef.current.delete(runtimeId)
+          dropSessionState(runtimeId)
+
+          return null
+        }
+
         if (state.storedSessionId !== storedSessionId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(runtimeId)
@@ -608,8 +635,15 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const storedForProfile = await resolveStoredSession(storedSessionId)
-      const sessionProfile = storedForProfile?.profile
+      let storedForProfile = findCachedStoredSession(storedSessionId, targetProfile)
+
+      if (!storedForProfile) {
+        storedForProfile = targetProfile
+          ? await getSession(storedSessionId, targetProfile).catch(() => undefined)
+          : await resolveStoredSession(storedSessionId)
+      }
+
+      const sessionProfile = targetProfile ?? storedForProfile?.profile
 
       if (resumeRequestRef.current !== requestId) {
         return
@@ -626,8 +660,7 @@ export function useSessionActions({
         const cachedRuntimeId = warmHit.runtimeId
         const cachedState = warmHit.state
 
-        const stored =
-          $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
+        const stored = findCachedStoredSession(storedSessionId, targetProfile) ?? storedForProfile
 
         let cachedViewState =
           !cachedState.model && stored?.model != null
@@ -813,8 +846,7 @@ export function useSessionActions({
       selectedStoredSessionIdRef.current = storedSessionId
       setSessionStartedAt(Date.now())
 
-      const stored =
-        $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
+      const stored = findCachedStoredSession(storedSessionId, targetProfile) ?? storedForProfile
 
       applyStoredSessionPreviewRuntimeInfo(stored)
 

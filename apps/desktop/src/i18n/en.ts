@@ -1637,6 +1637,8 @@ export const en: Translations = {
     manage: 'Manage',
     showRuns: 'Show runs',
     hideRuns: 'Hide runs',
+    showInSessionsList: 'Show in Sessions',
+    hideFromSessionsList: 'Hide from Sessions',
     runHistory: 'Run history',
     actionsFor: title => `Actions for ${title}`,
     actionsTitle: 'Cron job actions',

@@ -149,6 +149,7 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
+import { fanOutSidebarSessions } from './sidebar-session-fanout'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -9426,56 +9427,7 @@ async function interceptSessionRequestForRemote(request) {
       return undefined // local fast path → batched endpoint's single DB open
     }
 
-    const recentsProfile = (searchParams.get('recents_profile') || 'all').trim() || 'all'
-
-    const sliceParams = (limitKey, defaultLimit, extra) => {
-      const sp = new URLSearchParams({
-        limit: searchParams.get(limitKey) || defaultLimit,
-        offset: '0',
-        min_messages: '1',
-        archived: 'exclude',
-        order: 'recent',
-        ...extra
-      })
-
-      return sp
-    }
-
-    const recentsSp = sliceParams('recents_limit', '20', { profile: recentsProfile })
-    const recentsExclude = searchParams.get('recents_exclude')
-
-    if (recentsExclude) {
-      recentsSp.set('exclude_sources', recentsExclude)
-    }
-
-    const cronSp = sliceParams('cron_limit', '50', { profile: 'all', source: 'cron' })
-
-    const messagingSp = sliceParams('messaging_limit', '100', { profile: 'all' })
-    const messagingExclude = searchParams.get('messaging_exclude')
-
-    if (messagingExclude) {
-      messagingSp.set('exclude_sources', messagingExclude)
-    }
-
-    const [recents, cron, messaging] = await Promise.all([
-      fetchProfilesSessionSlice(recentsSp, remoteProfiles),
-      fetchProfilesSessionSlice(cronSp, remoteProfiles),
-      fetchProfilesSessionSlice(messagingSp, remoteProfiles)
-    ])
-
-    return {
-      recents: {
-        sessions: rowsOf(recents),
-        total: Number(recents?.total) || 0,
-        profile_totals: recents?.profile_totals || {}
-      },
-      cron: { sessions: rowsOf(cron) },
-      messaging: {
-        sessions: rowsOf(messaging),
-        total: Number(messaging?.total) || rowsOf(messaging).length
-      },
-      errors: []
-    }
+    return fanOutSidebarSessions(searchParams, remoteProfiles, fetchProfilesSessionSlice)
   }
 
   // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile

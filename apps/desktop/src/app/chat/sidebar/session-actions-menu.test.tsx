@@ -78,9 +78,16 @@ vi.mock('@/store/windows', () => ({
   openSessionInNewWindow: vi.fn()
 }))
 
-function renderMenu() {
+function renderMenu({ hideDestructiveActions = false } = {}) {
   return render(
-    <SessionActionsMenu sessionId="s1" title="My session" tooltip="Actions for My session">
+    <SessionActionsMenu
+      hideDestructiveActions={hideDestructiveActions}
+      onArchive={vi.fn()}
+      onDelete={vi.fn()}
+      sessionId="s1"
+      title="My session"
+      tooltip="Actions for My session"
+    >
       <button aria-label="Actions for My session" type="button">
         ⋮
       </button>
@@ -116,5 +123,18 @@ describe('SessionActionsMenu', () => {
     expect(await screen.findByRole('menu')).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /rename/i })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /archive/i })).toBeTruthy()
+  })
+
+  it('omits destructive actions only when a cron row explicitly requests it', async () => {
+    renderMenu({ hideDestructiveActions: true })
+
+    const trigger = screen.getByRole('button', { name: 'Actions for My session' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+
+    expect(await screen.findByRole('menu')).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /archive/i })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: /delete/i })).toBeNull()
   })
 })

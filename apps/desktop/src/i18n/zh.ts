@@ -1828,6 +1828,8 @@ export const zh: Translations = {
     manage: '管理',
     showRuns: '显示运行记录',
     hideRuns: '隐藏运行记录',
+    showInSessionsList: '在会话中显示',
+    hideFromSessionsList: '从会话中隐藏',
     runHistory: '运行记录',
     actionsFor: title => `${title} 的操作`,
     actionsTitle: '定时任务操作',

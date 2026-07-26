@@ -1,10 +1,11 @@
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { type FC, useCallback, useRef } from 'react'
+import { type ComponentProps, type FC, useCallback, useRef } from 'react'
 
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { sessionPresentationKey } from '@/lib/cron-session-visibility'
 import { type SidebarListRow } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
@@ -13,19 +14,7 @@ import { sessionPinId } from '@/store/session'
 import { SidebarDateDivider } from './chrome'
 import { SidebarSessionRow } from './session-row'
 
-interface SessionRowCommonProps {
-  branchStem?: string
-  isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
-  onArchive: () => void
-  onBranch?: () => void
-  onDelete: () => void
-  onPin: () => void
-  onResume: () => void
-  reorderable?: boolean
-  showProfile?: boolean
-}
+type SessionRowCommonProps = Omit<ComponentProps<typeof SidebarSessionRow>, 'session'>
 
 interface VirtualSessionListProps {
   activeSessionId: null | string
@@ -34,7 +23,7 @@ interface VirtualSessionListProps {
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
-  onResumeSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
   pinned: boolean
   showProfileTags?: boolean
@@ -69,7 +58,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     getItemKey: index => {
       const row = listRows[index]
 
-      return row ? (row.kind === 'divider' ? row.key : row.entry.session.id) : index
+      return row ? (row.kind === 'divider' ? row.key : sessionPresentationKey(row.entry.session)) : index
     },
     getScrollElement: () => scrollerRef.current,
     // jsdom-friendly default; the real rect takes over on first observe.
@@ -106,6 +95,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
     const commonProps: SessionRowCommonProps = {
       branchStem,
+      hideDestructiveActions: session.source === 'cron',
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       isWorking: workingSessionIdSet.has(session.id),
@@ -113,7 +103,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
       onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
+      onResume: () => onResumeSession(session.id, session.source === 'cron' ? session.profile : undefined),
       reorderable,
       showProfile: showProfileTags
     }
@@ -121,7 +111,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     return reorderable ? (
       <VirtualSortableRow
         index={virtualItem.index}
-        key={session.id}
+        key={sessionPresentationKey(session)}
         measureRef={virtualizer.measureElement}
         rowProps={commonProps}
         session={session}
@@ -130,7 +120,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       <SidebarSessionRow
         {...commonProps}
         data-index={virtualItem.index}
-        key={session.id}
+        key={sessionPresentationKey(session)}
         ref={virtualizer.measureElement}
         session={session}
       />

@@ -29,7 +29,7 @@ import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
 import { $billingSettingsRequest } from '@/store/billing-block'
-import { setCronFocusJobId } from '@/store/cron'
+import { setCronFocusJob } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { $filePreviewTarget, $previewTarget } from '@/store/preview'
 import { $activeGatewayProfile, $freshSessionRequest, $profileScope, refreshActiveProfile } from '@/store/profile'
@@ -74,7 +74,14 @@ import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
 import { closeAllTerminals } from '../right-sidebar/terminal/terminals'
-import { CRON_ROUTE, routeSessionId, sessionRoute, SETTINGS_ROUTE, syncWorkspaceIsPage } from '../routes'
+import {
+  CRON_ROUTE,
+  routeSessionId,
+  sessionProfileFromSearch,
+  sessionRoute,
+  SETTINGS_ROUTE,
+  syncWorkspaceIsPage
+} from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
@@ -163,6 +170,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const profileScope = useStore($profileScope)
 
   const routedSessionId = routeSessionId(location.pathname)
+  const routedSessionProfile = sessionProfileFromSearch(location.search)
   const routedSessionIdRef = useRef(routedSessionId)
 
   routedSessionIdRef.current = routedSessionId
@@ -230,7 +238,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     loadMoreSessionsForProfile,
     refreshCronJobs,
     refreshMessagingSessions,
-    refreshSessions
+    refreshSessions,
+    setCronJobSessionsVisibility
   } = useSessionListActions({ profileScope })
 
   const updateActiveSessionRuntimeInfo = useCallback(
@@ -635,6 +644,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     freshDraftReady,
     gatewayState,
     locationPathname: location.pathname,
+    routedSessionProfile,
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,
@@ -786,8 +796,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
     onLoadMoreProfileSessions: loadMoreSessionsForProfile,
     onLoadMoreSessions: loadMoreSessions,
-    onManageCronJob: jobId => {
-      setCronFocusJobId(jobId)
+    onManageCronJob: (jobId, profile) => {
+      setCronFocusJob({ id: jobId, profile })
       navigate(CRON_ROUTE)
     },
     onNavigate: selectSidebarItem,
@@ -802,19 +812,20 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onRestoreToMessage: restoreToMessage,
     // Already on screen (open tile, or the main session)? Jump to its tab;
     // otherwise load it into main.
-    onResumeSession: sessionId => {
-      if (!focusOpenSession(sessionId)) {
-        navigate(sessionRoute(sessionId))
+    onResumeSession: (sessionId, profile) => {
+      if (profile || !focusOpenSession(sessionId)) {
+        navigate(sessionRoute(sessionId, profile))
       }
     },
+    onSetCronJobSessionsVisibility: setCronJobSessionsVisibility,
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,
     onThreadMessagesChange: handleThreadMessagesChange,
     onToggleSelectedPin: toggleSelectedPin,
     onTranscribeAudio: transcribeVoiceAudio,
-    onTriggerCronJob: jobId => {
-      void triggerCronJob(jobId)
+    onTriggerCronJob: (jobId, profile) => {
+      void triggerCronJob(jobId, profile)
         .then(() => refreshCronJobs())
         .catch(() => undefined)
     },
@@ -1002,7 +1013,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         <Suspense fallback={null}>
           <CronView
             onClose={closeOverlayToPreviousRoute}
-            onOpenSession={sessionId => navigate(sessionRoute(sessionId))}
+            onOpenSession={(sessionId, profile) => navigate(sessionRoute(sessionId, profile))}
+            onSetSessionsVisibility={setCronJobSessionsVisibility}
           />
         </Suspense>
       )}
