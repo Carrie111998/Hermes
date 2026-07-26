@@ -2834,6 +2834,13 @@ DEFAULT_CONFIG = {
         # <id>`; remove by editing the list directly. See
         # ``hermes_cli/security_advisories.py`` for the catalog.
         "acked_advisories": [],
+        # Acknowledged npm/JS GHSA advisories that survive the routine
+        # `npm audit fix --force` path because the upstream fix requires a
+        # major-version bump or breaking API change. Same semantics as
+        # ``acked_advisories`` above — the user has reviewed the advisory,
+        # understands the residual risk, and chooses to dismiss it. Add via
+        # `hermes doctor --ack GHSA-xxx-xxx-xxx`.
+        "acked_npm_advisories": [],
         # Allow Hermes to lazy-install opt-in backend packages from PyPI
         # the first time the user enables a backend that needs them
         # (e.g. installing ``elevenlabs`` when the user picks ElevenLabs as

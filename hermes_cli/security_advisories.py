@@ -130,6 +130,82 @@ ADVISORIES: tuple[Advisory, ...] = (
 
 
 # =============================================================================
+# npm advisory catalog
+#
+# Tracks GHSA-IDs that affect packages in Hermes's monorepo (web, ui-tui,
+# apps/desktop, apps/shared, apps/bootstrap-installer) where:
+#   1. The vulnerability persists at the latest pinned version on main, AND
+#   2. The fix requires a major-version bump or breaking API change that
+#      blocks the routine `npm audit fix --force` path.
+#
+# These are the npm analogue of `ADVISORIES` above: curated, reviewable, and
+# user-ackable via `hermes doctor --ack GHSA-xxx-xxx-xxx`. Unlike the Python
+# catalog, npm advisories here are NOT auto-detected from installed packages
+# (npm audit does that); they exist so the doctor display + ack mechanism
+# covers advisories that survive the lockfile bump.
+#
+# To add a new entry: append below. Set `package` to the npm package name so
+# the doctor scope check can correlate GHSA IDs to workspace advisories.
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class NpmAdvisory:
+    """One npm/JS advisory tracked by Hermes doctor.
+
+    Attributes:
+        id: GHSA identifier (e.g. ``GHSA-qwww-vcr4-c8h2``). Used for acks.
+        title: one-line headline shown in banners.
+        summary: 1-3 sentences describing the vulnerability and its
+            relevance to Hermes specifically.
+        url: GitHub Advisory URL.
+        severity: low / high / critical.
+        package: affected npm package name. Used by the npm-audit scope
+            check to filter which workspace hits map to this advisory.
+        published: ISO date string for sort order.
+    """
+
+    id: str
+    title: str
+    summary: str
+    url: str
+    severity: str
+    package: str
+    published: str = ""
+    remediation: tuple[str, ...] = ()
+
+
+NPM_ADVISORIES: tuple[NpmAdvisory, ...] = (
+    NpmAdvisory(
+        id="GHSA-qwww-vcr4-c8h2",
+        title="React Router: RSC Mode CSRF Bypass Allows Action Execution Before 400 Response",
+        summary=(
+            "React Router's RSC (React Server Components) framework mode does "
+            "not enforce same-origin validation before executing Action POSTs, "
+            "allowing a malicious cross-origin page to trigger actions. The "
+            "vulnerability only affects apps using react-router framework mode "
+            "with RSC server-side hydration. Hermes web uses BrowserRouter, "
+            "apps/desktop uses HashRouter, ui-tui has no react-router, and "
+            "apps/bootstrap-installer uses an inline $route atom — none ship "
+            "framework mode / RSC hydration, so exploit surface is zero. "
+            "Upstream fix requires react-router@8.3.0, a major bump with "
+            "breaking API changes."
+        ),
+        url="https://github.com/advisories/GHSA-qwww-vcr4-c8h2",
+        severity="high",
+        package="react-router",
+        published="2025",
+        remediation=(
+            "Risk-accept by running: hermes doctor --ack GHSA-qwww-vcr4-c8h2",
+            "OR migrate to react-router@8.3.0+ (framework-mode compatible "
+            "config; breaking API changes from v7 — out of scope of routine "
+            "cleanup).",
+        ),
+    ),
+)
+
+
+# =============================================================================
 # Detection
 # =============================================================================
 
@@ -245,6 +321,126 @@ def ack_advisory(advisory_id: str) -> bool:
         return True
     except Exception:
         logger.exception("Failed to persist advisory ack for %s", advisory_id)
+        return False
+
+
+def get_acked_npm_ids() -> set[str]:
+    """Return the set of GHSA IDs the user has dismissed for npm advisories.
+
+    Stored under ``security.acked_npm_advisories`` in config.yaml. Same
+    semantics as :func:`get_acked_ids` — empty set on missing config, never
+    raises.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        logger.debug("Could not load config for npm advisory acks", exc_info=True)
+        return set()
+    sec = cfg.get("security") or {}
+    raw = sec.get("acked_npm_advisories") or []
+    if not isinstance(raw, list):
+        return set()
+    return {str(x).strip() for x in raw if str(x).strip()}
+
+
+def ack_npm_advisory(ghsa_id: str) -> bool:
+    """Persist an ack for ``ghsa_id``. Returns True on success.
+
+    The ID is validated against the NPM_ADVISORIES catalog — unknown GHSAs
+    are rejected (no silent persistence). Idempotent.
+    """
+    ghsa_id = ghsa_id.strip()
+    if not ghsa_id:
+        return False
+    known = {a.id for a in NPM_ADVISORIES}
+    if ghsa_id not in known:
+        logger.warning("Unknown npm advisory GHSA=%s; not persisting ack", ghsa_id)
+        return False
+    try:
+        from hermes_cli.config import load_config, save_config
+    except Exception:
+        logger.warning("Could not import config module to persist npm ack")
+        return False
+    try:
+        cfg = load_config()
+        sec = cfg.setdefault("security", {})
+        existing = sec.get("acked_npm_advisories") or []
+        if not isinstance(existing, list):
+            existing = []
+        if ghsa_id not in existing:
+            existing.append(ghsa_id)
+            sec["acked_npm_advisories"] = existing
+            save_config(cfg)
+        return True
+    except Exception:
+        logger.exception("Failed to persist npm advisory ack for %s", ghsa_id)
+        return False
+
+
+def filter_unacked_npm(ghsa_ids: Iterable[str]) -> list[str]:
+    """Return only GHSA IDs not in the user's ack list. Order preserved."""
+    acked = get_acked_npm_ids()
+    return [g for g in ghsa_ids if g not in acked]
+
+
+def unack_npm_advisory(ghsa_id: str) -> bool:
+    """Remove ``ghsa_id`` from the persisted npm ack list. Returns True on
+    success. Idempotent — unacking a never-acked ID is a no-op.
+
+    Use this when a previously risk-accepted advisory becomes exploitable
+    again (e.g. you add a feature that uses RSC hydration, or the upstream
+    GHSA range widens to cover your pinned version).
+    """
+    ghsa_id = ghsa_id.strip()
+    if not ghsa_id:
+        return False
+    try:
+        from hermes_cli.config import load_config, save_config
+    except Exception:
+        logger.warning("Could not import config module to remove npm ack")
+        return False
+    try:
+        cfg = load_config()
+        sec = cfg.get("security") or {}
+        existing = sec.get("acked_npm_advisories") or []
+        if not isinstance(existing, list):
+            existing = []
+        if ghsa_id in existing:
+            existing = [g for g in existing if g != ghsa_id]
+            sec["acked_npm_advisories"] = existing
+            save_config(cfg)
+        return True
+    except Exception:
+        logger.exception("Failed to remove npm advisory ack for %s", ghsa_id)
+        return False
+
+
+def unack_advisory(advisory_id: str) -> bool:
+    """Remove ``advisory_id`` from the persisted Python ack list. Returns
+    True on success. Idempotent — Python mirror of :func:`unack_npm_advisory`.
+    """
+    advisory_id = advisory_id.strip()
+    if not advisory_id:
+        return False
+    try:
+        from hermes_cli.config import load_config, save_config
+    except Exception:
+        logger.warning("Could not import config module to remove python ack")
+        return False
+    try:
+        cfg = load_config()
+        sec = cfg.get("security") or {}
+        existing = sec.get("acked_advisories") or []
+        if not isinstance(existing, list):
+            existing = []
+        if advisory_id in existing:
+            existing = [g for g in existing if g != advisory_id]
+            sec["acked_advisories"] = existing
+            save_config(cfg)
+        return True
+    except Exception:
+        logger.exception("Failed to remove python advisory ack for %s", advisory_id)
         return False
 
 

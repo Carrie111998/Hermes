@@ -677,6 +677,7 @@ def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
+    unack_target = getattr(args, 'unack', None)
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
     # checks (like cronjob management) should see the same context as `hermes`.
@@ -688,30 +689,99 @@ def run_doctor(args):
     if ack_target:
         from hermes_cli.security_advisories import (
             ADVISORIES,
+            NPM_ADVISORIES,
             ack_advisory,
+            ack_npm_advisory,
         )
         valid_ids = {a.id for a in ADVISORIES}
-        if ack_target not in valid_ids:
-            print(color(
-                f"Unknown advisory ID: {ack_target!r}. Known IDs: "
-                f"{', '.join(sorted(valid_ids)) or '(none)'}",
-                Colors.RED,
-            ))
-            sys.exit(2)
-        if ack_advisory(ack_target):
-            print(color(
-                f"  ✓ Acknowledged advisory {ack_target}. "
-                f"It will no longer trigger startup banners.",
-                Colors.GREEN,
-            ))
-        else:
-            print(color(
-                f"  ✗ Failed to persist ack for {ack_target}. "
-                f"Check ~/.hermes/config.yaml is writable.",
-                Colors.RED,
-            ))
-            sys.exit(1)
-        return
+        valid_npm_ids = {a.id for a in NPM_ADVISORIES}
+        if ack_target in valid_ids:
+            # Python advisory (e.g. ``shai-hulud-2026-05``).
+            if ack_advisory(ack_target):
+                print(color(
+                    f"  ✓ Acknowledged advisory {ack_target}. "
+                    f"It will no longer trigger startup banners.",
+                    Colors.GREEN,
+                ))
+            else:
+                print(color(
+                    f"  ✗ Failed to persist ack for {ack_target}. "
+                    f"Check ~/.hermes/config.yaml is writable.",
+                    Colors.RED,
+                ))
+                sys.exit(1)
+            return
+        if ack_target in valid_npm_ids:
+            # npm/JS GHSA advisory (e.g. ``GHSA-qwww-vcr4-c8h2``).
+            if ack_npm_advisory(ack_target):
+                print(color(
+                    f"  ✓ Acknowledged npm advisory {ack_target}. "
+                    f"It will no longer trigger startup banners.",
+                    Colors.GREEN,
+                ))
+            else:
+                print(color(
+                    f"  ✗ Failed to persist npm ack for {ack_target}. "
+                    f"Check ~/.hermes/config.yaml is writable.",
+                    Colors.RED,
+                ))
+                sys.exit(1)
+            return
+        # Unknown ID — print both catalogs so the user can find the right one.
+        all_known = sorted(valid_ids | valid_npm_ids)
+        print(color(
+            f"Unknown advisory ID: {ack_target!r}. Known IDs: "
+            f"{', '.join(all_known) or '(none)'}",
+            Colors.RED,
+        ))
+        sys.exit(2)
+
+    if unack_target:
+        from hermes_cli.security_advisories import (
+            ADVISORIES,
+            NPM_ADVISORIES,
+            unack_advisory,
+            unack_npm_advisory,
+        )
+        valid_ids = {a.id for a in ADVISORIES}
+        valid_npm_ids = {a.id for a in NPM_ADVISORIES}
+        if unack_target in valid_ids:
+            if unack_advisory(unack_target):
+                print(color(
+                    f"  ✓ Re-enabled advisory {unack_target}. "
+                    f"It will fire again on future `hermes doctor` runs.",
+                    Colors.GREEN,
+                ))
+            else:
+                print(color(
+                    f"  ✗ Failed to remove ack for {unack_target}. "
+                    f"Check ~/.hermes/config.yaml is writable.",
+                    Colors.RED,
+                ))
+                sys.exit(1)
+            return
+        if unack_target in valid_npm_ids:
+            if unack_npm_advisory(unack_target):
+                print(color(
+                    f"  ✓ Re-enabled npm advisory {unack_target}. "
+                    f"It will fire again on future `hermes doctor` runs.",
+                    Colors.GREEN,
+                ))
+            else:
+                print(color(
+                    f"  ✗ Failed to remove npm ack for {unack_target}. "
+                    f"Check ~/.hermes/config.yaml is writable.",
+                    Colors.RED,
+                ))
+                sys.exit(1)
+            return
+        all_known = sorted(valid_ids | valid_npm_ids)
+        print(color(
+            f"Unknown advisory ID: {unack_target!r}. Known IDs: "
+            f"{', '.join(all_known) or '(none)'}",
+            Colors.RED,
+        ))
+        sys.exit(2)
 
     issues = []
     manual_issues = []  # issues that can't be auto-fixed
@@ -1916,6 +1986,39 @@ def run_doctor(args):
                 high = vuln_count.get("high", 0)
                 moderate = vuln_count.get("moderate", 0)
                 total = critical + high + moderate
+                # Extract GHSA IDs from `via[*].source` and apply npm ack
+                # filtering. npm audit's `source` is a numeric ID (e.g.
+                # ``1124282``) that maps to a GitHub Advisory; we expose the
+                # GHSA via the NPM_ADVISORIES catalog so the doctor can
+                # translate it back into user-facing IDs.
+                try:
+                    from hermes_cli.security_advisories import (
+                        NPM_ADVISORIES,
+                        filter_unacked_npm,
+                    )
+                    # Build numeric-id → GHSA-id mapping for catalog entries.
+                    # Audit JSON uses numeric source IDs, but the catalog
+                    # stores GHSA strings. Reverse-lookup happens via npm
+                    # advisory title match below (advisory.title matches
+                    # via.title).
+                    title_to_ghsa = {a.title: a.id for a in NPM_ADVISORIES}
+                    seen_ghsas: set[str] = set()
+                    for _pkg, vuln in (
+                        audit_data.get("vulnerabilities") or {}
+                    ).items():
+                        for via in vuln.get("via") or []:
+                            if not isinstance(via, dict):
+                                continue
+                            via_title = via.get("title") or ""
+                            ghsa = title_to_ghsa.get(via_title)
+                            if ghsa:
+                                seen_ghsas.add(ghsa)
+                    unacked_ghsas = set(filter_unacked_npm(seen_ghsas))
+                    acked_ghsas = seen_ghsas - unacked_ghsas
+                except Exception:
+                    seen_ghsas = set()
+                    unacked_ghsas = set()
+                    acked_ghsas = set()
                 # Determine a scoped fix command for the remediation hint.
                 if audit_extra and audit_extra[0] == "--workspace":
                     # Detection (`npm audit --workspace <name>`) is read-only and
@@ -1930,8 +2033,39 @@ def run_doctor(args):
                     fix_cmd = f"cd {npm_dir} && npm audit fix --workspaces=false"
                 else:
                     fix_cmd = f"cd {npm_dir} && npm audit fix"
-                if total == 0:
-                    check_ok(f"{label} deps", "(no known vulnerabilities)")
+                # If every cataloged GHSA detected here is acked AND there are no
+                # uncatalogued critical/high remain, surface as clean.
+                #
+                # Note: `npm audit`'s `metadata.vulnerabilities.high` counts
+                # *affected packages* (e.g. react-router + react-router-dom
+                # both report `high` because the latter depends on the
+                # former). We deduplicate by GHSA via the catalog mapping,
+                # so a single root advisory inflating the high count is
+                # expected. The decision rule:
+                #   warn if   critical > 0   (always)
+                #          OR unacked_ghsas has any cataloged GHSA   (always)
+                #          OR uncatalogued GHSA appears in audit       (always)
+                #   else check_ok
+                uncatalogued_high = (
+                    # Audit reports a high but we don't recognize any GHSA
+                    # at all → conservative: keep warning so the user
+                    # notices a new advisory.
+                    bool(high) and not seen_ghsas
+                )
+                all_cataloged_acked = (
+                    bool(seen_ghsas) and not unacked_ghsas
+                )
+                show_as_clean = (
+                    total == 0
+                    or (all_cataloged_acked and critical == 0
+                        and not uncatalogued_high)
+                )
+                if show_as_clean:
+                    ack_note = (
+                        f" ({len(acked_ghsas)} acked via `hermes doctor --ack`)"
+                        if acked_ghsas else ""
+                    )
+                    check_ok(f"{label} deps", f"(no unacked vulnerabilities{ack_note})")
                 elif critical > 0 or high > 0:
                     if fix_cmd:
                         vuln_detail = (
@@ -1946,6 +2080,18 @@ def run_doctor(args):
                         f"{label} deps",
                         f"({vuln_detail})"
                     )
+                    # Surface any unacked GHSAs we recognize so the user knows
+                    # they can `--ack` them after risk review.
+                    if unacked_ghsas:
+                        for ghsa in sorted(unacked_ghsas):
+                            check_info(
+                                f"  → review and ack: hermes doctor --ack {ghsa}"
+                            )
+                    if acked_ghsas:
+                        check_info(
+                            f"  ({len(acked_ghsas)} acked, suppressed — re-show with "
+                            f"`hermes doctor --unack {next(iter(acked_ghsas))}`)"
+                        )
                     if audit_extra and audit_extra[0] == "--workspace":
                         # The web/ui-tui workspace advisories are in build-time
                         # tooling (esbuild/vite, etc.), not runtime code that ships
@@ -1962,10 +2108,14 @@ def run_doctor(args):
                         f"{'vulnerability' if total == 1 else 'vulnerabilities'}"
                     )
                 else:
+                    ack_note = (
+                        f" ({len(acked_ghsas)} acked)"
+                        if acked_ghsas else ""
+                    )
                     check_ok(
                         f"{label} deps",
                         f"({moderate} moderate "
-                        f"{'vulnerability' if moderate == 1 else 'vulnerabilities'})",
+                        f"{'vulnerability' if moderate == 1 else 'vulnerabilities'}{ack_note})",
                     )
             except Exception:
                 pass

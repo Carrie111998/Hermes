@@ -29,7 +29,19 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         help=(
             "Acknowledge a security advisory by ID and exit. After ack, the "
             "advisory will no longer trigger startup banners. Run `hermes "
-            "doctor` first to see active advisories and their IDs."
+            "doctor` first to see active advisories and their IDs. "
+            "Accepts both Python advisory IDs (e.g. `shai-hulud-2026-05`) "
+            "and npm GHSA IDs (e.g. `GHSA-qwww-vcr4-c8h2`)."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--unack",
+        metavar="ADVISORY_ID",
+        default=None,
+        help=(
+            "Reverse an ack previously set via `--ack`: re-enable the "
+            "advisory so it appears in future `hermes doctor` runs. "
+            "Accepts both Python and npm advisory IDs."
         ),
     )
     doctor_parser.set_defaults(func=cmd_doctor)
