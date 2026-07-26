@@ -2463,8 +2463,10 @@ class SessionDB:
             self._fts_cjk_available = False
             return
 
+        savepoint = "hermes_fts_cjk_ensure"
+        cursor.execute(f"SAVEPOINT {savepoint}")
         try:
-            cursor.executescript(FTS_CJK_TABLE_SQL)
+            self._execute_ddl_statements(cursor, FTS_CJK_TABLE_SQL)
             if not cjk_present:
                 # Freshly created. An empty DB's index is complete by
                 # construction (triggers will cover every future row); a
@@ -2504,14 +2506,18 @@ class SessionDB:
                 # for an unindexed rowid corrupts the index); the next
                 # `optimize-storage` run rebuilds from scratch.
                 self._fts_cjk_available = False
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            self._execute_ddl_statements(cursor, FTS_CJK_TRIGGER_SQL)
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
             ).fetchone()
             self._fts_cjk_available = not backfill_pending
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
         except sqlite3.OperationalError:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             # Includes "no such tokenizer: cjk_unicode61" if the extension
             # loaded but registration failed — degrade to trigram/LIKE.
             logger.warning(
@@ -2519,6 +2525,10 @@ class SessionDB:
                 "trigram/LIKE", exc_info=True,
             )
             self._fts_cjk_available = False
+        except BaseException:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
 
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
@@ -2807,6 +2817,16 @@ class SessionDB:
             "DELETE FROM state_meta WHERE key IN "
             "('fts_rebuild_high_water', 'fts_rebuild_progress')"
         )
+
+    @staticmethod
+    def _rebuild_current_fts_table(
+        cursor: sqlite3.Cursor,
+        table_name: str,
+    ) -> None:
+        """Backfill one newly recreated current external-content table."""
+        if table_name not in ("messages_fts", "messages_fts_trigram"):
+            raise ValueError(f"unsupported FTS table: {table_name}")
+        cursor.execute(f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')")
 
     @staticmethod
     def _rebuild_legacy_fts_indexes(
@@ -4254,6 +4274,12 @@ class SessionDB:
                                 cursor, include_trigram=trigram_enabled
                             )
             else:
+                base_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts") is False
+                )
+                trigram_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts_trigram") is False
+                )
                 migration_ddl = FTS_SQL + "\n" + FTS_TRIGRAM_SQL
                 if self._fts_cjk_loaded:
                     migration_ddl += "\n" + FTS_CJK_TRIGGER_SQL
@@ -4282,6 +4308,18 @@ class SessionDB:
                             cursor,
                             include_trigram=trigram_enabled,
                         )
+                    else:
+                        # An intact trigger set does not prove a recreated
+                        # virtual table contains historical rows. Backfill each
+                        # newly created current table before exposing search.
+                        if base_table_missing:
+                            self._rebuild_current_fts_table(
+                                cursor, "messages_fts"
+                            )
+                        if trigram_table_missing and trigram_enabled:
+                            self._rebuild_current_fts_table(
+                                cursor, "messages_fts_trigram"
+                            )
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)

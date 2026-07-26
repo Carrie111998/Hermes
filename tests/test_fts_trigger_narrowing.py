@@ -1041,6 +1041,138 @@ DROP TABLE IF EXISTS messages_fts;
             ).fetchall() == [(message_id,)]
 
 
+@pytest.mark.parametrize("missing_table", ["messages_fts", "messages_fts_trigram"])
+def test_missing_current_table_is_backfilled_with_intact_triggers(
+    db_path, missing_table
+):
+    """Recreating a dropped current FTS table must restore historical rows."""
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("missing-table", "test")
+    message_id = seeded.append_message(
+        "missing-table", "user", content="durable searchable history"
+    )
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        trigger_count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'messages_fts%_insert'"
+        ).fetchone()[0]
+        assert trigger_count >= 2
+        conn.execute(f"DROP TABLE {missing_table}")
+
+    restored = SessionDB(db_path=db_path)
+    try:
+        with restored._lock:
+            rows = restored._conn.execute(
+                f"SELECT rowid FROM {missing_table} "
+                f"WHERE {missing_table} MATCH 'searchable'"
+            ).fetchall()
+            assert [row[0] for row in rows] == [message_id]
+    finally:
+        restored.close()
+
+
+def test_cjk_schema_ensure_keeps_writer_out_until_triggers_exist(
+    db_path, monkeypatch
+):
+    """CJK table creation cannot commit before its maintenance triggers."""
+    import hermes_state
+    from hermes_state import SessionDB
+
+    table_sql = hermes_state.FTS_CJK_TABLE_SQL.replace(
+        "cjk_unicode61", "unicode61"
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, content TEXT, tool_name TEXT, tool_calls TEXT, "
+            "role TEXT, active INTEGER, compacted INTEGER)"
+        )
+        conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+
+    reached_trigger_ddl = threading.Event()
+    release_ensure = threading.Event()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+    result: dict[str, object] = {}
+    original_execute_ddl = SessionDB._execute_ddl_statements
+
+    def paused_execute_ddl(cursor, ddl):
+        if ddl == hermes_state.FTS_CJK_TRIGGER_SQL:
+            assert cursor.connection.in_transaction
+            reached_trigger_ddl.set()
+            assert release_ensure.wait(5), "test did not release CJK ensure"
+        return original_execute_ddl(cursor, ddl)
+
+    monkeypatch.setattr(hermes_state, "FTS_CJK_TABLE_SQL", table_sql)
+    monkeypatch.setattr(
+        SessionDB, "_execute_ddl_statements", staticmethod(paused_execute_ddl)
+    )
+
+    def ensure() -> None:
+        try:
+            with sqlite3.connect(
+                str(db_path), timeout=5.0, isolation_level=None
+            ) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                db = SessionDB.__new__(SessionDB)
+                db._fts_cjk_loaded = True
+                db._fts_cjk_available = False
+                db._ensure_fts_cjk_schema(conn.cursor())
+                result["available"] = db._fts_cjk_available
+                conn.commit()
+        except BaseException as exc:
+            result["ensure_error"] = exc
+
+    def write() -> None:
+        writer_started.set()
+        try:
+            with sqlite3.connect(str(db_path), timeout=5.0) as conn:
+                conn.execute(
+                    "INSERT INTO messages VALUES "
+                    "(1, 'atomic cjk needle', '', '', 'user', 1, 0)"
+                )
+                conn.commit()
+        except BaseException as exc:
+            result["writer_error"] = exc
+        finally:
+            writer_done.set()
+
+    initializer = threading.Thread(target=ensure, daemon=True)
+    initializer.start()
+    assert reached_trigger_ddl.wait(5), "CJK ensure never reached trigger DDL"
+
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    assert writer_started.wait(2)
+    assert not writer_done.wait(0.25), "writer bypassed triggerless CJK interval"
+
+    release_ensure.set()
+    initializer.join(10)
+    writer.join(10)
+    assert not initializer.is_alive()
+    assert not writer.is_alive()
+    assert "ensure_error" not in result, result.get("ensure_error")
+    assert "writer_error" not in result, result.get("writer_error")
+    assert result.get("available") is True
+
+    with sqlite3.connect(str(db_path)) as conn:
+        triggers = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchone()[0]
+        hits = conn.execute(
+            "SELECT rowid FROM messages_fts_cjk "
+            "WHERE messages_fts_cjk MATCH 'atomic'"
+        ).fetchall()
+        assert triggers == 3
+        assert hits == [(1,)]
+
+
 def test_capable_cjk_open_marks_missing_trigger_gap_stale(monkeypatch):
     """A missing CJK trigger means an unknown index gap, never safe service."""
     import hermes_state
