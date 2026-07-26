@@ -110,9 +110,11 @@ TOOLSETS = {
     "x_search": {
         "description": (
             "Search X (Twitter) posts and threads via xAI's built-in "
-            "x_search Responses tool. Available when xAI credentials are "
-            "configured (SuperGrok OAuth or XAI_API_KEY). Off by default; "
-            "enable in `hermes tools` → X (Twitter) Search."
+            "x_search Responses tool. Read-only public X discovery; use the "
+            "xurl skill for authenticated X API reads and account actions. "
+            "Available when xAI credentials are configured (SuperGrok OAuth "
+            "or XAI_API_KEY). Off by default; enable in `hermes tools` → "
+            "X (Twitter) Search."
         ),
         "tools": ["x_search"],
         "includes": []
@@ -225,6 +227,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "slack": {
+        "description": "Read bounded history from the active Slack conversation",
+        "tools": ["slack_history"],
+        "includes": []
+    },
+
     "project": {
         "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
         "tools": ["project_list", "project_create", "project_switch"],
@@ -287,12 +295,6 @@ TOOLSETS = {
     "discord_admin": {
         "description": "Discord server management (list channels/roles, pin messages, assign roles)",
         "tools": ["discord_admin"],
-        "includes": [],
-    },
-
-    "slack_history": {
-        "description": "Slack read-only active-conversation history and thread retrieval",
-        "tools": ["slack"],
         "includes": [],
     },
 
@@ -475,7 +477,7 @@ TOOLSETS = {
     
     "hermes-slack": {
         "description": "Slack bot toolset - full access for workspace use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["slack_history"],
         "includes": []
     },
     

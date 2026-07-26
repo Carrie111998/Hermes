@@ -69,13 +69,13 @@ Or in-session:
 | `context_engine` | (varies) | Runtime tools exposed by the active context-engine plugin (empty until a plugin populates it). |
 | `image_gen` | `image_generate` | Text-to-image generation via FAL.ai (with opt-in OpenAI / xAI backends). |
 | `video_gen` | `video_generate` | Text-to-video and image-to-video via plugin-registered backends (xAI Grok-Imagine, FAL.ai Veo 3.1 / Pixverse v6 / Kling O3). Pass `image_url` to animate an image; omit it for text-to-video. |
-| `kanban` | `kanban_block`, `kanban_comment`, `kanban_complete`, `kanban_create`, `kanban_heartbeat`, `kanban_link`, `kanban_list`, `kanban_show`, `kanban_unblock` | Multi-agent coordination tools. Registered for dispatcher-spawned task workers (`HERMES_KANBAN_TASK`) and for profiles that explicitly list the `kanban` toolset by name (the `all`/`*` wildcard does **not** enable it). Workers mark tasks done, block, heartbeat, comment, and create/link follow-up tasks; orchestrator profiles additionally get board-routing tools like list/unblock. |
+| `kanban` | `kanban_block`, `kanban_comment`, `kanban_complete`, `kanban_create`, `kanban_heartbeat`, `kanban_link`, `kanban_list`, `kanban_show`, `kanban_unblock` | Multi-agent coordination tools. Registered for dispatcher-spawned task workers (`HERMES_KANBAN_TASK`) and for profiles that explicitly list the `kanban` toolset by name (the `all`/`*` wildcard does **not** enable it). Workers mark tasks done, block, heartbeat, comment, and create/link follow-up tasks; orchestrator profiles additionally get board-routing tools like list/unblock. `delegate_task` children are not Kanban run owners: their schema strips/disables this toolset and runtime guards reject direct board mutations, even if parent `HERMES_KANBAN_*` env vars are present. |
 | `memory` | `memory` | Persistent cross-session memory management. |
 | `project` | `project_create`, `project_list`, `project_switch` | Create and switch desktop [Projects](../user-guide/cli.md) (named, multi-folder workspaces). GUI / desktop sessions only. |
 | `safe` | `image_generate`, `vision_analyze`, `web_extract`, `web_search` (via `includes`) | Read-only research + media generation. No file writes, no terminal, no code execution. |
 | `search` | `web_search` | Web search only (without extract). |
 | `session_search` | `session_search` | Search past conversation sessions. |
-| `slack_history` | `slack` | Opt-in, read-only history for the active Slack conversation by default. From a directly delivered 1:1 DM, configured owners may read same-workspace member channels. Available only on the Slack platform. |
+| `slack` | `slack_history` | Read bounded history from the active Slack conversation. |
 | `skills` | `skill_manage`, `skill_view`, `skills_list` | Skill CRUD and browsing. |
 | `spotify` | `spotify_albums`, `spotify_devices`, `spotify_library`, `spotify_playback`, `spotify_playlists`, `spotify_queue`, `spotify_search` | Native Spotify control (playback, queue, search, playlists, albums, library). Registered by the bundled `spotify` plugin. |
 | `terminal` | `process`, `terminal` | Shell command execution and background process management. |
@@ -84,7 +84,7 @@ Or in-session:
 | `vision` | `vision_analyze` | Image analysis via vision-capable models. |
 | `video` | `video_analyze` | Video analysis and understanding tools (opt-in, not in the default toolset — add explicitly via `--toolsets`). |
 | `web` | `web_extract`, `web_search` | Web search and page content extraction. |
-| `x_search` | `x_search` | Search X (Twitter) posts and threads via xAI's built-in `x_search` Responses tool. Off by default; opt in via `hermes tools`. Schema only registered when xAI credentials (SuperGrok OAuth or `XAI_API_KEY`) are configured. |
+| `x_search` | `x_search` | Read-only public X discovery via xAI's built-in `x_search` Responses tool. Use the `xurl` skill for authenticated X API reads and account actions. Off by default; opt in via `hermes tools`. Schema only registered when xAI credentials (SuperGrok OAuth or `XAI_API_KEY`) are configured. |
 | `yuanbao` | `yb_query_group_info`, `yb_query_group_members`, `yb_search_sticker`, `yb_send_dm`, `yb_send_sticker` | Yuanbao DM/group actions and sticker search. Registered only on `hermes-yuanbao`. |
 
 ## Platform Toolsets
@@ -99,7 +99,7 @@ Platform toolsets define the complete tool configuration for a deployment target
 | `hermes-cron` | Same as `hermes-cli`. |
 | `hermes-telegram` | Same as `hermes-cli`. |
 | `hermes-discord` | Adds `discord` and `discord_admin` on top of `hermes-cli`. |
-| `hermes-slack` | Same as `hermes-cli`. Add the separate `slack_history` toolset to opt into active-conversation history reads. |
+| `hermes-slack` | Adds read-only `slack_history` on top of `hermes-cli`. |
 | `hermes-whatsapp` | Same as `hermes-cli`. |
 | `hermes-signal` | Same as `hermes-cli`. |
 | `hermes-matrix` | Same as `hermes-cli`. |

@@ -1,2 +1,2 @@
 NaMinhyeok
-# PR #54535 continuation (Slack history scope hardening)
+# PR #54535 contributor attribution

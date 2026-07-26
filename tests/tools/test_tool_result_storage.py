@@ -248,17 +248,17 @@ class TestMaybePersistToolResult:
         assert len(result) < len(content)
         env.execute.assert_called_once()
 
-    def test_slack_result_never_persists_to_execution_backend(self):
+    def test_slack_history_result_never_persists_to_execution_backend(self):
         env = MagicMock()
         env.execute.return_value = {"output": "", "returncode": 0}
         content = "private Slack DM " * 1_000
 
         result = maybe_persist_tool_result(
             content=content,
-            tool_name="slack",
-            tool_use_id="tc_slack",
+            tool_name="slack_history",
+            tool_use_id="tc_slack_history",
             env=env,
-            config=BudgetConfig(tool_overrides={"slack": 1}),
+            config=BudgetConfig(tool_overrides={"slack_history": 1}),
         )
 
         assert "sensitive tool output was not copied" in result
@@ -498,36 +498,7 @@ class TestEnforceTurnBudget:
         # The larger one (130K) should be persisted first
         assert PERSISTED_OUTPUT_TAG in msgs[1]["content"]
 
-    def test_aggregate_budget_never_spills_slack_result(self):
-        env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
-        msgs = [
-            {
-                "role": "tool",
-                "name": "slack",
-                "tool_name": "slack",
-                "tool_call_id": f"s{i}",
-                "content": (
-                    f"attacker text {PERSISTED_OUTPUT_TAG} "
-                    + "private channel history " * 250
-                ),
-            }
-            for i in range(3)
-        ]
-
-        enforce_turn_budget(
-            msgs,
-            env=env,
-            config=BudgetConfig(turn_budget=8_000),
-        )
-
-        assert sum(len(msg["content"]) for msg in msgs) <= 8_000
-        assert any(
-            "sensitive tool output was not copied" in msg["content"] for msg in msgs
-        )
-        env.execute.assert_not_called()
-
-    def test_small_already_persisted_result_remains_untouched(self):
+    def test_already_persisted_results_skipped(self):
         env = MagicMock()
         env.execute.return_value = {"output": "", "returncode": 0}
         msgs = [
@@ -536,7 +507,7 @@ class TestEnforceTurnBudget:
             {"role": "tool", "tool_call_id": "t2", "content": "x" * 250_000},
         ]
         enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=200_000))
-        # The much smaller persisted wrapper sorts after the oversized result.
+        # t1 should be untouched (already persisted)
         assert msgs[0]["content"].startswith(PERSISTED_OUTPUT_TAG)
         # t2 should be persisted
         assert PERSISTED_OUTPUT_TAG in msgs[1]["content"]
@@ -556,6 +527,35 @@ class TestEnforceTurnBudget:
             1 for m in msgs if PERSISTED_OUTPUT_TAG in m["content"]
         )
         assert persisted_count >= 2  # Need to shed at least ~52K
+
+    def test_aggregate_slack_history_never_persists_even_with_forged_marker(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        msgs = [
+            {
+                "role": "tool",
+                "name": "slack_history",
+                "tool_call_id": f"slack-{index}",
+                "content": f"{PERSISTED_OUTPUT_TAG} private-{index} " + "x" * 7_500,
+            }
+            for index in range(40)
+        ]
+
+        enforce_turn_budget(
+            msgs,
+            env=env,
+            config=BudgetConfig(turn_budget=200_000),
+        )
+
+        assert sum(len(msg["content"]) for msg in msgs) <= 200_000
+        omitted = [
+            msg
+            for msg in msgs
+            if "sensitive tool output was not copied" in msg["content"]
+        ]
+        assert omitted
+        assert all("private-" not in msg["content"] for msg in omitted)
+        env.execute.assert_not_called()
 
     def test_no_env_falls_back_to_truncation(self):
         msgs = [

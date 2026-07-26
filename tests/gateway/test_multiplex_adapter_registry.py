@@ -457,7 +457,6 @@ class TestSecondaryProfileConfigHandling:
         runner.config = GatewayConfig(multiplex_profiles=True)
         runner.adapters = {}
         runner._profile_adapters = {}
-        runner._primary_profile_name = "default"
 
         async def fake_start_one(profile_name, profile_home, claimed):
             if profile_name == "bad":
@@ -473,6 +472,10 @@ class TestSecondaryProfileConfigHandling:
                 ("bad", Path("/tmp/bad")),
                 ("good", Path("/tmp/good")),
             ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
         )
         monkeypatch.setattr(runner, "_start_one_profile_adapters", fake_start_one)
         monkeypatch.setattr(
@@ -498,7 +501,6 @@ class TestSecondaryProfileConfigHandling:
         runner.config = GatewayConfig(multiplex_profiles=True)
         runner.adapters = {}
         runner._profile_adapters = {}
-        runner._primary_profile_name = "default"
 
         async def fake_start_one(profile_name, profile_home, claimed):
             raise MultiplexConfigError(
@@ -511,6 +513,10 @@ class TestSecondaryProfileConfigHandling:
                 ("default", Path("/tmp/default")),
                 ("unsafe", Path("/tmp/unsafe")),
             ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
         )
         monkeypatch.setattr(runner, "_start_one_profile_adapters", fake_start_one)
 

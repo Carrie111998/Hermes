@@ -139,7 +139,6 @@ class TestGatewayQuickCommands:
         event.get_command.return_value = command
         event.get_command_args.return_value = args
         event.text = f"/{command} {args}".strip()
-        event.internal = False
         event.source = MagicMock()
         event.source.user_id = "test_user"
         event.source.user_name = "Test User"

@@ -12,7 +12,7 @@ import pytest
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource, session_routing_source
+from gateway.session import SessionSource
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -115,6 +115,59 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class RetryableFirstEditProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Fail one progress edit transiently, then accept later edits."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.edit_outcomes = []
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        if not self.edit_outcomes:
+            self.edit_outcomes.append(False)
+            return SendResult(
+                success=False,
+                error="temporary network failure",
+                retryable=True,
+                error_kind="transient",
+            )
+        self.edit_outcomes.append(True)
+        return SendResult(success=True, message_id=message_id)
+
+
+class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
+    """Fail the first split edit transiently, then keep editing."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.retryable_edit_failures = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        if self.retryable_edit_failures == 0:
+            self.retryable_edit_failures += 1
+            self.edits.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                }
+            )
+            return SendResult(
+                success=False,
+                error="temporary network failure",
+                retryable=True,
+                error_kind="transient",
+            )
+        return await super().edit_message(chat_id, message_id, content)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -196,6 +249,31 @@ class DelayedProgressAgent:
         time.sleep(0.45)
         self.tool_progress_callback("tool.started", "terminal", "second command", {})
         time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class RetryableEditProgressAgent:
+    """Keep the turn alive long enough to retry the same progress bubble."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        callback = self.tool_progress_callback
+        assert callback is not None
+        callback("tool.started", "terminal", "first command", {})
+        time.sleep(0.5)
+        callback("tool.started", "terminal", "second command", {})
+        time.sleep(1.7)
+        callback("tool.started", "terminal", "third command", {})
+        time.sleep(0.5)
+        callback("tool.started", "terminal", "fourth command", {})
+        time.sleep(0.6)
         return {
             "final_response": "done",
             "messages": [],
@@ -443,8 +521,12 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
-    assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
+    expected_metadata = {
+        "thread_id": "1234567890.000001",
+        "message_id": "1234567890.000001",
+    }
+    assert adapter.sent[0]["metadata"] == expected_metadata
+    assert all(call["metadata"] == expected_metadata for call in adapter.typing)
 
 
 @pytest.mark.asyncio
@@ -697,23 +779,6 @@ class QueuedCommentaryAgent:
         }
 
 
-class QueuedSlackProvenanceAgent:
-    seen_direct_slack: list[bool] = []
-
-    def __init__(self, **kwargs):
-        self.tools = []
-
-    def run_conversation(self, message, conversation_history=None, task_id=None):
-        from gateway.session_context import direct_slack_session
-
-        type(self).seen_direct_slack.append(direct_slack_session())
-        return {
-            "final_response": f"turn {len(type(self).seen_direct_slack)}",
-            "messages": [],
-            "api_calls": 1,
-        }
-
-
 class QueuedSilenceAgent:
     """First turn is intentionally silent; queued follow-up still runs."""
 
@@ -852,6 +917,67 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_retryable_progress_edit_keeps_same_message_id(monkeypatch, tmp_path):
+    """A transient edit failure must not create a replacement progress bubble."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RetryableEditProgressAgent,
+        session_id="sess-progress-retry-same-message",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="direct",
+        thread_id="1700000000.000100",
+        adapter_cls=RetryableFirstEditProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, RetryableFirstEditProgressCaptureAdapter)
+    assert len(adapter.sent) == 1
+    assert adapter.edit_outcomes[0] is False
+    assert any(adapter.edit_outcomes[1:])
+    assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
+    assert "fourth command" in adapter.edits[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatch, tmp_path):
+    """A transient split edit must retain can_edit and the current message ID."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ManyProgressLinesAgent,
+        session_id="sess-progress-retry-overflow-same-message",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="direct",
+        thread_id="1700000000.000100",
+        adapter_cls=RetryableOverflowEditProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, RetryableOverflowEditProgressAdapter)
+    assert adapter.retryable_edit_failures == 1
+    assert len(adapter.sent) >= 2
+    assert adapter.edits[0]["message_id"] == "progress-1"
+    assert any(call["message_id"] == "progress-1" for call in adapter.edits[1:])
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
 
 
 @pytest.mark.asyncio
@@ -1147,70 +1273,6 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
     assert "final response 1" in sent_texts
-
-
-@pytest.mark.asyncio
-async def test_queued_synthetic_slack_turn_rebinds_direct_provenance(monkeypatch, tmp_path):
-    """A queued synthetic turn cannot borrow the live Slack turn's read grant."""
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    QueuedSlackProvenanceAgent.seen_direct_slack = []
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = QueuedSlackProvenanceAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    adapter = ProgressCaptureAdapter(platform=Platform.SLACK)
-    runner = _make_runner(adapter)
-    runner._goal_still_active_for_session = lambda _session_id: True
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs",
-        lambda: {"api_key": "***"},
-    )
-
-    source = SessionSource(
-        platform=Platform.SLACK,
-        chat_id="C123",
-        chat_type="channel",
-        scope_id="T123",
-        delivered_via_direct_slack_adapter=True,
-    )
-    session_key = "agent:main:slack:channel:C123"
-    adapter._pending_messages[session_key] = MessageEvent(
-        text="[Continuing toward your standing goal]\nGoal: finish",
-        message_type=MessageType.TEXT,
-        source=session_routing_source(source),
-        message_id="queued-goal-1",
-    )
-
-    from gateway.session_context import clear_session_vars, set_session_vars
-
-    tokens = set_session_vars(
-        platform="slack",
-        chat_id="C123",
-        scope_id="T123",
-        session_key=session_key,
-        direct_slack=True,
-    )
-    try:
-        result = await runner._run_agent(
-            message="live inbound",
-            context_prompt="",
-            history=[],
-            source=source,
-            session_id="sess-slack-provenance",
-            session_key=session_key,
-        )
-    finally:
-        clear_session_vars(tokens)
-
-    assert result["final_response"] == "turn 2"
-    assert QueuedSlackProvenanceAgent.seen_direct_slack == [True, False]
 
 
 @pytest.mark.asyncio
@@ -1853,3 +1915,48 @@ async def test_run_agent_suppresses_thinking_when_thinking_off(monkeypatch, tmp_
         [c["content"] for c in adapter.sent] + [c["content"] for c in adapter.edits]
     )
     assert "weighing the options here" not in blob
+
+
+class TestSlackReplyInThreadProgressRouting:
+    """#18859: reply_in_thread=false must stop progress from creating threads."""
+
+    def test_slack_reply_in_thread_false_drops_synthetic_thread(self):
+        from gateway.run import _resolve_progress_thread_id
+
+        # source.thread_id == event ts is the adapter's synthetic
+        # session-keying thread for top-level messages — not a real thread.
+        assert _resolve_progress_thread_id(
+            Platform.SLACK,
+            source_thread_id="1700000000.000100",
+            event_message_id="1700000000.000100",
+            reply_in_thread=False,
+        ) is None
+
+    def test_slack_reply_in_thread_false_keeps_real_thread(self):
+        from gateway.run import _resolve_progress_thread_id
+
+        assert _resolve_progress_thread_id(
+            Platform.SLACK,
+            source_thread_id="1700000000.000100",
+            event_message_id="1700000000.000500",
+            reply_in_thread=False,
+        ) == "1700000000.000100"
+
+    def test_slack_reply_in_thread_false_skips_event_id_fallback(self):
+        from gateway.run import _resolve_progress_thread_id
+
+        assert _resolve_progress_thread_id(
+            Platform.SLACK,
+            source_thread_id=None,
+            event_message_id="1700000000.000100",
+            reply_in_thread=False,
+        ) is None
+
+    def test_slack_default_keeps_event_id_fallback(self):
+        from gateway.run import _resolve_progress_thread_id
+
+        assert _resolve_progress_thread_id(
+            Platform.SLACK,
+            source_thread_id=None,
+            event_message_id="1700000000.000100",
+        ) == "1700000000.000100"

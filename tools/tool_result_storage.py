@@ -18,8 +18,8 @@ Defense against context-window overflow operates at three levels:
 3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
    results in a single assistant turn are collected, if the total exceeds
    MAX_TURN_BUDGET_CHARS (200K), the largest results are reduced until the
-   aggregate is under budget. Ordinary results spill to
-   disk; privacy-sensitive results are omitted without a backend write.
+   aggregate is under budget. Ordinary results spill to disk; privacy-sensitive
+   results are omitted without a backend write.
 """
 
 import hashlib
@@ -43,11 +43,10 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
-# Slack history may contain private channel or DM data. It is bounded at the
-# tool boundary and may be sent to the model in-context, but it must never be
-# copied into the active execution backend (which may be Docker, SSH, Modal,
-# or another environment with different storage/retention guarantees).
-_NO_SANDBOX_PERSIST_TOOL_NAMES = frozenset({"slack"})
+# Slack history may contain private channel or DM data. It is bounded for model
+# context, but must not be copied into a Docker, SSH, Modal, or other execution
+# backend with separate storage and retention guarantees.
+_NO_SANDBOX_PERSIST_TOOL_NAMES = frozenset({"slack_history"})
 
 
 def _no_persist_omission(tool_name: str, original_size: int) -> str:
@@ -230,8 +229,8 @@ def enforce_turn_budget(
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
-    If total chars exceed budget, reduce the largest results first until under
-    budget. Content markers are not trusted to opt a result out of accounting.
+    If total chars exceed budget, reduce the largest eligible results first.
+    Privacy-sensitive tool output is omitted without an execution-backend write.
 
     Mutates the list in-place and returns it.
     """
@@ -241,12 +240,12 @@ def enforce_turn_budget(
         content = msg.get("content", "")
         size = len(content)
         total_size += size
-        # Content is never trusted to self-identify as already persisted: an
-        # external tool result can forge the persisted-output marker. Include
-        # every string result. Genuine persisted wrappers are small and will
-        # naturally sort behind the large results that caused the overflow.
         tool_name = msg.get("name") or msg.get("tool_name") or _BUDGET_TOOL_NAME
-        candidates.append((i, size, tool_name))
+        if (
+            tool_name in _NO_SANDBOX_PERSIST_TOOL_NAMES
+            or PERSISTED_OUTPUT_TAG not in content
+        ):
+            candidates.append((i, size, tool_name))
 
     if total_size <= config.turn_budget:
         return tool_messages
