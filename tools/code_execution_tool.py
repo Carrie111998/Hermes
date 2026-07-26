@@ -1036,6 +1036,7 @@ def _execute_remote(
     exec_start = time.monotonic()
     stop_event = threading.Event()
     rpc_thread = None
+    _scrub_note = ""
 
     try:
         # Verify Python is available on the remote
@@ -1092,6 +1093,26 @@ def _execute_remote(
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
+
+        # The remote script inherits only the RPC prefix above — no provider
+        # credentials from this process are shipped to the remote backend, so
+        # they are all effectively scrubbed from the child's perspective.
+        # Compute the DX note from this path's own env (an empty child env),
+        # not by reaching into execute_code's locals() across function scopes.
+        _scrub_note = ""
+        try:
+            from tools.env_passthrough import (
+                format_scrubbed_provider_env_note,
+                list_scrubbed_provider_credentials,
+            )
+            _scrub_note = format_scrubbed_provider_env_note(
+                list_scrubbed_provider_credentials(os.environ, {})
+            )
+        except Exception:
+            logger.debug(
+                "Failed to compute credential scrub note (remote path)",
+                exc_info=True,
+            )
 
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
@@ -1164,15 +1185,11 @@ def _execute_remote(
         "duration_seconds": duration,
     }
     result.update(stdout_metadata)
-    try:
-        _note = locals().get("_scrub_note") or ""
-        if _note:
-            result["credential_scrub_note"] = _note
-            out = result.get("output") or ""
-            if _note not in out:
-                result["output"] = (out + ("\n\n" if out else "") + _note)
-    except Exception:
-        pass
+    if _scrub_note:
+        result["credential_scrub_note"] = _scrub_note
+        out = result.get("output") or ""
+        if _scrub_note not in out:
+            result["output"] = (out + ("\n\n" if out else "") + _scrub_note)
 
     if status == "timeout":
         timeout_msg = f"Script timed out after {timeout}s and was killed."
@@ -1387,6 +1404,10 @@ def execute_code(
                 list_scrubbed_provider_credentials(os.environ, child_env)
             )
         except Exception:
+            logger.debug(
+                "Failed to compute credential scrub note (local path)",
+                exc_info=True,
+            )
             _scrub_note = ""
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
@@ -1607,6 +1628,11 @@ def execute_code(
             "duration_seconds": duration,
         }
         result.update(stdout_metadata)
+        if _scrub_note:
+            result["credential_scrub_note"] = _scrub_note
+            _out = result.get("output") or ""
+            if _scrub_note not in _out:
+                result["output"] = (_out + ("\n\n" if _out else "") + _scrub_note)
 
         if status == "timeout":
             timeout_msg = f"Script timed out after {timeout}s and was killed."

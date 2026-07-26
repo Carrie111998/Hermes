@@ -2986,6 +2986,13 @@ def terminal_tool(
                 )
                 # Compare parent process env vs what LocalEnvironment would keep
                 # for a fresh local run without extra skill overrides.
+                #
+                # NOTE: this is an approximation — _make_run_env({}) recomputes
+                # the scrubbed set for a baseline run rather than reading back
+                # the exact env the child actually saw. If a skill added a
+                # passthrough/override for this run, the preview could diverge
+                # from reality. Acceptable for a DX note; the set of scrubbed
+                # provider credentials is stable across runs in practice.
                 from tools.environments.local import _make_run_env
 
                 child_preview = _make_run_env({})
