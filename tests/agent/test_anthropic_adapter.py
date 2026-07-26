@@ -1190,6 +1190,80 @@ class TestConvertMessages:
         assert tool_use["id"] == "tc_1"
         assert tool_use["cache_control"] == {"type": "ephemeral"}
 
+    def test_tool_result_text_only_parts_are_not_json_serialized(self):
+        """After compaction prunes a screenshot, a tool result's content is a
+        text-only parts LIST (_strip_image_parts_from_parts swaps the image for
+        a text placeholder and keeps the list). Gating the converted blocks on
+        "did an image survive" threw that list away and fell through to
+        json.dumps(), so the model read its own tool output as a serialized
+        array with every newline escaped."""
+        tool_text = "$ pytest -q\n....F...\nFAILED tests/test_auth.py::test_login"
+        messages = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "run the tests"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "content": [
+                    {"type": "text", "text": tool_text},
+                    {"type": "text", "text": "[screenshot removed to save context]"},
+                ],
+            },
+        ]
+
+        _system, converted = convert_messages_to_anthropic(messages)
+        result = next(
+            b
+            for m in converted
+            for b in (m.get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        )
+        content = result["content"]
+        assert isinstance(content, list), (
+            "text-only tool-result parts were JSON-serialized onto the wire"
+        )
+        assert content[0]["type"] == "text"
+        # The real output must survive verbatim, newlines intact.
+        assert content[0]["text"] == tool_text
+
+    def test_tool_result_plain_string_content_is_unchanged(self):
+        """Negative control: an ordinary string tool result still goes out as a
+        plain string, and an empty one still gets the placeholder."""
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "plain output"},
+        ]
+        _system, converted = convert_messages_to_anthropic(messages)
+        result = next(
+            b
+            for m in converted
+            for b in (m.get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        )
+        assert result["content"] == "plain output"
+
     def test_ordered_replay_tool_use_cache_control_is_preserved(self):
         messages = apply_anthropic_cache_control([
             {"role": "system", "content": "System prompt"},

@@ -2186,7 +2186,15 @@ def _convert_tool_message_to_result(
             ]
     elif isinstance(content, list):
         converted = _content_parts_to_anthropic_blocks(content)
-        if any(b.get("type") == "image" for b in converted):
+        # Keep the converted blocks whether or not an image survived. A
+        # text-only parts list is the normal shape after compaction prunes a
+        # screenshot (_strip_image_parts_from_parts swaps the image for a text
+        # placeholder and keeps the list), and Anthropic accepts a text-block
+        # list as tool_result content. Gating on an image dropped that list on
+        # the floor and fell through to json.dumps() below, so the model read
+        # its own tool output as a serialized array with the newlines escaped.
+        # An empty conversion still falls through to the existing fallback.
+        if converted:
             multimodal_blocks = converted
     # Back-compat: some callers stash blocks under a private key.
     if multimodal_blocks is None:
