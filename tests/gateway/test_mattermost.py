@@ -1,6 +1,7 @@
 """Tests for Mattermost platform adapter."""
 import json
 import os
+import subprocess
 import time
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -234,6 +235,247 @@ class TestMattermostFormatMessage:
         assert "![" not in result
         assert "http://a.com/1.png" in result
         assert "http://b.com/2.png" in result
+
+
+class TestMattermostHiggsfieldBypassDetection:
+    def test_detects_nano_banana_pro_job_type(self):
+        from plugins.platforms.mattermost.adapter import _detect_higgsfield_image_job_type
+
+        assert _detect_higgsfield_image_job_type("모델: Nano Banana 2 Pro") == "nano_banana_pro"
+
+    def test_detects_seedream_job_type(self):
+        from plugins.platforms.mattermost.adapter import _detect_higgsfield_image_job_type
+
+        assert _detect_higgsfield_image_job_type("Seedream 4.5로 얼굴 유지") == "seedream_v4_5"
+        assert _detect_higgsfield_image_job_type("Seedream 5.0 Pro로 고품질 이미지") == "seedream_v5_pro"
+
+    def test_image_edit_requires_image_attachment(self):
+        from plugins.platforms.mattermost.adapter import _looks_like_higgsfield_image_edit_request
+
+        text = "Nano Banana 2 Pro 요청: 옷만 정장으로 변경"
+        assert _looks_like_higgsfield_image_edit_request(text, has_image=True) is True
+        assert _looks_like_higgsfield_image_edit_request(text, has_image=False) is False
+
+    def test_extracts_aspect_and_resolution(self):
+        from plugins.platforms.mattermost.adapter import _extract_higgsfield_generation_params
+
+        assert _extract_higgsfield_generation_params("비율: 1:1 해상도: 1K") == ("1:1", "1k")
+
+    def test_confirmation_and_cancel_words(self):
+        from plugins.platforms.mattermost.adapter import _is_higgsfield_cancel, _is_higgsfield_confirmation
+
+        assert _is_higgsfield_confirmation("진행해줘") is True
+        assert _is_higgsfield_confirmation("네") is True
+        assert _is_higgsfield_cancel("취소") is True
+
+    @pytest.mark.asyncio
+    async def test_image_edit_request_launches_without_confirmation_prompt(self):
+        adapter = _make_adapter()
+
+        async def fake_cli(args, *, timeout=600.0):
+            assert args[:3] == ["generate", "cost", "nano_banana_pro"]
+            assert "--image-references" in args
+            assert "--image" not in args
+            assert "C:/tmp/input.png" in args
+            prompt = args[args.index("--prompt") + 1]
+            assert "Use the attached image as the primary reference" in prompt
+            assert "User request: Nano Banana 2 Pro 요청" in prompt
+            return 0, "2 credits\n", ""
+
+        adapter._run_higgsfield_cli = fake_cli
+        adapter.send = AsyncMock()
+
+        with patch("plugins.platforms.mattermost.adapter.asyncio.create_task") as create_task:
+            handled = await adapter._maybe_start_higgsfield_image_edit(
+                channel_id="channel_1",
+                sender_id="user_1",
+                post_id="post_1",
+                message_text="Nano Banana 2 Pro 요청: 옷만 정장으로 변경",
+                media_urls=["C:/tmp/input.png"],
+                media_types=["image/png"],
+            )
+
+        assert handled is True
+        adapter.send.assert_not_called()
+        assert adapter._pending_higgsfield_edits == {}
+        create_task.assert_called_once()
+        create_task.call_args.args[0].close()
+
+    @pytest.mark.asyncio
+    async def test_image_edit_channel_forces_higgsfield_for_attached_images(self):
+        adapter = _make_adapter()
+
+        async def fake_cli(args, *, timeout=600.0):
+            assert args[:3] == ["generate", "cost", "nano_banana_pro"]
+            assert "--image-references" in args
+            return 0, "2 credits\n", ""
+
+        adapter._run_higgsfield_cli = fake_cli
+        with patch("plugins.platforms.mattermost.adapter.asyncio.create_task") as create_task:
+            handled = await adapter._maybe_start_higgsfield_image_edit(
+                channel_id="image_channel",
+                sender_id="user_1",
+                post_id="post_1",
+                message_text="옷만 베이지 정장으로",
+                media_urls=["C:/tmp/input.png"],
+                media_types=["image/png"],
+                force=True,
+            )
+
+        assert handled is True
+        create_task.assert_called_once()
+        create_task.call_args.args[0].close()
+
+    def test_detects_higgsfield_image_edit_channel_from_env(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setenv("HIGGSFIELD_IMAGE_EDIT_CHANNELS", "chan_a, chan_b")
+        assert adapter._is_higgsfield_image_edit_channel("chan_b") is True
+        assert adapter._is_higgsfield_image_edit_channel("chan_c") is False
+
+    @pytest.mark.asyncio
+    async def test_recraft_logo_request_omits_media_inputs(self):
+        adapter = _make_adapter()
+
+        async def fake_cli(args, *, timeout=600.0):
+            assert args[:3] == ["generate", "cost", "recraft_v4_1"]
+            assert "--image-references" not in args
+            assert "--image" not in args
+            assert args[args.index("--model_type") + 1] == "vector"
+            prompt = args[args.index("--prompt") + 1]
+            assert "Do not assume there is an attached image reference" in prompt
+            return 0, "1 credit\n", ""
+
+        adapter._run_higgsfield_cli = fake_cli
+
+        with patch("plugins.platforms.mattermost.adapter.asyncio.create_task") as create_task:
+            handled = await adapter._maybe_start_higgsfield_image_edit(
+                channel_id="channel_1",
+                sender_id="user_1",
+                post_id="post_1",
+                message_text="Recraft V4.1 요청: 로고 제작",
+                media_urls=["C:/tmp/ignored-reference.png"],
+                media_types=["image/png"],
+            )
+
+        assert handled is True
+        create_task.assert_called_once()
+        create_task.call_args.args[0].close()
+
+    def test_extracts_result_url_from_dict_json(self):
+        from plugins.platforms.mattermost.adapter import _extract_higgsfield_result_url
+
+        output = json.dumps({"result_url": "https://cdn.example.com/result.png"})
+        assert _extract_higgsfield_result_url(output) == "https://cdn.example.com/result.png"
+
+    def test_extracts_job_id_from_plain_uuid(self):
+        from plugins.platforms.mattermost.adapter import _extract_higgsfield_job_id
+
+        assert _extract_higgsfield_job_id("0a3144b3-985f-43b1-84b6-f2564896b854\n") == "0a3144b3-985f-43b1-84b6-f2564896b854"
+
+    @pytest.mark.asyncio
+    async def test_uuid_output_fetches_job_before_sending_image(self):
+        adapter = _make_adapter()
+        pending = {
+            "job_type": "nano_banana_pro",
+            "prompt": "edit",
+            "image_path": "C:/tmp/input.png",
+            "aspect": "1:1",
+            "resolution": "1k",
+            "cost": "2 credits",
+        }
+
+        async def fake_cli(args, *, timeout=600.0):
+            if args[:3] == ["generate", "create", "nano_banana_pro"]:
+                assert "--image-references" in args
+                assert "--image" not in args
+                assert "C:/tmp/input.png" in args
+                return 0, "0a3144b3-985f-43b1-84b6-f2564896b854\n", ""
+            if args == ["generate", "get", "0a3144b3-985f-43b1-84b6-f2564896b854", "--json"]:
+                return 0, json.dumps({"result_url": "https://cdn.example.com/result.png"}), ""
+            raise AssertionError(args)
+
+        adapter._run_higgsfield_cli = fake_cli
+        adapter.send = AsyncMock()
+        adapter.send_image = AsyncMock()
+
+        await adapter._run_pending_higgsfield_edit("channel_1", "", pending)
+
+        adapter.send.assert_not_called()
+        adapter.send_image.assert_awaited_once()
+        args, kwargs = adapter.send_image.call_args
+        assert args[:2] == ("channel_1", "https://cdn.example.com/result.png")
+        assert "Higgsfield 이미지 편집이 완료되었습니다" in kwargs["caption"]
+        assert "https://cdn.example.com/result.png" not in kwargs["caption"]
+
+    @pytest.mark.asyncio
+    async def test_recraft_create_uses_vector_without_media(self):
+        adapter = _make_adapter()
+        pending = {
+            "job_type": "recraft_v4_1",
+            "prompt": "logo",
+            "image_path": "",
+            "aspect": "1:1",
+            "resolution": "2k",
+            "cost": "1 credit",
+        }
+
+        async def fake_cli(args, *, timeout=600.0):
+            if args[:3] == ["generate", "create", "recraft_v4_1"]:
+                assert "--image-references" not in args
+                assert "--image" not in args
+                assert args[args.index("--model_type") + 1] == "vector"
+                assert args[args.index("--resolution") + 1] == "2k"
+                return 0, json.dumps({"result_url": "https://cdn.example.com/logo.png"}), ""
+            raise AssertionError(args)
+
+        adapter._run_higgsfield_cli = fake_cli
+        adapter.send = AsyncMock()
+        adapter.send_image = AsyncMock()
+
+        await adapter._run_pending_higgsfield_edit("channel_1", "", pending)
+
+        adapter.send.assert_not_called()
+        adapter.send_image.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_uuid_lookup_retries_until_result_url_is_available(self):
+        adapter = _make_adapter()
+        calls = 0
+
+        async def fake_cli(args, *, timeout=600.0):
+            nonlocal calls
+            assert args == ["generate", "get", "0a3144b3-985f-43b1-84b6-f2564896b854", "--json"]
+            calls += 1
+            if calls == 1:
+                return 0, json.dumps({"status": "completed"}), ""
+            return 0, json.dumps({"result_url": "https://cdn.example.com/result.png"}), ""
+
+        adapter._run_higgsfield_cli = fake_cli
+
+        with patch("plugins.platforms.mattermost.adapter.asyncio.sleep", new=AsyncMock()) as sleep:
+            url = await adapter._resolve_higgsfield_result_url("0a3144b3-985f-43b1-84b6-f2564896b854")
+
+        assert url == "https://cdn.example.com/result.png"
+        assert calls == 2
+        sleep.assert_awaited_once_with(5)
+
+    @pytest.mark.asyncio
+    async def test_higgsfield_cli_runs_hidden_on_windows(self):
+        adapter = _make_adapter()
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"ok", b""
+
+        with patch("plugins.platforms.mattermost.adapter.shutil.which", return_value="higgsfield.CMD"), \
+             patch("plugins.platforms.mattermost.adapter.os.name", "nt"), \
+             patch("plugins.platforms.mattermost.adapter.asyncio.create_subprocess_exec", new=AsyncMock(return_value=FakeProc())) as create_proc:
+            code, stdout, stderr = await adapter._run_higgsfield_cli(["--version"])
+
+        assert (code, stdout, stderr) == (0, "ok", "")
+        assert create_proc.call_args.kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
 
 
 class TestMattermostTruncateMessage:
@@ -532,6 +774,32 @@ class TestMattermostWebSocketParsing:
         # @mention is stripped from the message text
         assert msg_event.text == "Hello from Matrix!"
         assert msg_event.message_id == "post_abc"
+
+    @pytest.mark.asyncio
+    async def test_higgsfield_model_help_request_sends_recommendations(self):
+        post_data = {
+            "id": "post_models",
+            "user_id": "user_123",
+            "channel_id": "chan_dm",
+            "message": "힉스필드모델",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+            },
+        }
+        self.adapter.send = AsyncMock()
+
+        await self.adapter._handle_ws_event(event)
+
+        self.adapter.handle_message.assert_not_called()
+        self.adapter.send.assert_awaited_once()
+        sent_text = self.adapter.send.call_args.args[1]
+        assert "GPT Image 2" in sent_text
+        assert "Recraft V4.1" in sent_text
+        assert "Seedance 2.0" in sent_text
 
     @pytest.mark.asyncio
     async def test_ignore_own_messages(self):
