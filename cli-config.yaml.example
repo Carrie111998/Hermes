@@ -1207,6 +1207,21 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  #
+  # profiles:                                  # Named credential bundles for per-call model selection
+  #   fast:                                    # Define any name; agent picks via profile param on delegate_task
+  #     model: "google/gemini-3-flash-preview"
+  #     provider: "openrouter"
+  #   smart:
+  #     model: "anthropic/claude-fable-5"
+  #     provider: "openrouter"
+  #   local:                                   # Custom endpoints work too
+  #     model: "qwen3-coder"
+  #     provider: "custom"
+  #     base_url: "http://localhost:4000/v1"
+  #     api_key: "sk-local"                    # Optional; falls back to main api_key if omitted
+  #     api_mode: "chat_completions"           # Optional: chat_completions | codex_responses | anthropic_messages
+  # Manage via CLI: hermes delegation profiles list|add|remove
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
