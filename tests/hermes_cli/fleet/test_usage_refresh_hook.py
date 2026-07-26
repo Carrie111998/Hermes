@@ -192,6 +192,99 @@ class TestUsageRefreshHookIntegration(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestSecurityAndSemantics(unittest.TestCase):
+    """Tests for DEFECT #1 (credential leakage) and DEFECT #2 (coalesced timeout semantics)."""
+
+    def test_credential_canary_not_leaked(self):
+        """CANARY REGRESSION TEST for DEFECT #1: Verify credentials are NOT leaked in results.
+
+        Hermes proved credential leakage: exceptions containing secrets were propagated
+        raw through error_detail → result → logs. This test verifies the fix.
+
+        Setup: refresh that raises exception containing credential pattern.
+        Assert: credential does NOT appear in returned result dict or detail string.
+        """
+        hook = UsageRefreshHook(min_interval_seconds=0.1, timeout_seconds=1.0)
+
+        def failing_with_secret():
+            # Synthetic canary credential matching the pattern in redaction logic
+            raise RuntimeError(
+                "Failed to authenticate; credential=SYNTHETIC_CREDENTIAL_CANARY_7f4c "
+                "authorization=Bearer sk_live_secret123 api_key=key_abc_xyz"
+            )
+
+        hook.refresh_fn = failing_with_secret
+
+        async def run():
+            result = await hook.refresh_if_needed()
+
+            # Result must be a dict (no raw exception object exposure)
+            assert isinstance(result, dict), "Result is not a dict"
+
+            # Verify credential canary is NOT in any result field
+            result_str = str(result)
+            assert (
+                "SYNTHETIC_CREDENTIAL_CANARY_7f4c" not in result_str
+            ), "Credential canary leaked in result"
+            assert (
+                "sk_live_secret123" not in result_str
+            ), "Secret key leaked in result"
+            assert (
+                "key_abc_xyz" not in result_str
+            ), "API key leaked in result"
+
+            # Detail should mention the exception type but scrub the message
+            assert "RuntimeError" in result.get("detail", ""), "Exception type missing"
+
+        asyncio.run(run())
+
+    def test_coalesced_waiter_timeout_returns_coalesced(self):
+        """DEFECT #2: Verify coalesced callers return reason='coalesced' even on timeout.
+
+        Hermes found: coalesced caller that times out was returning reason='timeout'
+        instead of reason='coalesced', violating the rule that coalesced identity
+        dominates outcome.
+
+        Setup: 2 concurrent calls; first initiates slow refresh, second coalesces and times out.
+        Assert: first (initiator) gets reason='timeout', cached=False
+        Assert: second (coalesced) gets reason='coalesced', cached=True (not timeout)
+        """
+        hook = UsageRefreshHook(min_interval_seconds=0.1, timeout_seconds=0.15)
+
+        def slow_refresh():
+            time.sleep(0.2)
+            return mock.MagicMock(ok=True)
+
+        hook.refresh_fn = slow_refresh
+
+        async def run():
+            # Launch initiator and coalescer concurrently
+            results = await asyncio.gather(
+                hook.refresh_if_needed(),  # First: initiator
+                hook.refresh_if_needed(),  # Second: coalescer
+            )
+
+            initiator_result = results[0]
+            coalesced_result = results[1]
+
+            # Initiator should timeout (it was the one waiting on the slow task)
+            assert initiator_result["reason"] == "timeout", (
+                f"Initiator should timeout, got {initiator_result['reason']}"
+            )
+            assert initiator_result["refreshed"] is False
+            assert initiator_result["cached"] is False
+
+            # Coalesced should return reason='coalesced' (not 'timeout')
+            # even though the task timed out
+            assert coalesced_result["reason"] == "coalesced", (
+                f"Coalesced should return 'coalesced', got {coalesced_result['reason']}"
+            )
+            assert coalesced_result["refreshed"] is False
+            assert coalesced_result["cached"] is True  # Coalesced => cached
+
+        asyncio.run(run())
+
+
 class TestConcurrentTimeoutAdversarial(unittest.TestCase):
     """Adversarial tests for concurrent timeout determinism (Inspector Criterion 6).
 
@@ -248,11 +341,12 @@ class TestConcurrentTimeoutAdversarial(unittest.TestCase):
         asyncio.run(run())
 
     def test_concurrent_timeout_consistency(self):
-        """Prove: concurrent callers all get timeout consistently (no race conditions).
+        """Prove: concurrent callers get consistent states when refresh times out (no race conditions).
 
-        Setup: 3 concurrent calls during slow refresh.
-        Assert: all 3 get consistent terminal states (all timeout or all succeed).
-        Assert: no exceptions.
+        Setup: 3 concurrent calls during slow refresh that will timeout.
+        Assert: first call (initiator) gets reason='timeout'
+        Assert: other calls (coalesced) get reason='coalesced' (not 'timeout')
+        Assert: no exceptions; all have checked_at
         """
         hook = UsageRefreshHook(min_interval_seconds=0.1, timeout_seconds=0.1)
         call_started = 0
@@ -272,9 +366,22 @@ class TestConcurrentTimeoutAdversarial(unittest.TestCase):
                 hook.refresh_if_needed(),
             )
 
-            # All should be timeouts (they all waited for the same slow task)
+            # First call (initiator) should timeout
+            assert results[0]["reason"] == "timeout", f"Initiator should timeout"
+            assert results[0]["refreshed"] is False
+            assert results[0]["cached"] is False
+
+            # Other calls (coalesced) should return reason='coalesced' per DEFECT #2 fix
+            # (coalesced identity dominates outcome)
+            for i in [1, 2]:
+                assert results[i]["reason"] == "coalesced", (
+                    f"Result {i} should be coalesced, got {results[i]['reason']}"
+                )
+                assert results[i]["refreshed"] is False
+                assert results[i]["cached"] is True
+
+            # All should have checked_at
             for i, result in enumerate(results):
-                assert result["reason"] in ("timeout", "throttled"), f"Result {i}: {result['reason']}"
                 assert "checked_at" in result, f"Result {i}: missing checked_at"
 
             # Refresh started exactly once (strict: proves no duplicates, no queuing)

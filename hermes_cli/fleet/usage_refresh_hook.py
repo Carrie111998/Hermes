@@ -15,12 +15,39 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_error_message(exc: Exception) -> str:
+    """Sanitize exception message to prevent credential/secret leakage.
+
+    Keeps exception type name but scrubs the message of credential-like patterns.
+    Max length capped at 100 chars to prevent DoS via enormous error messages.
+    """
+    exc_type = type(exc).__name__
+    msg = str(exc)
+
+    # Redact patterns that look like credentials/secrets
+    # Matches: key=..., token=..., credential=..., password=..., secret=...,
+    #          authorization=..., bearer ..., etc.
+    redaction_pattern = r"(?i)(key|token|credential|password|secret|authorization|bearer|api[\s_-]?key|access[\s_-]?token)[\s:=]*[^\s,;)]*"
+    sanitized = re.sub(redaction_pattern, r"\1=***", msg)
+
+    # If the entire message got scrubbed (all secrets), suppress it
+    if not sanitized or re.match(r"^\*+$", sanitized.replace("=", "")):
+        return f"{exc_type}: details suppressed"
+
+    # Cap length to prevent DoS
+    if len(sanitized) > 100:
+        sanitized = sanitized[:97] + "..."
+
+    return f"{exc_type}: {sanitized}"
 
 
 class UsageRefreshHook:
@@ -145,15 +172,31 @@ class UsageRefreshHook:
                         return {"ok": ok}
                     except Exception as exc:
                         logger.exception("Usage refresh failed: %s", exc)
+                        # Sanitize to prevent credential leakage (DEFECT #1 fix)
+                        sanitized_error = _sanitize_error_message(exc)
                         return {
                             "ok": False,
                             "error": type(exc).__name__,
-                            "error_detail": str(exc),
+                            "error_detail": sanitized_error,
                         }
 
                 task_to_await = asyncio.create_task(_do_refresh())
                 self._refresh_in_progress = task_to_await
                 was_initiated_by_this_caller = True
+
+                # DEFECT #3 (minor): Add done-callback to clear task reference when complete
+                # (instead of lazily clearing on next successful await)
+                def _clear_task_when_done(task: asyncio.Task[Any]) -> None:
+                    async def _do_clear():
+                        async with self._refresh_lock:
+                            if self._refresh_in_progress is task:
+                                self._refresh_in_progress = None
+                    asyncio.create_task(_do_clear())
+
+                task_to_await.add_done_callback(
+                    lambda _: _clear_task_when_done(task_to_await)
+                )
+
         # === END CRITICAL SECTION (lock released) ===
 
         # Await OUTSIDE lock with shield so multiple callers coalesce on same task
@@ -166,9 +209,6 @@ class UsageRefreshHook:
             )
             # Refresh task completed (check if it succeeded or failed)
             self._last_refresh_at = now
-            # Clear task only if it's still our reference (race-safe)
-            if task_to_await is self._refresh_in_progress:
-                self._refresh_in_progress = None
 
             # Distinguish between initiators and coalesced callers
             if was_initiated_by_this_caller:
@@ -184,9 +224,8 @@ class UsageRefreshHook:
                     }
                 else:
                     # Refresh task failed (exception or returned ok=False)
-                    error_msg = f"{refresh_result.get('error', 'Unknown')}"
-                    if refresh_result.get("error_detail"):
-                        error_msg += f": {refresh_result.get('error_detail')}"
+                    # DEFECT #1 (security): error_detail is already sanitized by _sanitize_error_message
+                    error_msg = refresh_result.get("error_detail", "Unknown error")
                     return {
                         "ok": False,
                         "refreshed": False,
@@ -208,27 +247,42 @@ class UsageRefreshHook:
         except asyncio.TimeoutError:
             # Timeout: task continues in background (shielded), throttle applies next
             self._last_refresh_at = now
-            return {
-                "ok": False,
-                "refreshed": False,
-                "cached": False,
-                "reason": "timeout",
-                "detail": f"Refresh timed out ({self.timeout_seconds}s)",
-                "checked_at": checked_at,
-            }
+
+            # DEFECT #2: coalesced identity must dominate outcome
+            # Coalesced callers return reason="coalesced" even on timeout
+            if was_initiated_by_this_caller:
+                return {
+                    "ok": False,
+                    "refreshed": False,
+                    "cached": False,
+                    "reason": "timeout",
+                    "detail": f"Refresh timed out ({self.timeout_seconds}s)",
+                    "checked_at": checked_at,
+                }
+            else:
+                return {
+                    "ok": False,
+                    "refreshed": False,
+                    "cached": True,
+                    "reason": "coalesced",
+                    "detail": f"Coalesced refresh timed out ({self.timeout_seconds}s)",
+                    "checked_at": checked_at,
+                }
         except Exception as exc:
-            # Refresh failed
+            # Refresh failed (outer layer — shouldn't happen if _do_refresh is robust)
             self._last_refresh_at = now
             # Clear task on failure so next caller can retry
             if task_to_await is self._refresh_in_progress:
                 self._refresh_in_progress = None
             logger.exception("Usage refresh failed: %s", exc)
+            # DEFECT #1 (security): sanitize exception details
+            sanitized_error = _sanitize_error_message(exc)
             return {
                 "ok": False,
                 "refreshed": False,
                 "cached": False,
                 "reason": "failed",
-                "detail": f"Refresh failed: {type(exc).__name__}: {exc}",
+                "detail": f"Refresh failed: {sanitized_error}",
                 "checked_at": checked_at,
             }
 
