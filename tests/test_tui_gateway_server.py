@@ -434,6 +434,44 @@ def test_compute_host_interrupt_failure_leaves_running_when_turn_pending(monkeyp
         server._sessions.pop("iso-int-pending", None)
 
 
+def test_compute_host_interrupt_failure_leaves_running_after_teardown(monkeypatch):
+    """After pending pop + turn teardown, do not clobber drain-owned busy."""
+
+    class _DeadHostNoPending:
+        def interrupt(self, sid, *, request_id=None):
+            raise RuntimeError("compute host is not running")
+
+        def has_pending_turn(self, sid: str) -> bool:
+            return False
+
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        running=True,
+        _compute_host_active=True,
+        # Crash waiter already cleared inflight; a successor drain may own running.
+        inflight_turn=None,
+    )
+    server._sessions["iso-int-post"] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(
+        server, "_get_compute_host_supervisor", lambda _cfg=None: _DeadHostNoPending()
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "int-post",
+                "method": "session.interrupt",
+                "params": {"session_id": "iso-int-post"},
+            }
+        )
+        assert resp.get("result") == {"status": "interrupted", "turn_isolation": True}
+        assert session["running"] is True
+        assert session.get("_turn_cancel_requested") is True
+    finally:
+        server._sessions.pop("iso-int-post", None)
+
+
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
     session = _session(
         agent=None,
