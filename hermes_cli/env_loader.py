@@ -342,6 +342,13 @@ def load_hermes_dotenv(
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
 
+    # Long-running processes reload this function to pick up rotated
+    # credentials. Refresh after every source has applied; the registry retains
+    # both new and previously used values for delayed diagnostics.
+    from agent.configured_secret_redaction import refresh_configured_secret_values
+
+    refresh_configured_secret_values()
+
     return loaded
 
 

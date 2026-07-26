@@ -1,7 +1,8 @@
-"""Regex-based secret redaction for logs and tool output.
+"""Secret redaction for logs and tool output.
 
-Applies pattern matching to mask API keys, tokens, and credentials
-before they reach log files, verbose output, or gateway logs.
+Applies pattern matching plus exact-value masking for configured credentials
+before they reach persistent logs. Tool and chat output use pattern matching
+and continue to honor the user-facing redaction setting.
 
 Short tokens (< 18 chars) are fully masked. Longer tokens preserve
 the first 6 and last 4 characters for debuggability.
@@ -12,6 +13,11 @@ import os
 import re
 import shlex
 from urllib.parse import unquote_plus
+
+from agent.configured_secret_redaction import (
+    redact_configured_secret_values,
+    refresh_configured_secret_values,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +66,13 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
 # `export HERMES_REDACT_SECRETS=false`) cannot disable redaction
 # mid-session.  ON by default — secure default per issue #17691. Users who
-# need raw credential values in tool output (e.g. working on the redactor
+# need raw credential values in tool or chat output (e.g. working on the redactor
 # itself) can opt out via `security.redact_secrets: false` in config.yaml
 # (bridged to this env var in hermes_cli/main.py, gateway/run.py, and
 # cli.py) or `HERMES_REDACT_SECRETS=false` in ~/.hermes/.env. An opt-out
 # warning is logged at gateway and CLI startup so operators see the
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
+# Persistent logs remain force-redacted by RedactingFormatter.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
 
 # Known API key prefixes -- match the prefix + contiguous token chars
@@ -862,11 +869,20 @@ def _has_http_method_substring(text: str) -> bool:
 
 
 class RedactingFormatter(logging.Formatter):
-    """Log formatter that redacts secrets from all log messages."""
+    """Redact logs, with an explicit hard-boundary mode for persistent files."""
 
-    def __init__(self, fmt=None, datefmt=None, style='%', **kwargs):
+    def __init__(
+        self, fmt=None, datefmt=None, style='%', *, force_redaction=False, **kwargs
+    ):
         super().__init__(fmt, datefmt, style, **kwargs)
+        self.force_redaction = force_redaction
+        refresh_configured_secret_values()
 
     def format(self, record: logging.LogRecord) -> str:
-        original = super().format(record)
-        return redact_sensitive_text(original)
+        text = super().format(record)
+        if self.force_redaction:
+            # Log files are a hard egress boundary. The user-facing opt-out is
+            # for tool/console output, not files that may enter debug bundles.
+            text = redact_configured_secret_values(text)
+            return redact_sensitive_text(text, force=True)
+        return redact_sensitive_text(text)

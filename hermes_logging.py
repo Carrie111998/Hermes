@@ -324,7 +324,7 @@ def setup_logging(
         level=level,
         max_bytes=max_bytes,
         backup_count=backups,
-        formatter=RedactingFormatter(_LOG_FORMAT),
+        formatter=RedactingFormatter(_LOG_FORMAT, force_redaction=True),
     )
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
@@ -334,7 +334,7 @@ def setup_logging(
         level=logging.WARNING,
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
-        formatter=RedactingFormatter(_LOG_FORMAT),
+        formatter=RedactingFormatter(_LOG_FORMAT, force_redaction=True),
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
@@ -345,7 +345,7 @@ def setup_logging(
             level=logging.INFO,
             max_bytes=5 * 1024 * 1024,
             backup_count=3,
-            formatter=RedactingFormatter(_LOG_FORMAT),
+            formatter=RedactingFormatter(_LOG_FORMAT, force_redaction=True),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 
@@ -357,7 +357,7 @@ def setup_logging(
             level=logging.INFO,
             max_bytes=10 * 1024 * 1024,
             backup_count=5,
-            formatter=RedactingFormatter(_LOG_FORMAT),
+            formatter=RedactingFormatter(_LOG_FORMAT, force_redaction=True),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
         )
 
@@ -777,6 +777,9 @@ def _read_logging_config():
                 cfg = managed_scope.apply_managed_overlay(cfg)
             except Exception:
                 pass
+            from agent.configured_secret_redaction import refresh_configured_secret_values
+
+            refresh_configured_secret_values(config=cfg)
             log_cfg = cfg.get("logging", {})
             if isinstance(log_cfg, dict):
                 return (

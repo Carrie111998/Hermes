@@ -20739,7 +20739,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 backupCount=3,
                 encoding="utf-8",
             )
-            file_handler.setFormatter(RedactingFormatter("%(message)s"))
+            file_handler.setFormatter(
+                RedactingFormatter("%(message)s", force_redaction=True)
+            )
             tool_logger = logging.getLogger(f"hermes.tool_calls.{id(log_queue)}")
             tool_logger.setLevel(logging.INFO)
             tool_logger.propagate = False
