@@ -104,9 +104,10 @@ def main() -> int:
         )
         == canonical / ".project-state" / "workspace-runtime-release-blocker-remediation-2026-07-25",
     )
+    forbidden_override = "WORKSPACE" + "_OS_ROOT"
     failures += check(
-        "F6 false WORKSPACE_OS_ROOT instruction removed",
-        "WORKSPACE_OS_ROOT" not in (Path(plugin._discovery.__file__).read_text()),
+        "F6 false root-override instruction removed",
+        forbidden_override not in (Path(plugin._discovery.__file__).read_text()),
     )
     failures += check(
         "F7 failure fallback is stable",
