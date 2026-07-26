@@ -429,19 +429,10 @@ def _run_one_file_once(
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     subproc_start = time.monotonic()
-    rc, output = _spawn_pytest_once(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    # _spawn_pytest_once owns Popen kwargs (cwd/env/start_new_session);
+    # do not forward raw subprocess kwargs here — a merge once did and
+    # CI collected 0 tests with TypeError on every file.
+    rc, output = _spawn_pytest_once(cmd, repo_root, file_timeout)
 
     # pytest exit 4 = "file or directory not found" at exec time. On loaded
     # shared CI runners we have seen the planner enumerate a file (its tests
