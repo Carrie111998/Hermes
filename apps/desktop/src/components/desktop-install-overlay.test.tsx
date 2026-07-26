@@ -99,7 +99,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
 
     render(<DesktopInstallOverlay />)
 
-    expect(await screen.findByText('Set up Hermes Desktop')).toBeTruthy()
+    expect(await screen.findByText('Set up NousAI Desktop')).toBeTruthy()
     expect(screen.getByText('Connect to existing Hermes')).toBeTruthy()
     expect(screen.getByText('Install Hermes locally')).toBeTruthy()
     expect(screen.queryByText(/steps complete/i)).toBeNull()
@@ -118,13 +118,13 @@ describe('DesktopInstallOverlay first-run setup', () => {
     fireEvent.click(await screen.findByText('Install Hermes locally'))
 
     expect(desktop.continueBootstrapLocal).toHaveBeenCalledTimes(1)
-    expect(screen.getByText('Set up Hermes Desktop')).toBeTruthy()
+    expect(screen.getByText('Set up NousAI Desktop')).toBeTruthy()
 
     act(() => {
       desktop.emitBootstrapEvent({ type: 'manifest', protocolVersion: 1, stages: [] })
     })
 
-    await waitFor(() => expect(screen.queryByText('Set up Hermes Desktop')).toBeNull())
+    await waitFor(() => expect(screen.queryByText('Set up NousAI Desktop')).toBeNull())
     expect(screen.getByText(/Fetching installer manifest/i)).toBeTruthy()
   })
 
@@ -142,7 +142,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
     fireEvent.click(install)
 
     expect(
-      await screen.findByText('Local installation could not start. Restart Hermes Desktop and try again.')
+      await screen.findByText('Local installation could not start. Restart NousAI Desktop and try again.')
     ).toBeTruthy()
     expect(install.disabled).toBe(false)
   })
@@ -167,7 +167,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
       await Promise.resolve()
     })
 
-    expect(screen.queryByText('Local installation could not start. Restart Hermes Desktop and try again.')).toBeTruthy()
+    expect(screen.queryByText('Local installation could not start. Restart NousAI Desktop and try again.')).toBeTruthy()
   })
 
   it('clears a stale local-start error when a repair presents a different root', async () => {
@@ -182,7 +182,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
 
     fireEvent.click((await screen.findByText('Install Hermes locally')).closest('button') as HTMLButtonElement)
     expect(
-      await screen.findByText('Local installation could not start. Restart Hermes Desktop and try again.')
+      await screen.findByText('Local installation could not start. Restart NousAI Desktop and try again.')
     ).toBeTruthy()
 
     act(() => {
@@ -194,7 +194,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
       })
     })
 
-    expect(screen.queryByText('Local installation could not start. Restart Hermes Desktop and try again.')).toBeNull()
+    expect(screen.queryByText('Local installation could not start. Restart NousAI Desktop and try again.')).toBeNull()
   })
 
   it('opens the remote connection form from the first-run choice', async () => {
@@ -227,7 +227,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
 
     fireEvent.click(screen.getByText('Back'))
 
-    expect(await screen.findByText('Set up Hermes Desktop')).toBeTruthy()
+    expect(await screen.findByText('Set up NousAI Desktop')).toBeTruthy()
     expect(screen.getByText('Install Hermes locally')).toBeTruthy()
   })
 

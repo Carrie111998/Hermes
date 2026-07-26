@@ -2010,7 +2010,7 @@ export const ja = defineLocale({
     viewDocs: 'インストールドキュメントを見る',
     installTo: 'インストール先',
     retryAfterRun: '実行しました — 再試行',
-    setupChoiceTitle: 'Hermes Desktop をセットアップ',
+    setupChoiceTitle: 'NousAI Desktop をセットアップ',
     setupChoiceDesc:
       'すでに実行している Hermes ゲートウェイに接続するか、このコンピューターに Hermes をローカルインストールします。',
     connectExistingTitle: '既存の Hermes に接続',
@@ -2020,10 +2020,10 @@ export const ja = defineLocale({
     installLocalTitle: 'Hermes をローカルにインストール',
     installLocalDesc: 'Hermes をダウンロードし、Python 環境を作成して、このコンピューターでバックエンドを実行します。',
     localStartUnavailable:
-      'ローカルインストールを開始できません。Hermes Desktop を再起動して、もう一度お試しください。',
+      'ローカルインストールを開始できません。NousAI Desktop を再起動して、もう一度お試しください。',
     remoteSetupTitle: '既存の Hermes に接続',
     remoteSetupDesc:
-      'ゲートウェイ URL を入力してください。Hermes Desktop がトークンとブラウザーサインインのどちらが必要かを検出します。',
+      'ゲートウェイ URL を入力してください。NousAI Desktop がトークンとブラウザーサインインのどちらが必要かを検出します。',
     remoteUrlTitle: 'ゲートウェイ URL',
     remoteUrlDesc: 'Hermes ゲートウェイのベース URL を使用します。リモートの場合は https:// を含めてください。',
     remoteUrlPlaceholder: 'https://gateway.example.com/hermes',

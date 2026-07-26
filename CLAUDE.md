@@ -78,7 +78,12 @@ auto-merge (squash) at PR creation instead of watch-and-merge.
     `public/nousai-mark.png` instead of `nous-girl.jpg`; upstream's asset file
     stays untouched — user-approved 2026-07-23)
   - "Hermes Desktop" → "NousAI Desktop" everywhere the app displays it
-    (user-approved full sweep 2026-07-23): `apps/desktop/src/i18n/{en,ja,zh,zh-hant}.ts`,
+    (user-approved full sweep 2026-07-23, re-swept 2026-07-26 after upstream
+    added new onboarding strings and the `ar` locale — **re-check after every
+    upstream sync**: `grep -rn "Hermes Desktop" apps/desktop/src apps/desktop/electron`
+    and rebrand source + any test that pins those strings, in lockstep):
+    `apps/desktop/src/i18n/{en,ja,zh,zh-hant,ar}.ts`,
+    `src/components/desktop-install-overlay.test.tsx`,
     `src/store/onboarding.ts`, `src/lib/desktop-{git,fs}.ts`,
     `electron/{remote-lifecycle,hardening}.ts`, and the pinned string in
     `src/i18n/runtime.test.ts`. On upstream-sync conflicts, keep upstream's
