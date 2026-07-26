@@ -8,7 +8,7 @@ description: "Delegate coding to xAI Grok Build CLI (features, PRs)"
 
 # Grok
 
-Delegate coding to xAI Grok Build CLI (features, PRs).
+Delegate coding to xAI Grok Build CLI (features, PRs). Headless automation: require stopReason EndTurn (exit 0 is not success), set SSL_CERT_FILE to avoid macOS hangs, prefer SuperGrok OAuth over XAI_API_KEY billing, use streaming-json with process watch_patterns for mid-run supervision.
 
 ## Skill metadata
 
@@ -16,11 +16,11 @@ Delegate coding to xAI Grok Build CLI (features, PRs).
 |---|---|
 | Source | Optional — install with `hermes skills install official/autonomous-ai-agents/grok` |
 | Path | `optional-skills/autonomous-ai-agents/grok` |
-| Version | `0.1.0` |
+| Version | `0.2.0` |
 | Author | Matt Maximo (MattMaximo), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
-| Tags | `Coding-Agent`, `Grok`, `xAI`, `Code-Review`, `Refactoring`, `Automation` |
+| Tags | `Coding-Agent`, `Grok`, `xAI`, `Code-Review`, `Refactoring`, `Automation`, `Headless`, `stopReason`, `SSL` |
 | Related skills | [`codex`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex), [`claude-code`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code), [`hermes-agent`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent) |
 
 ## Reference: full SKILL.md
@@ -68,11 +68,21 @@ for interactive sessions.
   `CLAUDE.md`, `.claude/` (skills, agents, MCPs, hooks, rules), and the
   `AGENTS.md` family. Existing project context just works.
 
-> **API-key fallback (not the default for this user):** Grok also supports
-> setting the `XAI_API_KEY` environment variable for pay-as-you-go billing
-> via `api.x.ai`. Only use
-> this if `grok login` / SuperGrok auth is unavailable. The subscription path
-> (`grok login`) is the intended setup here.
+> **API-key fallback (not the default):** Grok also supports setting the
+> `XAI_API_KEY` environment variable (`xai-…`) for pay-as-you-go billing via
+> `api.x.ai`. Only use this if `grok login` / SuperGrok auth is unavailable.
+> The subscription path (`grok login`) is the intended setup for most users.
+>
+> **Billing surface check (verified on Grok CLI):** run `grok models`.
+> - `You are logged in with grok.com.` → SuperGrok / subscription OAuth path.
+> - `You are using XAI_API_KEY.` → API-key / metered path.
+>
+> When **both** `~/.grok/auth.json` (OAuth) and `XAI_API_KEY` are present, the
+> CLI reports the API-key path. A leftover `XAI_API_KEY` in the Hermes process
+> environment can silently move spend off the subscription allotment onto
+> metered API billing. For subscription automation: **unset `XAI_API_KEY`**
+> (and do not inject OAuth access tokens into `XAI_API_KEY` — those are JWTs,
+> not `xai-…` API keys).
 
 ## Two Orchestration Modes
 
@@ -126,20 +136,23 @@ For pure automation, headless `-p` is still cleaner than the TUI.
 |------|--------|
 | `-p, --single <PROMPT>` | Send one prompt, run headless, exit |
 | `-m, --model <MODEL>` | Choose a model |
-| `-s, --session-id <ID>` | Create or resume a named headless session |
-| `-r, --resume <ID>` | Resume an existing session |
+| `-s, --session-id <UUID>` | Assign a **NEW** valid UUID to a fresh conversation (must not already exist). Does **not** resume — use `--resume`/`--continue` for that. Only valid with `--resume`/`--continue` when paired with `--fork-session` |
+| `-r, --resume [<UUID>]` | Resume an existing session by its UUID (or the most recent if omitted) |
 | `-c, --continue` | Continue the most recent session in the current directory |
+| `--fork-session` | When resuming, create a new session ID instead of reusing the original |
+| `--max-turns <N>` | Cap the maximum number of agent turns |
 | `--cwd <PATH>` | Set the working directory |
 | `--output-format <FMT>` | `plain` (default), `json`, or `streaming-json` |
 | `--always-approve` | Auto-approve all tool executions (the `--full-auto` / `--yolo` equivalent) |
 | `--no-alt-screen` | Run inline, no fullscreen TUI takeover |
-| `--no-auto-update` | Skip background update checks (use in all automation) |
+| `--no-auto-update` | Skip background update checks (use in all automation; hidden from `--help` but still works) |
 
 ### Output Formats
 
 - `plain` — human-readable text (default)
 - `json` — one JSON object at the end of the run (parse the result cleanly)
-- `streaming-json` — newline-delimited JSON events as they arrive
+- `streaming-json` — newline-delimited JSON events as they arrive (best with
+  background + `process` / `watch_patterns`)
 
 ```
 # Structured result for parsing
@@ -149,11 +162,102 @@ terminal(command="grok --no-auto-update -p 'List all TODO comments in src/' --ou
 terminal(command="grok --no-auto-update --always-approve -p 'Refactor the database layer and run the tests'", workdir="/project", timeout=300)
 ```
 
+### Success criteria — exit 0 is not enough
+
+Headless Grok can exit **0** on failed or cancelled runs. Process status alone
+must not be treated as task success.
+
+When automating with `--output-format json` (preferred for Hermes):
+
+1. Require non-empty stdout.
+2. Parse the JSON object (or the last JSON line if the stream mixed noise).
+3. Accept **only** when `stopReason == "EndTurn"`.
+4. Treat `stopReason` of `Cancelled`, missing fields, empty stdout, or invalid
+   JSON as **failure** — re-exit non-zero in any wrapper, and do not mark the
+   Kanban/task done.
+5. Independently inspect `git diff` / run the packet's verify commands. A
+   narrative "done" in the model text is not evidence.
+
+Example acceptance snippet (run after the CLI returns):
+
+```bash
+# stdout saved to result.json; fail closed unless EndTurn
+python3 - <<'PY'
+import json, sys
+raw = open("result.json").read().strip()
+if not raw:
+    sys.exit("empty grok stdout")
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    data = None
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            break
+        except json.JSONDecodeError:
+            continue
+    if data is None:
+        sys.exit("invalid grok JSON")
+if data.get("stopReason") != "EndTurn":
+    sys.exit(f"grok stopReason={data.get('stopReason')!r} (want EndTurn)")
+print("ok")
+PY
+```
+
+Without JSON mode, you cannot reliably distinguish Cancelled-from-permissions
+from a completed edit run — prefer `--output-format json` whenever Hermes owns
+the result.
+
+### macOS headless hang — set SSL_CERT_FILE
+
+On macOS, bare headless `grok` can hang indefinitely after model-cache load
+with empty stdout. The process may sit in TLS/certificate initialization
+(Security framework / keychain) with no useful error. Hermes already hardens
+similar cases elsewhere in the gateway/agent SSL paths; for Grok automation
+set a static CA bundle **before** launch:
+
+```bash
+export SSL_CERT_FILE=/etc/ssl/cert.pem
+export CURL_CA_BUNDLE="$SSL_CERT_FILE"
+export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+```
+
+If `/etc/ssl/cert.pem` is missing, a Python `certifi` bundle works as a
+fallback. Symptom of the bug: long wall time, empty stdout, eventual parent
+timeout — not an auth error message. Fix env and relaunch; do not keep waiting.
+
+### Preflight (cheap, before a long coding run)
+
+Run these in order; fail closed on the first miss:
+
+1. **Binary:** `command -v grok` (or your pinned path) is executable.
+2. **TLS (macOS automation):** `SSL_CERT_FILE` points at a readable CA file.
+3. **Auth path:** `test -f ~/.grok/auth.json` for subscription OAuth, **or**
+   `XAI_API_KEY` starts with `xai-` for intentional API-key billing — not both
+   unless you mean to force the API path.
+4. **Billing surface:** `grok models` prints the path you intend
+   (`grok.com` vs `XAI_API_KEY`).
+5. **Cheap call:**
+   `grok --no-auto-update -p 'Reply with exactly: PONG' --output-format plain`
+   with a short timeout. Expect `PONG` quickly; hang ⇒ TLS/env; auth error ⇒
+   login/key; success ⇒ proceed to the real packet.
+
 ### Background Mode (Long Tasks)
 
+Use Hermes `terminal` + `process` — do not invent a parallel job registry.
+
 ```
-# Start headless in background
-terminal(command="grok --no-auto-update --always-approve -p 'Refactor the auth module'", workdir="/project", background=true, notify_on_complete=true)
+# Start headless in background (JSON for honest completion checks)
+terminal(
+  command="grok --no-auto-update --always-approve --output-format json -p 'Refactor the auth module'",
+  workdir="/project",
+  background=true,
+  notify_on_complete=true
+)
 # Returns session_id
 
 # Monitor
@@ -164,19 +268,43 @@ process(action="log", session_id="<id>")
 process(action="kill", session_id="<id>")
 ```
 
-For an interactive (TUI) background session, use `pty=true` + tmux and monitor
-with `tmux capture-pane`, exactly like the `claude-code` / `codex` skills.
+For mid-run supervision, pair **`streaming-json`** with `watch_patterns` so
+matches land on real event boundaries instead of scraped prose:
+
+```
+terminal(
+  command="grok --no-auto-update --always-approve --output-format streaming-json -p 'Implement the ticket'",
+  workdir="/project",
+  background=true,
+  watch_patterns=["EndTurn", "stopReason"]
+)
+```
+
+Notes:
+
+- Prefer rare, high-signal patterns. `watch_patterns` is rate-limited (about one
+  notification per 15s) and auto-promotes to completion-only after repeated
+  noisy windows — do not watch generic words like `error` on a long build.
+- On completion, still parse the final JSON / last event for
+  `stopReason == "EndTurn"`; a process exit of 0 is insufficient.
+- For an interactive (TUI) background session, use `pty=true` + tmux and monitor
+  with `tmux capture-pane`, exactly like the `claude-code` / `codex` skills.
 
 ### Session Continuation
 
+Sessions are keyed by **UUID**, not by name. `--session-id` assigns a *new* UUID
+to a fresh run (it does **not** resume); `--resume` takes an existing session's
+UUID (or omit the value to resume the most recent).
+
 ```
-# Start a named session
-terminal(command="grok --no-auto-update -s refactor-db -p 'Start refactoring the database layer' --always-approve", workdir="/project", timeout=240)
+# Start a session with a self-assigned UUID (must be a valid, unused UUID)
+SID=$(uuidgen)
+terminal(command="grok --no-auto-update -s $SID -p 'Start refactoring the database layer' --always-approve", workdir="/project", timeout=240)
 
-# Resume it later
-terminal(command="grok --no-auto-update -r refactor-db -p 'Now add connection pooling' --always-approve", workdir="/project", timeout=180)
+# Resume that exact session later by its UUID
+terminal(command="grok --no-auto-update -r $SID -p 'Now add connection pooling' --always-approve", workdir="/project", timeout=180)
 
-# Or continue the most recent session in this directory
+# Or just continue the most recent session in this directory (no UUID needed)
 terminal(command="grok --no-auto-update -c -p 'What did you change last time?'", workdir="/project", timeout=60)
 ```
 
@@ -251,6 +379,7 @@ terminal(command="git worktree remove /tmp/issue-78", workdir="~/project")
 | `grok` | Start the interactive TUI |
 | `grok -p "query"` | Headless one-shot |
 | `grok login` / `grok logout` | Sign in / out (SuperGrok / X Premium+ OAuth) |
+| `grok models` | List models **and** show which auth/billing path is active |
 | `grok inspect` | Show what Grok discovered in cwd: config sources, instructions, skills, plugins, hooks, MCP servers |
 | `grok agent stdio` | Run as an ACP agent over JSON-RPC (for IDE/tool integration) |
 | `grok update` | Update the CLI (needs the `x.ai` host; skip in automation) |
@@ -286,20 +415,36 @@ Put global preferences in `~/.grok/config.toml` (not project-scoped
    `x_search` runs on its own xAI OAuth; the standalone `grok` CLI has a
    separate token in `~/.grok/auth.json`. A working `x_search` does NOT mean
    `grok` is logged in.
-3. **Always pass `--no-auto-update` in automation** — otherwise Grok phones home
+3. **Don't conflate SuperGrok OAuth with `XAI_API_KEY` billing.** OAuth lives
+   in `~/.grok/auth.json` and uses the subscription/plan allotment. `XAI_API_KEY`
+   (`xai-…`) is metered API billing. Check with `grok models` (see Prerequisites).
+   When both are present, the CLI selects the API-key path — unset `XAI_API_KEY`
+   to stay on subscription. Never copy an OAuth access token into
+   `XAI_API_KEY`.
+4. **Exit code 0 is not success.** Cancelled / empty / non-`EndTurn` JSON runs
+   can still exit 0. Require `stopReason == "EndTurn"` from `--output-format json`
+   (see Success criteria).
+5. **macOS headless hang without `SSL_CERT_FILE`.** Empty stdout + multi-minute
+   stall after cache load → set `SSL_CERT_FILE=/etc/ssl/cert.pem` (see above).
+6. **Always pass `--no-auto-update` in automation** — otherwise Grok phones home
    for update checks (and `x.ai`/`storage.googleapis.com` may be unreachable).
-4. **Prefer npm install over the curl installer** — `npm install -g
+7. **Prefer npm install over the curl installer** — `npm install -g
    @xai-official/grok` avoids the Cloudflare-walled `x.ai` host.
-5. **`--always-approve` is the autonomous-build switch.** Without it, headless
-   runs may stall waiting on tool-approval prompts. Omit it deliberately for
-   read-only review/audit work so Grok can't mutate files.
-6. **Headless `-p` skips TUI dialogs**; the TUI needs `pty=true` (+ tmux for
+8. **`--always-approve` is the autonomous-build switch.** Without it, headless
+   runs may stall waiting on tool-approval prompts (often surfacing as
+   `stopReason: Cancelled` with exit 0). Omit it deliberately for read-only
+   review/audit work so Grok can't mutate files.
+9. **Headless `-p` skips TUI dialogs**; the TUI needs `pty=true` (+ tmux for
    monitoring), just like Claude Code.
-7. **Use `--no-alt-screen`** if you run the TUI inline and the fullscreen
-   alt-screen takeover garbles captured output.
-8. **No git repo needed**, but for PR/commit workflows you still want one — use
-   `mktemp -d && git init` for scratch commit tasks.
-9. **Clean up tmux sessions** with `tmux kill-session -t <name>` when done.
+10. **Use `--no-alt-screen`** if you run the TUI inline and the fullscreen
+    alt-screen takeover garbles captured output.
+11. **No git repo needed**, but for PR/commit workflows you still want one — use
+    `mktemp -d && git init` for scratch commit tasks.
+12. **Clean up tmux sessions** with `tmux kill-session -t <name>` when done.
+13. **Imported project context can dominate cost.** Grok auto-reads `CLAUDE.md`,
+    `.claude/`, and related instruction trees. For bounded automation, prefer a
+    clean worktree / explicit `--cwd` and disable unneeded integrations when the
+    CLI supports it — then verify with `grok inspect`.
 
 ## Rules for Hermes Agents
 
@@ -307,13 +452,19 @@ Put global preferences in `~/.grok/config.toml` (not project-scoped
    output via `--output-format json`.
 2. **Always set `workdir`** (or `--cwd`) so Grok targets the right project.
 3. **Pass `--no-auto-update`** in every automated invocation.
-4. **Use `--always-approve` only when Grok should write autonomously**; omit it
+4. **On macOS automation, export `SSL_CERT_FILE=/etc/ssl/cert.pem`** (and the
+   usual CA bundle aliases) before launch.
+5. **Use `--always-approve` only when Grok should write autonomously**; omit it
    for read-only reviews and audits.
-5. **Background long tasks** with `background=true, notify_on_complete=true` and
-   monitor via the `process` tool.
-6. **Use tmux for multi-turn interactive work** and monitor with
+6. **Treat completion as `stopReason == "EndTurn"` + independent diff/tests**,
+   never process exit code alone.
+7. **Background long tasks** with `background=true`, `notify_on_complete=true`
+   (and `streaming-json` + sparse `watch_patterns` when mid-run signals help);
+   monitor via the `process` tool — do not rebuild a job control plane.
+8. **Use tmux for multi-turn interactive work** and monitor with
    `tmux capture-pane -t <session> -p -S -50`.
-7. **Verify auth before relying on it** — check `~/.grok/auth.json` or run a
-   cheap `grok -p "Say ok."` smoke test; don't assume Hermes' xAI auth carries
-   over.
-8. **Report results to the user** — summarize what Grok changed and what's left.
+9. **Verify auth and billing surface before relying on them** — preflight
+   (binary, cert, `grok models`, cheap PONG); don't assume Hermes' xAI auth
+   carries over; unset `XAI_API_KEY` when you intend SuperGrok OAuth.
+10. **Report results to the user** — summarize what Grok changed, the
+    stopReason, and what's left.
