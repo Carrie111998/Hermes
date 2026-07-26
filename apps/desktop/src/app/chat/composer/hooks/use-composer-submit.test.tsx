@@ -8,10 +8,16 @@ import { useComposerSubmit } from './use-composer-submit'
 interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
+  compacting?: boolean
   text?: string
 }
 
-function renderSubmitHook({ attachments = [], busy = false, text = '' }: SubmitHarnessOptions = {}) {
+function renderSubmitHook({
+  attachments = [],
+  busy = false,
+  compacting = false,
+  text = ''
+}: SubmitHarnessOptions = {}) {
   const draftRef = { current: text }
   const editor = document.createElement('div')
   editor.dataset.slot = 'composer-rich-input'
@@ -33,6 +39,7 @@ function renderSubmitHook({ attachments = [], busy = false, text = '' }: SubmitH
       activeQueueSessionKeyRef: { current: 'stored-session' },
       attachments,
       busy,
+      compacting,
       clearDraft,
       disabled: false,
       draftRef,
@@ -79,6 +86,23 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSubmit).not.toHaveBeenCalled()
   })
 
+  it('queues a plain-text follow-up while the active turn is compacting', () => {
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      compacting: true,
+      text: 'wait for the summary'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
   it('runs slash commands immediately while busy', async () => {
     const { clearDraft, hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
       busy: true,
@@ -89,7 +113,9 @@ describe('useComposerSubmit busy-turn routing', () => {
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('/compress preserve context'))
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('/compress preserve context', { composerScope: 'stored-session' })
+    )
     expect(clearDraft).toHaveBeenCalledTimes(1)
     expect(onSteer).not.toHaveBeenCalled()
     expect(queueCurrentDraft).not.toHaveBeenCalled()
@@ -135,9 +161,26 @@ describe('useComposerSubmit busy-turn routing', () => {
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('ordinary question', { attachments: [] }))
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('ordinary question', {
+        attachments: [],
+        composerScope: 'stored-session'
+      })
+    )
     expect(onSteer).not.toHaveBeenCalled()
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it('threads the loaded composer scope through onSubmit for the #59305 submit-time guard', async () => {
+    const { hook, onSubmit } = renderSubmitHook({ text: 'hello' })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('hello', expect.objectContaining({ composerScope: 'stored-session' }))
+    )
   })
 })

@@ -17,55 +17,114 @@ const ORIGINAL_PROMPT = `${CORRECTION_SWITCH_TRIGGER}: original prompt must rema
 const CORRECTION = 'E2E correction must stay after the original prompt.'
 const TOOL_STARTED = 'Checking the long-running task before I continue.'
 const CORRECTED_REPLY = 'The corrected task finished.'
+const INFERENCE_SWITCH_TRIGGER = 'E2E_INFERENCE_SWITCH_TRIGGER'
+const INFERENCE_PROMPT = `${INFERENCE_SWITCH_TRIGGER}: original inference prompt must remain singular.`
+const INFERENCE_CORRECTION = `${INFERENCE_SWITCH_TRIGGER}: correction sent while inference is live.`
+
+// Inactive tabs stay mounted under a data-pane-hidden ancestor. Match the
+// renderer's keep-alive visibility policy instead of relying on DOM order.
+const SURFACE = '[data-composer-target]:not([data-pane-hidden] [data-composer-target])'
+
+function activeSurface(page: Page) {
+  return page.locator(SURFACE).last()
+}
 
 async function send(page: Page, text: string): Promise<void> {
-  const composer = page.locator('[contenteditable="true"]').first()
+  const composer = activeSurface(page).locator('[contenteditable="true"]').first()
   await composer.waitFor({ state: 'visible', timeout: 15_000 })
   await composer.click()
   await composer.type(text, { delay: 5 })
   await page.keyboard.press('Enter')
 }
 
+async function steer(page: Page, text: string): Promise<void> {
+  const surface = activeSurface(page)
+  const composer = surface.locator('[contenteditable="true"]').first()
+  const primary = surface.locator('[data-slot="composer-root"] button[type="submit"]')
+
+  await composer.waitFor({ state: 'visible', timeout: 15_000 })
+  await composer.click()
+  await composer.type(text, { delay: 5 })
+  await expect(primary).toHaveAttribute('aria-label', /Steer/)
+  await primary.click()
+}
+
 async function waitForTranscriptText(page: Page, text: string): Promise<void> {
   await page.waitForFunction(
-    (expected: string) => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-    text,
+    ([expected, surfaceSelector]: [string, string]) => {
+      const surfaces = document.querySelectorAll(surfaceSelector)
+      const active = surfaces[surfaces.length - 1]
+
+      return (active?.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected)
+    },
+    [text, SURFACE] as [string, string],
     { timeout: 30_000 },
   )
 }
 
 async function textNodeOccurrences(page: Page, text: string): Promise<number> {
-  return page.evaluate((expected: string) => {
-    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
-    if (!viewport) return 0
+  return page.evaluate(
+    ([expected, surfaceSelector]: [string, string]) => {
+      const surfaces = document.querySelectorAll(surfaceSelector)
+      const viewport = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')
+      if (!viewport) return 0
 
-    const walker = document.createTreeWalker(viewport, NodeFilter.SHOW_TEXT)
-    let count = 0
-    while (walker.nextNode()) {
-      if (walker.currentNode.textContent?.includes(expected)) {
-        count += 1
+      const walker = document.createTreeWalker(viewport, NodeFilter.SHOW_TEXT)
+      let count = 0
+      while (walker.nextNode()) {
+        if (walker.currentNode.textContent?.includes(expected)) {
+          count += 1
+        }
       }
-    }
-    return count
-  }, text)
+      return count
+    },
+    [text, SURFACE] as [string, string],
+  )
 }
 
 async function transcriptTextOrder(page: Page): Promise<string[]> {
-  return page.evaluate(() => {
-    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
+  return page.evaluate((surfaceSelector: string) => {
+    const surfaces = document.querySelectorAll(surfaceSelector)
+    const viewport = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')
     if (!viewport) return []
 
     return Array.from(viewport.querySelectorAll<HTMLElement>('[data-role="message"], [data-message-id]'))
       .map(message => message.textContent?.trim() ?? '')
       .filter(Boolean)
-  })
+  }, SURFACE)
 }
 
+async function transcriptMessageOrder(page: Page): Promise<string[]> {
+  return page.evaluate((surfaceSelector: string) => {
+    const surfaces = document.querySelectorAll(surfaceSelector)
+    const viewport = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')
+    if (!viewport) return []
+
+    return Array.from(
+      viewport.querySelectorAll<HTMLElement>('[data-role="user"], [data-role="assistant"], [data-role="system"]'),
+    )
+      .map(message => message.textContent?.trim() ?? '')
+      .filter(Boolean)
+  }, SURFACE)
+}
+
+/**
+ * The sidebar "+" opens a NEW TAB beside the current chat rather than
+ * replacing it, so the prior session stays mounted in its own surface. Wait
+ * for the newly-mounted surface to show an empty transcript instead of waiting
+ * for the old text to disappear from the page (it never will).
+ */
 async function openFreshDraft(page: Page, priorSessionText: string): Promise<void> {
   await page.locator('[data-slot="sidebar"] button[aria-label="New session"]').first().click()
   await page.waitForFunction(
-    (priorText: string) => !(document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(priorText),
-    priorSessionText,
+    ([priorText, surfaceSelector]: [string, string]) => {
+      const surfaces = document.querySelectorAll(surfaceSelector)
+      const active = surfaces[surfaces.length - 1]
+      const transcript = active?.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? ''
+
+      return surfaces.length > 0 && !transcript.includes(priorText)
+    },
+    [priorSessionText, SURFACE] as [string, string],
     { timeout: 15_000 },
   )
 }
@@ -83,15 +142,39 @@ async function reopenOriginalSession(page: Page): Promise<void> {
   await openSidebarSession(page, ORIGINAL_PROMPT, ORIGINAL_PROMPT)
 }
 
+async function reopenInferenceSession(page: Page): Promise<void> {
+  const row = page.locator('[data-slot="sidebar"] button').filter({ hasText: INFERENCE_PROMPT }).first()
+  await row.waitFor({ state: 'visible', timeout: 30_000 })
+  await row.click()
+  await waitForTranscriptText(page, INFERENCE_PROMPT)
+}
+
 function relevantOrder(messages: string[]): string[] {
-  return messages.filter(message => message.includes(ORIGINAL_PROMPT) || message.includes(CORRECTION))
+  return messages.flatMap(message => {
+    if (message.includes(ORIGINAL_PROMPT)) return [ORIGINAL_PROMPT]
+    if (message.includes(CORRECTION)) return [CORRECTION]
+
+    return []
+  })
+}
+
+function steerTurnOrder(messages: string[]): string[] {
+  return messages.flatMap(message => {
+    if (message.includes(ORIGINAL_PROMPT)) return [ORIGINAL_PROMPT]
+    if (message.includes(CORRECTION)) return [CORRECTION]
+    if (message.includes(CORRECTED_REPLY)) return [CORRECTED_REPLY]
+
+    return []
+  })
 }
 
 test.describe('correction session switch', () => {
   let fixture: MockBackendFixture | null = null
 
   test.beforeEach(async () => {
-    fixture = await setupMockBackend()
+    fixture = await setupMockBackend({
+      mockServer: { holdFirstStreamForPrompt: INFERENCE_SWITCH_TRIGGER },
+    })
     await waitForAppReady(fixture, 120_000)
   })
 
@@ -113,9 +196,9 @@ test.describe('correction session switch', () => {
     await waitForTranscriptText(page, TOOL_STARTED)
     await waitForTranscriptText(page, ORIGINAL_PROMPT)
 
-    // The historical session redirected while a foreground terminal task was
-    // running. Enter records the accepted correction at the next tool boundary.
-    await send(page, CORRECTION)
+    // The historical session redirects while a foreground terminal task is
+    // running. Use the visible Steer action to cover the real composer path.
+    await steer(page, CORRECTION)
     await waitForTranscriptText(page, CORRECTION)
 
     const orderBeforeSwitch = relevantOrder(await transcriptTextOrder(page))
@@ -136,5 +219,31 @@ test.describe('correction session switch', () => {
     expect(await textNodeOccurrences(page, CORRECTION)).toBe(1)
 
     await waitForTranscriptText(page, CORRECTED_REPLY)
+    expect(steerTurnOrder(await transcriptMessageOrder(page))).toEqual([ORIGINAL_PROMPT, CORRECTION, CORRECTED_REPLY])
+  })
+
+  test('keeps an inference-time correction visible through a warm session switch', async ({}, testInfo: TestInfo) => {
+    const { mock, page } = fixture!
+
+    await send(page, OTHER_SESSION_PROMPT)
+    await waitForTranscriptText(page, MOCK_REPLY)
+    await openFreshDraft(page, OTHER_SESSION_PROMPT)
+
+    await send(page, INFERENCE_PROMPT)
+    await mock.waitForHeldStream()
+    await waitForTranscriptText(page, INFERENCE_PROMPT)
+
+    await send(page, INFERENCE_CORRECTION)
+    await waitForTranscriptText(page, INFERENCE_CORRECTION)
+
+    await openSidebarSession(page, MOCK_REPLY, OTHER_SESSION_PROMPT)
+    await reopenInferenceSession(page)
+
+    expect(await textNodeOccurrences(page, INFERENCE_PROMPT)).toBe(1)
+    expect(await textNodeOccurrences(page, INFERENCE_CORRECTION)).toBe(1)
+    await page.screenshot({ path: testInfo.outputPath('inference-correction-after-warm-resume.png') })
+
+    mock.releaseHeldStream()
+    await waitForTranscriptText(page, MOCK_REPLY)
   })
 })
