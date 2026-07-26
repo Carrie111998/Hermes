@@ -132,6 +132,15 @@ class FakeBackend:
             "resolution_code": "precutover_create_unrecoverable",
         }
     )
+    sidebar_bound_retry_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "requeued",
+            "job_id": "sidebar-job:" + "a" * 64,
+            "codex_thread_id": "019f-bound-retry-thread",
+            "error_code": "native_task_not_indexed",
+            "state": "sidebar_retry",
+        }
+    )
     claude_visibility_payload: dict[str, Any] = field(
         default_factory=lambda: {
             "enabled": False,
@@ -227,6 +236,25 @@ class FakeBackend:
             expected_error_code,
         ))
         return dict(self.sidebar_precreate_terminal_payload)
+
+    def sidebar_retry_bound(
+        self,
+        *,
+        job_id: str,
+        source_session_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_retry_bound",
+            job_id,
+            source_session_id,
+            codex_thread_id,
+            expected_error_code,
+            confirmation,
+        ))
+        return dict(self.sidebar_bound_retry_payload)
 
     def claude_visibility_status(self) -> dict[str, Any]:
         self.calls.append(("claude_visibility_status",))
@@ -520,6 +548,172 @@ def test_sidebar_run_once_rejects_a_nonfixed_error_code_without_rendering_it(
     rendered = capsys.readouterr().out
     assert json.loads(rendered) == {"error": "provider_degraded"}
     assert private_error not in rendered
+
+
+def test_sidebar_retry_bound_requires_exact_authority_and_preserves_ids(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "a" * 64
+    source_session_id = "claude:2a23388a-5d72-4e0d-bbad-5e655ef4c8a3"
+    thread_id = "019f8bed-2a9f-7353-a841-551fc1c8b68e"
+    backend = FakeBackend(
+        sidebar_bound_retry_payload={
+            "status": "requeued",
+            "job_id": job_id,
+            "codex_thread_id": thread_id,
+            "error_code": "native_task_not_indexed",
+            "state": "sidebar_retry",
+            "private_detail": "C:/private/provider-detail",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-retry-bound",
+                "--job-id",
+                job_id,
+                "--source-session-id",
+                source_session_id,
+                "--codex-thread-id",
+                thread_id,
+                "--expected-error-code",
+                "native_task_not_indexed",
+                "--confirm",
+                "PRESERVE_EXACT_BOUND_TASK",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    assert backend.calls == [
+        (
+            "sidebar_retry_bound",
+            job_id,
+            source_session_id,
+            thread_id,
+            "native_task_not_indexed",
+            "PRESERVE_EXACT_BOUND_TASK",
+        ),
+        ("close",),
+    ]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "status": "requeued",
+        "job_id": job_id,
+        "codex_thread_id": thread_id,
+        "state": "sidebar_retry",
+    }
+    assert "private/provider-detail" not in rendered
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        [
+            "sidebar-retry-bound",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--source-session-id",
+            "claude:source",
+            "--codex-thread-id",
+            "019f-bound-thread",
+            "--expected-error-code",
+            "native_task_not_indexed",
+        ],
+        [
+            "sidebar-retry-bound",
+            "--job-id",
+            "not-a-full-job-id",
+            "--source-session-id",
+            "claude:source",
+            "--codex-thread-id",
+            "019f-bound-thread",
+            "--expected-error-code",
+            "native_task_not_indexed",
+            "--confirm",
+            "PRESERVE_EXACT_BOUND_TASK",
+        ],
+        [
+            "sidebar-retry-bound",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--source-session-id",
+            "claude:source",
+            "--codex-thread-id",
+            "019f-bound-thread",
+            "--expected-error-code",
+            "marker_conflict",
+            "--confirm",
+            "PRESERVE_EXACT_BOUND_TASK",
+        ],
+        [
+            "sidebar-retry-bound",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--source-session-id",
+            "claude:source",
+            "--codex-thread-id",
+            "019f-bound-thread",
+            "--expected-error-code",
+            "native_task_not_indexed",
+            "--confirm",
+            "REPLACE_BOUND_TASK",
+        ],
+    ),
+)
+def test_sidebar_retry_bound_parser_rejects_incomplete_authority(
+    argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        main(argv)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("status", "already_requeued"),
+        ("state", "sidebar_pending"),
+        ("error_code", "marker_conflict"),
+        ("job_id", "not-a-job-id"),
+        ("codex_thread_id", "invalid thread id"),
+    ),
+)
+def test_sidebar_retry_bound_rejects_invalid_backend_results(
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    value: str,
+) -> None:
+    payload = {
+        "status": "requeued",
+        "job_id": "sidebar-job:" + "a" * 64,
+        "codex_thread_id": "019f-bound-retry-thread",
+        "error_code": "native_task_not_indexed",
+        "state": "sidebar_retry",
+    }
+    payload[field] = value
+    backend = FakeBackend(sidebar_bound_retry_payload=payload)
+
+    result = _run(
+        [
+            "sidebar-retry-bound",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--source-session-id",
+            "claude:source",
+            "--codex-thread-id",
+            "019f-bound-retry-thread",
+            "--expected-error-code",
+            "native_task_not_indexed",
+            "--confirm",
+            "PRESERVE_EXACT_BOUND_TASK",
+        ],
+        backend,
+    )
+
+    assert result == 3
+    assert _json_output(capsys) == {"error": "provider_degraded"}
 
 
 def test_sidebar_terminal_acknowledgement_requires_exact_operator_authority_and_sanitizes(
@@ -826,6 +1020,107 @@ def _production_terminal_resolution_backend(
     backend._catalog = UnifiedCatalog(db, store)
     backend._sidebar_codex_client = client  # type: ignore[assignment]
     return backend, store, failed, reservation, client
+
+
+def _production_bound_retry_backend(
+    tmp_path: Path,
+) -> tuple[
+    ProductionBackend,
+    SessionBridgeStore,
+    dict[str, Any],
+    dict[str, Any],
+]:
+    db = SessionDB(tmp_path / "bound-retry.db")
+    tokens = iter(f"bound-retry-token-{attempt}" for attempt in range(1, 7))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    source_session_id = "hermes:bound-retry"
+    db.ensure_session(source_session_id, source="cli")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Hermes] bound retry",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key="hermes-session-bridge-create-v1:bound-retry",
+        now=110.0,
+    )
+    thread_id = "019f-production-bound-retry"
+    store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=120.0,
+    )
+    failed = None
+    for _attempt in range(5):
+        failed = store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="native_task_not_indexed",
+            codex_thread_id=thread_id,
+            now=150.0 if failed is None else failed["next_attempt_at"],
+        )
+        if failed["state"] == SidebarJobState.RETRY.value:
+            lease = store.claim_sidebar_jobs(
+                now=failed["next_attempt_at"],
+                limit=1,
+            )[0]
+    assert failed is not None
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    return backend, store, failed, reservation
+
+
+def test_production_sidebar_retry_bound_preserves_exact_task_and_is_single_use(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation = _production_bound_retry_backend(tmp_path)
+    source_session_id = failed["source_session_id"]
+    thread_id = failed["codex_thread_id"]
+    try:
+        result = backend.sidebar_retry_bound(
+            job_id=failed["id"],
+            source_session_id=source_session_id,
+            codex_thread_id=thread_id,
+            expected_error_code="native_task_not_indexed",
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+        )
+
+        assert result == {
+            "status": "requeued",
+            "job_id": failed["id"],
+            "codex_thread_id": thread_id,
+            "error_code": "native_task_not_indexed",
+            "state": SidebarJobState.RETRY.value,
+        }
+        assert store.get_sidebar_create_reservation(source_session_id) == reservation
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_bound_retry_snapshot_mismatch",
+        ):
+            backend.sidebar_retry_bound(
+                job_id=failed["id"],
+                source_session_id=source_session_id,
+                codex_thread_id=thread_id,
+                expected_error_code="native_task_not_indexed",
+                confirmation="PRESERVE_EXACT_BOUND_TASK",
+            )
+    finally:
+        backend.close()
 
 
 def test_production_terminal_acknowledgement_derives_exact_evidence_and_replays(

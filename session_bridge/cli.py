@@ -547,6 +547,15 @@ class _Backend(Protocol):
     ) -> Mapping[str, Any]: ...
     def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]: ...
     def sidebar_run_once(self) -> Mapping[str, Any]: ...
+    def sidebar_retry_bound(
+        self,
+        *,
+        job_id: str,
+        source_session_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+        confirmation: str,
+    ) -> Mapping[str, Any]: ...
     def sidebar_acknowledge_unrecoverable(
         self,
         *,
@@ -924,6 +933,46 @@ class ProductionBackend:
             raise
         except Exception as exc:
             raise ProviderDegraded("sidebar_executor_failed") from exc
+
+    def sidebar_retry_bound(
+        self,
+        *,
+        job_id: str,
+        source_session_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+        confirmation: str,
+    ) -> Mapping[str, Any]:
+        """Requeue one exact failed bound task without replacement authority."""
+
+        if (
+            re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", codex_thread_id)
+            is None
+            or expected_error_code != "native_task_not_indexed"
+            or confirmation != "PRESERVE_EXACT_BOUND_TASK"
+        ):
+            raise RolloutGateBlocked("sidebar_bound_retry_snapshot_mismatch")
+        try:
+            result = self._require_store().retry_failed_bound_sidebar_job(
+                job_id=job_id,
+                source_session_id=source_session_id,
+                codex_thread_id=codex_thread_id,
+                expected_error_code=expected_error_code,
+                confirmation=confirmation,
+                now=time.time(),
+            )
+        except (TypeError, ValueError):
+            raise RolloutGateBlocked(
+                "sidebar_bound_retry_snapshot_mismatch"
+            ) from None
+        return {
+            "status": "requeued",
+            "job_id": result["id"],
+            "codex_thread_id": result["codex_thread_id"],
+            "error_code": "native_task_not_indexed",
+            "state": result["state"],
+        }
 
     def _apply_sidebar_create_reservation_cutover(
         self,
@@ -2615,6 +2664,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="process at most one native sidebar delivery job",
     )
 
+    sidebar_retry_bound = commands.add_parser(
+        "sidebar-retry-bound",
+        help="requeue one exact failed bound sidebar task without replacement",
+    )
+    sidebar_retry_bound.add_argument(
+        "--job-id", type=_sidebar_terminal_job_id, required=True
+    )
+    sidebar_retry_bound.add_argument("--source-session-id", required=True)
+    sidebar_retry_bound.add_argument(
+        "--codex-thread-id",
+        type=_sidebar_terminal_thread_id,
+        required=True,
+    )
+    sidebar_retry_bound.add_argument(
+        "--expected-error-code",
+        choices=("native_task_not_indexed",),
+        required=True,
+    )
+    sidebar_retry_bound.add_argument(
+        "--confirm",
+        choices=("PRESERVE_EXACT_BOUND_TASK",),
+        required=True,
+    )
+
     sidebar_terminal = commands.add_parser(
         "sidebar-acknowledge-unrecoverable",
         help="acknowledge one audited unrecoverable bound Codex thread",
@@ -2831,6 +2904,18 @@ def main(
             return (
                 EXIT_OK if payload["status"] in {"idle", "visible"} else EXIT_DEGRADED
             )
+        if args.command == "sidebar-retry-bound":
+            payload = _public_sidebar_bound_retry_result(
+                backend.sidebar_retry_bound(
+                    job_id=args.job_id,
+                    source_session_id=args.source_session_id,
+                    codex_thread_id=args.codex_thread_id,
+                    expected_error_code=args.expected_error_code,
+                    confirmation=args.confirm,
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
         if args.command == "sidebar-acknowledge-unrecoverable":
             payload = _public_sidebar_terminal_resolution_result(
                 backend.sidebar_acknowledge_unrecoverable(
@@ -3601,6 +3686,29 @@ def _public_sidebar_execution_result(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ProviderDegraded("invalid_sidebar_execution_result")
         result["error_code"] = error_code
     return result
+
+
+def _public_sidebar_bound_retry_result(raw: Mapping[str, Any]) -> dict[str, Any]:
+    status = raw.get("status")
+    state = raw.get("state")
+    job_id = raw.get("job_id")
+    thread_id = raw.get("codex_thread_id")
+    if (
+        status != "requeued"
+        or state != SidebarJobState.RETRY.value
+        or raw.get("error_code") != "native_task_not_indexed"
+        or not isinstance(job_id, str)
+        or re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
+        or not isinstance(thread_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", thread_id) is None
+    ):
+        raise ProviderDegraded("invalid_sidebar_bound_retry_result")
+    return {
+        "status": "requeued",
+        "job_id": job_id,
+        "codex_thread_id": thread_id,
+        "state": SidebarJobState.RETRY.value,
+    }
 
 
 def _public_sidebar_terminal_resolution_result(
