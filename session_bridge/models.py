@@ -119,6 +119,28 @@ class ContextPack:
     immutable_at: float | None = None
 
 
+@dataclass(frozen=True)
+class PreviewMessage:
+    role: str
+    content: str
+    timestamp: float | None
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class SessionPreview:
+    version: int
+    source_session_id: str
+    source_cursor: str
+    source_hash: str
+    captured_at: float
+    recent_messages: Sequence[PreviewMessage]
+    rendered: str
+    digest: str
+    budget_chars: int
+    truncated: bool
+
+
 class InvalidBridgeMarker(ValueError):
     """Raised when a bridge marker cannot be authenticated or decoded."""
 

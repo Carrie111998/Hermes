@@ -163,6 +163,99 @@ _STALE_WARNING = (
 _DIVERGED_WARNING = (
     "- [diverged] Both linked descendants advanced; this pack does not merge them."
 )
+_PUBLIC_CONTEXT_SECTIONS = (
+    "Goal / Latest Intent",
+    "Decisions and Constraints",
+    "Unresolved Work",
+    "Files",
+    "Referenced MemPalace / GBrain Links",
+)
+
+
+def extract_context_sections(
+    messages: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Sequence[str]]:
+    """Return redacted deterministic brief items without reading or writing state."""
+    user_contents = [
+        _compact(_redact(str(row["content"])))
+        for row in messages
+        if row.get("role") == "user"
+        and isinstance(row.get("content"), str)
+        and str(row["content"]).strip()
+    ]
+    sections: dict[str, list[str]] = {
+        section: [] for section in _PUBLIC_CONTEXT_SECTIONS
+    }
+    if user_contents:
+        sections["Goal / Latest Intent"].extend(
+            (
+                f"- Original goal: {_redact(user_contents[0])}",
+                f"- Latest user intent: {_redact(user_contents[-1])}",
+            )
+        )
+
+    decision_lines: dict[str, tuple[int, str]] = {}
+    open_lines: dict[str, tuple[int, str]] = {}
+    file_stats: dict[str, list[int]] = {}
+    memory_links: dict[str, int] = {}
+    occurrence = 0
+    for message_index, row in enumerate(messages):
+        content = row.get("content")
+        if isinstance(content, str):
+            redacted_content = _redact(content)
+            if row.get("role") in ("user", "assistant"):
+                for raw_line in redacted_content.splitlines():
+                    line = _compact(raw_line)
+                    if not line:
+                        continue
+                    if _DECISION_RE.search(line) or _CONSTRAINT_RE.search(line):
+                        decision_lines[line] = (message_index, line)
+                    if _OPEN_WORK_RE.search(line) or (
+                        row.get("role") == "user" and line.endswith("?")
+                    ):
+                        open_lines[line] = (message_index, line)
+            searchable = redacted_content
+        else:
+            searchable = ""
+        tool_calls = row.get("tool_calls")
+        if tool_calls:
+            searchable += "\n" + json.dumps(
+                tool_calls,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            searchable = _redact(searchable)
+        for match in _FILE_RE.finditer(searchable):
+            path = match.group(0).replace("\\", "/")
+            occurrence += 1
+            stats = file_stats.setdefault(path, [0, 0])
+            stats[0] += 1
+            stats[1] = occurrence
+        for link in _memory_references(searchable):
+            occurrence += 1
+            memory_links[link] = occurrence
+
+    sections["Decisions and Constraints"].extend(
+        f"- {_redact(line)}"
+        for _, line in sorted(decision_lines.values(), key=lambda value: value[0])
+    )
+    sections["Unresolved Work"].extend(
+        f"- {_redact(line)}"
+        for _, line in sorted(open_lines.values(), key=lambda value: value[0])
+    )
+    sections["Files"].extend(
+        f"- {_redact(path)} (references: {count})"
+        for path, (count, _) in sorted(
+            file_stats.items(),
+            key=lambda item: (-item[1][0], -item[1][1], item[0].casefold()),
+        )
+    )
+    sections["Referenced MemPalace / GBrain Links"].extend(
+        f"- {_redact(link)}"
+        for link, _ in sorted(memory_links.items(), key=lambda item: item[1])
+    )
+    return {section: tuple(sections[section]) for section in _PUBLIC_CONTEXT_SECTIONS}
 
 
 class ContextPackBuilder:
@@ -733,117 +826,46 @@ class ContextPackBuilder:
         messages: Sequence[Mapping[str, Any]],
         repository_items: list[_SectionItem],
     ) -> list[_SectionItem]:
+        sections = extract_context_sections(messages)
         items: list[_SectionItem] = []
-        user_contents = [
-            _compact(_redact(str(row["content"])))
-            for row in messages
-            if row.get("role") == "user"
-            and isinstance(row.get("content"), str)
-            and str(row["content"]).strip()
-        ]
-        if user_contents:
+        for order, text in enumerate(sections["Goal / Latest Intent"]):
             items.append(
                 _SectionItem(
                     "Goal / Latest Intent",
-                    f"- Original goal: {_redact(user_contents[0])}",
-                    94,
-                    0,
+                    text,
+                    94 if order == 0 else 100,
+                    order,
                 )
             )
-            items.append(
-                _SectionItem(
-                    "Goal / Latest Intent",
-                    f"- Latest user intent: {_redact(user_contents[-1])}",
-                    100,
-                    1,
-                )
-            )
-
-        decision_lines: dict[str, tuple[int, str]] = {}
-        open_lines: dict[str, tuple[int, str]] = {}
-        file_stats: dict[str, list[int]] = {}
-        memory_links: dict[str, int] = {}
-        occurrence = 0
-        for message_index, row in enumerate(messages):
-            content = row.get("content")
-            if isinstance(content, str):
-                redacted_content = _redact(content)
-                if row.get("role") in ("user", "assistant"):
-                    for raw_line in redacted_content.splitlines():
-                        line = _compact(raw_line)
-                        if not line:
-                            continue
-                        if _DECISION_RE.search(line) or _CONSTRAINT_RE.search(line):
-                            decision_lines[line] = (message_index, line)
-                        if _OPEN_WORK_RE.search(line) or (
-                            row.get("role") == "user" and line.endswith("?")
-                        ):
-                            open_lines[line] = (message_index, line)
-                searchable = redacted_content
-            else:
-                searchable = ""
-            tool_calls = row.get("tool_calls")
-            if tool_calls:
-                searchable += "\n" + json.dumps(
-                    tool_calls,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                )
-                searchable = _redact(searchable)
-            for match in _FILE_RE.finditer(searchable):
-                path = match.group(0).replace("\\", "/")
-                occurrence += 1
-                stats = file_stats.setdefault(path, [0, 0])
-                stats[0] += 1
-                stats[1] = occurrence
-            for link in _memory_references(searchable):
-                occurrence += 1
-                memory_links[link] = occurrence
-
-        for order, (_, line) in enumerate(
-            sorted(decision_lines.values(), key=lambda value: value[0])
-        ):
+        for order, text in enumerate(sections["Decisions and Constraints"]):
             items.append(
                 _SectionItem(
                     "Decisions and Constraints",
-                    f"- {_redact(line)}",
+                    text,
                     78 + min(order, 8),
                     order,
                 )
             )
-        for order, (_, line) in enumerate(
-            sorted(open_lines.values(), key=lambda value: value[0])
-        ):
+        for order, text in enumerate(sections["Unresolved Work"]):
             items.append(
                 _SectionItem(
                     "Unresolved Work",
-                    f"- {_redact(line)}",
+                    text,
                     82 + min(order, 8),
                     order,
                 )
             )
-
-        ranked_files = sorted(
-            file_stats.items(),
-            key=lambda item: (-item[1][0], -item[1][1], item[0].casefold()),
-        )
-        for order, (path, (count, _)) in enumerate(ranked_files):
+        for order, text in enumerate(sections["Files"]):
             items.append(
-                _SectionItem(
-                    "Files",
-                    f"- {_redact(path)} (references: {count})",
-                    max(45, 72 - order),
-                    order,
-                )
+                _SectionItem("Files", text, max(45, 72 - order), order)
             )
-        for order, (link, _) in enumerate(
-            sorted(memory_links.items(), key=lambda item: item[1])
+        for order, text in enumerate(
+            sections["Referenced MemPalace / GBrain Links"]
         ):
             items.append(
                 _SectionItem(
                     "Referenced MemPalace / GBrain Links",
-                    f"- {_redact(link)}",
+                    text,
                     55,
                     order,
                 )

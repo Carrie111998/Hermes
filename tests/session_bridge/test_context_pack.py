@@ -16,6 +16,7 @@ from session_bridge.context_pack import (
     _redact,
     _select_recent,
     _stable_pack_id,
+    extract_context_sections,
 )
 from session_bridge.models import (
     ContextPack,
@@ -40,6 +41,41 @@ SECTION_HEADINGS = (
     "## Referenced MemPalace / GBrain Links",
     "## Warnings",
 )
+
+
+def test_extract_context_sections_is_pure_and_has_stable_public_keys() -> None:
+    sections = extract_context_sections(
+        [
+            {
+                "role": "user",
+                "content": "Build src/bridge.py. Must preserve identity.",
+            },
+            {
+                "role": "assistant",
+                "content": "Decision: keep gbrain://systems/session-bridge.",
+            },
+            {
+                "role": "user",
+                "content": "Remaining: add tests for src/bridge.py",
+            },
+        ]
+    )
+
+    assert tuple(sections) == (
+        "Goal / Latest Intent",
+        "Decisions and Constraints",
+        "Unresolved Work",
+        "Files",
+        "Referenced MemPalace / GBrain Links",
+    )
+    assert sections["Goal / Latest Intent"] == (
+        "- Original goal: Build src/bridge.py. Must preserve identity.",
+        "- Latest user intent: Remaining: add tests for src/bridge.py",
+    )
+    assert "- Decision: keep gbrain://systems/session-bridge." in sections[
+        "Decisions and Constraints"
+    ]
+    assert sections["Files"][0].startswith("- src/bridge.py (references: 2)")
 
 
 @pytest.fixture
