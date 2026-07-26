@@ -22,30 +22,28 @@ petit ou trop dégradé pour la maquette (hero, photos événement, logos raster
 
 Ne jamais afficher ces valeurs en clair ; référence-les via `$MAGNIFIC_API_KEY`.
 
-## Usage
+## Usage — passer par le script
 
-L'endpoint est **asynchrone** : le POST retourne un `task_id`, puis on polle le
-statut jusqu'à `completed`.
-
-```bash
-curl -s -X POST "https://api.magnific.com/v1/ai/image-upscaler" \
-  -H "x-magnific-api-key: $MAGNIFIC_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "image": "<URL ou base64 de l image source>"
-  }'
-```
-
-Réponse : `{"task_id": "..."}` — poller le statut avec le même header
-(toutes les 5–10 s, l'upscale prend généralement < 1 min) :
+Utiliser `scripts/upscale.py`, qui gère tout le cycle (POST + polling +
+téléchargement immédiat des URLs CDN signées, qui expirent) :
 
 ```bash
-curl -s "https://api.magnific.com/v1/ai/image-upscaler/<task_id>" \
-  -H "x-magnific-api-key: $MAGNIFIC_API_KEY"
+python3 scripts/upscale.py SOURCE -o out.png --scale 2x \
+  [--mode creative|precision] [--engine automatic|magnific_illusio|magnific_sharpy|magnific_sparkle] \
+  [--optimized-for STYLE] [--prompt TXT] [--creativity N] [--hdr N] \
+  [--resemblance N] [--fractality N]
 ```
 
-Référence complète (paramètres scale/creativity/engine, schémas de réponse) :
-https://docs.magnific.com
+Points API à connaître (si appel manuel) :
+- `image` n'accepte **que du base64** (pas d'URL — le script télécharge puis encode).
+- Deux endpoints : `/v1/ai/image-upscaler` (creative) et
+  `/v1/ai/image-upscaler-precision` (precision).
+- Réponse enveloppée dans `data` : `{"data": {"task_id", "status", ...}}` ;
+  statuts `CREATED` → `IN_PROGRESS` → `COMPLETED`/failed ; résultat dans
+  `generated[]` (URLs signées à télécharger tout de suite).
+- Limite de sortie **25,3 MP** : baisser `--scale` ou recadrer la source sinon.
+
+Référence complète : https://docs.magnific.com
 
 ## Workflow recommandé
 1. Optimiser/recadrer l'image source d'abord (cf. persona : sips/ImageMagick).
