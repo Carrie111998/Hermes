@@ -189,6 +189,9 @@ class Workflow:
                                     # webhook storms or repeated dispatch signals.
                                     # Default False preserves the existing "multiple
                                     # parallel runs allowed" behavior.
+    inputs: list[dict] = field(default_factory=list)
+                                    # Declared inputs for this workflow.
+                                    # Each entry: {"name": str, "required": bool, "description": str}
 
 @dataclass
 class NodeState:
@@ -299,6 +302,7 @@ class WorkflowEngine:
             kanban_board=raw.get("kanban_board", ""),
             scope=raw.get("scope", "project"),
             single_flight=bool(raw.get("single_flight", False)),
+            inputs=raw.get("inputs", []),
         )
 
         for node_id, node_data in raw.get("nodes", {}).items():
