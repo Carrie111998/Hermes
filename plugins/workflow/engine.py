@@ -103,6 +103,7 @@ class WorkflowNode:
     agent: Optional[str]          # Agent name (matches kanban worker).
                                   # None for synthetic gate nodes.
     task: str                     # Task description for the kanban card
+    description: str = ""         # Human-readable description of what this node does
     depends_on: list[str] = field(default_factory=list)
     timeout_minutes: int = 30
     model: Optional[str] = None   # Optional model override
@@ -370,6 +371,7 @@ class WorkflowEngine:
 
             workflow.nodes[node_id] = WorkflowNode(
                 id=node_id,
+                description=node_data.get("description", ""),
                 agent=agent_value,
                 task=task_value,
                 depends_on=node_data.get("depends_on", []),
@@ -1818,23 +1820,28 @@ class WorkflowEngine:
                         f"expected format: attachments[N]"
                     )
 
-        # Check template variables reference declared inputs
+        # Check all references against declarations
         declared_inputs = {i.get("name", "") for i in raw.get("inputs", [])}
-        if declared_inputs:
-            for nid, node in workflow.nodes.items():
-                # Extract template references from task text
-                refs = re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z0-9_\-]+\}", node.task)
-                for ref_ns in set(refs):
-                    if ref_ns == "inputs":
-                        continue  # {inputs.X} is always valid
-                    if ref_ns in ("context", "run_id", "date"):
-                        continue  # Built-in namespaces
-                    # Check if it's a declared input
-                    if ref_ns not in declared_inputs and ref_ns not in workflow.nodes:
-                        result["issues"].append(
-                            f"Node '{nid}' has template ref {{{ref_ns}.}} "
-                            f"but '{ref_ns}' is not a declared input or node"
-                        )
+        declared_nodes = set(workflow.nodes.keys())
+        builtin_ns = {"context", "run_id", "date", "inputs"}
+
+        for nid, node in workflow.nodes.items():
+            # Extract template references from task text (both {ns.field} and {bare})
+            ns_refs = re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z0-9_\-]+\}", node.task)
+            bare_refs = re.findall(r"(?<!\.)\{([A-Za-z_][A-Za-z0-9_\-]*)\}(?!\.)", node.task)
+            # Filter out bare refs that are actually ns.field (already checked)
+            bare_refs = [r for r in bare_refs if r not in [f.split(".")[0] for f in ns_refs]]
+
+            all_refs = set(ns_refs) | set(bare_refs)
+            for ref in all_refs:
+                if ref in builtin_ns:
+                    continue
+                if ref in declared_inputs or ref in declared_nodes:
+                    continue
+                result["issues"].append(
+                    f"Node '{nid}' references '{{{ref}}}' which is not "
+                    f"a declared input or node"
+                )
 
         # Check reviews/depends_on conflicts
         for nid, node in workflow.nodes.items():

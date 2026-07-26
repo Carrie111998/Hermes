@@ -557,9 +557,11 @@ def handle_workflow_show(args: Dict[str, Any], **kwargs: Any) -> str:
     for nid, node in wf.nodes.items():
         nodes.append({
             "id": nid,
+            "description": getattr(node, "description", ""),
             "agent": node.agent,
-            "task": node.task,
+            "task": node.task[:200] + "..." if len(node.task) > 200 else node.task,
             "deps": sorted(node.depends_on),
+            "reviews": getattr(node, "reviews", []),
             "timeout_min": node.timeout_minutes,
             "layer": next((i for i, l in enumerate(layers) if nid in l), None),
         })
