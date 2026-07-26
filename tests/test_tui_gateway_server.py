@@ -94,6 +94,7 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     session_key = "cwd-key"
     project = tmp_path / "project"
     project.mkdir()
+    (project / ".git").mkdir()
     launcher = tmp_path / "apps" / "desktop"
     launcher.mkdir(parents=True)
 
@@ -564,6 +565,100 @@ def _write_profile_cfg(home: Path, cwd: str | None) -> Path:
     cfg = {"terminal": {"cwd": cwd}} if cwd is not None else {}
     (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     return home
+
+
+def test_profile_scoped_mcp_discovery_uses_target_home(monkeypatch, tmp_path):
+    """MCP discovery must start under the selected profile's HERMES_HOME."""
+    from hermes_cli import mcp_startup
+    from hermes_constants import get_hermes_home
+    from tui_gateway import entry
+
+    profile_home = tmp_path / "profiles" / "sheepyr"
+    profile_home.mkdir(parents=True)
+
+    (profile_home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  bluesky_sheepyr:\n"
+        "    command: test-command\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+    token = set_hermes_home_override(str(profile_home))
+
+    seen = []
+
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_started", False)
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", None)
+    # ensure_mcp_discovery_started flips this module global; monkeypatch it so
+    # the enablement doesn't leak into sibling tests in this file.
+    monkeypatch.setattr(entry, "_mcp_discovery_enabled", False)
+    monkeypatch.setattr(
+        mcp_startup,
+        "_discover_mcp_tools_without_interactive_oauth",
+        lambda: seen.append(str(get_hermes_home())),
+    )
+
+    try:
+        entry.ensure_mcp_discovery_started()
+        thread = mcp_startup._mcp_discovery_thread
+        assert thread is not None
+        thread.join(timeout=2)
+    finally:
+        reset_hermes_home_override(token)
+        mcp_startup._mcp_discovery_thread = None
+        mcp_startup._mcp_discovery_started = False
+
+    assert seen == [str(profile_home)]
+
+
+def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
+    monkeypatch, tmp_path
+):
+    """Agent construction must start MCP discovery under the selected profile."""
+    import threading
+
+    from hermes_constants import get_hermes_home
+
+    profile_home = tmp_path / "profiles" / "sheepyr"
+    profile_home.mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+
+    seen = []
+    built = threading.Event()
+
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *args, **kwargs: built.set()
+        or type("Agent", (), {"model": "test"})(),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started",
+        lambda: seen.append(str(get_hermes_home())),
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+
+    ready = threading.Event()
+    sid = "test-sid"
+    session = {
+        "agent_ready": ready,
+        "session_key": "test-key",
+        "profile_home": str(profile_home),
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert built.wait(timeout=2)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert seen == [str(profile_home)]
 
 
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
@@ -10700,12 +10795,14 @@ def test_session_most_recent_handles_db_unavailable(monkeypatch):
 # ── verification.status ──────────────────────────────────────────────
 
 
-def test_verification_status_returns_recorded_evidence(tmp_path):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    token = set_hermes_home_override(home)
+def test_verification_status_returns_recorded_evidence(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "verify"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "verify" else None)
+    token = set_hermes_home_override(profile_home)
     project = tmp_path / "project"
     project.mkdir()
+    (project / ".git").mkdir()
     (project / "package.json").write_text(
         json.dumps({"scripts": {"test": "vitest"}}),
         encoding="utf-8",
@@ -10726,7 +10823,7 @@ def test_verification_status_returns_recorded_evidence(tmp_path):
             {
                 "id": "1",
                 "method": "verification.status",
-                "params": {"cwd": str(project), "session_id": "sid"},
+                "params": {"cwd": str(project), "session_id": "sid", "profile": "verify"},
             }
         )
     finally:
