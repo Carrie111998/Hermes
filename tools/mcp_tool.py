@@ -4496,8 +4496,14 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         # eventually garbage-collected. Reap it here before propagating.
         try:
             await server.shutdown()
-        except Exception:  # noqa: BLE001 -- best-effort cleanup, don't mask the real error
-            pass
+        except Exception as shutdown_exc:  # noqa: BLE001 -- best-effort cleanup, don't mask the real error
+            # Log (don't swallow silently): if shutdown() itself fails, the
+            # orphan-reap this except-branch exists for may not have actually
+            # happened, and that failure would otherwise leave zero trace.
+            logger.debug(
+                "MCP server '%s' shutdown during orphan-reap failed: %s",
+                name, shutdown_exc,
+            )
         raise
     return server
 

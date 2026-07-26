@@ -4672,3 +4672,40 @@ class TestConnectServerOrphanReaping:
                 await _connect_server("timeout-case", {"command": "echo"})
 
         assert shutdown_calls == []
+
+    @pytest.mark.asyncio
+    async def test_real_shutdown_interrupts_a_genuinely_parked_task_promptly(self):
+        """Exercise the REAL shutdown()/_wait_for_reconnect_or_shutdown()
+        machinery (not a fake) against a task actually parked there, to
+        prove the reap in _connect_server's except-Exception branch can't
+        stall on _PARKED_RETRY_INTERVAL. Only `run()` is faked here -- it
+        parks by awaiting the real _wait_for_reconnect_or_shutdown() coroutine
+        directly, the same one the production run() loop parks in.
+        """
+        from tools.mcp_tool import MCPServerTask, _connect_server
+
+        server = MCPServerTask("really-parked")
+
+        async def fake_run(self, config):
+            self._error = ConnectionError("simulated initial-connect failure")
+            self._ready.set()
+            # Actually parks in the real helper, same as production run()
+            # does after exhausting _MAX_INITIAL_CONNECT_RETRIES -- this is
+            # an asyncio.wait() on _shutdown_event/_reconnect_event, NOT a
+            # blind sleep, so shutdown() must be able to interrupt it fast.
+            await self._wait_for_reconnect_or_shutdown()
+
+        with patch.object(MCPServerTask, "run", fake_run), \
+             patch("tools.mcp_tool.MCPServerTask", return_value=server):
+            with pytest.raises(ConnectionError):
+                # The real shutdown() must interrupt the real park via
+                # _shutdown_event, not block on a timeout/sleep -- bound
+                # the whole call tightly enough that a regression to
+                # polling/sleeping would fail this test rather than just
+                # running slow.
+                await asyncio.wait_for(
+                    _connect_server("really-parked", {"command": "echo"}),
+                    timeout=2.0,
+                )
+
+        assert server._task is not None and server._task.done()
