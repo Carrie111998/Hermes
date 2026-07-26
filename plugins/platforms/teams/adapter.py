@@ -18,6 +18,7 @@ Configuration in config.yaml:
           client_secret: "your-secret"      # or TEAMS_CLIENT_SECRET env var
           tenant_id: "your-tenant-id"       # or TEAMS_TENANT_ID env var
           port: 3978                        # or TEAMS_PORT env var
+          reactions: true                   # processing status reactions
 """
 
 from __future__ import annotations
@@ -794,6 +795,10 @@ class TeamsAdapter(BasePlatformAdapter):
         self._client_id = extra.get("client_id") or os.getenv("TEAMS_CLIENT_ID", "")
         self._client_secret = extra.get("client_secret") or _get_scoped_secret("TEAMS_CLIENT_SECRET", "")
         self._tenant_id = extra.get("tenant_id") or os.getenv("TEAMS_TENANT_ID", "")
+        self._processing_reactions = _parse_bool(
+            extra.get("reactions"),
+            default=True,
+        )
         self._port = _coerce_port(
             extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT))
         )
@@ -1502,12 +1507,7 @@ class TeamsAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Return whether automatic processing-status reactions are enabled."""
-        return os.getenv("TEAMS_REACTIONS", "true").lower() not in {
-            "false",
-            "0",
-            "no",
-            "off",
-        }
+        return self._processing_reactions
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an eyes reaction while Hermes processes an inbound message."""

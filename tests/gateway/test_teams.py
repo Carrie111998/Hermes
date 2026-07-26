@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from gateway.config import Platform, PlatformConfig, HomeChannel
+from gateway.config import GatewayConfig, Platform, PlatformConfig, HomeChannel
 from gateway.platforms.base import ProcessingOutcome
 from plugins.teams_pipeline.models import TeamsMeetingRef, TeamsMeetingSummaryPayload
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
@@ -535,9 +535,23 @@ class TestTeamsReactions:
         )
 
     @pytest.mark.anyio
-    async def test_processing_reactions_can_be_disabled(self, monkeypatch):
-        monkeypatch.setenv("TEAMS_REACTIONS", "false")
-        adapter, reactions = self._adapter()
+    async def test_processing_reactions_can_be_disabled_from_platform_config(self):
+        config = GatewayConfig.from_dict({
+            "platforms": {
+                "teams": {
+                    "enabled": True,
+                    "extra": {"reactions": False},
+                },
+            },
+        })
+        adapter = TeamsAdapter(config.platforms[Platform("teams")])
+        reactions = SimpleNamespace(
+            add=AsyncMock(),
+            delete=AsyncMock(),
+        )
+        adapter._app = SimpleNamespace(
+            api=SimpleNamespace(reactions=reactions),
+        )
         event = MagicMock()
         event.source.chat_id = "conv-id"
         event.message_id = "msg-1"
