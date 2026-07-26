@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
+from .client import HealthStatus
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -236,6 +237,10 @@ ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCH
 
 class HonchoMemoryProvider(MemoryProvider):
     """Honcho AI-native memory with dialectic Q&A and persistent user modeling."""
+    def check_health(self) -> HealthStatus:
+        from .client import check_health
+        return check_health()
+
 
     def backup_paths(self) -> List[str]:
         """Honcho keeps its peer/session config under ~/.honcho when no

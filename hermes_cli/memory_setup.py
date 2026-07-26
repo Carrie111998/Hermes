@@ -483,9 +483,12 @@ def cmd_status(args) -> None:
         if provider:
             print("\n  Plugin:    installed ✓")
             if provider.is_available():
-                print("  Status:    available ✓")
+                print(f"  Status:    configured ✓")
+                if hasattr(provider, "check_health"):
+                    health = provider.check_health()
+                    print(f"  Health:    {health.value.upper()}")
             else:
-                print("  Status:    not available ✗")
+                print(f"  Status:    not configured ✗")
                 schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
                 # Check all fields that have env_var (both secret and non-secret)
                 required_fields = [f for f in schema if f.get("env_var")]
