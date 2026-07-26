@@ -4289,7 +4289,7 @@ def test_session_title_get_falls_back_to_pending_when_db_read_throws(monkeypatch
             raise RuntimeError("db temporarily locked")
 
     server._sessions["sid"] = _session(pending_title="queued title")
-    monkeypatch.setattr(server, "_open_session_db", lambda _home: _FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -4318,7 +4318,7 @@ def test_session_title_get_retries_persist_for_pending_title(monkeypatch):
 
     db = _FakeDB()
     server._sessions["sid"] = _session(pending_title="queued title")
-    monkeypatch.setattr(server, "_open_session_db", lambda _home: db)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
     try:
         resp = server.handle_request({
             "id": "1",
@@ -4348,7 +4348,7 @@ def test_session_title_get_retries_pending_even_when_db_has_title(monkeypatch):
 
     db = _FakeDB()
     server._sessions["sid"] = _session(pending_title="queued title")
-    monkeypatch.setattr(server, "_open_session_db", lambda _home: db)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
     try:
         resp = server.handle_request({
             "id": "1",
@@ -4370,7 +4370,7 @@ def test_session_title_rejects_empty_title_with_specific_error_code(monkeypatch)
             return None
 
     server._sessions["sid"] = _session()
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -4398,7 +4398,7 @@ def test_session_title_set_maps_valueerror_to_user_error(monkeypatch):
             return None
 
     server._sessions["sid"] = _session()
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -4427,7 +4427,7 @@ def test_session_title_set_errors_when_row_lookup_fails_after_noop(monkeypatch):
             return None
 
     server._sessions["sid"] = _session()
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -7048,7 +7048,7 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
         def close(self):
             return None
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _DB())
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
     try:
         resp = server.handle_request({
             "id": "1",
@@ -7431,7 +7431,7 @@ def test_session_info_includes_session_title(monkeypatch):
         def close(self):
             return None
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
 
     info = server._session_info(
         types.SimpleNamespace(tools=[], model="test/model", provider="openai-codex"),
@@ -10348,7 +10348,7 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
 
     previous_sessions = dict(server._sessions)
     server._sessions.clear()
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: _DB())
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "find docs"}],
