@@ -409,7 +409,41 @@ def test_rotate_now_hard_limit_triggers_telegram_dedup(db_path, monkeypatch):
     assert seen[0]["token_count"] == 160_000
 
 
-# Integration with conversation loop (4)
+# Integration with conversation loop (5)
+def test_persist_disabled_fork_cannot_register_or_rotate_parent(monkeypatch):
+    agent = _agent()
+    agent._persist_disabled = True
+    agent._cached_system_prompt = "x" * 640_000
+    history = [{"role": "user", "content": "foreground context"}]
+
+    monkeypatch.setattr(
+        conversation_loop,
+        "_register_runtime_session",
+        lambda *a, **k: pytest.fail(
+            "persistence-isolated fork must not register the foreground session"
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "rotate_now",
+        lambda **kwargs: pytest.fail(
+            "persistence-isolated fork must not rotate the foreground session"
+        ),
+    )
+
+    assert conversation_loop.prepare_session_rotation(
+        agent,
+        user_message="background review harness",
+        system_message=None,
+        conversation_history=history,
+        task_id="task-1",
+        lane="platform",
+        profile="atlas",
+        route="background_review",
+    ) == history
+    assert agent.session_id == "runtime-session"
+
+
 def test_conversation_loop_below_soft_limit_no_rotation(monkeypatch):
     agent = _agent()
     monkeypatch.setattr(conversation_loop, "_register_runtime_session", lambda *a, **k: None)

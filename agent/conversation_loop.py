@@ -318,6 +318,14 @@ def prepare_session_rotation(
     from hermes_cli.session.estimator import estimate_next_turn_input_tokens
 
     history = list(conversation_history or [])
+    # Persistence-isolated forks (notably background skill/memory review)
+    # deliberately share the foreground agent's session id for prompt-cache
+    # warmth, but they are not lifecycle owners.  Letting one register or
+    # rotate that shared id can close the foreground session and strand the
+    # gateway on its parent while the fork exits on an unindexed child.
+    if getattr(agent, "_persist_disabled", False):
+        return history
+
     durable_task_id = _runtime_rotation_task_id(agent, task_id)
     durable_lane = str(lane or getattr(agent, "lane", None) or "platform")
     _register_runtime_session(
