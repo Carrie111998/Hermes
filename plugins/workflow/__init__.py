@@ -519,11 +519,6 @@ def _spawn_supervisor_for_next_layer(state, state_path):
 
 
 def _notify_workflow_complete(task_id: str, state=None):
-    import os as _os
-    _dbg = _os.path.join(_os.environ.get("HERMES_HOME", "/tmp"), "workflows", "workflow-debug.log")
-    _os.makedirs(_os.path.dirname(_dbg), exist_ok=True)
-    with open(_dbg, "a") as _f:
-        _f.write(f"[{_os.getpid()}] _notify_workflow_complete: task={task_id} state={bool(state)}\n")
     """Write a completion marker to /tmp for the watcher thread to inject.
 
     When a final-layer card completes, reads the state file for session info

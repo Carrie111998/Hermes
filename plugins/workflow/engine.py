@@ -440,12 +440,6 @@ class WorkflowEngine:
 
     def _fire_completion_notification(self, workflow_name, workflow, states, layers, layer_idx, context=None, session_info=None):
         """Fire completion notification after all layers complete."""
-        import os as _os
-        _dbg = _os.path.join(_os.environ.get("HERMES_HOME", "/tmp"), "workflows", "workflow-debug.log")
-        _os.makedirs(_os.path.dirname(_dbg), exist_ok=True)
-        _session = session_info or (context or {}).get("_session_info", {})
-        with open(_dbg, "a") as _f:
-            _f.write(f"[{_os.getpid()}] _fire_completion_notification: ctx_keys={list((context or {}).keys())} session={bool(_session)} platform={_session.get('platform', 'NONE')} chat={_session.get('chat_id', 'NONE')}\n")
         try:
             from plugins.workflow import _notify_workflow_complete
             _notif_state = {
@@ -2211,7 +2205,9 @@ class WorkflowEngine:
                     context = saved["context"]
                 # Restore _session_info from saved session_info so
                 # completion notifications work in the supervisor subprocess.
-                if context and "session_info" in saved:
+                if "session_info" in saved:
+                    if context is None:
+                        context = {}
                     context.setdefault("_session_info", saved["session_info"])
                 # Restore attachments from saved state so the supervisor
                 # subprocess can attach files to first-layer cards.
