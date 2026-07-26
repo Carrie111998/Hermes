@@ -153,6 +153,32 @@ def _resolve_source_meta_and_bundle(identifier: str, sources):
     return meta, bundle, matched_source
 
 
+def _is_official_optional_adapter(matched_source) -> bool:
+    """True only when the resolving adapter is the local optional-skills source.
+
+    Bundle ``source`` / index metadata strings are not provenance: adapters such
+    as HermesIndexSource can stamp ``source="official"`` onto third-party
+    GitHub content. Builtin install trust must follow the adapter identity.
+    """
+    if matched_source is None:
+        return False
+    source_id = getattr(matched_source, "source_id", None)
+    if not callable(source_id):
+        return False
+    return source_id() == "official"
+
+
+def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> str:
+    """Choose the scanner trust identity for an install/audit scan."""
+    if _is_official_optional_adapter(matched_source):
+        return "official"
+    return (
+        getattr(bundle, "identifier", "")
+        or getattr(meta, "identifier", "")
+        or identifier
+    )
+
+
 def _derive_category_from_install_path(install_path: str) -> str:
     path = Path(install_path)
     parent = str(path.parent)
@@ -554,7 +580,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
     c.print(f"\n[bold]Fetching:[/] {identifier}")
 
-    meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
+    meta, bundle, matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not bundle:
         # Check if any source hit GitHub API rate limit
@@ -575,6 +601,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         else:
             c.print()
         return
+
+    is_official_optional = _is_official_optional_adapter(matched_source)
 
     # URL-sourced skills may arrive with an empty name when SKILL.md has no
     # ``name:`` in frontmatter AND the URL path doesn't yield a valid
@@ -631,7 +659,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Auto-detect the full parent path for official skills. Optional skills
     # can be nested (e.g. "official/mlops/training/trl-fine-tuning"), so keep
     # every identifier segment between "official" and the final skill slug.
-    if bundle.source == "official" and not category:
+    # Only the local OptionalSkillSource adapter is authoritative for this.
+    if is_official_optional and not category:
         id_parts = bundle.identifier.split("/")
         if len(id_parts) >= 3:
             category = "/".join(id_parts[1:-1])
@@ -659,16 +688,9 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         return
     c.print(f"[dim]Quarantined to {q_path.relative_to(q_path.parent.parent.parent)}[/]")
 
-    # Scan
+    # Scan - builtin trust only when the matched adapter is OptionalSkillSource.
     c.print("[bold]Running security scan...[/]")
-    if bundle.source == "official":
-        scan_source = "official"
-    else:
-        scan_source = (
-            getattr(bundle, "identifier", "")
-            or getattr(meta, "identifier", "")
-            or identifier
-        )
+    scan_source = _scan_source_for_install(bundle, meta, identifier, matched_source)
     from tools.skills_hub import HUB_DIR, source_url_for_bundle
     result, scan_provenance = scan_skill_cached(
         q_path,
@@ -705,11 +727,11 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         if metadata_lines:
             c.print(Panel("\n".join(metadata_lines), title="Upstream Metadata", border_style="blue"))
 
-    # Confirm with user — show appropriate warning based on source
+    # Confirm with user — show appropriate warning based on adapter provenance
     # skip_confirm bypasses the prompt (needed in TUI mode where input() hangs)
     if not force and not skip_confirm:
         c.print()
-        if bundle.source == "official":
+        if is_official_optional:
             c.print(Panel(
                 "[bold bright_cyan]This is an official optional skill maintained by Nous Research.[/]\n\n"
                 "It ships with hermes-agent but is not activated by default.\n"
