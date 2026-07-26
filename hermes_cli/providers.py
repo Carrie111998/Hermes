@@ -201,6 +201,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         extra_env_vars=("FIREWORKS_API_KEY",),
         base_url_override="https://api.fireworks.ai/inference/v1",
     ),
+    "aiand": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("AIAND_API_KEY",),
+        base_url_override="https://api.aiand.com/v1",
+    ),
     "upstage": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("UPSTAGE_API_KEY",),
@@ -371,6 +376,10 @@ ALIASES: Dict[str, str] = {
     "fireworks-ai": "fireworks",
     "fw": "fireworks",
 
+    # aiand
+    "ai&": "aiand",
+    "ai-and": "aiand",
+
     # upstage
     "solar": "upstage",
 
@@ -398,6 +407,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",
+    "aiand": "ai&",
     "upstage": "Upstage Solar",
     "tencent-tokenhub": "Tencent TokenHub",
     "lmstudio": "LM Studio",

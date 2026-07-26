@@ -50,6 +50,7 @@ _PROVIDER_ENV_HINTS = (
     "KIMI_CN_API_KEY",
     "GMI_API_KEY",
     "FIREWORKS_API_KEY",
+    "AIAND_API_KEY",
     "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY",
     "KILOCODE_API_KEY",
@@ -1078,6 +1079,10 @@ def run_doctor(args):
                 # is exclusively ``vendor/model`` slugs (Qwen/Qwen3.5-…,
                 # meta-llama/Llama-3-…, anthropic/claude-opus-4-7, …).
                 "deepinfra",
+                # ai&'s catalog is exclusively vendor/model slugs matching
+                # the upstream org names (deepseek-ai/deepseek-v4-flash,
+                # moonshotai/kimi-k2.7-code, zai-org/glm-5.2, …).
+                "aiand",
             }
             provider_accepts_vendor_slug = (
                 provider_policy_id in providers_accepting_vendor_slugs

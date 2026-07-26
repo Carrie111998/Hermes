@@ -172,6 +172,7 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "opencode-go": "opencode-go",
     "kilocode": "kilo",
     "fireworks": "fireworks-ai",
+    "aiand": "aiand",
     "huggingface": "huggingface",
     "gemini": "google",
     "google": "google",

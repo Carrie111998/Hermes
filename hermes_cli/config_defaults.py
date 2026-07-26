@@ -3227,6 +3227,14 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "AIAND_API_KEY": {
+        "description": "ai& API key",
+        "prompt": "ai& API key",
+        "url": "https://docs.aiand.com/",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
     "MINIMAX_API_KEY": {
         "description": "MiniMax API key (international)",
         "prompt": "MiniMax API key",

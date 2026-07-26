@@ -1,0 +1,5 @@
+name: aiand-provider
+kind: model-provider
+version: 1.0.0
+description: ai& — open frontier models, OpenAI-compatible direct API
+author: Jetha Chan
