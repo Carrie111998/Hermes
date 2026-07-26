@@ -481,6 +481,22 @@ class MemoryStore:
                 # If all matches are identical (exact duplicates), operate on the first one
                 unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
+                    # Ambiguous substring match traps models into add() as a
+                    # fallback. If new_content already exists verbatim as its
+                    # own entry, say so explicitly so the agent does not create
+                    # a near-duplicate (#60089).
+                    if new_content in entries:
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Multiple entries matched '{old_text}', and "
+                                f"new_content already exists as its own entry "
+                                f"(no change needed). Prefer operations=[] to "
+                                f"disambiguate a replace, or skip the write."
+                            ),
+                            "matches": self._previews([e for _, e in matches]),
+                            "current_entries": entries,
+                        }
                     previews = self._previews([e for _, e in matches])
                     return {
                         "success": False,
