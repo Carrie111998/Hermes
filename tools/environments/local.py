@@ -984,6 +984,9 @@ _SANE_PATH = (
 _SENTINEL = object()
 _HERMES_BIN_DIR: "str | None | object" = _SENTINEL
 
+# Cached ``bin`` / ``Scripts`` dir of the venv Hermes itself runs from.
+_HERMES_VENV_BIN_DIR: "str | None | object" = _SENTINEL
+
 
 def _resolve_hermes_bin_dir() -> str | None:
     """Return the directory holding the ``hermes`` console-script, or None.
@@ -1042,14 +1045,41 @@ def _resolve_hermes_bin_dir() -> str | None:
     return candidate
 
 
-def _prepend_hermes_bin_dir(existing_path: str) -> str:
-    """Prepend the hermes install dir to ``existing_path`` if it's missing.
+def _resolve_hermes_venv_bin_dir() -> str | None:
+    """Return the ``bin``/``Scripts`` dir of the venv Hermes runs from, or None.
+
+    The POSIX installer creates the venv with ``uv venv`` and exposes Hermes
+    through a launcher shim in ``~/.local/bin`` (or ``/usr/local/bin``), so the
+    venv's own ``bin`` dir never reaches the user's PATH — unlike the Windows
+    installer, which puts ``venv\\Scripts`` on the user PATH directly.  Terminal
+    commands therefore resolve ``python``/``pip`` from whatever the login shell
+    provides, and with pyenv installed its shims win: ``pip install`` writes to
+    the user's pyenv-global site-packages instead of the Hermes venv (#7309).
+
+    Returns None when Hermes is not running from a venv (``--no-venv`` or a
+    system-wide install), where there is no Hermes environment to prefer.
+    """
+    global _HERMES_VENV_BIN_DIR
+    if _HERMES_VENV_BIN_DIR is not _SENTINEL:
+        return _HERMES_VENV_BIN_DIR  # type: ignore[return-value]
+
+    candidate: str | None = None
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix) and sys.executable:
+        exe_dir = os.path.dirname(sys.executable)
+        if exe_dir and os.path.isdir(exe_dir):
+            candidate = exe_dir
+
+    _HERMES_VENV_BIN_DIR = candidate
+    return candidate
+
+
+def _prepend_path_dir(existing_path: str, bin_dir: "str | None") -> str:
+    """Prepend ``bin_dir`` to ``existing_path`` if it's missing.
 
     Cross-platform (uses ``os.pathsep``). First-occurrence wins, so a PATH
     that already contains the dir is returned unchanged. Returns the input
-    unchanged when the install dir can't be resolved.
+    unchanged when ``bin_dir`` is empty/unresolved.
     """
-    bin_dir = _resolve_hermes_bin_dir()
     if not bin_dir:
         return existing_path
     sep = os.pathsep
@@ -1057,6 +1087,16 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
     if bin_dir in entries:
         return existing_path
     return sep.join([bin_dir, *entries])
+
+
+def _prepend_hermes_bin_dir(existing_path: str) -> str:
+    """Prepend the hermes install dir to ``existing_path`` if it's missing."""
+    return _prepend_path_dir(existing_path, _resolve_hermes_bin_dir())
+
+
+def _prepend_hermes_venv_bin_dir(existing_path: str) -> str:
+    """Prepend the Hermes venv bin dir to ``existing_path`` if it's missing."""
+    return _prepend_path_dir(existing_path, _resolve_hermes_venv_bin_dir())
 
 
 def _append_missing_sane_path_entries(existing_path: str) -> str:
@@ -1177,6 +1217,10 @@ def _make_run_env(env: dict) -> dict:
         # error / exit 127).  No-op off Windows and when a login snapshot is
         # healthy (the snapshot re-exports the full PATH inside the shell).
         new_path = _prepend_git_bash_dirs(new_path)
+        # Ensure ``python``/``pip`` resolve to the Hermes venv rather than to
+        # whatever interpreter the host happens to expose, so packages the
+        # agent installs land in the Hermes environment (#7309).
+        new_path = _prepend_hermes_venv_bin_dir(new_path)
         # Ensure the hermes install dir is reachable so plugins can shell out
         # to bare ``hermes`` via the terminal tool even when the gateway was
         # launched without it on PATH (systemd, service managers, cron, etc.).
@@ -1285,6 +1329,43 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return prelude + cmd_string
 
 
+def _prepend_venv_bin_path_guard(cmd_string: str) -> str:
+    """Re-assert the Hermes venv bin dir at the front of PATH in a login shell.
+
+    ``_make_run_env`` already puts that dir on the subprocess PATH, but a login
+    shell re-exports its own: pyenv/asdf/conda init snippets in the user's
+    profile *prepend* their shim dirs, so the shim wins and ``pip install``
+    writes to the user's global interpreter instead of the Hermes venv (#7309).
+    Re-prepending after the profile has been sourced restores the venv's
+    precedence in the captured session snapshot.
+
+    Applied to login invocations only — that is, while the snapshot is being
+    built — never per command, so a later ``source .venv/bin/activate`` inside
+    the session still wins exactly as it would in the user's own terminal.
+
+    No-op on Windows: bash there receives a native ``;``-separated PATH that it
+    converts itself, and the Windows installer already puts ``venv\\Scripts`` on
+    the user PATH, so there is nothing to restore.
+    """
+    if _IS_WINDOWS:
+        return cmd_string
+    bin_dir = _resolve_hermes_venv_bin_dir()
+    if not bin_dir:
+        return cmd_string
+    # Same defensive quote escaping as _prepend_shell_init — the value comes
+    # from sys.executable, so it is a concrete absolute path.
+    safe = bin_dir.replace("'", "'\\''")
+    guard = (
+        f"__hermes_venv_bin='{safe}'\n"
+        'case "$PATH" in\n'
+        '  "$__hermes_venv_bin"|"$__hermes_venv_bin":*) ;;\n'
+        '  *) PATH="$__hermes_venv_bin:$PATH"; export PATH ;;\n'
+        'esac\n'
+        'unset __hermes_venv_bin\n'
+    )
+    return guard + cmd_string
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
 
@@ -1367,6 +1448,10 @@ class LocalEnvironment(BaseEnvironment):
         # don't need this.
         if login:
             init_files = _resolve_shell_init_files()
+            # The PATH guard is applied first so the source lines land ABOVE
+            # it: rc files run, then the Hermes venv is restored to the front
+            # of PATH before the environment is dumped into the snapshot.
+            cmd_string = _prepend_venv_bin_path_guard(cmd_string)
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]

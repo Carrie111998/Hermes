@@ -1945,7 +1945,9 @@ function Install-Venv {
     # normal progress such as "Using CPython ..." on stderr; under Windows
     # PowerShell 5.1 with EAP=Stop that stderr is a NativeCommandError unless
     # we temporarily relax EAP and trust $LASTEXITCODE for real failures.
-    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion }
+    # --seed adds pip (uv leaves it out), keeping the venv in lockstep with
+    # install.sh so `pip install` from the agent targets the Hermes venv (#7309).
+    Invoke-NativeWithRelaxedErrorAction { & $UvCmd venv venv --python $PythonVersion --seed }
     # Relaxing EAP above means a *genuine* uv-venv failure (exit != 0) no longer
     # aborts on its own. Capture $LASTEXITCODE immediately and fail fast, so the
     # `venv` stage can't falsely report success (and Invoke-Stage can't emit

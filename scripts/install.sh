@@ -1345,8 +1345,12 @@ setup_venv() {
         rm -rf venv
     fi
 
-    # uv creates the venv and pins the Python version in one step
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
+    # uv creates the venv and pins the Python version in one step.  --seed adds
+    # pip, which uv otherwise leaves out: the terminal tool puts venv/bin first
+    # on PATH, so without a pip there the agent's `pip install` falls through to
+    # whatever interpreter the host exposes (a pyenv shim, the system Python)
+    # and packages land outside the Hermes venv (#7309).
+    $UV_CMD venv venv --python "$PYTHON_VERSION" --seed
 
     # Neutralize any inherited UV_PYTHON (e.g. UV_PYTHON=3.14 left in the
     # user's shell env). uv honours UV_PYTHON over an existing venv for the
