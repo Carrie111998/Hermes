@@ -6512,7 +6512,7 @@ def _restore_stashed_changes(
     has_conflicts = bool(unmerged.stdout.strip())
 
     if restore.returncode != 0 or has_conflicts:
-        print("✗ Update pulled new code, but restoring local changes hit conflicts.")
+        print("✗ Restoring local changes hit conflicts.")
         if restore.stdout.strip():
             print(restore.stdout.strip())
         if restore.stderr.strip():
@@ -6733,31 +6733,17 @@ def _mark_skip_upstream_prompt():
         pass
 
 
-def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
-    """Attempt to push updated main to origin (sync fork).
-
-    Returns True if push succeeded, False otherwise.
-    """
-    try:
-        result = subprocess.run(
-            git_cmd + ["push", "origin", "main", "--force-with-lease"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
 def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
-    """Check if fork is behind upstream and sync if safe.
+    """Report official upstream drift without mutating a maintained fork.
 
-    This implements the fork upstream sync logic:
+    Fork releases are consumed from ``origin``. Official upstream integration is
+    prepared and tested separately so an updater cannot rewrite published fork
+    history or change the live runtime while resolving conflicts.
+
+    This check:
     - If upstream remote doesn't exist, ask user if they want to add it
     - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
+    - Report whether the fork needs a separately reviewed upstream integration
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
@@ -6822,48 +6808,25 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    if upstream_ahead == 0:
+        print("  ✓ Fork contains all current upstream commits")
+        return
+
+    # A maintained fork needs a reviewed integration when upstream has new
+    # commits. Never merge, reset, or push from the product updater.
     if origin_ahead > 0:
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        if upstream_ahead > 0:
+            print(f"  Official upstream has {upstream_ahead} new commit(s).")
+        print("  Upstream integration requires a separately reviewed candidate.")
+        print("  No merge or push was performed.")
         return
 
-    # If upstream is not ahead, fork is up to date
-    if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
-        return
-
-    # origin/main is strictly behind upstream/main (can fast-forward)
     print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
-
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
-        )
-        return
-
-    print("  ✓ Updated from upstream")
-
-    # Try to sync fork back to origin
-    print("→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd):
-        print("  ✓ Fork synced with upstream")
-    else:
-        print(
-            "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
-        )
-        print("    Your local repo is updated, but your fork on GitHub may be behind.")
+    print(f"ℹ Official upstream has {upstream_ahead} new commit(s).")
+    print("  Prepare and verify the upstream update outside the live updater.")
+    print("  No pull or push was performed.")
 
 
 def _invalidate_update_cache():
@@ -9472,26 +9435,40 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True,
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                detail = pull_result.stderr.strip()
+                print("✗ Failed to pull updates from origin.")
+                if detail:
+                    print(f"  {detail.splitlines()[0]}")
+                divergence_check = subprocess.run(
+                    git_cmd
+                    + [
+                        "merge-base",
+                        "--is-ancestor",
+                        "HEAD",
+                        f"origin/{branch}",
+                    ],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                print("  Update stopped without rewriting local commits.")
+                if divergence_check.returncode == 1:
+                    print("  Local and origin history have diverged.")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        "  Review the divergence and choose a merge or rebase explicitly."
                     )
-                    sys.exit(1)
+                else:
+                    print("  Resolve the Git error above, then retry the update.")
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                    auto_stash_ref = None
+                sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

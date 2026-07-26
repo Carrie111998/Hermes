@@ -250,6 +250,151 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
+    @patch("subprocess.run")
+    def test_fork_upstream_check_never_pulls_or_pushes(self, mock_run, capsys):
+        from hermes_cli import main as hm
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        )
+        with patch.object(hm, "_has_upstream_remote", return_value=True), patch.object(
+            hm, "_count_commits_between", side_effect=[2, 5]
+        ):
+            hm._sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        commands = [
+            " ".join(str(arg) for arg in call.args[0])
+            for call in mock_run.call_args_list
+        ]
+        assert any("fetch upstream main" in command for command in commands)
+        assert not any(" pull " in f" {command} " for command in commands)
+        assert not any(" push " in f" {command} " for command in commands)
+        assert "No merge or push was performed." in capsys.readouterr().out
+
+    @patch("subprocess.run")
+    def test_fork_only_commits_are_up_to_date_when_upstream_has_no_new_work(
+        self, mock_run, capsys
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        )
+        with patch.object(hm, "_has_upstream_remote", return_value=True), patch.object(
+            hm, "_count_commits_between", side_effect=[2, 0]
+        ):
+            hm._sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        output = capsys.readouterr().out
+        assert "contains all current upstream commits" in output
+        assert "requires a separately reviewed candidate" not in output
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_divergent_origin_update_stops_without_hard_reset(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        base_side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(arg) for arg in cmd)
+            if "pull --ff-only origin main" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="not possible to fast-forward"
+                )
+            if "merge-base --is-ancestor HEAD origin/main" in joined:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+            return base_side_effect(cmd, **kwargs)
+
+        mock_run.side_effect = side_effect
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(mock_args)
+
+        assert exc_info.value.code == 1
+        commands = [
+            " ".join(str(arg) for arg in call.args[0])
+            for call in mock_run.call_args_list
+        ]
+        assert not any("reset --hard" in command for command in commands)
+        assert (
+            "Update stopped without rewriting local commits."
+            in capsys.readouterr().out
+        )
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_origin_pull_network_failure_preserves_git_error(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        base_side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(arg) for arg in cmd)
+            if "pull --ff-only origin main" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    stdout="",
+                    stderr="fatal: unable to access origin: network is down",
+                )
+            if "merge-base --is-ancestor HEAD origin/main" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return base_side_effect(cmd, **kwargs)
+
+        mock_run.side_effect = side_effect
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(mock_args)
+
+        assert exc_info.value.code == 1
+        output = capsys.readouterr().out
+        assert "network is down" in output
+        assert "Resolve the Git error above" in output
+        assert "history have diverged" not in output
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_failed_pull_restores_updater_stash(
+        self, mock_run, _mock_which, mock_args
+    ):
+        from hermes_cli import main as hm
+
+        base_side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(arg) for arg in cmd)
+            if "pull --ff-only origin main" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="network failure"
+                )
+            if "merge-base --is-ancestor HEAD origin/main" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return base_side_effect(cmd, **kwargs)
+
+        mock_run.side_effect = side_effect
+
+        with patch.object(
+            hm, "_stash_local_changes_if_needed", return_value="stash-sha"
+        ), patch.object(
+            hm, "_restore_stashed_changes", return_value=True
+        ) as restore_mock, pytest.raises(SystemExit):
+            cmd_update(mock_args)
+
+        restore_mock.assert_called_once_with(
+            ["git"],
+            PROJECT_ROOT,
+            "stash-sha",
+            prompt_user=False,
+            input_fn=None,
+        )
+
     @patch("shutil.which")
     @patch("subprocess.run")
     def test_update_refreshes_repo_and_tui_node_dependencies(
