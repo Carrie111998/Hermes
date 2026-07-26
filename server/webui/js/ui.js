@@ -93,24 +93,334 @@ export function statCard({ label, value, delta, deltaDir = 'flat', spark }) {
 const STATUS_KIND = {
   // generic
   active: 'success', completed: 'success', connected: 'success', verified: 'success', approved: 'success',
-  sent: 'success', replied: 'accent', interested: 'accent', done: 'success',
-  running: 'info', processing: 'info', queued: 'neutral', in_progress: 'info', draft_created: 'info',
-  pending: 'warning', awaiting_approval: 'warning', draft_generated: 'warning', unverified: 'warning',
-  paused: 'warning', not_connected: 'neutral', new: 'neutral', draft: 'neutral', archived: 'neutral',
-  researched: 'info', contacted: 'info',
-  failed: 'error', error: 'error', cancelled: 'error', do_not_contact: 'error', not_found: 'error', lost: 'error',
+  processed: 'success',
+  sent: 'success', sent_manually: 'success', replied: 'accent', interested: 'accent', done: 'success',
+  running: 'info', processing: 'info', generating: 'info', queued: 'neutral', in_progress: 'info',
+  draft_created: 'info',
+  qualified: 'info', researched: 'info', contacted: 'info',
+  pending: 'warning', pending_approval: 'warning', awaiting_approval: 'warning', partially_sent: 'warning',
+  draft_generated: 'warning', unverified: 'warning', paused: 'warning',
+  not_connected: 'neutral', not_configured: 'neutral', not_built: 'neutral',
+  new: 'neutral', draft: 'neutral', archived: 'neutral', uploaded: 'neutral',
+  opted_out: 'neutral',
+  failed: 'error', error: 'error', qa_failed: 'error', paused_bounce_rate: 'error',
+  cancelled: 'error', do_not_contact: 'error', not_found: 'error', lost: 'error',
 };
+
+/* Customer-facing language for persisted/API status values. Keep this table
+   at the shared boundary so pages never need to print database enums. */
+export const LABELS = Object.freeze({
+  active: 'Active',
+  completed: 'Completed',
+  connected: 'Connected',
+  verified: 'Verified',
+  processed: 'Ready to use',
+  approved: 'Approved',
+  sent: 'Sent',
+  sent_manually: 'You sent this',
+  replied: 'They replied',
+  interested: 'Interested',
+  done: 'Complete',
+  running: 'In progress',
+  processing: 'In progress',
+  generating: 'Generating messages',
+  queued: 'Waiting',
+  in_progress: 'In progress',
+  pending: 'Pending',
+  pending_approval: 'Waiting for you',
+  awaiting_approval: 'Waiting for you',
+  draft_generated: 'Waiting for you',
+  draft: 'Saved as a draft',
+  draft_created: 'Saved as a draft',
+  unverified: 'Not verified',
+  paused: 'Paused',
+  paused_bounce_rate: 'Sending paused — too many bounces',
+  not_connected: 'Not connected',
+  not_configured: 'Not configured',
+  not_built: 'Not built yet',
+  uploaded: 'Uploaded',
+  partially_sent: 'Partly sent',
+  new: 'Not looked at yet',
+  qualified: 'Worth approaching',
+  researched: 'Researched',
+  contacted: 'Emailed',
+  archived: 'Set aside',
+  qa_failed: 'Needs a second look',
+  opted_out: 'Asked not to be contacted',
+  do_not_contact: 'Never contact',
+  unqualified_after_source_removal: 'No longer supported by its source',
+  failed: 'Failed',
+  error: 'Error',
+  cancelled: 'Cancelled',
+  not_found: 'Not found',
+  lost: 'Lost',
+  blocked: 'Blocked',
+  access_pending: 'Access pending',
+  enabled: 'Enabled',
+  disabled: 'Disabled',
+  suspended: 'Suspended',
+  partial: 'Partly completed',
+  succeeded: 'Completed',
+  observed: 'Verified',
+  estimated: 'Estimated',
+  unknown: 'Not known',
+  profile_found: 'Profile found',
+  connection_sent: 'Connection sent',
+  note_generated: 'Note ready',
+  opened: 'Opened',
+});
+
+export const QA_LABELS = Object.freeze({
+  missing_recipient: "The email address is missing.",
+  missing_body_or_template: "The message itself is missing.",
+  subject_mismatch: "The subject line doesn't match your standard subject.",
+  operator_language_contamination: 'Some Turkish slipped into a non-Turkish email.',
+  unresolved_placeholder: "A blank didn't get filled in.",
+  unknown_placeholder: "A blank didn't get filled in.",
+  invalid_or_missing_recipient: "The email address doesn't look right.",
+  invalid_cc_recipient: "One of the CC addresses doesn't look right.",
+  double_dash: "Contains a double dash, which your style rules don't allow.",
+  internal_marker: 'An internal note was left in the text.',
+  unapproved_link: "Contains a link that isn't on your approved list.",
+});
+
+export const APPROVAL_STATUSES = Object.freeze([
+  'pending_approval',
+  'draft_generated',
+  'qa_failed',
+  'approved',
+]);
+
+export const MESSAGE_SUPERSESSION_EVENT = 'ifz:message-superseded';
+const SUPERSEDED_MESSAGES_KEY = 'ifz.approvals.superseded-message-ids.v1';
+let supersededMessageIds = null;
+
+function messageIdOf(messageOrId) {
+  const value = typeof messageOrId === 'object' ? messageOrId?.id : messageOrId;
+  return value == null || value === '' ? null : String(value);
+}
+
+function loadSupersededMessageIds() {
+  if (supersededMessageIds) return supersededMessageIds;
+  supersededMessageIds = new Set();
+  try {
+    const raw = globalThis.localStorage?.getItem(SUPERSEDED_MESSAGES_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) {
+      supersededMessageIds = new Set(parsed
+        .filter(value => value != null && value !== '')
+        .map(String));
+    }
+  } catch { /* storage may be unavailable or contain invalid legacy data */ }
+  return supersededMessageIds;
+}
+
+function emitMessageSupersession(messageId = null) {
+  const target = globalThis.document;
+  const EventCtor = globalThis.CustomEvent;
+  if (!target?.dispatchEvent || typeof EventCtor !== 'function') return;
+  target.dispatchEvent(new EventCtor(MESSAGE_SUPERSESSION_EVENT, {
+    detail: {
+      messageId,
+      ids: [...loadSupersededMessageIds()],
+    },
+  }));
+}
+
+export function readSupersededMessageIds() {
+  return new Set(loadSupersededMessageIds());
+}
+
+export function markMessageSuperseded(messageOrId) {
+  const messageId = messageIdOf(messageOrId);
+  if (!messageId) return false;
+  const ids = loadSupersededMessageIds();
+  const changed = !ids.has(messageId);
+  ids.add(messageId);
+  try {
+    globalThis.localStorage?.setItem(SUPERSEDED_MESSAGES_KEY, JSON.stringify([...ids]));
+  } catch { /* the in-memory set still keeps this browser view coherent */ }
+  if (changed) emitMessageSupersession(messageId);
+  return changed;
+}
+
+export function isMessageSuperseded(messageOrId) {
+  const messageId = messageIdOf(messageOrId);
+  return Boolean(messageId && loadSupersededMessageIds().has(messageId));
+}
+
+globalThis.addEventListener?.('storage', event => {
+  if (event.key !== SUPERSEDED_MESSAGES_KEY) return;
+  supersededMessageIds = null;
+  emitMessageSupersession();
+});
+
+export function isApprovalActionable(message, { lead, contact } = {}) {
+  if (!message || !APPROVAL_STATUSES.includes(message.status)) return false;
+  const channel = message.channel == null ? '' : String(message.channel).trim().toLowerCase();
+  if (channel && channel !== 'email') return false;
+  if (isMessageSuperseded(message)) return false;
+  if (lead?.do_not_contact || lead?.status === 'do_not_contact' || contact?.do_not_contact) return false;
+  return true;
+}
+
+export function labelFor(status) {
+  if (status == null || status === '') return 'Not known';
+  return LABELS[status] || String(status).replace(/_/g, ' ');
+}
+
 export function badge(status, textOverride) {
   const kind = STATUS_KIND[status] || 'neutral';
-  const label = textOverride || String(status).replace(/_/g, ' ');
+  const label = textOverride ?? labelFor(status);
   const cls = ['ifz-badge', kind];
   if (status === 'running' || status === 'processing') cls.push('running');
   return el('span', { class: cls.join(' ') }, label);
 }
-export function scoreBadge(score, { title } = {}) {
-  const v = typeof score === 'object' ? score.value : score;
+
+/**
+ * Turn a background task into a short customer-facing sentence.
+ * Progress values may select a sentence, but they are never printed.
+ */
+export function runSentence(run = {}) {
+  const type = run.type || run.run_type;
+  const status = run.status === 'succeeded' ? 'completed' : run.status;
+  const progress = Number(run.progress) || 0;
+
+  if (status === 'failed' || status === 'error') {
+    const failures = {
+      lead_scan: "I couldn't finish looking for buyers.",
+      lead_research: "I couldn't finish learning about one of the buyers.",
+      contact_discovery: "I couldn't finish looking for the right contacts.",
+      outreach_generation: "I couldn't finish writing one of the emails.",
+      company_brain_build: "I couldn't finish reading your company information.",
+      document_processing: "I couldn't finish reading one of your files.",
+      product_extraction: "I couldn't finish finding products in your files.",
+    };
+    return failures[type] || "I couldn't finish that work.";
+  }
+  if (status === 'cancelled') return 'The work was stopped. Nothing was sent.';
+  if (status === 'queued' || status === 'created') {
+    const queued = {
+      lead_scan: 'Getting the buyer search ready.',
+      lead_research: 'Getting the buyer research ready.',
+      contact_discovery: 'Getting the contact search ready.',
+      outreach_generation: 'Getting the email drafts ready.',
+      company_brain_build: 'Getting your company information ready.',
+      document_processing: 'Getting the file ready to read.',
+      product_extraction: 'Getting the product files ready.',
+    };
+    return queued[type] || 'Getting the work ready.';
+  }
+  if (status === 'completed') {
+    const completed = {
+      lead_scan: 'The buyer search is complete.',
+      lead_research: 'The buyer research is complete.',
+      contact_discovery: 'The contact search is complete.',
+      outreach_generation: 'The email draft is ready for review.',
+      analytics_refresh: 'Your workspace summary is up to date.',
+      company_brain_build: 'Your company information is ready for review.',
+      document_processing: 'The file is ready to use.',
+      product_extraction: 'The product list is ready for review.',
+    };
+    return completed[type] || 'The work is complete.';
+  }
+
+  if (type === 'lead_scan') {
+    if (progress >= 75) return 'Saving the strongest buyers to your workspace.';
+    if (progress >= 30) return 'Comparing possible buyers with your company profile.';
+    return 'Looking through your target markets for buyers.';
+  }
+  const running = {
+    lead_research: 'Learning enough about each buyer to write a useful email.',
+    contact_discovery: 'Looking for the right person at each company.',
+    outreach_generation: 'Writing an email for review.',
+    analytics_refresh: 'Updating your workspace summary.',
+    company_brain_build: 'Reading your company information.',
+    document_processing: 'Reading the file and saving what matters.',
+    product_extraction: 'Finding products in your uploaded files.',
+  };
+  return running[type] || 'Work is underway.';
+}
+
+const PIPELINE_STAGES = Object.freeze([
+  ['found', 'Found'],
+  ['researched', 'Researched'],
+  ['contacts', 'Contacts'],
+  ['written', 'Written'],
+  ['sent', 'Sent'],
+  ['replied', 'Replied'],
+]);
+
+/**
+ * A compact, job-shaped view of the buyer journey.
+ * Counts do not have to be a strict funnel: Contacts is intentionally a people
+ * count, while the other stages describe company or message progress.
+ */
+export function pipelineRail(counts = {}, nextAction = null, { active = '', onSelect } = {}) {
+  const stages = PIPELINE_STAGES.map(([key, label]) => {
+    const count = Math.max(0, Number(counts[key]) || 0);
+    const content = [
+      el('span', { class: 'ifz-pipeline-count' }, String(count)),
+      el('span', { class: 'ifz-pipeline-label' }, label),
+    ];
+    return el('li', {
+      class: `ifz-pipeline-stage is-${key}${active === key ? ' is-active' : ''}`,
+    }, onSelect
+      ? el('button', {
+          type: 'button',
+          'aria-pressed': active === key ? 'true' : 'false',
+          onclick: () => onSelect(key),
+        }, content)
+      : content);
+  });
+
+  const action = nextAction
+    ? el('div', { class: `ifz-pipeline-next${nextAction.tone ? ` ${nextAction.tone}` : ''}` },
+        el('div', { class: 'ifz-pipeline-next-copy' },
+          el('span', { class: 'ifz-pipeline-next-mark', 'aria-hidden': 'true' }, '›'),
+          el('div', {},
+            el('strong', {}, nextAction.text || 'Your buyers are moving forward.'),
+            nextAction.detail ? el('span', {}, nextAction.detail) : null)),
+        nextAction.href
+          ? el('a', { class: 'ifz-btn', href: nextAction.href }, nextAction.label || 'Open')
+          : nextAction.onClick
+            ? button(nextAction.busyLabel && nextAction.busy ? nextAction.busyLabel : (nextAction.label || 'Continue'), {
+                kind: nextAction.kind || '',
+                icon: nextAction.icon,
+                onClick: nextAction.onClick,
+                disabled: nextAction.disabled || nextAction.busy,
+              })
+            : null)
+    : null;
+
+  return el('section', {
+    class: 'ifz-pipeline',
+    'aria-label': 'Buyer pipeline',
+  },
+  el('ol', { class: 'ifz-pipeline-stages' }, stages),
+  action);
+}
+
+export function scoreBadge(score, {
+  title,
+  words = false,
+  allowZero = false,
+  emptyLabel = 'Not researched yet',
+} = {}) {
+  const raw = score && typeof score === 'object' ? score.value : score;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || (allowZero ? v < 0 : v <= 0)) {
+    return el('span', {
+      class: 'ifz-score unscored',
+      title: title || 'This buyer has not been researched yet',
+    }, emptyLabel);
+  }
   const band = v >= 75 ? 'high' : v >= 50 ? 'mid' : 'low';
-  return el('span', { class: `ifz-score ${band}`, title: title || `Lead score ${v}/100` }, v);
+  const label = band === 'high' ? 'Strong fit' : band === 'mid' ? 'Possible fit' : 'Weak fit';
+  return el('span', {
+    class: `ifz-score ${band}`,
+    title: title || (words ? label : `Buyer score ${v}/100`),
+  }, words ? label : Math.round(v));
 }
 
 /* ---------- Data table ---------- */
@@ -154,33 +464,74 @@ export function dataTable({ columns, rows, onRowClick, empty, rowKey }) {
 export function emptyState({ icon: iconName = 'search', title, hint, action }) {
   return el('div', { class: 'ifz-empty' },
     el('div', { class: 'ifz-empty-icon' }, icon(iconName, 20)),
-    el('div', { class: 'ifz-empty-title' }, title || 'Nothing here yet'),
+    el('div', { class: 'ifz-empty-title', role: 'heading', 'aria-level': '2' },
+      title || 'Nothing here yet'),
     hint ? el('div', { class: 'ifz-empty-hint' }, hint) : null,
     action || null);
 }
 
 /* ---------- Modal ---------- */
+let _modalId = 0;
 export function modal({ title, body, actions, wide = false, onClose }) {
+  const previousFocus = document.activeElement;
+  const titleId = `ifz-modal-title-${++_modalId}`;
   const overlay = el('div', { class: 'ifz-overlay' });
+  let closed = false;
   function close() {
+    if (closed) return;
+    closed = true;
     document.removeEventListener('keydown', onKey);
     overlay.remove();
     if (onClose) onClose();
+    if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
   }
-  function onKey(e) { if (e.key === 'Escape') close(); }
+  function onKey(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const focusable = [...box.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), '
+      + 'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )].filter(node => !node.hidden && node.getAttribute('aria-hidden') !== 'true');
+    if (!focusable.length) {
+      e.preventDefault();
+      box.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
   document.addEventListener('keydown', onKey);
   overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
 
-  const box = el('div', { class: `ifz-modal${wide ? ' wide' : ''}`, role: 'dialog', 'aria-modal': 'true' },
+  const box = el('div', {
+    class: `ifz-modal${wide ? ' wide' : ''}`,
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-labelledby': titleId,
+    tabindex: '-1',
+  },
     el('div', { class: 'ifz-modal-head' },
-      el('div', { class: 'ifz-modal-title' }, title),
+      el('div', { class: 'ifz-modal-title', id: titleId }, title),
       el('button', { class: 'ifz-modal-x', 'aria-label': 'Close', onclick: close }, '×')),
     el('div', { class: 'ifz-modal-body' }, body),
     actions ? el('div', { class: 'ifz-modal-foot' }, actions) : null);
   overlay.append(box);
   document.body.append(overlay);
-  const firstInput = box.querySelector('input, select, textarea, button.primary');
-  if (firstInput) setTimeout(() => firstInput.focus(), 40);
+  const firstInput = box.querySelector('input, select, textarea, button.primary')
+    || box.querySelector('button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])')
+    || box;
+  setTimeout(() => firstInput.focus(), 40);
   return { close, box };
 }
 
@@ -270,7 +621,7 @@ export function tabs(items, activeKey, onSelect) {
 }
 
 /* ---------- Chip multi-select ---------- */
-export function chipSelect(options, selected, { onChange } = {}) {
+export function chipSelect(options, selected, { onChange, max, onLimit } = {}) {
   const sel = new Set(selected);
   const host = el('div', { class: 'ifz-chipselect', role: 'group' });
   for (const opt of options) {
@@ -282,7 +633,15 @@ export function chipSelect(options, selected, { onChange } = {}) {
       'aria-pressed': sel.has(value) ? 'true' : 'false',
     }, label);
     chip.addEventListener('click', () => {
-      if (sel.has(value)) sel.delete(value); else sel.add(value);
+      if (sel.has(value)) {
+        sel.delete(value);
+      } else {
+        if (max && sel.size >= max) {
+          onLimit?.(max);
+          return;
+        }
+        sel.add(value);
+      }
       chip.classList.toggle('on');
       chip.setAttribute('aria-pressed', sel.has(value) ? 'true' : 'false');
       if (onChange) onChange([...sel]);
@@ -469,7 +828,12 @@ export function select(options, attrs = {}) {
   return el('select', { class: 'ifz-select', ...attrs }, options.map(o =>
     el('option', { value: o.value ?? o, selected: (o.value ?? o) === attrs.value }, o.label ?? o)));
 }
-export function textarea(attrs = {}) { return el('textarea', { class: 'ifz-textarea', ...attrs }); }
+export function textarea(attrs = {}) {
+  const { value, ...rest } = attrs;
+  const node = el('textarea', { class: 'ifz-textarea', ...rest });
+  if (value != null) node.value = value;
+  return node;
+}
 
 /** Password field with show/hide toggle. Returns { wrap, input }. */
 export function passwordField(attrs = {}) {

@@ -424,10 +424,22 @@ export const handlers = {
   'onboarding.updateIntegrations': ({ body }) => markStep('integrations', body),
   'onboarding.reviewBrain': ({ body }) => markStep('brain-review', body),
   'onboarding.complete': () => {
+    const required = [
+      'company-identity',
+      'positioning',
+      'products',
+      'internal-sales-data',
+      'target-markets',
+    ];
+    const missing = required.filter(key =>
+      db.onboarding.steps.find(step => step.key === key)?.status !== 'done');
+    if (missing.length) {
+      throw new ApiError('Finish the required Setup items before completing Setup.', 409);
+    }
     db.onboarding.status = 'complete';
-    db.onboarding.steps.forEach(s => { s.status = 'done'; });
-    db.onboarding.current_step = db.onboarding.steps.length;
-    log('user', 'Onboarding completed');
+    const next = db.onboarding.steps.findIndex(step => step.status !== 'done');
+    db.onboarding.current_step = next < 0 ? db.onboarding.steps.length : next;
+    log('user', 'Setup completed');
     emit('onboarding', db.onboarding);
     return db.onboarding;
   },
@@ -1428,6 +1440,7 @@ function adminCompanyStatus(companyId, status) {
 function markStep(key) {
   const step = db.onboarding.steps.find(s => s.key === key);
   if (step) step.status = 'done';
+  db.onboarding.status = 'in_progress';
   const idx = db.onboarding.steps.findIndex(s => s.status !== 'done');
   db.onboarding.current_step = idx < 0 ? db.onboarding.steps.length : idx;
   emit('onboarding', db.onboarding);
@@ -1510,11 +1523,11 @@ function collectLeadActivity(leadId) {
 function buildRecommendedActions() {
   const actions = [];
   const awaiting = db.messages.filter(m => m.status === 'draft_generated').length;
-  if (awaiting) actions.push({ icon: 'mail', title: `Review ${awaiting} generated emails awaiting approval`, sub: 'UAE HoReCa campaign is ready to go out', href: '/app/outreach' });
-  if (db.onboarding.status !== 'complete') actions.push({ icon: 'upload', title: 'Finish onboarding — import your current contacts', sub: 'The Company Brain flagged missing contact data', href: '/app/onboarding' });
+  if (awaiting) actions.push({ icon: 'mail', title: `Review ${awaiting} emails waiting for you`, sub: 'UAE HoReCa campaign is ready to go out', href: '/app/approvals' });
+  if (db.onboarding.status !== 'complete') actions.push({ icon: 'upload', title: 'Finish setup — import your current contacts', sub: 'The Company Brain flagged missing contact data', href: '/app/setup' });
   const newLeads = db.leads.filter(l => l.status === 'new').length;
-  if (newLeads) actions.push({ icon: 'search', title: `Research ${newLeads} new leads`, sub: 'Prioritized by lead score', href: '/app/leads?status=new' });
-  if (db.leadMap.selected.length < db.leadMap.max_selected) actions.push({ icon: 'map', title: 'Expand to Netherlands and United Kingdom', sub: 'Both are recommended markets not yet scanned', href: '/app/lead-map' });
+  if (newLeads) actions.push({ icon: 'search', title: `Research ${newLeads} new buyers`, sub: 'Prioritized by fit', href: '/app/buyers?state=needs' });
+  if (db.leadMap.selected.length < db.leadMap.max_selected) actions.push({ icon: 'map', title: 'Expand to Netherlands and United Kingdom', sub: 'Both are recommended markets not yet scanned', href: '/app/buyers?map=1' });
   return actions.slice(0, 4);
 }
 

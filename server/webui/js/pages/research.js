@@ -40,14 +40,14 @@ export async function mount(root, ctx) {
         { key: 'updated_at', label: 'Updated', render: row => fmt.relTime(row.updated_at) },
       ],
       rows,
-      onRowClick: row => ctx.navigate(`/app/research/${row.id}`),
+      onRowClick: row => ctx.navigate(`/admin/research/${row.id}`),
       empty: emptyState({
         icon: 'search', title: campaigns.length ? 'No campaigns match' : 'Build your first research campaign',
         hint: campaigns.length
           ? 'Change the status filter or search term.'
           : 'Choose a seller market, target countries, a sector or product, buyer types, and at least one evidence source.',
         action: campaigns.length ? null : button('New research campaign', {
-          kind: 'primary', onClick: () => ctx.navigate('/app/research/new'),
+          kind: 'primary', onClick: () => ctx.navigate('/admin/research/new'),
         }),
       }),
     }) }));
@@ -70,8 +70,7 @@ export async function mount(root, ctx) {
       title: 'Research',
       sub: 'An evidence ledger for finding and qualifying plausible buyers—source by source, claim by claim.',
       actions: [
-        button('Open Lead Map', { kind: 'ghost', icon: 'map', onClick: () => ctx.navigate('/app/lead-map') }),
-        button('New research campaign', { kind: 'primary', icon: 'search', onClick: () => ctx.navigate('/app/research/new') }),
+        button('New research campaign', { kind: 'primary', icon: 'search', onClick: () => ctx.navigate('/admin/research/new') }),
       ],
     }),
     el('div', { class: 'ifz-research-toolbar' }, search, filterHost),

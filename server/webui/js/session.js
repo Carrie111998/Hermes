@@ -29,5 +29,5 @@ export function isAuthed() {
 }
 
 export function homeRoute(session = getSession()) {
-  return session?.user?.role === 'admin' ? '/admin/dashboard' : '/app/dashboard';
+  return session?.user?.role === 'admin' ? '/admin/dashboard' : '/app/today';
 }

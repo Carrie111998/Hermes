@@ -160,3 +160,14 @@ company-packs/*
 server/runs.db
 server/*.db
 server/.test-hermes/
+
+# WebUI acceptance-run scratch: Playwright temp profiles, result dumps and the
+# throwaway SQLite tenant those runs seed. Regenerated on every run.
+.browser-*.db
+.browser-*.db-shm
+.browser-*.db-wal
+.tmp-playwright-*/
+test-results/
+
+# Local hermes runtime config (may carry provider credentials — never committed).
+.local-hermes/

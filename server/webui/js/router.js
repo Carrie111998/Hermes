@@ -1,4 +1,4 @@
-/* Hash router — routes like '/app/leads/:leadId', guards, mount/cleanup lifecycle.
+/* Hash router — routes like '/admin/agent-runs/:runId', guards, mount/cleanup lifecycle.
    Page contract: mount(pageRoot, ctx) -> optional cleanup fn (or a Promise of one).
    ctx = { params, query, navigate, route } */
 

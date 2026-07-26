@@ -1,0 +1,1029 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>interfaze-agent — the collapse</title>
+
+<style>
+  /* ---------- reset ---------- */
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  img, svg { max-width: 100%; height: auto; display: block; }
+  table { border-collapse: collapse; }
+
+  /* ---------- tokens ---------- */
+  :root {
+    --paper:   #FAF9F5;
+    --surface: #F2EFE8;
+    --sunk:    #E8E4DA;
+    --ink:     #171614;
+    --ink-2:   #3A3733;
+    --muted:   #6E6A61;
+    --faint:   #9C968B;
+    --accent:  #0062D6;
+    --cut:     #A0453A;
+    --keep:    #2D6A4F;
+    --rule:    #DCD7CB;
+
+    --mono: "Cascadia Code", "SF Mono", ui-monospace, "JetBrains Mono", "Roboto Mono", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:   #131211;
+      --surface: #1C1B19;
+      --sunk:    #252320;
+      --ink:     #EAE6DE;
+      --ink-2:   #C9C4BA;
+      --muted:   #948E83;
+      --faint:   #6B665D;
+      --accent:  #5AA2FF;
+      --cut:     #D98177;
+      --keep:    #5CB88A;
+      --rule:    #302D29;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:   #131211;
+    --surface: #1C1B19;
+    --sunk:    #252320;
+    --ink:     #EAE6DE;
+    --ink-2:   #C9C4BA;
+    --muted:   #948E83;
+    --faint:   #6B665D;
+    --accent:  #5AA2FF;
+    --cut:     #D98177;
+    --keep:    #5CB88A;
+    --rule:    #302D29;
+  }
+  :root[data-theme="light"] {
+    --paper:   #FAF9F5;
+    --surface: #F2EFE8;
+    --sunk:    #E8E4DA;
+    --ink:     #171614;
+    --ink-2:   #3A3733;
+    --muted:   #6E6A61;
+    --faint:   #9C968B;
+    --accent:  #0062D6;
+    --cut:     #A0453A;
+    --keep:    #2D6A4F;
+    --rule:    #DCD7CB;
+  }
+
+  html { background: var(--paper); }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16.5px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 28px 140px;
+  }
+  .col { max-width: 68ch; }
+
+  /* ---------- type ---------- */
+  h1, h2, h3, .mono, .eyebrow, .num { font-family: var(--mono); }
+
+  .eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--faint);
+    font-weight: 600;
+  }
+
+  h1 {
+    font-size: clamp(38px, 7vw, 76px);
+    line-height: 0.98;
+    letter-spacing: -0.045em;
+    font-weight: 400;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h1 b { font-weight: 700; }
+
+  h2 {
+    font-size: clamp(23px, 3vw, 31px);
+    line-height: 1.12;
+    letter-spacing: -0.035em;
+    font-weight: 500;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-size: 17px;
+    letter-spacing: -0.01em;
+    font-weight: 600;
+    margin: 0 0 4px;
+  }
+
+  p { margin: 0 0 1.05em; }
+  p.lead {
+    font-size: 20.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+    letter-spacing: -0.011em;
+  }
+  .dim { color: var(--muted); }
+  strong { font-weight: 650; color: var(--ink); }
+  code {
+    font-family: var(--mono);
+    font-size: 0.855em;
+    background: var(--sunk);
+    padding: 0.12em 0.38em;
+    border-radius: 3px;
+    color: var(--ink-2);
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+  }
+
+  /* ---------- rhythm ---------- */
+  .band { padding: 86px 0 0; }
+  .band + .band { padding-top: 96px; }
+
+  .sechead {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 34px;
+  }
+
+  /* ---------- hero ---------- */
+  .hero {
+    padding: 96px 0 78px;
+    display: flex;
+    flex-direction: column;
+    gap: 30px;
+  }
+  .hero-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 22px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--faint);
+    letter-spacing: 0.02em;
+  }
+
+  /* ---------- the two sidebars ---------- */
+  .collapse {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 0;
+    align-items: start;
+    margin: 8px 0 0;
+  }
+  @media (max-width: 760px) {
+    .collapse { grid-template-columns: 1fr; }
+    .collapse-arrow { padding: 22px 0 !important; transform: rotate(90deg); }
+  }
+
+  .navcard {
+    background: var(--accent);
+    padding: 20px 0 24px;
+    border-radius: 5px;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: #fff;
+    overflow: hidden;
+  }
+  .navcard-brand {
+    padding: 0 20px 18px;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: rgba(255,255,255,0.95);
+  }
+  .navgroup {
+    padding: 13px 20px 4px;
+    font-size: 9.5px;
+    letter-spacing: 0.19em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.5);
+  }
+  .navitem {
+    padding: 6.5px 20px;
+    color: rgba(255,255,255,0.9);
+    position: relative;
+  }
+  .navitem.gone { color: rgba(255,255,255,0.42); }
+  .navitem.gone > span {
+    position: relative;
+    display: inline-block;
+  }
+  .navitem.gone > span::after {
+    content: "";
+    position: absolute;
+    left: -2px;
+    right: -2px;
+    top: 51%;
+    height: 1.5px;
+    background: #FFD9D4;
+    transform: scaleX(0);
+    transform-origin: left;
+    animation: strike 0.5s cubic-bezier(.4,0,.2,1) forwards;
+    animation-delay: var(--d, 0s);
+  }
+  @keyframes strike { to { transform: scaleX(1); } }
+  @media (prefers-reduced-motion: reduce) {
+    .navitem.gone > span::after { animation: none; transform: scaleX(1); }
+  }
+
+  .navitem .to {
+    font-size: 10.5px;
+    color: rgba(255,255,255,0.55);
+    letter-spacing: 0.01em;
+  }
+  .navcard.after .navitem {
+    padding: 11px 20px;
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .navcard.after .navitem .sub {
+    display: block;
+    font-size: 10.5px;
+    font-weight: 400;
+    color: rgba(255,255,255,0.62);
+    letter-spacing: 0.01em;
+    margin-top: 1px;
+  }
+  .navbadge {
+    background: #fff;
+    color: var(--accent);
+    border-radius: 3px;
+    font-size: 10.5px;
+    font-weight: 700;
+    padding: 1px 6px;
+    margin-left: 7px;
+    vertical-align: 1px;
+  }
+
+  .collapse-arrow {
+    padding: 0 34px;
+    align-self: center;
+    font-family: var(--mono);
+    color: var(--faint);
+    font-size: 26px;
+    letter-spacing: -0.06em;
+  }
+
+  .countline {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 12px;
+    font-family: var(--mono);
+  }
+  .count {
+    font-size: 40px;
+    letter-spacing: -0.05em;
+    line-height: 1;
+    font-weight: 500;
+  }
+  .count.before { color: var(--cut); }
+  .count.after  { color: var(--keep); }
+  .countlabel {
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+
+  /* ---------- pull quote ---------- */
+  blockquote {
+    margin: 0;
+    padding: 0 0 0 22px;
+    border-left: 2px solid var(--accent);
+    font-size: 18.5px;
+    line-height: 1.55;
+    color: var(--ink-2);
+  }
+  blockquote cite {
+    display: block;
+    margin-top: 12px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-style: normal;
+    color: var(--faint);
+    letter-spacing: 0.02em;
+  }
+
+  /* ---------- defects ---------- */
+  .defects {
+    display: grid;
+    gap: 1px;
+    background: var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+    margin-top: 6px;
+  }
+  .defect {
+    background: var(--paper);
+    padding: 17px 20px;
+    display: grid;
+    grid-template-columns: 26px 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+  .defect .n {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--cut);
+    padding-top: 3px;
+    font-weight: 600;
+  }
+  .defect p { margin: 0; font-size: 15.5px; line-height: 1.5; }
+  .defect .src {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--faint);
+    margin-top: 5px;
+    display: block;
+    word-break: break-word;
+  }
+
+  /* ---------- wireframes ---------- */
+  .screen { margin-top: 44px; }
+  .screen-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-bottom: 5px;
+  }
+  .screen-route {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 0;
+  }
+  .screen-purpose {
+    color: var(--muted);
+    font-size: 16px;
+    margin: 0 0 18px;
+    max-width: 62ch;
+  }
+  .frame {
+    background: var(--surface);
+    border-radius: 5px;
+    padding: 22px 24px;
+    overflow-x: auto;
+  }
+  .frame pre {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.58;
+    color: var(--ink-2);
+    white-space: pre;
+  }
+  .notes {
+    margin: 18px 0 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 9px;
+    max-width: 74ch;
+  }
+  .notes li {
+    padding-left: 17px;
+    position: relative;
+    font-size: 15.5px;
+    line-height: 1.52;
+    color: var(--ink-2);
+  }
+  .notes li::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.62em;
+    width: 6px;
+    height: 1.5px;
+    background: var(--accent);
+  }
+
+  /* ---------- copy table ---------- */
+  .tablewrap { overflow-x: auto; margin-top: 8px; }
+  table { width: 100%; font-size: 15px; }
+  th, td { text-align: left; padding: 9px 18px 9px 0; vertical-align: top; }
+  thead th {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--faint);
+    font-weight: 600;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 9px;
+  }
+  tbody tr + tr td { border-top: 1px solid var(--rule); }
+  td.was {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--cut);
+    white-space: nowrap;
+  }
+  td.now { color: var(--ink); }
+
+  /* ---------- phases ---------- */
+  .phases {
+    display: grid;
+    gap: 1px;
+    background: var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+    margin-top: 6px;
+  }
+  .phase {
+    background: var(--paper);
+    padding: 19px 22px;
+    display: grid;
+    grid-template-columns: 78px 1fr auto;
+    gap: 20px;
+    align-items: baseline;
+  }
+  @media (max-width: 680px) {
+    .phase { grid-template-columns: 1fr; gap: 6px; }
+    .phase .est { justify-self: start; }
+  }
+  .phase .n {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .phase h3 { margin: 0 0 3px; }
+  .phase p { margin: 0; font-size: 15px; color: var(--muted); line-height: 1.5; }
+  .phase .est {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--faint);
+    white-space: nowrap;
+  }
+  .phase.first { background: var(--surface); }
+  .phase.first .n { color: var(--accent); }
+  .tag-first {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 1px 6px;
+    margin-left: 9px;
+    vertical-align: 2px;
+  }
+
+  /* ---------- not doing ---------- */
+  .nots {
+    display: grid;
+    gap: 7px;
+    margin-top: 6px;
+    padding: 0;
+    list-style: none;
+    max-width: 72ch;
+  }
+  .nots li {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: var(--muted);
+    padding-left: 22px;
+    position: relative;
+    line-height: 1.5;
+  }
+  .nots li::before {
+    content: "×";
+    position: absolute;
+    left: 3px;
+    color: var(--faint);
+  }
+
+  .kicker {
+    margin-top: 76px;
+    padding: 28px 30px;
+    background: var(--surface);
+    border-radius: 5px;
+    max-width: 74ch;
+  }
+  .kicker p { margin: 0; font-size: 18px; line-height: 1.52; color: var(--ink-2); }
+  .kicker p + p { margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="hero-meta">
+      <span>interfaze-agent</span>
+      <span>UX proposal</span>
+      <span>server/webui</span>
+      <span>26 July 2026</span>
+    </div>
+    <h1>Fifteen doors.<br><b>One job.</b></h1>
+    <p class="lead col">The sidebar is a picture of your database, not a picture of the
+      user's job. A salesperson has three verbs — find buyers, write to them, get replies.
+      The app gives them fifteen nouns and no map.</p>
+  </header>
+
+  <div class="collapse">
+    <div>
+      <div class="countline">
+        <span class="count before">15</span>
+        <span class="countlabel">destinations today</span>
+      </div>
+      <div class="navcard">
+        <div class="navcard-brand">interfaze</div>
+        <div class="navgroup">Overview</div>
+        <div class="navitem gone" style="--d:.15s"><span>Dashboard</span> <span class="to">→ Today</span></div>
+        <div class="navgroup">Market</div>
+        <div class="navitem gone" style="--d:.21s"><span>Lead Map</span> <span class="to">→ filter</span></div>
+        <div class="navitem gone" style="--d:.27s"><span>Research</span> <span class="to">→ admin</span></div>
+        <div class="navitem gone" style="--d:.33s"><span>Leads</span> <span class="to">→ Buyers</span></div>
+        <div class="navitem gone" style="--d:.39s"><span>Contacts</span> <span class="to">→ inside a company</span></div>
+        <div class="navgroup">Outreach</div>
+        <div class="navitem gone" style="--d:.45s"><span>Campaigns</span> <span class="to">→ Approvals</span></div>
+        <div class="navitem gone" style="--d:.51s"><span>Custom Outreach</span> <span class="to">→ + Add a buyer</span></div>
+        <div class="navitem gone" style="--d:.57s"><span>Email Templates</span> <span class="to">→ Setup</span></div>
+        <div class="navgroup">Intelligence</div>
+        <div class="navitem gone" style="--d:.63s"><span>Company Brain</span> <span class="to">→ Setup</span></div>
+        <div class="navitem gone" style="--d:.69s"><span>Analytics</span> <span class="to">→ one sentence</span></div>
+        <div class="navgroup">System</div>
+        <div class="navitem gone" style="--d:.75s"><span>Agent Runs</span> <span class="to">→ admin</span></div>
+        <div class="navitem gone" style="--d:.81s"><span>Integrations</span> <span class="to">→ Setup</span></div>
+        <div class="navitem gone" style="--d:.87s"><span>Settings</span> <span class="to">→ Setup</span></div>
+      </div>
+    </div>
+
+    <div class="collapse-arrow">⟶</div>
+
+    <div>
+      <div class="countline">
+        <span class="count after">4</span>
+        <span class="countlabel">destinations proposed</span>
+      </div>
+      <div class="navcard after">
+        <div class="navcard-brand">interfaze</div>
+        <div class="navitem"><span>Today</span><span class="sub">what happened, what needs you</span></div>
+        <div class="navitem"><span>Approvals</span><span class="navbadge">6</span><span class="sub">the daily job</span></div>
+        <div class="navitem"><span>Buyers</span><span class="sub">companies and the people in them</span></div>
+        <div class="navitem"><span>Setup</span><span class="sub">everything configured once</span></div>
+        <div class="navgroup" style="margin-top:14px">Everywhere</div>
+        <div class="navitem"><span>Ask</span><span class="sub">⌘K — answers questions, can't act</span></div>
+      </div>
+    </div>
+  </div>
+
+
+  <section class="band">
+    <div class="col sechead">
+      <span class="eyebrow">The diagnosis</span>
+      <h2>The product already knows what it should be</h2>
+    </div>
+    <div class="col">
+      <blockquote>
+        Daily operation runs without per-day approval, but the operator gets a daily plan
+        notification each morning and a results report each evening. […] Supervisors get
+        clean business reports — <strong>never technical logs, error dumps, or workflow
+        mechanics.</strong>
+        <cite>company-packs/silverline/business-rules.md:17–21</cite>
+      </blockquote>
+      <p style="margin-top:26px">That is the right product, written down in your own repo. What
+        shipped is the opposite: a customer-facing run-log viewer, a raw
+        <code>Hermes command unavailable</code> string on the Integrations page, and database
+        enums printed straight into the interface.</p>
+      <p>The gap isn't craft — the CSS is careful, the accessibility work is real, the
+        component kit is clean. The gap is that <strong>the human was made the orchestrator of a
+        seven-stage pipeline nobody showed them.</strong> To get one reply today you must know to
+        go: Lead&nbsp;Map → Research → Leads → research each lead → Contacts → Campaigns →
+        Message&nbsp;queue → approve → send.</p>
+    </div>
+  </section>
+
+
+  <section class="band">
+    <div class="col sechead">
+      <span class="eyebrow">Verified in code</span>
+      <h2>What's costing you trust right now</h2>
+    </div>
+
+    <div class="defects">
+      <div class="defect">
+        <span class="n">01</span>
+        <div>
+          <p><strong>Every status enum is printed to the user by default.</strong>
+            <code>badge()</code> falls back to <code>String(status).replace(/_/g,' ')</code>, so
+            the interface says “draft generated”, “draft created”, “do not contact”. This one
+            function is the mechanical root of the system-language problem — and the one-function fix.</p>
+          <span class="src">server/webui/js/ui.js:105</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">02</span>
+        <div>
+          <p><strong>The biggest thing on the dashboard can't do anything.</strong> The chat box
+            is read-only by design — its system prompt forbids it from claiming it sent, changed,
+            or ran anything. It looks like an agent you can command. It's a FAQ bot.</p>
+          <span class="src">server/chat_bridge.py:152–160</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">03</span>
+        <div>
+          <p><strong>“Onboarding step 5 of 8” is wrong.</strong> Only five of the eight steps are
+            required. You're telling users who have finished that they're 62% done, forever.</p>
+          <span class="src">server/routes/onboarding.py:22–24 — REQUIRED_STEPS has 5 entries</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">04</span>
+        <div>
+          <p><strong>Messages that failed quality checks are invisible.</strong> The approval
+            queue's filter chips list five statuses and omit <code>qa_failed</code> — so a message
+            the agent itself doesn't trust appears under no filter but “All”, in neutral grey,
+            looking exactly as calm as a good one.</p>
+          <span class="src">server/webui/js/pages/outreach.js:119 · STATUS_KIND has no qa_failed entry</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">05</span>
+        <div>
+          <p><strong>Six buttons, no primary path.</strong> The review modal offers Save, Regenerate,
+            Approve, Create draft, Send now, and Mark replied at equal weight. “Send now” then
+            toasts <em>“Message marked sent.”</em> A user cannot tell what any of them will do.</p>
+          <span class="src">server/webui/js/pages/_page-utils.js:143–159</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">06</span>
+        <div>
+          <p><strong>Every score reads 0.</strong> The band maths treats an unscored lead as a
+            low-scoring one, so twenty-five companies are presented as uniformly worthless.</p>
+          <span class="src">server/webui/js/ui.js:110–114 · pages/leads.js:122</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">07</span>
+        <div>
+          <p><strong>Two scoring systems argue on one card.</strong> Lead detail shows evidence-based
+            <code>fit_score</code> and <code>evidence_confidence</code> directly beside the legacy
+            score, band, and factor bars. Two parallel discovery systems are both in the nav —
+            Research sits empty while Leads holds 25 — with nothing explaining the relationship.</p>
+          <span class="src">server/webui/js/pages/leads.js:210–240</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">08</span>
+        <div>
+          <p><strong>The pipeline is exposed as buttons.</strong> Lead detail's action row is
+            Research → Find contacts → Generate email, to be clicked by hand, per company,
+            twenty-five times. Starting any of them offers a “Watch” toast that navigates the
+            customer into the run-log viewer.</p>
+          <span class="src">server/webui/js/pages/leads.js:185, 311</span>
+        </div>
+      </div>
+      <div class="defect">
+        <span class="n">09</span>
+        <div>
+          <p><strong>The daily job is three clicks deep.</strong> Approving six emails — the entire
+            reason to open the app — lives behind Campaigns → Message queue tab → row → modal.</p>
+          <span class="src">server/webui/js/pages/outreach.js:39–47</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <section class="band">
+    <div class="col sechead">
+      <span class="eyebrow">The four screens</span>
+      <h2>What replaces them</h2>
+    </div>
+    <p class="col dim" style="margin-bottom:6px">Same stack — vanilla ES modules, no build step,
+      no React. These reuse the existing component kit in <code>ui.js</code> rather than
+      introducing a parallel layer.</p>
+
+    <div class="screen">
+      <div class="screen-head">
+        <h3>Today</h3>
+        <span class="screen-route">/app/today</span>
+      </div>
+      <p class="screen-purpose">A short note from a competent assistant, not a metrics dashboard.
+        Answers “what happened, what needs me, what's next” in one glance.</p>
+      <div class="frame"><pre>┌──────────────────────────────────────────────────────────────────┐
+│  Good morning.                                                   │
+│                                                                  │
+│  Overnight I looked through Germany and the United Arab          │
+│  Emirates, found 12 companies worth approaching, and wrote       │
+│  6 emails.                                                       │
+│                                                                  │
+│      ┌────────────────────────────────────────────┐              │
+│      │  6 emails are waiting for you  [ Review → ]│              │
+│      └────────────────────────────────────────────┘              │
+│                                                                  │
+│  Since yesterday                                                 │
+│  ·  NordHaus Geräte replied — they asked about a sample order    │
+│  ·  2 more replies are in your mailbox                           │
+│  ·  Al Fardan Home Retail opened your email twice                │
+│                                                                  │
+│  Next                                                            │
+│  Tonight I'll look through Saudi Arabia. Nothing needed from you.│
+│                                                                  │
+│  ────────────────────────────────────────────────────────────    │
+│  25 buyers · 2 replies from 4 emails        See the numbers →    │
+└──────────────────────────────────────────────────────────────────┘</pre></div>
+      <ul class="notes">
+        <li><strong>Deleted:</strong> six stat cards, two weekly bar charts, the funnel, the run
+          table, the live-run progress strip, and the “next best action” list. There is one action.</li>
+        <li>The chat moves to a global <code>⌘K</code> <em>Ask</em>, relabelled honestly:
+          “I can answer questions about your workspace. I can't send anything.”</li>
+        <li><strong>Until the scheduler ships</strong> the briefing is retrospective and the primary
+          control is one button — <em>“▶ Find buyers and write to them”</em> — which chains the
+          existing pipeline routes and reports progress as sentences, never a percentage.</li>
+      </ul>
+    </div>
+
+    <div class="screen">
+      <div class="screen-head">
+        <h3>Approvals</h3>
+        <span class="screen-route">/app/approvals</span>
+      </div>
+      <p class="screen-purpose">The reason the user opens the app, promoted from a tab inside a
+        page called Campaigns to a focused, keyboard-first queue.</p>
+      <div class="frame"><pre>┌────────────────────────────────────────────────────────────────────┐
+│  Emails waiting for you                    2 of 6    ● ● ○ ○ ○ ○   │
+├──────────────────────────────────┬─────────────────────────────────┤
+│  To    Layla Ibrahim             │  Dubai Hospitality Supplies     │
+│        Head of Imports           │  Abu Dhabi, UAE                 │
+│  CC    export@silverline.com.tr  │  Hotel equipment supplier       │
+│                                  │                                 │
+│  Silverline Premium Built-In     │  Why this company               │
+│  Kitchen Appliances              │  Supplies 4–5★ hotel projects   │
+│  ────────────────────────────    │  in the Gulf. Two hotel fit-out │
+│                                  │  contracts announced this year. │
+│  Dear Ms Ibrahim,                │                                 │
+│                                  │  Where this came from           │
+│  I saw that Dubai Hospitality    │  · Company registry  (verified) │
+│  Supplies is fitting out the     │  · Trade data        (verified) │
+│  new Marina district hotels…     │  · Project note, Mar (estimated)│
+│                                  │                                 │
+│  [ exactly what she receives ]   │  Contact                        │
+│                                  │  ✓ Email verified               │
+├──────────────────────────────────┴─────────────────────────────────┤
+│  [ ✓ Approve — saves a draft ]  [ Edit ]  [ Skip ]  [Never contact]│
+│    A                              E        S                        │
+└────────────────────────────────────────────────────────────────────┘</pre></div>
+      <ul class="notes">
+        <li><strong>Approve never means send.</strong> The button states its outcome — “saves a
+          draft in your mailbox” or “Approve and send” — because the default mode is draft.</li>
+        <li>Editing nulls the approval server-side, so Edit is inline and its save button reads
+          <strong>“Save and approve”</strong>. One action, no trap.</li>
+        <li>QA-failed messages join the queue and explain themselves: <em>“I wrote this one but I
+          don't trust it — the subject line doesn't match your standard subject.”</em></li>
+        <li>The send gate fails closed outside working hours. That becomes a sentence, not an error:
+          <em>“Approved. I'll send this at 09:00 Dubai time — it's outside their hours now.”</em></li>
+        <li>Keyboard: <code>A</code> approve, <code>E</code> edit, <code>S</code> skip. Six in ninety seconds.</li>
+      </ul>
+    </div>
+
+    <div class="screen">
+      <div class="screen-head">
+        <h3>Buyers</h3>
+        <span class="screen-route">/app/buyers</span>
+      </div>
+      <p class="screen-purpose">One list of companies with the people inside them. Replaces five
+        destinations, because nobody thinks “lead” and “contact” as separate things.</p>
+      <div class="frame"><pre>┌─────────────────────────────────────────────────────────────────────┐
+│  Buyers                                    [+ Add a buyer] [Export] │
+│                                                                     │
+│  Found 9  Researched 4  Contacts 14  Written 6  Sent 4  Replied 2   │
+│  ─────────────────────────────────────────────────────────────────  │
+│  ▸ 9 buyers still need research                    [Research them]  │
+│                                                                     │
+│  [Search]   All · Germany · UAE     Needs you · Waiting · Replied   │
+├─────────────────────────────────────────────────────────────────────┤
+│  Al Fardan Home Retail          Dubai, UAE                          │
+│  Hotel equipment supplier       Replied · 2 days ago                │
+│    Layla Ibrahim · Head of Imports · email verified                 │
+│                                                                     │
+│  NordHaus Geräte GmbH           Hamburg, Germany        Strong fit  │
+│  Appliance distributor          Replied — asked for a sample order  │
+│    Anna Müller · Procurement Director · email verified              │
+│    Jan Becker · Category Manager                                    │
+│                                                                     │
+│  Khaleej Kitchen Imports        Abu Dhabi, UAE                      │
+│  Construction project supplier  Not researched yet                  │
+└─────────────────────────────────────────────────────────────────────┘</pre></div>
+      <ul class="notes">
+        <li><strong>The pipeline rail is the headline</strong> — it supplies the mental model the
+          product currently withholds, and always names the single next action.</li>
+        <li>Scores appear only once a lead has actually been scored. Bands become words —
+          <em>Strong fit / Possible fit / Weak fit</em> — and never <code>0</code>.</li>
+        <li>One scoring system on screen at a time. Fit and confidence stay distinct, as your own
+          research guidelines require: “Strong fit · based on verified sources” vs “· partly estimated”.</li>
+        <li>The world map becomes a collapsed filter here and a step in Setup. It is not a destination.</li>
+        <li>The five-step Custom Outreach wizard becomes <code>+ Add a buyer</code>, feeding the
+          normal pipeline. Scoring weights, enrichment and model profiles move to admin.</li>
+      </ul>
+    </div>
+
+    <div class="screen">
+      <div class="screen-head">
+        <h3>Setup</h3>
+        <span class="screen-route">/app/setup</span>
+      </div>
+      <p class="screen-purpose">A checklist when incomplete, a settings page when complete.
+        No separate wizard route, no permanent nag banner.</p>
+      <div class="frame"><pre>┌─────────────────────────────────────────────────────────────────────┐
+│  Setup                                                              │
+│  Two things left before the agent is at full strength.              │
+│                                                                     │
+│  ✓  Your company           Silverline Ev Aletleri A.Ş., Istanbul    │
+│  ✓  What you sell          7 products                               │
+│  ✓  How you win            Positioning and sales arguments          │
+│  ✓  Where you sell         Germany, UAE, Saudi Arabia      [Map]    │
+│  ✓  Your mailbox           sales@silverline.com.tr · drafts first   │
+│  ○  Your price list        Would make quotes far sharper  [Upload]  │
+│  ○  Your current contacts  So the agent skips people you know [Add] │
+│                                                                     │
+│  ─────────────────────────────────────────────────────────────────  │
+│  What we know about you                               [ Review → ]  │
+│  Approved 15 days ago. Used for every email the agent writes.       │
+│                                                                     │
+│  Three things would make it sharper:                                │
+│  ·  No price list for the HoReCa series                             │
+│  ·  Your current contact list isn't imported                        │
+│  ·  No won/lost history — the agent is guessing why deals close     │
+│                                                                     │
+│  ─────────────────────────────────────────────────────────────────  │
+│  How we send      Drafts first · max 50/day · EN, DE, AR  [Change]  │
+│  WhatsApp         Not connected                          [Connect]  │
+│  LinkedIn         Notes only — you send them yourself               │
+└─────────────────────────────────────────────────────────────────────┘</pre></div>
+      <ul class="notes">
+        <li>Onboarding and Setup are the same surface at different times. The eight-step wizard
+          and the nag banner are deleted; the five genuinely required steps gate completeness.</li>
+        <li><strong>Company Brain's “Missing data” panel is promoted to the centre.</strong> It is
+          the best pattern in the app — it tells the user exactly what makes the agent smarter.
+          Version numbers and snapshot history go to admin.</li>
+        <li>Partially-shipped capabilities read as offers, not breakage. LinkedIn being manual is
+          a deliberate legal decision, so it's stated as one.</li>
+      </ul>
+    </div>
+  </section>
+
+
+  <section class="band">
+    <div class="col sechead">
+      <span class="eyebrow">One constant, applied everywhere</span>
+      <h2>Say it the way a salesperson would</h2>
+    </div>
+    <p class="col dim">A <code>LABELS</code> map lands beside <code>STATUS_KIND</code> in
+      <code>ui.js</code>, so the fix is structural rather than a sweep through twenty page
+      modules. An excerpt:</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>System value</th><th>What the user reads</th></tr></thead>
+        <tbody>
+          <tr><td class="was">pending_approval</td><td class="now">Waiting for you</td></tr>
+          <tr><td class="was">qa_failed</td><td class="now">Needs a second look</td></tr>
+          <tr><td class="was">draft_created</td><td class="now">Saved as a draft</td></tr>
+          <tr><td class="was">sent_manually</td><td class="now">You sent this</td></tr>
+          <tr><td class="was">opted_out</td><td class="now">Asked not to be contacted</td></tr>
+          <tr><td class="was">paused_bounce_rate</td><td class="now">Sending paused — too many bounces</td></tr>
+          <tr><td class="was">unqualified_after_source_removal</td><td class="now">No longer supported by its source</td></tr>
+          <tr><td class="was">score band: high / mid / low</td><td class="now">Strong fit / Possible fit / Weak fit</td></tr>
+          <tr><td class="was">score: 0</td><td class="now">Not researched yet</td></tr>
+          <tr><td class="was">run: lead_scan</td><td class="now">Looking for buyers in Germany… → Found 12 companies worth approaching.</td></tr>
+          <tr><td class="was">run: contact_discovery</td><td class="now">Looking for the right person at NordHaus… → Found 2 people to contact.</td></tr>
+          <tr><td class="was">QA: operator_language_contamination</td><td class="now">Some Turkish slipped into a non-Turkish email.</td></tr>
+          <tr><td class="was">QA: subject_mismatch</td><td class="now">The subject line doesn't match your standard subject.</td></tr>
+          <tr><td class="was">Hermes command unavailable</td><td class="now">The agent is offline right now. Your data is safe — we're on it.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+
+  <section class="band">
+    <div class="col sechead">
+      <span class="eyebrow">Build order</span>
+      <h2>Every phase ships on its own</h2>
+    </div>
+    <p class="col dim">Phases 0–5 are frontend-only and run on today's backend. The scheduler is a
+      parallel track — nothing waits on it.</p>
+
+    <div class="phases">
+      <div class="phase">
+        <span class="n">Phase 0</span>
+        <div>
+          <h3>Tell the truth</h3>
+          <p>The <code>LABELS</code> map, the missing badge states, the unscored score, the step
+            count, the contradictory brain header, the untranslated error strings. No structural change.</p>
+        </div>
+        <span class="est">½ day</span>
+      </div>
+      <div class="phase first">
+        <span class="n">Phase 1</span>
+        <div>
+          <h3>Approvals <span class="tag-first">build this first</span></h3>
+          <p>The focused review queue. Highest value per hour in the whole plan — it takes the one
+            task that matters daily and moves it from three clicks deep to the front door.</p>
+        </div>
+        <span class="est">2–3 days</span>
+      </div>
+      <div class="phase">
+        <span class="n">Phase 2</span>
+        <div>
+          <h3>Today</h3>
+          <p>The briefing, the single action, the plain-English run sentences, and the global Ask.</p>
+        </div>
+        <span class="est">2 days</span>
+      </div>
+      <div class="phase">
+        <span class="n">Phase 3</span>
+        <div>
+          <h3>Buyers</h3>
+          <p>Companies with people inside them, the pipeline rail, evidence inline, map as a filter.
+            Absorbs five destinations without losing a single capability.</p>
+        </div>
+        <span class="est">3–4 days</span>
+      </div>
+      <div class="phase">
+        <span class="n">Phase 4</span>
+        <div>
+          <h3>Setup</h3>
+          <p>One progressive surface. Onboarding stops being a separate place and a permanent nag.</p>
+        </div>
+        <span class="est">2–3 days</span>
+      </div>
+      <div class="phase">
+        <span class="n">Phase 5</span>
+        <div>
+          <h3>Cutover</h3>
+          <p>Flat four-item nav; twelve old routes redirect rather than 404; Agent Runs, research
+            configuration and data sources move to the admin group.</p>
+        </div>
+        <span class="est">1 day</span>
+      </div>
+      <div class="phase">
+        <span class="n">Parallel</span>
+        <div>
+          <h3>Scheduler — backend</h3>
+          <p>A per-tenant daily job, a digest table, a <code>since</code> filter on the activity
+            feed, and an emailed report. <strong>Until it ships, “the agent worked overnight” is
+            not true and the UI must not say it</strong> — Phase 2's degraded state is the honest one.</p>
+        </div>
+        <span class="est">~1 week</span>
+      </div>
+    </div>
+  </section>
+
+
+  <section class="band">
+    <div class="col sechead">
+      <span class="eyebrow">Scope</span>
+      <h2>What this is not</h2>
+    </div>
+    <ul class="nots">
+      <li>No React, no build step, no touching web/src</li>
+      <li>No i18n — the interface stays English</li>
+      <li>No change to the 216-route API contract; the frontend adapts</li>
+      <li>No design-token overhaul — tokens.css stays exactly as it is</li>
+      <li>Not deleting the evidence-first research subsystem — it moves behind admin</li>
+      <li>No WhatsApp or LinkedIn feature work</li>
+      <li>No admin redesign beyond receiving the three demoted pages</li>
+    </ul>
+
+    <div class="kicker">
+      <p>Roughly 1,700 lines of page code get deleted, and nothing a user can do today
+        becomes impossible.</p>
+      <p class="dim" style="font-size:16px">Simplicity here isn't hiding features behind menus.
+        It's that the deep structure of this product is one sentence — <em>the agent finds buyers
+        and writes to them; the human decides</em> — and the interface should be shaped like that
+        sentence.</p>
+    </div>
+  </section>
+
+</div>
+
+</body>
+</html>

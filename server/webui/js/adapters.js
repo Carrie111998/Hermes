@@ -378,6 +378,7 @@ export async function adaptResponse(name, payload, { realCall, body }) {
   if (['messages.get', 'messages.update', 'messages.approve'].includes(name)) return message(payload);
   if (name === 'campaigns.generateMessages' || name === 'research.bulk') return mapItems(payload, run);
   if (name === 'agentRuns.list') return mapItems(payload, run);
+  if (name === 'linkedin.findProfile' && payload?.profile_url && !payload?.id) return payload;
   if (['agentRuns.create', 'agentRuns.get', 'agentRuns.start', 'agentRuns.cancel', 'agentRuns.retry',
        'leadScans.start', 'leadScans.cancel', 'leadScans.retry', 'leads.research', 'leads.findContacts',
        'leads.generateOutreach', 'research.company', 'research.lead', 'research.regenerateInsights',

@@ -32,6 +32,16 @@ function upsert(key, value, topic = key) {
   emit(topic, value);
 }
 
+function merge(key, payload, topic = key) {
+  if (!Array.isArray(db[key])) db[key] = [];
+  const next = new Map(db[key].map(item => [item.id, item]));
+  for (const value of items(payload)) {
+    if (value?.id) next.set(value.id, value);
+  }
+  db[key] = [...next.values()];
+  emit(topic, db[key]);
+}
+
 function remove(key, id, topic = key) {
   if (!id || !Array.isArray(db[key])) return;
   db[key] = db[key].filter(item => item.id !== id);
@@ -55,7 +65,7 @@ function syncOnboarding(payload) {
   emit('onboarding', db.onboarding);
 }
 
-export function syncRealResponse(name, payload, { params = {} } = {}) {
+export function syncRealResponse(name, payload, { params = {}, query = {} } = {}) {
   if (name === 'auth.login') {
     db.user = payload?.user || db.user;
     db.company = { ...db.company, ...(payload?.company || {}) };
@@ -127,7 +137,12 @@ export function syncRealResponse(name, payload, { params = {} } = {}) {
   else if (name === 'campaigns.list') replace('campaigns', payload);
   else if (['campaigns.create', 'campaigns.get', 'campaigns.update'].includes(name)) upsert('campaigns', payload);
   else if (name === 'campaigns.delete') remove('campaigns', params.campaignId);
-  else if (name === 'messages.list') replace('messages', payload);
+  else if (name === 'messages.list') {
+    const filtered = ['campaign_id', 'lead_id', 'contact_id', 'status']
+      .some(key => query?.[key] != null && query[key] !== '');
+    if (filtered) merge('messages', payload);
+    else replace('messages', payload);
+  }
   else if (['messages.get', 'messages.update', 'messages.approve'].includes(name)) upsert('messages', payload);
   else if (name === 'ccRules.list') replace('ccRules', payload);
   else if (['ccRules.create', 'ccRules.get', 'ccRules.update'].includes(name)) upsert('ccRules', payload);

@@ -21,8 +21,9 @@ export async function mount(root, ctx) {
         await exportCsv('exports.analytics');
       } }),
       button('Refresh', { kind: 'primary', icon: 'refresh', onClick: async () => {
-        const run = await call('agentRuns.create', { body: { type: 'analytics_refresh', label: 'Refresh analytics' } });
-        toast('Analytics refresh started', 'success', { actionLabel: 'Watch', onAction: () => ctx.navigate(`/app/agent-runs/${run.id}`) });
+        await call('agentRuns.create', { body: { type: 'analytics_refresh', label: 'Refresh analytics' } });
+        // No run-log link: the customer never sees run ids, progress or logs.
+        toast('Refreshing the numbers now. They will update shortly.', 'success');
       } }),
     ],
   }), host);
@@ -95,7 +96,7 @@ function marketView(market, ctx) {
     el('div', { class: 'ifz-grid cols-3 ifz-mb-4' },
       card({
         title: 'Country opportunity',
-        actions: button('Open map', { size: 'sm', icon: 'map', onClick: () => ctx.navigate('/app/lead-map') }),
+        actions: button('Open map', { size: 'sm', icon: 'map', onClick: () => ctx.navigate('/app/buyers?map=1') }),
         body: hbarList(market.country_scores.map(c => ({ label: countryName(c.country), value: c.score }))),
       }),
       card({

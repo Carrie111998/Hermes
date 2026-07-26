@@ -70,6 +70,116 @@ def test_static_assets_resolve_from_relative_hrefs():
         assert res.status_code == 200, path
 
 
+def test_phase3_buyers_workspace_is_served_with_customer_safe_boundaries():
+    _, client = make_client()
+    for path in (
+        "/js/pages/buyers.js",
+        "/js/pages/_components.js",
+        "/js/pages/research-evidence.js",
+    ):
+        assert client.get(path).status_code == 200, path
+
+    main = client.get("/js/main.js").text
+    shell = client.get("/js/shell.js").text
+    buyers = client.get("/js/pages/buyers.js").text
+    ui = client.get("/js/ui.js").text
+    evidence = client.get("/js/pages/research-evidence.js").text
+
+    assert "{ path: '/app/buyers'" in main
+    assert "path: '/app/buyers'" in shell
+    assert all(call in buyers for call in (
+        "call('leads.list')",
+        "call('contacts.list')",
+        "call('messages.list')",
+    ))
+    assert "pipelineRail(counts" in buyers
+    assert "companyRow(model.lead, model.contacts" in buyers
+    assert "Buyer companies CSV" in buyers and "People CSV" in buyers
+    assert "qa_failed: 'error'" in ui
+    assert "unknown: 'Not known'" in ui
+    assert "Not known" in evidence
+    assert "err.message" not in evidence
+
+
+def test_phase4_setup_workspace_is_served_with_customer_safe_boundaries():
+    _, client = make_client()
+    assert client.get("/js/pages/setup.js").status_code == 200
+
+    main = client.get("/js/main.js").text
+    shell = client.get("/js/shell.js").text
+    setup = client.get("/js/pages/setup.js").text
+
+    assert re.search(r"path:\s*['\"]/app/setup['\"]", main)
+    assert re.search(r"path:\s*['\"]/app/setup['\"]", shell)
+    assert all(call in setup for call in (
+        "call('onboarding.status')",
+        "call('company.getProfile')",
+        "call('products.list')",
+        "call('documents.list')",
+    ))
+    assert "const REQUIRED_STEPS" in setup
+    assert "call('onboarding.complete')" in setup
+    assert "stepper(" not in setup
+    assert "/app/agent-runs" not in setup
+    assert "Hermes command unavailable" not in setup
+
+
+def test_phase5_cutover_collapses_nav_and_keeps_every_legacy_bookmark_alive():
+    """The customer navigation is four destinations. Operator machinery moves to
+    admin, and every pre-collapse bookmark still resolves — see
+    docs/ux-redesign-plan.md §5 Phase 5."""
+    _, client = make_client()
+    main = client.get("/js/main.js").text
+    shell = client.get("/js/shell.js").text
+    # Assert against the navigation table itself: the avatar menu and page logic
+    # legitimately reference routes that are not navigation entries.
+    nav = re.search(r"const NAV_GROUPS = \[.*?\n\];", shell, re.S)
+    assert nav, "NAV_GROUPS not found in shell.js"
+    nav = nav.group(0)
+
+    # Exactly four customer destinations, plus Analytics kept off the nav.
+    customer_nav = re.findall(r"path:\s*['\"](/app/[^'\"]+)['\"]", nav)
+    assert customer_nav == ["/app/today", "/app/approvals", "/app/buyers", "/app/setup"], customer_nav
+    for path in customer_nav:
+        assert re.search(rf"path:\s*['\"]{path}['\"]", main), path
+    assert re.search(r"path:\s*['\"]/app/analytics['\"]", main)
+    assert "/app/analytics" not in nav, "Analytics is reachable from Today, not the nav"
+
+    # Operator machinery is admin-only: a log viewer must not reach the customer.
+    for path in ("/admin/agent-runs", "/admin/research", "/admin/data-sources"):
+        assert re.search(rf"path:\s*['\"]{path}['\"]", nav), path
+
+    # Every superseded customer route still resolves rather than 404ing.
+    for path in ("/app/dashboard", "/app/onboarding", "/app/leads", "/app/leads/:leadId",
+                 "/app/contacts", "/app/contacts/:contactId", "/app/custom-outreach",
+                 "/app/lead-map", "/app/outreach", "/app/outreach/campaigns/:campaignId",
+                 "/app/company-brain", "/app/integrations", "/app/email-templates",
+                 "/app/settings", "/app/agent-runs", "/app/agent-runs/:runId",
+                 "/app/research", "/app/research/new", "/app/research/:campaignId",
+                 "/app/research/:campaignId/edit"):
+        assert re.search(rf"path:\s*['\"]{re.escape(path)}['\"]", main), path
+
+    # Redirects carry context the destination can actually use.
+    assert "buyer: r.params.leadId" in main
+    assert "person: r.params.contactId" in main
+    assert "message: r.query.message" in main
+
+    # The superseded page modules are gone, not merely unrouted.
+    for path in ("leads", "contacts", "custom-outreach", "email-templates", "integrations",
+                 "settings", "company-brain", "onboarding", "outreach", "dashboard"):
+        assert client.get(f"/js/pages/{path}.js").status_code == 404, path
+
+    # The run viewer survives for operators only, mounted under the admin guard.
+    assert client.get("/js/pages/agent-runs.js").status_code == 200
+    assert re.search(r"path:\s*['\"]/admin/agent-runs/:runId['\"]", main)
+
+    # The map survives only as a shared component, with no page mount left behind.
+    lead_map = client.get("/js/pages/lead-map.js")
+    assert lead_map.status_code == 200
+    assert "export async function renderMiniMap" in lead_map.text
+    assert "export async function mount" not in lead_map.text
+
+
 def test_api_routes_win_over_static_mount():
     _, client = make_client()
     assert client.get("/health").json()["service"] == "interfaze-agent"
@@ -116,6 +226,110 @@ def test_company_profile_round_trip_with_data_envelope():
 
     flat = client.patch("/api/v1/company/profile", headers=headers, json={"name": "Acme"})
     assert flat.status_code == 422
+
+
+def test_phase4_onboarding_completion_uses_only_the_five_required_steps():
+    _, client = make_client()
+    login = client.post("/api/v1/auth/login", json={
+        "email": "admin@example.test", "password": "correct-horse-battery",
+    })
+    assert login.status_code == 200, login.text
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    company = client.post(
+        "/api/v1/admin/companies", headers=headers, json={"name": "Setup Boundary Co"},
+    )
+    assert company.status_code == 201, company.text
+    headers["X-Company-ID"] = company.json()["id"]
+
+    assert client.post("/api/v1/onboarding/start", headers=headers).status_code == 200
+    required = (
+        "company-identity",
+        "positioning",
+        "products",
+        "internal-sales-data",
+        "target-markets",
+    )
+    for step in required[:-1]:
+        response = client.patch(
+            f"/api/v1/onboarding/{step}",
+            headers=headers,
+            json={"data": {"confirmed": True}},
+        )
+        assert response.status_code == 200, response.text
+
+    incomplete = client.post("/api/v1/onboarding/complete", headers=headers)
+    assert incomplete.status_code == 409
+    assert incomplete.json()["detail"]["missing_steps"] == ["target-markets"]
+
+    fifth = client.patch(
+        "/api/v1/onboarding/target-markets",
+        headers=headers,
+        json={"data": {"target_markets": ["DE"]}},
+    )
+    assert fifth.status_code == 200, fifth.text
+    completed = client.post("/api/v1/onboarding/complete", headers=headers)
+    assert completed.status_code == 200, completed.text
+    body = completed.json()
+    assert body["status"] == "completed"
+    assert body["current_step"] is None
+    assert set(body["completed_steps"]) == set(required)
+    assert {"current-contacts", "integrations", "brain-review"}.isdisjoint(
+        body["completed_steps"],
+    )
+
+
+def test_phase4_sales_preferences_and_email_templates_round_trip():
+    _, client = make_client()
+    login = client.post("/api/v1/auth/login", json={
+        "email": "admin@example.test", "password": "correct-horse-battery",
+    })
+    assert login.status_code == 200, login.text
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    company = client.post(
+        "/api/v1/admin/companies", headers=headers, json={"name": "Setup Sections Co"},
+    )
+    assert company.status_code == 201, company.text
+    headers["X-Company-ID"] = company.json()["id"]
+
+    preferences = {
+        "default_send_mode": "create_draft",
+        "default_language": "de",
+        "languages": ["en", "de"],
+        "connected_mailbox": "sales@example.test",
+    }
+    saved_preferences = client.patch(
+        "/api/v1/company/sales-preferences",
+        headers=headers,
+        json={"data": preferences},
+    )
+    assert saved_preferences.status_code == 200, saved_preferences.text
+    assert saved_preferences.json()["data"] == preferences
+    assert client.get(
+        "/api/v1/company/sales-preferences", headers=headers,
+    ).json()["data"] == preferences
+
+    templates = {
+        "templates": {
+            "en": {
+                "subject": "A partnership with {{company_name}}",
+                "body": "Hello {{contact_name}}",
+            },
+            "de": {
+                "subject": "Partnerschaft mit {{company_name}}",
+                "body": "Guten Tag {{contact_name}}",
+            },
+        },
+    }
+    saved_templates = client.patch(
+        "/api/v1/company/email-templates",
+        headers=headers,
+        json={"data": templates},
+    )
+    assert saved_templates.status_code == 200, saved_templates.text
+    assert saved_templates.json()["data"] == templates
+    assert client.get(
+        "/api/v1/company/email-templates", headers=headers,
+    ).json()["data"] == templates
 
 
 def test_phase2_core_data_flow_with_stub_executor():
@@ -493,10 +707,11 @@ def test_real_mode_has_no_mock_routes_or_tenant_seed():
     assert "export const MOCK_ROUTES = new Set();" in source
     assert "requestBody instanceof FormData" in source
 
-    onboarding = (ROOT / "server" / "webui" / "js" / "pages" / "onboarding.js").read_text(
+    # Phase 5 folded the onboarding wizard into Setup; document upload moved with it.
+    setup = (ROOT / "server" / "webui" / "js" / "pages" / "setup.js").read_text(
         encoding="utf-8",
     )
-    assert "form.append('file', selected, selected.name)" in onboarding
+    assert "form.append('file', selected, selected.name)" in setup
     helpers = (ROOT / "server" / "webui" / "js" / "pages" / "_page-utils.js").read_text(
         encoding="utf-8",
     )

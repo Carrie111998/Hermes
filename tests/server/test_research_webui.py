@@ -10,9 +10,14 @@ def test_research_modules_routes_and_evidence_copy_are_served():
     ):
         assert client.get(path).status_code == 200, path
     main = client.get("/js/main.js").text
-    assert "/app/research" in main and "/app/research/new" in main
-    leads = client.get("/js/pages/leads.js").text
-    assert "Fit score" in leads and "Evidence confidence" in leads
+    # Phase 5 moved research configuration behind the admin guard: scoring weights,
+    # enrichment and model profiles are operator machinery, not customer controls.
+    assert "/admin/research" in main and "/admin/research/new" in main
+    # The customer-facing surface keeps fit and evidence confidence distinct
+    # (research-page-UI-guidelines.md §3.4), now rendered by the shared company card.
+    components = client.get("/js/pages/_components.js").text
+    assert "fit_score" in components and "evidence_confidence" in components
+    assert "based on verified sources" in components and "partly estimated" in components
 
 
 def test_mock_mode_research_handlers_are_wired():

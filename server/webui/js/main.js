@@ -9,20 +9,13 @@ import { el, emptyState, button } from './ui.js';
 
 import * as login from './pages/login.js';
 import * as accessPending from './pages/access-pending.js';
-import * as dashboard from './pages/dashboard.js';
-import * as onboarding from './pages/onboarding.js';
-import * as companyBrain from './pages/company-brain.js';
-import * as leadMap from './pages/lead-map.js';
-import * as leads from './pages/leads.js';
-import * as contacts from './pages/contacts.js';
-import * as outreach from './pages/outreach.js';
-import * as customOutreach from './pages/custom-outreach.js';
-import * as emailTemplates from './pages/email-templates.js';
+import * as today from './pages/today.js';
+import * as approvals from './pages/approvals.js';
+import * as buyers from './pages/buyers.js';
+import * as setup from './pages/setup.js';
 import * as analytics from './pages/analytics.js';
-import * as agentRuns from './pages/agent-runs.js';
-import * as integrations from './pages/integrations.js';
-import * as settings from './pages/settings.js';
 import * as admin from './pages/admin.js';
+import * as agentRuns from './pages/agent-runs.js';
 import * as research from './pages/research.js';
 import * as researchEditor from './pages/research-editor.js';
 import * as researchDetail from './pages/research-detail.js';
@@ -95,40 +88,81 @@ function appPage(title, mountFn) {
   };
 }
 
+/* Build a hash target, dropping empty values so redirects never emit "?a=&b=". */
+function withQuery(path, params = {}) {
+  const pairs = Object.entries(params)
+    .filter(([, value]) => value != null && value !== '')
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+  return pairs.length ? `${path}?${pairs.join('&')}` : path;
+}
+
+/* Phase 5 cutover. Every pre-collapse customer bookmark still resolves, and it
+   carries whatever context the new destination can actually use — a lead id
+   becomes an expanded company, a contact id becomes a highlighted person, a
+   message id opens that email in the review queue. `to` receives the matched
+   route ({ params, query, path }) and returns the replacement hash path. */
+const LEGACY_REDIRECTS = [
+  { path: '/app/dashboard',       to: () => '/app/today' },
+  { path: '/app/onboarding',      to: () => '/app/setup' },
+
+  // Leads + Contacts + Custom Outreach + Lead Map all became Buyers.
+  { path: '/app/leads',           to: r => withQuery('/app/buyers', { q: r.query.q, country: r.query.country }) },
+  { path: '/app/leads/:leadId',   to: r => withQuery('/app/buyers', { buyer: r.params.leadId }) },
+  { path: '/app/contacts',        to: r => withQuery('/app/buyers', { q: r.query.q, country: r.query.country }) },
+  { path: '/app/contacts/:contactId', to: r => withQuery('/app/buyers', { person: r.params.contactId }) },
+  { path: '/app/custom-outreach', to: () => withQuery('/app/buyers', { add: '1' }) },
+  { path: '/app/lead-map',        to: () => withQuery('/app/buyers', { map: '1' }) },
+
+  // Campaigns became a filter over the approval queue, not a destination.
+  { path: '/app/outreach',        to: r => withQuery('/app/approvals', { message: r.query.message }) },
+  { path: '/app/outreach/campaigns/:campaignId', to: () => '/app/approvals' },
+
+  // Company Brain, Integrations, Email Templates and Settings became Setup sections.
+  { path: '/app/company-brain',   to: () => withQuery('/app/setup', { section: 'brain' }) },
+  { path: '/app/integrations',    to: () => withQuery('/app/setup', { section: 'sending' }) },
+  { path: '/app/email-templates', to: () => withQuery('/app/setup', { section: 'sending' }) },
+  { path: '/app/settings',        to: () => withQuery('/app/setup', { section: 'sending' }) },
+
+  // Agent Runs is a log viewer: admin-only now. Research configuration moved too.
+  { path: '/app/agent-runs',      to: () => '/app/today' },
+  { path: '/app/agent-runs/:runId', to: () => '/app/today' },
+  { path: '/app/research',        to: () => '/app/buyers' },
+  { path: '/app/research/new',    to: () => '/app/buyers' },
+  { path: '/app/research/:campaignId', to: () => '/app/buyers' },
+  { path: '/app/research/:campaignId/edit', to: () => '/app/buyers' },
+];
+
 const routes = [
   { path: '/login', title: 'Sign in', public: true, mount: (ctx) => login.mount(appRoot, ctx) },
   { path: '/access-pending', title: 'Access pending', public: true, mount: (ctx) => accessPending.mount(appRoot, ctx) },
-  { path: '/app/dashboard',       mount: appPage('Dashboard', dashboard.mount) },
-  { path: '/app/onboarding',      mount: appPage('Onboarding', onboarding.mount) },
-  { path: '/app/company-brain',   mount: appPage('Company Brain', companyBrain.mount) },
-  { path: '/app/lead-map',        mount: appPage('Lead Map', leadMap.mount) },
-  { path: '/app/research',        mount: appPage('Research', research.mount) },
-  { path: '/app/research/new',    mount: appPage('New research campaign', researchEditor.mount) },
-  { path: '/app/research/:campaignId/edit', mount: appPage('Edit research campaign', researchEditor.mount) },
-  { path: '/app/research/:campaignId', mount: appPage('Research campaign', researchDetail.mount) },
-  { path: '/app/leads',           mount: appPage('Leads', leads.mountList) },
-  { path: '/app/leads/:leadId',   mount: appPage('Lead', leads.mountDetail) },
-  { path: '/app/contacts',        mount: appPage('Contacts', contacts.mountList) },
-  { path: '/app/contacts/:contactId', mount: appPage('Contact', contacts.mountDetail) },
-  { path: '/app/outreach',        mount: appPage('Outreach', outreach.mountList) },
-  { path: '/app/outreach/campaigns/:campaignId', mount: appPage('Campaign', outreach.mountDetail) },
-  { path: '/app/custom-outreach', mount: appPage('Custom Outreach', customOutreach.mount) },
-  { path: '/app/email-templates', mount: appPage('Email Templates', emailTemplates.mount) },
+
+  // The four customer destinations.
+  { path: '/app/today',           mount: appPage('Today', today.mount) },
+  { path: '/app/approvals',       mount: appPage('Approvals', approvals.mount) },
+  { path: '/app/buyers',          mount: appPage('Buyers', buyers.mount) },
+  { path: '/app/setup',           mount: appPage('Setup', setup.mount) },
+  // Kept and reachable from Today's "See the numbers", deliberately off the nav.
   { path: '/app/analytics',       mount: appPage('Analytics', analytics.mount) },
-  { path: '/app/agent-runs',      mount: appPage('Agent Runs', agentRuns.mountList) },
-  { path: '/app/agent-runs/:runId', mount: appPage('Agent Run', agentRuns.mountDetail) },
-  { path: '/app/integrations',    mount: appPage('Integrations', integrations.mount) },
-  { path: '/app/settings',        mount: appPage('Settings', settings.mount) },
+
+  ...LEGACY_REDIRECTS.map(({ path, to }) => ({ path, redirect: to, mount: () => {} })),
+
   { path: '/admin/dashboard',      mount: appPage('Admin Dashboard', admin.mountDashboard) },
   { path: '/admin/companies',      mount: appPage('Companies', admin.mountCompanies) },
   { path: '/admin/companies/:companyId', mount: appPage('Company', admin.mountCompanyDetail) },
   { path: '/admin/users',          mount: appPage('Users', admin.mountUsers) },
-  { path: '/admin/agent-runs',     mount: appPage('Admin Agent Runs', admin.mountAgentRuns) },
+  { path: '/admin/agent-runs',     mount: appPage('Agent Runs', admin.mountAgentRuns) },
+  { path: '/admin/agent-runs/:runId', mount: appPage('Agent Run', agentRuns.mountDetail) },
   { path: '/admin/analytics',      mount: appPage('Admin Analytics', admin.mountAnalytics) },
   { path: '/admin/integrations',   mount: appPage('Integration Health', admin.mountIntegrations) },
   { path: '/admin/errors',         mount: appPage('Errors', admin.mountErrors) },
   { path: '/admin/logs',           mount: appPage('Logs', admin.mountLogs) },
   { path: '/admin/data-sources',   mount: appPage('Data Sources', admin.mountDataSources) },
+  // Research configuration is operator machinery: scoring weights, enrichment and
+  // model profiles. It stays available, behind the admin guard.
+  { path: '/admin/research',       mount: appPage('Research', research.mount) },
+  { path: '/admin/research/new',   mount: appPage('New research campaign', researchEditor.mount) },
+  { path: '/admin/research/:campaignId/edit', mount: appPage('Edit research campaign', researchEditor.mount) },
+  { path: '/admin/research/:campaignId', mount: appPage('Research campaign', researchDetail.mount) },
 ];
 
 startRouter({
@@ -143,6 +177,9 @@ startRouter({
     }
     if (!route.mount) return null; // unmatched — handled by notFound
     if (!isAuthed()) return '/login';
+    // Legacy bookmarks resolve only once the session exists, so a signed-out
+    // visitor lands on /login instead of bouncing through the redirect first.
+    if (route.redirect) return route.redirect(route);
     if (route.path.startsWith('/admin') && session?.user?.role !== 'admin') return home;
     if (route.path.startsWith('/app') && session?.user?.role === 'admin' && !session?.company?.id) {
       return '/admin/dashboard';
@@ -157,7 +194,7 @@ startRouter({
         icon: 'search',
         title: 'Page not found',
         hint: `No page matches "${path}".`,
-        action: button('Back to dashboard', { kind: 'primary', onClick: () => navigate(homeRoute()) }),
+        action: button('Back to Today', { kind: 'primary', onClick: () => navigate(homeRoute()) }),
       }));
     } else {
       navigate('/login', { replace: true });
@@ -174,7 +211,7 @@ startRouter({
       icon: error?.status === 403 ? 'ban' : 'warning',
       title: error?.status === 403 ? 'You do not have access to this page' : 'This page could not be loaded',
       hint: error?.message || `The route ${path} failed to load.`,
-      action: button('Back to dashboard', { kind: 'primary', onClick: () => navigate(homeRoute()) }),
+      action: button('Back to Today', { kind: 'primary', onClick: () => navigate(homeRoute()) }),
     }));
   },
 });

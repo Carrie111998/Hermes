@@ -109,7 +109,7 @@ export async function mount(root, ctx) {
         field('Campaign name', name, { required: true, hint: '3–120 characters; use a market and buyer-role description.' }),
         field('Seller countries', sellers, { required: true, hint: 'Defaults to Türkiye. Effective value origin: system-safe default.' }),
         field('Target countries', targets, { required: true, hint: 'Large selections create bounded country × sector × source partitions.' }),
-        el('div', { class: 'ifz-row' }, button('Select on map', { kind: 'ghost', icon: 'map', onClick: () => ctx.navigate('/app/lead-map') })),
+        el('div', { class: 'ifz-row' }, button('Select on map', { kind: 'ghost', icon: 'map', onClick: () => ctx.navigate('/app/buyers?map=1') })),
         field('Sectors', sectorPicker, { hint: 'Canonical taxonomy controls classification coverage and applicable features.' }),
         field('HS codes', hs, { hint: 'Optional narrowing; interpreted against HS 2022.' }),
         field('Buyer types', buyers, { required: true }),
@@ -253,7 +253,7 @@ export async function mount(root, ctx) {
         const result = await call('researchCampaigns.start', { params: { campaignId: saved.id } });
         toast(result.status === 'partial' ? 'Campaign completed with partial source coverage' : 'Research completed',
           result.status === 'partial' ? 'warning' : 'success');
-        ctx.navigate(`/app/research/${saved.id}`);
+        ctx.navigate(`/admin/research/${saved.id}`);
       } }));
     } else {
       actions.push(button('Continue', { kind: 'primary', onClick: () => {
@@ -269,7 +269,7 @@ export async function mount(root, ctx) {
     pageHead({
       title: campaign ? `Edit · ${campaign.name}` : 'New research campaign',
       sub: 'Configure a reusable, evidence-first buyer research workflow. Every behavioral setting remains visible.',
-      actions: [button('Close', { kind: 'ghost', onClick: () => ctx.navigate(campaign ? `/app/research/${campaign.id}` : '/app/research') })],
+      actions: [button('Close', { kind: 'ghost', onClick: () => ctx.navigate(campaign ? `/admin/research/${campaign.id}` : '/admin/research') })],
     }),
     el('div', { class: 'ifz-research-editor' }, stepHost, formHost, actionHost),
   );

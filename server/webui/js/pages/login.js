@@ -83,7 +83,7 @@ export function mount(root, ctx) {
     try {
       const res = await call('auth.login', { body: { email: emailInput.value, password: passInput.value } });
       setSession(res);
-      ctx.navigate(res.user?.role === 'admin' ? '/admin/dashboard' : '/app/dashboard');
+      ctx.navigate(res.user?.role === 'admin' ? '/admin/dashboard' : '/app/today');
     } catch (err) {
       setBusy(submitBtn, false);
       toast(err.message || 'Sign-in failed', 'error');

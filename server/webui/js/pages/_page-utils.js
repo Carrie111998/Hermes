@@ -68,17 +68,24 @@ export async function exportCsv(route) {
   );
 }
 
-export async function waitForRun(runOrId, { timeoutMs = 15000, intervalMs = 120 } = {}) {
+export async function waitForRun(
+  runOrId,
+  { timeoutMs = 15000, intervalMs = 120, onUpdate } = {},
+) {
   const runId = typeof runOrId === 'string' ? runOrId : runOrId?.run_id || runOrId?.id;
-  if (!runId) return runOrId;
+  if (!runId) {
+    onUpdate?.(runOrId);
+    return runOrId;
+  }
   const deadline = Date.now() + timeoutMs;
   let current = typeof runOrId === 'object' ? runOrId : null;
   while (Date.now() < deadline) {
     current = await call('agentRuns.get', { params: { runId } });
+    onUpdate?.(current);
     if (['completed', 'failed', 'cancelled'].includes(current.status)) return current;
     await new Promise(resolve => setTimeout(resolve, intervalMs));
   }
-  throw new Error('Agent run is still working. Open Agent Runs to continue watching it.');
+  throw new Error('The work is taking longer than expected. You can leave this page and come back later.');
 }
 
 export function leadOptions({ includeEmpty = false } = {}) {
@@ -192,14 +199,14 @@ export function openMessageReviewModal(message, { onUpdated, title = 'Review mes
     await refresh(updated);
   });
   draftBtn.addEventListener('click', async () => {
-    const updated = await call('messages.createDraft', { params: { messageId: current.id } });
+    await call('messages.createDraft', { params: { messageId: current.id } });
     toast('Draft created in mailbox', 'success');
-    await refresh(updated);
+    await refresh();
   });
   sendBtn.addEventListener('click', async () => {
-    const updated = await call('messages.send', { params: { messageId: current.id } });
-    toast('Message marked sent', 'success');
-    await refresh(updated);
+    await call('messages.send', { params: { messageId: current.id } });
+    toast('Message sent', 'success');
+    await refresh();
   });
   repliedBtn.addEventListener('click', async () => {
     const updated = await call('messages.markReplied', { params: { messageId: current.id } });
@@ -215,10 +222,10 @@ export function openContactModal({ leadId = '', onCreated } = {}) {
   const emailInput = input({ placeholder: 'anna@example.com', type: 'email' });
   const phoneInput = input({ placeholder: '+49 170 1234567' });
   const linkedinInput = input({ placeholder: 'https://www.linkedin.com/in/...' });
-  const createBtn = button('Create contact', { kind: 'primary', icon: 'plus' });
+  const createBtn = button('Add person', { kind: 'primary', icon: 'plus' });
 
   const m = modal({
-    title: 'Add contact manually',
+    title: 'Add a person',
     body: el('div', {},
       field('Company', leadSelect),
       field('Full name', nameInput, { required: true }),
@@ -230,8 +237,8 @@ export function openContactModal({ leadId = '', onCreated } = {}) {
   });
 
   createBtn.addEventListener('click', async () => {
-    if (!nameInput.value.trim()) { toast('Name is required', 'warning'); return; }
-    setBusy(createBtn, true, 'Creating...');
+    if (!nameInput.value.trim()) { toast('Add the person’s name.', 'warning'); return; }
+    setBusy(createBtn, true, 'Adding…');
     try {
       const contact = await call('contacts.create', { body: {
         lead_id: leadSelect.value || null,
@@ -242,10 +249,10 @@ export function openContactModal({ leadId = '', onCreated } = {}) {
         linkedin_url: linkedinInput.value.trim(),
       } });
       m.close();
-      toast(`Contact created: ${contact.name}`, 'success');
+      toast(`${contact.name || nameInput.value.trim()} was added.`, 'success');
       if (onCreated) onCreated(contact);
-    } catch (err) {
-      toast(err.message || 'Could not create contact', 'error');
+    } catch {
+      toast("We couldn't add this person. Try again.", 'error');
       setBusy(createBtn, false);
     }
   });

@@ -109,16 +109,16 @@ export async function mount(root, ctx) {
 
   const actions = [];
   if (campaign.status === 'draft') {
-    actions.push(button('Edit', { kind: 'ghost', onClick: () => ctx.navigate(`/app/research/${campaignId}/edit`) }));
+    actions.push(button('Edit', { kind: 'ghost', onClick: () => ctx.navigate(`/admin/research/${campaignId}/edit`) }));
     actions.push(button('Start research', { kind: 'primary', onClick: async () => {
       const result = await call('researchCampaigns.start', { params: { campaignId } });
       toast(result.status === 'partial' ? 'Research completed with partial source coverage' : 'Research completed', result.status === 'partial' ? 'warning' : 'success');
-      ctx.navigate(`/app/research/${campaignId}`);
+      ctx.navigate(`/admin/research/${campaignId}`);
     } }));
   } else {
     actions.push(button('Clone', { kind: 'ghost', onClick: async () => {
       const clone = await call('researchCampaigns.clone', { params: { campaignId } });
-      ctx.navigate(`/app/research/${clone.id}/edit`);
+      ctx.navigate(`/admin/research/${clone.id}/edit`);
     } }));
     actions.push(button('Export leads', { kind: 'primary', onClick: () => csvDownload(`research-${campaignId}.csv`, leads) }));
   }

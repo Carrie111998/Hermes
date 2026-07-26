@@ -34,7 +34,7 @@ function withAdmin(root, ctx, title, sub, activePath, body, actions = []) {
     pageHead({
       title,
       sub,
-      actions: [button('App', { icon: 'dashboard', onClick: () => ctx.navigate('/app/dashboard') }), ...actions],
+      actions: [button('App', { icon: 'dashboard', onClick: () => ctx.navigate('/app/today') }), ...actions],
     }),
     adminNav(ctx, activePath),
     body);
@@ -106,7 +106,7 @@ export async function mountCompanyDetail(root, ctx) {
         updateSession({ company: { id: company.id, name: company.name } });
         db.company = { ...db.company, id: company.id, name: company.name };
         emit('company', db.company);
-        ctx.navigate('/app/dashboard');
+        ctx.navigate('/app/today');
       } }),
       button('Edit', { icon: 'edit', onClick: () => openCompanyModal(company, () => ctx.navigate(`/admin/companies/${company.id}`)) }),
     ]);
@@ -130,7 +130,7 @@ export async function mountAgentRuns(root, ctx) {
         { key: 'created', label: 'Started', render: r => fmt.ago(r.created_at) },
       ],
       rows: res.items,
-      onRowClick: r => ctx.navigate(`/app/agent-runs/${r.id}`),
+      onRowClick: r => ctx.navigate(`/admin/agent-runs/${r.id}`),
     }) }));
 }
 
