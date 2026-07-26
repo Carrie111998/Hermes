@@ -259,6 +259,13 @@ class InteractiveReplyStore:
             state["cards"].pop(card_id, None)
             self._write_state(state)
 
+    def pending_count(self) -> int:
+        """Return the number of unexpired cards without modifying stored state."""
+        with _file_lock(self._lock_path):
+            state = self._read_state()
+            self._clean_expired(state, time.time())
+            return len(state["cards"])
+
     def consume(
         self, button_token: str, channel_id: str, message_ts: str
     ) -> ConsumedInteractiveAction | None:

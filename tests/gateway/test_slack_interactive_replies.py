@@ -202,6 +202,19 @@ async def test_adapter_send_posts_buttons_without_literal_directive(tmp_path, mo
     assert posted["blocks"][-1]["type"] == "actions"
     assert posted["blocks"][-1]["elements"][0]["action_id"] == "hermes_interactive_reply"
 
+
+@pytest.mark.asyncio
+async def test_post_failure_discards_unbound_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    client.chat_postMessage.side_effect = RuntimeError("slack unavailable")
+
+    result = await adapter.send("C1", "x\n[[slack_buttons: Go:go]]")
+
+    assert result.success is False
+    assert adapter._interactive_reply_store.pending_count() == 0
+
+
 @pytest.mark.asyncio
 async def test_adapter_send_posts_slash_reply_buttons_ephemerally(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
