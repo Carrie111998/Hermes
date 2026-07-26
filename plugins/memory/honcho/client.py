@@ -18,6 +18,7 @@ import os
 import logging
 import hashlib
 import ipaddress
+from enum import Enum
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -31,6 +32,17 @@ if TYPE_CHECKING:
     from honcho import Honcho
 
 logger = logging.getLogger(__name__)
+
+
+class HealthStatus(str, Enum):
+    """Real connectivity state for Honcho L3, distinct from ``is_available()``
+    (which only checks that an api_key/base_url is configured, never touches
+    the network)."""
+
+    NOT_CONFIGURED = "not_configured"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
 
 HOST = "hermes"
 
@@ -963,6 +975,94 @@ def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -
         logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
 
 
+def _resolve_honcho_kwargs(config: "HonchoClientConfig", *, timeout_override: float | None = None) -> dict:
+    """Resolve the kwargs used to construct a Honcho SDK client for ``config``.
+
+    Shared by the client singleton builder and :func:`check_health` so the
+    base_url/api_key/timeout resolution logic (hermes config fallback, local
+    placeholder auth, version-prefix stripping) lives in exactly one place.
+    """
+    # Allow config.yaml honcho.base_url to override the SDK's environment
+    # mapping, enabling remote self-hosted Honcho deployments without
+    # requiring the server to live on localhost.
+    resolved_base_url = config.base_url
+    resolved_timeout = config.timeout
+    if not resolved_base_url or resolved_timeout is None:
+        try:
+            from hermes_cli.config import load_config
+            hermes_cfg = load_config()
+            honcho_cfg = hermes_cfg.get("honcho", {})
+            if isinstance(honcho_cfg, dict):
+                if not resolved_base_url:
+                    resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
+                if resolved_timeout is None:
+                    resolved_timeout = _resolve_optional_float(
+                        honcho_cfg.get("timeout"),
+                        honcho_cfg.get("request_timeout"),
+                    )
+        except Exception:
+            pass
+
+    if timeout_override is not None:
+        # e.g. the health probe's short, no-retry timeout — never persisted,
+        # never affects the shared client singleton.
+        resolved_timeout = timeout_override
+    elif resolved_timeout is None:
+        # Fall back to the default so an unconfigured install cannot hang
+        # indefinitely on a stalled Honcho request.
+        resolved_timeout = _DEFAULT_HTTP_TIMEOUT
+
+    if resolved_base_url:
+        logger.info("Initializing Honcho client (base_url: %s, workspace: %s)", resolved_base_url, config.workspace_id)
+    else:
+        logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, config.workspace_id)
+
+    # Local Honcho instances don't require an API key, but the SDK
+    # expects a non-empty string.  Use a placeholder for local URLs.
+    # For local: only use config.api_key if the host block explicitly
+    # sets apiKey (meaning the user wants local auth). Otherwise skip
+    # the stored key -- it's likely a cloud key that would break local.
+    _is_local = resolved_base_url and (
+        "localhost" in resolved_base_url
+        or "127.0.0.1" in resolved_base_url
+        or "::1" in resolved_base_url
+    )
+    if _is_local:
+        # Check if the host block has its own apiKey (explicit local auth).
+        # Auth-skipping is loopback-only: a stored key is likely a cloud key
+        # that would break a no-auth local server, so we substitute the SDK's
+        # required-non-empty placeholder unless the host block opts in.
+        _raw = config.raw or {}
+        _host_block = (_raw.get("hosts") or {}).get(config.host, {})
+        _host_has_key = bool(_host_block.get("apiKey"))
+        effective_api_key = config.api_key if _host_has_key else "local"
+    else:
+        effective_api_key = config.api_key
+
+    # The Honcho SDK's route builders (e.g. routes.workspaces()) already
+    # include the version prefix (e.g. "/v3/workspaces").  When a user-supplied
+    # base_url already ends in a version segment (e.g.
+    # "http://localhost:38000/v3", "https://honcho.my.ts.net/v3"), concatenating
+    # the two produces "/v3/v3/workspaces" → 404 on every call.  This is a pure
+    # routing concern independent of host, so strip a trailing version segment
+    # from ANY base_url — loopback, LAN, custom domain, or cloud alike.  The
+    # SDK then appends its own versioned paths correctly.
+    if resolved_base_url:
+        import re as _re
+        resolved_base_url = _re.sub(r"/v\d+/*$", "", resolved_base_url).rstrip("/")
+
+    kwargs: dict = {
+        "workspace_id": config.workspace_id,
+        "api_key": effective_api_key,
+        "environment": config.environment,
+    }
+    if resolved_base_url:
+        kwargs["base_url"] = resolved_base_url
+    if resolved_timeout is not None:
+        kwargs["timeout"] = resolved_timeout
+    return kwargs
+
+
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     """Get or create the Honcho client singleton.
 
@@ -1110,3 +1210,61 @@ def reset_honcho_client() -> None:
     _honcho_client_slot.reset()
     _cached_timeout = None
     _honcho_json_timeout_memo = (None, None)
+
+
+def check_health(
+    client: "Honcho | None" = None,
+    config: "HonchoClientConfig | None" = None,
+    timeout: float = 1.5,
+) -> HealthStatus:
+    """Probe whether Honcho L3 is actually reachable, not just configured.
+
+    ``is_available()`` only checks that an api_key/base_url is present; this
+    makes a real round trip (``queue_status()``, the cheapest authenticated
+    call) and classifies the result:
+
+    - ``NOT_CONFIGURED``: no api_key/base_url set (mirrors ``is_available()``).
+    - ``HEALTHY``: the round trip succeeded.
+    - ``DEGRADED``: Honcho responded but with an API error (e.g. 5xx/4xx).
+    - ``UNAVAILABLE``: connection failed, timed out, or the SDK isn't
+      installed.
+
+    Uses its own short, no-retry ``timeout`` (default 1.5s) independent of
+    the shared client singleton's timeout, so a stalled Honcho instance can't
+    hang callers like ``doctor`` or memory setup that need a fast answer. If
+    ``client`` is given, it's probed directly (its own timeout applies) and
+    ``config``/``timeout`` are ignored — useful for tests and for callers
+    that already hold a live client.
+    """
+    if client is None:
+        if config is None:
+            config = HonchoClientConfig.from_global_config()
+        if not config.api_key and not config.base_url:
+            return HealthStatus.NOT_CONFIGURED
+
+        try:
+            from honcho import Honcho
+        except ImportError:
+            return HealthStatus.UNAVAILABLE
+
+        try:
+            client = Honcho(**_resolve_honcho_kwargs(config, timeout_override=timeout))
+        except Exception:
+            return HealthStatus.UNAVAILABLE
+
+    try:
+        client.queue_status()
+    except Exception as e:
+        # Handle expected Honcho errors if they exist, else catch-all
+        err_type = type(e).__name__
+        if err_type in ("ConnectionError", "TimeoutError"):
+            return HealthStatus.UNAVAILABLE
+        elif err_type == "APIError":
+            return HealthStatus.DEGRADED
+        
+        # If the error is a generic OSError, it's also UNAVAILABLE
+        if isinstance(e, OSError):
+            return HealthStatus.UNAVAILABLE
+            
+        return HealthStatus.UNAVAILABLE
+    return HealthStatus.HEALTHY

@@ -307,6 +307,10 @@ class HonchoMemoryProvider(MemoryProvider):
             return cfg.enabled and bool(cfg.api_key or cfg.base_url)
         except Exception:
             return False
+    def check_health(self) -> str:
+        """Real L3 connectivity check: NOT_CONFIGURED, HEALTHY, DEGRADED, UNAVAILABLE."""
+        from plugins.memory.honcho.client import check_health as perform_health_check
+        return perform_health_check(config=self._config).value
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/honcho.json (Honcho SDK native format)."""

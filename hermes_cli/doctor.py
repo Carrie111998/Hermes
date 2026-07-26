@@ -2521,6 +2521,18 @@ def run_doctor(args):
                     issues,
                 )
             else:
+                # Perform a real connectivity check
+                from plugins.memory.honcho.client import check_health, HealthStatus
+                status = check_health(config=hcfg)
+                if status == HealthStatus.HEALTHY:
+                    check_ok("Honcho L3 connectivity healthy")
+                elif status == HealthStatus.DEGRADED:
+                    check_warn("Honcho L3 connectivity degraded (API error)")
+                elif status == HealthStatus.UNAVAILABLE:
+                    check_fail("Honcho L3 connectivity unavailable")
+                else:
+                    check_fail(f"Honcho L3 connectivity check failed: {status}")
+                
                 from plugins.memory.honcho.client import get_honcho_client, reset_honcho_client
                 reset_honcho_client()
                 try:
