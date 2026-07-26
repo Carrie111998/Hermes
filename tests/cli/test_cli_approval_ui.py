@@ -1290,6 +1290,23 @@ class TestSudoClarifyRemoteControl:
         assert not thread.is_alive()
         assert result["value"] == "a"
 
+    def test_remote_extend_preserves_unlimited_clarify_deadline(self):
+        """Remote extend must not turn an explicitly unlimited prompt finite."""
+        cli = _make_sudo_clarify_stub()
+        cli._rc_consume = MagicMock(
+            return_value=SimpleNamespace(
+                decision="extend",
+                decision_source="telegram",
+                deadline_ts=time.time() + 600,
+            )
+        )
+
+        signal, source, deadline = cli._poll_remote_intervention("8081", None)
+
+        assert signal == "extend"
+        assert source == "telegram"
+        assert deadline is None
+
     def test_sudo_remote_disabled_no_pending(self):
         cli = _make_sudo_clarify_stub()
         cli._remote_intervention_settings = lambda: {
