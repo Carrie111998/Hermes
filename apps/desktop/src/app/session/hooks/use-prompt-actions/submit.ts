@@ -20,10 +20,12 @@ import {
 } from '@/store/composer'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import { $sessions, resolveComposerSessionKey, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
+import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import {
   _submitInFlight,
@@ -33,6 +35,7 @@ import {
   isProviderSetupError,
   isSessionBusyError,
   isSessionNotFoundError,
+  isTargetSessionBusy,
   type SubmitTextOptions,
   withSessionBusyRetry
 } from './utils'
@@ -142,9 +145,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // from $busy by a separate effect) may still read true — honoring it would
       // bounce the drained send. The drain lock serializes them; the user path
       // keeps the guard so a stray Enter mid-turn can't double-submit.
+      //
+      // The guard reads the TARGET session's busy state (isTargetSessionBusy),
+      // not the foreground flag: an explicit target (tile, queue drain) is
+      // frequently not the session on screen, so the foreground flag would gate
+      // one session's send on another session's turn.
       const hasSendable = Boolean(visibleText || terminalContextBlocks || attachments.length || hasImage)
 
-      if (!hasSendable || (!options?.fromQueue && busyRef.current)) {
+      const guardSessionId = options?.sessionId ?? activeSessionIdRef.current
+
+      if (
+        !hasSendable ||
+        (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
+      ) {
         return false
       }
 
@@ -166,7 +179,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const targetStartedInCurrentView =
         !targetStoredSessionId || targetStoredSessionId === selectedStoredSessionIdRef.current
 
-      let sessionId: null | string = options?.sessionId ?? activeSessionIdRef.current
+      // A queued/background drain whose runtime binding was reaped must NOT
+      // inherit the foreground runtime id when its storedSessionId targets a
+      // different session — that would land the queued prompt in whichever
+      // session the user happens to be viewing (cross-session leak). When the
+      // drain is for the current view (no storedSessionId, or it matches the
+      // foreground), the foreground runtime is correct and must be kept.
+      const isBackgroundQueueDrain = Boolean(
+        options?.fromQueue && options?.storedSessionId && options.storedSessionId !== selectedStoredSessionIdRef.current
+      )
+
+      let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
 
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
@@ -209,7 +232,15 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               nowRouteToken: getRouteToken(),
               startSelectedStoredId: startingStoredSessionId,
               nowSelectedStoredId: selectedStoredSessionIdRef.current,
-              submitTargetStoredId: startingStoredSessionId
+              submitTargetStoredId: startingStoredSessionId,
+              composerScope: options?.composerScope,
+              // The composer keys drafts/attachments on the durable lineage
+              // root (survives auto-compression tip rotation), while
+              // startingStoredSessionId is the live tip — resolve the target
+              // into the same lineage-root domain before comparing, or every
+              // submit into a session that has ever compressed would
+              // false-positive-abort.
+              submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
             })
           : null
 
@@ -384,9 +415,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // background queue drain only has the durable id). Continue that target
         // conversation; only a genuine new-chat draft may create a new session.
         try {
+          // Re-register on the session's OWNING profile — resuming on whichever
+          // profile is live would fork the conversation into the wrong DB (#67603).
+          const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
+
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
-            source: 'desktop'
+            source: 'desktop',
+            ...(resumeProfile ? { profile: resumeProfile } : {})
           })
 
           const resumeDrift = sessionDriftReason()
@@ -528,9 +564,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // backend loop (#55578 symptom d) rejects the submit even though
             // the stored session is fine — resume + retry instead of erroring
             // out and losing the session binding.
+            const resumeProfile = await resolveSessionProfile(recoverStoredSessionId)
+
             const resumed = await requestGateway<{ session_id: string }>('session.resume', {
               session_id: recoverStoredSessionId,
-              source: 'desktop'
+              source: 'desktop',
+              ...(resumeProfile ? { profile: resumeProfile } : {})
             })
 
             const resumeRetryDrift = sessionDriftReason()
