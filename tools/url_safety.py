@@ -400,7 +400,7 @@ def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
     return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
 
 
-def is_safe_url(url: str) -> bool:
+def is_safe_url(url: str, *, allow_private_exceptions: bool = True) -> bool:
     """Return True if the URL target is not a private/internal address.
 
     Resolves the hostname to an IP and checks against private ranges.
@@ -410,6 +410,10 @@ def is_safe_url(url: str) -> bool:
     ``HERMES_ALLOW_PRIVATE_URLS=true``), private-IP blocking is skipped.
     Cloud metadata endpoints (169.254.169.254, metadata.google.internal)
     remain blocked regardless — they are never legitimate agent targets.
+
+    Set ``allow_private_exceptions=False`` for security-sensitive checks that
+    must reject every private/internal resolution regardless of configuration
+    or the trusted-host compatibility allowlist.
     """
     try:
         parsed = urlparse(url)
@@ -427,9 +431,14 @@ def is_safe_url(url: str) -> bool:
             return False
 
         # Check the global toggle AFTER blocking metadata hostnames
-        allow_all_private = _global_allow_private_urls()
+        allow_all_private = (
+            allow_private_exceptions and _global_allow_private_urls()
+        )
 
-        allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
+        allow_private_ip = (
+            allow_private_exceptions
+            and _allows_private_ip_resolution(hostname, scheme)
+        )
 
         # Try to resolve and check IP
         try:
@@ -451,7 +460,11 @@ def is_safe_url(url: str) -> bool:
                 ipaddress.ip_address(hostname)
             except ValueError:
                 _is_literal_ip = False
-            if not _is_literal_ip and _proxy_is_configured():
+            if (
+                allow_private_exceptions
+                and not _is_literal_ip
+                and _proxy_is_configured()
+            ):
                 logger.debug(
                     "DNS resolution failed for %s — proxy configured, "
                     "allowing through for proxy-side resolution",
@@ -459,6 +472,10 @@ def is_safe_url(url: str) -> bool:
                 )
                 return True
             logger.warning("Blocked request — DNS resolution failed for: %s", hostname)
+            return False
+
+        if not addr_info:
+            logger.warning("Blocked request — DNS resolution returned no addresses for: %s", hostname)
             return False
 
         for family, _, _, _, sockaddr in addr_info:
@@ -505,6 +522,60 @@ def is_safe_url(url: str) -> bool:
         # become SSRF bypass vectors
         logger.warning("Blocked request — URL safety check error for %s: %s", url, exc)
         return False
+
+
+PROVIDER_FINAL_URL_ERROR = (
+    "Blocked: provider response is missing or reported an unsafe authoritative final URL"
+)
+
+
+def validate_provider_final_url(url: Any) -> Optional[str]:
+    """Return a provider-reported final URL only when it is strictly safe.
+
+    Extraction providers are an external trust boundary: content must not be
+    associated with the originally requested URL when the provider omits or
+    changes its authoritative final URL. Unlike ordinary user-configured URL
+    access, this check never permits private/internal compatibility exceptions.
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    if url != url.strip() or any(
+        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F
+        for char in url
+    ):
+        return None
+    if "\\" in url:
+        return None
+
+    hex_digits = frozenset("0123456789abcdefABCDEF")
+    for index, char in enumerate(url):
+        if char == "%" and (
+            index + 2 >= len(url)
+            or url[index + 1] not in hex_digits
+            or url[index + 2] not in hex_digits
+        ):
+            return None
+
+    try:
+        parsed = urlsplit(url)
+        # Accessing ``port`` validates malformed/non-numeric port syntax.
+        _ = parsed.port
+    except ValueError:
+        return None
+
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+
+    if not is_safe_url(url, allow_private_exceptions=False):
+        return None
+    return url
+
+
+async def async_validate_provider_final_url(url: Any) -> Optional[str]:
+    """Strictly validate a provider final URL without blocking the event loop."""
+    return await asyncio.to_thread(validate_provider_final_url, url)
 
 
 async def async_is_safe_url(url: str) -> bool:

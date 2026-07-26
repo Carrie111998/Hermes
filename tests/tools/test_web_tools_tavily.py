@@ -153,11 +153,14 @@ class TestNormalizeTavilyDocuments:
         assert docs[0]["url"] == "https://bad.com"
         assert docs[0]["error"] == "extraction failed"
 
-    def test_fallback_url(self):
+    def test_missing_authoritative_url_fails_closed_without_fallback(self):
         from tools.web_tools import _normalize_tavily_documents
         raw = {"results": [{"content": "data"}]}
         docs = _normalize_tavily_documents(raw, fallback_url="https://fallback.com")
-        assert docs[0]["url"] == "https://fallback.com"
+        assert docs[0]["url"] == ""
+        assert docs[0]["content"] == ""
+        assert docs[0]["raw_content"] == ""
+        assert "authoritative final URL" in docs[0]["error"]
 
 
 # ─── web_search_tool (Tavily dispatch) ────────────────────────────────────────
@@ -224,4 +227,40 @@ class TestWebExtractTavily:
             assert len(result["results"]) == 1
             assert result["results"][0]["url"] == "https://example.com"
             assert "Extracted content" in result["results"][0]["content"]
+
+    def test_extract_serialization_omits_rejected_provider_fields(self):
+        unsafe_url = "http://127.0.0.1/private"
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "results": [
+                {
+                    "url": unsafe_url,
+                    "raw_content": "provider-controlled content",
+                    "title": "provider-controlled title",
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with (
+            patch("tools.web_tools._get_backend", return_value="tavily"),
+            patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}),
+            patch("tools.web_tools.httpx.post", return_value=mock_response),
+        ):
+            from tools.web_tools import web_extract_tool
+
+            serialized = asyncio.get_event_loop().run_until_complete(
+                web_extract_tool(["https://example.com"])
+            )
+
+        assert unsafe_url not in serialized
+        assert "provider-controlled content" not in serialized
+        assert "provider-controlled title" not in serialized
+        result = json.loads(serialized)["results"][0]
+        assert result["url"] == ""
+        assert result["title"] == ""
+        assert result["content"] == ""
+        assert result.get("raw_content", "") == ""
+        assert result.get("metadata") in (None, {})
+        assert "authoritative final URL" in result["error"]
 

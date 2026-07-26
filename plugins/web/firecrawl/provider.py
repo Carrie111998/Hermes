@@ -51,7 +51,10 @@ import os
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent.web_search_provider import WebSearchProvider
-from tools.url_safety import is_safe_url
+from tools.url_safety import (
+    PROVIDER_FINAL_URL_ERROR,
+    async_validate_provider_final_url,
+)
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
@@ -524,24 +527,23 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                         metadata = {}
 
                 title = metadata.get("title", "")
-                final_url = metadata.get("sourceURL", url)
+                reported_final_url = metadata.get("sourceURL")
+                final_url = await async_validate_provider_final_url(
+                    reported_final_url
+                )
 
-                # Re-check SSRF safety after any redirect reported by Firecrawl.
-                if not is_safe_url(final_url):
+                # Fail closed unless Firecrawl reports a safe authoritative URL.
+                if final_url is None:
                     logger.info(
-                        "Blocked redirected web_extract for unsafe final URL: %s",
-                        final_url,
+                        "Blocked web_extract for missing or unsafe provider final URL"
                     )
                     results.append(
                         {
-                            "url": final_url,
-                            "title": title,
+                            "url": "",
+                            "title": "",
                             "content": "",
                             "raw_content": "",
-                            "error": (
-                                "Blocked: URL targets a private or internal "
-                                "network address"
-                            ),
+                            "error": PROVIDER_FINAL_URL_ERROR,
                         }
                     )
                     continue
