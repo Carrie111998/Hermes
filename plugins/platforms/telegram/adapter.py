@@ -944,8 +944,6 @@ class TelegramAdapter(BasePlatformAdapter):
         carry no ``from_user``) so a removed/unauthorized channel cannot
         inject content via the broadcast path either.
         """
-        from gateway.session import SessionSource
-
         user = getattr(message, "from_user", None)
         chat = getattr(message, "chat", None)
         user_id = str(getattr(user, "id", "")).strip() or None
@@ -987,23 +985,13 @@ class TelegramAdapter(BasePlatformAdapter):
             elif chat_type == "dm" and is_topic_message:
                 thread_id = str(thread_id_raw)
 
-        source = SessionSource(
-            platform=Platform.TELEGRAM,
+        source = self.build_source(
             chat_id=chat_id or "",
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_id,
         )
-        runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
-            try:
-                source.profile = runner._profile_name_for_source(source)
-            except Exception:
-                logger.debug(
-                    "[Telegram] Profile routing failed during intake auth",
-                    exc_info=True,
-                )
         if not source.profile:
             source.profile = getattr(self, "_gateway_profile_name", None)
         return source
@@ -1044,8 +1032,6 @@ class TelegramAdapter(BasePlatformAdapter):
         # users work everywhere, while group users and allowed group chats add
         # scoped grants without widening direct-message access.
         config_authorized = _telegram_config_authorizes_source(source, self.config.extra)
-        if config_authorized is True:
-            return True
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -1066,23 +1052,31 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        auth_is_configured = (
-            config_authorized is not None or self._telegram_auth_env_configured()
-        )
-
         runner = getattr(self, "gateway_runner", None)
         if runner is None:
             runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        intake_auth = getattr(runner, "_is_user_authorized_for_adapter_intake", None)
-        if callable(intake_auth) and auth_is_configured:
+        intake_auth = getattr(runner, "_adapter_intake_authorization_decision", None)
+        if callable(intake_auth):
             try:
-                return bool(intake_auth(source))
+                intake_decision = intake_auth(
+                    source,
+                    config_authorized=config_authorized,
+                )
+                if intake_decision is not None:
+                    return bool(intake_decision)
             except Exception:
                 logger.debug(
                     "[Telegram] Falling back after scoped auth failed for user %s",
                     user_id,
                     exc_info=True,
                 )
+
+        if config_authorized is True:
+            return True
+
+        auth_is_configured = (
+            config_authorized is not None or self._telegram_auth_env_configured()
+        )
 
         # The gateway also registers a profile-bound callback on every adapter.
         # Keep it as the fallback for lightweight runners and adapter contexts
