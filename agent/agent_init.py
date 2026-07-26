@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -1637,18 +1638,18 @@ def init_agent(
             if isinstance(_config_temperature, bool):
                 raise ValueError
             _parsed_temperature = float(_config_temperature)
-            if _parsed_temperature < 0 or _parsed_temperature > 2:
+            if not math.isfinite(_parsed_temperature) or _parsed_temperature < 0 or _parsed_temperature > 2:
                 raise ValueError
         except (TypeError, ValueError):
             _ra().logger.warning(
                 "Invalid model.temperature in config.yaml: %r — "
-                "must be a number between 0.0 and 2.0. "
+                "must be a finite number between 0.0 and 2.0. "
                 "Falling back to provider default.",
                 _config_temperature,
             )
             print(
                 f"\n⚠ Invalid model.temperature in config.yaml: {_config_temperature!r}\n"
-                f"  Must be a number between 0.0 and 2.0.\n"
+                f"  Must be a finite number between 0.0 and 2.0.\n"
                 f"  Falling back to provider default.\n",
                 file=sys.stderr,
             )
@@ -1663,18 +1664,18 @@ def init_agent(
             if isinstance(_config_top_p, bool):
                 raise ValueError
             _parsed_top_p = float(_config_top_p)
-            if _parsed_top_p < 0 or _parsed_top_p > 1:
+            if not math.isfinite(_parsed_top_p) or _parsed_top_p < 0 or _parsed_top_p > 1:
                 raise ValueError
         except (TypeError, ValueError):
             _ra().logger.warning(
                 "Invalid model.top_p in config.yaml: %r — "
-                "must be a number between 0.0 and 1.0. "
+                "must be a finite number between 0.0 and 1.0. "
                 "Falling back to provider default.",
                 _config_top_p,
             )
             print(
                 f"\n⚠ Invalid model.top_p in config.yaml: {_config_top_p!r}\n"
-                f"  Must be a number between 0.0 and 1.0.\n"
+                f"  Must be a finite number between 0.0 and 1.0.\n"
                 f"  Falling back to provider default.\n",
                 file=sys.stderr,
             )
