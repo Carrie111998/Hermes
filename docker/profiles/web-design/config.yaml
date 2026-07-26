@@ -22,8 +22,10 @@ toolsets:
 # API Magnific (upscale/enhance d'images) — consommée en curl par le skill
 # `magnific` (skills/magnific/SKILL.md, rafraîchi à chaque redeploy Railway).
 # Vars Railway attendues (globales au conteneur, injectées dans l'env) :
-#   MAGNIFIC_API_KEY     — clé API (header x-magnific-api-key)
-#   MAGNIFIC_WEBHOOK_URL — callback de fin de tâche (endpoint asynchrone)
+#   MAGNIFIC_API_KEY        — clé API (header x-magnific-api-key)
+#   MAGNIFIC_WEBHOOK_SECRET — signing secret pour vérifier les payloads webhook.
+#                             Inutilisé tant qu'aucun récepteur HTTP n'est exposé :
+#                             le skill récupère les résultats en pollant le task_id.
 
 # Autonomie non-supervisée : assesseur LLM pour auto-approuver/refuser les
 # commandes dangereuses au lieu de bloquer en attente d'une validation humaine

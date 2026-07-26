@@ -16,27 +16,28 @@ petit ou trop dégradé pour la maquette (hero, photos événement, logos raster
 
 ## Credentials (vars Railway, déjà injectées dans l'environnement)
 - `MAGNIFIC_API_KEY` — clé API (header `x-magnific-api-key`)
-- `MAGNIFIC_WEBHOOK_URL` — URL de callback pour la notification de fin de tâche
+- `MAGNIFIC_WEBHOOK_SECRET` — signing secret webhook. **Inutilisé pour l'instant** :
+  aucun récepteur HTTP n'est exposé côté Railway, donc ne pas passer de
+  `webhook_url` — récupérer les résultats en pollant le `task_id`.
 
 Ne jamais afficher ces valeurs en clair ; référence-les via `$MAGNIFIC_API_KEY`.
 
 ## Usage
 
-L'endpoint est **asynchrone** : le POST retourne un `task_id`, le résultat est
-poussé sur le webhook (ou récupérable en pollant le statut de la tâche).
+L'endpoint est **asynchrone** : le POST retourne un `task_id`, puis on polle le
+statut jusqu'à `completed`.
 
 ```bash
 curl -s -X POST "https://api.magnific.com/v1/ai/image-upscaler" \
   -H "x-magnific-api-key: $MAGNIFIC_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "image": "<URL ou base64 de l image source>",
-    "webhook_url": "'"$MAGNIFIC_WEBHOOK_URL"'"
+    "image": "<URL ou base64 de l image source>"
   }'
 ```
 
-Réponse : `{"task_id": "..."}` — poller le statut avec le même header si le
-webhook n'est pas exploitable dans le contexte courant :
+Réponse : `{"task_id": "..."}` — poller le statut avec le même header
+(toutes les 5–10 s, l'upscale prend généralement < 1 min) :
 
 ```bash
 curl -s "https://api.magnific.com/v1/ai/image-upscaler/<task_id>" \
