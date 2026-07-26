@@ -3889,6 +3889,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         key = (str(chat_id), str(status_key))
         cached_id = self._status_message_ids.get(key)
+        stale_edit_target = False
         if cached_id is not None:
             result = await self.edit_message(
                 chat_id, cached_id, content, finalize=True, metadata=metadata,
@@ -3898,10 +3899,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._status_message_ids[key] = str(result.message_id)
                 return result
             # Edit failed — clear the cached id and fall through to a fresh send.
+            stale_edit_target = "message to edit not found" in (result.error or "").lower()
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
             self._status_message_ids[key] = str(result.message_id)
+        if stale_edit_target and result.success:
+            logger.info(
+                "[%s] Stale status edit target %s replaced with new message %s",
+                self.name,
+                cached_id,
+                result.message_id,
+            )
         return result
 
     async def edit_message(
@@ -4000,6 +4009,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
+                # The cached target was deleted. Do not retry the same stale
+                # id as plain text; send_or_update_status clears it and sends
+                # exactly one fresh status message instead.
+                if "message to edit not found" in str(fmt_err).lower():
+                    raise
                 # Fallback: strip MarkdownV2 escapes and retry as clean plain text
                 safe_format_error = _redact_telegram_error_text(fmt_err)
                 logger.warning(

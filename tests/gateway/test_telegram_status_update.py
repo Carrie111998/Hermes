@@ -129,6 +129,58 @@ async def test_edit_failure_falls_back_to_fresh_send(adapter):
 
 
 @pytest.mark.asyncio
+async def test_stale_edit_skips_plain_retry_and_replaces_cached_target(adapter, caplog):
+    """A deleted status message is replaced with one send, never a plain re-edit."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter.send = TelegramAdapter.send.__get__(adapter, TelegramAdapter)
+    adapter.edit_message = TelegramAdapter.edit_message.__get__(adapter, TelegramAdapter)
+    adapter._bot.edit_message_text = AsyncMock(
+        side_effect=sys.modules["telegram.error"].BadRequest("Message to edit not found"),
+    )
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=200),
+    )
+    key = ("chat-1", "lifecycle")
+    adapter._status_message_ids[key] = "100"
+    caplog.set_level("INFO", logger="plugins.platforms.telegram.adapter")
+
+    result = await adapter.send_or_update_status("chat-1", "lifecycle", "replacement")
+
+    assert result.success is True
+    assert result.message_id == "200"
+    adapter._bot.edit_message_text.assert_awaited_once()
+    adapter._bot.send_message.assert_awaited_once()
+    assert adapter._status_message_ids[key] == "200"
+    assert caplog.text.count("Stale status edit target") == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_edit_fallback_send_failure_returns_error_and_logs(adapter, caplog):
+    """A failed replacement send keeps the existing send failure result/log."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter.send = TelegramAdapter.send.__get__(adapter, TelegramAdapter)
+    adapter.edit_message = TelegramAdapter.edit_message.__get__(adapter, TelegramAdapter)
+    adapter._bot.edit_message_text = AsyncMock(
+        side_effect=sys.modules["telegram.error"].BadRequest("Message to edit not found"),
+    )
+    adapter._bot.send_message = AsyncMock(side_effect=RuntimeError("fallback send failed"))
+    key = ("chat-1", "lifecycle")
+    adapter._status_message_ids[key] = "100"
+    caplog.set_level("ERROR", logger="plugins.platforms.telegram.adapter")
+
+    result = await adapter.send_or_update_status("chat-1", "lifecycle", "replacement")
+
+    assert result.success is False
+    assert "fallback send failed" in (result.error or "")
+    adapter._bot.edit_message_text.assert_awaited_once()
+    adapter._bot.send_message.assert_awaited_once()
+    assert key not in adapter._status_message_ids
+    assert "Failed to send Telegram message" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_distinct_status_keys_do_not_collide(adapter):
     """A different status_key gets its own message; the original isn't touched."""
     adapter.send.side_effect = [
