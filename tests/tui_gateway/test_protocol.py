@@ -457,6 +457,30 @@ def test_save_cfg_refuses_non_mapping_root(server, tmp_path):
         server._save_cfg({"display": {"busy_input_mode": "steer"}})
 
     assert cfg_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("config.yaml.corrupt.*.bak")), "expected corrupt backup"
+
+
+def test_config_set_rpc_refuses_unparseable_yaml(server, tmp_path):
+    """Inline config.set must error out, not raise through dispatch (stdio crash)."""
+    server._hermes_home = tmp_path
+    _reset_cfg_cache(server)
+    original = "model:\n  default: precious/model\nbroken: [unterminated\n"
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(original, encoding="utf-8")
+
+    resp = server.dispatch(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"key": "busy", "value": "steer"},
+        }
+    )
+
+    assert resp is not None
+    assert "error" in resp
+    assert "invalid YAML" in resp["error"]["message"]
+    assert cfg_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("config.yaml.corrupt.*.bak"))
 
 
 def test_write_config_key_allows_valid_empty_mapping(server, tmp_path):

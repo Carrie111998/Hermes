@@ -1784,7 +1784,14 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         _rid, method, _params = normalized
         if method not in _LONG_HANDLERS:
-            return handle_request(req)
+            # Mirror the pool path: uncaught handler errors must become JSON-RPC
+            # errors. config.set (and other inline methods) can raise when
+            # _save_cfg refuses a corrupt config.yaml — without this, stdio
+            # entry crashes the whole TUI gateway process.
+            try:
+                return handle_request(req)
+            except Exception as exc:
+                return _err(_rid, -32000, f"handler error: {exc}")
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
