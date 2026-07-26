@@ -4057,6 +4057,35 @@ def _append_event(
     )
 
 
+def _finalize_tick(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+    started_at: int,
+    dry_run: bool,
+    result: "DispatchResult",
+) -> "DispatchResult":
+    """Record a dispatcher tick and return result.
+
+    Every non-dry_run dispatch pass records a tick.  Write failures are
+    surfaced via ``result.tick_error`` so callers can log them and
+    downstream telemetry can tell "tick happened, recording failed" from
+    "tick did not happen at all" (SOL-FD-003).
+    """
+    _tick_finished_at = int(time.time())
+    if not dry_run:
+        try:
+            _record_dispatcher_tick(
+                conn,
+                board=board or get_current_board(),
+                started_at=started_at,
+                finished_at=_tick_finished_at,
+                result=result,
+            )
+        except Exception as exc:
+            result.tick_error = str(exc)
+    return result
+
+
 def _record_dispatcher_tick(
     conn: sqlite3.Connection,
     *,
@@ -7027,6 +7056,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    tick_error: Optional[str] = None
+    """When set, the dispatcher attempted to record this tick but the
+    ``dispatcher_ticks`` INSERT failed. Carries the exception message so
+    callers can log it and downstream telemetry can tell "tick happened,
+    recording failed" from "tick did not happen at all" (SOL-FD-003)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8555,7 +8589,9 @@ def _dispatch_once_locked(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
-            return result
+            return _finalize_tick(
+                conn, board, _tick_started_at, dry_run, result
+            )
         # Only spawn enough to reach the cap, respecting max_spawn too.
         remaining = max_in_progress - in_progress
         if max_spawn is None or max_spawn > remaining:
@@ -8855,21 +8891,7 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
 
-    # Record the dispatcher tick for diagnostics.
-    _tick_finished_at = int(time.time())
-    if not dry_run:
-        try:
-            _record_dispatcher_tick(
-                conn,
-                board=board or get_current_board(),
-                started_at=_tick_started_at,
-                finished_at=_tick_finished_at,
-                result=result,
-            )
-        except Exception:
-            pass  # Tick recording failure must not block dispatch.
-
-    return result
+    return _finalize_tick(conn, board, _tick_started_at, dry_run, result)
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
