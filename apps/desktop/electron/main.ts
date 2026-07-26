@@ -124,6 +124,7 @@ import {
   oauthSessionIsLive,
   resolveJsonBody,
   resolveOauthRestAuth,
+  resolveProfileRestAuth,
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
 import {
@@ -7374,19 +7375,23 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
   const url = `${conn.baseUrl}${path}`
   const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
 
-  if (conn.authMode === 'oauth') {
-    // Native RFC 8252 flow: authenticate with the bearer token (cookieless)
-    // when we hold one for this gateway; otherwise use the cookie partition.
-    const nativeAt = await ensureNativeAccessToken(conn.baseUrl).catch(() => null)
+  // Native RFC 8252 flow: authenticate with the bearer token (cookieless) when
+  // we hold one for this gateway; otherwise use the cookie partition. Only a
+  // non-oauth gateway may use conn.token — see resolveProfileRestAuth.
+  const nativeAt =
+    conn.authMode === 'oauth' ? await ensureNativeAccessToken(conn.baseUrl).catch(() => null) : null
 
-    if (nativeAt) {
-      return fetchJson(url, null, { ...opts, bearer: nativeAt })
-    }
+  const auth = resolveProfileRestAuth(conn.authMode, nativeAt, conn.token)
 
+  if (auth.kind === 'bearer') {
+    return fetchJson(url, null, { ...opts, bearer: auth.token })
+  }
+
+  if (auth.kind === 'cookie') {
     return fetchJsonViaOauthSession(url, opts)
   }
 
-  return fetchJson(url, conn.token, opts)
+  return fetchJson(url, auth.token, opts)
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -9555,12 +9560,11 @@ async function fetchProfilesSessionSlice(searchParams, remoteProfiles) {
       return remoteSessionList(requested, searchParams)
     }
 
-    const primary = await ensureBackend(null)
-
-    return fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
-      method: 'GET',
-      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
-    }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))
+    return fetchJsonForProfile(null, `/api/profiles/sessions?${searchParams}`).catch(() => ({
+      sessions: [],
+      total: 0,
+      profile_totals: {}
+    }))
   }
 
   return mergeRemoteProfileSessions(searchParams, remoteProfiles)
@@ -9575,12 +9579,11 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
   const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
 
-  const primary = await ensureBackend(null)
-
-  const base = (await fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
-    method: 'GET',
-    timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
-  }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))) as any
+  const base = (await fetchJsonForProfile(null, `/api/profiles/sessions?${searchParams}`).catch(() => ({
+    sessions: [],
+    total: 0,
+    profile_totals: {}
+  }))) as any
 
   // Over-fetch each remote from offset 0 (limit+offset rows) so the merged window
   // is correct for this page — mirrors the primary's per-profile over-fetch.

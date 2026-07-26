@@ -142,3 +142,33 @@ export function oauthGuardMayHardFail(providers: AdvertisedAuthProvider[] | null
 
   return !named.every(provider => provider.supportsPassword)
 }
+
+export type ProfileRestAuth = OauthRestAuth | { kind: 'connection-token'; token: string | null }
+
+/**
+ * Decide how a per-profile REST request authenticates. Same branch as
+ * resolveReadinessProbeAuth, with one deliberate difference: a REST call keeps
+ * sending the connection token when authMode is not yet known, where the
+ * readiness probe treats an unknown gateway as public. Probing anonymously is
+ * safe; dropping the credential from a real request is not.
+ *
+ * This is the seam the /api/profiles/sessions call sites skipped: they resolved
+ * the connection and passed `conn.token` straight to fetchJson, ignoring
+ * authMode entirely. Against an oauth gateway that token is not a valid
+ * credential, so the request 401s — and because those callers collapse a
+ * rejected fetch into an empty slice, the session sidebar renders empty with no
+ * error surfaced anywhere (#67600).
+ */
+export function resolveProfileRestAuth(
+  authMode: string | null | undefined,
+  nativeAccessToken: string | null | undefined,
+  connectionToken: string | null | undefined
+): ProfileRestAuth {
+  const probe = resolveReadinessProbeAuth(authMode, nativeAccessToken, connectionToken)
+
+  if (probe.kind === 'bearer' || probe.kind === 'cookie') {
+    return probe
+  }
+
+  return { kind: 'connection-token', token: connectionToken ?? null }
+}

@@ -15,6 +15,7 @@ import {
   oauthSessionIsLive,
   resolveJsonBody,
   resolveOauthRestAuth,
+  resolveProfileRestAuth,
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
 
@@ -129,4 +130,50 @@ test('oauthGuardMayHardFail keeps the strict guard when the list is unusable', (
   assert.equal(oauthGuardMayHardFail(undefined), true)
   assert.equal(oauthGuardMayHardFail('nonsense' as any), true)
   assert.equal(oauthGuardMayHardFail([{ supportsPassword: true }]), true)
+})
+
+// --- Per-profile REST auth selection (guards the empty sidebar of #67600) ---
+
+test('resolveProfileRestAuth uses the connection token on a token-auth gateway', () => {
+  assert.deepEqual(resolveProfileRestAuth('token', null, 'conn-token'), {
+    kind: 'connection-token',
+    token: 'conn-token'
+  })
+})
+
+test('resolveProfileRestAuth keeps the connection token when authMode is unknown', () => {
+  // Deliberate divergence from resolveReadinessProbeAuth, which treats an
+  // unknown gateway as public: a REST call must not silently drop its
+  // credential just because the mode has not been resolved yet.
+  assert.deepEqual(resolveProfileRestAuth('unknown', null, 'conn-token'), {
+    kind: 'connection-token',
+    token: 'conn-token'
+  })
+  assert.deepEqual(resolveProfileRestAuth(undefined, null, 'conn-token'), {
+    kind: 'connection-token',
+    token: 'conn-token'
+  })
+  assert.deepEqual(resolveProfileRestAuth(null, null, null), { kind: 'connection-token', token: null })
+})
+
+test('resolveProfileRestAuth prefers the native bearer on an oauth gateway', () => {
+  assert.deepEqual(resolveProfileRestAuth('oauth', 'bearer-token-123', 'conn-token'), {
+    kind: 'bearer',
+    token: 'bearer-token-123'
+  })
+})
+
+test('resolveProfileRestAuth falls back to the cookie partition on an oauth gateway', () => {
+  assert.deepEqual(resolveProfileRestAuth('oauth', null, 'conn-token'), { kind: 'cookie' })
+})
+
+test('resolveProfileRestAuth never authenticates an oauth gateway with the connection token', () => {
+  // The #67600 regression: call sites that ignored authMode passed the
+  // connection token to an oauth-gated gateway, which 401s. Whatever the
+  // native token state, an oauth gateway must never resolve to that token.
+  for (const nativeAt of ['bearer-token-123', null, undefined, '']) {
+    const auth = resolveProfileRestAuth('oauth', nativeAt, 'conn-token')
+
+    assert.notEqual(auth.kind, 'connection-token')
+  }
 })
