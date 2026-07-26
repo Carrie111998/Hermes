@@ -14556,7 +14556,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
-                            history_media_paths=_history_media_paths,
+                            history_media_paths=_history_media_paths if '_history_media_paths' in dir() else set(),
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
