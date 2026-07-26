@@ -1418,6 +1418,30 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
     return cfg
 
 
+def fetch_diagnostics_dispatcher_ticks(
+    conn: "sqlite3.Connection",
+    *,
+    board: "Optional[str]" = None,
+) -> list:
+    """Fetch dispatcher tick rows for use by diagnostic rules.
+
+    Returns a bounded list of the most recent tick rows (last 10 within
+    the past 24 hours, whichever is fewer). Callers pass this to
+    ``compute_task_diagnostics(dispatcher_ticks=...)``.
+
+    Returns an empty list (never None) when no ticks exist, so rules
+    can distinguish "no data" from "explicitly skipped".
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        since_ts = int(time.time()) - 86400  # 24h window
+        rows = _kb.get_dispatcher_ticks_since(conn, since_ts, board=board)
+        # Last 10 ticks; the 24h window already bounds it practically
+        return rows[-10:] if len(rows) > 10 else rows
+    except Exception:
+        return []
+
+
 def compute_task_diagnostics(
     task,
     events: list,

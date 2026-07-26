@@ -1109,3 +1109,241 @@ class TestOldSchemaMigration:
             task, [], [], int(time.time()), {}, dispatcher_ticks=[old_tick],
         )
         assert len(diags2) == 0
+
+
+# ---------------------------------------------------------------------------
+# fetch_diagnostics_dispatcher_ticks — unit + integration
+# ---------------------------------------------------------------------------
+
+
+class TestFetchDiagnosticsDispatcherTicks:
+    """Unit + integration tests for fetch_diagnostics_dispatcher_ticks."""
+
+    def test_returns_empty_when_no_ticks(self, kanban_home):
+        """Empty list when no ticks exist — callers can distinguish 'no data'."""
+        import sqlite3
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        result = kd.fetch_diagnostics_dispatcher_ticks(conn)
+        assert isinstance(result, list)
+        assert len(result) == 0
+
+    def test_returns_ticks_within_24h(self, kanban_home):
+        """Ticks from the last 24 hours are returned."""
+        import sqlite3
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        for offset in (3600, 7200, 18000):
+            conn.execute(
+                """INSERT INTO dispatcher_ticks
+                   (board, started_at, finished_at,
+                    reclaimed, promoted, spawned,
+                    skipped_nonspawnable_ids, skipped_capacity_ids,
+                    stale_claims_reclaimed,
+                    spawned_ids, reclaimed_ids, auto_blocked_ids, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("default", now - offset, now - offset + 1,
+                 0, 1, 1, "[]", "[]", 0, "[]", "[]", "[]", None),
+            )
+        conn.commit()
+        result = kd.fetch_diagnostics_dispatcher_ticks(conn)
+        assert len(result) == 3
+
+    def test_excludes_ticks_beyond_24h(self, kanban_home):
+        """Ticks older than 24h are excluded."""
+        import sqlite3
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO dispatcher_ticks
+               (board, started_at, finished_at,
+                reclaimed, promoted, spawned,
+                skipped_nonspawnable_ids, skipped_capacity_ids,
+                stale_claims_reclaimed,
+                spawned_ids, reclaimed_ids, auto_blocked_ids, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("default", now - 90000, now - 90000 + 1,
+             0, 0, 0, "[]", "[]", 0, "[]", "[]", "[]", None),
+        )
+        conn.commit()
+        result = kd.fetch_diagnostics_dispatcher_ticks(conn)
+        assert len(result) == 0, "tick >24h old should be excluded"
+
+    def test_bounded_to_last_10(self, kanban_home):
+        """More than 10 ticks in 24h returns only the last 10."""
+        import sqlite3
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        for i in range(15):
+            conn.execute(
+                """INSERT INTO dispatcher_ticks
+                   (board, started_at, finished_at,
+                    reclaimed, promoted, spawned,
+                    skipped_nonspawnable_ids, skipped_capacity_ids,
+                    stale_claims_reclaimed,
+                    spawned_ids, reclaimed_ids, auto_blocked_ids, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("default", now - (15 - i) * 300, now - (15 - i) * 300 + 1,
+                 0, 1, 1, "[]", "[]", 0, "[]", "[]", "[]", None),
+            )
+        conn.commit()
+        result = kd.fetch_diagnostics_dispatcher_ticks(conn)
+        assert len(result) == 10, "should return at most 10 ticks"
+        ids = [r["id"] for r in result]
+        assert min(ids) > 5, "should return the last 10, not the first 10"
+
+    def test_board_isolation(self, kanban_home):
+        """Ticks from a different board are excluded."""
+        import sqlite3
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO dispatcher_ticks
+               (board, started_at, finished_at,
+                reclaimed, promoted, spawned,
+                skipped_nonspawnable_ids, skipped_capacity_ids,
+                stale_claims_reclaimed,
+                spawned_ids, reclaimed_ids, auto_blocked_ids, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("other-board", now - 60, now - 30,
+             0, 1, 1, "[]", "[]", 0, "[]", "[]", "[]", None),
+        )
+        conn.execute(
+            """INSERT INTO dispatcher_ticks
+               (board, started_at, finished_at,
+                reclaimed, promoted, spawned,
+                skipped_nonspawnable_ids, skipped_capacity_ids,
+                stale_claims_reclaimed,
+                spawned_ids, reclaimed_ids, auto_blocked_ids, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("default", now - 120, now - 90,
+             0, 1, 1, "[]", "[]", 0, "[]", "[]", "[]", None),
+        )
+        conn.commit()
+        result = kd.fetch_diagnostics_dispatcher_ticks(conn)
+        assert len(result) == 1
+        assert result[0]["board"] == "default"
+
+    def test_handles_exception_gracefully(self):
+        """Corrupt or missing DB returns empty list, never raises."""
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        result = kd.fetch_diagnostics_dispatcher_ticks(conn)
+        assert isinstance(result, list)
+        assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# Production caller integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestDispatcherTickProductionCallers:
+    """Verify production callers wire dispatcher_ticks into diagnostics."""
+
+    def test_plugin_api_helper_passes_ticks(self, kanban_home):
+        """_compute_task_diagnostics passes dispatcher_ticks through."""
+        import sqlite3
+        from plugins.kanban.dashboard import plugin_api
+
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO tasks
+               (id, title, assignee, status, created_at,
+                consecutive_failures)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("t_prod_test", "prod test", "worker-terra", "ready",
+             now - 300, 0),
+        )
+        conn.execute(
+            """INSERT INTO dispatcher_ticks
+               (board, started_at, finished_at,
+                reclaimed, promoted, spawned,
+                skipped_nonspawnable_ids, skipped_capacity_ids,
+                stale_claims_reclaimed,
+                spawned_ids, reclaimed_ids, auto_blocked_ids, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("default", now - 120, now - 60,
+             0, 1, 1, "[]", "[]", 0, "[]", "[]", "[]", None),
+        )
+        conn.commit()
+        result = plugin_api._compute_task_diagnostics(conn)
+        assert isinstance(result, dict)
+        task_diags = result.get("t_prod_test", [])
+        kinds = {d["kind"] for d in task_diags}
+        assert "dispatcher_no_recent_tick" not in kinds, (
+            "recent tick should suppress the no-recent-tick diagnostic"
+        )
+
+    def test_plugin_api_handles_empty_ticks(self, kanban_home):
+        """_compute_task_diagnostics works without any ticks."""
+        import sqlite3
+        from plugins.kanban.dashboard import plugin_api
+
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO tasks
+               (id, title, assignee, status, created_at,
+                consecutive_failures)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("t_no_ticks", "no ticks", "worker-terra", "ready",
+             now - 500, 0),
+        )
+        conn.commit()
+        result = plugin_api._compute_task_diagnostics(conn)
+        assert isinstance(result, dict)
+        task_diags = result.get("t_no_ticks", [])
+        kinds = {d["kind"] for d in task_diags}
+        assert "dispatcher_no_recent_tick" in kinds, (
+            "no ticks should trigger the no-recent-tick diagnostic"
+        )
+
+    def test_different_task_negative(self, kanban_home):
+        """Diagnostics on task A not affected by ticks relevant to task B."""
+        import sqlite3, json as _json
+        from plugins.kanban.dashboard import plugin_api
+
+        conn = sqlite3.connect(str(kanban_home / "kanban.db"))
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        for tid, name in [("t_a", "task A"), ("t_b", "task B")]:
+            conn.execute(
+                """INSERT INTO tasks
+                   (id, title, assignee, status, created_at,
+                    consecutive_failures)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (tid, name, "worker-terra", "ready", now - 500, 0),
+            )
+        conn.execute(
+            """INSERT INTO dispatcher_ticks
+               (board, started_at, finished_at,
+                reclaimed, promoted, spawned,
+                skipped_nonspawnable_ids, skipped_capacity_ids,
+                stale_claims_reclaimed,
+                spawned_ids, reclaimed_ids, auto_blocked_ids, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("default", now - 120, now - 60,
+             0, 0, 0,
+             "[]",
+             _json.dumps([["t_b", "worker-terra", 3]]),
+             0, "[]", "[]", "[]", None),
+        )
+        conn.commit()
+        result = plugin_api._compute_task_diagnostics(conn)
+        diags_b = result.get("t_b", [])
+        kinds_b = {d["kind"] for d in diags_b}
+        assert "dispatcher_capacity_wait" in kinds_b
+        diags_a = result.get("t_a", [])
+        kinds_a = {d["kind"] for d in diags_a}
+        assert "dispatcher_capacity_wait" not in kinds_a, (
+            "capacity wait for task B must not leak to task A"
+        )

@@ -300,6 +300,7 @@ def _compute_task_diagnostics(
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
     out: dict[str, list[dict]] = {}
+    dispatcher_ticks = kd.fetch_diagnostics_dispatcher_ticks(conn)
     for r in rows:
         tid = r["id"]
         diags = kd.compute_task_diagnostics(
@@ -307,6 +308,7 @@ def _compute_task_diagnostics(
             events_by_task.get(tid, []),
             runs_by_task.get(tid, []),
             config=diag_config,
+            dispatcher_ticks=dispatcher_ticks,
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]
