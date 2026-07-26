@@ -201,6 +201,42 @@ advertised base model name defaults to the [profile](/user-guide/profiles) name
 (or `hermes-agent` for the default profile). Required by most frontends for
 model discovery.
 
+`/v1/models` is intentionally the cheap OpenAI-compat surface. It does **not**
+enumerate every authenticated provider/model combination Hermes can route to,
+and it does not do pricing or capability enrichment.
+
+### GET /api/model/options
+
+Hermes-aware clients can request the same curated provider/model inventory used
+by the dashboard and TUI. This route uses the API server's normal bearer
+authentication and returns provider rows, model capability hints, and pricing
+metadata that do not belong in the OpenAI-compatible `/v1/models` response:
+
+```bash
+curl \
+  -H "Authorization: Bearer $API_SERVER_KEY" \
+  "http://127.0.0.1:8642/api/model/options"
+```
+
+That payload is the same substrate the dashboard Models page and the TUI
+`model.options` RPC use. It returns authenticated providers, curated model
+lists, per-model pricing, and model capability hints.
+
+Normal opens are intentionally conservative for custom providers: Hermes probes
+only the **currently selected** custom endpoint so a stale or offline saved
+endpoint does not block the picker. An explicit refresh flips to full probing
+and busts the provider model cache:
+
+```bash
+curl \
+  -H "Authorization: Bearer $API_SERVER_KEY" \
+  "http://127.0.0.1:8642/api/model/options?refresh=1"
+```
+
+Use `/v1/models` when an OpenAI-compatible client only needs a model name to
+send back in chat/responses requests. Use `/api/model/options` when an
+authenticated UI needs the richer Hermes-specific picker metadata.
+
 ### GET /v1/capabilities
 
 Returns a machine-readable description of the API server's stable surface for external UIs, orchestrators, and plugin bridges.
@@ -223,6 +259,69 @@ Returns a machine-readable description of the API server's stable surface for ex
 ```
 
 Use this endpoint when integrating dashboards, browser UIs, or control planes so they can discover whether the running Hermes version supports runs, streaming, cancellation, and session continuity without depending on private Python internals.
+
+## Per-request model selection
+
+Authenticated clients can override Hermes' default model selection per request
+by sending:
+
+- `model` — the target model id for this turn
+- `provider` — the Hermes provider slug to resolve credentials/runtime for this turn
+- `model_options` — request-scoped reasoning / service-tier controls
+
+The same request fields are accepted on:
+
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/runs`
+- `POST /api/sessions/{session_id}/chat`
+- `POST /api/sessions/{session_id}/chat/stream`
+
+Precedence is deterministic:
+
+1. Session `/model` override, if that session already has one
+2. A static `gateway.platforms.api_server.model_routes` mapping selected when
+   the request's `model` is a configured route alias
+3. Direct request `model` / `provider` when no route alias matches
+4. Global gateway config / environment defaults
+
+`model_options` stays request-scoped regardless of which model/provider wins.
+If a request sends a `provider` that conflicts with a configured `model_routes`
+alias, Hermes rejects the request with `400` instead of silently remixing route
+credentials with another provider.
+
+**Bare `model` values on the OpenAI-compatible endpoints are opt-in.** Generic
+OpenAI clients routinely hardcode model names (`gpt-4o`, ...), and existing
+deployments rely on those falling back to the gateway default. On
+`POST /v1/chat/completions` and `POST /v1/responses`, a `model` value sent
+WITHOUT a `provider` is therefore ignored unless you enable:
+
+```yaml
+gateway:
+  platforms:
+    api_server:
+      direct_model_requests: true
+```
+
+Requests that include an explicit `provider` — and the Hermes-native
+`/v1/runs` and session-chat endpoints — always honor the requested model
+regardless of this flag.
+
+Example:
+
+```json
+{
+  "model": "MiniMax-M3",
+  "provider": "minimax",
+  "model_options": {
+    "reasoning_effort": "high",
+    "service_tier": "priority"
+  },
+  "messages": [
+    {"role": "user", "content": "Summarize the repo status."}
+  ]
+}
+```
 
 ### GET /health
 
@@ -429,20 +528,35 @@ The API server gives full access to hermes-agent's toolset, **including terminal
 
 ### config.yaml
 
-Environment variables configure the listener and client authentication.
+The same settings can live in `~/.hermes/config.yaml` under a nested `gateway.api_server:` section:
+
+```yaml
+gateway:
+  api_server:
+    enabled: true
+    port: 8642
+    host: 127.0.0.1
+    key: your-secret-key
+    cors_origins: http://localhost:3000
+    model_name: my-hermes
+```
+
+`port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+
 `config.yaml` can additionally map an OpenAI request's `model` field to a
 server-side model route:
 
 ```yaml
-platforms:
-  api_server:
-    extra:
-      model_routes:
-        coding:
-          model: "openai/gpt-4o-mini"
-          provider: "openai"
-          toolsets: [web, no_mcp]  # Optional: only for requests using "coding"
-          reasoning_effort: "low"  # Optional: only for requests using "coding"
+gateway:
+  platforms:
+    api_server:
+      extra:
+        model_routes:
+          coding:
+            model: "openai/gpt-4o-mini"
+            provider: "openai"
+            toolsets: [web, no_mcp]  # Optional: only for requests using "coding"
+            reasoning_effort: "low"  # Optional: only for requests using "coding"
 ```
 
 Configured aliases are returned by `GET /v1/models`. A route can also set a
@@ -539,6 +653,9 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 - **Unmapped model names are cosmetic** — configure a `model_routes` alias
   when a request's `model` field should select a server-side model; otherwise
   the server uses its configured default.
+- **Simple OpenAI clients still see an alias** — `/v1/models` advertises the
+  stable Hermes alias (`hermes-agent` or the active profile name). Richer
+  clients can send explicit `provider` / `model_options` overrides on requests.
 
 ## Proxy Mode
 
