@@ -654,6 +654,7 @@ class TestCardActionCallbackResponse:
         data = _make_card_action_data(
             {"hermes_action": "approve_once", "approval_id": 7},
             open_id="ou_user7",
+            chat_id="oc_dm_123",
         )
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
