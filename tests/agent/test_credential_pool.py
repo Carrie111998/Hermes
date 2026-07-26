@@ -14,7 +14,11 @@ def test_env_seed_does_not_use_global_secret_under_empty_profile_scope(
     tmp_path, monkeypatch
 ):
     from agent.credential_pool import load_pool
-    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from agent.secret_scope import (
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
 
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
@@ -24,11 +28,13 @@ def test_env_seed_does_not_use_global_secret_under_empty_profile_scope(
     )
     monkeypatch.setenv("OPENROUTER_API_KEY", "global-default-key")
 
+    set_multiplex_active(True)
     token = set_secret_scope({})
     try:
         pool = load_pool("openrouter")
     finally:
         reset_secret_scope(token)
+        set_multiplex_active(False)
 
     assert pool.has_credentials() is False
     auth_path = hermes_home / "auth.json"

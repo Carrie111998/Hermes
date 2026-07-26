@@ -58,14 +58,20 @@ class TestResolveEntryApiKey:
     def test_key_env_does_not_fall_through_outside_active_profile_scope(
         self, monkeypatch
     ):
-        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
 
         monkeypatch.setenv("FB_KEY", "default-profile-key")
+        set_multiplex_active(True)
         token = set_secret_scope({})
         try:
             assert resolve_entry_api_key({"key_env": "FB_KEY"}) is None
         finally:
             reset_secret_scope(token)
+            set_multiplex_active(False)
 
 
 def test_strict_loader_serializes_yaml_parsing(tmp_path, monkeypatch):

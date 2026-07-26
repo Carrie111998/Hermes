@@ -264,11 +264,13 @@ def test_provider_resolver_is_fail_closed_in_scope_but_legacy_global_unscoped(
     )
     monkeypatch.setenv("OLLAMA_API_KEY", "single-profile-global-key")
 
+    ss.set_multiplex_active(True)
     token = ss.set_secret_scope({})
     try:
         scoped = resolve_api_key_provider_credentials("ollama-cloud")
     finally:
         ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
     unscoped = resolve_api_key_provider_credentials("ollama-cloud")
 
     assert scoped.get("api_key") in (None, "")

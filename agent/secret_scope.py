@@ -252,4 +252,21 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
             continue
         secrets[key] = value
 
+    try:
+        from hermes_cli.managed_scope import load_managed_env
+
+        managed_secrets = load_managed_env()
+    except Exception:
+        logger.debug(
+            "managed env load failed for %s; continuing without managed secrets",
+            hermes_home,
+            exc_info=True,
+        )
+        managed_secrets = {}
+
+    for key, value in managed_secrets.items():
+        if _is_global_env(key):
+            continue
+        secrets[key] = value
+
     return secrets
