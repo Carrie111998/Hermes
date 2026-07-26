@@ -6,10 +6,14 @@ from unittest.mock import Mock, patch
 
 from tools.computer_use.transports.http_mcp import HttpMcpTransport
 from tools.computer_use.transports.stdio import StdioMcpTransport
+from tools.environments import CuaFleetConfig, CuaFleetDesktopProvider
 from tools.environments.capability_adapter import resolve_tools
 from tools.environments.capability_manifest import CapabilityManifest, desktop_manifest
 from tools.environments.compute_provider import ComputeLease, EnvironmentCapabilities
-from tools.environments.cua_fleet import CuaFleetConfig
+from tools.environments.cua_fleet import (
+    CuaFleetConfig as CuaFleetConfigImplementation,
+    CuaFleetDesktopProvider as CuaFleetDesktopProviderImplementation,
+)
 from tools.environments.desktop_lease import DesktopSandboxManager
 from tools.environments.modal_desktop import ModalDesktopConfig
 
@@ -121,3 +125,8 @@ def test_cua_fleet_config_defaults() -> None:
 
     assert config.pool == "default"
     assert config.endpoint == ""
+
+
+def test_environments_package_reexports_cua_fleet_sdk() -> None:
+    assert CuaFleetConfig is CuaFleetConfigImplementation
+    assert CuaFleetDesktopProvider is CuaFleetDesktopProviderImplementation
