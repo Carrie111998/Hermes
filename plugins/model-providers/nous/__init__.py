@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from agent.portal_tags import nous_portal_tags
+from agent.portal_tags import get_conversation_context, nous_portal_tags
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -14,15 +14,28 @@ class NousProfile(ProviderProfile):
         self, *, session_id: str | None = None, **context
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"tags": nous_portal_tags(session_id=session_id)}
-        if session_id:
-            # Top-level session_id → provider sticky routing key. Pins every
-            # turn of a session to the same upstream endpoint so explicit
-            # Anthropic cache_control breakpoints stay warm instead of
-            # cold-writing a fresh cache on each reroute (Anthropic/Vertex/
-            # Bedrock caches are instance-local). Mirrors the OpenRouter
-            # profile; without it the portal falls back to hashing the opening
-            # messages, which breaks pinning whenever those shift.
-            body["session_id"] = session_id
+        # Top-level session_id → provider sticky routing key. Pins every
+        # turn of a session to the same upstream endpoint so explicit
+        # Anthropic cache_control breakpoints stay warm instead of
+        # cold-writing a fresh cache on each reroute (Anthropic/Vertex/
+        # Bedrock caches are instance-local). Mirrors the OpenRouter
+        # profile; without it the portal falls back to hashing the opening
+        # messages, which breaks pinning whenever those shift.
+        #
+        # Resolve it exactly like ``nous_portal_tags`` resolves the
+        # ``conversation=`` tag: ambient context first (the lineage ROOT id
+        # published by the agent loop), explicit argument as fallback. Two
+        # reasons they must agree:
+        #   * ``agent.session_id`` rotates when context compression starts a
+        #     new segment, so using it alone silently re-keys sticky routing
+        #     mid-conversation and cold-writes the cache right after the
+        #     compression turn — the most expensive prompt of the session.
+        #   * auxiliary call sites (compression, titles, vision, MoA slots)
+        #     never pass ``session_id``; they carried the conversation tag
+        #     but no sticky key at all, so they routed independently.
+        sticky_key = get_conversation_context() or session_id
+        if sticky_key:
+            body["session_id"] = sticky_key
         provider_preferences = context.get("provider_preferences")
         if provider_preferences:
             body["provider"] = provider_preferences
