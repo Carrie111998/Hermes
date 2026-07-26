@@ -437,6 +437,46 @@ def test_fetch_cache_hits(monkeypatch, tmp_path):
     assert call_count["n"] == 1  # cached on second call
 
 
+def test_fetch_key_map_isolates_cache_entries(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "Friendly Name", "value": "opaque"}])
+    call_count = {"n": 0}
+
+    def fake_run(*a, **kw):
+        call_count["n"] += 1
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    first, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        cache_ttl_seconds=60,
+        key_map={"Friendly Name": "FIRST_ALIAS"},
+    )
+    second, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        cache_ttl_seconds=60,
+        key_map={"Friendly Name": "SECOND_ALIAS"},
+    )
+    second_cached, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        cache_ttl_seconds=60,
+        key_map={"Friendly Name": "SECOND_ALIAS"},
+    )
+
+    assert first == {"FIRST_ALIAS": "opaque"}
+    assert second == {"SECOND_ALIAS": "opaque"}
+    assert second_cached == second
+    assert call_count["n"] == 2
+
+
 def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
     """server_url must be plumbed into the subprocess as BWS_SERVER_URL."""
     fake_binary = tmp_path / "bws"
