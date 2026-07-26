@@ -3481,6 +3481,7 @@ class AIAgent:
         except Exception:
             # Never let durable heartbeat I/O break the agent loop.
             pass
+
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
 

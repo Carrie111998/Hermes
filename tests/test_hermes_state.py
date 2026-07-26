@@ -4674,6 +4674,19 @@ class TestListSessionsRich:
         db.touch_session_activity("s1", heartbeat - 100)
         assert db.get_session("s1")["last_activity_at"] == heartbeat
 
+    def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
+        """Rate-limited heartbeats can lag message writes; last_active must take max."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "hello")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp=? WHERE session_id=?",
+                (1_700_000_800.0, "s1"),
+            )
+            db._conn.commit()
+        db.touch_session_activity("s1", 1_700_000_500.0)  # older than message
+        assert db.list_sessions_rich()[0]["last_active"] == 1_700_000_800.0
+
     def test_list_gateway_sessions_last_active_uses_activity_heartbeat(self, db):
         db.create_session(
             "gw-1",

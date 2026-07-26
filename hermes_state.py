@@ -215,17 +215,50 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
 def _sql_session_last_active(alias: str = "s") -> str:
     """SQL expression for session recency used by list/status surfaces.
 
-    Preference order:
-      1. ``last_activity_at`` — mid-turn agent heartbeat (API/tool/compaction)
-      2. latest message timestamp
-      3. ``started_at``
+    Freshest of ``last_activity_at`` (mid-turn agent heartbeat) and the
+    latest message timestamp, then fall back to ``started_at``.
+
+    Must not prefer a stale heartbeat over a newer message: durable
+    heartbeats are rate-limited (~60s), so after a turn writes messages
+    ``last_activity_at`` can lag ``MAX(messages.timestamp)``.
     """
+    msg_max = (
+        f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
+        f"WHERE _act_m.session_id = {alias}.id)"
+    )
     return (
         f"COALESCE("
-        f"{alias}.last_activity_at, "
-        f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
-        f"WHERE _act_m.session_id = {alias}.id), "
+        f"(SELECT MAX(_act_v.v) FROM ("
+        f"SELECT {alias}.last_activity_at AS v "
+        f"UNION ALL "
+        f"SELECT {msg_max}"
+        f") _act_v), "
         f"{alias}.started_at)"
+    )
+
+
+def _sql_session_last_active_by_id(session_id_expr: str) -> str:
+    """Same freshest-of expression keyed by a session-id SQL expression."""
+    msg_max = (
+        f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
+        f"WHERE _act_m.session_id = {session_id_expr})"
+    )
+    activity = (
+        f"(SELECT last_activity_at FROM sessions _act_s "
+        f"WHERE _act_s.id = {session_id_expr})"
+    )
+    started = (
+        f"(SELECT started_at FROM sessions _act_s "
+        f"WHERE _act_s.id = {session_id_expr})"
+    )
+    return (
+        f"COALESCE("
+        f"(SELECT MAX(_act_v.v) FROM ("
+        f"SELECT {activity} AS v "
+        f"UNION ALL "
+        f"SELECT {msg_max}"
+        f") _act_v), "
+        f"{started})"
     )
 
 
@@ -6085,11 +6118,7 @@ class SessionDB:
                 chain_max AS (
                     SELECT
                         root_id,
-                        MAX(COALESCE(
-                            (SELECT last_activity_at FROM sessions ss WHERE ss.id = cur_id),
-                            (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = cur_id),
-                            (SELECT started_at FROM sessions ss WHERE ss.id = cur_id)
-                        )) AS effective_last_active
+                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
                     FROM chain
                     GROUP BY root_id
                 )
@@ -8687,9 +8716,9 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
-        Returns rows enriched with a computed ``last_active`` column (latest
-        message timestamp for the session, falling back to ``started_at``),
-        ordered by most-recently-used first.
+        Returns rows enriched with a computed ``last_active`` column
+        (freshest of ``last_activity_at`` and latest message timestamp,
+        else ``started_at``), ordered by most-recently-used first.
         """
         select_with_last_active = (
             f"SELECT s.*, {_sql_session_last_active('s')} AS last_active "
