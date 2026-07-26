@@ -1347,6 +1347,20 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
+                # Refresh usage evidence before routing decisions (GOAL B).
+                # Throttled to min 5-min interval, timeout-bounded, coalescing-safe.
+                try:
+                    from hermes_cli.fleet.usage_refresh_hook import refresh_usage_before_dispatch
+                    usage_status = await refresh_usage_before_dispatch()
+                    if not usage_status.get("ok") and usage_status.get("reason") not in ("throttled", "coalesced"):
+                        logger.debug(
+                            "kanban dispatcher: pre-dispatch usage refresh %s — %s",
+                            usage_status.get("reason"),
+                            usage_status.get("detail"),
+                        )
+                except Exception as exc:
+                    logger.debug("kanban dispatcher: usage refresh hook import/call failed: %s", exc)
+
                 # Re-read the auto-decompose toggle live each tick so a user
                 # flipping kanban.auto_decompose=false to STOP runaway fan-out
                 # takes effect on the next tick, not on gateway restart (#49638).

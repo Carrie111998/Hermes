@@ -15,7 +15,7 @@ import math
 import os
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -83,8 +83,106 @@ def _read_console_attestation(path: Path) -> dict[str, tuple[float, str]]:
     return out
 
 
+def _is_attestation_stale(checked_at_str: str | None, *, max_age_hours: int = 24, now: datetime | None = None) -> bool:
+    """Check if an attestation timestamp is stale.
+
+    Args:
+        checked_at_str: ISO format timestamp string or None
+        max_age_hours: Maximum age in hours before considered stale
+        now: Reference time (defaults to current UTC time)
+
+    Returns:
+        True if stale or unparseable; False if fresh
+    """
+    if not checked_at_str or not isinstance(checked_at_str, str):
+        return True
+    try:
+        attested_at = datetime.fromisoformat(checked_at_str.replace("Z", "+00:00"))
+        age = (now or _utc_now()) - attested_at
+        return age > timedelta(hours=max_age_hours)
+    except (ValueError, TypeError):
+        return True
+
+
+def _resolve_agy_executable() -> str | None:
+    """Resolve absolute path to agy executable.
+
+    Checks:
+    1. Known installation path: C:/Users/HieuKa/AppData/Local/agy/bin/agy.exe
+    2. On PATH via shutil.which("agy")
+
+    Returns absolute path or None if not found.
+    """
+    import shutil
+    from pathlib import Path
+
+    # Known installation location (from COO diagnostic)
+    known_path = Path("C:/Users/HieuKa/AppData/Local/agy/bin/agy.exe").resolve()
+    if known_path.is_file():
+        return str(known_path)
+
+    # Fallback to PATH
+    agy_bin = shutil.which("agy")
+    return agy_bin
+
+
+def _probe_agy_health() -> tuple[bool | None, str]:
+    """Probe agy CLI health by querying installed models.
+
+    Surface real subprocess errors (file-not-found vs exit code).
+    Tolerant of catalog evolution (unknown models don't fail the probe).
+
+    Returns:
+        (True, detail) if agy is healthy and model list parsed
+        (False, detail) if agy runs but models unavailable
+        (None, detail) if agy not found or probe failed
+    """
+    import subprocess
+
+    agy_exe = _resolve_agy_executable()
+    if not agy_exe:
+        return None, "agy executable not found on PATH or known location"
+
+    try:
+        completed = subprocess.run(
+            [agy_exe, "models"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, f"agy executable not found: {agy_exe}"
+    except subprocess.TimeoutExpired:
+        return None, f"agy models command timeout (5s): {agy_exe}"
+    except OSError as exc:
+        return None, f"agy executable launch failed: {type(exc).__name__}: {exc}"
+
+    if completed.returncode != 0:
+        stderr_detail = (
+            completed.stderr[:100].strip() if completed.stderr else ""
+        )
+        return (
+            False,
+            f"agy models exit {completed.returncode}: {stderr_detail or '(no stderr)'}",
+        )
+
+    # Check that output contains expected model markers (tolerant of catalog changes)
+    output_lower = (completed.stdout or "").lower()
+    if not output_lower or "gemini" not in output_lower:
+        return False, "agy models output missing model list"
+
+    return True, f"agy {agy_exe} healthy; model list available"
+
+
 def _probe_console_lane_health(lane_id: str) -> tuple[bool | None, str]:
-    """Return (healthy, detail) without inventing usage percentages."""
+    """Return (healthy, detail) without inventing usage percentages.
+
+    Returns:
+        (True, detail) if healthy
+        (False, detail) if unhealthy
+        (None, detail) if unavailable to probe
+    """
     if lane_id == "grok":
         try:
             from hermes_cli.auth import get_xai_oauth_auth_status
@@ -97,17 +195,9 @@ def _probe_console_lane_health(lane_id: str) -> tuple[bool | None, str]:
         return False, "xai-oauth not logged_in"
     if lane_id == "antigravity":
         try:
-            from hermes_cli.fleet.live import FleetQualificationDoctor
-            from hermes_cli.fleet.profiles import profile_map
-
-            qualification = FleetQualificationDoctor().qualify(
-                (profile_map()["antigravity"],)
-            )["antigravity"]
+            return _probe_agy_health()
         except Exception as exc:  # noqa: BLE001
-            return None, f"antigravity doctor failed: {type(exc).__name__}"
-        if qualification.qualified:
-            return True, "antigravity live-receipt qualified"
-        return False, qualification.detail or "antigravity not qualified"
+            return None, f"agy probe failed: {type(exc).__name__}: {exc}"
     return None, f"unsupported console lane: {lane_id}"
 
 
@@ -404,8 +494,40 @@ def refresh_usage_document(
             plans.append(row)
         prior_pct = _clamp_pct(row.get("weekly_pct_used"))
         attested = lane_id in attestation
+        attested_fresh = False
         if attested:
             attested_pct, attested_checked_at = attestation[lane_id]
+            # Check for stale attestation (>24h old) — grok/antigravity only,
+            # never use stale evidence for capacity routing.
+            if _is_attestation_stale(attested_checked_at, max_age_hours=24, now=now or _utc_now()):
+                # Attestation is stale; keep prior values but mark as stale
+                prior_checked = row.get("checked_at")
+                health_state, health_detail = _probe_console_lane_health(lane_id)
+                health_observed = health_state is not None
+                if health_observed:
+                    any_console_health_evidence = True
+                    row["health_status"] = "UP" if health_state else "DOWN"
+                    row["health_checked_at"] = stamp
+                    health_summary = (
+                        f"console health probe {'ok' if health_state else 'down'}; "
+                        f"{health_detail}; attestation stale (>{24}h)"
+                    )
+                else:
+                    health_summary = f"console health probe unavailable; attestation stale (>24h)"
+                results.append(
+                    LaneRefreshResult(
+                        lane_id=lane_id,
+                        updated=health_observed,
+                        weekly_pct_used=prior_pct,
+                        checked_at=(
+                            str(prior_checked) if isinstance(prior_checked, str) else None
+                        ),
+                        detail=health_summary,
+                    )
+                )
+                continue
+
+            attested_fresh = True
             row["weekly_pct_used"] = attested_pct
             row["checked_at"] = attested_checked_at
             row["measurement_kind"] = "measured"
@@ -432,7 +554,7 @@ def refresh_usage_document(
         results.append(
             LaneRefreshResult(
                 lane_id=lane_id,
-                updated=attested or health_observed,
+                updated=attested_fresh or health_observed,
                 weekly_pct_used=prior_pct,
                 checked_at=(
                     str(prior_checked) if isinstance(prior_checked, str) else None
