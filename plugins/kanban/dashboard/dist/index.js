@@ -301,6 +301,33 @@
     } catch (_e) { /* ignore quota / private mode */ }
   }
 
+  // A task drawer is shareable as /kanban?board=<slug>&task=<id>.  Keep
+  // localStorage as the fallback for ordinary visits, but let an explicit URL
+  // win so links are stable across browsers and dashboard sessions.
+  function readKanbanUrlSelection() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const board = (params.get("board") || "").trim() || null;
+      const task = (params.get("task") || "").trim() || null;
+      return { board: board, task: task };
+    } catch (_e) { return { board: null, task: null }; }
+  }
+
+  function replaceKanbanUrl(board, taskId) {
+    try {
+      const url = new URL(window.location.href);
+      const params = url.searchParams;
+      // The default board is intentionally implicit in the public URL.
+      if (board && board !== "default") params.set("board", board);
+      else params.delete("board");
+      if (taskId) params.set("task", taskId);
+      else params.delete("task");
+      const next = `${url.pathname}${params.toString() ? `?${params}` : ""}${url.hash}`;
+      const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      if (next !== current) window.history.replaceState(window.history.state, "", next);
+    } catch (_e) { /* URL/history unavailable (for example, an embedded preview) */ }
+  }
+
   function withBoard(url, board) {
     // Always append ?board=<slug> when we have one picked — including
     // "default". Omitting the param would fall through to the backend's
@@ -603,7 +630,17 @@
   function KanbanPage() {
     const { t } = useI18n();
     const kanbanDialogs = useKanbanDialogs(t);
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    const initialUrlSelectionRef = useRef(null);
+    if (initialUrlSelectionRef.current === null) {
+      initialUrlSelectionRef.current = readKanbanUrlSelection();
+    }
+    const initialTaskRef = useRef(initialUrlSelectionRef.current.task);
+    const initialTaskResolvedRef = useRef(!initialUrlSelectionRef.current.task);
+    const [board, setBoard] = useState(() =>
+      initialUrlSelectionRef.current.board
+      // `task` without `board` is the compact deep-link form for default;
+      // it must not inherit a different board from this browser's storage.
+      || (initialUrlSelectionRef.current.task ? "default" : readSelectedBoard() || null));
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -646,6 +683,28 @@
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+    // Fetches are not abortable through every dashboard SDK host.  Keep the
+    // selected slug separately so a response for a board we have since left
+    // cannot repaint the grid after a fallback or board switch.
+    const currentBoardRef = useRef(board);
+    // Increment for both committed selections and synchronous transitions.
+    // The request generation prevents A -> B -> A from accepting the first
+    // A response after the newer A request has started.
+    const boardRequestGenerationRef = useRef(0);
+    useEffect(function () {
+      currentBoardRef.current = board;
+      boardRequestGenerationRef.current += 1;
+    }, [board]);
+
+    const openTask = useCallback(function (taskId) {
+      setSelectedTaskId(taskId);
+      replaceKanbanUrl(board, taskId);
+    }, [board]);
+
+    const closeTask = useCallback(function () {
+      setSelectedTaskId(null);
+      replaceKanbanUrl(board, null);
+    }, [board]);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -664,30 +723,44 @@
 
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
+      const requestedBoard = board;
+      const requestGeneration = ++boardRequestGenerationRef.current;
+      const isCurrentRequest = function () {
+        return currentBoardRef.current === requestedBoard
+          && boardRequestGenerationRef.current === requestGeneration;
+      };
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
-      return SDK.fetchJSON(withBoard(url, board))
+      return SDK.fetchJSON(withBoard(url, requestedBoard))
         .then(function (data) {
+          if (!isCurrentRequest()) return;
           setBoardData(data);
           cursorRef.current = data.latest_event_id || 0;
           setError(null);
         })
         .catch(function (err) {
+          if (!isCurrentRequest()) return;
           setError(String(err && err.message ? err.message : err));
         })
-        .finally(function () { setLoading(false); });
+        .finally(function () {
+          if (isCurrentRequest()) setLoading(false);
+        });
     }, [tenantFilter, includeArchived, board]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
-      return SDK.fetchJSON(withBoard(`${API}/boards`, board))
+      const requestedBoard = board;
+      return SDK.fetchJSON(withBoard(`${API}/boards`, requestedBoard))
         .then(function (data) {
+          if (currentBoardRef.current !== requestedBoard) return;
           const boards = (data && data.boards) || [];
           const storedBoard = readSelectedBoard();
           setBoardList(boards);
           if (!storedBoard && !board && data && data.current) {
+            currentBoardRef.current = data.current;
+            boardRequestGenerationRef.current += 1;
             setBoard(data.current);
             return;
           }
@@ -695,8 +768,21 @@
           // deleted in the CLI while dashboard was open), fall back to
           // default so the UI doesn't hang on a 404.
           if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
-            setBoard("default");
-            writeSelectedBoard("default");
+            // Do not leave a stale task id paired with the fallback board.
+            initialTaskRef.current = null;
+            initialTaskResolvedRef.current = true;
+            setSelectedTaskId(null);
+            setBoardData(null);
+            setLoading(true);
+            // An explicit URL is a one-off navigation, not a preference.
+            // Keep an existing local choice intact when that URL is invalid.
+            const fallbackBoard = initialUrlSelectionRef.current.board
+              ? (boards.find(function (b) { return b.slug === storedBoard; }) || {}).slug || "default"
+              : "default";
+            currentBoardRef.current = fallbackBoard;
+            boardRequestGenerationRef.current += 1;
+            setBoard(fallbackBoard);
+            if (!initialUrlSelectionRef.current.board) writeSelectedBoard(fallbackBoard);
           }
         })
         .catch(function () { /* non-fatal */ });
@@ -721,6 +807,41 @@
         }
       };
     }, [loadBoard]);
+
+    // Resolve a deep-linked task only after the board data is available.  The
+    // board payload intentionally omits archived cards, so validate a missing
+    // card through the authenticated detail endpoint before clearing it.
+    useEffect(function () {
+      const initialTaskId = initialTaskRef.current;
+      if (!initialTaskId || !boardData) return;
+      const task = boardData.columns.reduce(function (found, column) {
+        return found || column.tasks.find(function (item) { return item.id === initialTaskId; });
+      }, null);
+      const requestedBoard = board;
+      let cancelled = false;
+      const resolve = function (resolvedTaskId) {
+        if (cancelled || currentBoardRef.current !== requestedBoard || initialTaskRef.current !== initialTaskId) return;
+        initialTaskRef.current = null;
+        initialTaskResolvedRef.current = true;
+        setSelectedTaskId(resolvedTaskId);
+        replaceKanbanUrl(requestedBoard, resolvedTaskId);
+      };
+      if (task) {
+        resolve(task.id);
+        return;
+      }
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(initialTaskId)}`, requestedBoard))
+        .then(function (data) { resolve(data && data.task ? initialTaskId : null); })
+        .catch(function () { resolve(null); });
+      return function () { cancelled = true; };
+    }, [board, boardData]);
+
+    // Board-only links and normal board changes are canonicalized too.  Wait
+    // for an initial task link to be validated so this never drops `task`
+    // before the first board response arrives.
+    useEffect(function () {
+      if (initialTaskResolvedRef.current) replaceKanbanUrl(board, selectedTaskId);
+    }, [board, selectedTaskId]);
 
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
@@ -1146,8 +1267,12 @@
       setBoardData(null);
       cursorRef.current = 0;
       setLoading(true);
+      currentBoardRef.current = nextSlug;
+      boardRequestGenerationRef.current += 1;
       setBoard(nextSlug);
       writeSelectedBoard(nextSlug);
+      setSelectedTaskId(null);
+      replaceKanbanUrl(nextSlug, null);
       // Reset filters so stale search/tenant/assignee don't persist across boards.
       setSearch("");
       setTenantFilter("");
@@ -1283,7 +1408,7 @@
         h(OrchestrationPanel, null),
         h(AttentionStrip, {
           boardData,
-          onOpen: setSelectedTaskId,
+          onOpen: openTask,
         }),
         h(BoardToolbar, {
           board: boardData,
@@ -1328,15 +1453,15 @@
           onMoveSelected: moveSelected,
           onDelete: deleteTask,
           onDeleteSelected: deleteSelected,
-          onOpen: setSelectedTaskId,
+          onOpen: openTask,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,
-          onClose: function () { setSelectedTaskId(null); },
-          onOpenTask: setSelectedTaskId,
+          onClose: closeTask,
+          onOpenTask: openTask,
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
