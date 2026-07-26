@@ -641,7 +641,8 @@ class WorkflowEngine:
         try:
             import json as _json
             from pathlib import Path as _P
-            for _p in ["/tmp/wfe-session.json",
+            _profile = os.environ.get("HERMES_PROFILE") or "default"
+            for _p in [f"/tmp/wfe-session-{_profile}.json",
                        _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session.json"]:
                 try:
                     with open(_p) as _f:
