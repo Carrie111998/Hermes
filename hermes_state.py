@@ -23,6 +23,7 @@ import random
 import re
 import sqlite3
 import sys
+from abc import ABC, abstractmethod
 import threading
 import time
 from pathlib import Path
@@ -1843,7 +1844,535 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
-class SessionDB:
+
+class SessionStoreBackend(ABC):
+    """
+    Abstract base class for session storage backends.
+
+    Implementations include SqliteSessionDB (default), PostgresSessionDB,
+    and future backends (MySQL, SQL Server, etc.). Each backend is
+    responsible for its own connection management, schema initialisation,
+    retry logic, and search implementation.
+
+    All public methods accept an optional ``profile_name`` parameter for
+    multi-tenancy. In single-profile mode (the default), callers omit this
+    parameter and the backend scopes queries to the current profile. In
+    multiplex mode, the gateway passes the resolved profile name so a
+    single backend instance can serve multiple profiles via a WHERE clause
+    or equivalent routing mechanism.
+
+    Backend constructors are NOT part of this ABC — each backend defines
+    its own ``__init__`` signature (e.g. SQLite takes a ``db_path``,
+    PostgreSQL takes a ``database_url`` and pool config). The factory
+    (AsyncSessionDB / SessionStore) wires the correct constructor.
+    """
+
+    @abstractmethod
+    def append_message(self, session_id: str, role: str, content: str = None, tool_name: str = None, tool_calls: Any = None, tool_call_id: str = None, token_count: int = None, finish_reason: str = None, reasoning: str = None, reasoning_content: str = None, reasoning_details: Any = None, codex_reasoning_items: Any = None, codex_message_items: Any = None, platform_message_id: str = None, observed: bool = False, effect_disposition: Optional[str] = None, timestamp: Any = None, api_content: Optional[str] = None, display_kind: Optional[str] = None, display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None) -> None:
+        ...
+
+    @abstractmethod
+    def apply_telegram_topic_migration(self) -> None:
+        ...
+
+    @abstractmethod
+    def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]]) -> None:
+        ...
+
+    @abstractmethod
+    def archive_sessions(self, older_than_days: Optional[float] = None, source: str = None, **filters) -> None:
+        ...
+
+    @abstractmethod
+    def archive_stale_sessions(self, idle_days: float, *, exclude_pinned: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
+        ...
+
+    @abstractmethod
+    def bind_telegram_topic(self, *, chat_id: str, thread_id: str, user_id: str, session_key: str, session_id: str, managed_mode: str = 'auto') -> None:
+        ...
+
+    @abstractmethod
+    def claim_handoff(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def clear_compression_failure_cooldown(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def clear_messages(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def close(self) -> None:
+        ...
+
+    @abstractmethod
+    def complete_handoff(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def count_empty_sessions(self) -> None:
+        ...
+
+    @abstractmethod
+    def create_session(self, session_id: str, source: str, **kwargs) -> None:
+        ...
+
+    @abstractmethod
+    def delete_empty_sessions(self, sessions_dir: Optional[Any] = None) -> None:
+        ...
+
+    @abstractmethod
+    def delete_gateway_routing_entries(self, session_keys: List[str], *, scope: str = '') -> None:
+        ...
+
+    @abstractmethod
+    def delete_session(self, session_id: str, sessions_dir: Optional[Any] = None, expected_delete_ids: Optional[List[str]] = None) -> None:
+        ...
+
+    @abstractmethod
+    def delete_session_if_empty(self, session_id: str, sessions_dir: Optional[Any] = None) -> None:
+        ...
+
+    @abstractmethod
+    def delete_sessions(self, session_ids: List[str], sessions_dir: Optional[Any] = None) -> None:
+        ...
+
+    @abstractmethod
+    def delete_telegram_topic_binding(self, *, chat_id: str, thread_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def disable_telegram_topic_mode(self, *, chat_id: str, clear_bindings: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def distinct_session_cwds(self, include_archived: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def enable_telegram_topic_mode(self, *, chat_id: str, user_id: str, has_topics_enabled: Optional[bool] = None, allows_users_to_create_topics: Optional[bool] = None) -> None:
+        ...
+
+    @abstractmethod
+    def end_session(self, session_id: str, end_reason: str) -> None:
+        ...
+
+    @abstractmethod
+    def ensure_session(self, session_id: str, source: str = 'unknown', model: str = None, **kwargs) -> None:
+        ...
+
+    @abstractmethod
+    def export_all(self, source: str = None) -> None:
+        ...
+
+    @abstractmethod
+    def export_session(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def export_session_lineage(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def fail_handoff(self, session_id: str, error: str) -> None:
+        ...
+
+    @abstractmethod
+    def finalize_orphaned_compression_sessions(self) -> None:
+        ...
+
+    @abstractmethod
+    def find_latest_gateway_session_for_peer(self, *, source: str, user_id: Optional[str] = None, session_key: Optional[str] = None, chat_id: Optional[str] = None, chat_type: Optional[str] = None, thread_id: Optional[str] = None) -> None:
+        ...
+
+    @abstractmethod
+    def find_live_compression_child(self, parent_session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def find_session_by_origin(self, *, platform: str, chat_id: str, thread_id: Optional[str] = None, user_id: Optional[str] = None) -> None:
+        ...
+
+    @abstractmethod
+    def fts_cjk_rebuild_status(self) -> None:
+        ...
+
+    @abstractmethod
+    def fts_cjk_rebuild_step(self) -> None:
+        ...
+
+    @abstractmethod
+    def fts_optimize_available(self) -> None:
+        ...
+
+    @abstractmethod
+    def fts_rebuild_status(self) -> None:
+        ...
+
+    @abstractmethod
+    def fts_rebuild_step(self) -> None:
+        ...
+
+    @abstractmethod
+    def get_ancestor_display_prefix(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_anchored_view(self, session_id: str, around_message_id: int, window: int = 5, bookend: int = 3, keep_roles: Optional[Tuple[str, ...]] = ('user', 'assistant')) -> None:
+        ...
+
+    @abstractmethod
+    def get_compression_failure_cooldown(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_compression_fallback_streak(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_compression_ineffective_count(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_compression_lineage(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_compression_lock_holder(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_compression_tip(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_conversation_root(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_first_assistant_text(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_handoff_state(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_messages(self, session_id: str, include_inactive: bool = False, limit: Optional[int] = None, offset: int = 0) -> None:
+        ...
+
+    @abstractmethod
+    def get_messages_around(self, session_id: str, around_message_id: int, window: int = 5) -> None:
+        ...
+
+    @abstractmethod
+    def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False, include_inactive: bool = False, repair_alternation: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def get_meta(self, key: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_next_title_in_lineage(self, base_title: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_resume_conversations(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_session(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_session_by_title(self, title: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_session_delete_targets(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_session_title(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_telegram_topic_binding(self, *, chat_id: str, thread_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def get_telegram_topic_binding_by_session(self, *, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def has_archived_messages(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def has_platform_message_id(self, session_id: str, platform_message_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def import_sessions(self, sessions: List[Dict[str, Any]]) -> None:
+        ...
+
+    @abstractmethod
+    def is_telegram_session_linked_to_topic(self, *, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def list_cron_job_runs(self, job_id: str, limit: int = 20, offset: int = 0) -> None:
+        ...
+
+    @abstractmethod
+    def list_gateway_sessions(self, *, platform: Optional[str] = None, active_only: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def list_pending_handoffs(self) -> None:
+        ...
+
+    @abstractmethod
+    def list_prune_candidates(self, older_than_days: Optional[float] = None, source: str = None, **filters) -> None:
+        ...
+
+    @abstractmethod
+    def list_recent_user_messages(self, session_id: str, limit: int = 20, include_inactive: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def list_sessions_rich(self, source: str = None, exclude_sources: List[str] = None, cwd_prefix: str = None, limit: int = 20, offset: int = 0, include_children: bool = False, min_message_count: int = 0, project_compression_tips: bool = True, order_by_last_active: bool = False, include_archived: bool = False, archived_only: bool = False, id_query: str = None, search_query: str = None, compact_rows: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def list_skill_scaffolded_sessions(self, limit: int = 200) -> None:
+        ...
+
+    @abstractmethod
+    def list_telegram_topic_bindings_for_chat(self, *, chat_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def list_unlinked_telegram_sessions_for_user(self, *, chat_id: str, user_id: str, limit: int = 10) -> None:
+        ...
+
+    @abstractmethod
+    def load_gateway_routing_entries(self, *, scope: str = '') -> None:
+        ...
+
+    @abstractmethod
+    def logical_size_bytes(self) -> None:
+        ...
+
+    @abstractmethod
+    def maybe_auto_archive(self, idle_days: float = 3, min_interval_hours: int = 24, exclude_pinned: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def maybe_auto_prune_and_vacuum(self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True, sessions_dir: Optional[Any] = None) -> None:
+        ...
+
+    @abstractmethod
+    def message_count(self, session_id: str = None) -> None:
+        ...
+
+    @abstractmethod
+    def optimize_fts(self) -> None:
+        ...
+
+    @abstractmethod
+    def optimize_fts_storage(self, *, progress_cb: Optional[Any] = None, vacuum: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def promote_to_session_reset(self, session_id: str, reason: str = 'session_reset') -> None:
+        ...
+
+    @abstractmethod
+    def prune_empty_ghost_sessions(self, sessions_dir: Any = None) -> None:
+        ...
+
+    @abstractmethod
+    def prune_sessions(self, older_than_days: Optional[float] = 90, source: str = None, sessions_dir: Optional[Any] = None, **filters) -> None:
+        ...
+
+    @abstractmethod
+    def publish_compression_child(self, *, parent_session_id: str, child_session_id: str, source: str, messages: List[Dict[str, Any]], model: str = None, model_config: Dict[str, Any] = None, system_prompt: str = None, cwd: str = None, profile_name: str = None, compression_lock_holder: str = None, require_compression_lease: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def rebuild_fts(self) -> None:
+        ...
+
+    @abstractmethod
+    def record_auxiliary_usage(self, session_id: str, task: str, *, model: Optional[str] = None, billing_provider: Optional[str] = None, billing_base_url: Optional[str] = None, input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: Optional[float] = None) -> None:
+        ...
+
+    @abstractmethod
+    def record_compression_failure_cooldown(self, session_id: str, cooldown_until: float, error: Optional[str] = None) -> None:
+        ...
+
+    @abstractmethod
+    def record_gateway_session_peer(self, session_id: str, *, source: str, user_id: str = None, session_key: str = None, chat_id: str = None, chat_type: str = None, thread_id: str = None, display_name: str = None, origin_json: str = None) -> None:
+        ...
+
+    @abstractmethod
+    def refresh_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> None:
+        ...
+
+    @abstractmethod
+    def release_compression_lock(self, session_id: str, holder: str) -> None:
+        ...
+
+    @abstractmethod
+    def reopen_session(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def replace_gateway_routing_entries(self, entries: Dict[str, str], *, scope: str = '') -> None:
+        ...
+
+    @abstractmethod
+    def replace_messages(self, session_id: str, messages: List[Dict[str, Any]], active_only: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def request_handoff(self, session_id: str, platform: str) -> None:
+        ...
+
+    @abstractmethod
+    def resolve_resume_session_id(self, session_id: str) -> None:
+        ...
+
+    @abstractmethod
+    def resolve_session_by_title(self, title: str) -> None:
+        ...
+
+    @abstractmethod
+    def resolve_session_id(self, session_id_or_prefix: str) -> None:
+        ...
+
+    @abstractmethod
+    def restore_rewound(self, session_id: str, since_message_id: int) -> None:
+        ...
+
+    @abstractmethod
+    def rewind_to_message(self, session_id: str, target_message_id: int) -> None:
+        ...
+
+    @staticmethod
+    @abstractmethod
+    def sanitize_title(title: Optional[str]) -> None:
+        ...
+
+    @abstractmethod
+    def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = '') -> None:
+        ...
+
+    @abstractmethod
+    def search_messages(self, query: str, source_filter: List[str] = None, exclude_sources: List[str] = None, role_filter: List[str] = None, limit: int = 20, offset: int = 0, sort: str = None, include_inactive: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def search_sessions(self, source: str = None, limit: int = 20, offset: int = 0) -> None:
+        ...
+
+    @abstractmethod
+    def search_sessions_by_id(self, query: str, limit: int = 20, include_archived: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def session_count(self, source: str = None, cwd_prefix: str = None, min_message_count: int = 0, include_archived: bool = False, archived_only: bool = False, exclude_children: bool = False, exclude_sources: List[str] = None) -> None:
+        ...
+
+    @abstractmethod
+    def set_auto_title_if_empty(self, session_id: str, title: str) -> None:
+        ...
+
+    @abstractmethod
+    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None:
+        ...
+
+    @abstractmethod
+    def set_compression_ineffective_count(self, session_id: str, count: int) -> None:
+        ...
+
+    @abstractmethod
+    def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
+        ...
+
+    @abstractmethod
+    def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str, display_kind: str, display_metadata: Optional[Dict[str, Any]] = None) -> None:
+        ...
+
+    @abstractmethod
+    def set_latest_user_api_content(self, session_id: str, content: Any, api_content: str) -> None:
+        ...
+
+    @abstractmethod
+    def set_meta(self, key: str, value: str, *, cursor: Optional[Any] = None) -> None:
+        ...
+
+    @abstractmethod
+    def set_session_archived(self, session_id: str, archived: bool) -> None:
+        ...
+
+    @abstractmethod
+    def set_session_pinned(self, session_id: str, pinned: bool) -> None:
+        ...
+
+    @abstractmethod
+    def set_session_title(self, session_id: str, title: str) -> None:
+        ...
+
+    @abstractmethod
+    def try_acquire_compression_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> None:
+        ...
+
+    @abstractmethod
+    def update_session_billing_route(self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None) -> None:
+        ...
+
+    @abstractmethod
+    def update_session_cwd(self, session_id: str, cwd: str, git_branch: str = None, git_repo_root: str = None) -> None:
+        ...
+
+    @abstractmethod
+    def update_session_meta(self, session_id: str, model_config_json: str, model: Optional[str] = None) -> None:
+        ...
+
+    @abstractmethod
+    def update_session_model(self, session_id: str, model: str) -> None:
+        ...
+
+    @abstractmethod
+    def update_session_runtime_lock(self, session_id: str, *, model: Optional[str] = None, provider: Optional[str] = None, model_options: Optional[Dict[str, Any]] = None, route_source: Optional[str] = None, confirmed: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+        ...
+
+    @abstractmethod
+    def update_token_counts(self, session_id: str, input_tokens: int = 0, output_tokens: int = 0, model: str = None, cache_read_tokens: int = 0, cache_write_tokens: int = 0, reasoning_tokens: int = 0, estimated_cost_usd: Optional[float] = None, actual_cost_usd: Optional[float] = None, cost_status: Optional[str] = None, cost_source: Optional[str] = None, pricing_version: Optional[str] = None, billing_provider: Optional[str] = None, billing_base_url: Optional[str] = None, billing_mode: Optional[str] = None, api_call_count: int = 0, absolute: bool = False) -> None:
+        ...
+
+    @abstractmethod
+    def vacuum(self) -> None:
+        ...
+
+class SqliteSessionDB(SessionStoreBackend):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -10833,10 +11362,15 @@ class SessionDB:
         self._execute_write(_do)
 
 
-class AsyncSessionDB:
-    """Async door onto SessionDB: offloads each call via asyncio.to_thread so a blocking SQLite call never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
 
-    def __init__(self, db: "SessionDB") -> None:
+# Backward-compatibility alias: existing code may import SessionDB.
+# New code should use the concrete class (SqliteSessionDB) directly
+# or depend on the ABC (SessionStoreBackend).
+SessionDB = SqliteSessionDB
+class AsyncSessionDB:
+    """Async door onto a SessionStoreBackend: offloads each call via asyncio.to_thread so a blocking backend (e.g. SQLite) never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
+
+    def __init__(self, db: "SessionStoreBackend") -> None:
         self._db = db
 
     def __getattr__(self, name: str):
