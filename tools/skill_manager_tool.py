@@ -373,11 +373,20 @@ def _background_review_write_guard(
                 ),
             }
         if skill_usage.is_bundled(name):
+            # Bundled built-ins are governed by `curator.prune_builtins`, not
+            # by the `created_by` ownership marker — `adopt_skill()` refuses
+            # them for exactly that reason ("governed by curator.prune_builtins,
+            # not by adoption"). So decide here and return either way, rather
+            # than falling through to the curator-managed check below, which
+            # keys on `created_by` and would reject every bundled skill (they
+            # ship with no usage record) even when pruning is enabled.
+            if skill_usage._prune_builtins_enabled():
+                return None
             return {
                 "success": False,
                 "error": (
                     f"Refusing background curator {action} for bundled "
-                    f"skill '{name}'."
+                    f"skill '{name}' (curator.prune_builtins is disabled)."
                 ),
             }
         # Skills that are not curator-managed are off-limits to autonomous
