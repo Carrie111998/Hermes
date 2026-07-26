@@ -657,9 +657,10 @@ def _notify_workflow_complete(task_id: str, state=None):
             "run_id": state.get("run_id", ""),
         }
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
+        run_id = state.get("run_id", "unknown")
         wf_marker_dir = _COMPLETIONS_DIR / workflow_name
         wf_marker_dir.mkdir(parents=True, exist_ok=True)
-        marker_path = wf_marker_dir / f"{ts}.json"
+        marker_path = wf_marker_dir / f"{ts}_{run_id}.json"
         # Atomic write: temp file → rename (prevents TOCTOU reads of partial JSON)
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json")
         try:
