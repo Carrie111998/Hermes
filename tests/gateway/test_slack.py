@@ -304,10 +304,14 @@ class TestBotEventDiagnostics:
 class TestSlashCommandSessionIsolation:
     @pytest.mark.asyncio
     async def test_channel_slash_command_uses_group_session_semantics(self, adapter):
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"name": "project-x"}}
+        )
         command = {
             "text": "hello",
             "user_id": "U123",
             "channel_id": "C123",
+            "channel_name": "privategroup",
             "team_id": "T123",
         }
 
@@ -317,15 +321,27 @@ class TestSlashCommandSessionIsolation:
         event = adapter.handle_message.await_args.args[0]
         assert event.source.chat_type == "group"
         assert event.source.chat_id == "C123"
+        assert event.source.chat_name == "project-x"
+        assert event.source.description == "group: project-x"
         assert event.source.user_id == "U123"
         assert event.source.scope_id == "T123"
 
     @pytest.mark.asyncio
     async def test_dm_slash_command_keeps_dm_session_semantics(self, adapter):
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {"is_im": True, "user": "U_PEER"},
+            }
+        )
+        adapter._app.client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Peer Person"}}}
+        )
         command = {
             "text": "hello",
             "user_id": "U123",
             "channel_id": "D123",
+            "channel_name": "directmessage",
             "team_id": "T123",
         }
 
@@ -335,6 +351,7 @@ class TestSlashCommandSessionIsolation:
         event = adapter.handle_message.await_args.args[0]
         assert event.source.chat_type == "dm"
         assert event.source.chat_id == "D123"
+        assert event.source.chat_name == "Peer Person"
         assert event.source.user_id == "U123"
         assert event.source.scope_id == "T123"
 
@@ -5771,6 +5788,38 @@ class TestAssistantThreadLifecycle:
         await assistant_adapter._handle_slack_message(event)
 
         assistant_adapter._app.client.assistant_threads_setTitle.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestChannelNameResolution
+# ---------------------------------------------------------------------------
+
+
+class TestChannelNameResolution:
+    @pytest.mark.asyncio
+    async def test_resolves_real_async_slack_response(self, adapter):
+        try:
+            from slack_sdk.web.async_slack_response import AsyncSlackResponse
+        except ImportError:
+            pytest.skip("slack-sdk is not installed")
+
+        team_client = AsyncMock()
+        response = AsyncSlackResponse(
+            client=team_client,
+            http_verb="GET",
+            api_url="https://slack.com/api/conversations.info",
+            req_args={"params": {"channel": "C123"}},
+            data={"ok": True, "channel": {"name": "project-x"}},
+            headers={},
+            status_code=200,
+        )
+        team_client.conversations_info = AsyncMock(return_value=response)
+        adapter._team_clients["T123"] = team_client
+
+        name = await adapter._resolve_channel_name("C123", team_id="T123")
+
+        assert name == "project-x"
+        team_client.conversations_info.assert_awaited_once_with(channel="C123")
 
 
 # ---------------------------------------------------------------------------

@@ -3854,6 +3854,8 @@ class SlackAdapter(BasePlatformAdapter):
             resp = await self._get_client(
                 channel_id, team_id=team_id or None
             ).conversations_info(channel=channel_id)
+            if not isinstance(resp, dict):
+                resp = getattr(resp, "data", None)
             if not isinstance(resp, dict) or not resp.get("ok"):
                 name = channel_id
             else:
@@ -7718,8 +7720,12 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id,
             )
             return
+        channel_name = await self._resolve_channel_name(
+            channel_id, team_id=team_id
+        )
         source = self.build_source(
             chat_id=channel_id,
+            chat_name=channel_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             thread_id=thread_id,
