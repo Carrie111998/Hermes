@@ -432,7 +432,8 @@ class TurnController {
     }
 
     const duplicateToolBoundaryText =
-      Boolean(split.text && this.pendingSegmentTools.length) && repeatsLastAssistantSegment(split.text, this.segmentMessages)
+      Boolean(split.text && this.pendingSegmentTools.length) &&
+      repeatsLastAssistantSegment(split.text, this.segmentMessages)
 
     const msg: Msg = duplicateToolBoundaryText
       ? {
