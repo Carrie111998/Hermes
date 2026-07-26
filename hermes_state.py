@@ -2151,7 +2151,8 @@ class SessionDB:
                         break
                     else:
                         return None
-                    tokens.append(("value", "".join(value).lower()))
+                    kind = "string" if char == "'" else "value"
+                    tokens.append((kind, "".join(value).lower()))
                     continue
                 if char.isalpha() or char == "_":
                     start = index
@@ -2191,38 +2192,97 @@ class SessionDB:
                 if (
                     tokens[position][0] == "value"
                     and tokens[position + 1][0] == "="
-                    and tokens[position + 2][0] == "value"
+                    and tokens[position + 2][0] in ("value", "string")
                 ):
                     key = tokens[position][1]
                     if key in options:
                         return "ambiguous"
                     options[key] = tokens[position + 2][1]
-            source = options.get("content")
-            rowid = options.get("content_rowid")
             if columns == ["content", "tool_name", "tool_calls"]:
-                expected_source = (
-                    "messages_fts_trigram_src"
-                    if name == "messages_fts_trigram"
-                    else "messages"
-                )
-                if source == expected_source and rowid == "id":
-                    return "current"
-                return "ambiguous"
+                expected_options = {
+                    "content": (
+                        "messages_fts_trigram_src"
+                        if name == "messages_fts_trigram"
+                        else "messages"
+                    ),
+                    "content_rowid": "id",
+                }
+                if name == "messages_fts_trigram":
+                    expected_options["tokenize"] = "trigram"
+                return "current" if options == expected_options else "ambiguous"
             if columns != ["content"]:
                 return "ambiguous"
 
-            if source is None and rowid is None:
+            if name == "messages_fts_trigram":
+                if options == {"tokenize": "trigram"}:
+                    return "inline"
+                if options == {
+                    "content": "messages",
+                    "content_rowid": "id",
+                    "tokenize": "trigram",
+                }:
+                    return "external"
+                return "ambiguous"
+            if not options:
                 return "inline"
-            if source == "messages" and rowid in (None, "id"):
+            if options == {"content": "messages", "content_rowid": "id"}:
                 return "external"
             return "ambiguous"
 
+        def _current_trigram_view_is_valid() -> Optional[bool]:
+            row = cursor.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='view' AND name='messages_fts_trigram_src'"
+            ).fetchone()
+            if row is None:
+                return None
+            sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+            tokens = _tokens(sql)
+            if not tokens:
+                return False
+            if tokens[-1:] == [("symbol", ";")]:
+                tokens = tokens[:-1]
+            prefix = [
+                ("value", "create"),
+                ("value", "view"),
+                ("value", "messages_fts_trigram_src"),
+                ("value", "as"),
+                ("value", "select"),
+                ("value", "id"),
+                (",", ","),
+                ("value", "role"),
+                (",", ","),
+                ("value", "content"),
+                (",", ","),
+                ("value", "tool_name"),
+                (",", ","),
+                ("value", "tool_calls"),
+                ("value", "from"),
+                ("value", "messages"),
+                ("value", "where"),
+                ("value", "role"),
+            ]
+            suffixes = (
+                [("symbol", "<"), ("symbol", ">"), ("string", "tool")],
+                [("symbol", "!"), ("=", "="), ("string", "tool")],
+            )
+            return any(tokens == prefix + suffix for suffix in suffixes)
+
         standard = _table_layout("messages_fts")
         trigram = _table_layout("messages_fts_trigram")
+        view_valid = _current_trigram_view_is_valid()
         if standard in ("missing", "current"):
-            if trigram in ("missing", "current"):
-                return None
-            return "ambiguous"
+            if trigram not in ("missing", "current"):
+                return "ambiguous"
+            # A present current trigram table requires its exact filtered
+            # source view. If the table is absent, no view is safe (the
+            # canonical DDL creates it), while an existing malformed view is
+            # unsafe because CREATE VIEW IF NOT EXISTS would preserve it.
+            if trigram == "current" and view_valid is not True:
+                return "ambiguous"
+            if trigram == "missing" and view_valid is False:
+                return "ambiguous"
+            return None
         if standard in ("inline", "external"):
             if trigram in ("missing", standard):
                 return standard

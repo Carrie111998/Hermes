@@ -719,6 +719,105 @@ def test_mixed_legacy_layout_is_ambiguous_and_not_rewritten():
         assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
 
 
+@pytest.mark.parametrize(
+    "trigram_options",
+    [
+        "content='messages_fts_trigram_src', content_rowid='id'",
+        "content='messages_fts_trigram_src', content_rowid='id', "
+        "tokenize='unicode61'",
+        "content='messages_fts_trigram_src', content_rowid='id', "
+        "tokenize='trigram', prefix='2'",
+    ],
+)
+def test_current_layout_requires_exact_trigram_options(trigram_options):
+    """Current shape without exact trigram semantics must fail closed."""
+    from hermes_state import SessionDB
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE messages("
+            "id INTEGER PRIMARY KEY, role TEXT, content TEXT, "
+            "tool_name TEXT, tool_calls TEXT)"
+        )
+        conn.execute(
+            "CREATE VIEW messages_fts_trigram_src AS "
+            "SELECT id, role, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages', content_rowid='id')"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            f"content, tool_name, tool_calls, {trigram_options})"
+        )
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+
+def test_current_layout_rejects_unfiltered_trigram_source_view():
+    """A current-shaped table cannot make an unfiltered view trustworthy."""
+    from hermes_state import SessionDB
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE messages("
+            "id INTEGER PRIMARY KEY, role TEXT, content TEXT, "
+            "tool_name TEXT, tool_calls TEXT)"
+        )
+        conn.execute(
+            "CREATE VIEW messages_fts_trigram_src AS "
+            "SELECT id, role, content, tool_name, tool_calls FROM messages"
+        )
+        conn.execute(
+            "INSERT INTO messages VALUES "
+            "(1, 'tool', 'hidden needle', '', '')"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages', content_rowid='id')"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages_fts_trigram_src', content_rowid='id', "
+            "tokenize='trigram')"
+        )
+        conn.execute(
+            "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+            "VALUES('rebuild')"
+        )
+        assert conn.execute(
+            "SELECT rowid FROM messages_fts_trigram "
+            "WHERE messages_fts_trigram MATCH 'hidden'"
+        ).fetchall() == [(1,)]
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+
+def test_missing_trigram_table_rejects_malformed_existing_source_view():
+    """IF NOT EXISTS must not build a new index over an unsafe old view."""
+    from hermes_state import SessionDB
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE messages("
+            "id INTEGER PRIMARY KEY, role TEXT, content TEXT, "
+            "tool_name TEXT, tool_calls TEXT)"
+        )
+        conn.execute(
+            "CREATE VIEW messages_fts_trigram_src AS "
+            "SELECT id, role, content, tool_name, tool_calls FROM messages"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages', content_rowid='id')"
+        )
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+
 def test_capable_cjk_open_marks_missing_trigger_gap_stale(monkeypatch):
     """A missing CJK trigger means an unknown index gap, never safe service."""
     import hermes_state
