@@ -144,7 +144,18 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
-        return None
+        # Backwards-compatible local/CLI invocation. Dispatcher workers always
+        # receive a token; resolving the live task run here preserves the
+        # ownership check without breaking direct tool callers.
+        try:
+            from hermes_cli import kanban_db as _kb
+            with _kb.connect() as conn:
+                task = _kb.get_task(conn, task_id)
+                # Legacy direct goal-loop callers predate dispatcher run tokens;
+                # all normal worker lifecycle mutations remain token-bound.
+                return (task.current_run_id if task and task.goal_mode and task.current_run_id is not None else None)
+        except Exception:
+            return None
     try:
         return int(raw)
     except ValueError:

@@ -1074,6 +1074,11 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    canonical_worktree: Optional[str] = None
+    dispatch_key: Optional[str] = None
+    run_role: str = "owner"
+    owner_task_id: Optional[str] = None
+    checkpoint_id: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1098,6 +1103,11 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            canonical_worktree=(row["canonical_worktree"] if "canonical_worktree" in row.keys() else None),
+            dispatch_key=(row["dispatch_key"] if "dispatch_key" in row.keys() else None),
+            run_role=(row["run_role"] if "run_role" in row.keys() and row["run_role"] else "owner"),
+            owner_task_id=(row["owner_task_id"] if "owner_task_id" in row.keys() else None),
+            checkpoint_id=(int(row["checkpoint_id"]) if "checkpoint_id" in row.keys() and row["checkpoint_id"] is not None else None),
         )
 
 
@@ -1281,8 +1291,24 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    canonical_worktree  TEXT,
+    dispatch_key        TEXT,
+    run_role            TEXT NOT NULL DEFAULT 'owner',
+    owner_task_id       TEXT,
+    checkpoint_id       INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS recovery_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER,
+    canonical_worktree TEXT NOT NULL, head_sha TEXT, porcelain_digest TEXT NOT NULL,
+    untracked_digest TEXT NOT NULL, remaining_defects TEXT NOT NULL,
+    remaining_defects_digest TEXT NOT NULL, causal_classification TEXT,
+    semantic_digest TEXT NOT NULL, owner_pid INTEGER, owner_run_id INTEGER,
+    owner_identity TEXT, reason TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoints_no_update BEFORE UPDATE ON recovery_checkpoints BEGIN SELECT RAISE(ABORT, 'recovery checkpoints are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoints_no_delete BEFORE DELETE ON recovery_checkpoints BEGIN SELECT RAISE(ABORT, 'recovery checkpoints are immutable'); END;
 
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
@@ -2448,6 +2474,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    runs_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_exist:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        for column, ddl in (
+            ("canonical_worktree", "canonical_worktree TEXT"),
+            ("dispatch_key", "dispatch_key TEXT"),
+            ("run_role", "run_role TEXT NOT NULL DEFAULT 'owner'"),
+            ("owner_task_id", "owner_task_id TEXT"),
+            ("checkpoint_id", "checkpoint_id INTEGER"),
+        ):
+            if column not in run_cols:
+                _add_column_if_missing(conn, "task_runs", column, ddl)
+        final_run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "ended_at" in final_run_cols:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_live_owner_worktree ON task_runs(canonical_worktree) WHERE ended_at IS NULL AND run_role='owner' AND canonical_worktree IS NOT NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_dispatch_key ON task_runs(dispatch_key, ended_at, outcome)")
+    conn.execute("CREATE TABLE IF NOT EXISTS recovery_checkpoints (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER, canonical_worktree TEXT NOT NULL, head_sha TEXT, porcelain_digest TEXT NOT NULL, untracked_digest TEXT NOT NULL, remaining_defects TEXT NOT NULL, remaining_defects_digest TEXT NOT NULL, causal_classification TEXT, semantic_digest TEXT NOT NULL, owner_pid INTEGER, owner_run_id INTEGER, owner_identity TEXT, reason TEXT NOT NULL, created_at INTEGER NOT NULL)")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS recovery_checkpoints_no_update BEFORE UPDATE ON recovery_checkpoints BEGIN SELECT RAISE(ABORT, 'recovery checkpoints are immutable'); END")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS recovery_checkpoints_no_delete BEFORE DELETE ON recovery_checkpoints BEGIN SELECT RAISE(ABORT, 'recovery checkpoints are immutable'); END")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_recovery_task ON recovery_checkpoints(task_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_recovery_semantic ON recovery_checkpoints(task_id, semantic_digest)")
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2572,10 +2622,13 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, canonical_worktree TEXT, dispatch_key TEXT,"
+        " run_role TEXT NOT NULL DEFAULT 'owner', owner_task_id TEXT, checkpoint_id INTEGER)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
+            "CREATE UNIQUE INDEX idx_runs_one_live_owner_worktree ON task_runs(canonical_worktree) WHERE ended_at IS NULL AND run_role='owner' AND canonical_worktree IS NOT NULL",
+            "CREATE INDEX idx_runs_dispatch_key ON task_runs(dispatch_key, ended_at, outcome)",
         ),
     ),
     "kanban_notify_subs": (
@@ -4031,6 +4084,72 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _canonical_worktree(task: Task, *, board: Optional[str] = None) -> str:
+    path = Path(task.workspace_path) if task.workspace_path else workspaces_root(board=board) / task.id
+    path = path.expanduser().resolve(strict=False)
+    try:
+        result = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            path = Path(os.fsdecode(result.stdout.strip())).resolve(strict=False)
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        pass
+    return os.path.normcase(str(path))
+
+
+def dispatch_idempotency_key(outcome_key: str, canonical_worktree: str) -> str:
+    return hashlib.sha256(f"kanban-dispatch-v1\0{outcome_key}\0{canonical_worktree}".encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _uses_recovery_gates(task: Task) -> bool:
+    return task.workspace_kind == "worktree" or (task.workspace_kind == "dir" and bool(task.workspace_path))
+
+
+def _snapshot_worktree(path: str) -> tuple[Optional[str], str, str]:
+    def git(*args: str) -> bytes:
+        try:
+            p = subprocess.run(["git", "-C", path, *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=10)
+            return p.stdout if p.returncode == 0 else b""
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return b""
+    head = git("rev-parse", "--verify", "HEAD").strip() or None
+    return (os.fsdecode(head) if head else None, hashlib.sha256(git("status", "--porcelain=v1", "-z", "--untracked-files=no")).hexdigest(), hashlib.sha256(git("ls-files", "--others", "--exclude-standard", "-z")).hexdigest())
+
+
+def _defects(conn: sqlite3.Connection, task_id: str, fallback: str) -> list[str]:
+    row = conn.execute("SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    try:
+        values = json.loads(row["metadata"] or "{}") .get("remaining_acceptance_defects", []) if row else []
+    except (TypeError, ValueError): values = []
+    return [str(v).strip() for v in values if str(v).strip()] or [fallback]
+
+
+def _checkpoint(conn: sqlite3.Connection, task: Task, reason: str, defects: Optional[Iterable[str]] = None) -> int:
+    canonical = _canonical_worktree(task)
+    head, porcelain, untracked = _snapshot_worktree(canonical)
+    values = list(dict.fromkeys(str(v).strip() for v in (defects or _defects(conn, task.id, reason)) if str(v).strip()))
+    encoded = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    defects_digest = hashlib.sha256(encoded.encode()).hexdigest()
+    semantic = hashlib.sha256(json.dumps({"head": head, "porcelain": porcelain, "untracked": untracked, "defects": defects_digest, "cause": task.recovery_cause}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    existing = conn.execute("SELECT id FROM recovery_checkpoints WHERE task_id=? AND semantic_digest=? ORDER BY id DESC LIMIT 1", (task.id, semantic)).fetchone()
+    if existing is not None:
+        return int(existing["id"])
+    cur = conn.execute("INSERT INTO recovery_checkpoints (task_id,run_id,canonical_worktree,head_sha,porcelain_digest,untracked_digest,remaining_defects,remaining_defects_digest,causal_classification,semantic_digest,owner_pid,owner_run_id,owner_identity,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (task.id,task.current_run_id,canonical,head,porcelain,untracked,encoded,defects_digest,task.recovery_cause,semantic,task.worker_pid,task.current_run_id,task.claim_lock,reason,int(time.time())))
+    return int(cur.lastrowid)
+
+
+def classify_recovery_cause(conn: sqlite3.Connection, task_id: str, classification: str) -> bool:
+    value = str(classification).strip()
+    if not value: raise ValueError("causal classification is required")
+    with write_txn(conn):
+        cur = conn.execute("UPDATE tasks SET recovery_cause=? WHERE id=? AND status NOT IN ('done','archived')", (value, task_id))
+        if cur.rowcount: _append_event(conn, task_id, "recovery_cause_classified", {"classification": value})
+        return bool(cur.rowcount)
+
+
+# ---------------------------------------------------------------------------
+# Claim / complete / block
+# ---------------------------------------------------------------------------
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4046,7 +4165,40 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    canonical_worktree = _canonical_worktree(task)
     with write_txn(conn):
+        if _uses_recovery_gates(task):
+            outcome_key = task.idempotency_key or task.id
+            dispatch_key = dispatch_idempotency_key(outcome_key, canonical_worktree)
+            live = conn.execute("SELECT id, task_id FROM task_runs WHERE canonical_worktree=? AND ended_at IS NULL AND run_role='owner' LIMIT 1", (canonical_worktree,)).fetchone()
+            if live is None:
+                for legacy in conn.execute("SELECT id, task_id FROM task_runs WHERE canonical_worktree IS NULL AND ended_at IS NULL AND run_role='owner'").fetchall():
+                    other = get_task(conn, legacy["task_id"])
+                    if other and _uses_recovery_gates(other) and _canonical_worktree(other) == canonical_worktree:
+                        live = legacy; break
+            if live is not None:
+                _append_event(conn, task_id, "dispatch_deduplicated", {"reason":"live_owner_exists","owner_task_id":live["task_id"],"owner_run_id":live["id"]})
+                return None
+            terminal = conn.execute("SELECT id FROM task_runs WHERE dispatch_key=? AND outcome='completed' LIMIT 1", (dispatch_key,)).fetchone()
+            if terminal is not None:
+                _append_event(conn, task_id, "dispatch_deduplicated", {"reason":"terminal_outcome_exists","terminal_run_id":terminal["id"]})
+                return None
+            previous = conn.execute("SELECT checkpoint_id FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+            checkpoint_id = None
+            if previous:
+                checkpoint_id = _checkpoint(conn, get_task(conn, task_id) or task, "redispatch")
+                digest = conn.execute("SELECT semantic_digest FROM recovery_checkpoints WHERE id=?", (checkpoint_id,)).fetchone()["semantic_digest"]
+                retries = conn.execute("SELECT COUNT(*) FROM task_runs r JOIN recovery_checkpoints c ON c.id=r.checkpoint_id WHERE r.dispatch_key=? AND c.semantic_digest=?", (dispatch_key, digest)).fetchone()[0]
+                if retries >= 1:
+                    already_blocked = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='recovery_gate_blocked' AND payload LIKE '%causal_classification_required%' LIMIT 1", (task_id,)).fetchone()
+                    if already_blocked is None:
+                        _append_event(conn, task_id, "recovery_gate_blocked", {"reason":"causal_classification_required","checkpoint_id":checkpoint_id})
+                    return None
+        else:
+            dispatch_key, checkpoint_id = dispatch_idempotency_key(task.idempotency_key or task.id, canonical_worktree), None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4117,20 +4269,16 @@ def claim_task(
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
-                task_id, profile, step_key, status,
-                claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                task_id, profile, step_key, status, claim_lock, claim_expires,
+                max_runtime_seconds, started_at, canonical_worktree, dispatch_key,
+                run_role, owner_task_id, checkpoint_id
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, 'owner', ?, ?)
             """,
-            (
-                task_id,
-                trow["assignee"] if trow else None,
-                trow["current_step_key"] if trow else None,
-                lock,
-                expires,
-                trow["max_runtime_seconds"] if trow else None,
-                now,
-            ),
+            (task_id, trow["assignee"] if trow else None,
+             trow["current_step_key"] if trow else None, lock, expires,
+             trow["max_runtime_seconds"] if trow else None, now,
+             canonical_worktree if _uses_recovery_gates(task) else None,
+             dispatch_key, task_id, checkpoint_id),
         )
         run_id = run_cur.lastrowid
         conn.execute(
@@ -4197,22 +4345,8 @@ def claim_review_task(
             (task_id,),
         ).fetchone()
         run_cur = conn.execute(
-            """
-            INSERT INTO task_runs (
-                task_id, profile, step_key, status,
-                claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                trow["assignee"] if trow else None,
-                trow["current_step_key"] if trow else None,
-                lock,
-                expires,
-                trow["max_runtime_seconds"] if trow else None,
-                now,
-            ),
+            """INSERT INTO task_runs (task_id, profile, step_key, status, claim_lock, claim_expires, max_runtime_seconds, started_at, run_role, owner_task_id) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, 'reviewer', ?)""",
+            (task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None, lock, expires, trow["max_runtime_seconds"] if trow else None, now, task_id),
         )
         run_id = run_cur.lastrowid
         conn.execute(
@@ -4438,7 +4572,12 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    if not termination.get("descendants_stopped", True) or _worker_survived_termination(termination):
+        return False
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is not None and _uses_recovery_gates(task):
+            _checkpoint(conn, task, "manual_reclaim")
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
@@ -7128,6 +7267,7 @@ def heartbeat_worker(
     task_id: str,
     *,
     note: Optional[str] = None,
+    remaining_defects: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
@@ -7166,9 +7306,18 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
+            if remaining_defects is not None:
+                row = conn.execute("SELECT metadata FROM task_runs WHERE id=?", (run_id,)).fetchone()
+                try:
+                    metadata = json.loads(row["metadata"] or "{}") if row else {}
+                except (TypeError, ValueError):
+                    metadata = {}
+                if not isinstance(metadata, dict): metadata = {}
+                metadata["remaining_acceptance_defects"] = list(dict.fromkeys(str(v).strip() for v in remaining_defects if str(v).strip()))
+                conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps(metadata, ensure_ascii=False), run_id))
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            ({"note": note, "remaining_defects_count": len(remaining_defects or [])} if remaining_defects is not None else ({"note": note} if note else None)),
             run_id=run_id,
         )
     return True
@@ -7632,6 +7781,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            task = get_task(conn, row["id"])
+            if task is not None and _uses_recovery_gates(task):
+                _checkpoint(conn, task, "rate_limited" if rate_limited_exit else "crashed")
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
