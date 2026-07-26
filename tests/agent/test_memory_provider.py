@@ -1,6 +1,8 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
 import json
+import threading
+import time
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -90,6 +92,21 @@ class MessagesMemoryProvider(FakeMemoryProvider):
 
     def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
+
+
+class BlockingPrefetchProvider(FakeMemoryProvider):
+    """External provider whose prefetch call blocks until released."""
+
+    def __init__(self, name="external"):
+        super().__init__(name=name)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def prefetch(self, query, *, session_id=""):
+        self.prefetch_queries.append(query)
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        return self._prefetch_result
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +415,48 @@ class TestMemoryManager:
 
         result = mgr.prefetch_all("query")
         assert "external memory" in result
+
+    def test_external_prefetch_timeout_skips_stuck_provider(self):
+        mgr = MemoryManager(external_prefetch_timeout=0.01)
+        builtin = FakeMemoryProvider("builtin")
+        builtin._prefetch_result = "builtin memory"
+        external = BlockingPrefetchProvider("hy-memory")
+        external._prefetch_result = "late external memory"
+        mgr.add_provider(builtin)
+        mgr.add_provider(external)
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query")
+        elapsed = time.monotonic() - started
+
+        assert result == "builtin memory"
+        assert elapsed < 0.5
+        assert external.started.wait(timeout=1.0)
+        assert external.prefetch_queries == ["query"]
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query 2")
+        elapsed = time.monotonic() - started
+
+        assert result == "builtin memory"
+        assert elapsed < 0.2
+        assert external.prefetch_queries == ["query"]
+
+        external.release.set()
+
+        deadline = time.monotonic() + 1.0
+        while (
+            external.name in mgr._external_prefetch_threads
+            and mgr._external_prefetch_threads[external.name].is_alive()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        result = mgr.prefetch_all("query 3")
+
+        assert result == "builtin memory\n\nlate external memory"
+        assert external.prefetch_queries == ["query", "query 3"]
+        assert external.name not in mgr._external_prefetch_threads
 
     def test_system_prompt_failure_doesnt_block(self):
         mgr = MemoryManager()
@@ -1309,18 +1368,26 @@ class TestHonchoCadenceTracking:
 
 class TestMemoryToolToolsetGate:
     """Issue #5544: memory provider tools must respect platform_toolsets,
-    and Issue #45422: external memory providers work regardless of whether
-    the built-in memory toolset is explicitly enabled.
+    and Issue #45422: external memory providers work when the built-in memory
+    toolset is present or implicitly enabled via resolve_toolset.
+
+    Before the fix, MemoryManager.get_all_tool_schemas() output was appended
+    to AIAgent.tools unconditionally in agent_init.py — bypassing the
+    enabled_toolsets filter. Result: `platform_toolsets: telegram: []`
+    still leaked fact_store and other memory tools into the tool surface,
+    causing 10x latency on local models (Qwen3-30B: 1.7s → 42s) and
+    tool-call loops on small models.
 
     These tests exercise the shared gate used by agent init and ACP refreshes.
-    The gate condition is (#45422):
+    The gate condition is:
 
-        enabled_toolsets is None          → no filter, inject (backward compat)
-        enabled_toolsets is non-empty     → inject (external provider works
-                                             regardless of whether the built-in
-                                             memory toolset is enabled)
-        enabled_toolsets is empty ([])    → skip (constrained platform, no tools)
-        "memory" in disabled_toolsets     → skip (global nuclear option)
+        disabled_toolsets includes "memory" → skip injection
+        memory tool is present in tool surface → inject
+        enabled_toolsets is None            → no filter, inject (backward compat)
+        enabled_toolsets includes "memory"  → user opted in, inject
+        selected toolsets include "memory"
+          (via resolve_toolset)             → user opted in, inject
+        otherwise (incl. [])                → skip injection
     """
 
     @staticmethod
@@ -1366,6 +1433,18 @@ class TestMemoryToolToolsetGate:
         assert "hindsight_recall" in names
         assert any(t["function"]["name"] == "hindsight_recall" for t in tools)
 
+    @pytest.mark.parametrize("enabled_toolsets", [None, ["memory"], ["all"], ["hermes-acp"]])
+    def test_disabled_memory_toolset_blocks_injection(self, enabled_toolsets):
+        """An explicit memory disable wins over default or composite enablement."""
+        mgr = self._mgr_with_tools("hindsight_recall")
+        tools, names = self._run_memory_injection(
+            enabled_toolsets,
+            mgr,
+            disabled_toolsets=["memory"],
+        )
+        assert tools == []
+        assert names == set()
+
     def test_empty_toolsets_blocks_injection(self):
         """`platform_toolsets: telegram: []` must suppress memory tools. (#5544)"""
         mgr = self._mgr_with_tools("fact_store")
@@ -1373,16 +1452,12 @@ class TestMemoryToolToolsetGate:
         assert tools == []
         assert names == set()
 
-    def test_toolsets_without_memory_still_injects(self):
-        """Toolset list that doesn't name 'memory' still injects external providers (#45422).
-
-        Disabling the built-in memory toolset should not suppress external memory
-        providers configured via memory.provider in config.yaml.
-        """
+    def test_toolsets_without_memory_blocks_injection(self):
+        """Toolsets that don't include memory must suppress injection."""
         mgr = self._mgr_with_tools("fact_store")
         tools, names = self._run_memory_injection(["terminal", "web"], mgr)
-        assert "fact_store" in names
-        assert any(t["function"]["name"] == "fact_store" for t in tools)
+        assert tools == []
+        assert names == set()
 
     def test_no_memory_manager_no_injection(self):
         """Gate is moot without a memory manager."""
@@ -1390,34 +1465,11 @@ class TestMemoryToolToolsetGate:
         assert tools == []
 
     def test_multiple_schemas_all_blocked_together(self):
-        """When the gate is closed (empty toolsets), no memory tools leak — not even partially."""
-        mgr = self._mgr_with_tools("fact_store", "memory_search", "memory_add")
-        tools, names = self._run_memory_injection([], mgr)
-        assert tools == []
-        assert names == set()
-
-    def test_multiple_schemas_all_injected_with_nonempty_toolsets(self):
-        """Non-empty toolsets (without 'memory') still injects external provider tools (#45422)."""
+        """When the gate is closed, no memory tools leak — not even partially."""
         mgr = self._mgr_with_tools("fact_store", "memory_search", "memory_add")
         tools, names = self._run_memory_injection(["terminal"], mgr)
-        assert names == {"fact_store", "memory_search", "memory_add"}
-
-    def test_disabled_toolsets_blocks_injection(self):
-        """agent.disabled_toolsets containing 'memory' suppresses all external provider tools."""
-        mgr = self._mgr_with_tools("fact_store")
-        tools, names = self._run_memory_injection(
-            ["terminal", "web"], mgr, disabled_toolsets=["memory"]
-        )
         assert tools == []
         assert names == set()
-
-    def test_disabled_toolsets_none_does_not_block(self):
-        """agent.disabled_toolsets without 'memory' does not suppress external providers."""
-        mgr = self._mgr_with_tools("fact_store")
-        tools, names = self._run_memory_injection(
-            ["terminal", "web"], mgr, disabled_toolsets=["browser"]
-        )
-        assert "fact_store" in names
 
     def test_multiple_schemas_all_injected_when_enabled(self):
         """When the gate is open, every memory tool schema is injected."""
