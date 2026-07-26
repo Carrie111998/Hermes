@@ -7000,13 +7000,17 @@ def test_gateway_session_recovery_reopens_legacy_agent_close_rows(db):
     )
     db._conn.commit()
 
-    assert db.find_latest_gateway_session_for_peer(
+    # session_reset is also recoverable — unclean gateway shutdown marks
+    # active sessions as session_reset and the transcript should survive.
+    recovered_after_reset = db.find_latest_gateway_session_for_peer(
         source="telegram",
         user_id="user-1",
         session_key="agent:main:telegram:dm:chat-1",
         chat_id="chat-1",
         chat_type="dm",
-    ) is None
+    )
+    assert recovered_after_reset is not None
+    assert recovered_after_reset["id"] == "closed-gw-session"
 
 
 def test_gateway_metadata_display_name_origin_round_trip(db):

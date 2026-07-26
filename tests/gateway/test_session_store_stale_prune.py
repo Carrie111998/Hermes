@@ -137,7 +137,13 @@ class TestPruneStaleSessionsLocked:
         db.find_latest_gateway_session_for_peer.assert_called_once()
         db.reopen_session.assert_called_once_with("sid_child")
 
-    def test_prunes_stale_entry_when_recovery_only_finds_same_ended_session(self, tmp_path):
+    def test_keeps_recovered_entry_when_recovery_reopens_same_session(self, tmp_path):
+        """When recovery reopens the same ended session, keep it in routing.
+
+        A session ended by ``agent_close`` (old gateway cleanup bug) or
+        ``session_reset`` (unclean shutdown) should be reopened and kept in
+        the routing index — the transcript is intact and the user can resume.
+        """
         key = "agent:main:telegram:dm:5140768830"
         db = _db_returning({"sid_parent": {"end_reason": "agent_close", "id": "sid_parent"}})
         db.find_latest_gateway_session_for_peer.return_value = {
@@ -149,7 +155,8 @@ class TestPruneStaleSessionsLocked:
 
         store._prune_stale_sessions_locked()
 
-        assert key not in store._entries
+        assert key in store._entries
+        db.reopen_session.assert_called_once_with("sid_parent")
 
     def test_keeps_stale_entry_when_recovery_lookup_raises(self, tmp_path):
         """Indeterminate recovery must not delete the only routing handle.

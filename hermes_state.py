@@ -4124,9 +4124,10 @@ class SessionDB:
         pruned after process-level restart bugs.  New gateway sessions persist
         the deterministic ``session_key`` on the durable session row so the
         mapping can be rebuilt exactly.  Rows ended only by older gateway
-        cleanup's ``agent_close`` bug or a mistaken TUI ``ws_orphan_reap``
-        (dashboard viewer disconnect before #60609) are treated as recoverable;
-        explicit conversation boundaries such as /new, /resume switches, and
+        cleanup's ``agent_close`` bug, a mistaken TUI ``ws_orphan_reap``
+        (dashboard viewer disconnect before #60609), or a ``session_reset``
+        from an unclean gateway shutdown are treated as recoverable; explicit
+        conversation boundaries such as /new, /resume switches, and
         compression splits are not.
         """
         if not session_key:
@@ -4137,7 +4138,7 @@ class SessionDB:
                 SELECT * FROM sessions
                 WHERE session_key = ?
                   AND source = ?
-                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap', 'session_reset'))
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
@@ -4162,7 +4163,7 @@ class SessionDB:
                   AND COALESCE(chat_id, '') = COALESCE(?, '')
                   AND COALESCE(chat_type, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
-                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap', 'session_reset'))
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
@@ -4348,11 +4349,12 @@ class SessionDB:
         Promotes *only* live rows (``ended_at IS NULL``) or rows carrying an
         accidental end_reason that the recovery query
         (``find_latest_gateway_session_for_peer``) treats as recoverable:
-        ``agent_close`` (older gateway cleanup bug) and ``ws_orphan_reap``
-        (mistaken TUI reaper).  Explicit conversation boundaries such as
-        ``compression``, ``session_reset``, ``session_switch``, etc. are
-        preserved — the first writer wins for those, and a later expiry
-        finalization must not silently overwrite them.
+        ``agent_close`` (older gateway cleanup bug), ``ws_orphan_reap``
+        (mistaken TUI reaper), and ``session_reset`` (unclean shutdown).
+        Explicit conversation boundaries such as ``compression``,
+        ``session_switch``, etc. are preserved — the first writer wins for
+        those, and a later expiry finalization must not silently overwrite
+        them.
 
         Plain ``end_session()`` is NOT sufficient for reset boundaries: it
         no-ops on an already-ended row, so a row that agent cleanup already

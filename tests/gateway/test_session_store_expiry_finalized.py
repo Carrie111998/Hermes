@@ -140,7 +140,8 @@ class TestPromotionBlocksRecovery:
         assert recovered is not None
         assert recovered["id"] == "sid-pre"
 
-    def test_promoted_session_not_recoverable(self, db: SessionDB) -> None:
+    def test_promoted_session_now_recoverable(self, db: SessionDB) -> None:
+        """session_reset is in the recovery set — unclean shutdown recovery."""
         db.create_session(
             "sid-post", _SOURCE,
             user_id=_USER_ID, session_key=_SESSION_KEY,
@@ -153,10 +154,10 @@ class TestPromotionBlocksRecovery:
             source=_SOURCE, session_key=_SESSION_KEY,
             user_id=_USER_ID, chat_id="8494508720", chat_type="dm",
         )
-        # session_reset rows are not in the recovery set
-        assert recovered is None
+        assert recovered is not None
+        assert recovered["id"] == "sid-post"
 
-    def test_agent_close_session_recoverable_but_not_after_promotion(
+    def test_agent_close_session_recoverable_and_stays_after_promotion(
         self, db: SessionDB
     ) -> None:
         db.create_session(
@@ -175,10 +176,11 @@ class TestPromotionBlocksRecovery:
         assert recovered is not None
         assert recovered["id"] == "sid-ac-rec"
 
-        # After promotion, it is no longer recoverable
+        # After promotion to session_reset, still recoverable (unclean shutdown recovery)
         db.promote_to_session_reset("sid-ac-rec")
         recovered2 = db.find_latest_gateway_session_for_peer(
             source=_SOURCE, session_key=_SESSION_KEY,
             user_id=_USER_ID, chat_id="8494508720", chat_type="dm",
         )
-        assert recovered2 is None
+        assert recovered2 is not None
+        assert recovered2["id"] == "sid-ac-rec"
