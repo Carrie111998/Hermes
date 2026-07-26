@@ -3367,6 +3367,7 @@ class BasePlatformAdapter(ABC):
         return await self.send(
             chat_id=chat_id,
             content=text,
+            reply_to=(metadata or {}).get("reply_to_message_id") if (metadata or {}).get("reply_in_thread") else None,
             metadata=metadata,
         )
 

@@ -2189,6 +2189,48 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIsNone(metadata)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_starts_thread_for_explicit_reply_metadata(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _ReplyAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_ReplyAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat",
+                    question="Which setting?",
+                    choices=["Fast", "Deep"],
+                    clarify_id="clarify-1",
+                    session_key="session-1",
+                    metadata={
+                        "reply_in_thread": True,
+                        "reply_to_message_id": "om_trigger",
+                    },
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].message_id, "om_trigger")
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_starts_thread_for_explicit_reply_metadata(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
