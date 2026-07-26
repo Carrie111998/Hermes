@@ -289,6 +289,21 @@ launch_train() {
   actual_hash="$(shasum -a 256 "$asar" | awk '{print $1}')"
   [[ "$actual_hash" == "$expected_hash" ]] || die "package hash changed after build; refusing launch"
 
+  # Bind agent backend to the composed train worktree (not ~/.hermes/hermes-agent).
+  # UI package alone is insufficient: agent fixes (e.g. verify-hold merge) live in
+  # Python under TRAIN_WORKTREE. HERMES_DESKTOP_HERMES_ROOT is the Desktop override.
+  # Reuse the managed venv for third-party deps via a non-committed symlink.
+  local managed_venv="$HOME_DIR/.hermes/hermes-agent/venv"
+  local train_venv="$TRAIN_WORKTREE/venv"
+  if [[ -x "$managed_venv/bin/python" || -x "$managed_venv/Scripts/python.exe" ]]; then
+    if [[ -L "$train_venv" ]]; then
+      ln -sfn "$managed_venv" "$train_venv"
+    elif [[ ! -e "$train_venv" ]]; then
+      ln -sfn "$managed_venv" "$train_venv"
+    fi
+  fi
+  [[ -d "$TRAIN_WORKTREE/hermes_cli" ]] || die "train worktree missing hermes_cli; refusing launch"
+
   # Never terminate an arbitrary Desktop. Only replace a previously recorded
   # train root process when it still points at this exact train executable.
   if [[ -f "$LAUNCH_PID" ]]; then
@@ -301,7 +316,9 @@ launch_train() {
     fi
   fi
 
-  nohup "$bin" >>"$LOG" 2>&1 &
+  nohup env \
+    HERMES_DESKTOP_HERMES_ROOT="$TRAIN_WORKTREE" \
+    "$bin" >>"$LOG" 2>&1 &
   local pid=$!
   umask 077
   printf '%s\n' "$pid" >"$LAUNCH_PID"
@@ -309,9 +326,10 @@ launch_train() {
   sleep 2
   kill -0 "$pid" 2>/dev/null || die "package exited; inspect $LOG"
   say "✓ release train launched"
-  say "  app:  $app"
-  say "  head: $expected_head"
-  say "  log:  $LOG"
+  say "  app:     $app"
+  say "  head:    $expected_head"
+  say "  agent:   HERMES_DESKTOP_HERMES_ROOT=$TRAIN_WORKTREE"
+  say "  log:     $LOG"
 }
 
 status_train() {
