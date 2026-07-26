@@ -10,16 +10,19 @@ metadata:
     tags: [MOA, OpenRouter, free-models, synthesis, agent]
 ---
 
-# MOA-Free: Quota-Aware Mixture of Agents (Free Tier)
+# MOA-Free: Mixture of Agents (local-first, truly free)
 
-Fan a prompt across several FREE OpenRouter chat models in parallel, then
-synthesize their outputs into one final answer with a free aggregator.
+Fan a prompt across several models in parallel, then synthesize their outputs
+into one final answer with an aggregator model.
 
-WHY QUOTA-AWARE (critical): OpenRouter enforces a DAILY free-model request cap.
-A naive "call all 12 free models" burns the entire day's quota on ONE task and
-429s instantly. This skill runs a SMALL strength-ordered proposer set (default 3)
-to conserve the daily budget, probes quota first, and QUEUES the prompt if
-capped instead of failing.
+DEFAULT BACKEND = OLLAMA (http://localhost:11434/v1) — TRULY free and UNCAPPED,
+no API key, no daily rate limit. This is the recommended path: pull a couple of
+models (e.g. `ollama pull qwen2.5:3b qwen2.5:0.5b`) and MOA runs forever at $0.
+
+OPTIONAL `--backend openrouter` uses OpenRouter's $0/token `:free` models, but
+those are rate-limited per day. For that backend only, the script probes the
+cap, runs a small strength-ordered set, and QUEUES the prompt if capped (reads
+X-RateLimit-Reset from the HTTP headers and reports the exact UTC reset).
 
 ## When to use
 - User says "moa <prompt>", "run moa on this", "mix models on this".
@@ -31,14 +34,16 @@ capped instead of failing.
 
 ## Usage
 ```
-python moa_all.py --list
-python moa_all.py "your prompt here"
-python moa_all.py --proposers 4 "prompt"
+python moa_all.py --list                        # show local proposers
+python moa_all.py "your prompt here"            # local Ollama (default, uncapped)
+python moa_all.py --backend openrouter "prompt" # OR free models (rate-limited)
+python moa_all.py --proposers 3 "prompt"
 python moa_all.py --queue-only "prompt"
 python moa_all.py --run-queue
 ```
 Run from this skill directory (or pass an absolute path). The script reads
-OPENROUTER_API_KEY from the Hermes `.env` automatically.
+OPENROUTER_API_KEY from the Hermes `.env` ONLY when using `--backend openrouter`.
+Ollama needs no key. Edit LOCAL_PROPOSERS to match the models you have pulled.
 
 ## Behavior
 1. probe_quota() fires one tiny call. On 200 quota available. On 429 parse

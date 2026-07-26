@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """
-model_advisor.py - Task-aware model router over FREE OpenRouter chat models.
+model_advisor.py - Task-aware model router over FREE models, local-first.
 
-Classifies your prompt by task type and routes the real work to the BEST free
-OpenRouter model for that job (not one fixed default). This is the
-"advisor"/model-switching-by-need pattern, shipped as a portable script.
+Defaults to Ollama (http://localhost:11434/v1) — TRULY free and UNCAPPED, no
+API key. Optionally route via OpenRouter free models with `--backend openrouter`
+(those are $0/token but rate-limited per day).
+
+Classifies your prompt by task type and routes the real work to the BEST model
+for that job (not one fixed default). This is the "advisor"/model-switching-by-
+need pattern, shipped as a portable script.
 
 Classifier:
-  * Default: local keyword heuristic (FREE, instant, burns 0 quota).
-  * --llm-classify: use a cheap free model to tag the task (burns 1 quota).
+  * Default: local keyword heuristic (FREE, instant, 0 quota).
+  * --llm-classify: use a small local/free model to tag the task (1 call).
 
-Routing table (strength-ordered, free only):
-  code     -> north-mini-code, nemotron-super, gpt-oss-20b
-  creative -> nemotron-ultra, gemma-4-31b, ling-3.0-flash
-  research -> ling-3.0-flash, nemotron-ultra, gemma-4-31b
+Routing table (local models you have pulled):
+  code     -> qwen2.5:3b
+  creative -> qwen2.5:3b
+  research -> qwen2.5:3b
+  long     -> qwen2.5:3b
+  chat     -> qwen2.5:0.5b
+
+OpenRouter fallback table (when --backend openrouter):
+  code     -> north-mini-code > nemotron-super > gpt-oss-20b
+  creative -> nemotron-ultra > gemma-4-31b > ling-3.0-flash
+  research -> ling-3.0-flash > nemotron-ultra > gemma-4-31b
   long     -> nemotron-ultra (1M ctx)
-  chat     -> gemma-4-31b, gpt-oss-20b, nemotron-nano-30b
-
-Quota-aware: probes OpenRouter free cap first; queues + reports UTC reset if
-capped. Portable: reads key from Hermes .env (cross-platform), stdlib only.
+  chat     -> gemma-4-31b > gpt-oss-20b > nemotron-nano-30b
 
 Usage:
-  python model_advisor.py "prompt"
-  python model_advisor.py --llm-classify "prompt"
+  python model_advisor.py "prompt"                       # local Ollama
+  python model_advisor.py --backend openrouter "prompt"
   python model_advisor.py --show-routes
   python model_advisor.py --queue-only "prompt"
   python model_advisor.py --run-queue
@@ -31,12 +39,23 @@ import os, sys, json, time, argparse
 import urllib.request as urllib_request
 import urllib.error as urllib_error
 
-API     = "https://openrouter.ai/api/v1/chat/completions"
 HERE    = os.path.dirname(os.path.abspath(__file__))
 QUEUE_FILE = os.path.join(HERE, "advisor_queue.json")
-CLASSIFIER = "openai/gpt-oss-20b:free"
 
-ROUTES  = {
+OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
+LOCAL_MODELS = ["qwen2.5:3b", "qwen2.5:0.5b", "llama3.2-vision"]
+
+OR_URL = "https://openrouter.ai/api/v1/chat/completions"
+OR_CLASSIFIER = "openai/gpt-oss-20b:free"
+
+ROUTES_LOCAL = {
+    "code":     ["qwen2.5:3b"],
+    "creative": ["qwen2.5:3b"],
+    "research": ["qwen2.5:3b"],
+    "long":     ["qwen2.5:3b"],
+    "chat":     ["qwen2.5:0.5b"],
+}
+ROUTES_OR = {
     "code":     ["cohere/north-mini-code:free",
                  "nvidia/nemotron-3-super-120b-a12b:free",
                  "openai/gpt-oss-20b:free"],
@@ -66,6 +85,12 @@ KW = {
              "summarize this book", "full text", "paste the", "long article"],
 }
 
+# active target globals
+API = OLLAMA_URL
+KEY = "ollama"
+ROUTES = ROUTES_LOCAL
+CLASSIFIER = LOCAL_MODELS[1]  # qwen2.5:0.5b for llm-classify locally
+
 def hermes_home():
     if os.environ.get("HERMES_HOME"):
         return os.environ["HERMES_HOME"]
@@ -73,7 +98,7 @@ def hermes_home():
         return os.path.expandvars(r"%APPDATA%\hermes")
     return os.path.expanduser("~/.hermes")
 
-def load_key():
+def load_or_key():
     p = os.path.join(hermes_home(), ".env")
     try:
         for line in open(p):
@@ -84,14 +109,31 @@ def load_key():
         pass
     return os.environ.get("OPENROUTER_API_KEY")
 
+def load_target(backend):
+    global API, KEY, ROUTES, CLASSIFIER
+    if backend == "openrouter":
+        API = OR_URL
+        KEY = load_or_key()
+        ROUTES = ROUTES_OR
+        CLASSIFIER = OR_CLASSIFIER
+        if not KEY:
+            print("OPENROUTER_API_KEY not found (needed for --backend openrouter).",
+                  file=sys.stderr); sys.exit(1)
+    else:
+        API = OLLAMA_URL
+        KEY = "ollama"
+        ROUTES = ROUTES_LOCAL
+        CLASSIFIER = LOCAL_MODELS[1]
+
 def _post(key, model, messages, max_tokens, timeout):
     body = {"model": model, "messages": messages,
             "max_tokens": max_tokens, "temperature": 0.5}
-    req = urllib_request.Request(API, data=json.dumps(body).encode(),
-          headers={"Authorization": f"Bearer {key}",
-                   "Content-Type": "application/json",
-                   "HTTP-Referer": "https://hermes-agent.local",
-                   "X-Title": "Model-Advisor"})
+    headers = {"Content-Type": "application/json"}
+    if key and key != "ollama":
+        headers["Authorization"] = f"Bearer {key}"
+        headers["HTTP-Referer"] = "https://hermes-agent.local"
+        headers["X-Title"] = "Model-Advisor"
+    req = urllib_request.Request(API, data=json.dumps(body).encode(), headers=headers)
     try:
         with urllib_request.urlopen(req, timeout=timeout) as r:
             return r.read().decode(), None
@@ -102,7 +144,7 @@ def _post(key, model, messages, max_tokens, timeout):
         return None, (0, str(e)[:160])
 
 def probe_quota(key):
-    raw, err = _post(key, CLASSIFIER,
+    raw, err = _post(key, OR_CLASSIFIER,
                      [{"role": "user", "content": "ping"}], 3, 30)
     if raw:
         return True, 0
@@ -137,12 +179,10 @@ def classify_local(prompt):
 
 def classify_llm(key, prompt):
     sys_p = ("Classify the user request into exactly ONE of these tags and reply "
-             "with ONLY the tag word: code, creative, research, long, chat. "
-             "code=programming; creative=writing stories/poems/characters; "
-             "research=analysis/summaries; long=needs huge context; chat=other.")
+             "with ONLY the tag word: code, creative, research, long, chat.")
     raw, err = _post(key, CLASSIFIER,
                      [{"role": "system", "content": sys_p},
-                      {"role": "user", "content": prompt}], 5, 30)
+                      {"role": "user", "content": prompt}], 5, 60)
     if raw:
         tag = json.loads(raw)["choices"][0]["message"]["content"].strip().lower()
         tag = tag.strip("`. ")
@@ -153,7 +193,7 @@ def classify_llm(key, prompt):
 def run_route(key, tag, prompt, tokens):
     for model in ROUTES[tag]:
         raw, err = _post(key, model, [{"role": "user", "content": prompt}],
-                         tokens, 90)
+                         tokens, 120)
         if raw:
             try:
                 return model, json.loads(raw)["choices"][0]["message"]["content"].strip()
@@ -172,42 +212,42 @@ def queue_load():
     return json.load(open(QUEUE_FILE)) if os.path.exists(QUEUE_FILE) else []
 
 def dispatch(key, prompt, args):
-    avail, reset = probe_quota(key)
-    if not avail:
-        rt = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(reset/1000)) if reset else "unknown"
-        print(f"[ADVISOR] OpenRouter free quota CAPPED. Resets: {rt}")
-        print("[ADVISOR] Queued. Re-run with --run-queue after reset (or add $10 credit).")
-        queue_save(prompt)
-        return
+    if args.backend == "openrouter":
+        avail, reset = probe_quota(key)
+        if not avail:
+            rt = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(reset/1000)) if reset else "unknown"
+            print(f"[ADVISOR] OpenRouter free quota CAPPED. Resets: {rt}")
+            print("[ADVISOR] Queued. Re-run with --run-queue after reset (or add $10 credit).")
+            queue_save(prompt)
+            return
     tag, why = (classify_llm(key, prompt) if args.llm_classify
                 else classify_local(prompt))
-    print(f"[ADVISOR] task='{tag}' ({why})")
+    print(f"[ADVISOR] backend={args.backend} task='{tag}' ({why})")
     model, out = run_route(key, tag, prompt, args.tokens)
     if model:
         print(f"[ADVISOR] routed to: {model}\n")
         print(out)
     else:
-        print("[ADVISOR] all models in route capped. Try later or add credit.")
+        print("[ADVISOR] all models in route failed. Check Ollama is running.")
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt", nargs="?", default=None)
+    ap.add_argument("--backend", choices=["ollama", "openrouter"], default="ollama")
     ap.add_argument("--llm-classify", action="store_true")
-    ap.add_argument("--tokens", type=int, default=500)
+    ap.add_argument("--tokens", type=int, default=600)
     ap.add_argument("--show-routes", action="store_true")
     ap.add_argument("--queue-only", action="store_true")
     ap.add_argument("--run-queue", action="store_true")
     args = ap.parse_args()
 
     if args.show_routes:
-        for k, v in ROUTES.items():
+        src = ROUTES_OR if args.backend == "openrouter" else ROUTES_LOCAL
+        for k, v in src.items():
             print(f"{k:9} -> " + " > ".join(v))
         return
 
-    key = load_key()
-    if not key:
-        print("OPENROUTER_API_KEY not found in Hermes .env or env.", file=sys.stderr)
-        sys.exit(1)
+    load_target(args.backend)
 
     if args.run_queue:
         q = queue_load()
@@ -216,7 +256,7 @@ def main():
         print(f"Running {len(q)} queued prompt(s)...")
         for item in q:
             print(f"\n##### QUEUED: {item['prompt'][:60]}...")
-            dispatch(key, item["prompt"], args)
+            dispatch(KEY, item["prompt"], args)
         os.remove(QUEUE_FILE)
         return
 
@@ -227,7 +267,7 @@ def main():
         queue_save(prompt)
         print(f"Queued. File: {QUEUE_FILE}")
         return
-    dispatch(key, prompt, args)
+    dispatch(KEY, prompt, args)
 
 if __name__ == "__main__":
     main()

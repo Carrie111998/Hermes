@@ -10,11 +10,15 @@ metadata:
     tags: [routing, advisor, model-selection, free-models]
 ---
 
-# Model-Advisor: Task-Aware Free-Model Router
+# Model-Advisor: Task-Aware Model Router (local-first, truly free)
 
-Classifies your prompt by task type and routes the real work to the BEST free
-OpenRouter model for that job (not one fixed default). This is the
-model-switching-by-need pattern, shipped as a portable skill.
+Classifies your prompt by task type and routes the real work to the BEST model
+for that job (not one fixed default). This is the model-switching-by-need
+pattern, shipped as a portable skill.
+
+DEFAULT BACKEND = OLLAMA (http://localhost:11434/v1) — TRULY free and UNCAPPED,
+no API key. OPTIONAL `--backend openrouter` uses OpenRouter's $0/token `:free`
+models (rate-limited per day; the script queues + reports reset on 429).
 
 ## When to use
 - User says "advisor", "route this", "pick the best model for this", or wants
@@ -27,8 +31,9 @@ model-switching-by-need pattern, shipped as a portable skill.
 ## Usage
 ```
 python model_advisor.py --show-routes
-python model_advisor.py "write a python yaml parser"      # local classify
-python model_advisor.py --llm-classify "prompt"           # LLM classify (1 quota)
+python model_advisor.py "write a python yaml parser"          # local Ollama (default)
+python model_advisor.py --backend openrouter "prompt"        # OR free models
+python model_advisor.py --llm-classify "prompt"              # LLM classify (local or OR)
 python model_advisor.py --queue-only "prompt"
 python model_advisor.py --run-queue
 ```
