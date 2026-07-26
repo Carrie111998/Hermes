@@ -289,6 +289,7 @@ class TestRunBackgroundTask:
         image as a native image, and everything else as a document.
         """
         from gateway import run as gateway_run
+        from gateway.platforms.base import BasePlatformAdapter
 
         runner = _make_runner()
         runner._resolve_session_agent_runtime = MagicMock(
@@ -327,6 +328,11 @@ class TestRunBackgroundTask:
             (_png, False),
             (_pdf, False),
         ]
+        _ogg_safe = BasePlatformAdapter.validate_media_delivery_path(_ogg)
+        _mp4_safe = BasePlatformAdapter.validate_media_delivery_path(_mp4)
+        _png_safe = BasePlatformAdapter.validate_media_delivery_path(_png)
+        _pdf_safe = BasePlatformAdapter.validate_media_delivery_path(_pdf)
+        assert _ogg_safe and _mp4_safe and _png_safe and _pdf_safe
 
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
@@ -352,13 +358,13 @@ class TestRunBackgroundTask:
             await runner._run_background_task("make stuff", source, "bg_test")
 
             mock_adapter.send_voice.assert_called_once()
-            assert mock_adapter.send_voice.call_args.kwargs["audio_path"] == _ogg
+            assert mock_adapter.send_voice.call_args.kwargs["audio_path"] == _ogg_safe
             mock_adapter.send_video.assert_called_once()
-            assert mock_adapter.send_video.call_args.kwargs["video_path"] == _mp4
+            assert mock_adapter.send_video.call_args.kwargs["video_path"] == _mp4_safe
             mock_adapter.send_image_file.assert_called_once()
-            assert mock_adapter.send_image_file.call_args.kwargs["image_path"] == _png
+            assert mock_adapter.send_image_file.call_args.kwargs["image_path"] == _png_safe
             mock_adapter.send_document.assert_called_once()
-            assert mock_adapter.send_document.call_args.kwargs["file_path"] == _pdf
+            assert mock_adapter.send_document.call_args.kwargs["file_path"] == _pdf_safe
         finally:
             import shutil as _shutil
             _shutil.rmtree(_tmpdir, ignore_errors=True)

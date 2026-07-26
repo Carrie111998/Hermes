@@ -977,7 +977,14 @@ class GatewaySlashCommandsMixin:
         return await self._resume_target_allowed(source, sid, allow_override=False)
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
-        """Handle /agents command - list active agents and running tasks."""
+        """Handle /agents (aka /tasks) — plain-English overview of what
+        the bot is currently working on across every active chat/thread.
+
+        Deliberately omits internal session keys, session IDs, model
+        names, and raw process commands from the default readout — those
+        are debug detail the user asking "what are you doing?" doesn't
+        want. Verbose IDs are reserved for /debug-style commands.
+        """
         from gateway.run import _AGENT_PENDING_SENTINEL
         from tools.process_registry import format_uptime_short, process_registry
 
@@ -986,19 +993,23 @@ class GatewaySlashCommandsMixin:
 
         running_agents: dict = getattr(self, "_running_agents", {}) or {}
         running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
+        running_task: dict = getattr(self, "_running_agents_task", {}) or {}
+
+        humanize = getattr(self, "_humanize_session_key", None)
 
         agent_rows: list[dict] = []
         for session_key, agent in running_agents.items():
             started = float(running_started.get(session_key, now))
             elapsed = max(0, int(now - started))
             is_pending = agent is _AGENT_PENDING_SENTINEL
+            thread_label = humanize(session_key) if callable(humanize) else "an active chat"
             agent_rows.append(
                 {
                     "session_key": session_key,
                     "elapsed": elapsed,
                     "state": t("gateway.agents.state_starting") if is_pending else t("gateway.agents.state_running"),
-                    "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
-                    "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
+                    "thread": thread_label,
+                    "task": running_task.get(session_key, ""),
                 }
             )
 
@@ -1027,11 +1038,11 @@ class GatewaySlashCommandsMixin:
         if agent_rows:
             for idx, row in enumerate(agent_rows[:12], 1):
                 current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
-                sid = f" · `{row['session_id']}`" if row["session_id"] else ""
-                model = f" · `{row['model']}`" if row["model"] else ""
+                task = (row["task"] or "").strip()
+                task_suffix = f" — {task}" if task else ""
                 lines.append(
-                    f"{idx}. `{row['session_key']}` · {row['state']} · "
-                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"
+                    f"{idx}. {row['thread']}{current} · {row['state']} for "
+                    f"{format_uptime_short(row['elapsed'])}{task_suffix}"
                 )
             if len(agent_rows) > 12:
                 lines.append(t("gateway.agents.more", count=len(agent_rows) - 12))
@@ -1044,12 +1055,21 @@ class GatewaySlashCommandsMixin:
         )
         if running_processes:
             for proc in running_processes[:12]:
-                cmd = " ".join(str(proc.get("command", "")).split())
-                if len(cmd) > 90:
-                    cmd = cmd[:87] + "..."
+                # Prefer a human-readable goal/purpose over the raw shell
+                # command so /agents stays plain-English by default.
+                goal = ""
+                for key in ("goal", "task", "description", "purpose", "label", "name"):
+                    val = proc.get(key)
+                    if val:
+                        goal = " ".join(str(val).split())
+                        break
+                if not goal:
+                    goal = t("gateway.agents.state_running")
+                if len(goal) > 90:
+                    goal = goal[:87] + "..."
                 lines.append(
-                    f"- `{proc.get('session_id', '?')}` · "
-                    f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))} · `{cmd}`"
+                    f"- {goal} · "
+                    f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))}"
                 )
             if len(running_processes) > 12:
                 lines.append(t("gateway.agents.more", count=len(running_processes) - 12))
@@ -1060,6 +1080,29 @@ class GatewaySlashCommandsMixin:
                 t("gateway.agents.async_jobs", count=len(background_tasks)),
             ]
         )
+        if background_tasks:
+            for task in background_tasks[:12]:
+                # asyncio tasks expose get_name(); anonymous tasks default
+                # to Task-N which is still nicer than a repr(). Use it as a
+                # last-resort human label.
+                label = ""
+                try:
+                    for attr in ("goal", "task_description", "description", "task_name"):
+                        val = getattr(task, attr, None)
+                        if val:
+                            label = " ".join(str(val).split())
+                            break
+                    if not label:
+                        get_name = getattr(task, "get_name", None)
+                        if callable(get_name):
+                            label = str(get_name())
+                except Exception:
+                    label = ""
+                if not label:
+                    label = t("gateway.agents.state_running")
+                if len(label) > 90:
+                    label = label[:87] + "..."
+                lines.append(f"- {label}")
 
         if not agent_rows and not running_processes and not background_tasks:
             lines.append("")

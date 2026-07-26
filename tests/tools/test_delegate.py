@@ -410,6 +410,49 @@ class TestDelegateTask(unittest.TestCase):
         mock_run.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool.resolve_routing_decision")
+    def test_delegation_applies_centralized_routing_to_child_model_and_reasoning(
+        self,
+        mock_route,
+        mock_run,
+    ):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "Done!",
+            "api_calls": 1,
+            "duration_seconds": 1.0,
+        }
+        mock_route.return_value = types.SimpleNamespace(
+            model="gpt-5.6-terra",
+            reasoning_config={"enabled": True, "effort": "high"},
+            profile="creative",
+            category="creative.deep_work",
+            reason="test route",
+            override_used=False,
+            escalation_reason=None,
+            no_escalation=False,
+            retry_count=0,
+            workflow_match=None,
+            clean_message="build a YouTube video packet",
+        )
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "low"}
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="build a YouTube video packet", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "gpt-5.6-terra")
+            self.assertEqual(
+                kwargs["reasoning_config"],
+                {"enabled": True, "effort": "high"},
+            )
+
+    @patch("tools.delegate_tool._run_single_child")
     def test_batch_capped_at_3(self, mock_run):
         mock_run.return_value = {
             "task_index": 0, "status": "completed",

@@ -40,6 +40,7 @@ from typing import Any, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
+from agent.model_routing import resolve_routing_decision
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
@@ -3411,6 +3412,39 @@ def run_job(
                 f"job_id={job_id} provider=<provider> model=<model>` "
                 f"(or pin the original values to keep them). See #44585."
             )
+
+        # Shared centralized turn routing (same policy as gateway/CLI).
+        # Job-level model pins are treated as workflow-level overrides that
+        # still yield to explicit inline route directives in the prompt.
+        try:
+            _route_message = str(job.get("prompt") or prompt or "")
+            _workflow_model_override = str(job.get("model") or "").strip() or None
+            decision = resolve_routing_decision(
+                message=_route_message,
+                base_model=str(model),
+                fallback_reasoning_config=reasoning_config,
+                config=_cfg if isinstance(_cfg, dict) else {},
+                surface="cron",
+                workflow_model_override=_workflow_model_override,
+            )
+            model = decision.model or model
+            if isinstance(decision.reasoning_config, dict):
+                reasoning_config = decision.reasoning_config
+            logger.info(
+                "Cron routing: profile=%s category=%s model=%s reasoning=%s "
+                "override=%s escalation=%s workflow=%s reason=%s",
+                decision.profile,
+                decision.category,
+                model,
+                (reasoning_config or {}).get("effort", "none")
+                if reasoning_config is not None else "session",
+                decision.override_used,
+                decision.escalation_reason or "",
+                decision.workflow_match or "",
+                decision.reason,
+            )
+        except Exception:
+            logger.debug("Cron centralized routing failed; using resolved model", exc_info=True)
 
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None

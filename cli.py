@@ -12279,6 +12279,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
+        _clean_message = turn_route.get("clean_message")
+        if (
+            isinstance(message, str)
+            and isinstance(_clean_message, str)
+            and _clean_message
+        ):
+            message = _clean_message
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
 
@@ -16526,6 +16533,13 @@ def main(
                                 announce=False,
                             )
                     turn_route = cli._resolve_turn_agent_config(effective_query)
+                    _clean_query = turn_route.get("clean_message")
+                    if (
+                        isinstance(effective_query, str)
+                        and isinstance(_clean_query, str)
+                        and _clean_query
+                    ):
+                        effective_query = _clean_query
                     if turn_route["signature"] != cli._active_agent_route_signature:
                         cli.agent = None
                     if cli._init_agent(
