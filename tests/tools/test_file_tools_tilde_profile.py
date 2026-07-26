@@ -43,6 +43,13 @@ class TestExpandTilde:
             result = ft._expand_tilde("~")
         assert result == "/opt/data/profiles/coder/home"
 
+    def test_consecutive_slashes_stay_under_profile_home(self):
+        """Extra slashes after ~/ must not turn the rest into an absolute path."""
+        profile_home = "/opt/data/profiles/coder/home"
+        with patch("hermes_constants.get_subprocess_home", return_value=profile_home):
+            result = ft._expand_tilde("~//foo")
+        assert result == os.path.join(profile_home, "foo")
+
     def test_falls_back_when_no_profile_home(self):
         """When get_subprocess_home returns None, use os.path.expanduser."""
         with patch("hermes_constants.get_subprocess_home", return_value=None):
