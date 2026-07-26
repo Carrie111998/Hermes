@@ -8310,6 +8310,287 @@ def test_dispatch_review_spawns_when_ready_empty(
     assert spawns[0] == t
 
 
+def _seed_product_review_worktree(
+    conn, board: str, repo: Path, *, dirty=False, base_ref="main"
+):
+    tid = kb.create_task(
+        conn,
+        title="Review committed change",
+        board=board,
+        assignee="reviewer",
+        workflow_template_id="product",
+        current_step_key="review",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+        max_retries=5,
+    )
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task, board=board)
+    kb.set_workspace_path(conn, tid, str(workspace))
+    kb.set_branch_name(conn, tid, branch)
+    head_sha = _commit_file(
+        workspace,
+        "reviewed.txt",
+        "immutable reviewer input\n",
+        "reviewed change",
+    )
+    if dirty:
+        (workspace / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+    base_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", base_ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return tid, workspace, base_sha, head_sha
+
+
+def test_dispatch_pins_review_target_before_reviewer_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-pinned"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+
+        def capture_spawn(task, launched_workspace, board=None):
+            run = kb.get_run(conn, task.current_run_id)
+            observed.append((launched_workspace, run.metadata))
+            return 4242
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+
+    assert result.spawned[0][0] == tid
+    assert observed == [
+        (
+            str(workspace),
+            {"review_base_sha": base_sha, "review_head_sha": head_sha},
+        )
+    ]
+
+
+def test_pinned_review_target_survives_run_completion(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-audit"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 4242,
+        )
+        assert result.spawned[0][0] == tid
+        running_task = kb.get_task(conn, tid)
+        assert running_task.current_run_id is not None
+        run_id = running_task.current_run_id
+        with kb.write_txn(conn):
+            assert kb._end_run(
+                conn,
+                tid,
+                outcome="completed",
+                metadata={"findings": []},
+                expected_run_id=run_id,
+            ) == run_id
+        run = kb.get_run(conn, run_id)
+
+    assert run.metadata == {
+        "findings": [],
+        "review_base_sha": base_sha,
+        "review_head_sha": head_sha,
+    }
+
+
+def test_dispatch_blocks_dirty_review_target_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-dirty"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    spawned = []
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
+            conn, board, repo, dirty=True
+        )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: spawned.append(args) or 4242,
+            failure_limit=5,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert tid in result.auto_blocked
+    assert task.status == "blocked"
+    assert "review target preparation" in task.last_failure_error
+    assert "dirty" in task.last_failure_error
+
+
+def test_review_target_preparation_rejects_workspace_mismatch(
+    kanban_home, tmp_path,
+):
+    board = "review-target-workspace-mismatch"
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    _init_git_repo(repo)
+    _init_git_repo(other)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        assert kb.claim_task(conn, tid) is not None
+        with pytest.raises(
+            kb.ReviewTargetPreparationError,
+            match="does not match task workspace",
+        ):
+            kb._prepare_review_target(conn, tid, other, board=board)
+
+
+def test_dispatch_review_pins_against_board_checkout_branch(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-develop"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "develop", str(repo)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        check=True,
+    )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "base"],
+        check=True,
+    )
+    _v2_product_board_with_repo(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo, base_ref="develop"
+        )
+
+        def capture_spawn(task, launched_workspace, board=None):
+            observed.append(kb.get_run(conn, task.current_run_id).metadata)
+            return 4242
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+
+    assert result.spawned[0][0] == tid
+    assert observed == [
+        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+    ]
+    assert workspace.name == tid
+
+
+def test_dispatch_custom_review_assignee_does_not_require_reviewer_pin(
+    kanban_home, all_assignees_spawnable,
+):
+    spawned = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="custom non-Claude review",
+            assignee="alice",
+            workflow_template_id="product",
+            current_step_key="review",
+        )
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args, **kwargs: spawned.append(args) or 4242,
+        )
+
+    assert result.spawned[0][0] == tid
+    assert len(spawned) == 1
+
+
+def test_unexpected_review_pin_failure_blocks_without_aborting_dispatch(
+    kanban_home, tmp_path, all_assignees_spawnable, monkeypatch,
+):
+    board = "review-target-unexpected-failure"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        monkeypatch.setattr(
+            kb,
+            "_prepare_review_target",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+            ),
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 4242,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert tid in result.auto_blocked
+    assert result.spawned == []
+    assert task.status == "blocked"
+    assert "review target preparation" in task.last_failure_error
+
+
+def test_review_git_output_decodes_unusual_bytes_lossily(
+    kanban_home, monkeypatch, tmp_path,
+):
+    observed = {}
+
+    class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(*args, **kwargs):
+        observed.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(kb.shutil, "which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr(kb.subprocess, "run", fake_run)
+
+    assert kb._review_git_output(tmp_path, "status") == "ok"
+    assert observed["encoding"] == "utf-8"
+    assert observed["errors"] == "replace"
+
+
 def test_has_spawnable_review_true(kanban_home):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
     with kb.connect() as conn:
@@ -9432,11 +9713,9 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Clean-exit adjudication: a worker that finishes its work but exits without
-# calling kanban_complete / kanban_block should NOT be fast-blocked as a
-# protocol violation when it left completion evidence. Instead Hermes advances
-# the card to the next role (who independently verifies), matching the rule
-# that Hermes inspects state itself rather than trusting the terminal call.
+# Product-card clean exits fail closed: only the structured completion/block
+# protocol may advance or stop a product workflow. Comments that merely look
+# like handoff evidence are not an authority boundary.
 # ---------------------------------------------------------------------------
 
 
@@ -9469,10 +9748,10 @@ def _add_handoff_comment(conn, tid, body="Architecture handoff — ready for dev
     conn.commit()
 
 
-def test_detect_crashed_workers_adjudicates_clean_exit_with_evidence(
+def test_product_worker_clean_exit_ignores_completion_like_prose(
     kanban_home, monkeypatch,
 ):
-    """Clean-exit worker + completion evidence -> advance, not fast-block."""
+    """Completion-looking comments cannot advance a product workflow."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -9488,47 +9767,16 @@ def test_detect_crashed_workers_adjudicates_clean_exit_with_evidence(
         task = kb.get_task(conn, tid)
         kinds = [event.kind for event in kb.list_events(conn, tid)]
 
-    assert task.status == "ready", f"expected advanced (ready), got {task.status}"
-    assert task.current_step_key == "development"
-    assert "workflow_advanced" in kinds
-    assert "adjudicated_advance" in kinds
+    assert task.status == "blocked"
+    assert task.current_step_key == "architecture"
+    assert "workflow_advanced" not in kinds
+    assert "adjudicated_advance" not in kinds
 
 
-def test_detect_crashed_workers_adjudicates_provenance_gated_step(
+def test_product_worker_clean_exit_blocks_without_protocol_completion(
     kanban_home, monkeypatch,
 ):
-    """A provenance-gated step (development) still advances: Hermes reconstructs
-    provenance from the assignee it spawned, rather than blocking finished work."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
-
-    kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
-        tid = _make_running_product_card(
-            conn, _kb, step="development", assignee="developer",
-        )
-        _add_handoff_comment(
-            conn, tid,
-            body="Development handoff — implementation complete, ready for test.",
-        )
-
-        kb.detect_crashed_workers(conn)
-
-        task = kb.get_task(conn, tid)
-
-    assert task.status == "ready", (
-        f"expected advanced, got step={task.current_step_key} status={task.status}"
-    )
-    assert task.current_step_key == "test"
-
-
-def test_detect_crashed_workers_clean_exit_without_evidence_still_blocks(
-    kanban_home, monkeypatch,
-):
-    """No completion evidence -> the fast-block is preserved. A worker that
-    bailed with nothing done must not be advanced."""
+    """A product worker that omits the terminal protocol blocks on first miss."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -9547,49 +9795,10 @@ def test_detect_crashed_workers_clean_exit_without_evidence_still_blocks(
     assert task.current_step_key == "architecture"
 
 
-def test_detect_crashed_workers_does_not_chain_adjudicated_advances(
+def test_product_worker_nonzero_exit_retains_retry_semantics(
     kanban_home, monkeypatch,
 ):
-    """After one adjudicated advance, a second clean-exit at the new step blocks
-    for a human instead of racing the card forward on comments alone."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
-
-    host = _kb._claimer_id().split(":", 1)[0]
-    kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
-        tid = _make_running_product_card(
-            conn, _kb, step="architecture", max_retries=5,
-        )
-        _add_handoff_comment(conn, tid)
-
-        # First clean-exit -> adjudicated advance to development.
-        kb.detect_crashed_workers(conn)
-        assert kb.get_task(conn, tid).current_step_key == "development"
-
-        # Development worker also clean-exits, with a comment, but no genuine
-        # completion happened in between.
-        conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
-            (91002, f"{host}:w2", tid),
-        )
-        _add_handoff_comment(conn, tid, body="Development handoff — ready for test. Approved.")
-        conn.commit()
-
-        kb.detect_crashed_workers(conn)
-        task = kb.get_task(conn, tid)
-
-    assert task.status == "blocked", f"chained advance should block, got {task.status}"
-    assert task.current_step_key == "development"
-
-
-def test_detect_crashed_workers_nonzero_exit_unaffected_by_adjudication(
-    kanban_home, monkeypatch,
-):
-    """A normal (nonzero) crash keeps isolated-retry semantics — adjudication
-    only applies to clean-exit protocol violations, never touches real crashes."""
+    """A normal (nonzero) crash keeps the existing isolated-retry semantics."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)

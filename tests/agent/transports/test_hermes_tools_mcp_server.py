@@ -218,6 +218,80 @@ class TestModuleSurface:
             )
 
 
+class TestCapabilitySets:
+    def test_missing_capability_set_preserves_codex_app_surface(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        assert m.selected_tool_names({}) == m.CODEX_APP_TOOLS
+        assert m.EXPOSED_TOOLS == m.CODEX_APP_TOOLS
+
+    def test_product_owner_capabilities_are_task_lifecycle_only(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        selected = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner"}
+        )
+        assert selected == (
+            "kanban_show",
+            "kanban_create",
+            "kanban_link",
+            "kanban_comment",
+            "kanban_heartbeat",
+            "kanban_complete",
+            "kanban_block",
+        )
+        assert "kanban_list" not in selected
+
+    def test_reviewer_capabilities_are_read_and_lifecycle_only(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        selected = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "reviewer"}
+        )
+        assert selected == (
+            "kanban_show",
+            "kanban_comment",
+            "kanban_heartbeat",
+            "kanban_complete",
+            "kanban_block",
+            "review_target",
+        )
+        assert {"kanban_create", "kanban_link", "kanban_list"}.isdisjoint(selected)
+
+    def test_unknown_explicit_capability_set_exposes_nothing(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        assert m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "unknown"}
+        ) == ()
+
+    def test_server_registration_honors_fail_closed_selection(
+        self, monkeypatch,
+    ):
+        from agent.transports import hermes_tools_mcp_server as m
+        import model_tools
+
+        monkeypatch.setenv("HERMES_MCP_CAPABILITY_SET", "unknown")
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **_kwargs: [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_show",
+                        "description": "show",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+        server = m._build_server()
+
+        assert server._tool_manager._tools == {}
+
+
 class TestMain:
     def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):
         """When the mcp package isn't installed, main() should exit

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import queue
+import sys
 import threading
 import time
 from contextvars import copy_context
@@ -50,6 +52,12 @@ _ACTING_BACKENDS: dict[str, dict[str, Any]] = {
             "--output-format",
             "--no-session-persistence",
             "--permission-mode",
+            "--mcp-config",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "--tools",
+            "--allowedTools",
+            "--disable-slash-commands",
         ),
     },
     "codex-cli": {
@@ -65,6 +73,22 @@ _ACTING_BACKENDS: dict[str, dict[str, Any]] = {
         ),
     },
 }
+
+_CLAUDE_TASK_CAPABILITY_BY_PROFILE = {
+    "productowner": "product-owner",
+    "reviewer": "reviewer",
+}
+_CLAUDE_TASK_REQUIRED_ENV = (
+    "HERMES_HOME",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_PROFILE",
+)
+_CLAUDE_READONLY_BUILTINS = ("Read", "Grep", "Glob", "ToolSearch")
 
 
 class LocalAgentInvocationError(RuntimeError):
@@ -110,6 +134,65 @@ def provider_timeout(provider: str) -> float:
     return value
 
 
+def _task_scoped_claude_options() -> tuple[str, str] | None:
+    """Return inline MCP config and allowed tools for a task-scoped Claude run."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    capability_set = _CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+    if capability_set is None:
+        raise CliConfigurationError(
+            f"task-scoped claude-cli profile is not approved: {profile or '(missing)'}"
+        )
+    missing = [key for key in _CLAUDE_TASK_REQUIRED_ENV if not os.environ.get(key)]
+    if missing:
+        raise CliConfigurationError(
+            "task-scoped claude-cli is missing dispatcher identity: "
+            + ", ".join(missing)
+        )
+
+    from agent.transports.hermes_tools_mcp_server import CAPABILITY_SETS
+
+    child_env = {
+        "HERMES_HOME": os.environ["HERMES_HOME"],
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "HERMES_QUIET": "1",
+        "HERMES_REDACT_SECRETS": "true",
+        "HERMES_KANBAN_TASK": os.environ["HERMES_KANBAN_TASK"],
+        "HERMES_KANBAN_RUN_ID": os.environ["HERMES_KANBAN_RUN_ID"],
+        "HERMES_KANBAN_CLAIM_LOCK": os.environ["HERMES_KANBAN_CLAIM_LOCK"],
+        "HERMES_KANBAN_DB": os.environ["HERMES_KANBAN_DB"],
+        "HERMES_KANBAN_BOARD": os.environ["HERMES_KANBAN_BOARD"],
+        "HERMES_KANBAN_WORKSPACES_ROOT": os.environ[
+            "HERMES_KANBAN_WORKSPACES_ROOT"
+        ],
+        "HERMES_PROFILE": profile,
+        "HERMES_MCP_CAPABILITY_SET": capability_set,
+    }
+    for key in ("PATH", "SYSTEMROOT", "COMSPEC", "PATHEXT"):
+        value = os.environ.get(key)
+        if value:
+            child_env[key] = value
+    inline = {
+        "mcpServers": {
+            "hermes-tools": {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+                "env": child_env,
+            }
+        }
+    }
+    allowed = (
+        *_CLAUDE_READONLY_BUILTINS,
+        *(f"mcp__hermes-tools__{name}" for name in CAPABILITY_SETS[capability_set]),
+    )
+    return (
+        json.dumps(inline, ensure_ascii=False, separators=(",", ":")),
+        ",".join(allowed),
+    )
+
+
 def _acting_argv(
     executable: str,
     provider: str,
@@ -117,6 +200,34 @@ def _acting_argv(
     effort: str | None = None,
 ) -> list[str]:
     if provider == "claude-cli":
+        task_options = _task_scoped_claude_options()
+        if task_options is not None:
+            inline_mcp, allowed_tools = task_options
+            argv = [
+                executable,
+                "-p",
+                "--output-format",
+                "json",
+                "--no-session-persistence",
+                "--permission-mode",
+                "dontAsk",
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                inline_mcp,
+                "--tools",
+                ",".join(_CLAUDE_READONLY_BUILTINS),
+                "--allowedTools",
+                allowed_tools,
+                "--disable-slash-commands",
+            ]
+            # These CLI flags are variadic. Keep every later argv element
+            # flag-prefixed; the prompt is supplied only on stdin.
+            argv.extend(_effort_args(provider, effort))
+            if model and model != "default":
+                argv.extend(["--model", model])
+            return argv
         argv = [
             executable,
             "-p",
@@ -174,9 +285,28 @@ def run_cli_acting(
     if not Path(project_cwd).is_dir():
         raise CliConfigurationError(f"Active project directory does not exist: {project_cwd}")
     prompt = _render_messages(messages)
+    if provider == "claude-cli" and os.environ.get("HERMES_KANBAN_TASK"):
+        profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+        capability_set = _CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+        if capability_set is not None:
+            from agent.transports.hermes_tools_mcp_server import (
+                CAPABILITY_INSTRUCTIONS,
+            )
+
+            prompt = (
+                "# Task-scoped capability contract\n"
+                f"{CAPABILITY_INSTRUCTIONS[capability_set]}\n\n"
+                f"{prompt}"
+            )
     effective_timeout = float(timeout) if timeout is not None else provider_timeout(provider)
     deadline = time.monotonic() + max(0.01, effective_timeout)
     executable = _executable_for(selected)
+    argv = _acting_argv(
+        executable,
+        provider,
+        model,
+        resolve_cli_effort(provider, reasoning_config),
+    )
     _probe_capability(
         executable,
         selected,
@@ -189,12 +319,7 @@ def run_cli_acting(
     if remaining <= 0:
         raise CliTimeoutError(f"{provider} invocation timed out")
     returncode, stdout, stderr = _run_process(
-        _acting_argv(
-            executable,
-            provider,
-            model,
-            resolve_cli_effort(provider, reasoning_config),
-        ),
+        argv,
         prompt=prompt,
         cwd=project_cwd,
         timeout=remaining,

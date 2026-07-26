@@ -157,7 +157,7 @@ def _configured_product_board(
     board = "agent-memory"
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
         check=True,

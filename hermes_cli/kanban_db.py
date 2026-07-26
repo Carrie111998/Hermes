@@ -7546,11 +7546,24 @@ def _end_run(
     if int(row["current_run_id"]) != run_id:
         return None
     active = conn.execute(
-        "SELECT id FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        "SELECT id, metadata FROM task_runs "
+        "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
         (run_id, task_id),
     ).fetchone()
     if active is None:
         return None
+    final_metadata = dict(metadata or {})
+    try:
+        active_metadata = (
+            json.loads(active["metadata"]) if active["metadata"] else {}
+        )
+    except (TypeError, ValueError):
+        active_metadata = {}
+    if isinstance(active_metadata, dict):
+        for key in ("review_base_sha", "review_head_sha"):
+            value = active_metadata.get(key)
+            if value is not None:
+                final_metadata.setdefault(key, value)
     closed = conn.execute(
         """
         UPDATE task_runs
@@ -7572,7 +7585,11 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            (
+                json.dumps(final_metadata, ensure_ascii=False)
+                if final_metadata
+                else None
+            ),
             now,
             run_id,
             task_id,
@@ -12888,6 +12905,176 @@ def handoff(
     return True
 
 
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class ReviewTargetPreparationError(RuntimeError):
+    """Reviewer input could not be pinned safely before worker launch."""
+
+
+def _review_git_output(workspace: Path, *args: str) -> str:
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        raise ReviewTargetPreparationError("git executable is unavailable")
+    try:
+        result = subprocess.run(
+            [git_executable, "-C", str(workspace), *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ReviewTargetPreparationError(
+            f"git {' '.join(args)} failed: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown git error").strip()
+        raise ReviewTargetPreparationError(
+            f"git {' '.join(args)} failed: {detail[:300]}"
+        )
+    return (result.stdout or "").strip()
+
+
+def _review_target_branch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path,
+    *,
+    board: Optional[str] = None,
+) -> str:
+    """Resolve the board-owned branch against which Reviewer compares."""
+    story_base = _story_base_branch(conn, task_id, board=board)
+    if story_base:
+        return story_base
+    meta = product_board_metadata(board) or {}
+    board_checkout = str(meta.get("default_workdir") or "").strip()
+    if not board_checkout:
+        raise ReviewTargetPreparationError(
+            "product board has no target checkout"
+        )
+    checkout_root = _git_toplevel(Path(board_checkout).expanduser())
+    if checkout_root is None:
+        raise ReviewTargetPreparationError(
+            "product board target checkout is not a git repository"
+        )
+    if _git_common_dir(checkout_root) != _git_common_dir(workspace):
+        raise ReviewTargetPreparationError(
+            "product board target checkout does not match the task repository"
+        )
+    target_branch = _git_current_branch(checkout_root)
+    if not target_branch:
+        raise ReviewTargetPreparationError(
+            "product board target checkout has no active branch"
+        )
+    return target_branch
+
+
+def _prepare_review_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    """Pin immutable base/head commits into the active review run."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ReviewTargetPreparationError(f"task {task_id} not found")
+    if task.current_step_key != "review":
+        return None
+    if not task.workspace_path:
+        raise ReviewTargetPreparationError("task has no workspace path")
+    try:
+        expected_workspace = Path(task.workspace_path).expanduser().resolve(strict=True)
+        actual_workspace = Path(workspace).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ReviewTargetPreparationError(f"workspace is unavailable: {exc}") from exc
+    if actual_workspace != expected_workspace:
+        raise ReviewTargetPreparationError(
+            f"launch workspace {actual_workspace} does not match task workspace "
+            f"{expected_workspace}"
+        )
+    if not actual_workspace.is_dir():
+        raise ReviewTargetPreparationError(
+            f"task workspace is not a directory: {actual_workspace}"
+        )
+    if task.current_run_id is None:
+        raise ReviewTargetPreparationError("task has no active review run")
+    run = get_run(conn, task.current_run_id)
+    if (
+        run is None
+        or run.task_id != task_id
+        or run.ended_at is not None
+        or run.status != "running"
+        or run.profile != "reviewer"
+        or run.step_key != "review"
+    ):
+        raise ReviewTargetPreparationError("active run is not the current review run")
+
+    dirty = _review_git_output(
+        actual_workspace, "status", "--porcelain", "--untracked-files=all"
+    )
+    if dirty:
+        raise ReviewTargetPreparationError("review workspace is dirty or uncommitted")
+    head_sha = _review_git_output(
+        actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
+    )
+    base_ref = _review_target_branch(
+        conn, task_id, actual_workspace, board=board
+    )
+    base_sha = _review_git_output(
+        actual_workspace, "merge-base", base_ref, head_sha
+    )
+    if not _FULL_GIT_SHA_RE.fullmatch(base_sha):
+        raise ReviewTargetPreparationError("review base is not a full commit SHA")
+    if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
+        raise ReviewTargetPreparationError("review head is not a full commit SHA")
+
+    metadata = dict(run.metadata or {})
+    metadata.update(
+        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET metadata = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (json.dumps(metadata, sort_keys=True), run.id, task_id),
+        )
+        if cur.rowcount != 1:
+            raise ReviewTargetPreparationError(
+                "active review run changed before target pinning"
+            )
+    return {"review_base_sha": base_sha, "review_head_sha": head_sha}
+
+
+def _pin_review_target_or_block(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    if task.current_step_key != "review" or task.assignee != "reviewer":
+        return True
+    try:
+        _prepare_review_target(conn, task.id, workspace, board=board)
+        return True
+    except Exception as exc:
+        _record_task_failure(
+            conn,
+            task.id,
+            f"review target preparation: {exc}",
+            outcome="spawn_failed",
+            failure_limit=1,
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+        )
+        return False
+
+
 def _spawn_one_v2(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12943,6 +13130,10 @@ def _spawn_one_v2(
             conn, claimed.id,
             resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
         )
+    if not _pin_review_target_or_block(
+        conn, claimed, workspace, board=board
+    ):
+        return None
     _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     _spawn = spawn_fn if spawn_fn is not None else _default_spawn
     try:
@@ -14138,9 +14329,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``). Product boards either adjudicate
-    from completion evidence or block immediately; other boards use the
-    bounded protocol-violation retry budget.
+    ``kanban_complete`` / ``kanban_block``). Product boards block immediately;
+    other boards use the bounded protocol-violation retry budget.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -14319,7 +14509,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # A per-task ``max_retries`` overrides the violation bound with the same
     # top precedence it has for every other failure kind. Systemic same-error
     # crashes still trip immediately. Product boards preserve their stricter
-    # handoff contract: adjudicate from evidence or block on the first miss.
+    # handoff contract and block on the first miss.
     auto_blocked: list[str] = []
     if crash_details:
         product_board = product_board_metadata(_board_slug_for_connection(conn)) is not None
@@ -14329,11 +14519,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
-            if protocol_violation and _adjudicate_clean_exit(conn, tid):
-                # Worker exited 0 without a terminal call but left completion
-                # evidence — Hermes advanced the card to the next role instead
-                # of tripping the breaker. Don't count a failure.
-                continue
             if protocol_violation and product_board:
                 tripped = _record_task_failure(
                     conn, tid,
@@ -14416,121 +14601,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
-
-
-_COMPLETION_EVIDENCE_RE = re.compile(
-    r"handoff|approv|verif|accepted|review (?:required|pass)"
-    r"|ready for (?:architecture|development|test|review|release)"
-    r"|tests?\s+(?:pass|green)|implementation (?:complete|done)",
-    re.IGNORECASE,
-)
-
-
-def _has_completion_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the worker left a terminal-intent comment (handoff / approval /
-    verification). Distinguishes a worker that finished its work but forgot the
-    terminal tool call from one that bailed with nothing done."""
-    rows = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? "
-        "ORDER BY created_at DESC, id DESC LIMIT 5",
-        (task_id,),
-    ).fetchall()
-    return any(_COMPLETION_EVIDENCE_RE.search(row["body"] or "") for row in rows)
-
-
-def _adjudicated_into_current_step(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the card's most recent transition was itself an adjudicated
-    advance. Guards against chaining auto-advances with no genuine worker
-    completion in between — after one adjudicated hop, the next clean-exit blocks
-    for a human instead of racing the card forward on nothing but comments."""
-    row = conn.execute(
-        "SELECT kind FROM task_events WHERE task_id = ? "
-        "AND kind IN ('workflow_advanced', 'adjudicated_advance', 'completed') "
-        "ORDER BY created_at DESC, id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return row is not None and row["kind"] == "adjudicated_advance"
-
-
-_ADJUDICATION_PROVENANCE_ROLE = {
-    "development": "writer",
-    "test": "tester",
-    "review": "reviewer",
-}
-
-
-def _reconstructed_adjudication_provenance(
-    step_key: Optional[str], assignee: Optional[str]
-) -> Optional[dict]:
-    """Rebuild AI provenance from the profile Hermes assigned to run this step.
-
-    The assignee is Hermes's own spawn record, so this is Hermes inspecting its
-    own state — authoritative, unlike a worker's self-reported provenance. The
-    provenance-gated steps (development/test/review) can then advance instead of
-    blocking just because the worker forgot to declare who it was.
-    """
-    agent = (assignee or "").strip()
-    role = _ADJUDICATION_PROVENANCE_ROLE.get(str(step_key or ""))
-    if not agent or role is None:
-        return None
-    return {"ai_provenance": {role: {"agent": agent, "source": "hermes_adjudicated"}}}
-
-
-def _adjudicate_clean_exit(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Decide a clean-exit-without-terminal-call on a product board.
-
-    Instead of blindly tripping the circuit breaker, inspect the card: if it is
-    a product-workflow card that reached its step through a real completion and
-    the worker left completion evidence, advance it to the next role (who then
-    independently verifies) rather than fast-blocking finished work. Returns
-    True when the card was advanced; False falls through to the normal block.
-    Advancing can never loop: each hop moves the workflow strictly forward.
-    """
-    board = _board_slug_for_connection(conn)
-    if product_board_metadata(board) is None:
-        return False
-    if _adjudicated_into_current_step(conn, task_id):
-        return False
-    if not _has_completion_evidence(conn, task_id):
-        return False
-    row = conn.execute(
-        "SELECT current_step_key, assignee FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    metadata = _reconstructed_adjudication_provenance(
-        row["current_step_key"], row["assignee"],
-    )
-    try:
-        advanced = _complete_product_workflow_step(
-            conn,
-            task_id,
-            board=board,
-            metadata=metadata,
-            summary=(
-                "Adjudicated advance: worker exited without calling "
-                "kanban_complete/kanban_block but left completion evidence; "
-                "Hermes advanced the card to the next role for verification."
-            ),
-        )
-    except Exception:
-        # Provenance rejection or any advance error -> stay conservative and
-        # let the normal fast-block path handle it.
-        return False
-    if not advanced:
-        return False
-    with write_txn(conn):
-        _append_event(
-            conn,
-            task_id,
-            "adjudicated_advance",
-            {
-                "reason": "clean_exit_without_terminal_call",
-                "evidence": "completion_comment",
-            },
-        )
-    return True
 
 
 def _record_task_failure(
@@ -15321,6 +15391,11 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        if not _pin_review_target_or_block(
+            conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -15414,6 +15489,11 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        if not _pin_review_target_or_block(
+            conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:

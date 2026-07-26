@@ -31,6 +31,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -47,6 +51,11 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+REVIEW_TARGET_PAGE_LINES = 400
+REVIEW_TARGET_PAGE_CHARS = 48_000
+REVIEW_TARGET_MAX_LINE_CHARS = 4_000
+REVIEW_TARGET_FILE_LIST_LIMIT = 200
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -128,6 +137,13 @@ def _check_resolver_mode() -> bool:
     """Expose the Resolver mutation only to a task-scoped Resolver run."""
     return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
         os.environ.get("HERMES_PROFILE") == "resolver"
+    )
+
+
+def _check_reviewer_mode() -> bool:
+    """Expose immutable review input only to the current Reviewer worker."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
+        os.environ.get("HERMES_PROFILE") == "reviewer"
     )
 
 
@@ -532,6 +548,225 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+def _review_target_git(workspace: Path, *args: str) -> str:
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        raise ValueError("git executable is unavailable")
+    try:
+        result = subprocess.run(
+            [git_executable, "-C", str(workspace), *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"git {' '.join(args)} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown git error").strip()
+        raise ValueError(f"git {' '.join(args)} failed: {detail[:300]}")
+    return result.stdout or ""
+
+
+def _bounded_review_diff_page(
+    diff: str,
+    offset: int,
+) -> tuple[str, Optional[int], bool, list[int]]:
+    """Return a bounded page where offsets address original diff lines."""
+    lines = diff.splitlines(keepends=True)
+    if offset > len(lines):
+        raise ValueError("offset exceeds the pinned diff")
+
+    page: list[str] = []
+    truncated_lines: list[int] = []
+    total_chars = 0
+    line_index = offset
+    line_limit = max(
+        1,
+        min(REVIEW_TARGET_MAX_LINE_CHARS, REVIEW_TARGET_PAGE_CHARS),
+    )
+    while (
+        line_index < len(lines)
+        and line_index - offset < REVIEW_TARGET_PAGE_LINES
+    ):
+        original = lines[line_index]
+        rendered = original
+        was_truncated = len(original) > line_limit
+        if was_truncated:
+            newline = "\n" if original.endswith("\n") else ""
+            marker = (
+                f"... [line {line_index} truncated from "
+                f"{len(original)} chars]{newline}"
+            )
+            if len(marker) >= line_limit:
+                rendered = marker[:line_limit]
+            else:
+                rendered = original[: line_limit - len(marker)] + marker
+
+        if page and total_chars + len(rendered) > REVIEW_TARGET_PAGE_CHARS:
+            break
+        page.append(rendered)
+        total_chars += len(rendered)
+        if was_truncated:
+            truncated_lines.append(line_index)
+        line_index += 1
+
+    complete = line_index >= len(lines)
+    return (
+        "".join(page),
+        None if complete else line_index,
+        complete,
+        truncated_lines,
+    )
+
+
+def _handle_review_target(args: dict, **kw) -> str:
+    """Return a bounded diff page for the current run's pinned commits."""
+    if not _check_reviewer_mode():
+        return tool_error(
+            "review_target is restricted to a task-scoped reviewer profile"
+        )
+    offset = args.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return tool_error("review_target: offset must be a non-negative integer")
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        return tool_error("review_target: current reviewer run is missing")
+
+    try:
+        kb, conn = _connect()
+        try:
+            task = kb.get_task(conn, task_id)
+            if (
+                task is None
+                or task.current_step_key != "review"
+                or task.current_run_id != run_id
+            ):
+                return tool_error(
+                    "review_target: task is not owned by the current reviewer run"
+                )
+            run = kb.get_run(conn, run_id)
+            if (
+                run is None
+                or run.task_id != task_id
+                or run.profile != "reviewer"
+                or run.step_key != "review"
+                or run.ended_at is not None
+                or run.status != "running"
+            ):
+                return tool_error(
+                    "review_target: task is not owned by the current reviewer run"
+                )
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            if (
+                not claim_lock
+                or task.claim_lock != claim_lock
+                or run.claim_lock != claim_lock
+            ):
+                return tool_error(
+                    "review_target: task is not owned by the current reviewer claim"
+                )
+            metadata = run.metadata if isinstance(run.metadata, dict) else {}
+            base_sha = metadata.get("review_base_sha")
+            head_sha = metadata.get("review_head_sha")
+            if (
+                not isinstance(base_sha, str)
+                or not _FULL_GIT_SHA_RE.fullmatch(base_sha)
+                or not isinstance(head_sha, str)
+                or not _FULL_GIT_SHA_RE.fullmatch(head_sha)
+            ):
+                return tool_error(
+                    "review_target: active run has no valid pinned review commits"
+                )
+            if not task.workspace_path:
+                return tool_error("review_target: task workspace is missing")
+            workspace = Path(task.workspace_path).expanduser().resolve(strict=True)
+            if not workspace.is_dir():
+                return tool_error("review_target: task workspace is not a directory")
+            repo_root = Path(
+                _review_target_git(
+                    workspace, "rev-parse", "--show-toplevel"
+                ).strip()
+            ).resolve(strict=True)
+            if repo_root != workspace:
+                return tool_error(
+                    "review_target: repository root does not match task workspace"
+                )
+            _review_target_git(workspace, "cat-file", "-e", f"{base_sha}^{{commit}}")
+            _review_target_git(workspace, "cat-file", "-e", f"{head_sha}^{{commit}}")
+            all_changed_files = [
+                line
+                for line in _review_target_git(
+                    workspace,
+                    "diff",
+                    "--name-only",
+                    base_sha,
+                    head_sha,
+                    "--",
+                    ".",
+                ).splitlines()
+                if line
+            ]
+            all_binary_files = []
+            for line in _review_target_git(
+                workspace,
+                "diff",
+                "--numstat",
+                base_sha,
+                head_sha,
+                "--",
+                ".",
+            ).splitlines():
+                fields = line.split("\t", 2)
+                if len(fields) == 3 and fields[:2] == ["-", "-"]:
+                    all_binary_files.append(fields[2])
+            changed_files = all_changed_files[:REVIEW_TARGET_FILE_LIST_LIMIT]
+            binary_files = all_binary_files[:REVIEW_TARGET_FILE_LIST_LIMIT]
+            diff = _review_target_git(
+                workspace,
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--unified=3",
+                base_sha,
+                head_sha,
+                "--",
+                ".",
+            )
+            diff_page, next_offset, complete, truncated_lines = (
+                _bounded_review_diff_page(diff, offset)
+            )
+            return json.dumps(
+                {
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                    "changed_files": changed_files,
+                    "changed_files_omitted": (
+                        len(all_changed_files) - len(changed_files)
+                    ),
+                    "binary_files": binary_files,
+                    "binary_files_omitted": (
+                        len(all_binary_files) - len(binary_files)
+                    ),
+                    "diff": diff_page,
+                    "truncated_lines": truncated_lines,
+                    "next_offset": next_offset,
+                    "complete": complete,
+                }
+            )
+        finally:
+            conn.close()
+    except (OSError, ValueError) as exc:
+        return tool_error(f"review_target: {exc}")
+    except Exception as exc:
+        logger.exception("review_target failed")
+        return tool_error(f"review_target: {exc}")
+
 
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
@@ -2145,6 +2380,28 @@ KANBAN_SHOW_SCHEMA = {
     },
 }
 
+REVIEW_TARGET_SCHEMA = {
+    "name": "review_target",
+    "description": (
+        "Read the immutable Git diff pinned for the current Reviewer run. "
+        "Returns fixed base/head commit SHAs, changed and binary files, and one "
+        "bounded diff-line page with explicit overlong-line truncation. Continue "
+        "with next_offset until complete is true."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Diff-line offset into the pinned diff (default 0).",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
 KANBAN_LIST_SCHEMA = {
     "name": "kanban_list",
     "description": (
@@ -3031,6 +3288,15 @@ registry.register(
     handler=_handle_show,
     check_fn=_check_kanban_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="review_target",
+    toolset="kanban",
+    schema=REVIEW_TARGET_SCHEMA,
+    handler=_handle_review_target,
+    check_fn=_check_reviewer_mode,
+    emoji="🔎",
 )
 
 registry.register(
