@@ -30,6 +30,7 @@ import asyncio
 import base64
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -109,6 +110,11 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
     # Everything else is a filesystem path — including bare relative names
     # like "pic.png" (accepted on main; a path-shape gate here regressed them).
     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
+    local_backend = _is_local_terminal_backend()
+    msys_input = local_backend and _looks_like_msys_path(candidate)
+    translated = _translate_msys_path(candidate) if msys_input else None
+    if translated:
+        candidate = translated
     p = Path(os.path.expanduser(candidate))
     # Confinement decision (see module docstring). Under a non-local backend
     # a path is host-readable ONLY if it lands in a media cache (after
@@ -135,9 +141,18 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
                 raise SourceUnsafe(str(exc), src=s, origin="file")
         data = await asyncio.to_thread(host_target.read_bytes)
         return _finalize(data, "", "file", s)
-    if _is_local_terminal_backend():
+    if local_backend:
         # Local backend: any path was host-readable, so a miss simply means
         # the file doesn't exist — no sandbox to fall back to.
+        if msys_input and translated is None:
+            raise SourceNotFound(
+                f"image file not found: '{p}'. The input looks like an MSYS/Git Bash "
+                "path, but cygpath could not translate it. Install or repair Git for "
+                "Windows, or pass a native Windows path such as "
+                r"'C:\Users\you\Pictures\image.png'.",
+                src=s,
+                origin="file",
+            )
         raise SourceNotFound(f"image file not found: '{p}'", src=s, origin="file")
     # Not a permitted host read (or the host file is absent) -> read the
     # bytes inside the sandbox. Under a sandbox this reads the container's
@@ -196,6 +211,45 @@ async def _download_to_bytes(url: str) -> bytes:
         raise SourceUnsafe(str(exc), src=url, origin="http")
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _looks_like_msys_path(candidate: str, *, is_windows: Optional[bool] = None) -> bool:
+    """Return whether *candidate* needs MSYS/Git Bash path translation."""
+
+    windows = os.name == "nt" if is_windows is None else is_windows
+    return windows and candidate.startswith("/")
+
+
+def _translate_msys_path(
+    candidate: str,
+    *,
+    is_windows: Optional[bool] = None,
+    run=None,
+) -> Optional[str]:
+    """Translate an MSYS path to native Windows form with ``cygpath``.
+
+    The command is invoked without a shell and is only used for local Windows
+    backends. Container paths such as ``/workspace/image.png`` must retain their
+    sandbox meaning and therefore never pass through this helper.
+    """
+
+    if not _looks_like_msys_path(candidate, is_windows=is_windows):
+        return None
+
+    runner = subprocess.run if run is None else run
+    try:
+        result = runner(
+            ["cygpath", "-w", candidate],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    translated = result.stdout.strip()
+    return translated or None
 
 
 def _is_local_terminal_backend() -> bool:
