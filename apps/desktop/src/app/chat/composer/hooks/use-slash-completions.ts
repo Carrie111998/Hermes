@@ -158,7 +158,12 @@ export function useSlashCompletions(options: {
         }
 
         const result = await gateway.request<{ items?: CompletionEntry[]; replace_from?: number }>('complete.slash', {
-          text
+          text,
+          // Same desktop opt-in as the empty-query catalog above. Without it a
+          // typed prefix (`/con`) misses desktop-only commands entirely, so
+          // `/context` would only be discoverable by opening the bare `/`
+          // list — not "as convenient as /model".
+          surface: 'desktop'
         })
 
         // Arg-completion items (replace_from > 1) carry just the arg stub —

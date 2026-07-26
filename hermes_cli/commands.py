@@ -320,6 +320,19 @@ for _cmd in COMMAND_REGISTRY:
         for _alias in _cmd.aliases:
             _cat[f"/{_alias}"] = COMMANDS[f"/{_alias}"]
 
+# Desktop-only commands, kept OUT of ``COMMANDS`` (which drives CLI/TUI help
+# and autocomplete, where these have no handler) but still needed as data: the
+# Electron slash popover completes a typed prefix through the gateway's
+# ``complete.slash``, so without a surface-scoped source of these names,
+# ``/con`` would report "No matches" for a command that runs fine when typed
+# in full.
+DESKTOP_ONLY_COMMANDS: dict[str, str] = {}
+for _cmd in COMMAND_REGISTRY:
+    if _cmd.desktop_only:
+        DESKTOP_ONLY_COMMANDS[f"/{_cmd.name}"] = _build_description(_cmd)
+        for _alias in _cmd.aliases:
+            DESKTOP_ONLY_COMMANDS[f"/{_alias}"] = f"{_cmd.description} (alias for /{_cmd.name})"
+
 
 # Subcommands lookup: "/cmd" -> ["sub1", "sub2", ...]
 SUBCOMMANDS: dict[str, list[str]] = {}

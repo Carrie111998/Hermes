@@ -6961,6 +6961,43 @@ def test_commands_catalog_includes_desktop_only_commands_for_the_desktop():
     assert "/status" in pairs
 
 
+def test_complete_slash_hides_desktop_only_commands_from_the_tui():
+    """The prefix path must stay TUI-clean, same as `commands.catalog`."""
+    resp = server.handle_request(
+        {"id": "1", "method": "complete.slash", "params": {"text": "/con"}}
+    )
+    assert not any(item["text"] == "context" for item in resp["result"]["items"])
+
+
+def test_complete_slash_includes_desktop_only_commands_for_the_desktop():
+    """A typed prefix must complete `/context` for the desktop popover.
+
+    `SlashCommandCompleter` walks `COMMANDS`, which deliberately excludes
+    `desktop_only` commands. The desktop slash popover routes an EMPTY query to
+    `commands.catalog` but a typed one to `complete.slash`, so without the same
+    surface opt-in here, `/con` reported "No matches" for a command that runs
+    fine when typed in full -- the command existed but was undiscoverable.
+    """
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "complete.slash",
+            "params": {"text": "/con", "surface": "desktop"},
+        }
+    )
+    items = resp["result"]["items"]
+    context = next((it for it in items if it["text"] == "context"), None)
+    assert context is not None
+    # Display/meta follow the same plain-string contract as every other item.
+    assert context["display"] == "/context"
+    assert isinstance(context["meta"], str) and context["meta"]
+    # Ordinary commands sharing the prefix are unaffected by the opt-in.
+    assert any(it["text"] == "config" for it in items)
+    # `replace_from` still points at the command position, so accepting the
+    # completion replaces `con` rather than appending to it.
+    assert resp["result"]["replace_from"] == 1
+
+
 def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     monkeypatch.setattr(
         server,

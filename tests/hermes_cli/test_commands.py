@@ -8,6 +8,7 @@ from hermes_cli.commands import (
     COMMANDS,
     COMMANDS_BY_CATEGORY,
     CommandDef,
+    DESKTOP_ONLY_COMMANDS,
     GATEWAY_KNOWN_COMMANDS,
     SUBCOMMANDS,
     SlashCommandAutoSuggest,
@@ -168,6 +169,25 @@ class TestDerivedDicts:
     def test_every_command_has_nonempty_description(self):
         for cmd, desc in COMMANDS.items():
             assert isinstance(desc, str) and len(desc) > 0, f"{cmd} has empty description"
+
+    def test_desktop_only_commands_are_exposed_as_data(self):
+        """Excluded from COMMANDS, but still reachable for the desktop surface.
+
+        `COMMANDS` drives CLI/TUI help and autocomplete, where a `desktop_only`
+        command would dead-end. The gateway's `complete.slash` needs the names
+        anyway to complete a typed prefix for the Electron popover, so they
+        live in a separate projection instead of being unavailable entirely.
+        """
+        expected = {
+            f"/{cmd.name}" for cmd in COMMAND_REGISTRY if cmd.desktop_only
+        }
+        assert expected, "expected at least one desktop_only command"
+        assert set(DESKTOP_ONLY_COMMANDS) >= expected
+        # The two projections must not overlap: a command belongs to the CLI
+        # surface or the desktop-only one, never both.
+        assert not set(DESKTOP_ONLY_COMMANDS) & set(COMMANDS)
+        for cmd, desc in DESKTOP_ONLY_COMMANDS.items():
+            assert isinstance(desc, str) and desc, f"{cmd} has empty description"
 
 
 # ---------------------------------------------------------------------------
