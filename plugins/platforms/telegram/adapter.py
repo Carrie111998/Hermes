@@ -985,13 +985,29 @@ class TelegramAdapter(BasePlatformAdapter):
             elif chat_type == "dm" and is_topic_message:
                 thread_id = str(thread_id_raw)
 
-        source = self.build_source(
-            chat_id=chat_id or "",
-            chat_type=chat_type,
-            user_id=user_id,
-            user_name=user_name,
-            thread_id=thread_id,
-        )
+        if getattr(self, "platform", None) is None:
+            # A few defensive cold paths deliberately construct an adapter via
+            # ``object.__new__`` (for example, oversized-media rejection before
+            # normal adapter initialization). Preserve that identityless path
+            # without weakening profile routing for initialized adapters.
+            from gateway.session import SessionSource
+
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=chat_id or "",
+                chat_type=chat_type,
+                user_id=user_id,
+                user_name=user_name,
+                thread_id=thread_id,
+            )
+        else:
+            source = self.build_source(
+                chat_id=chat_id or "",
+                chat_type=chat_type,
+                user_id=user_id,
+                user_name=user_name,
+                thread_id=thread_id,
+            )
         if not source.profile:
             source.profile = getattr(self, "_gateway_profile_name", None)
         return source
