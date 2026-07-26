@@ -90,6 +90,10 @@ def _active_target(channel: str, thread_ts: str) -> tuple[str, str, str]:
                 "Slack history reads cannot switch away from the active thread."
             )
         requested_thread = active_thread
+    elif requested_thread:
+        raise SlackHistoryError(
+            "Slack history reads cannot select a thread outside the active conversation."
+        )
     scope_id = get_session_env("HERMES_SESSION_SCOPE_ID", "").strip()
     if not scope_id:
         raise SlackHistoryError(
@@ -152,6 +156,9 @@ def _read_from_live_adapter(
         team_clients = getattr(adapter, "_team_clients", None)
         if not isinstance(team_clients, Mapping) or scope_id not in team_clients:
             raise SlackHistoryError("The active Slack workspace is unavailable.")
+        team_bot_ids = getattr(adapter, "_team_bot_ids", None)
+        if not isinstance(team_bot_ids, Mapping) or not team_bot_ids.get(scope_id):
+            raise SlackHistoryError("The active Slack bot is unavailable.")
         client = team_clients[scope_id]
         if thread_ts:
             return await client.conversations_replies(

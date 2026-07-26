@@ -19,6 +19,7 @@ CHANNEL_ID = "C12345678"
 THREAD_TS = "1712345678.000100"
 TEAM_ID = "T12345678"
 OTHER_TEAM_ID = "T87654321"
+BOT_ID = "B12345678"
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +127,19 @@ def test_active_thread_cannot_switch_to_another_thread(monkeypatch):
 
     assert result["success"] is False
     assert "cannot switch away from the active thread" in result["error"]
+
+
+def test_channel_context_cannot_select_a_thread(monkeypatch):
+    monkeypatch.setattr(
+        slack_tool,
+        "_read_from_live_adapter",
+        lambda *_args, **_kwargs: pytest.fail("unrelated thread reached Slack"),
+    )
+
+    result = json.loads(slack_tool.slack_history(thread_ts=THREAD_TS))
+
+    assert result["success"] is False
+    assert "cannot select a thread" in result["error"]
 
 
 def test_other_channel_is_rejected_before_io(monkeypatch):
@@ -239,6 +253,7 @@ def test_live_reader_uses_transport_adapter_and_forwards_thread_bounds(monkeypat
     class Adapter:
         def __init__(self):
             self._team_clients = {TEAM_ID: Client()}
+            self._team_bot_ids = {TEAM_ID: BOT_ID}
 
     class Loop:
         def is_running(self):
@@ -311,6 +326,7 @@ def test_live_reader_forwards_channel_bounds_and_cursor(monkeypatch):
     class Adapter:
         def __init__(self):
             self._team_clients = {TEAM_ID: Client()}
+            self._team_bot_ids = {TEAM_ID: BOT_ID}
 
     class Loop:
         def is_running(self):
@@ -371,6 +387,7 @@ def test_live_reader_rejects_unknown_workspace_before_slack_io(monkeypatch):
     class Adapter:
         def __init__(self):
             self._team_clients = {TEAM_ID: Client()}
+            self._team_bot_ids = {TEAM_ID: BOT_ID}
 
     class Loop:
         def is_running(self):
@@ -405,6 +422,60 @@ def test_live_reader_rejects_unknown_workspace_before_slack_io(monkeypatch):
         slack_tool._read_from_live_adapter(
             CHANNEL_ID,
             scope_id=OTHER_TEAM_ID,
+            thread_ts="",
+            limit=20,
+            before="",
+            after="",
+            cursor="",
+        )
+
+
+def test_live_reader_rejects_user_token_principal_before_slack_io(monkeypatch):
+    from gateway.config import Platform
+    import gateway.run as gateway_run
+
+    class Client:
+        async def conversations_history(self, **_kwargs):
+            pytest.fail("user-token principal reached Slack")
+
+    class Adapter:
+        def __init__(self):
+            self._team_clients = {TEAM_ID: Client()}
+            self._team_bot_ids = {}
+
+    class Loop:
+        def is_running(self):
+            return True
+
+    adapter = Adapter()
+    clear_session_vars([])
+    set_session_vars(
+        platform="slack",
+        chat_id=CHANNEL_ID,
+        scope_id=TEAM_ID,
+        transport_adapter=adapter,
+    )
+    runner = SimpleNamespace(
+        adapters={Platform.SLACK: adapter},
+        _profile_adapters={},
+        _gateway_loop=Loop(),
+    )
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+
+    def run_now(coro, _loop, **_kwargs):
+        future: Future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(slack_tool, "safe_schedule_threadsafe", run_now)
+
+    with pytest.raises(slack_tool.SlackHistoryError, match="bot is unavailable"):
+        slack_tool._read_from_live_adapter(
+            CHANNEL_ID,
+            scope_id=TEAM_ID,
             thread_ts="",
             limit=20,
             before="",
