@@ -271,9 +271,11 @@ class TestSessionScoping:
         state_a, _ = ke._get_or_create_state("session_a")
         state_a.record_route("t_a", "worker-terra", "deepseek-v4-flash", "new-api", 0)
 
-        # session_a should be authorized
+        # session_a route is isolated to the session but no longer authorizes
+        # controller-side worker tools.
         result_a = _pre_result("terminal", session_id="session_a")
-        assert result_a is None, "session A should be authorized"
+        assert result_a is not None, "session A route should block controller work"
+        assert result_a["action"] == "block"
 
         # session_b should be blocked
         result_b = _pre_result("terminal", session_id="session_b")
@@ -293,9 +295,10 @@ class TestSessionScoping:
         # Clean up session A
         ke.cleanup_session("session_a")
 
-        # session B should still be authorized
+        # session B state remains, but a route does not authorize controller work.
         result_b = _pre_result("terminal", session_id="session_b")
-        assert result_b is None, "session B should remain authorized"
+        assert result_b is not None, "session B state should remain but block"
+        assert result_b["action"] == "block"
 
         # session A state should be gone
         ke.advance_turn_for("session_a")
@@ -309,14 +312,97 @@ class TestSessionScoping:
         ke.advance_turn()
         ke._get_state().record_route("t_x", "worker-terra", "deepseek-v4-flash", "new-api", 0)
 
-        # Unsatisfied calls use empty session_id → gets the same sentinel
+        # Unsatisfied calls use empty session_id → gets the same sentinel, but
+        # a route still blocks controller worker execution.
         result_anon = _pre_result("terminal")
-        assert result_anon is None, "unsessioned should be authorized"
+        assert result_anon is not None, "unsessioned route should block"
+        assert result_anon["action"] == "block"
 
         # Session "a" should not be authorized
         result_a = _pre_result("terminal", session_id="a")
         assert result_a is not None
         assert result_a["action"] == "block"
+
+
+class TestRouteVsScopedExemption:
+    """Routes never authorize controller worker tools; exemptions are exact-scope."""
+
+    @pytest.mark.parametrize(
+        "tool_name,args",
+        [
+            ("terminal", {"command": "true"}),
+            ("write_file", {"path": "/tmp/x", "content": "x"}),
+            ("patch", {"mode": "replace", "path": "/tmp/x", "old_string": "a", "new_string": "b"}),
+            ("execute_code", {"code": "print('hi')"}),
+            ("delegate_task", {"goal": "do work"}),
+        ],
+    )
+    def test_route_does_not_authorize_substantial_tools(
+        self, enforcement_on, tool_name, args
+    ):
+        state = ke._DispatchState()
+        state.record_route("t_route", "worker-terra", "deepseek-v4-flash", "new-api", 0)
+        with patch.object(ke, "_get_or_create_state", return_value=(state, 0)):
+            result = _pre_result(tool_name, args=args, session_id="route-session")
+        assert result is not None
+        assert result["action"] == "block"
+        assert "route delegated the work" in result["message"]
+
+    def test_scoped_exemption_allows_exact_tool_once(self, enforcement_on):
+        state = ke._DispatchState()
+        state.record_exemption(
+            "controller_judgment",
+            {
+                "allowed_tool": "process",
+                "allowed_action": "kill",
+                "allowed_uses": 1,
+            },
+            0,
+        )
+        with patch.object(ke, "_get_or_create_state", return_value=(state, 0)):
+            assert _pre_result(
+                "process",
+                args={"action": "kill", "session_id": "p1"},
+                session_id="scoped-exemption",
+            ) is None
+            blocked_after_use = _pre_result(
+                "process",
+                args={"action": "kill", "session_id": "p1"},
+                session_id="scoped-exemption",
+            )
+        assert blocked_after_use is not None
+        assert blocked_after_use["action"] == "block"
+        assert "consumed" in blocked_after_use["message"]
+
+    def test_scoped_exemption_blocks_unrelated_tool(self, enforcement_on):
+        state = ke._DispatchState()
+        state.record_exemption(
+            "tiny",
+            {"allowed_tool": "terminal", "allowed_uses": 1},
+            0,
+        )
+        with patch.object(ke, "_get_or_create_state", return_value=(state, 0)):
+            blocked = _pre_result(
+                "write_file",
+                args={"path": "/tmp/x", "content": "x"},
+                session_id="scoped-exemption",
+            )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+        assert "exact scoped exemption" in blocked["message"]
+
+    def test_legacy_unscoped_exemption_fails_closed(self, enforcement_on):
+        state = ke._DispatchState()
+        state.record_exemption("tiny", None, 0)
+        with patch.object(ke, "_get_or_create_state", return_value=(state, 0)):
+            blocked = _pre_result(
+                "terminal",
+                args={"command": "true"},
+                session_id="legacy-exemption",
+            )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+        assert "missing tool scope" in blocked["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -479,11 +565,12 @@ class TestTurnBoundaries:
         assert "expire" in result["message"].lower() or "turn" in result["message"]
 
     def test_same_turn_authorisation_persists(self, enforcement_on):
-        """Authorisation from earlier in the same turn persists."""
+        """A same-turn route still blocks controller-side worker execution."""
         state = ke._get_state()
         state.record_route("t_abc", "worker-terra", "deepseek-v4-flash", "new-api", 0)
         result = _pre_result("terminal")
-        assert result is None
+        assert result is not None
+        assert result["action"] == "block"
 
     def test_reset_enforcement_state(self, enforcement_on):
         """reset_all_state clears all sessions."""

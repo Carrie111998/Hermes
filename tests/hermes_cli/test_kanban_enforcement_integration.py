@@ -88,13 +88,93 @@ def test_post_hook_uses_result_board_for_durable_readback(tmp_path, monkeypatch)
         session_id="session-a",
     )
     assert ke.dispatch_enforcement_is_established("session-a")
-    assert ke._pre_tool_call_enforcement(
+    blocked_same_session = ke._pre_tool_call_enforcement(
         tool_name="terminal", session_id="session-a",
-    ) is None
+    )
+    assert blocked_same_session and blocked_same_session["action"] == "block"
     blocked = ke._pre_tool_call_enforcement(
         tool_name="terminal", session_id="session-b",
     )
     assert blocked and blocked["action"] == "block"
+
+
+def test_plugin_path_route_blocks_and_scoped_exemption_allows_exact_op(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    bundled = Path(__file__).resolve().parents[2] / "plugins"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    config_path.write_text(
+        yaml.safe_dump({
+            "plugins": {"enabled": ["kanban-enforcement"]},
+            "kanban": {"enforce_dispatch_routing": True},
+        }),
+        encoding="utf-8",
+    )
+    ke._CONFIG_LAST_READ = 0.0
+    old_manager = plugins_mod._plugin_manager
+    try:
+        plugins_mod._plugin_manager = plugins_mod.PluginManager()
+        plugins_mod.discover_plugins()
+
+        route = {
+            "route": "worker-terra",
+            "model": "deepseek-v4-flash",
+            "provider": "new-api",
+        }
+        route_id = _create_dispatch_task(home, board="route-board", decision=route)
+        plugins_mod.invoke_hook(
+            "post_tool_call",
+            tool_name="kanban_create",
+            args={"assignee": "worker-terra", "dispatch_decision": route},
+            result={"success": True, "task_id": route_id, "board": "route-board"},
+            status="ok",
+            session_id="route-session",
+        )
+        blocked = plugins_mod.invoke_hook(
+            "pre_tool_call",
+            tool_name="terminal",
+            args={"command": "true"},
+            session_id="route-session",
+        )
+        assert any(item.get("action") == "block" for item in blocked)
+
+        scoped = {
+            "exemption": "controller_judgment",
+            "allowed_tool": "process",
+            "allowed_action": "kill",
+            "allowed_uses": 1,
+        }
+        exempted_id = _create_dispatch_task(home, board="exemption-board", decision=scoped)
+        plugins_mod.invoke_hook(
+            "post_tool_call",
+            tool_name="kanban_create",
+            args={"dispatch_decision": scoped},
+            result={"success": True, "task_id": exempted_id, "board": "exemption-board"},
+            status="ok",
+            session_id="exemption-session",
+        )
+        allowed = plugins_mod.invoke_hook(
+            "pre_tool_call",
+            tool_name="process",
+            args={"action": "kill", "session_id": "p1"},
+            session_id="exemption-session",
+        )
+        assert allowed == []
+        blocked_unrelated = plugins_mod.invoke_hook(
+            "pre_tool_call",
+            tool_name="process",
+            args={"action": "write", "session_id": "p1", "data": "hi"},
+            session_id="exemption-session",
+        )
+        assert any(item.get("action") == "block" for item in blocked_unrelated)
+    finally:
+        plugins_mod._plugin_manager = old_manager
 
 
 def test_real_plugin_discovery_and_invoke_hook_require_dual_opt_in(

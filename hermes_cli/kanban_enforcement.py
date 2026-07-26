@@ -191,6 +191,9 @@ class _DispatchState:
         self.exemption_keyword: Optional[str] = None
         """Bounded exemption keyword from DISPATCH_EXEMPTIONS."""
 
+        self.exemption_scope: Optional[Dict[str, Any]] = None
+        """Exact durable scope for a controller-only exemption."""
+
         self.turn_ordinal: int = -1
         """Turn ordinal when the current authorisation was established."""
 
@@ -215,15 +218,63 @@ class _DispatchState:
         self.route_model = model
         self.route_provider = provider
         self.exemption_keyword = None
+        self.exemption_scope = None
         self.turn_ordinal = turn_ordinal
 
-    def record_exemption(self, keyword: str, turn_ordinal: int) -> None:
+    def record_exemption(
+        self,
+        keyword: str,
+        scope: Optional[Dict[str, Any]] | int | None,
+        turn_ordinal: Optional[int] = None,
+    ) -> None:
+        if turn_ordinal is None and not isinstance(scope, dict):
+            turn_ordinal = int(scope if scope is not None else -1)
+            scope = None
         self.route_task_id = None
         self.route_assignee = None
         self.route_model = None
         self.route_provider = None
         self.exemption_keyword = keyword
-        self.turn_ordinal = turn_ordinal
+        self.exemption_scope = dict(scope) if isinstance(scope, dict) else None
+        if isinstance(self.exemption_scope, dict):
+            try:
+                allowed_uses = int(self.exemption_scope.get("allowed_uses", 1))
+            except (TypeError, ValueError):
+                allowed_uses = 1
+            self.exemption_scope.setdefault("allowed_uses", allowed_uses)
+            self.exemption_scope.setdefault("remaining_uses", allowed_uses)
+        self.turn_ordinal = int(turn_ordinal if turn_ordinal is not None else -1)
+
+    def matching_exemption_for(
+        self,
+        tool_name: str,
+        args: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        scope = self.exemption_scope
+        if not isinstance(scope, dict):
+            return None
+        allowed_tool = str(scope.get("allowed_tool", "")).strip()
+        if not allowed_tool or allowed_tool != tool_name:
+            return None
+        allowed_action = scope.get("allowed_action")
+        if allowed_action is not None:
+            if not isinstance(args, dict):
+                return None
+            actual_action = args.get("action")
+            if str(actual_action or "").strip().lower() != str(allowed_action).strip().lower():
+                return None
+        remaining = scope.get("remaining_uses")
+        if remaining is not None and int(remaining) <= 0:
+            return None
+        return scope
+
+    def consume_exemption_use(self) -> None:
+        if not isinstance(self.exemption_scope, dict):
+            return
+        remaining = self.exemption_scope.get("remaining_uses")
+        if remaining is None:
+            return
+        self.exemption_scope["remaining_uses"] = max(0, int(remaining) - 1)
 
     def reset(self) -> None:
         """Clear all authorisation."""
@@ -232,6 +283,7 @@ class _DispatchState:
         self.route_model = None
         self.route_provider = None
         self.exemption_keyword = None
+        self.exemption_scope = None
         self.turn_ordinal = -1
 
 
@@ -404,8 +456,40 @@ def _pre_tool_call_enforcement(
     sid = _resolve_session_id(session_id) or "__unsessioned__"
     state, current_turn = _get_or_create_state(session_id)
 
-    if state.is_established(current_turn):
-        return None
+    if state.route_task_id is not None and state.turn_ordinal == current_turn:
+        detail = (
+            "A dispatch route is active for this turn, but that route delegated "
+            "the work to a worker and does not authorize controller-side worker "
+            "tool execution. Use the worker artifact, or record a matching scoped "
+            "exemption for this exact controller operation."
+        )
+        logger.debug("dispatch enforcement blocked routed controller tool %s for %s", tool_name, sid)
+        return {"action": "block", "message": f"BLOCKED: dispatch enforcement — {detail}"}
+
+    if state.exemption_keyword is not None and state.turn_ordinal == current_turn:
+        scope = state.matching_exemption_for(tool_name, args)
+        if scope is not None:
+            state.consume_exemption_use()
+            return None
+        if state.exemption_scope is None:
+            detail = (
+                "A legacy exemption is active for this turn, but it is missing tool "
+                "scope and therefore fails closed under enforcement. Recreate the "
+                "exemption with allowed_tool (and allowed_action for dual-use tools)."
+            )
+            return {"action": "block", "message": f"BLOCKED: dispatch enforcement — {detail}"}
+        remaining = state.exemption_scope.get("remaining_uses")
+        if remaining is not None and int(remaining) <= 0:
+            detail = (
+                "The exact scoped exemption for this turn has already been consumed. "
+                "Record a new bounded exemption if another controller operation is required."
+            )
+            return {"action": "block", "message": f"BLOCKED: dispatch enforcement — {detail}"}
+        detail = (
+            "An exemption exists for this turn, but it authorizes only an exact scoped "
+            "exemption target (tool/action/count). This tool call does not match that scope."
+        )
+        return {"action": "block", "message": f"BLOCKED: dispatch enforcement — {detail}"}
 
     # Build an actionable block message.
     if state.route_task_id is not None and state.turn_ordinal != current_turn:
@@ -515,6 +599,7 @@ def _post_tool_call_enforcement(
         expected_model=str(dd.get("model", "")).strip() or None,
         expected_provider=str(dd.get("provider", "")).strip() or None,
         exemption_keyword=str(dd.get("exemption", "")).strip() or None,
+        exemption_scope=_extract_exemption_scope(dd),
         board=board,
     )
     if not readback_ok:
@@ -548,10 +633,34 @@ def _post_tool_call_enforcement(
         )
     elif "exemption" in dd:
         exemption = str(dd.get("exemption", "")).strip()
-        state.record_exemption(keyword=exemption, turn_ordinal=current_turn)
+        state.record_exemption(
+            keyword=exemption,
+            scope=_extract_exemption_scope(dd),
+            turn_ordinal=current_turn,
+        )
         logger.debug(
             "dispatch enforcement: exemption %s turn=%d", exemption, current_turn,
         )
+
+
+def _extract_exemption_scope(decision: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(decision, dict) or "exemption" not in decision:
+        return None
+    allowed_tool = str(decision.get("allowed_tool", "")).strip()
+    if not allowed_tool:
+        return None
+    scope: Dict[str, Any] = {"allowed_tool": allowed_tool}
+    allowed_action = decision.get("allowed_action")
+    if allowed_action is not None and str(allowed_action).strip():
+        scope["allowed_action"] = str(allowed_action).strip().lower()
+    allowed_uses = decision.get("allowed_uses")
+    try:
+        parsed_uses = int(allowed_uses) if allowed_uses is not None else 1
+    except (TypeError, ValueError):
+        parsed_uses = 1
+    scope["allowed_uses"] = parsed_uses
+    scope["remaining_uses"] = parsed_uses
+    return scope
 
 
 def _verify_dispatch_decision_from_db(
@@ -560,6 +669,7 @@ def _verify_dispatch_decision_from_db(
     expected_model: Optional[str],
     expected_provider: Optional[str],
     exemption_keyword: Optional[str],
+    exemption_scope: Optional[Dict[str, Any]] = None,
     board: Optional[str] = None,
 ) -> bool:
     """Read back the created task from the DB and verify dispatch_decision.
@@ -691,6 +801,18 @@ def _verify_dispatch_decision_from_db(
                         created_task_id, expected_kw, payload_keyword,
                     )
                     return False
+                if exemption_scope is not None:
+                    for key in ("allowed_tool", "allowed_action", "allowed_uses"):
+                        if exemption_scope.get(key) != payload.get(key):
+                            logger.warning(
+                                "dispatch enforcement: exemption task %s scope mismatch for %s "
+                                "(expected %r, got %r)",
+                                created_task_id,
+                                key,
+                                exemption_scope.get(key),
+                                payload.get(key),
+                            )
+                            return False
             else:
                 row = conn.execute(
                     "SELECT 1 FROM task_events "
@@ -832,6 +954,7 @@ def dispatch_enforcement_summary(session_id: str = "") -> Dict[str, Any]:
         "route_model": state.route_model,
         "route_provider": state.route_provider,
         "exemption_keyword": state.exemption_keyword,
+        "exemption_scope": dict(state.exemption_scope) if isinstance(state.exemption_scope, dict) else None,
         "enforcement_enabled": _is_enforcement_enabled(),
     }
 

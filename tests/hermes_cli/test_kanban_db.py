@@ -5049,6 +5049,28 @@ class TestDispatchDecision:
         assert len(exempted) == 1
         assert exempted[0].payload == {"exemption": "tiny"}
 
+    def test_scoped_exemption_payload_is_persisted_verbatim(self, kanban_home):
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="scoped exemption",
+                dispatch_decision={
+                    "exemption": "controller_judgment",
+                    "allowed_tool": "process",
+                    "allowed_action": "kill",
+                    "allowed_uses": 2,
+                },
+            )
+            events = kb.list_events(conn, tid)
+        exempted = [e for e in events if e.kind == "dispatch_exempted"]
+        assert len(exempted) == 1
+        assert exempted[0].payload == {
+            "exemption": "controller_judgment",
+            "allowed_tool": "process",
+            "allowed_action": "kill",
+            "allowed_uses": 2,
+        }
+
     def test_no_dispatch_decision_omits_routing_events(self, kanban_home):
         """Without dispatch_decision, no dispatch_routed/exempted event."""
         with kb.connect() as conn:

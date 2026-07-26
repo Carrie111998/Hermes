@@ -309,7 +309,9 @@ def validate_dispatch_decision(decision: Optional[dict]) -> None:
             f"dispatch_decision must be a dict, got {type(decision).__name__}"
         )
 
-    keys = set(decision.keys()) - {"model", "provider"}
+    keys = set(decision.keys()) - {
+        "model", "provider", "allowed_tool", "allowed_action", "allowed_uses"
+    }
     has_route = "route" in keys
     has_exemption = "exemption" in keys
 
@@ -347,6 +349,28 @@ def validate_dispatch_decision(decision: Optional[dict]) -> None:
                 f"dispatch_decision: unknown exemption {exemption!r}. "
                 f"Valid exemptions: {sorted(DISPATCH_EXEMPTIONS)}"
             )
+        allowed_tool = decision.get("allowed_tool")
+        if allowed_tool is not None and not str(allowed_tool).strip():
+            raise ValueError(
+                "dispatch_decision: 'allowed_tool' must be non-empty when provided"
+            )
+        allowed_action = decision.get("allowed_action")
+        if allowed_action is not None and not str(allowed_action).strip():
+            raise ValueError(
+                "dispatch_decision: 'allowed_action' must be non-empty when provided"
+            )
+        allowed_uses = decision.get("allowed_uses")
+        if allowed_uses is not None:
+            try:
+                parsed_uses = int(allowed_uses)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "dispatch_decision: 'allowed_uses' must be a positive integer"
+                ) from None
+            if parsed_uses <= 0:
+                raise ValueError(
+                    "dispatch_decision: 'allowed_uses' must be a positive integer"
+                )
 
 
 def _resolve_crash_grace_seconds() -> int:
