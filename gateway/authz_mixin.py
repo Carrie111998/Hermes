@@ -119,6 +119,22 @@ class GatewayAuthorizationMixin:
             return None
         profile_name = (profile or "").strip() or None
         if profile_name and profile_name != "default":
+            active_profile = None
+            active_profile_fn = getattr(self, "_active_profile_name", None)
+            if callable(active_profile_fn):
+                try:
+                    active_profile = active_profile_fn()
+                except Exception:
+                    active_profile = None
+            if profile_name == active_profile:
+                if adapter_id:
+                    adapter = getattr(self, "adapters_by_id", {}).get(
+                        str(adapter_id)
+                    )
+                    if adapter is not None:
+                        return adapter
+                adapters = getattr(self, "adapters", None) or {}
+                return adapters.get(platform)
             if adapter_id:
                 profile_adapters_by_id = (
                     getattr(self, "_profile_adapters_by_id", None) or {}
