@@ -274,9 +274,23 @@ class TestUpdateManagedUv:
             assert update_managed_uv() is None
 
     def test_self_update_success(self, tmp_path):
+        from hermes_cli.managed_uv import RuntimeRepairResult
+
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
+             patch("hermes_cli.managed_uv.subprocess.run") as mock_run, \
+             patch(
+                 "hermes_cli.managed_uv.repair_vulnerable_runtime",
+                 return_value=RuntimeRepairResult(
+                     "safe",
+                     sqlite_before="3.53.1",
+                     sqlite_after="3.53.1",
+                 ),
+             ) as mock_repair:
+            # update_managed_uv() always reaches the runtime-repair hook when a
+            # live checkout venv exists. Stub that hook here so this test only
+            # counts the uv self-update/version calls instead of depending on
+            # the developer worktree's real runtime layout.
             # uv self update succeeds
             mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
             from hermes_cli.managed_uv import update_managed_uv
@@ -285,6 +299,7 @@ class TestUpdateManagedUv:
             # First call is self update, second is --version
             assert mock_run.call_count == 2
             assert mock_run.call_args_list[0][0][0] == [str(tmp_path / "bin" / "uv"), "self", "update"]
+            mock_repair.assert_called_once_with(str(tmp_path / "bin" / "uv"))
 
     def test_self_update_failure_non_fatal(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
