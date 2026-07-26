@@ -7,6 +7,7 @@ break them.
 
 from __future__ import annotations
 
+from tui_gateway import git_probe
 from tui_gateway import project_tree as pt
 
 _SID = 0
@@ -76,6 +77,22 @@ def test_main_checkout_groups_by_recorded_branch_with_stable_lane_ids():
     # Trunk sorts ahead of the feature branch; both live in the main checkout.
     assert [g["label"] for repo in project["repos"] for g in repo["groups"]] == ["main", "feature"]
     assert all(g["isMain"] for repo in project["repos"] for g in repo["groups"])
+
+
+def test_windows_main_checkout_matches_mixed_separator_roots(monkeypatch):
+    cwd = r"C:\Users\alice\repo"
+    monkeypatch.setattr(git_probe, "repo_root", lambda _cwd: "C:/Users/alice/repo")
+    monkeypatch.setattr(git_probe, "common_repo_root", lambda _cwd: cwd)
+    session = _session(cwd, branch="main")
+
+    tree = pt.build_tree([], [session], [], git_probe.resolve, hydrate=True)
+    project = tree["projects"][0]
+    lane = project["repos"][0]["groups"][0]
+
+    assert lane["id"] == rf"{cwd}::branch::main"
+    assert lane["label"] == "main"
+    assert lane["isMain"] is True
+    assert lane["sessions"] == [session]
 
 
 def test_linked_worktrees_fold_under_their_common_repo_root():
