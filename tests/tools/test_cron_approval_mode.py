@@ -7,6 +7,7 @@ from tools.approval import (
     _get_cron_approval_mode,
     check_all_command_guards,
     check_dangerous_command,
+    check_execute_code_guard,
     detect_dangerous_command,
 )
 
@@ -358,6 +359,26 @@ class TestCronModeInteractions:
 
         result = check_dangerous_command("rm -rf /tmp/stuff", "local")
         assert result["approved"]
+
+    def test_inherited_cron_marker_does_not_make_kanban_worker_cron(self, monkeypatch):
+        """Kanban workers ignore leaked HERMES_CRON_SESSION from the gateway.
+
+        The gateway hosts both cron and kanban. A process-global cron marker can
+        be inherited by a dispatcher-spawned worker, but HERMES_KANBAN_TASK is a
+        stronger signal that this process has a live task owner rather than a
+        detached cron approval surface.
+        """
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            assert check_dangerous_command("rm -rf /tmp/stuff", "local")["approved"]
+            assert check_execute_code_guard("print('ok')", "local")["approved"]
 
 
 class TestCronWithGatewayOrigin:
