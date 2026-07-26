@@ -246,6 +246,13 @@ function Stage-VendorFiles {
         # stub commit is discarded and never seen again.
         Push-Location $InstallDir
         $gitInitOk = $true
+        # Temporarily relax ErrorActionPreference: git writes hints/warnings
+        # to stderr (e.g. "hint: Using 'master' as the name for the initial
+        # branch..."). Under $ErrorActionPreference="Stop" (the script's
+        # default), PowerShell treats any stderr line from a native command as
+        # a terminating error, aborting git init before remote add + commit.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         try {
             $gitStep = "init"
             git -c windows.appendAtomically=false init 2>&1 | Out-Null
@@ -281,6 +288,8 @@ function Stage-VendorFiles {
             $gitInitOk = $false
             Write-Host "[vendor] WARNING: Git init failed at step '$gitStep': $_" -ForegroundColor Yellow
             Write-Host "[vendor] Updates will use HTTP fallback instead of git." -ForegroundColor Yellow
+        } finally {
+            $ErrorActionPreference = $prevEAP
         }
         Pop-Location
         Write-Host "[vendor] Staged hermes-agent repository" -ForegroundColor Cyan

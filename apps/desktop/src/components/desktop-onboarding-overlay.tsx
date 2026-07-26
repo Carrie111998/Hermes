@@ -277,6 +277,9 @@ export function DesktopOnboardingOverlay({ enabled, onCompleted, requestGateway 
   // Mount from frame 1 so we replace the boot overlay seamlessly. The
   // configured field stays null until the runtime check resolves; only then
   // do we know whether to dismiss (true) or surface the picker (false).
+  // When configured===null (unknown), the code falls through to <Preparing>
+  // which shows the boot progress bar — the user sees real startup progress
+  // instead of a bare spinner.
   // EXCEPTION: manual mode (user opened the selector from a working app to
   // add/switch a provider) shows the overlay regardless of configured state.
   if (onboarding.configured === true && !onboarding.manual) {
@@ -448,6 +451,17 @@ export function Picker({ ctx }: { ctx: OnboardingContext }) {
   // provider refresh may flip back to 'oauth'); it preselects the local option
   // and hides the "back to sign in" link since the user came specifically to
   // configure a custom endpoint.
+  //
+  // IMPORTANT: when providers === null (not yet loaded), hasOauth is false
+  // because ordered is []. Without this guard, the component falls through to
+  // ApiKeyForm immediately, causing a brief flash of the API-key form before
+  // the OAuth provider list finishes loading. Show a loading placeholder until
+  // the provider list resolves, unless the user explicitly chose the API-key
+  // mode or local-endpoint mode (those don't need the provider list).
+  if (providers === null && !localEndpoint && mode !== 'apikey') {
+    return <Status>{t.onboarding.lookingUpProviders}</Status>
+  }
+
   if (localEndpoint || mode === 'apikey' || !hasOauth) {
     return (
       <div className="grid gap-3">

@@ -1,1 +1,8 @@
-{"schemaVersion":1,"commit":"70b616b96d04e2f080049e0eab8acc6a6538796e","branch":"main","dirty":false,"source":"local"}
+{
+  "schemaVersion": 1,
+  "commit": "4fdc0a49c7689387512fc034bcbf921acf5d1af9",
+  "branch": "main",
+  "builtAt": "2026-07-26T00:57:07.253Z",
+  "dirty": true,
+  "source": "local"
+}

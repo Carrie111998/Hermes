@@ -277,12 +277,15 @@ async function checkUpdatesViaHttp(updateRoot, branch, remoteUrl) {
     }
   }
 
-  // Try .git plumbing first, then fall back to bootstrap marker.
-  // When git.exe is broken, install.ps1's git init also failed, leaving
-  // no .git at all.  The bootstrap marker may still have a pinnedCommit.
-  let localSha = readLocalHeadSha(updateRoot)
+  // Prefer the bootstrap marker's pinnedCommit over git HEAD. For vendor/offline
+  // installs, install.ps1 creates a stub commit that doesn't match the remote —
+  // the pinnedCommit from install-stamp.json is the ground truth for "what was
+  // installed." git HEAD is only reliable for normal `git clone` installs and
+  // after `hermes update` (which moves HEAD and the desktop now refreshes the
+  // marker after a successful update).
+  let localSha = readShaFromBootstrapMarker(updateRoot)
   if (!localSha) {
-    localSha = readShaFromBootstrapMarker(updateRoot)
+    localSha = readLocalHeadSha(updateRoot)
   }
   const currentBranch = readLocalBranch(updateRoot)
 

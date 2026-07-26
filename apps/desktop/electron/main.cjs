@@ -1644,13 +1644,18 @@ async function checkUpdates() {
   try {
   const gitDir = path.join(updateRoot, '.git')
   if (!directoryExists(gitDir)) {
-    return {
-      supported: false,
-      reason: 'not-a-git-checkout',
-      message: `${updateRoot} isn't a git checkout — desktop self-update only runs against a source install.`,
-      hermesRoot: updateRoot,
-      branch
-    }
+    // No .git at all — skip straight to HTTP API. This happens on fresh SFX
+    // installs before bootstrap creates the git repo, or when bootstrap failed.
+    rememberLog('[updates] no .git directory, using HTTP API fallback')
+    return checkUpdatesViaHttp(updateRoot, branch, OFFICIAL_REPO_HTTPS_URL)
+  }
+
+  // .git exists but might be an empty repo (git init succeeded but commit
+  // failed). Verify HEAD resolves; if not, use HTTP API.
+  const headCheck = await runGit(['rev-parse', '--verify', 'HEAD'], { cwd: updateRoot })
+  if (headCheck.code !== 0) {
+    rememberLog(`[updates] git HEAD invalid (${firstLine(headCheck.stderr)}), using HTTP API fallback`)
+    return checkUpdatesViaHttp(updateRoot, branch, OFFICIAL_REPO_HTTPS_URL)
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
@@ -2073,9 +2078,26 @@ async function handOffWindowsBootstrapRecovery(reason) {
 // Resolve the hermes CLI to drive an in-app update: prefer the venv shim in
 // the install we're updating, fall back to `hermes` on PATH.
 function resolveHermesCliBinary(updateRoot) {
-  const venvHermes = path.join(updateRoot, 'venv', 'bin', 'hermes')
+  const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
+  const venvHermes = path.join(venvBin, IS_WINDOWS ? 'hermes.exe' : 'hermes')
   if (fileExists(venvHermes)) return venvHermes
+  // Fallback: if hermes.exe wasn't created in the venv (editable install
+  // without entry points, or a copied venv), use the venv's Python directly
+  // to invoke hermes_cli.main. This avoids findOnPath('hermes') picking up a
+  // stale hermes from a different HERMES_HOME.
+  const venvPython = path.join(venvBin, IS_WINDOWS ? 'python.exe' : 'python')
+  if (fileExists(venvPython)) return venvPython
   return findOnPath('hermes') || null
+}
+
+// Build the spawn args for `hermes update` (or any hermes CLI subcommand),
+// transparently handling the case where resolveHermesCliBinary returned the
+// venv Python instead of a real hermes binary.
+function hermesCliArgs(binary, cliArgs) {
+  if (binary.endsWith(IS_WINDOWS ? 'python.exe' : 'python')) {
+    return ['-m', 'hermes_cli.main', ...cliArgs]
+  }
+  return cliArgs
 }
 
 // Spawn a command and stream each output line to the update progress channel.
@@ -2134,12 +2156,17 @@ async function applyUpdatesPosixInApp() {
     return { ok: true, manual: true, command: 'hermes update', hermesRoot: updateRoot }
   }
 
-  // Put the Hermes-managed Node and the venv on PATH so `hermes desktop`'s
-  // npm build can find them on a machine with no system Node. Windows portable
-  // Node lives directly under %LOCALAPPDATA%\hermes\node, not node\bin.
+  // Put the Hermes-managed Node, bundled git, and the venv on PATH so that
+  // `hermes update` (which calls `git fetch` as a subprocess) and
+  // `hermes desktop` (which needs npm) both work on a machine with no
+  // system-level git or Node.
   const env = {
     HERMES_HOME,
-    PATH: pathWithHermesManagedNode(path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin'))
+    PATH: pathWithHermesManagedNode(
+      path.join(HERMES_HOME, 'git', 'cmd'),
+      path.join(HERMES_HOME, 'git', 'bin'),
+      path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
+    )
   }
 
   // `hermes update` reaps stale `hermes dashboard` backends (a code update
@@ -2187,7 +2214,7 @@ async function applyUpdatesPosixInApp() {
   } catch { /* best effort */ }
 
   emitUpdateProgress({ stage: 'update', message: '正在更新奇计（代码 + 依赖）…', percent: 10 })
-  const updated = await runStreamedUpdate(hermes, ['update', '--yes', ...branchArgs], {
+  const updated = await runStreamedUpdate(hermes, hermesCliArgs(hermes, ['update', '--yes', ...branchArgs]), {
     cwd: updateRoot,
     env,
     stage: 'update'
@@ -2196,6 +2223,18 @@ async function applyUpdatesPosixInApp() {
     emitUpdateProgress({ stage: 'error', message: 'hermes update failed.', error: updated.error || 'update-failed' })
     return { ok: false, error: 'hermes update failed' }
   }
+
+  // Refresh the bootstrap marker's pinnedCommit so checkUpdates stops
+  // reporting "behind" after a successful update. Without this, the marker
+  // retains the pre-update commit SHA and every subsequent check shows an
+  // update is available (false positive).
+  try {
+    const newHead = await runGit(['rev-parse', 'HEAD'], { cwd: updateRoot })
+    if (newHead.code === 0 && newHead.stdout) {
+      writeBootstrapMarker({ pinnedCommit: newHead.stdout.trim() })
+    }
+  } catch { /* best effort — marker refresh is not critical */ }
+
 
   // ── Classify changed files to decide the rebuild strategy ──────────────
   //   Path A: only Python/skills changed   → skip rebuild entirely (~30s)
@@ -2382,7 +2421,7 @@ async function applyUpdatesPosixInApp() {
     if (attempt > 0) {
       emitUpdateProgress({ stage: 'rebuild', message: 'Retrying the desktop rebuild…', percent: 60 })
     }
-    return runStreamedUpdate(hermes, ['desktop', '--build-only'], { cwd: updateRoot, env, stage: 'rebuild' })
+    return runStreamedUpdate(hermes, hermesCliArgs(hermes, ['desktop', '--build-only']), { cwd: updateRoot, env, stage: 'rebuild' })
   })
   if (rebuilt.code !== 0) {
     rememberLog(`[updates] rebuild failed: ${rebuilt.error || 'unknown'}`)
