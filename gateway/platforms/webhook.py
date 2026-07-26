@@ -376,10 +376,14 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "log":
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
-            return SendResult(success=True)
+            result = SendResult(success=True)
+            self._record_completion_delivery(delivery, metadata, result)
+            return result
 
         if deliver_type == "github_comment":
-            return await self._deliver_github_comment(content, delivery)
+            result = await self._deliver_github_comment(content, delivery)
+            self._record_completion_delivery(delivery, metadata, result)
+            return result
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
@@ -391,14 +395,30 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         if self.gateway_runner and _is_known_platform:
-            return await self._deliver_cross_platform(
+            result = await self._deliver_cross_platform(
                 deliver_type, content, delivery
             )
+            self._record_completion_delivery(delivery, metadata, result)
+            return result
 
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
-        return SendResult(
+        result = SendResult(
             success=False, error=f"Unknown deliver type: {deliver_type}"
         )
+        self._record_completion_delivery(delivery, metadata, result)
+        return result
+
+    @staticmethod
+    def _record_completion_delivery(
+        delivery: dict,
+        metadata: Optional[Dict[str, Any]],
+        result: SendResult,
+    ) -> None:
+        """Track the final user-visible send, excluding interim status messages."""
+        if not (metadata or {}).get("notify"):
+            return
+        delivery["completion_delivery_attempted"] = True
+        delivery["completion_delivery_succeeded"] = bool(result.success)
 
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL.
@@ -1016,6 +1036,11 @@ class WebhookAdapter(BasePlatformAdapter):
             if outcome == ProcessingOutcome.CANCELLED
             else "failed"
         )
+        delivery = self._delivery_info.get(event.source.chat_id, {})
+        if status == "completed" and not delivery.get(
+            "completion_delivery_succeeded", False
+        ):
+            status = "failed"
         body = self._completion_callback_body(event, status)
         if body is None:
             return

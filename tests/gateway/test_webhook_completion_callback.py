@@ -136,12 +136,35 @@ async def test_final_callback_is_spooled_then_removed_after_ack(tmp_path):
     adapter._send_completion_callback = AsyncMock(return_value=True)
     adapter._end_webhook_session = AsyncMock()
 
+    await adapter.send(event.source.chat_id, "progress", metadata={})
+    assert "completion_delivery_succeeded" not in adapter._delivery_info[
+        event.source.chat_id
+    ]
+    await adapter.send(
+        event.source.chat_id, "final report", metadata={"notify": True}
+    )
+
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     sent = adapter._send_completion_callback.await_args.args[1]
     assert sent["status"] == "completed"
     assert not list((tmp_path / "outbox").glob("*.json"))
     adapter._end_webhook_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_success_without_final_delivery_callbacks_failed(tmp_path):
+    adapter = make_adapter(callback_config())
+    event = make_event(adapter)
+    adapter._callback_outbox_dir = lambda: tmp_path / "outbox"
+    adapter._send_completion_callback = AsyncMock(return_value=True)
+    adapter._end_webhook_session = AsyncMock()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    sent = adapter._send_completion_callback.await_args.args[1]
+    assert sent["status"] == "failed"
+    assert sent["error_code"] == "processing_failed"
 
 
 @pytest.mark.asyncio
