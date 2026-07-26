@@ -8,6 +8,7 @@
 
 | ID | 目标文件 | 做了什么 | 为什么需要 | 上游状态 |
 |---|---|---|---|---|
+| **P-053** | `scripts/update_thirdparty.py`、`tests/scripts/test_update_thirdparty.py` | 新增维护脚本，检查 **ripgrep** 与 **rtk** 的 GitHub 最新 release，自动同步 `scripts/install.sh`、`scripts/install.ps1`、`tools/rtk_provision.py`、`.github/workflows/tests.yml` 中**每一处**版本钉子（tests.yml 里 `test` 与 `e2e` 两个 job 各钉一次 ripgrep），并重新计算 ripgrep 在 CI 工作流里的 SHA256；支持 `--china-mirror` / `--mirror` / `HERMES_THIRDPARTY_MIRROR` 显式开启的国内镜像回退。 | Hermes-CN 把这些外部二进制版本钉在多种文件格式（Bash、PowerShell、Python、YAML）中，且国内访问 GitHub 经常慢或不通；统一 updater 可保持多文件版本一致，并提供镜像回退。 | CN 专属维护工具；待上游引入 `_ripgrep_common.py` / `_rtk_common.py` 后可考虑 upstream |
 | **P-025** | `hermes_cli/web_server.py` | `/api/providers/oauth` 现在：(1) 命中 20s 的按 profile 进程内 TTL 缓存；(2) 用 `asyncio.to_thread` 并发跑各 provider 的状态检查（移出 FastAPI 事件循环），不再串行内联；(3) 在每次连接/断开时失效缓存（断开的两条清理路径、PKCE submit、设备码/loopback 轮询到 `approved`）。另加 `refresh=true` 逃生阀。 | 桌面端模型页每次打开、以及每次窗口重新聚焦都会串行枚举所有 OAuth provider 的状态；部分检查会联网/起子进程，而该 handler 是 `async`，于是阻塞了同时服务聊天网关 WebSocket 的事件循环——模型页要等好几秒，还会拖累实时会话。 | 建议上游（通用响应性修复） |
 | **P-001** | `tui_gateway/server.py` | provider 配置 dict/list 不一致修复 | 早期 fork 需要兼容用户配置形态 | 已由上游修复，本 fork 不再携带 |
 | **P-002** | `hermes_cli/web_server.py` | 增加 `POST /api/upload` 附件上传接口 | desktop / web composer 拖拽上传依赖它 | 未进入上游 |

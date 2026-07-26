@@ -1253,8 +1253,8 @@ install_system_packages() {
 }
 
 # ── Hermes-managed external tools (ripgrep, rtk, ...) ──
-RIPGREP_VERSION="14.1.1"
-RTK_VERSION="0.43.0"
+RIPGREP_VERSION="15.2.0"
+RTK_VERSION="0.44.0"
 
 _install_ripgrep_direct() {
     local arch_suffix
