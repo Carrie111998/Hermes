@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -45,14 +46,23 @@ def resolve_codex_bin(codex_bin: str = DEFAULT_CODEX_BIN) -> str:
     so a bare ``"codex"`` raises ``FileNotFoundError`` even though the CLI is
     installed and ``shutil.which("codex")`` finds it (#48510).
 
-    ``find_hermes_node_executable`` searches the Hermes-managed Node dirs
-    directly (not just inherited ``PATH``) and its candidate order —
-    ``["codex.cmd", "codex.exe", "codex"]`` — deliberately excludes ``.ps1``,
-    which PowerShell's execution policy blocks by default. That also fixes
-    gateway/service/Kanban-worker contexts where ``PATH`` is minimal (#61360).
+    Resolution order for the default (only the ``DEFAULT_CODEX_BIN`` sentinel
+    is resolved — an explicit path is always returned untouched):
 
-    An explicitly supplied path is returned untouched. Falls back to the input
-    when nothing resolves, so the caller still gets the original error message.
+    1. ``find_hermes_node_executable`` — searches the Hermes-managed Node dirs
+       directly (not just inherited ``PATH``). Its candidate order
+       ``["codex.cmd", "codex.exe", "codex"]`` deliberately excludes ``.ps1``.
+       Covers Hermes-managed npm installs and minimal-``PATH`` gateway /
+       service / Kanban-worker contexts where ``PATH`` is sanitized (#61360).
+    2. ``shutil.which`` — covers a system-Node global install where the shim
+       lives in e.g. ``%APPDATA%\\npm`` (the exact layout in the #48510 report),
+       which is on ``PATH`` but outside the Hermes node dirs. A ``.ps1`` hit is
+       rejected: PowerShell blocks it under the default execution policy and
+       ``CreateProcess`` cannot launch a bare ``.ps1``, so accepting it would
+       just trade one spawn failure for another. (Windows' default ``PATHEXT``
+       excludes ``.PS1``, but a user can add it, so the guard is defensive.)
+    3. Fall back to the input, so the caller still gets the actionable
+       "codex CLI not found ... npm i -g @openai/codex" message.
     """
     if codex_bin != DEFAULT_CODEX_BIN:
         return codex_bin
@@ -62,6 +72,12 @@ def resolve_codex_bin(codex_bin: str = DEFAULT_CODEX_BIN) -> str:
         resolved = find_hermes_node_executable(codex_bin)
         if resolved:
             return resolved
+    except Exception:  # pragma: no cover - defensive, never block spawn
+        pass
+    try:
+        which_hit = shutil.which(codex_bin)
+        if which_hit and not which_hit.lower().endswith(".ps1"):
+            return which_hit
     except Exception:  # pragma: no cover - defensive, never block spawn
         pass
     return codex_bin

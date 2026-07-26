@@ -58,19 +58,71 @@ class TestResolveCodexBin:
 
     def test_falls_back_to_input_when_nothing_resolves(self, monkeypatch):
         """No discoverable binary → return the original so the caller still
-        gets the actionable 'not found, install with npm i -g' message."""
+        gets the actionable 'not found, install with npm i -g' message.
+        Both resolver tiers must miss."""
         monkeypatch.setattr(
             "hermes_constants.find_hermes_node_executable", lambda name: None
         )
+        monkeypatch.setattr(cas.shutil, "which", lambda name: None)
         assert cas.resolve_codex_bin() == cas.DEFAULT_CODEX_BIN
 
     def test_resolver_failure_does_not_block_spawn(self, monkeypatch):
-        """A broken resolver must degrade to the old behaviour, not raise."""
+        """A broken tier-1 resolver must degrade, not raise. Tier-2 also
+        misses here so the final fallback is exercised."""
 
         def boom(name):
             raise RuntimeError("resolver exploded")
 
         monkeypatch.setattr("hermes_constants.find_hermes_node_executable", boom)
+        monkeypatch.setattr(cas.shutil, "which", lambda name: None)
+        assert cas.resolve_codex_bin() == cas.DEFAULT_CODEX_BIN
+
+    def test_tier2_which_covers_system_npm_when_hermes_dirs_miss(self, monkeypatch):
+        """The #48510 reporter's layout: codex.cmd in %APPDATA%\\npm, on PATH
+        but outside the Hermes node dirs. Tier 1 misses; tier 2 (shutil.which)
+        must find the launchable .cmd — otherwise the reported bug is unfixed."""
+        monkeypatch.setattr(
+            "hermes_constants.find_hermes_node_executable", lambda name: None
+        )
+        appdata_cmd = r"C:\Users\x\AppData\Roaming\npm\codex.CMD"
+        monkeypatch.setattr(cas.shutil, "which", lambda name: appdata_cmd)
+        assert cas.resolve_codex_bin() == appdata_cmd
+
+    def test_tier2_rejects_ps1_hit(self, monkeypatch):
+        """shutil.which can resolve to codex.ps1 if a user added .PS1 to
+        PATHEXT. PowerShell blocks it and CreateProcess can't launch a bare
+        .ps1, so it must be rejected and the bare-name fallback returned."""
+        monkeypatch.setattr(
+            "hermes_constants.find_hermes_node_executable", lambda name: None
+        )
+        monkeypatch.setattr(
+            cas.shutil, "which", lambda name: r"C:\Users\x\AppData\Roaming\npm\codex.ps1"
+        )
+        assert cas.resolve_codex_bin() == cas.DEFAULT_CODEX_BIN
+
+    def test_tier1_wins_over_tier2(self, monkeypatch):
+        """When the Hermes-managed resolver finds a binary, tier 2 is never
+        consulted — the managed path is authoritative."""
+        managed = r"C:\hermes\node\codex.cmd"
+        monkeypatch.setattr(
+            "hermes_constants.find_hermes_node_executable", lambda name: managed
+        )
+        monkeypatch.setattr(
+            cas.shutil, "which",
+            lambda name: pytest.fail("tier 2 must not run when tier 1 hits"),
+        )
+        assert cas.resolve_codex_bin() == managed
+
+    def test_tier2_failure_does_not_block_spawn(self, monkeypatch):
+        """A broken shutil.which must degrade to the bare-name fallback."""
+        monkeypatch.setattr(
+            "hermes_constants.find_hermes_node_executable", lambda name: None
+        )
+
+        def boom(name):
+            raise RuntimeError("which exploded")
+
+        monkeypatch.setattr(cas.shutil, "which", boom)
         assert cas.resolve_codex_bin() == cas.DEFAULT_CODEX_BIN
 
 
@@ -114,6 +166,7 @@ class TestCheckCodexBinaryUsesResolver:
         monkeypatch.setattr(
             "hermes_constants.find_hermes_node_executable", lambda name: None
         )
+        monkeypatch.setattr(cas.shutil, "which", lambda name: None)
 
         def fake_run(cmd, **kwargs):
             raise FileNotFoundError(2, "not found")
