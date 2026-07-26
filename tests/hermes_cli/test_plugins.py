@@ -17,6 +17,7 @@ from hermes_cli.plugins import (
     PluginManifest,
     get_plugin_command_handler,
     get_plugin_commands,
+    invoke_plugin_command,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
@@ -2067,6 +2068,46 @@ class TestPluginCommands:
         assert "cmd-b" in mgr._plugin_commands
         assert mgr._plugin_commands["cmd-a"]["plugin"] == "plugin-a"
         assert mgr._plugin_commands["cmd-b"]["plugin"] == "plugin-b"
+
+    def test_invoke_plugin_command_preserves_legacy_one_arg_handler(self):
+        """Handlers without context continue to receive exactly their raw args."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        seen = []
+        ctx.register_command("legacy", lambda args: seen.append(args) or "ok")
+
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            result = invoke_plugin_command(
+                "legacy", "hello", context={"surface": "gateway", "platform": "telegram"}
+            )
+
+        assert result == "ok"
+        assert seen == ["hello"]
+
+    def test_invoke_plugin_command_passes_context_only_when_opted_in(self):
+        """Opted-in handlers receive trusted dispatch context as a second argument."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        seen = []
+        ctx.register_command(
+            "contextual",
+            lambda args, context: seen.append((args, context)) or "ok",
+            accepts_context=True,
+        )
+        context = {"surface": "gateway", "platform": "telegram", "user_id": "42"}
+
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            result = invoke_plugin_command("contextual", "approve 1234", context=context)
+
+        assert result == "ok"
+        assert seen == [("approve 1234", context)]
+
+    def test_invoke_plugin_command_returns_none_for_unknown_name(self):
+        mgr = PluginManager()
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            assert invoke_plugin_command("missing", "x", context={}) is None
 
 
 class TestPluginCommandResultResolution:

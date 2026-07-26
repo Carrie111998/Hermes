@@ -12239,17 +12239,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
 
-        # Plugin-registered slash commands
+        # Plugin-registered slash commands. Gateway authorization has already
+        # passed at this point; contextual handlers receive only the trusted
+        # metadata needed for their own fine-grained policy checks.
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_command_handler,
+                    invoke_plugin_command,
+                )
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
+                plugin_name = command.replace("_", "-")
+                if get_plugin_command_handler(plugin_name):
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    platform = getattr(getattr(source, "platform", None), "value", None)
+                    context = {
+                        "surface": "gateway",
+                        "platform": str(platform or ""),
+                        "user_id": str(getattr(source, "user_id", "") or ""),
+                        "chat_id": str(getattr(source, "chat_id", "") or ""),
+                    }
+                    result = invoke_plugin_command(plugin_name, user_args, context=context)
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None

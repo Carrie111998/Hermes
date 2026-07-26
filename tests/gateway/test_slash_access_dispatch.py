@@ -316,6 +316,37 @@ async def test_plugin_registered_command_is_gated(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gateway_contextual_plugin_command_receives_trusted_source(monkeypatch):
+    """A context-opted plugin gets platform/user/chat metadata after gateway auth."""
+    runner = _make_runner()
+    source = _make_source(user_id="111", chat_id="222")
+    received = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: object() if name == "contextual" else None,
+    )
+
+    def _invoke(name, raw_args, *, context):
+        received.update(name=name, raw_args=raw_args, context=context)
+        return "context-ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_plugin_command", _invoke)
+
+    result = await runner._handle_message(_make_event("/contextual approve 1234", source))
+
+    assert result == "context-ok"
+    assert received["name"] == "contextual"
+    assert received["raw_args"] == "approve 1234"
+    assert received["context"] == {
+        "surface": "gateway",
+        "platform": source.platform.value,
+        "user_id": "111",
+        "chat_id": "222",
+    }
+
+
+@pytest.mark.asyncio
 async def test_non_admin_denied_for_unlisted_quick_command_exec():
     """A non-admin must not reach the quick_commands exec sink for a command
     that isn't in user_allowed_commands. Regression for #44727 — quick

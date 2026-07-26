@@ -532,24 +532,16 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        *,
+        accepts_context: bool = False,
     ) -> None:
-        """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
+        """Register an in-session slash command for CLI and gateway sessions.
 
-        The handler signature is ``fn(raw_args: str) -> str | None``.
-        It may also be an async callable — the gateway dispatch handles both.
-
-        Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
-        terminal commands), this registers in-session slash commands that users
-        invoke during a conversation.
-
-        ``args_hint`` is an optional short string (e.g. ``"<file>"`` or
-        ``"dias:7 formato:json"``) used by gateway adapters to surface the
-        command with an argument field — for example Discord's native slash
-        command picker. Plugin commands without ``args_hint`` register as
-        parameterless in Discord and still accept trailing text when invoked
-        as free-form chat.
-
-        Names conflicting with built-in commands are rejected with a warning.
+        ``handler`` normally receives ``fn(raw_args: str)``. Set
+        ``accepts_context=True`` to opt into ``fn(raw_args, context)``. The
+        context is supplied only by the dispatch surface and contains trusted
+        local metadata such as the gateway platform and authenticated user ID;
+        legacy handlers are never called with an unexpected second argument.
         """
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
@@ -577,6 +569,7 @@ class PluginContext:
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "accepts_context": bool(accepts_context),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
@@ -2340,6 +2333,29 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
 def get_plugin_context_engine():
     """Return the plugin-registered context engine, or None."""
     return _ensure_plugins_discovered()._context_engine
+
+
+def invoke_plugin_command(
+    name: str,
+    raw_args: str,
+    *,
+    context: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Invoke a registered command with optional trusted dispatch context.
+
+    A plugin must explicitly opt in through ``register_command(...,
+    accepts_context=True)`` before receiving the second argument. This keeps
+    every existing ``handler(raw_args)`` plugin API-compatible.
+    """
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    if entry is None:
+        return None
+    handler = entry.get("handler")
+    if not callable(handler):
+        return None
+    if entry.get("accepts_context", False):
+        return handler(raw_args, dict(context or {}))
+    return handler(raw_args)
 
 
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
