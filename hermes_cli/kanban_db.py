@@ -1365,6 +1365,84 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Task-2 workflow acceptance state.  These records are additive and immutable:
+-- ordinary task status/result fields remain backwards compatible, while a
+-- workflow verifier edge consults only these kernel-created records.
+CREATE TABLE IF NOT EXISTS accepted_handoffs (
+    id                         TEXT PRIMARY KEY,
+    workflow_step_attempt_id   TEXT NOT NULL UNIQUE,
+    implementation_task_id     TEXT NOT NULL,
+    implementation_run_id      INTEGER NOT NULL,
+    implementation_event_id    INTEGER NOT NULL,
+    verifier_task_id            TEXT NOT NULL UNIQUE,
+    verifier_role               TEXT NOT NULL,
+    artifact_manifest_json      TEXT NOT NULL,
+    artifact_manifest_digest    TEXT NOT NULL,
+    source_revision             TEXT NOT NULL,
+    baseline_manifest_digest    TEXT,
+    acceptance_contract_hash    TEXT NOT NULL,
+    route_gate_json             TEXT,
+    created_at                  INTEGER NOT NULL,
+    UNIQUE (implementation_task_id, implementation_run_id, implementation_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS verifier_pass_receipts (
+    id                          TEXT PRIMARY KEY,
+    verifier_task_id            TEXT NOT NULL UNIQUE,
+    verifier_run_id             INTEGER NOT NULL UNIQUE,
+    verifier_role               TEXT NOT NULL,
+    accepted_handoff_id         TEXT NOT NULL UNIQUE,
+    workflow_step_attempt_id    TEXT NOT NULL,
+    parent_run_id               INTEGER NOT NULL,
+    parent_event_id             INTEGER NOT NULL,
+    artifact_manifest_digest    TEXT NOT NULL,
+    recomputed_manifest_digest  TEXT NOT NULL,
+    source_revision             TEXT NOT NULL,
+    baseline_manifest_digest    TEXT,
+    acceptance_contract_hash    TEXT NOT NULL,
+    predecessor_versions_json   TEXT NOT NULL,
+    route_telemetry_json        TEXT,
+    outcome                     TEXT NOT NULL CHECK (outcome = 'PASS'),
+    receipt_version             INTEGER NOT NULL CHECK (receipt_version > 0),
+    created_at                  INTEGER NOT NULL
+);
+
+-- Exact parent/link/status/result/receipt state captured atomically with claim.
+-- The JSON is canonical and content-addressed so direct SQL changes are caught
+-- even when they bypass a version-incrementing application path.
+CREATE TABLE IF NOT EXISTS task_run_prerequisite_sets (
+    run_id          INTEGER PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    snapshot_json   TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS accepted_handoffs_immutable_update
+BEFORE UPDATE ON accepted_handoffs BEGIN
+    SELECT RAISE(ABORT, 'accepted handoff is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS accepted_handoffs_immutable_delete
+BEFORE DELETE ON accepted_handoffs BEGIN
+    SELECT RAISE(ABORT, 'accepted handoff is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS verifier_pass_receipts_immutable_update
+BEFORE UPDATE ON verifier_pass_receipts BEGIN
+    SELECT RAISE(ABORT, 'verifier PASS receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS verifier_pass_receipts_immutable_delete
+BEFORE DELETE ON verifier_pass_receipts BEGIN
+    SELECT RAISE(ABORT, 'verifier PASS receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS task_run_prerequisite_sets_immutable_update
+BEFORE UPDATE ON task_run_prerequisite_sets BEGIN
+    SELECT RAISE(ABORT, 'prerequisite snapshot is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS task_run_prerequisite_sets_immutable_delete
+BEFORE DELETE ON task_run_prerequisite_sets BEGIN
+    SELECT RAISE(ABORT, 'prerequisite snapshot is immutable');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1375,6 +1453,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_verifier     ON accepted_handoffs(verifier_task_id);
+CREATE INDEX IF NOT EXISTS idx_verifier_receipts_task ON verifier_pass_receipts(verifier_task_id, receipt_version);
+CREATE INDEX IF NOT EXISTS idx_prerequisite_task      ON task_run_prerequisite_sets(task_id, run_id);
 """
 
 
@@ -3929,6 +4010,167 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
+
+def _canonical_json(value: Any) -> str:
+    """Serialize a kernel record deterministically for hashing/comparison."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _workflow_verifier_edge(
+    conn: sqlite3.Connection, parent_id: str, child_id: str,
+) -> bool:
+    """Return whether ``parent -> child`` is a workflow verification edge."""
+    row = conn.execute(
+        """
+        SELECT p.workflow_template_id AS parent_workflow,
+               p.current_step_key AS parent_step,
+               c.workflow_template_id AS child_workflow
+          FROM tasks AS p
+          JOIN tasks AS c ON c.id = ?
+         WHERE p.id = ?
+        """,
+        (child_id, parent_id),
+    ).fetchone()
+    return bool(
+        row
+        and row["parent_workflow"]
+        and row["parent_workflow"] == row["child_workflow"]
+        and row["parent_step"] == "verify"
+    )
+
+
+def _valid_verifier_receipt(
+    conn: sqlite3.Connection, verifier_task_id: str,
+) -> Optional[sqlite3.Row]:
+    """Return the immutable, internally consistent current PASS receipt."""
+    return conn.execute(
+        """
+        SELECT r.*
+          FROM verifier_pass_receipts AS r
+          JOIN accepted_handoffs AS h ON h.id = r.accepted_handoff_id
+          JOIN tasks AS verifier ON verifier.id = r.verifier_task_id
+         WHERE r.verifier_task_id = ?
+           AND r.outcome = 'PASS'
+           AND verifier.status IN ('done', 'archived')
+           AND verifier.current_step_key = 'verify'
+           AND h.verifier_task_id = r.verifier_task_id
+           AND h.workflow_step_attempt_id = r.workflow_step_attempt_id
+           AND h.implementation_run_id = r.parent_run_id
+           AND h.implementation_event_id = r.parent_event_id
+           AND h.artifact_manifest_digest = r.artifact_manifest_digest
+           AND r.artifact_manifest_digest = r.recomputed_manifest_digest
+           AND h.source_revision = r.source_revision
+           AND h.acceptance_contract_hash = r.acceptance_contract_hash
+           AND COALESCE(h.baseline_manifest_digest, '') =
+               COALESCE(r.baseline_manifest_digest, '')
+         LIMIT 1
+        """,
+        (verifier_task_id,),
+    ).fetchone()
+
+
+def _prerequisites_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Kernel eligibility predicate for ordinary and verifier dependencies."""
+    parents = conn.execute(
+        """
+        SELECT p.id, p.status
+          FROM task_links AS l
+          JOIN tasks AS p ON p.id = l.parent_id
+         WHERE l.child_id = ?
+         ORDER BY p.id
+        """,
+        (task_id,),
+    ).fetchall()
+    for parent in parents:
+        if parent["status"] not in ("done", "archived"):
+            return False
+        if _workflow_verifier_edge(conn, parent["id"], task_id):
+            if _valid_verifier_receipt(conn, parent["id"]) is None:
+                return False
+    return True
+
+
+def _prerequisite_snapshot(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    """Return exact current graph/state/receipt versions for ``task_id``."""
+    rows = conn.execute(
+        """
+        SELECT p.id, p.status, p.result, p.workflow_template_id, p.current_step_key
+          FROM task_links AS l
+          JOIN tasks AS p ON p.id = l.parent_id
+         WHERE l.child_id = ?
+         ORDER BY p.id
+        """,
+        (task_id,),
+    ).fetchall()
+    snapshot: list[dict] = []
+    for parent in rows:
+        is_verifier = _workflow_verifier_edge(conn, parent["id"], task_id)
+        receipt = _valid_verifier_receipt(conn, parent["id"]) if is_verifier else None
+        result_value = parent["result"]
+        snapshot.append(
+            {
+                "parent_id": parent["id"],
+                "status": parent["status"],
+                "result_digest": (
+                    _sha256_text(str(result_value)) if result_value is not None else None
+                ),
+                "workflow_template_id": parent["workflow_template_id"],
+                "step_key": parent["current_step_key"],
+                "verification_dependency": is_verifier,
+                "receipt_id": receipt["id"] if receipt else None,
+                "receipt_version": int(receipt["receipt_version"]) if receipt else None,
+                "accepted_handoff_id": receipt["accepted_handoff_id"] if receipt else None,
+            }
+        )
+    return snapshot
+
+
+def _capture_prerequisite_snapshot(
+    conn: sqlite3.Connection, task_id: str, run_id: int, *, created_at: int,
+) -> None:
+    snapshot_json = _canonical_json(_prerequisite_snapshot(conn, task_id))
+    conn.execute(
+        """
+        INSERT INTO task_run_prerequisite_sets
+            (run_id, task_id, snapshot_json, snapshot_digest, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (run_id, task_id, snapshot_json, _sha256_text(snapshot_json), created_at),
+    )
+
+
+def _captured_prerequisites_are_current(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> bool:
+    captured = conn.execute(
+        "SELECT snapshot_json, snapshot_digest FROM task_run_prerequisite_sets "
+        "WHERE run_id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if captured is None:
+        # Additive rollout compatibility is safe only for ordinary legacy DAG
+        # runs. A pre-existing workflow run with predecessors has no frozen
+        # version baseline and therefore must fail closed at terminal time.
+        workflow = conn.execute(
+            "SELECT workflow_template_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        has_parents = conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,),
+        ).fetchone()
+        return not bool(
+            workflow and workflow["workflow_template_id"] and has_parents
+        )
+    current_json = _canonical_json(_prerequisite_snapshot(conn, task_id))
+    return (
+        captured["snapshot_json"] == current_json
+        and captured["snapshot_digest"] == _sha256_text(current_json)
+        and _prerequisites_satisfied(conn, task_id)
+    )
+
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
