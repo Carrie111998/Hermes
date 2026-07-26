@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+from hermes_cli.human_intervention import HumanInterventionProvider
 from hermes_cli.plugins import (
     ENTRY_POINTS_GROUP,
     VALID_HOOKS,
@@ -17,6 +18,7 @@ from hermes_cli.plugins import (
     PluginManifest,
     get_plugin_command_handler,
     get_plugin_commands,
+    get_human_intervention_provider,
     invoke_plugin_command,
     is_plugin_control_plane_command,
     get_pre_tool_call_block_message,
@@ -2122,6 +2124,31 @@ class TestPluginCommands:
             assert is_plugin_control_plane_command("control") is True
             assert is_plugin_control_plane_command("normal") is False
             assert is_plugin_control_plane_command("missing") is False
+
+
+class TestHumanInterventionProviderRegistration:
+    class _Provider(HumanInterventionProvider):
+        def begin(self, request):
+            return None
+
+        def poll(self, handle):
+            return None
+
+        def finish(self, handle, outcome):
+            return None
+
+    def test_first_valid_provider_wins(self):
+        mgr = PluginManager()
+        first = self._Provider()
+        second = self._Provider()
+        ctx = PluginContext(PluginManifest(name="first", source="user"), mgr)
+        other_ctx = PluginContext(PluginManifest(name="second", source="user"), mgr)
+
+        ctx.register_human_intervention_provider(first)
+        other_ctx.register_human_intervention_provider(second)
+
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            assert get_human_intervention_provider() is first
 
 
 class TestPluginCommandResultResolution:
