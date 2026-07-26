@@ -7972,6 +7972,101 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_ordinal_skips_display_kind_timeline_rows(monkeypatch):
+    """Bookkeeping timeline rows must not shift the truncation ordinal.
+
+    ``model_switch`` / ``async_delegation_complete`` / ``auto_continue`` /
+    ``hidden`` rows are stored as durable ``role="user"`` rows, but no client
+    presents them as user turns — the desktop demotes them to ``role:'system'``
+    (or drops them) in ``toChatMessages`` before ``visibleUserOrdinal`` counts,
+    and the CLI excludes them with the same predicate. Counting them here made
+    the ordinal resolve one real turn too early, and ``replace_messages`` then
+    hard-DELETEd a completed exchange the user never selected.
+    """
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            return {
+                "final_response": "edited reply",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "edited reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    # A backgrounded delegation finished early in the chat; two ordinary
+    # exchanges followed. The desktop renders the delegation row as a grey
+    # system row, so the edit pencil on "third" sends ordinal 2 — counting
+    # only first/second/third.
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {
+            "role": "user",
+            "content": "background agent work finished",
+            "display_kind": "async_delegation_complete",
+        },
+        {"role": "assistant", "content": "ack"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+        {"role": "user", "content": "third"},
+        {"role": "assistant", "content": "third reply"},
+    ]
+    server._sessions["sid"] = _session(agent=_Agent(), history=original_history)
+
+    class _StubDb:
+        def __init__(self):
+            self.replaced = []
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    stub_db = _StubDb()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": "edited third",
+                    "truncate_before_user_ordinal": 2,
+                },
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+
+        # The cut belongs at "third" (index 6), NOT at "second" (index 4).
+        # Counting the delegation row as a user turn shifts the ordinal one
+        # place early and destroys the completed second/second-reply exchange
+        # the user never selected.
+        assert stub_db.replaced == [("session-key", original_history[:6])]
+        kept = [m["content"] for m in stub_db.replaced[0][1]]
+        assert "second" in kept and "second reply" in kept
+        assert server._sessions["sid"]["history"] == [
+            *original_history[:6],
+            {"role": "user", "content": "edited third"},
+            {"role": "assistant", "content": "edited reply"},
+        ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 # ---------------------------------------------------------------------------
 # session.interrupt must only cancel pending prompts owned by the calling
 # session — it must not blast-resolve clarify/sudo/secret prompts on

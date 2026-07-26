@@ -10843,7 +10843,22 @@ def _(rid, params: dict) -> dict:
             except (TypeError, ValueError):
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
-            user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
+            # Count the SAME rows the client counted when it produced this
+            # ordinal. Bookkeeping timeline rows (model_switch,
+            # async_delegation_complete, auto_continue, hidden) are stored as
+            # durable ``role="user"`` rows, but no client ever presents them as
+            # user turns: the desktop demotes them to ``role: 'system'`` /
+            # drops them in ``toChatMessages`` before ``visibleUserOrdinal``
+            # counts, and the CLI excludes them with this same predicate
+            # (hermes_cli/cli_agent_setup_mixin.py, cli_commands_mixin.py).
+            # Counting them here made the ordinal resolve N real turns too
+            # early, and the ``replace_messages`` below then hard-DELETEd those
+            # extra completed turns — in range, so neither guard fires.
+            user_indices = [
+                i
+                for i, m in enumerate(history)
+                if m.get("role") == "user" and not m.get("display_kind")
+            ]
             # Reject out-of-range ordinals on BOTH ends. A negative value would
             # otherwise sail past the upper-bound check and hit Python's negative
             # indexing below (user_indices[-1] -> the LAST user turn), silently
