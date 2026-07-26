@@ -5673,16 +5673,25 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+    def get_session_by_title(
+        self, title: str, session_key: str = None
+    ) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
+        where = "title = ?"
+        params = [title]
+        if session_key:
+            where += " AND session_key = ?"
+            params.append(session_key)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+                f"SELECT * FROM sessions WHERE {where}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(
+        self, title: str, session_key: str = None
+    ) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
@@ -5691,16 +5700,21 @@ class SessionDB:
         latest numbered variant (the most recent continuation).
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, session_key=session_key)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        key_clause = " AND session_key = ?" if session_key else ""
+        params = [f"{escaped} #%"]
+        if session_key:
+            params.append(session_key)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+                f"WHERE title LIKE ? ESCAPE '\\'{key_clause} "
+                "ORDER BY started_at DESC",
+                params,
             )
             numbered = cursor.fetchall()
 
@@ -5873,6 +5887,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        session_key: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -5912,6 +5927,9 @@ class SessionDB:
         the SELECT so SQLite never copies it out of the B-tree page — a
         significant I/O saving on large databases where the blob routinely
         runs to tens of kilobytes per row.
+
+        Pass ``session_key`` to restrict rows to one exact persisted gateway
+        conversation before ordering and pagination are applied.
         """
         where_clauses = []
         params = []
@@ -5941,6 +5959,9 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if session_key:
+            where_clauses.append("s.session_key = ?")
+            params.append(session_key)
         if cwd_prefix:
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)
@@ -7839,6 +7860,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        session_key: str = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Run a search against a substring-capable FTS index.
 
@@ -7878,6 +7900,9 @@ class SessionDB:
         if role_filter:
             tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             tri_params.extend(role_filter)
+        if session_key:
+            tri_where.append("s.session_key = ?")
+            tri_params.append(session_key)
         tri_sql = f"""
             SELECT
                 m.id,
@@ -7916,6 +7941,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        session_key: str = None,
     ) -> List[Dict[str, Any]]:
         """Instrumented wrapper around :meth:`_search_messages_impl`.
 
@@ -7937,6 +7963,7 @@ class SessionDB:
                 offset=offset,
                 sort=sort,
                 include_inactive=include_inactive,
+                session_key=session_key,
             )
             return rows
         finally:
@@ -7986,6 +8013,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        session_key: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -8007,6 +8035,9 @@ class SessionDB:
         The short-CJK LIKE fallback already orders by timestamp DESC and
         ignores ``sort``. The trigram CJK path honours ``sort`` like the main
         FTS5 path.
+
+        ``session_key`` applies an exact gateway-conversation predicate in
+        every search route before ranking and limits.
 
         Rewound (``active=0``, ``compacted=0``) rows are excluded by default —
         the user took those back. Compaction-archived rows (``active=0``,
@@ -8067,6 +8098,9 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+        if session_key:
+            where_clauses.append("s.session_key = ?")
+            params.append(session_key)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -8160,6 +8194,9 @@ class SessionDB:
                 if role_filter:
                     cjk_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     cjk_params.extend(role_filter)
+                if session_key:
+                    cjk_where.append("s.session_key = ?")
+                    cjk_params.append(session_key)
                 cjk_sql = f"""
                     SELECT
                         m.id,
@@ -8249,6 +8286,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if session_key:
+                    tri_where.append("s.session_key = ?")
+                    tri_params.append(session_key)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -8343,6 +8383,9 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if session_key:
+                    like_where.append("s.session_key = ?")
+                    like_params.append(session_key)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -8402,6 +8445,7 @@ class SessionDB:
                     source_filter=source_filter,
                     exclude_sources=exclude_sources,
                     role_filter=role_filter,
+                    session_key=session_key,
                 )
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
@@ -8440,6 +8484,7 @@ class SessionDB:
                     source_filter=source_filter,
                     exclude_sources=exclude_sources,
                     role_filter=role_filter,
+                    session_key=session_key,
                     limit=limit,
                     offset=offset,
                 )
@@ -8457,6 +8502,7 @@ class SessionDB:
                     source_filter=source_filter,
                     exclude_sources=exclude_sources,
                     role_filter=role_filter,
+                    session_key=session_key,
                     limit=limit,
                     offset=offset,
                 )
@@ -8540,6 +8586,7 @@ class SessionDB:
         source_filter: Optional[List[str]] = None,
         exclude_sources: Optional[List[str]] = None,
         role_filter: Optional[List[str]] = None,
+        session_key: str = None,
     ) -> List[Dict[str, Any]]:
         """LIKE-scan the rows the deferred rebuild hasn't indexed yet.
 
@@ -8585,6 +8632,9 @@ class SessionDB:
         if role_filter:
             where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             params.extend(role_filter)
+        if session_key:
+            where.append("s.session_key = ?")
+            params.append(session_key)
 
         sql = f"""
             SELECT m.id, m.session_id, m.role,

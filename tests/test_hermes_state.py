@@ -2419,6 +2419,30 @@ class TestCJKSearchFallback:
     the query contains CJK characters.
     """
 
+    @pytest.mark.parametrize("query", ["sharedtoken", "记忆断裂", "通信"])
+    def test_session_key_filter_applies_before_limit_on_every_search_path(
+        self, db, query
+    ):
+        current_key = "agent:main:telegram:group:-1003966911334:40507"
+        other_key = "agent:main:telegram:group:-1003966911334:799"
+        db.create_session("current-topic", source="telegram", session_key=current_key)
+        db.append_message(
+            "current-topic", role="user",
+            content=f"sharedtoken 记忆断裂 通信 {query}",
+        )
+        for index in range(25):
+            sid = f"other-topic-{index}"
+            db.create_session(sid, source="telegram", session_key=other_key)
+            db.append_message(
+                sid, role="user",
+                content=f"sharedtoken 记忆断裂 通信 {query}",
+            )
+
+        results = db.search_messages(
+            query, session_key=current_key, limit=1, sort="newest",
+        )
+        assert [row["session_id"] for row in results] == ["current-topic"]
+
     def test_cjk_detection_covers_all_ranges(self):
         from hermes_state import SessionDB
         f = SessionDB._contains_cjk
@@ -7703,4 +7727,3 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-

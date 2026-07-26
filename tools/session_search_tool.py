@@ -394,6 +394,9 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
             "source": meta.get("source"),
             "model": meta.get("model"),
             "title": meta.get("title"),
+            "session_key": meta.get("session_key"),
+            "chat_id": meta.get("chat_id"),
+            "thread_id": meta.get("thread_id"),
         },
         "message_count": total,
         "truncated": truncated,
@@ -407,13 +410,20 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    link_profile: str = None,
+    session_key: str = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = db.list_sessions_rich(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            session_key=session_key,
         )  # fetch extra so we can skip current
 
         current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
@@ -435,6 +445,9 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
                 "preview": s.get("preview", ""),
+                "session_key": s.get("session_key"),
+                "chat_id": s.get("chat_id"),
+                "thread_id": s.get("thread_id"),
             })
             if len(results) >= limit:
                 break
@@ -564,6 +577,9 @@ def _scroll(
             "source": session_meta.get("source"),
             "model": session_meta.get("model"),
             "title": session_meta.get("title"),
+            "session_key": session_meta.get("session_key"),
+            "chat_id": session_meta.get("chat_id"),
+            "thread_id": session_meta.get("thread_id"),
         },
         "window": window,
         "messages": [_shape_message(m, anchor_id=around_message_id) for m in messages],
@@ -584,6 +600,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    session_key: str = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -591,7 +608,12 @@ def _title_match_result(
         return None
 
     try:
-        session_id = db.resolve_session_by_title(title_query)
+        if session_key:
+            session_id = db.resolve_session_by_title(
+                title_query, session_key=session_key,
+            )
+        else:
+            session_id = db.resolve_session_by_title(title_query)
     except Exception:
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
@@ -608,6 +630,8 @@ def _title_match_result(
         logging.debug("get_session failed for title match %s", session_id, exc_info=True)
         session_meta = {}
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
+        return None
+    if session_key and session_meta.get("session_key") != session_key:
         return None
 
     try:
@@ -632,6 +656,9 @@ def _title_match_result(
         "source": session_meta.get("source", "unknown"),
         "model": session_meta.get("model") or "unknown",
         "title": session_meta.get("title") or title_query,
+        "session_key": session_meta.get("session_key"),
+        "chat_id": session_meta.get("chat_id"),
+        "thread_id": session_meta.get("thread_id"),
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
@@ -655,11 +682,14 @@ def _discover(
     sort: Optional[str],
     current_session_id: str = None,
     link_profile: str = None,
+    session_key: str = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(
+        db, query, current_lineage_root, session_key=session_key,
+    )
 
     try:
         raw_results = db.search_messages(
@@ -671,6 +701,7 @@ def _discover(
             # of cron rows are still in hand for the demotion pass below.
             offset=0,
             sort=sort,
+            session_key=session_key,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -768,6 +799,9 @@ def _discover(
             "source": session_meta.get("source") or match_info.get("source", "unknown"),
             "model": session_meta.get("model") or match_info.get("model") or "unknown",
             "title": session_meta.get("title") or None,
+            "session_key": session_meta.get("session_key"),
+            "chat_id": session_meta.get("chat_id"),
+            "thread_id": session_meta.get("thread_id"),
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
             "snippet": match_info.get("snippet") or "",
@@ -818,6 +852,8 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    # Browse/discovery visibility
+    scope: str = "current",
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -826,7 +862,9 @@ def session_search(
     Read:      pass ``session_id`` (no anchor) — dumps the whole session.
     Browse:    pass nothing.
 
-    Pass ``profile`` to read another profile's sessions (e.g. resolving an
+    Browse and discovery default to the current routed gateway conversation
+    when its persisted session_key is available. Pass ``scope="all"`` for
+    global history. Pass ``profile`` to read another profile's sessions (e.g. resolving an
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
@@ -894,6 +932,27 @@ def session_search(
                 return json.dumps(found, ensure_ascii=False)
         return result
 
+    scope_norm = str(scope or "current").strip().lower()
+    if scope_norm not in ("current", "all"):
+        return tool_error("scope must be 'current' or 'all'", success=False)
+
+    # Cross-profile browse/discovery is intentionally global within the named
+    # profile. A session_key from the caller's profile/conversation must never
+    # silently constrain another profile.
+    scoped_session_key = None
+    if scope_norm == "current" and current_session_id:
+        try:
+            current_meta = db.get_session(current_session_id) or {}
+        except Exception:
+            logging.debug(
+                "get_session failed while resolving session_search scope",
+                exc_info=True,
+            )
+            current_meta = {}
+        key = current_meta.get("session_key")
+        if isinstance(key, str) and key.strip():
+            scoped_session_key = key.strip()
+
     # Limit clamp [1, 10]
     if not isinstance(limit, int):
         try:
@@ -904,7 +963,13 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            link_profile=profile,
+            session_key=scoped_session_key,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -926,6 +991,7 @@ def session_search(
         sort=sort_norm,
         current_session_id=current_session_id,
         link_profile=profile,
+        session_key=scoped_session_key,
     )
 
 
@@ -971,6 +1037,10 @@ SESSION_SEARCH_SCHEMA = {
         "       - match_message_id, messages_before, messages_after\n"
         "     Bookends + window together let you reconstruct goal → match → resolution "
         "without paying for the whole transcript.\n\n"
+        "     In routed gateway conversations, discovery and browse default to the "
+        "same authenticated conversation/session_key (including its older reset or "
+        "compression history). Pass scope=\"all\" explicitly to search other chats "
+        "or topics. Direct READ and SCROLL by session_id remain exact and unscoped.\n\n"
         "  2) SCROLL — pass `session_id` + `around_message_id`:\n"
         "     session_search(session_id=\"...\", around_message_id=12345, window=10)\n"
         "     Returns a window of ±`window` messages centered on the anchor. No FTS5, "
@@ -1090,6 +1160,19 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "scope": {
+                "type": "string",
+                "enum": ["current", "all"],
+                "default": "current",
+                "description": (
+                    "Browse/discovery scope. 'current' (default) restricts routed "
+                    "gateway calls to the current authenticated conversation's exact "
+                    "session_key when available; CLI and sessions without routing "
+                    "metadata fall back to global history. Use 'all' only as an "
+                    "explicit opt-in to cross-chat/topic history. READ and SCROLL by "
+                    "session_id are always exact and ignore this scope."
+                ),
+            },
         },
         "required": [],
     },
@@ -1112,8 +1195,9 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         profile=args.get("profile"),
+        scope=args.get("scope", "current"),
         db=kw.get("db"),
-        current_session_id=kw.get("current_session_id"),
+        current_session_id=kw.get("session_id"),
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",

@@ -23,6 +23,7 @@ from tools.session_search_tool import (
     _session_link,
     session_search,
 )
+from tools.registry import registry
 
 
 @pytest.fixture
@@ -89,6 +90,11 @@ class TestSchema:
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
         assert params["sort"]["enum"] == ["newest", "oldest"]
 
+    def test_scope_enum_defaults_safe(self):
+        scope = SESSION_SEARCH_SCHEMA["parameters"]["properties"]["scope"]
+        assert scope["enum"] == ["current", "all"]
+        assert scope["default"] == "current"
+
     def test_schema_description_teaches_scroll(self):
         desc = SESSION_SEARCH_SCHEMA["description"]
         assert "SCROLL" in desc
@@ -153,6 +159,71 @@ class TestBrowseShape:
         titles = [r.get("title") for r in result["results"]]
         assert any("Modpack" in (t or "") for t in titles)
 
+    def test_gateway_browse_defaults_to_current_session_key_before_limit(self, db):
+        current_key = "agent:main:telegram:group:-1003966911334:40507"
+        other_key = "agent:main:telegram:group:-1003966911334:799"
+        db.create_session(
+            "topic-40507-current", source="telegram", session_key=current_key,
+            chat_id="-1003966911334", thread_id="40507",
+        )
+        db.create_session(
+            "topic-40507-prior", source="telegram", session_key=current_key,
+            chat_id="-1003966911334", thread_id="40507",
+        )
+        for index in range(12):
+            db.create_session(
+                f"topic-799-newer-{index}", source="telegram",
+                session_key=other_key, chat_id="-1003966911334", thread_id="799",
+            )
+        result = json.loads(session_search(
+            db=db, current_session_id="topic-40507-current", limit=1,
+        ))
+        assert [row["session_id"] for row in result["results"]] == ["topic-40507-prior"]
+        assert result["results"][0]["chat_id"] == "-1003966911334"
+        assert result["results"][0]["thread_id"] == "40507"
+        assert result["results"][0]["session_key"] == current_key
+
+    def test_gateway_browse_scope_all_is_explicit_global_opt_in(self, db):
+        current_key = "agent:main:telegram:group:-1003966911334:40507"
+        other_key = "agent:main:telegram:group:-1003966911334:799"
+        db.create_session("current", source="telegram", session_key=current_key)
+        db.create_session("same-topic", source="telegram", session_key=current_key)
+        db.create_session("other-topic", source="telegram", session_key=other_key)
+        result = json.loads(session_search(
+            db=db, current_session_id="current", scope="all", limit=10,
+        ))
+        assert {"same-topic", "other-topic"} <= {
+            row["session_id"] for row in result["results"]
+        }
+
+    @pytest.mark.parametrize(
+        ("args", "expected_ids"),
+        [
+            ({}, {"topic-40507-prior"}),
+            ({"scope": "all"}, {"topic-40507-prior", "topic-799-prior"}),
+        ],
+    )
+    def test_registered_handler_receives_production_session_id_scope(
+        self, db, args, expected_ids
+    ):
+        current_key = "agent:main:telegram:group:-1003966911334:40507"
+        other_key = "agent:main:telegram:group:-1003966911334:799"
+        db.create_session(
+            "topic-40507-current", source="telegram", session_key=current_key,
+        )
+        db.create_session(
+            "topic-40507-prior", source="telegram", session_key=current_key,
+        )
+        db.create_session(
+            "topic-799-prior", source="telegram", session_key=other_key,
+        )
+
+        result = json.loads(registry.dispatch(
+            "session_search", args, db=db, session_id="topic-40507-current",
+        ))
+
+        assert {row["session_id"] for row in result["results"]} == expected_ids
+
 
 # =========================================================================
 # Discovery shape (with query)
@@ -165,6 +236,52 @@ class TestDiscoveryShape:
         assert result["success"] is True
         assert result["mode"] == "discover"
         assert result["count"] >= 1
+
+    def test_gateway_discovery_defaults_to_current_session_key_before_limit(self, db):
+        current_key = "agent:main:telegram:group:-1003966911334:40507"
+        other_key = "agent:main:telegram:group:-1003966911334:799"
+        db.create_session(
+            "topic-40507-current", source="telegram", session_key=current_key,
+            chat_id="-1003966911334", thread_id="40507",
+        )
+        db.append_message("topic-40507-current", role="user", content="Sauna steam schedule")
+        db.create_session(
+            "topic-40507-prior", source="telegram", session_key=current_key,
+            chat_id="-1003966911334", thread_id="40507",
+        )
+        db.append_message("topic-40507-prior", role="user", content="Sauna steam schedule history")
+        for index in range(25):
+            sid = f"topic-799-newer-{index}"
+            db.create_session(
+                sid, source="telegram", session_key=other_key,
+                chat_id="-1003966911334", thread_id="799",
+            )
+            db.append_message(sid, role="user", content="Sauna steam schedule form")
+
+        scoped = json.loads(session_search(
+            query="Sauna steam schedule", db=db,
+            current_session_id="topic-40507-current", limit=1, sort="newest",
+        ))
+        assert [row["session_id"] for row in scoped["results"]] == ["topic-40507-prior"]
+        assert scoped["results"][0]["thread_id"] == "40507"
+        assert scoped["results"][0]["session_key"] == current_key
+
+        global_result = json.loads(session_search(
+            query="Sauna steam schedule", db=db,
+            current_session_id="topic-40507-current", scope="all", limit=10,
+            sort="newest",
+        ))
+        assert any(row["thread_id"] == "799" for row in global_result["results"])
+
+    def test_missing_current_routing_metadata_falls_back_to_global(self, db):
+        db.create_session("current-without-route", source="cli")
+        db.create_session("global-history", source="telegram")
+        db.append_message("global-history", role="user", content="route fallback token")
+        result = json.loads(session_search(
+            query="route fallback token", db=db,
+            current_session_id="current-without-route",
+        ))
+        assert [row["session_id"] for row in result["results"]] == ["global-history"]
 
     def test_discovery_result_has_bookends_and_window(self, db):
         _seed_modpack_sessions(db)
@@ -459,6 +576,23 @@ class TestShapePrecedence:
         # session_id alone (no anchor, no query) → read shape, not browse.
         result = json.loads(session_search(session_id="s_oldest", db=db))
         assert result["mode"] == "read"
+
+    def test_explicit_read_ignores_current_topic_scope_and_reports_route(self, db):
+        current_key = "agent:main:telegram:group:-1003966911334:40507"
+        other_key = "agent:main:telegram:group:-1003966911334:799"
+        db.create_session("current", source="telegram", session_key=current_key)
+        db.create_session(
+            "explicit-other", source="telegram", session_key=other_key,
+            chat_id="-1003966911334", thread_id="799",
+        )
+        db.append_message("explicit-other", role="user", content="exact linked read")
+        result = json.loads(session_search(
+            session_id="explicit-other", db=db, current_session_id="current",
+        ))
+        assert result["mode"] == "read"
+        assert result["session_meta"]["session_key"] == other_key
+        assert result["session_meta"]["chat_id"] == "-1003966911334"
+        assert result["session_meta"]["thread_id"] == "799"
 
 
 # =========================================================================
