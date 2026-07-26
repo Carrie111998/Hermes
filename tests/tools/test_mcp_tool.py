@@ -4562,3 +4562,113 @@ class TestMcpParallelToolCalls:
             register_mcp_servers(config_off)
         with _lock:
             assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
+
+class TestConnectServerOrphanReaping:
+    """_connect_server() must not leak an orphaned MCPServerTask when
+    server.start() raises after the task has already parked.
+
+    Root cause: start() spawns self._task = ensure_future(self.run(config)),
+    then awaits self._ready.wait(). When the initial connection fails
+    _MAX_INITIAL_CONNECT_RETRIES times (or hits certain auth/URL-validation
+    failures), run() sets self._error and self._ready, then PARKS in
+    _wait_for_reconnect_or_shutdown() to self-probe periodically rather than
+    returning. start() sees _ready set, sees _error set, and raises it -- but
+    self._task is still alive and parked. _connect_server() never returned
+    `server` to its caller on this path, so nothing holds a reference to call
+    shutdown() on it: the task runs forever as an orphan, invisible to
+    shutdown_mcp_servers() (never added to _servers), and gets abandoned
+    rather than cleanly finished when the MCP loop is closed at process exit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_failure_reaps_orphaned_parked_task(self):
+        from tools.mcp_tool import MCPServerTask, _connect_server
+
+        server = MCPServerTask("flaky")
+        shutdown_calls = []
+
+        async def fake_run(self, config):
+            # Simulate run() parking after exhausting initial retries:
+            # sets _error + _ready, but the task itself keeps running
+            # (awaiting a park sleep) rather than returning.
+            self._error = ConnectionError("simulated initial-connect failure")
+            self._ready.set()
+            await self._shutdown_event.wait()
+
+        async def fake_shutdown(self):
+            shutdown_calls.append(True)
+            self._shutdown_event.set()
+            if self._task and not self._task.done():
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+
+        with patch.object(MCPServerTask, "run", fake_run), \
+             patch.object(MCPServerTask, "shutdown", fake_shutdown), \
+             patch("tools.mcp_tool.MCPServerTask", return_value=server):
+            with pytest.raises(ConnectionError):
+                await _connect_server("flaky", {"command": "echo"})
+
+        # The orphaned task must have been reaped (shutdown called), not
+        # left running detached on the event loop.
+        assert shutdown_calls == [True]
+        assert server._task is not None and server._task.done()
+
+    @pytest.mark.asyncio
+    async def test_start_success_does_not_call_shutdown(self):
+        """A clean successful start must not trigger the reaping path."""
+        from tools.mcp_tool import MCPServerTask, _connect_server
+
+        server = MCPServerTask("healthy")
+        shutdown_calls = []
+
+        async def fake_run(self, config):
+            self._ready.set()
+            await self._shutdown_event.wait()
+
+        async def fake_shutdown(self):
+            shutdown_calls.append(True)
+
+        with patch.object(MCPServerTask, "run", fake_run), \
+             patch.object(MCPServerTask, "shutdown", fake_shutdown), \
+             patch("tools.mcp_tool.MCPServerTask", return_value=server):
+            result = await _connect_server("healthy", {"command": "echo"})
+
+        assert result is server
+        assert shutdown_calls == []
+        server._shutdown_event.set()
+        if server._task and not server._task.done():
+            server._task.cancel()
+            try:
+                await server._task
+            except asyncio.CancelledError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_still_propagates_without_double_shutdown(self):
+        """A CancelledError from start() (external cancel, e.g. connect
+        timeout) must propagate untouched -- start() already reaps its own
+        task on this path (see start()'s own CancelledError handler), so
+        _connect_server() must not call shutdown() again on top of it.
+        """
+        from tools.mcp_tool import MCPServerTask, _connect_server
+
+        server = MCPServerTask("timeout-case")
+        shutdown_calls = []
+
+        async def fake_start(self, config):
+            raise asyncio.CancelledError()
+
+        async def fake_shutdown(self):
+            shutdown_calls.append(True)
+
+        with patch.object(MCPServerTask, "start", fake_start), \
+             patch.object(MCPServerTask, "shutdown", fake_shutdown), \
+             patch("tools.mcp_tool.MCPServerTask", return_value=server):
+            with pytest.raises(asyncio.CancelledError):
+                await _connect_server("timeout-case", {"command": "echo"})
+
+        assert shutdown_calls == []
