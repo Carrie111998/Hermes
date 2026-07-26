@@ -1,17 +1,17 @@
 ---
 sidebar_position: 3
 title: "Built-in Tools Reference"
-description: "Authoritative reference for Hermes built-in tools, grouped by toolset"
+description: "Authoritative reference for IYARI built-in tools, grouped by toolset"
 ---
 
 # Built-in Tools Reference
 
-This page documents Hermes' built-in tools, grouped by toolset. Availability varies by platform, credentials, and enabled toolsets.
+This page documents IYARI's built-in tools, grouped by toolset. Availability varies by platform, credentials, and enabled toolsets.
 
 **Quick counts (current registry):** ~73 tools — 10 browser tools (core) + 2 CDP-gated browser tools, 4 file tools, 4 Home Assistant tools, 3 terminal tools (`terminal`, `process`, `read_terminal`), 2 web tools, 5 Feishu tools, 7 Spotify tools (registered by the bundled `spotify` plugin), 5 Yuanbao tools, 9 kanban tools (registered when the kanban dispatcher spawns the agent), 3 project tools (desktop/GUI sessions), 2 Discord tools, and a handful of standalone tools (`memory`, `clarify`, `delegate_task`, `execute_code`, `cronjob`, `session_search`, `skill_view`/`skill_manage`/`skills_list`, `text_to_speech`, `image_generate`, `video_generate`, `vision_analyze`, `video_analyze`, `todo`, `computer_use`).
 
 :::tip MCP Tools
-In addition to built-in tools, Hermes can load tools dynamically from MCP servers. MCP tools appear with the prefix `mcp_<server>_` (e.g., `mcp_github_create_issue` for the `github` MCP server). See [MCP Integration](/user-guide/features/mcp) for configuration.
+In addition to built-in tools, IYARI can load tools dynamically from MCP servers. MCP tools appear with the prefix `mcp_<server>_` (e.g., `mcp_github_create_issue` for the `github` MCP server). See [MCP Integration](/user-guide/features/mcp) for configuration.
 :::
 
 ## `browser` toolset
@@ -48,7 +48,7 @@ These two tools live in the `browser` toolset but only register when a Chrome De
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `execute_code` | Run a Python script that can call Hermes tools programmatically. Use this when you need 3+ tool calls with processing logic between them, need to filter/reduce large tool outputs before they enter your context, need conditional branching (… | — |
+| `execute_code` | Run a Python script that can call IYARI tools programmatically. Use this when you need 3+ tool calls with processing logic between them, need to filter/reduce large tool outputs before they enter your context, need conditional branching (… | — |
 
 ## `cronjob` toolset
 
@@ -168,7 +168,7 @@ Tools for driving desktop [Projects](../user-guide/cli.md) — named, multi-fold
 |------|-------------|----------------------|
 | `process` | Manage background processes started with terminal(background=true). Actions: 'list' (show all), 'poll' (check status + new output), 'log' (full output with pagination), 'wait' (block until done or timeout), 'kill' (terminate), 'write' (sen… | — |
 | `terminal` | Execute shell commands on a Linux environment. Filesystem persists between calls. Set `background=true` for long-running servers. Set `notify_on_complete=true` (with `background=true`) to get an automatic notification when the process finishes — no polling needed. Do NOT use cat/head/tail — use read_file. Do NOT use grep/rg/find — use search_files. | — |
-| `read_terminal` | Read what's currently shown in the in-app terminal pane of the Hermes desktop GUI (the embedded shell beside this chat). Desktop-app only. | — |
+| `read_terminal` | Read what's currently shown in the in-app terminal pane of the IYARI desktop GUI (the embedded shell beside this chat). Desktop-app only. | — |
 
 ## `todo` toolset
 

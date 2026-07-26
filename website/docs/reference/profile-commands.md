@@ -4,7 +4,7 @@ sidebar_position: 7
 
 # Profile Commands Reference
 
-This page covers all commands related to [Hermes profiles](../user-guide/profiles.md). For general CLI commands, see [CLI Commands Reference](./cli-commands.md).
+This page covers all commands related to [IYARI profiles](../user-guide/profiles.md). For general CLI commands, see [CLI Commands Reference](./cli-commands.md).
 
 ## `hermes profile`
 
@@ -174,7 +174,7 @@ hermes profile show <name>
 
 Displays details about a profile including its home directory, configured model, gateway status, skills count, and configuration file status.
 
-This shows the profile's Hermes home directory, not the terminal working directory. Terminal commands start from `terminal.cwd` (or the launch directory on the local backend when `cwd: "."`).
+This shows the profile's IYARI home directory, not the terminal working directory. Terminal commands start from `terminal.cwd` (or the launch directory on the local backend when `cwd: "."`).
 
 | Argument | Description |
 |----------|-------------|
@@ -200,7 +200,7 @@ Alias:   ~/.local/bin/work
 hermes profile alias <name> [options]
 ```
 
-Regenerates the shell alias script at `~/.local/bin/<name>`. Useful if the alias was accidentally deleted or if you need to update it after moving your Hermes installation.
+Regenerates the shell alias script at `~/.local/bin/<name>`. Useful if the alias was accidentally deleted or if you need to update it after moving your IYARI installation.
 
 | Argument / Option | Description |
 |-------------------|-------------|
@@ -367,7 +367,7 @@ hermes profile info <name>
 ```
 
 Prints the profile's distribution manifest — name, version, required
-Hermes version, author, env var requirements, the source URL/path, and
+IYARI version, author, env var requirements, the source URL/path, and
 the `Installed:` timestamp recorded when the distribution was last
 `install`-ed or `update`-d. Useful for checking what a shared profile
 needs before installing it, and for spotting "this profile was installed
@@ -426,7 +426,7 @@ distribution_owned:   # optional; defaults to SOUL.md, config.yaml,
 
 `hermes_requires` supports `>=`, `<=`, `==`, `!=`, `>`, `<`, or a bare
 version (treated as `>=`). Install fails with a clear error if the current
-Hermes version doesn't satisfy the spec.
+IYARI version doesn't satisfy the spec.
 
 `distribution_owned` is optional. If set, only those paths are replaced on
 update; anything else in the profile stays user-owned. If omitted, the
@@ -439,7 +439,7 @@ Authoring a distribution is just a git push:
 1. In your profile directory, create `distribution.yaml` with at least `name`
    and `version`.
 2. Initialize a git repo (or use an existing one) and push to GitHub /
-   GitLab / any host Hermes can clone from.
+   GitLab / any host IYARI can clone from.
 3. Tell recipients to run `hermes profile install <your-repo-url>`.
 
 Use git tags for versioned releases — recipients who clone `HEAD` get your
@@ -452,7 +452,7 @@ hermes -p <name> <command> [options]
 hermes --profile <name> <command> [options]
 ```
 
-Global flag to run any Hermes command under a specific profile without changing the sticky default. This overrides the active profile for the duration of the command.
+Global flag to run any IYARI command under a specific profile without changing the sticky default. This overrides the active profile for the duration of the command.
 
 | Option | Description |
 |--------|-------------|
