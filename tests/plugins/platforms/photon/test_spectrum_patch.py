@@ -160,6 +160,39 @@ def _write_fixture(tmp_path: Path) -> Path:
     return chunk
 
 
+def test_spectrum_patch_accepts_upstream_ordered_mixed_parts(tmp_path: Path) -> None:
+    """Spectrum 8.2.2+ already preserves text/attachment ordering.
+
+    A clean install must accept that implementation as a successful no-op
+    rather than fail because the legacy 8.0 patch anchors disappeared.
+    """
+    dist = tmp_path / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    dist.mkdir(parents=True)
+    chunk = dist / "index.js"
+    original = """
+const rebuildFromAppleMessage = async () => {};
+const toInboundMessages = async () => {};
+const buildUnwrappedContentMessage = async () => {
+  const parts = toOrderedParts(message.content.text, attachments);
+  items.push(await buildOrderedPartMessage(client, base, part, i, messageGuidStr));
+  return { content: asProviderGroup(items) };
+};
+""".strip()
+    chunk.write_text(original, encoding="utf-8")
+
+    result = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert chunk.read_text(encoding="utf-8") == original
+    assert "upstream preserves mixed attachments" in result.stderr
+
+
 def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     """The dependency patch must apply to the 8.x `@spectrum-ts/imessage` chunk
     and rewrite both inbound mappers to thread text through attachment bubbles."""

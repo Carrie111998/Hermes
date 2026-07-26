@@ -144,10 +144,28 @@ export function patchSpectrumTs(root = scriptDir()) {
     const CRLF = CR + "\n";
     const usedCRLF = raw.includes(CRLF);
     const original = usedCRLF ? raw.split(CRLF).join("\n") : raw;
-    if (!original.includes("const toInboundMessages = async") ||
-        !original.includes("const rebuildFromAppleMessage = async")) {
+    if (!original.includes("const rebuildFromAppleMessage = async")
+        || !original.includes("const toInboundMessages = async")) {
       continue;
     }
+
+    // spectrum-ts >= 8.2.2 preserves mixed text/attachment order upstream.
+    // Treat that implementation as a successful no-op so clean installs do
+    // not fail merely because the legacy patch anchors disappeared.
+    const upstreamOrderedMarkers = [
+      "const buildUnwrappedContentMessage = async",
+      "const parts = toOrderedParts(message.content.text, attachments);",
+      "items.push(await buildOrderedPartMessage",
+      "content: asProviderGroup(items)",
+    ];
+    if (upstreamOrderedMarkers.every((marker) => original.includes(marker))) {
+      return {
+        patched: false,
+        file,
+        reason: "upstream preserves mixed attachments",
+      };
+    }
+
     let patched = original;
     patched = patchRebuild(patched);
     patched = patchInbound(patched);
@@ -170,7 +188,10 @@ if (_invokedDirectly) {
     const root = process.argv[2] ? path.resolve(process.argv[2]) : scriptDir();
     const result = patchSpectrumTs(root);
     const action = result.patched ? "patched" : "ok";
-    console.error(`photon-sidecar: spectrum mixed attachment patch ${action}: ${result.file}`);
+    const reason = result.reason ? ` (${result.reason})` : "";
+    console.error(
+      `photon-sidecar: spectrum mixed attachment patch ${action}: ${result.file}${reason}`,
+    );
   } catch (err) {
     console.error(`photon-sidecar: spectrum mixed attachment patch failed: ${err?.stack || err}`);
     process.exit(1);
