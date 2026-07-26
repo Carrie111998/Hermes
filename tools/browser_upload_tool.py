@@ -387,7 +387,13 @@ BROWSER_UPLOAD_FILES_SCHEMA: Dict[str, Any] = {
 
 
 def _browser_upload_files_check() -> bool:
-    return bool(_resolve_cdp_endpoint() and _node_command())
+    # Tool schemas are fixed when an agent is initialized, while the CDP
+    # endpoint is commonly established later by browser_navigate. Hiding this
+    # tool when no endpoint exists at startup makes it permanently unavailable
+    # for the rest of that worker turn, even after the browser is connected.
+    # Node.js is the stable installation prerequisite; endpoint readiness is a
+    # call-time condition handled by browser_upload_files with a concrete error.
+    return bool(_node_command())
 
 
 registry.register(
