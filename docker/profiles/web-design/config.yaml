@@ -19,6 +19,12 @@ terminal:
 toolsets:
   - kanban
 
+# API Magnific (upscale/enhance d'images) — consommée en curl par le skill
+# `magnific` (skills/magnific/SKILL.md, rafraîchi à chaque redeploy Railway).
+# Vars Railway attendues (globales au conteneur, injectées dans l'env) :
+#   MAGNIFIC_API_KEY     — clé API (header x-magnific-api-key)
+#   MAGNIFIC_WEBHOOK_URL — callback de fin de tâche (endpoint asynchrone)
+
 # Autonomie non-supervisée : assesseur LLM pour auto-approuver/refuser les
 # commandes dangereuses au lieu de bloquer en attente d'une validation humaine
 # (défaut approvals.mode=manual, cf. #30882). provider "auto" => OpenRouter.
