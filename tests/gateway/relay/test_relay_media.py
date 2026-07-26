@@ -15,6 +15,8 @@ Covers:
 
 from __future__ import annotations
 
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -192,6 +194,148 @@ def test_client_recognizes_rehost_urls_under_connector_base_path():
     c = RelayMediaClient("https://c.example/team-a", "gw1", "sec")
     assert c.is_relay_media_url("https://c.example/team-a/relay/media/abc") is True
     assert c.is_relay_media_url("https://c.example/relay/media/abc") is False
+
+
+class _CaptureHandler(BaseHTTPRequestHandler):
+    seen: list[tuple[str, str, Optional[str]]] = []
+    location: str = ""
+    body: bytes = b"ok"
+    content_type: str = "application/octet-stream"
+
+    def do_GET(self):
+        type(self).seen.append(("GET", self.path, self.headers.get("Authorization")))
+        if type(self).location:
+            self.send_response(302)
+            self.send_header("Location", type(self).location)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", type(self).content_type)
+        self.send_header("Content-Length", str(len(type(self).body)))
+        self.end_headers()
+        self.wfile.write(type(self).body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        type(self).seen.append(("POST", self.path, self.headers.get("Authorization")))
+        if type(self).location:
+            self.send_response(302)
+            self.send_header("Location", type(self).location)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"id":"uploaded"}')
+
+    def log_message(self, format, *args):
+        return
+
+
+def _serve(handler_cls):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def _stop(server: ThreadingHTTPServer) -> None:
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_download_does_not_follow_cross_origin_redirect():
+    class Capture(_CaptureHandler):
+        seen = []
+
+    capture_server = _serve(Capture)
+
+    class Redirect(_CaptureHandler):
+        seen = []
+        location = f"http://127.0.0.1:{capture_server.server_port}/capture"
+
+    redirect_server = _serve(Redirect)
+    result = None
+    try:
+        c = RelayMediaClient(
+            f"http://127.0.0.1:{redirect_server.server_port}", "gw1", "sec"
+        )
+        result = await c.download(
+            f"http://127.0.0.1:{redirect_server.server_port}/relay/media/x"
+        )
+        assert result is None
+        assert len(Redirect.seen) == 1
+        assert Redirect.seen[0][2]
+        assert Capture.seen == []
+    finally:
+        _stop(redirect_server)
+        _stop(capture_server)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_upload_does_not_follow_cross_origin_redirect(tmp_path):
+    class Capture(_CaptureHandler):
+        seen = []
+
+    capture_server = _serve(Capture)
+
+    class Redirect(_CaptureHandler):
+        seen = []
+        location = f"http://127.0.0.1:{capture_server.server_port}/capture"
+
+    redirect_server = _serve(Redirect)
+    media = tmp_path / "clip.txt"
+    media.write_text("hello", encoding="utf-8")
+    try:
+        c = RelayMediaClient(
+            f"http://127.0.0.1:{redirect_server.server_port}", "gw1", "sec"
+        )
+        result = await c.upload(str(media))
+        assert result is None
+        assert len(Redirect.seen) == 1
+        assert Redirect.seen[0][0] == "POST"
+        assert Redirect.seen[0][2]
+        assert Capture.seen == []
+    finally:
+        _stop(redirect_server)
+        _stop(capture_server)
+
+
+@pytest.mark.asyncio
+async def test_public_download_keeps_normal_redirect_behavior():
+    class Capture(_CaptureHandler):
+        seen = []
+        body = b"public image"
+        content_type = "image/png"
+
+    capture_server = _serve(Capture)
+
+    class Redirect(_CaptureHandler):
+        seen = []
+        location = f"http://127.0.0.1:{capture_server.server_port}/capture.png"
+
+    redirect_server = _serve(Redirect)
+    try:
+        c = RelayMediaClient(
+            f"http://127.0.0.1:{redirect_server.server_port}", "gw1", "sec"
+        )
+        result = await c.download(
+            f"http://127.0.0.1:{redirect_server.server_port}/public/image"
+        )
+        assert result is not None
+        assert Path(result).read_bytes() == b"public image"
+        assert len(Redirect.seen) == 1
+        assert Redirect.seen[0][2] is None
+        assert len(Capture.seen) == 1
+        assert Capture.seen[0][2] is None
+    finally:
+        if result is not None:
+            Path(result).unlink(missing_ok=True)
+        _stop(redirect_server)
+        _stop(capture_server)
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,14 @@ MEDIA_MAX_BYTES = 25 * 1024 * 1024
 _REQUEST_TIMEOUT_S = 30.0
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def media_base_url(relay_dial_url: str) -> str:
     """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…`` base.
 
@@ -148,7 +156,7 @@ class RelayMediaClient:
         def _post() -> Optional[str]:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as resp:
+                with _NO_REDIRECT_OPENER.open(req, timeout=_REQUEST_TIMEOUT_S) as resp:
                     import json
 
                     body = json.loads(resp.read().decode("utf-8"))
@@ -182,7 +190,15 @@ class RelayMediaClient:
         def _get() -> Optional[str]:
             req = urllib.request.Request(url, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_S) as resp:
+                if needs_auth:
+                    response_cm = _NO_REDIRECT_OPENER.open(
+                        req, timeout=_REQUEST_TIMEOUT_S
+                    )
+                else:
+                    response_cm = urllib.request.urlopen(
+                        req, timeout=_REQUEST_TIMEOUT_S
+                    )
+                with response_cm as resp:
                     length = int(resp.headers.get("Content-Length") or 0)
                     if length > MEDIA_MAX_BYTES:
                         logger.warning("relay media download too large: %s", url)
