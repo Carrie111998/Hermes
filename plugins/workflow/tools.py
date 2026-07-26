@@ -233,6 +233,25 @@ def _handle_workflow_start_predefined(
             if not result["valid"]:
                 issues = "\n".join(f"  - {i}" for i in result["issues"])
                 return _err(f"Workflow validation failed:\n{issues}")
+            # Validate provided inputs and attachments against declarations
+            try:
+                wf_def = engine.load_workflow(workflow)
+                for inp in getattr(wf_def, "inputs", []):
+                    if inp.get("required", False):
+                        if not inputs or inp["name"] not in inputs:
+                            return _err(
+                                f"Missing required input: '{inp['name']}'",
+                                hint=inp.get("description", ""),
+                            )
+                for att in getattr(wf_def, "attachments", []):
+                    if att.get("required", False):
+                        if not attachments or att["name"] not in attachments:
+                            return _err(
+                                f"Missing required attachment: '{att['name']}'",
+                                hint=att.get("description", ""),
+                            )
+            except FileNotFoundError:
+                pass
         except FileNotFoundError:
             pass  # Will be caught by execute()
         except Exception as exc:
