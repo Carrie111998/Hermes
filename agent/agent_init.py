@@ -1328,11 +1328,9 @@ def init_agent(
                         "Check the plugin install/symlink (`hermes plugins`)."
                     )
                     _ra().logger.warning(_warn_msg)
-                    if getattr(agent, "_emit_warning", None):
-                        try:
-                            agent._emit_warning(_warn_msg)
-                        except Exception:
-                            pass
+                    # Store for replay after gateway binds status_callback
+                    # (same pattern as _compression_warning replay).
+                    agent._init_memory_warning = _warn_msg
                     agent._memory_manager = None
         except Exception as _mpe:
             _failed_name = locals().get("_mem_provider_name") or "?"
@@ -1342,11 +1340,8 @@ def init_agent(
                 "Check the plugin install/symlink (`hermes plugins`)."
             )
             _ra().logger.warning(_warn_msg)
-            if getattr(agent, "_emit_warning", None):
-                try:
-                    agent._emit_warning(_warn_msg)
-                except Exception:
-                    pass
+            # Store for replay after gateway binds status_callback.
+            agent._init_memory_warning = _warn_msg
             agent._memory_manager = None
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools

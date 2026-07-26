@@ -243,6 +243,10 @@ def build_turn_context(
     if agent._compression_warning:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
+    # Replay init-time memory provider warning (same late-bound pattern).
+    if getattr(agent, "_init_memory_warning", None):
+        agent._replay_init_memory_warning()
+        # _replay_init_memory_warning clears the attribute on replay
 
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
     agent.iteration_budget = IterationBudget(agent.max_iterations)

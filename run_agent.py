@@ -1151,6 +1151,23 @@ class AIAgent:
         from agent.conversation_compression import replay_compression_warning
         replay_compression_warning(self)
 
+    def _replay_init_memory_warning(self) -> None:
+        """Replay the init-time memory provider warning through status_callback.
+
+        During ``AIAgent.__init__`` the gateway's ``status_callback`` is not yet
+        wired, so ``_emit_warning`` would reach nobody.  This method is called
+        at the start of every ``run_conversation()`` — by then the gateway has
+        set the callback, so every platform receives the warning.
+        """
+        msg = getattr(self, "_init_memory_warning", None)
+        cb = getattr(self, "status_callback", None)
+        if msg and cb:
+            try:
+                cb("warn", msg)
+            except Exception:
+                pass
+        self._init_memory_warning = None  # send once
+
     def _is_direct_openai_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets OpenAI's native API."""
         if base_url is not None:

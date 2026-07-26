@@ -191,7 +191,8 @@ def test_configured_memory_provider_load_failure_warns(caplog):
     Regression for the silent fallback to built-in memory (#49200): when
     memory.provider names a provider but load_memory_provider returns None, the
     agent used to log only at DEBUG and quietly run built-in memory. The
-    failure must now reach WARNING level and name the configured provider.
+    failure must now reach WARNING level, name the configured provider, and
+    store the warning for late-bound callback replay.
     """
     import logging
 
@@ -219,6 +220,7 @@ def test_configured_memory_provider_load_failure_warns(caplog):
             )
 
     assert agent._memory_manager is None
+    # WARNING must reach the log.
     warnings = [
         r.getMessage()
         for r in caplog.records
@@ -228,6 +230,11 @@ def test_configured_memory_provider_load_failure_warns(caplog):
         "expected a WARNING naming the configured provider 'mnemosyne'; "
         f"got: {[r.getMessage() for r in caplog.records]}"
     )
+    # Warning must be stored for late-bound callback replay.
+    assert getattr(agent, "_init_memory_warning", None) is not None, (
+        "expected _init_memory_warning to be set for late-bound replay"
+    )
+    assert "mnemosyne" in agent._init_memory_warning
 
 
 def test_configured_memory_provider_unavailable_warns(caplog):
@@ -268,3 +275,124 @@ def test_configured_memory_provider_unavailable_warns(caplog):
         "expected a WARNING naming the unavailable provider 'mnemosyne'; "
         f"got: {[r.getMessage() for r in caplog.records]}"
     )
+    # Warning must be stored for late-bound callback replay.
+    assert getattr(agent, "_init_memory_warning", None) is not None, (
+        "expected _init_memory_warning to be set for late-bound replay"
+    )
+    assert "mnemosyne" in agent._init_memory_warning
+
+
+def test_replay_init_memory_warning_reaches_late_bound_callback():
+    """Stored init memory warning replays when status_callback is set post-construction.
+
+    Regression for the late-bound callback pattern (#49302): the gateway creates
+    AIAgent and assigns agent.status_callback only *after* __init__ returns, so
+    _emit_warning calls during construction have no sink. The warning must be
+    stored on the agent and delivered when _replay_init_memory_warning() is
+    called after the callback is bound (matching the compression-warning pattern).
+    """
+    cfg = {"memory": {"provider": "mnemosyne"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=None),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-replay",
+            platform="cli",
+        )
+
+    # Simulate gateway: bind status_callback after construction.
+    callback_events = []
+    agent.status_callback = lambda ev, msg: callback_events.append((ev, msg))
+
+    # Replay the stored warning (as done in run_conversation).
+    agent._replay_init_memory_warning()
+
+    # Must have been delivered through status_callback.
+    assert len(callback_events) == 1, f"expected 1 callback event, got {callback_events}"
+    event_type, msg = callback_events[0]
+    assert event_type == "warn", f"expected 'warn' type, got {event_type!r}"
+    assert "mnemosyne" in msg, f"expected 'mnemosyne' in warning, got {msg!r}"
+
+    # Attribute must be cleared after one replay.
+    assert getattr(agent, "_init_memory_warning", None) is None, (
+        "_init_memory_warning must be cleared after replay"
+    )
+
+
+def test_replay_init_memory_warning_noop_when_no_warning():
+    """_replay_init_memory_warning is a no-op when there's no stored warning."""
+    cfg = {"memory": {"provider": "mnemosyne"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=None),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-no-warn",
+            platform="cli",
+        )
+
+    # Clear any stored warning (simulate no-warning state).
+    agent._init_memory_warning = None
+    callback_events = []
+    agent.status_callback = lambda ev, msg: callback_events.append((ev, msg))
+
+    # Must not raise.
+    agent._replay_init_memory_warning()
+
+    assert len(callback_events) == 0, f"expected no events, got {callback_events}"
+
+
+def test_replay_init_memory_warning_without_callback_is_noop():
+    """_replay_init_memory_warning doesn't crash when status_callback is None."""
+    cfg = {"memory": {"provider": "mnemosyne"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=None),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-no-cb",
+            platform="cli",
+        )
+
+    agent._init_memory_warning = "some warning"
+    # status_callback is None — must not raise.
+    agent._replay_init_memory_warning()
+    # Attribute should still be cleared.
+    assert getattr(agent, "_init_memory_warning", None) is None
