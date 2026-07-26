@@ -935,6 +935,19 @@ export const ar = defineLocale({
     durationMinutes: (minutes, seconds) => `${minutes} د ${seconds} ث`,
     tokens: value => `${value} رمز`
   },
+  projectSwitcher: {
+    title: 'تبديل المشروع',
+    openLabel: 'تبديل المشروع…',
+    searchPlaceholder: 'ابحث في المشاريع الأخيرة…',
+    recentHeading: 'المشاريع الأخيرة',
+    empty: 'لا توجد مشاريع حديثة بعد.',
+    openFolder: 'فتح مجلد…',
+    missingBadge: 'مفقود',
+    missingHint: 'لم يعد هذا المجلد متاحًا.',
+    remove: 'إزالة من القائمة الأخيرة',
+    switchedTo: name => `تم التبديل إلى ${name}`,
+    switchFailed: 'تعذّر تبديل المشروع'
+  },
   commandCenter: {
     close: 'إغلاق',
     paletteTitle: 'لوحة الأوامر',

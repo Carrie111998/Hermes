@@ -1086,6 +1086,20 @@ export const ja = defineLocale({
     tokens: value => `${value} トーク`
   },
 
+  projectSwitcher: {
+    title: 'プロジェクトを切り替え',
+    openLabel: 'プロジェクトを切り替え…',
+    searchPlaceholder: '最近のプロジェクトを検索…',
+    recentHeading: '最近のプロジェクト',
+    empty: '最近のプロジェクトはまだありません。',
+    openFolder: 'フォルダーを開く…',
+    missingBadge: '見つかりません',
+    missingHint: 'このフォルダーは利用できなくなりました。',
+    remove: '最近の一覧から削除',
+    switchedTo: name => `${name} に切り替えました`,
+    switchFailed: 'プロジェクトを切り替えられませんでした'
+  },
+
   commandCenter: {
     close: 'コマンドセンターを閉じる',
     paletteTitle: 'コマンドパレット',

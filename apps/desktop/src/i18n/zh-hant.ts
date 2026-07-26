@@ -1054,6 +1054,20 @@ export const zhHant = defineLocale({
     tokens: value => `${value} 詞元`
   },
 
+  projectSwitcher: {
+    title: '切換專案',
+    openLabel: '切換專案…',
+    searchPlaceholder: '搜尋最近的專案…',
+    recentHeading: '最近的專案',
+    empty: '尚無最近的專案。',
+    openFolder: '開啟資料夾…',
+    missingBadge: '已遺失',
+    missingHint: '此資料夾已無法使用。',
+    remove: '從最近清單移除',
+    switchedTo: name => `已切換至 ${name}`,
+    switchFailed: '無法切換專案'
+  },
+
   commandCenter: {
     close: '關閉命令中心',
     paletteTitle: '命令面板',

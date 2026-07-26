@@ -974,6 +974,20 @@ export interface Translations {
     tokens: (value: number | string) => string
   }
 
+  projectSwitcher: {
+    title: string
+    openLabel: string
+    searchPlaceholder: string
+    recentHeading: string
+    empty: string
+    openFolder: string
+    missingBadge: string
+    missingHint: string
+    remove: string
+    switchedTo: (name: string) => string
+    switchFailed: string
+  }
+
   commandCenter: {
     close: string
     paletteTitle: string

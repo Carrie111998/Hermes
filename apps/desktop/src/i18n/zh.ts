@@ -1302,6 +1302,20 @@ export const zh: Translations = {
     tokens: value => `${value} 词元`
   },
 
+  projectSwitcher: {
+    title: '切换项目',
+    openLabel: '切换项目…',
+    searchPlaceholder: '搜索最近的项目…',
+    recentHeading: '最近的项目',
+    empty: '暂无最近的项目。',
+    openFolder: '打开文件夹…',
+    missingBadge: '已丢失',
+    missingHint: '该文件夹已不可用。',
+    remove: '从最近列表中移除',
+    switchedTo: name => `已切换到 ${name}`,
+    switchFailed: '无法切换项目'
+  },
+
   commandCenter: {
     close: '关闭命令中心',
     paletteTitle: '命令面板',
