@@ -796,6 +796,41 @@ class QueuedSilenceAgent:
         }
 
 
+class QueuedRotatingAgent:
+    """First turn rotates; the queued turn must receive the child session."""
+
+    calls = 0
+    init_session_ids = []
+    task_ids = []
+    expected_child_session_id = None
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+        self.tools = []
+        type(self).init_session_ids.append(self.session_id)
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        type(self).task_ids.append(task_id)
+        if type(self).calls == 1:
+            type(self).expected_child_session_id = f"{self.session_id}-child"
+            self.session_id = type(self).expected_child_session_id
+            return {
+                "final_response": "first response after rotation",
+                "messages": [],
+                "api_calls": 1,
+            }
+        if task_id != type(self).expected_child_session_id:
+            raise RuntimeError(
+                f"queued turn reused closed parent session {task_id}"
+            )
+        return {
+            "final_response": "follow-up processed on child",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -1296,6 +1331,36 @@ async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_follo
     assert QueuedSilenceAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert "NO_REPLY" not in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_uses_child_session_after_first_turn_rotation(
+    monkeypatch, tmp_path,
+):
+    QueuedRotatingAgent.calls = 0
+    QueuedRotatingAgent.init_session_ids = []
+    QueuedRotatingAgent.task_ids = []
+    QueuedRotatingAgent.expected_child_session_id = None
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedRotatingAgent,
+        session_id="sess-queued-rotation-parent",
+        pending_text="queued follow-up",
+    )
+
+    child = "sess-queued-rotation-parent-child"
+    assert result["final_response"] == "follow-up processed on child"
+    assert result["session_id"] == child
+    assert QueuedRotatingAgent.init_session_ids == [
+        "sess-queued-rotation-parent",
+        child,
+    ]
+    assert QueuedRotatingAgent.task_ids == [
+        "sess-queued-rotation-parent",
+        child,
+    ]
 
 
 @pytest.mark.asyncio

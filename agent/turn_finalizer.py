@@ -630,6 +630,9 @@ def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
+    # The foreground task is terminal from the agent loop's perspective.
+    agent._foreground_turn_active = False
+
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
     if (agent._skill_nudge_interval > 0
@@ -637,6 +640,13 @@ def finalize_turn(
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
+
+    agent._pending_memory_review = bool(
+        getattr(agent, "_pending_memory_review", False) or _should_review_memory
+    )
+    agent._pending_skill_review = bool(
+        getattr(agent, "_pending_skill_review", False) or _should_review_skills
+    )
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
@@ -646,15 +656,28 @@ def finalize_turn(
         messages=messages,
     )
 
-    # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    from agent.background_review import task_is_terminal_for_review
+
+    _review_due = agent._pending_memory_review or agent._pending_skill_review
+    _review_terminal = task_is_terminal_for_review(
+        agent,
+        final_response=final_response,
+        completed=completed,
+        interrupted=interrupted,
+        failed=failed,
+        task_id=effective_task_id,
+    )
+    if _review_due and _review_terminal:
         try:
-            agent._spawn_background_review(
+            _review_spawned = agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
+                review_memory=agent._pending_memory_review,
+                review_skills=agent._pending_skill_review,
+                completion_id=f"{agent.session_id}:{turn_id}",
             )
+            if _review_spawned:
+                agent._pending_memory_review = False
+                agent._pending_skill_review = False
         except Exception:
             pass  # Background review is best-effort
 

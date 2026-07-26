@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Missing date fixture</title>
+    <link>https://example.test/missing-date</link>
+    <description>Fixture feed</description>
+    <item>
+      <title>Interesting but undated entry</title>
+      <guid>undated-1</guid>
+      <link>https://example.test/missing-date/undated-1</link>
+      <description>This synthetic item intentionally omits its publication date while retaining a sufficiently long body so the test proves the date filter, rather than another validation rule, excludes it.</description>
+    </item>
+  </channel>
+</rss>

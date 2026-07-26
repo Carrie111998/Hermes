@@ -677,6 +677,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
+        # Operators can make restart recovery finish the interrupted task instead
+        # of asking "what next?". Default remains interactive for compatibility.
+        self.interactive_resume = not self._coerce_bool_extra(
+            "resume_interrupted_tasks", False
+        )
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False

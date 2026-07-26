@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Synthetic Neuroscience News</title>
+    <link>https://example.test/news</link>
+    <description>Fixture feed</description>
+    <item>
+      <title>Community researchers compare rhythmic sensory protocols</title>
+      <guid>rss-item-1</guid>
+      <link>https://example.test/news/rss-item-1</link>
+      <pubDate>Fri, 25 Jul 2026 08:00:00 GMT</pubDate>
+      <description><![CDATA[<div>A synthetic community report compares several rhythmic sensory protocols, their measurement limitations, and the need for controlled replication. This body deliberately exceeds the minimum stored-entry length.</div>]]></description>
+    </item>
+  </channel>
+</rss>

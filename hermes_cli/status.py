@@ -582,6 +582,18 @@ def show_status(args):
             print(f"  Active:       {_session_count if _session_count is not None else 0}")
 
     # =========================================================================
+    # Programme control
+    # =========================================================================
+    print()
+    print(color("◆ Programme Control", Colors.CYAN, Colors.BOLD))
+    try:
+        from hermes_cli.programme.cli import print_status as _print_programme_status
+
+        _print_programme_status()
+    except Exception as exc:
+        print(f"  Status:       unavailable ({exc})")
+
+    # =========================================================================
     # Deep checks
     # =========================================================================
     if deep:

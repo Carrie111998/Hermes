@@ -824,20 +824,39 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
 
-    # Background review fork — same cadence + signature as the default
-    # path (line ~15449). Only fires when a trigger actually tripped AND
-    # we have a real final response.
-    if (
-        turn.final_text
-        and not turn.interrupted
-        and (should_review_memory or should_review_skills)
-    ):
+    agent._foreground_turn_active = False
+    agent._pending_memory_review = bool(
+        getattr(agent, "_pending_memory_review", False) or should_review_memory
+    )
+    agent._pending_skill_review = bool(
+        getattr(agent, "_pending_skill_review", False) or should_review_skills
+    )
+
+    from agent.background_review import task_is_terminal_for_review
+
+    _review_due = agent._pending_memory_review or agent._pending_skill_review
+    _review_terminal = task_is_terminal_for_review(
+        agent,
+        final_response=turn.final_text,
+        completed=not turn.interrupted and turn.error is None,
+        interrupted=turn.interrupted,
+        failed=turn.error is not None,
+        task_id=effective_task_id,
+    )
+    if _review_due and _review_terminal:
         try:
-            agent._spawn_background_review(
+            _review_spawned = agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=should_review_memory,
-                review_skills=should_review_skills,
+                review_memory=agent._pending_memory_review,
+                review_skills=agent._pending_skill_review,
+                completion_id=(
+                    f"{agent.session_id}:"
+                    f"{getattr(turn, 'turn_id', effective_task_id)}"
+                ),
             )
+            if _review_spawned:
+                agent._pending_memory_review = False
+                agent._pending_skill_review = False
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 

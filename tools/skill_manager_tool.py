@@ -840,6 +840,45 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         raise
 
 
+def _write_skill_file(
+    file_path: Path,
+    content: str,
+    *,
+    skill_name: str,
+    write_source: str = "skill_manage",
+) -> None:
+    """Lint and atomically write one canonical ``SKILL.md``.
+
+    Lint failures occur before the disk write and therefore leave the previous
+    file untouched. Audit-ledger failures are deliberately non-gating: the
+    cleaned skill is already durable, and the failure is surfaced in runtime
+    logs for operational follow-up.
+    """
+    from hermes_cli.skills.lint import lint_skill_body, split_skill_document
+
+    frontmatter, body = split_skill_document(content)
+    result = lint_skill_body(body)
+    _atomic_write_text(file_path, frontmatter + result.linted_body)
+
+    if not result.findings:
+        return
+    try:
+        from hermes_cli.skills.lint_log import record_lint
+
+        record_lint(
+            skill_name=skill_name,
+            skill_path=file_path,
+            write_source=write_source,
+            findings=result.findings,
+        )
+    except Exception:
+        logger.warning(
+            "Skill lint audit logging failed after writing %s",
+            file_path,
+            exc_info=True,
+        )
+
+
 # =============================================================================
 # Core actions
 # =============================================================================
@@ -890,7 +929,12 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
     # Write SKILL.md atomically
     skill_md = skill_dir / "SKILL.md"
-    _atomic_write_text(skill_md, content)
+    _write_skill_file(
+        skill_md,
+        content,
+        skill_name=name,
+        write_source="skill_manage",
+    )
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
@@ -951,7 +995,12 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    _atomic_write_text(skill_md, content)
+    _write_skill_file(
+        skill_md,
+        content,
+        skill_name=name,
+        write_source="skill_manage",
+    )
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
@@ -1063,8 +1112,10 @@ def _patch_skill(
     if err:
         return {"success": False, "error": err}
 
+    is_skill_md = target.name == "SKILL.md"
+
     # If patching SKILL.md, validate frontmatter is still intact
-    if not file_path:
+    if is_skill_md:
         err = _validate_frontmatter(new_content)
         if err:
             return {
@@ -1073,7 +1124,15 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
-    _atomic_write_text(target, new_content)
+    if is_skill_md:
+        _write_skill_file(
+            target,
+            new_content,
+            skill_name=name,
+            write_source="skill_manage",
+        )
+    else:
+        _atomic_write_text(target, new_content)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
@@ -1242,7 +1301,18 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    _atomic_write_text(target, file_content)
+    if target.name == "SKILL.md":
+        err = _validate_frontmatter(file_content)
+        if err:
+            return {"success": False, "error": err}
+        _write_skill_file(
+            target,
+            file_content,
+            skill_name=name,
+            write_source="skill_manage",
+        )
+    else:
+        _atomic_write_text(target, file_content)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])

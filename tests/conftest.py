@@ -581,7 +581,6 @@ def _wal_is_usable() -> bool:
         return True  # 3.44.x backport
     return False
 
-
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
     config.addinivalue_line(
@@ -607,24 +606,21 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
-    """Skip ``requires_wal`` tests when the linked SQLite can't use WAL.
+    """Skip ``requires_wal`` tests when the linked SQLite cannot use WAL.
 
     Cheaper and more honest than each test hand-rolling a version check: the
     reason string names the actual linked version so the skip is diagnosable
     rather than mysterious.
     """
-    if _wal_is_usable():
-        return
-
-    reason = (
-        f"SQLite {sqlite3.sqlite_version} has the WAL-reset bug — Hermes uses "
-        "journal_mode=DELETE here, so no -wal sidecar exists to assert on"
-    )
-    skip_marker = pytest.mark.skip(reason=reason)
-    for item in items:
-        if item.get_closest_marker(_REQUIRES_WAL_MARK) is not None:
-            item.add_marker(skip_marker)
-
+    if not _wal_is_usable():
+        reason = (
+            f"SQLite {sqlite3.sqlite_version} has the WAL-reset bug — Hermes uses "
+            "journal_mode=DELETE here, so no -wal sidecar exists to assert on"
+        )
+        skip_marker = pytest.mark.skip(reason=reason)
+        for item in items:
+            if item.get_closest_marker(_REQUIRES_WAL_MARK) is not None:
+                item.add_marker(skip_marker)
 
 @pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):

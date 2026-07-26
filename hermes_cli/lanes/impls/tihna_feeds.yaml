@@ -1,0 +1,33 @@
+schema_version: 1
+updated_at: "2026-07-26"
+feeds:
+  - name: "PubMed — binaural beats"
+    url: "https://pubmed.ncbi.nlm.nih.gov/rss/search/1DIwKvIXYqp_XKKr-JGVLNhX3JEjmZfCzHM4h_pF6zHYuGWTfg/?limit=20&utm_campaign=pubmed-2&fc=20260101120000"
+    category: papers
+  - name: "PubMed — brainwave entrainment"
+    url: "https://pubmed.ncbi.nlm.nih.gov/rss/search/1Q5oJP7Ck4Zn3F-x2Yjs-8DcL3ZE0nz5F5hcW9F-U3vAe/?limit=20&fc=20260101120000"
+    category: papers
+  - name: "NIH ClinicalTrials — binaural"
+    url: "https://clinicaltrials.gov/api/v2/studies?query.term=binaural&format=rss&limit=20"
+    category: papers
+  - name: "r/binauralbeats"
+    url: "https://www.reddit.com/r/binauralbeats/.rss"
+    category: community
+  - name: "r/Meditation"
+    url: "https://www.reddit.com/r/Meditation/.rss"
+    category: community
+  - name: "r/neuroscience"
+    url: "https://www.reddit.com/r/neuroscience/.rss"
+    category: community
+  - name: "MIT Technology Review — Neuroscience"
+    url: "https://www.technologyreview.com/topic/biotechnology-health/feed"
+    category: tech
+  - name: "Nature Neuroscience latest"
+    url: "https://www.nature.com/neuro.rss"
+    category: papers
+  - name: "Andrew Huberman podcast RSS"
+    url: "https://feeds.megaphone.fm/hubermanlab"
+    category: podcast
+  - name: "Neurosity blog"
+    url: "https://blog.neurosity.co/rss.xml"
+    category: tech

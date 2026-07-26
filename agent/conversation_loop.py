@@ -17,6 +17,7 @@ resolved through :func:`_ra` so those patches keep working.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import random
@@ -111,6 +112,599 @@ _LOCAL_PROCESSING_MODULES = frozenset({
 _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
+
+
+def _runtime_rotation_task_id(agent: Any, task_id: str | None) -> str:
+    """Keep one stable task identity across direct turns with no task id."""
+    explicit = str(task_id).strip() if task_id is not None else ""
+    existing = str(getattr(agent, "_rotation_task_id", "") or "").strip()
+    resolved = explicit or existing or str(getattr(agent, "session_id", "") or "")
+    if not resolved:
+        resolved = str(uuid.uuid4())
+    agent._rotation_task_id = resolved
+    return resolved
+
+
+def _rotation_base_system_prompt(agent: Any, system_message: str | None) -> str:
+    cached = getattr(agent, "_cached_system_prompt", None)
+    if isinstance(cached, str) and cached:
+        return cached
+    try:
+        return str(agent._build_system_prompt(system_message) or "")
+    except Exception:
+        return str(system_message or "")
+
+
+def _register_runtime_session(
+    agent: Any,
+    *,
+    task_id: str,
+    lane: str,
+    profile: str | None,
+    route: str | None,
+) -> None:
+    """Cross-link the existing state.db identity into the shared ledger."""
+    from hermes_cli.session import api as session_api
+    from hermes_cli.session import schema as session_schema
+
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if not session_id:
+        raise RuntimeError("runtime session identity is missing")
+    session_schema.ensure_migrated()
+    conn = session_schema.connect()
+    try:
+        row = conn.execute(
+            "SELECT task_id, closed_ts FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        session_api.open_session(
+            task_id=task_id,
+            lane=lane,
+            profile=profile,
+            route=route,
+            session_id=session_id,
+        )
+        return
+    if row["closed_ts"] is not None:
+        raise RuntimeError(
+            f"runtime attempted to reuse closed session {session_id}"
+        )
+    if str(row["task_id"]) != task_id:
+        logger.warning(
+            "Session %s already belongs to task %s; retaining durable owner "
+            "instead of rewriting it to %s",
+            session_id,
+            row["task_id"],
+            task_id,
+        )
+        agent._rotation_task_id = str(row["task_id"])
+
+
+def _rollback_shared_rotation(
+    *,
+    old_session_id: str,
+    new_session_id: str,
+) -> None:
+    from hermes_cli.session import schema as session_schema
+    from hermes_cli.sqlite_util import retrying_write_txn
+
+    conn = session_schema.connect()
+    try:
+        with retrying_write_txn(conn):
+            conn.execute(
+                "DELETE FROM sessions WHERE id = ? AND parent_session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            conn.execute(
+                """
+                UPDATE sessions
+                   SET closed_ts = NULL,
+                       rotation_reason = NULL,
+                       token_count_at_close = NULL,
+                       handoff_summary_json = NULL
+                 WHERE id = ?
+                """,
+                (old_session_id,),
+            )
+    finally:
+        conn.close()
+
+
+def _transition_runtime_session(
+    agent: Any,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    old_history: list,
+    handoff_system_prompt: str,
+) -> None:
+    """Move the pre-existing state.db identity with orphan-safe recovery."""
+    session_db = getattr(agent, "_session_db", None)
+    old_title = None
+    if session_db is not None:
+        try:
+            agent._ensure_db_session()
+            old_title = session_db.get_session_title(old_session_id)
+            session_db.end_session(old_session_id, "rotation")
+            session_db.create_session(
+                session_id=new_session_id,
+                source=(
+                    getattr(agent, "platform", None)
+                    or os.environ.get("HERMES_SESSION_SOURCE", "cli")
+                ),
+                model=getattr(agent, "model", None),
+                model_config=getattr(agent, "_session_init_model_config", None),
+                system_prompt=handoff_system_prompt,
+                parent_session_id=old_session_id,
+            )
+        except Exception:
+            try:
+                session_db.reopen_session(old_session_id)
+            except Exception:
+                pass
+            raise
+
+    agent.session_id = new_session_id
+    agent._parent_session_id = old_session_id
+    agent._session_db_created = session_db is not None
+    agent._rotation_handoff_system_prompt = handoff_system_prompt
+    agent._cached_system_prompt = handoff_system_prompt
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = new_session_id
+
+    try:
+        from gateway.session_context import set_current_session_id
+
+        set_current_session_id(new_session_id)
+    except Exception:
+        os.environ["HERMES_SESSION_ID"] = new_session_id
+    try:
+        set_session_context(new_session_id)
+    except Exception:
+        pass
+
+    try:
+        agent.reset_session_state(
+            previous_messages=old_history,
+            old_session_id=old_session_id,
+            carry_over_context=True,
+        )
+    except Exception:
+        logger.debug("Context-engine rotation notification failed", exc_info=True)
+    try:
+        if getattr(agent, "_memory_manager", None):
+            agent._memory_manager.on_session_switch(
+                new_session_id,
+                parent_session_id=old_session_id,
+                reset=False,
+                reason="rotation",
+            )
+    except Exception:
+        logger.debug("Memory-manager rotation notification failed", exc_info=True)
+    try:
+        from hermes_cli.goals import migrate_goal_to_session
+
+        migrate_goal_to_session(
+            old_session_id,
+            new_session_id,
+            reason="rotation",
+        )
+    except Exception:
+        logger.debug("Goal migration on rotation failed", exc_info=True)
+    if session_db is not None and old_title:
+        try:
+            title = session_db.get_next_title_in_lineage(old_title)
+            session_db.set_session_title(new_session_id, title)
+        except Exception:
+            logger.debug("Session title propagation failed", exc_info=True)
+
+
+def prepare_session_rotation(
+    agent: Any,
+    *,
+    user_message: Any,
+    system_message: str | None,
+    conversation_history: list | None,
+    task_id: str | None,
+    lane: str | None,
+    profile: str | None,
+    route: str | None,
+) -> list:
+    """Register and, when needed, rotate before turn-context construction."""
+    from hermes_cli.session.controller import rotate_now, should_rotate
+    from hermes_cli.session.estimator import estimate_next_turn_input_tokens
+
+    history = list(conversation_history or [])
+    # Persistence-isolated forks (notably background skill/memory review)
+    # deliberately share the foreground agent's session id for prompt-cache
+    # warmth, but they are not lifecycle owners.  Letting one register or
+    # rotate that shared id can close the foreground session and strand the
+    # gateway on its parent while the fork exits on an unindexed child.
+    if getattr(agent, "_persist_disabled", False):
+        return history
+
+    durable_task_id = _runtime_rotation_task_id(agent, task_id)
+    durable_lane = str(lane or getattr(agent, "lane", None) or "platform")
+    _register_runtime_session(
+        agent,
+        task_id=durable_task_id,
+        lane=durable_lane,
+        profile=profile,
+        route=route,
+    )
+    base_prompt = _rotation_base_system_prompt(agent, system_message)
+    rotate, reason = should_rotate(
+        system_prompt=base_prompt,
+        conversation_history=history,
+        pending_user_message=str(user_message or ""),
+    )
+    if not rotate:
+        return history
+
+    estimate = estimate_next_turn_input_tokens(
+        base_prompt,
+        history,
+        str(user_message or ""),
+    )
+    old_session_id = str(agent.session_id)
+    new_session_id, handoff_prefix = rotate_now(
+        current_session_id=old_session_id,
+        task_id=durable_task_id,
+        lane=durable_lane,
+        profile=profile,
+        route=route,
+        reason=reason,
+        token_count_at_close=estimate,
+    )
+    merged_prompt = f"{handoff_prefix}\n\n{base_prompt}"
+    try:
+        _transition_runtime_session(
+            agent,
+            old_session_id=old_session_id,
+            new_session_id=new_session_id,
+            old_history=history,
+            handoff_system_prompt=merged_prompt,
+        )
+    except Exception:
+        _rollback_shared_rotation(
+            old_session_id=old_session_id,
+            new_session_id=new_session_id,
+        )
+        agent.session_id = old_session_id
+        raise
+    return []
+
+
+def _metered_vendor(provider: Any, base_url: Any) -> Optional[str]:
+    """Map runtime provider routes to their durable ledger vendor names."""
+    provider_name = str(provider or "").strip().lower()
+    base_url_text = str(base_url or "")
+    if provider_name == "openai-codex":
+        return "openai-codex"
+    if provider_name == "openrouter" or base_url_host_matches(
+        base_url_text, "openrouter.ai"
+    ):
+        return "openrouter"
+    if provider_name == "anthropic" or base_url_host_matches(
+        base_url_text, "api.anthropic.com"
+    ):
+        return "anthropic"
+    if provider_name in {"openai", "openai-api"} or base_url_host_matches(
+        base_url_text, "api.openai.com"
+    ):
+        return "openai"
+    return None
+
+
+def _cost_model_slug(vendor: str, model: Any) -> str:
+    model_text = str(model or "unknown").strip() or "unknown"
+    if "/" in model_text:
+        return model_text
+    return f"{vendor}/{model_text}"
+
+
+def _record_metered_provider_call(
+    agent: Any,
+    response: Any,
+    *,
+    task_id: str,
+    attempt_number: int,
+    latency_ms: int,
+    profile: str | None = None,
+    route: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Synchronously ledger one successful CS-02 provider response."""
+    vendor = _metered_vendor(agent.provider, agent.base_url)
+    if vendor is None:
+        return
+
+    raw_usage = getattr(response, "usage", None)
+    usage = normalize_usage(
+        raw_usage,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+    response_model = getattr(response, "model", None) or agent.model
+    cost_result = estimate_usage_cost(
+        response_model,
+        usage,
+        provider=agent.provider,
+        base_url=agent.base_url,
+        api_key=getattr(agent, "api_key", ""),
+    )
+    reported_cost = getattr(raw_usage, "cost", None)
+    try:
+        usd_amount = (
+            float(reported_cost)
+            if vendor == "openrouter" and reported_cost is not None
+            else float(cost_result.amount_usd)
+            if cost_result.amount_usd is not None
+            else 0.0
+        )
+    except (TypeError, ValueError):
+        usd_amount = (
+            float(cost_result.amount_usd)
+            if cost_result.amount_usd is not None
+            else 0.0
+        )
+
+    # CS-05 will thread doctrine lanes/rungs/escalation through this call.
+    # Until then the spec requires a visible warning and platform fallback.
+    lane = "platform"
+    logger.warning(
+        "Cost gate lane unavailable for task %s; using platform fallback",
+        task_id,
+    )
+
+    from hermes_cli.cost.gate_integration import on_call_complete
+
+    on_call_complete(
+        task_id=task_id,
+        lane=lane,
+        vendor=vendor,
+        model_slug=_cost_model_slug(vendor, response_model),
+        attempt_number=attempt_number,
+        rung_id=None,
+        escalation=False,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cached_input_tokens=usage.cache_read_tokens + usage.cache_write_tokens,
+        usd_amount=usd_amount,
+        latency_ms=latency_ms,
+        request_id=getattr(response, "id", None),
+        raw_response_meta={
+            "cost_status": (
+                "actual"
+                if vendor == "openrouter" and reported_cost is not None
+                else cost_result.status
+            ),
+            "cost_source": (
+                "provider_response"
+                if vendor == "openrouter" and reported_cost is not None
+                else cost_result.source
+            ),
+            "pricing_version": cost_result.pricing_version,
+            "response_model": str(response_model),
+        },
+        profile=profile,
+        route=route,
+        session_id=getattr(agent, "session_id", None),
+    )
+
+
+def _prompt_hash(prompt: Any) -> str:
+    """Hash the exact prompt text (or a stable JSON rendering for rich input)."""
+    if isinstance(prompt, str):
+        text = prompt
+    else:
+        text = json.dumps(
+            prompt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _execute_recorded_leaf_call(
+    call,
+    *,
+    task_id: str,
+    attempt_number: int,
+    rung_id: str,
+    model: str,
+    prompt: Any,
+    task_run_id: int | None = None,
+    db_path=None,
+    on_success=None,
+    provider: str | None = None,
+    lane: str = "platform",
+    profile: str | None = None,
+    route: str | None = None,
+    session_id: str | None = None,
+):
+    """Issue one provider call and persist its dispatch plus compact verdict.
+
+    The response shape is deliberately unchanged. ``on_success`` runs before
+    the verdict insert so CS-02 can append the provider cost row first and the
+    verdict can copy that row's AUD amount.
+    """
+    from hermes_cli.verdict import (
+        DispatchEnvelope,
+        LeafVerdict,
+        last_cost_aud_for_task,
+        record_dispatch,
+        record_verdict,
+    )
+
+    model_slug = str(model or "unknown")
+    strategy_payload = {
+        "model": model_slug,
+        "mode": "single",
+        "prompt_hash": _prompt_hash(prompt),
+    }
+    envelope = DispatchEnvelope(
+        task_id=task_id,
+        task_run_id=task_run_id,
+        attempt_number=attempt_number,
+        rung_id=rung_id,
+        model_slug=model_slug,
+        mode="single",
+        strategy_payload=strategy_payload,
+    )
+    dispatch_id = record_dispatch(
+        envelope,
+        db_path=db_path,
+        profile=profile,
+        route=route,
+        session_id=session_id,
+    )
+    provider_name = str(provider or "").strip().lower()
+    if provider_name == "openai-codex":
+        from hermes_cli.cost import bridge_state
+        from hermes_cli.cost.errors import SubscriptionBridgeHaltedError
+
+        disabled, reason = bridge_state.is_fallthrough_disabled(db_path)
+        if disabled:
+            message = reason or "subscription bridge fallthrough is disabled"
+            try:
+                from hermes_cli.cost.gate_integration import record_bridge_turn
+
+                record_bridge_turn(
+                    task_id=task_id,
+                    lane=lane,
+                    outcome="rate_limited",
+                    bridge_tier="pro",
+                    model_requested=model_slug,
+                    error_class=SubscriptionBridgeHaltedError.__name__,
+                    error_message=message,
+                    raw_response_meta={"precheck": "bridge_state_disabled"},
+                    db_path=db_path,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record disabled Pro-bridge precheck for task %s",
+                    task_id,
+                )
+            halted = SubscriptionBridgeHaltedError(message)
+            record_verdict(
+                LeafVerdict(
+                    task_id=task_id,
+                    task_run_id=task_run_id,
+                    attempt_number=attempt_number,
+                    rung_id=rung_id,
+                    dispatch_envelope_id=dispatch_id,
+                    model_used=model_slug,
+                    outcome="failure",
+                    failure_class="budget",
+                    confidence=0.0,
+                    strategy_hash=envelope.strategy_hash,
+                    wall_ms=0,
+                    error_class=type(halted).__name__,
+                    error_message=str(halted),
+                ),
+                db_path=db_path,
+                profile=profile,
+                route=route,
+                session_id=session_id,
+            )
+            raise halted
+
+    started = time.monotonic()
+    try:
+        response = call()
+    except Exception as exc:
+        wall_ms = max(0, round((time.monotonic() - started) * 1000))
+        if provider_name == "openai-codex":
+            error_text = str(exc).lower()
+            bridge_outcome = (
+                "rate_limited"
+                if (
+                    "429" in error_text
+                    or "rate limit" in error_text
+                    or "rate_limit" in error_text
+                    or "quota" in error_text
+                )
+                else "failure"
+            )
+            try:
+                from hermes_cli.cost.gate_integration import record_bridge_turn
+
+                record_bridge_turn(
+                    task_id=task_id,
+                    lane=lane,
+                    outcome=bridge_outcome,
+                    bridge_tier="pro",
+                    model_requested=model_slug,
+                    latency_ms=wall_ms,
+                    error_class=type(exc).__name__,
+                    error_message=str(exc),
+                    raw_response_meta={"source": "on_error"},
+                    db_path=db_path,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record Pro-bridge error for task %s",
+                    task_id,
+                )
+        record_verdict(
+            LeafVerdict(
+                task_id=task_id,
+                task_run_id=task_run_id,
+                attempt_number=attempt_number,
+                rung_id=rung_id,
+                dispatch_envelope_id=dispatch_id,
+                model_used=model_slug,
+                outcome="failure",
+                failure_class="infra",
+                confidence=0.0,
+                strategy_hash=envelope.strategy_hash,
+                wall_ms=wall_ms,
+                error_class=type(exc).__name__,
+                error_message=str(exc),
+            ),
+            db_path=db_path,
+            profile=profile,
+            route=route,
+            session_id=session_id,
+        )
+        raise
+
+    wall_ms = max(0, round((time.monotonic() - started) * 1000))
+    if on_success is not None:
+        on_success(response, wall_ms)
+
+    raw_usage = getattr(response, "usage", None)
+    usage = normalize_usage(raw_usage)
+    response_model = str(getattr(response, "model", None) or model_slug)
+    record_verdict(
+        LeafVerdict(
+            task_id=task_id,
+            task_run_id=task_run_id,
+            attempt_number=attempt_number,
+            rung_id=rung_id,
+            dispatch_envelope_id=dispatch_id,
+            model_used=response_model,
+            outcome="success",
+            confidence=1.0,
+            strategy_hash=envelope.strategy_hash,
+            cost_aud=last_cost_aud_for_task(task_id, db_path=db_path),
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            wall_ms=wall_ms,
+        ),
+        db_path=db_path,
+        profile=profile,
+        route=route,
+        session_id=session_id,
+    )
+    return response
 
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
@@ -411,6 +1005,29 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    rotation_prompt = getattr(
+        agent,
+        "_rotation_handoff_system_prompt",
+        None,
+    )
+    if isinstance(rotation_prompt, str) and rotation_prompt:
+        agent._cached_system_prompt = rotation_prompt
+        agent._rotation_handoff_system_prompt = None
+        try:
+            if agent._session_db:
+                agent._session_db.update_system_prompt(
+                    agent.session_id,
+                    rotation_prompt,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Rotated handoff system prompt persistence failed "
+                "(session=%s): %s",
+                agent.session_id,
+                exc,
+            )
+        return
+
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:
@@ -930,6 +1547,58 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _arm_doctrine_fallback_failure(
+    agent,
+    *,
+    failure_class: str,
+    latency_ms: int,
+    error: Any,
+) -> None:
+    """Attach evidence that is consumed only if a provider switch succeeds."""
+    agent._doctrine_fallback_failure = {
+        "failure_class": str(failure_class or "unknown"),
+        "latency_ms": max(0, int(latency_ms or 0)),
+        "error_repr": repr(error)[:500],
+        "transition_reason": "provider_switch",
+    }
+
+
+def _flush_doctrine_route_context(agent, result: Dict[str, Any]) -> None:
+    """Persist one routed worker's result without changing its turn outcome."""
+    try:
+        from hermes_cli.routing.route_context import (
+            flush_to_db,
+            get_route_context,
+            mark_cascade_exhausted,
+        )
+
+        if get_route_context() is None:
+            return
+        failed = bool(
+            result.get("failed") or result.get("completed") is False
+        )
+        chain = getattr(agent, "_fallback_chain", None) or []
+        if (
+            failed
+            and chain
+            and int(getattr(agent, "_fallback_index", 0)) >= len(chain)
+        ):
+            pending = (
+                getattr(agent, "_doctrine_fallback_failure", None) or {}
+            )
+            mark_cascade_exhausted(pending.get("failure_class"))
+        flush_to_db(
+            chosen_provider=str(getattr(agent, "provider", "") or ""),
+            chosen_model=str(getattr(agent, "model", "") or ""),
+            outcome="failure" if failed else "success",
+        )
+    except Exception:
+        logger.warning(
+            "Doctrine route-context flush failed without changing turn outcome",
+            exc_info=True,
+        )
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -940,6 +1609,11 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    rung_id: str = "r0_baseline",
+    profile: str | None = None,
+    route: str | None = None,
+    _programme_ingress_admitted: bool = False,
+    _session_rotation_checked: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -957,11 +1631,43 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
+        rung_id: Compact execution rung stamped onto dispatches and verdicts.
                 or queuing follow-up prefetch work.
 
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if not _programme_ingress_admitted:
+        from hermes_cli.programme.ingress import (
+            admit_new_turn,
+            resolve_turn_attribution,
+        )
+
+        route, profile = resolve_turn_attribution(
+            route=route,
+            profile=profile,
+            platform=getattr(agent, "platform", None),
+            task_id_hint=task_id,
+        )
+        admit_new_turn(
+            route=route,
+            profile=profile,
+            session_id=getattr(agent, "session_id", None),
+            task_id_hint=task_id,
+        )
+
+    if not _session_rotation_checked:
+        conversation_history = prepare_session_rotation(
+            agent,
+            user_message=user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            lane=getattr(agent, "lane", None),
+            profile=profile,
+            route=route,
+        )
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -2055,21 +2761,44 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
+                    response = _execute_recorded_leaf_call(
+                        lambda: run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        ),
                         task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
+                        attempt_number=api_call_count,
+                        rung_id=rung_id,
                         model=agent.model,
+                        prompt=original_user_message,
                         provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
+                        lane="platform",
+                        profile=profile,
+                        route=route,
+                        session_id=getattr(agent, "session_id", None),
+                        on_success=lambda completed, wall_ms: (
+                            _record_metered_provider_call(
+                                agent,
+                                completed,
+                                task_id=effective_task_id,
+                                attempt_number=api_call_count,
+                                latency_ms=wall_ms,
+                                profile=profile,
+                                route=route,
+                            )
+                        ),
                     )
                 finally:
                     if _redirect_lock is not None:
@@ -2100,7 +2829,7 @@ def run_conversation(
                     break
                 
                 api_duration = time.time() - api_start_time
-                
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:
@@ -3102,6 +3831,20 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                from hermes_cli.cost.errors import SubscriptionBridgeHaltedError
+                from hermes_cli.cost.kill_switch import (
+                    KillSwitchTripped,
+                )
+
+                if isinstance(
+                    api_error,
+                    (
+                        SubscriptionBridgeHaltedError,
+                        KillSwitchTripped,
+                    ),
+                ):
+                    raise
+
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -4040,6 +4783,12 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                        _arm_doctrine_fallback_failure(
+                            agent,
+                            failure_class=classified.reason.value,
+                            latency_ms=round(elapsed_time * 1000),
+                            error=api_error,
+                        )
                         if agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -4072,6 +4821,12 @@ def run_conversation(
                     agent._buffer_status(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
+                    )
+                    _arm_doctrine_fallback_failure(
+                        agent,
+                        failure_class=classified.reason.value,
+                        latency_ms=round(elapsed_time * 1000),
+                        error=api_error,
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
@@ -6205,6 +6960,16 @@ def run_conversation(
                             "⚠️ Model returning empty responses — "
                             "switching to fallback provider..."
                         )
+                        _arm_doctrine_fallback_failure(
+                            agent,
+                            failure_class="empty_response",
+                            latency_ms=round(
+                                max(0.0, time.time() - api_start_time) * 1000
+                            ),
+                            error=RuntimeError(
+                                "empty response after retry exhaustion"
+                            ),
+                        )
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -6577,6 +7342,20 @@ def run_conversation(
                 break
             
         except Exception as e:
+            from hermes_cli.cost.errors import SubscriptionBridgeHaltedError
+            from hermes_cli.cost.kill_switch import (
+                KillSwitchTripped,
+            )
+
+            if isinstance(
+                e,
+                (
+                    SubscriptionBridgeHaltedError,
+                    KillSwitchTripped,
+                ),
+            ):
+                raise
+
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.
@@ -6675,7 +7454,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -6692,7 +7471,8 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
-
+    _flush_doctrine_route_context(agent, result)
+    return result
 
 
 __all__ = ["run_conversation"]

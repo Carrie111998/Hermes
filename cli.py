@@ -16277,12 +16277,31 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _halt() -> None:
+        c = _kb.connect()
+        try:
+            _kb.block_task(
+                c,
+                task_id,
+                reason="Programme halted by operator at leaf-attempt checkpoint.",
+                metadata={"halted_by_operator": True},
+            )
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    from hermes_cli.programme.gate import is_halt_signalled as _is_halt_signalled
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,
+        halt_signalled_fn=_is_halt_signalled,
+        halt_fn=_halt,
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),

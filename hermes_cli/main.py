@@ -14485,16 +14485,16 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "auth", "backup", "bridge", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
+        "drain", "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "pairing", "pets", "plugins", "portal", "profile",
+        "halt", "model", "pairing", "pause", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
-        "send", "sessions", "setup",
+        "resume", "send", "session", "sessions", "setup", "side-effects",
         "skin", "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
@@ -15269,6 +15269,69 @@ def main():
     # auth command  (parser built in hermes_cli/subcommands/auth.py)
     # =========================================================================
     build_auth_parser(subparsers, cmd_auth=cmd_auth)
+
+    # =========================================================================
+    # programme-control commands
+    # =========================================================================
+    from hermes_cli.programme.cli import register_cli as _register_programme_cli
+
+    _register_programme_cli(subparsers)
+
+    # =========================================================================
+    # cost command
+    # =========================================================================
+    from hermes_cli.cost.cli import register_cli as _register_cost_cli
+
+    _register_cost_cli(subparsers)
+
+    # =========================================================================
+    # per-task kill switch
+    # =========================================================================
+    from hermes_cli.subcommands.kill import register_cli as _register_kill_cli
+
+    _register_kill_cli(subparsers)
+
+    # =========================================================================
+    # ChatGPT Pro subscription bridge
+    # =========================================================================
+    from hermes_cli.subcommands.bridge import register_cli as _register_bridge_cli
+
+    _register_bridge_cli(subparsers)
+
+    # =========================================================================
+    # shared session rotation
+    # =========================================================================
+    from hermes_cli.subcommands.session import register_cli as _register_session_cli
+
+    _register_session_cli(subparsers)
+
+    # =========================================================================
+    # Atlas routing doctrine
+    # =========================================================================
+    from hermes_cli.subcommands.doctrine import register_cli as _register_doctrine_cli
+
+    _register_doctrine_cli(subparsers)
+
+    # =========================================================================
+    # side-effect idempotency ledger
+    # =========================================================================
+    from hermes_cli.side_effects.cli import register_cli as _register_side_effects_cli
+
+    _register_side_effects_cli(subparsers)
+
+    # =========================================================================
+    # coordinated service restart
+    # =========================================================================
+    from hermes_cli.service.cli import register_cli as _register_restart_cli
+
+    _register_restart_cli(subparsers)
+
+    # =========================================================================
+    # business-lane contract framework
+    # =========================================================================
+    from hermes_cli.lanes.cli import register_cli as _register_lanes_cli
+
+    _register_lanes_cli(subparsers)
 
     # =========================================================================
     # status command  (parser built in hermes_cli/subcommands/status.py)
