@@ -214,8 +214,8 @@ class TestNotifyWorkflowComplete:
         ))
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
-        assert "✅ spec" in msg
-        assert "✅ qa" in msg
+        assert "spec (edison)" in msg
+        assert "qa (raven)" in msg
         assert "edison" in msg
         assert "raven" in msg
         os.unlink(markers[-1])

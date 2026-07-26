@@ -612,7 +612,7 @@ def _notify_workflow_complete(task_id: str, state=None):
                 # Layer summary
                 for layer_info in r.get("layer_summary", []):
                     for node_info in layer_info.get("nodes", []):
-                        status_icon = {
+                        status_label = {
                             "done": "✅", "running": "⏳", "pending": "⬜",
                             "failed": "❌", "blocked": "🚫", "timed_out": "⏰",
                         }.get(node_info.get("status", ""), "❓")
@@ -634,16 +634,14 @@ def _notify_workflow_complete(task_id: str, state=None):
         if not message:
             lines = []
             for n in all_nodes:
-                icon = {"done": "✅", "failed": "❌", "blocked": "🚫", "skipped": "⏭"}.get(n["status"], "❓")
-                lines.append(f"  {icon} {n['node']} ({n['agent']})")
+                lines.append(f"  {n['node']} ({n['agent']}): {n['status']}")
                 if n.get("summary"):
-                    # Indent and wrap summary
-                    for sline in n["summary"].split("\n")[:5]:  # Max 5 lines
-                        lines.append(f"      {sline}")
+                    for sline in n["summary"].split("\n")[:5]:
+                        lines.append(f"    {sline}")
             message = "\n".join(lines)
 
         # Build the full notification
-        heading = f"✅ Workflow '{workflow_name}' completed on board '{board}' — {done_count}/{total} nodes succeeded"
+        heading = f"Workflow '{workflow_name}' completed on board '{board}' — {done_count}/{total} nodes succeeded"
         if failed_count:
             heading += f" ({failed_count} failed)"
         full_message = f"{heading}\n\nNodes:\n{message}"
@@ -675,7 +673,7 @@ def _notify_workflow_complete(task_id: str, state=None):
         except Exception:
             os.unlink(tmp_path)
             raise
-        print(f"   📨 Workflow completion marker written: {marker_path.relative_to(_COMPLETIONS_DIR)}")
+        print(f"   Workflow completion marker written: {marker_path.relative_to(_COMPLETIONS_DIR)}")
     except Exception as e:
         print(f"   ⚠  Failed to write completion marker: {e}")
 
