@@ -409,6 +409,24 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
+    @staticmethod
+    def _replace_would_shrink(db, state: SessionState) -> bool:
+        """True when replacing the stored transcript would drop live rows.
+
+        A save that carries FEWER messages than the session already has on disk
+        is a compaction (or a truncation), not an update — the destructive
+        ``replace_messages`` would delete the difference outright. Counting is
+        enough here: ACP's in-memory history is always a prefix-plus-tail of the
+        stored conversation, so a shorter history means stored turns are about
+        to disappear. Errors fall back to ``False`` so persistence keeps working
+        exactly as before when the count cannot be read.
+        """
+        try:
+            stored = db.get_messages(state.session_id)
+        except Exception:
+            return False
+        return len(stored) > len(state.history or [])
+
     def _persist(self, state: SessionState) -> None:
         """Write session state to the database.
 
@@ -488,6 +506,31 @@ class SessionManager:
                     has_archived = db.has_archived_messages(state.session_id)
                 except Exception:
                     has_archived = False
+                # "No archived rows" does NOT imply "nothing to lose". ACP
+                # /compress unsets agent._session_db before calling
+                # _compress_context (to avoid its session-splitting side
+                # effect), which also suppresses archive_and_compact() — so a
+                # compacted ACP session reaches this point with a FULL stored
+                # transcript, ZERO active=0 rows, and an in-memory history that
+                # is just the summary. The guard above then reads that absence
+                # as "fresh create/fork" and the replace hard-DELETEs every
+                # stored turn (and its FTS rows). Detect the shrink directly:
+                # when the write would drop stored live rows, soft-archive them
+                # instead via archive_and_compact() — same session id (#38763),
+                # summary becomes the live set, prior turns stay on disk and
+                # searchable.
+                if not has_archived and self._replace_would_shrink(db, state):
+                    try:
+                        db.archive_and_compact(state.session_id, state.history)
+                        return
+                    except Exception:
+                        logger.warning(
+                            "ACP: archive_and_compact failed for %s; falling back "
+                            "to a live-only replace to avoid deleting history",
+                            state.session_id,
+                            exc_info=True,
+                        )
+                        has_archived = True
                 db.replace_messages(
                     state.session_id, state.history, active_only=has_archived
                 )
