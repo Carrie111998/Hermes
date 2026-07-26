@@ -65,6 +65,8 @@ export function ContextUsagePanel({
 
   const contextMax = breakdown?.context_max ?? currentUsage.context_max ?? 0
   const contextUsed = breakdown?.context_used ?? currentUsage.context_used ?? 0
+  const contextUsedIsEstimate = breakdown ? breakdown.context_used_is_estimate !== false : false
+  const contextUsedLabel = `${contextUsedIsEstimate ? '~' : ''}${compactNumber(contextUsed)}`
 
   const contextPercent = Math.max(
     0,
@@ -87,14 +89,23 @@ export function ContextUsagePanel({
       <div className="flex items-baseline justify-between gap-2">
         <p className="font-medium text-foreground">{copy.title}</p>
 
-        <span className="text-[0.6875rem] text-muted-foreground">
-          {copy.tokenSummary(`~${compactNumber(contextUsed)}`, compactNumber(contextMax))}
+        <span className="text-[0.6875rem] text-muted-foreground" data-slot="context-usage-total">
+          {copy.tokenSummary(contextUsedLabel, compactNumber(contextMax))}
         </span>
       </div>
 
       <p className="text-[0.6875rem] text-foreground">{copy.percentFull(contextPercent)}</p>
 
       <ContextUsageBar categories={categories} segmentTotal={segmentTotal} />
+
+      {!!categories.length && (
+        <div className="flex flex-col gap-0.5">
+          <p className="font-medium text-foreground">{copy.estimatedBreakdown}</p>
+          <p className="text-[0.6875rem] leading-relaxed text-muted-foreground">
+            {copy.estimatedBreakdownHint}
+          </p>
+        </div>
+      )}
 
       <ul className="flex flex-col gap-1.5">
         {categories.map(category => (

@@ -8162,14 +8162,16 @@ def _(rid, params: dict) -> dict:
     agent = session.get("agent")
     if agent is None:
         usage = _session_usage_snapshot(session) or _get_usage(None)
+        context_used = usage.get("context_used", 0) or 0
         return _ok(
             rid,
             {
                 "categories": [],
                 "context_max": usage.get("context_max", 0) or 0,
                 "context_percent": usage.get("context_percent", 0) or 0,
-                "context_used": usage.get("context_used", 0) or 0,
-                "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
+                "context_used": context_used,
+                "context_used_is_estimate": not bool(context_used),
+                "estimated_total": context_used or usage.get("total", 0) or 0,
                 "model": _metadata_mirror(session).get("model", ""),
             },
         )

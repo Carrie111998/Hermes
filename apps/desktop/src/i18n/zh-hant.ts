@@ -2205,6 +2205,8 @@ export const zhHant = defineLocale({
           tool_definitions: '工具定義'
         },
         empty: '尚無上下文資料',
+        estimatedBreakdown: '估算明細',
+        estimatedBreakdownHint: '分類數值為近似值，其總和可能與實測總數不同。',
         loading: '正在載入明細…',
         percentFull: percent => `已用 ${percent}%`,
         title: '上下文使用量',

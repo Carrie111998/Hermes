@@ -151,6 +151,7 @@ def compute_session_context_breakdown(
         "context_max": context_max,
         "context_percent": context_percent,
         "context_used": context_used,
+        "context_used_is_estimate": measured_used <= 0,
         "estimated_total": estimated_total,
         "model": getattr(agent, "model", "") or "",
     }

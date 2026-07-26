@@ -1,4 +1,4 @@
-import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -21,6 +21,7 @@ const breakdown: ContextBreakdown = {
   context_max: 272_000,
   context_percent: 89,
   context_used: 241_400,
+  context_used_is_estimate: false,
   estimated_total: 286_600,
   model: 'test-model'
 }
@@ -89,5 +90,30 @@ describe('ContextUsagePanel', () => {
     rerender(<ContextUsagePanel currentUsage={initialUsage} requestGateway={secondGateway} sessionId="runtime-2" />)
 
     await waitFor(() => expect(secondGateway).toHaveBeenCalledTimes(1))
+  })
+
+  it('distinguishes the measured total from the estimated category breakdown', async () => {
+    const requestGateway = vi.fn().mockResolvedValue(breakdown)
+
+    render(<ContextUsagePanel currentUsage={initialUsage} requestGateway={requestGateway} sessionId="runtime-1" />)
+
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledTimes(1))
+
+    expect(screen.getByText('Estimated breakdown')).toBeTruthy()
+    expect(screen.getByText(/Category values are approximate/)).toBeTruthy()
+    expect(document.querySelector('[data-slot="context-usage-total"]')?.textContent).not.toContain('~')
+  })
+
+  it('marks the total as approximate when no provider measurement exists', async () => {
+    const requestGateway = vi.fn().mockResolvedValue({
+      ...breakdown,
+      context_used_is_estimate: true
+    })
+
+    render(<ContextUsagePanel currentUsage={initialUsage} requestGateway={requestGateway} sessionId="runtime-1" />)
+
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledTimes(1))
+
+    expect(document.querySelector('[data-slot="context-usage-total"]')?.textContent).toContain('~')
   })
 })

@@ -2585,6 +2585,8 @@ export const zh: Translations = {
           tool_definitions: '工具定义'
         },
         empty: '暂无上下文数据',
+        estimatedBreakdown: '估算明细',
+        estimatedBreakdownHint: '分类数值为近似值，其总和可能与实测总数不同。',
         loading: '正在加载明细…',
         percentFull: percent => `已用 ${percent}%`,
         title: '上下文用量',
