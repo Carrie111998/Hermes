@@ -1,10 +1,10 @@
 ---
 sidebar_position: 11
-title: "ACP 编辑器集成"
-description: "在 VS Code、Zed 和 JetBrains 等兼容 ACP 的编辑器中使用 Hermes Agent"
+title: "ACP 集成"
+description: "在 VS Code、Zed 和 JetBrains 等兼容 ACP 的编辑器中使用 Hermes Agent，也可从其他 ACP 客户端接入"
 ---
 
-# ACP 编辑器集成
+# ACP 集成
 
 Hermes Agent 可作为 ACP 服务器运行，让兼容 ACP 的编辑器通过 stdio 与 Hermes 通信并渲染：
 
@@ -142,6 +142,25 @@ hermes acp --setup-browser --yes     # 非交互式接受下载
 ### JetBrains
 
 使用兼容 ACP 的插件并将其指向 `hermes acp` 或 `hermes-acp`。
+
+## 其他 ACP 客户端
+
+ACP 宿主并不限于编辑器。任何通过 stdio 讲 ACP 的客户端都可以启动 `hermes acp`，因此远程与移动端客户端无需针对 Hermes 做专门集成即可接入。
+
+已验证的示例，使用 [Happy](https://github.com/slopus/happy) 的通用 ACP runner：
+
+```bash
+happy acp -- hermes acp
+```
+
+该组合会协商 ACP protocol v1，并带起完整的 Hermes 表面：`hermes-acp` 工具集、供宿主模型选择器使用的 `available_models`、承载编辑审批策略的会话模式，以及通过 `available_commands_update` 下发的 Hermes 斜杠命令（`/help`、`/model`、`/tools`、`/context`、`/reset`、`/compact`、`/steer`、`/queue`）。
+
+接入任何宿主之前请先用 `--check` 做预检。`PATH` 上存在 `hermes` 二进制并不代表已安装 `[acp]` extra，只探测二进制可能通过检查、随后在握手阶段失败：
+
+```bash
+$ hermes acp --check
+Hermes ACP check OK
+```
 
 ## 配置与凭据
 

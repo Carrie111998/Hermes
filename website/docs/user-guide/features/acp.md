@@ -1,10 +1,10 @@
 ---
 sidebar_position: 11
-title: "ACP Editor Integration"
-description: "Use Hermes Agent inside ACP-compatible editors such as VS Code, Zed, and JetBrains"
+title: "ACP Integration"
+description: "Use Hermes Agent from ACP-compatible editors such as VS Code, Zed, and JetBrains, and from other ACP clients"
 ---
 
-# ACP Editor Integration
+# ACP Integration
 
 Hermes Agent can run as an ACP server, letting ACP-compatible editors talk to Hermes over stdio and render:
 
@@ -144,6 +144,25 @@ Prerequisites:
 ### JetBrains
 
 Use an ACP-compatible plugin and point it at `hermes acp` or `hermes-acp`.
+
+## Other ACP clients
+
+ACP hosts are not limited to editors. Any client that speaks ACP over stdio can launch `hermes acp`, so remote and mobile clients work against Hermes without needing a Hermes-specific integration.
+
+Verified example, using [Happy](https://github.com/slopus/happy)'s generic ACP runner:
+
+```bash
+happy acp -- hermes acp
+```
+
+That negotiates ACP protocol v1 and brings up the full Hermes surface: the `hermes-acp` toolset, `available_models` for the host's model picker, session modes carrying the edit-approval policy, and the Hermes slash commands (`/help`, `/model`, `/tools`, `/context`, `/reset`, `/compact`, `/steer`, `/queue`) delivered as `available_commands_update`.
+
+Use `--check` as the pre-flight before wiring up any host. A `hermes` binary on `PATH` does not imply the `[acp]` extra is installed, so probing for the binary alone can pass and then fail during the handshake:
+
+```bash
+$ hermes acp --check
+Hermes ACP check OK
+```
 
 ## Configuration and credentials
 
