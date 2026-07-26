@@ -450,6 +450,7 @@ from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
 from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
 from hermes_cli.subcommands.config import build_config_parser
+from hermes_cli.subcommands.delegation import build_delegation_parser
 from hermes_cli.subcommands.skin import build_skin_parser
 from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.version import build_version_parser
@@ -4567,6 +4568,13 @@ def cmd_config(args):
     from hermes_cli.config import config_command
 
     config_command(args)
+
+
+def cmd_delegation(args):
+    """Delegation profile management."""
+    from hermes_cli.delegation_cmd import cmd_delegation as delegation_command
+
+    delegation_command(args)
 
 
 def cmd_skin(args):
@@ -14731,6 +14739,11 @@ def main():
     # config command  (parser built in hermes_cli/subcommands/config.py)
     # =========================================================================
     build_config_parser(subparsers, cmd_config=cmd_config)
+
+    # =========================================================================
+    # delegation command  (parser built in hermes_cli/subcommands/delegation.py)
+    # =========================================================================
+    build_delegation_parser(subparsers, cmd_delegation=cmd_delegation)
 
     # =========================================================================
     # skin command  (parser built in hermes_cli/subcommands/skin.py)
