@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { ComposerAttachment } from '@/store/composer'
 
@@ -98,6 +98,29 @@ describe('toRuntimeMessage timestamps', () => {
     })
 
     expect(message.createdAt.getTime()).toBe(createdAt)
+  })
+
+  it('uses a Unix-seconds token embedded in a synthetic id', () => {
+    const message = toRuntimeMessage({
+      id: 'assistant-stream-1785064294-1',
+      parts: [],
+      role: 'assistant'
+    })
+
+    expect(message.createdAt.getTime()).toBe(1_785_064_294_000)
+  })
+
+  it('ignores non-timestamp digits in a synthetic id', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-26T13:30:00.000Z'))
+
+    try {
+      const message = toRuntimeMessage({ id: 'assistant-stream-rt9', parts: [], role: 'assistant' })
+
+      expect(message.createdAt.toISOString()).toBe('2026-07-26T13:30:00.000Z')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('converts persisted Unix seconds to milliseconds', () => {

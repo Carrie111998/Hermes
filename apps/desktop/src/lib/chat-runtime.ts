@@ -369,7 +369,11 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
   const role =
     message.role === 'user' || message.role === 'assistant' || message.role === 'system' ? message.role : 'assistant'
 
-  const createdAt = coerceTimestampDate(message.timestamp ?? message.id.match(/\d+/)?.[0]) ?? new Date()
+  // Synthetic live ids may carry a Unix timestamp as a complete dash-delimited
+  // token. Ignore arbitrary digits in session ids (`rt9`, counters, etc.) so
+  // they cannot turn into plausible-looking dates near the Unix epoch.
+  const idTimestamp = message.id.match(/(?:^|-)(\d{13}|\d{10})(?=-|$)/)?.[1]
+  const createdAt = coerceTimestampDate(message.timestamp ?? idTimestamp) ?? new Date()
 
   if (role === 'user') {
     return {
