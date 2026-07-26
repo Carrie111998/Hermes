@@ -4815,7 +4815,21 @@ function closePreviewWatchers() {
   }
 }
 
-async function waitForHermes(baseUrl, token, signal?) {
+async function waitForHermes(baseUrl, token, signal?, authMode = 'token') {
+  // A gated remote gateway needs the cookie held in the dedicated Electron
+  // session partition for *both* its health probe and legacy status fallback.
+  // Probing it through the raw HTTP client drops that cookie, receives 401,
+  // and makes Desktop retry its entire connection forever after a successful
+  // sign-in.
+  if (authMode === 'oauth') {
+    return waitForHermesReady(baseUrl, {
+      token,
+      signal,
+      fetchPublicJson: (url, options) => fetchJsonViaOauthSession(url, options),
+      fetchJson: (url, _token, options) => fetchJsonViaOauthSession(url, options)
+    })
+  }
+
   return waitForHermesReady(baseUrl, {
     token,
     signal,
@@ -7736,7 +7750,7 @@ async function spawnPoolBackend(profile, entry) {
   const remote = await resolveRemoteBackend(profile)
 
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token)
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
 
     return {
       ...remote,
@@ -7954,7 +7968,7 @@ async function startHermes() {
   const connectionPromise = (async () => {
     const connectRemote = async remote => {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token)
+      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
