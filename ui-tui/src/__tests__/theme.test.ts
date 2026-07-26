@@ -341,9 +341,10 @@ describe('fromSkin', () => {
     expect(skinIsLight({})).toBe(true) // no canvas of its own → host polarity
   })
 
-  it('keeps truecolor light Apple Terminal in truecolor (adapting, not ansi256-bucketing)', async () => {
+  it('keeps a truecolor light background in truecolor (adapting, not ansi256-bucketing)', async () => {
     const { contrastRatio, fromSkin } = await importThemeWithEnv({
       COLORTERM: 'truecolor',
+      HERMES_TUI_BACKGROUND: '#ffffff',
       TERM_PROGRAM: 'Apple_Terminal'
     })
 
