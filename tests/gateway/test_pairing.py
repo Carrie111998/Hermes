@@ -418,6 +418,68 @@ class TestApprovalFlow:
         assert result["user_id"] == "user1"
         assert result["user_name"] == "Alice"
 
+    def test_approve_code_does_not_clobber_existing_approved_on_read_failure(
+        self, tmp_path
+    ):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            code = store.generate_code("discord", "carol", "Carol")
+            approved_path = store._approved_path("discord")
+            approved_path.write_text(
+                json.dumps(
+                    {
+                        "alice": {"user_name": "Alice", "approved_at": 1},
+                        "bob": {"user_name": "Bob", "approved_at": 2},
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            before_approved = approved_path.read_text(encoding="utf-8")
+            pending_path = store._pending_path("discord")
+            before_pending = pending_path.read_text(encoding="utf-8")
+            original_read_text = Path.read_text
+
+            def flaky_read_text(self, *args, **kwargs):
+                if Path(self) == approved_path:
+                    raise OSError("simulated transient read failure")
+                return original_read_text(self, *args, **kwargs)
+
+            with patch.object(Path, "read_text", flaky_read_text):
+                result = store.approve_code("discord", code)
+
+            assert result is None
+            assert approved_path.read_text(encoding="utf-8") == before_approved
+            assert pending_path.read_text(encoding="utf-8") == before_pending
+
+    def test_direct_approve_user_does_not_clobber_on_read_failure(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            approved_path = store._approved_path("discord")
+            approved_path.write_text(
+                json.dumps(
+                    {
+                        "alice": {"user_name": "Alice", "approved_at": 1},
+                        "bob": {"user_name": "Bob", "approved_at": 2},
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            before_approved = approved_path.read_text(encoding="utf-8")
+            original_read_text = Path.read_text
+
+            def flaky_read_text(self, *args, **kwargs):
+                if Path(self) == approved_path:
+                    raise OSError("simulated transient read failure")
+                return original_read_text(self, *args, **kwargs)
+
+            with patch.object(Path, "read_text", flaky_read_text):
+                result = store._approve_user("discord", "carol", "Carol")
+
+            assert result is False
+            assert approved_path.read_text(encoding="utf-8") == before_approved
+
     def test_approved_user_is_approved(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()

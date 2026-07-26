@@ -281,10 +281,11 @@ class PairingStore:
     def _rate_limit_path(self) -> Path:
         return self._dir / "_rate_limits.json"
 
-    def _load_json(self, path: Path) -> dict:
+    def _load_json_checked(self, path: Path) -> tuple[dict, bool]:
         if path.exists():
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return (data if isinstance(data, dict) else {}), True
             except PermissionError as e:
                 # Surface this loudly: a 0600 file owned by a different user
                 # (classic Docker symptom: `docker exec` runs as root and writes
@@ -308,10 +309,25 @@ class PairingStore:
                     "container so the entrypoint can fix ownership.",
                     path, euid, owner_info, e,
                 )
-                return {}
+                return {}, False
             except (json.JSONDecodeError, OSError):
-                return {}
-        return {}
+                return {}, False
+        return {}, True
+
+    def _load_json(self, path: Path) -> dict:
+        data, _ok = self._load_json_checked(path)
+        return data
+
+    def _load_json_for_write(self, path: Path) -> Optional[dict]:
+        data, ok = self._load_json_checked(path)
+        if not ok:
+            logger.warning(
+                "Refusing to update pairing store %s because the existing file "
+                "could not be read; retry after the file is readable",
+                path,
+            )
+            return None
+        return data
 
     def _save_json(self, path: Path, data: dict) -> None:
         _secure_write(path, json.dumps(data, indent=2, ensure_ascii=False))
@@ -361,9 +377,11 @@ class PairingStore:
                 results.append({"platform": p, "user_id": uid, **info})
         return results
 
-    def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> None:
+    def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> bool:
         """Add a user to the approved list. Must be called under self._lock."""
-        approved = self._load_json(self._approved_path(platform))
+        approved = self._load_json_for_write(self._approved_path(platform))
+        if approved is None:
+            return False
         normalized_user_id = self._normalize_user_id(platform, user_id)
         duplicate_ids = [
             approved_user_id
@@ -383,12 +401,15 @@ class PairingStore:
         # (option i), so the pairing store and the allowlist stay a single
         # visible source of truth. No-op on open gateways.
         _sync_allowlist_add(platform, normalized_user_id)
+        return True
 
     def revoke(self, platform: str, user_id: str) -> bool:
         """Remove a user from the approved list. Returns True if found."""
         path = self._approved_path(platform)
         with self._lock:
-            approved = self._load_json(path)
+            approved = self._load_json_for_write(path)
+            if approved is None:
+                return False
             matching_ids = [
                 approved_user_id
                 for approved_user_id in approved
@@ -439,7 +460,10 @@ class PairingStore:
                 return None
 
             # Check max pending
-            pending = self._load_json(self._pending_path(platform))
+            pending_path = self._pending_path(platform)
+            pending = self._load_json_for_write(pending_path)
+            if pending is None:
+                return None
             if len(pending) >= MAX_PENDING_PER_PLATFORM:
                 return None
 
@@ -495,7 +519,10 @@ class PairingStore:
             if self._is_locked_out(platform):
                 return None
 
-            pending = self._load_json(self._pending_path(platform))
+            pending_path = self._pending_path(platform)
+            pending = self._load_json_for_write(pending_path)
+            if pending is None:
+                return None
 
             # Find the entry whose hash matches the provided code.
             # Tolerate legacy plaintext-key entries (no salt/hash) and
@@ -524,12 +551,16 @@ class PairingStore:
                 self._record_failed_attempt(platform)
                 return None
 
-            del pending[matched_key]
-            self._save_json(self._pending_path(platform), pending)
-
             # Add to approved list
-            self._approve_user(platform, matched_entry["user_id"],
-                               matched_entry.get("user_name", ""))
+            if not self._approve_user(
+                platform,
+                matched_entry["user_id"],
+                matched_entry.get("user_name", ""),
+            ):
+                return None
+
+            del pending[matched_key]
+            self._save_json(pending_path, pending)
 
             return {
                 "user_id": matched_entry["user_id"],
