@@ -818,6 +818,229 @@ def test_missing_trigram_table_rejects_malformed_existing_source_view():
         assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
 
 
+def test_non_fts_tables_cannot_spoof_current_storage_layout():
+    """Ordinary catalog tables cannot impersonate validated FTS5 storage."""
+    from hermes_state import SessionDB
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, role TEXT, content TEXT, "
+            "tool_name TEXT, tool_calls TEXT)"
+        )
+        conn.execute(
+            "CREATE VIEW messages_fts_trigram_src AS "
+            "SELECT id, role, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        conn.execute(
+            "CREATE TABLE messages_fts("
+            "content TEXT, tool_name TEXT, tool_calls TEXT, "
+            "CHECK(content='messages' AND \"content_rowid\"='id'))"
+        )
+        conn.execute(
+            "CREATE TABLE messages_fts_trigram("
+            "content TEXT, tool_name TEXT, tool_calls TEXT, "
+            "CHECK(content='messages_fts_trigram_src' AND "
+            "\"content_rowid\"='id' AND \"tokenize\"='trigram'))"
+        )
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+
+def test_missing_current_trigram_view_is_repaired_without_rebuild(db_path, monkeypatch):
+    """A missing canonical view is repairable without discarding the index."""
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("missing-view", "test")
+    message_id = seeded.append_message(
+        "missing-view", "user", content="stable searchable payload"
+    )
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        before = conn.execute(
+            "SELECT rowid FROM messages_fts_trigram "
+            "WHERE messages_fts_trigram MATCH 'searchable'"
+        ).fetchall()
+        assert before == [(message_id,)]
+        conn.execute("DROP VIEW messages_fts_trigram_src")
+        assert SessionDB._legacy_fts_layout(conn.cursor()) is None
+
+    monkeypatch.setattr(
+        SessionDB,
+        "_rebuild_fts_indexes",
+        staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("missing-view repair must not rebuild")
+        )),
+    )
+    repaired = SessionDB(db_path=db_path)
+    try:
+        with repaired._lock:
+            view = repaired._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='view' "
+                "AND name='messages_fts_trigram_src'"
+            ).fetchone()
+            assert view is not None
+            preserved = repaired._conn.execute(
+                "SELECT rowid FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'searchable'"
+            ).fetchall()
+            assert [row[0] for row in preserved] == [message_id]
+            repaired._conn.execute(
+                "UPDATE messages SET role='tool' WHERE id=?", (message_id,)
+            )
+            repaired._conn.commit()
+            excluded = repaired._conn.execute(
+                "SELECT rowid FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'searchable'"
+            ).fetchall()
+            assert excluded == []
+    finally:
+        repaired.close()
+
+
+def test_initializer_layout_and_optional_trigram_decisions_share_write_lock(
+    db_path, monkeypatch
+):
+    """A v23 converter cannot overtake stale legacy repair decisions."""
+    from hermes_state import (
+        FTS_SQL,
+        FTS_TRIGRAM_SQL,
+        LEGACY_FTS_SQL,
+        LEGACY_FTS_TRIGRAM_SQL,
+        SessionDB,
+    )
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("optional-race", "test")
+    message_id = seeded.append_message(
+        "optional-race", "user", content="old payload", tool_name="oldmetadata"
+    )
+    seeded.close()
+
+    drop_current = """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+    with sqlite3.connect(str(db_path), isolation_level=None) as conn:
+        conn.executescript(
+            drop_current + LEGACY_FTS_SQL + "\n" + LEGACY_FTS_TRIGRAM_SQL
+        )
+        for table in ("messages_fts", "messages_fts_trigram"):
+            conn.execute(
+                f"INSERT INTO {table}(rowid, content) "
+                "SELECT id, COALESCE(content, '') || ' ' || "
+                "COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') "
+                "FROM messages"
+            )
+        for trigger in (
+            "messages_fts_insert", "messages_fts_delete", "messages_fts_update",
+            "messages_fts_trigram_insert", "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ):
+            conn.execute(f'DROP TRIGGER "{trigger}"')
+
+    selected_legacy = threading.Event()
+    release_initializer = threading.Event()
+    converter_started = threading.Event()
+    converter_done = threading.Event()
+    result: dict[str, object] = {}
+    original_layout = SessionDB._legacy_fts_layout
+    original_ensure = SessionDB._ensure_fts_schema
+
+    def paused_layout(cursor):
+        layout = original_layout(cursor)
+        connection = getattr(cursor, "connection", cursor)
+        if (
+            threading.current_thread().name == "locked-legacy-initializer"
+            and layout == "inline"
+            and connection.in_transaction
+            and not selected_legacy.is_set()
+        ):
+            selected_legacy.set()
+            assert release_initializer.wait(5), "test did not release initializer"
+        return layout
+
+    def optional_trigram_unavailable(self, cursor, table_name, ddl):
+        if (
+            threading.current_thread().name == "locked-legacy-initializer"
+            and table_name == "messages_fts_trigram"
+        ):
+            return False
+        return original_ensure(self, cursor, table_name, ddl)
+
+    monkeypatch.setattr(SessionDB, "_legacy_fts_layout", staticmethod(paused_layout))
+    monkeypatch.setattr(SessionDB, "_ensure_fts_schema", optional_trigram_unavailable)
+
+    def initialize() -> None:
+        try:
+            result["db"] = SessionDB(db_path=db_path)
+        except BaseException as exc:
+            result["initializer_error"] = exc
+
+    def convert() -> None:
+        converter_started.set()
+        try:
+            with sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None) as conn:
+                conn.executescript(
+                    "BEGIN IMMEDIATE;\n" + drop_current + FTS_SQL + "\n"
+                    + FTS_TRIGRAM_SQL
+                    + "\nINSERT INTO messages_fts(messages_fts) VALUES('rebuild');\n"
+                    + "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                    + "VALUES('rebuild');\nCOMMIT;"
+                )
+        except BaseException as exc:
+            result["converter_error"] = exc
+        finally:
+            converter_done.set()
+
+    initializer = threading.Thread(
+        target=initialize, name="locked-legacy-initializer", daemon=True
+    )
+    initializer.start()
+    assert selected_legacy.wait(5), (
+        "initializer never classified legacy layout: "
+        f"{result.get('initializer_error')!r}"
+    )
+
+    converter = threading.Thread(target=convert, daemon=True)
+    converter.start()
+    assert converter_started.wait(2)
+    assert not converter_done.wait(0.25), "converter overtook locked FTS repair"
+
+    release_initializer.set()
+    initializer.join(10)
+    converter.join(10)
+    assert not initializer.is_alive()
+    assert not converter.is_alive()
+    assert "initializer_error" not in result, result.get("initializer_error")
+    assert "converter_error" not in result, result.get("converter_error")
+
+    database = result.get("db")
+    if isinstance(database, SessionDB):
+        database.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        assert original_layout(conn.cursor()) is None
+        conn.execute(
+            "UPDATE messages SET tool_name='newmetadata' WHERE id=?", (message_id,)
+        )
+        conn.commit()
+        for table in ("messages_fts", "messages_fts_trigram"):
+            assert conn.execute(
+                f"SELECT rowid FROM {table} WHERE {table} MATCH 'oldmetadata'"
+            ).fetchall() == []
+            assert conn.execute(
+                f"SELECT rowid FROM {table} WHERE {table} MATCH 'newmetadata'"
+            ).fetchall() == [(message_id,)]
+
+
 def test_capable_cjk_open_marks_missing_trigger_gap_stale(monkeypatch):
     """A missing CJK trigger means an unknown index gap, never safe service."""
     import hermes_state
@@ -1052,20 +1275,40 @@ DROP TABLE IF EXISTS messages_fts;
     assert migration_paused.wait(5), "initializer never selected legacy DDL"
 
     current_ddl = FTS_SQL + "\n" + FTS_TRIGRAM_SQL
-    with sqlite3.connect(str(db_path), isolation_level=None) as converter:
-        converter.executescript(
-            "BEGIN IMMEDIATE;\n"
-            + drop_current
-            + current_ddl
-            + "\nINSERT INTO messages_fts(messages_fts) VALUES('rebuild');\n"
-            + "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
-            + "VALUES('rebuild');\nCOMMIT;"
-        )
+    converter_started = threading.Event()
+    converter_done = threading.Event()
+
+    def convert_to_current() -> None:
+        converter_started.set()
+        try:
+            with sqlite3.connect(
+                str(db_path), timeout=5.0, isolation_level=None
+            ) as converter:
+                converter.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + drop_current
+                    + current_ddl
+                    + "\nINSERT INTO messages_fts(messages_fts) VALUES('rebuild');\n"
+                    + "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                    + "VALUES('rebuild');\nCOMMIT;"
+                )
+        except BaseException as exc:
+            result["converter_error"] = exc
+        finally:
+            converter_done.set()
+
+    converter = threading.Thread(target=convert_to_current, daemon=True)
+    converter.start()
+    assert converter_started.wait(2)
+    assert not converter_done.wait(0.25), "converter bypassed initializer lock"
 
     release_initializer.set()
     initializer.join(10)
+    converter.join(10)
     assert not initializer.is_alive()
+    assert not converter.is_alive()
     assert "error" not in result, result.get("error")
+    assert "converter_error" not in result, result.get("converter_error")
 
     db = result["db"]
     assert isinstance(db, SessionDB)
@@ -1358,17 +1601,35 @@ def test_writer_cannot_bypass_fts_during_real_migration(db_path, monkeypatch):
     initializer.start()
     assert migration_paused.wait(5), "initializer never reached FTS schema ensure"
 
-    with sqlite3.connect(str(db_path), timeout=2.0) as writer:
-        writer.execute(
-            "UPDATE messages SET content = ? WHERE id = ?",
-            ("concurrent replacement", message_id),
-        )
-        writer.commit()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+
+    def write() -> None:
+        writer_started.set()
+        try:
+            with sqlite3.connect(str(db_path), timeout=5.0) as writer:
+                writer.execute(
+                    "UPDATE messages SET content = ? WHERE id = ?",
+                    ("concurrent replacement", message_id),
+                )
+                writer.commit()
+        except BaseException as exc:
+            result["writer_error"] = exc
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    assert writer_started.wait(2)
+    assert not writer_done.wait(0.25), "writer bypassed schema-repair lock"
 
     allow_initializer.set()
     initializer.join(5)
+    writer.join(5)
     assert not initializer.is_alive()
+    assert not writer.is_alive()
     assert "error" not in result, result.get("error")
+    assert "writer_error" not in result, result.get("writer_error")
 
     try:
         with sqlite3.connect(str(db_path)) as conn:

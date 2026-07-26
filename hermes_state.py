@@ -2187,17 +2187,65 @@ class SessionDB:
             tokens = _tokens(sql)
             if not tokens:
                 return "ambiguous"
+
+            # Trust only a real FTS5 virtual-table declaration. PRAGMA
+            # table_info alone is spoofable by an ordinary table with matching
+            # columns, and option-like CHECK expressions must not be parsed as
+            # FTS5 arguments.
+            position = 0
+            required = [
+                ("value", "create"),
+                ("value", "virtual"),
+                ("value", "table"),
+            ]
+            if tokens[:3] != required:
+                return "ambiguous"
+            position = 3
+            if tokens[position : position + 3] == [
+                ("value", "if"),
+                ("value", "not"),
+                ("value", "exists"),
+            ]:
+                position += 3
+            if position >= len(tokens) or tokens[position] != ("value", name):
+                return "ambiguous"
+            position += 1
+            if tokens[position : position + 3] != [
+                ("value", "using"),
+                ("value", "fts5"),
+                ("(", "("),
+            ]:
+                return "ambiguous"
+            args_start = position + 3
+            depth = 1
+            args_end = None
+            for offset in range(args_start, len(tokens)):
+                if tokens[offset][0] == "(":
+                    depth += 1
+                elif tokens[offset][0] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        args_end = offset
+                        break
+            if args_end is None:
+                return "ambiguous"
+            trailing = tokens[args_end + 1 :]
+            if trailing not in ([], [("symbol", ";")]):
+                return "ambiguous"
+            arguments = tokens[args_start:args_end]
+
             options = {}
-            for position in range(len(tokens) - 2):
+            for position in range(len(arguments) - 2):
+                tokens_at_position = arguments[position : position + 3]
                 if (
-                    tokens[position][0] == "value"
-                    and tokens[position + 1][0] == "="
-                    and tokens[position + 2][0] in ("value", "string")
+                    tokens_at_position[0][0] == "value"
+                    and tokens_at_position[1][0] == "="
+                    and tokens_at_position[2][0] in ("value", "string")
                 ):
-                    key = tokens[position][1]
+                    key = tokens_at_position[0][1]
                     if key in options:
                         return "ambiguous"
-                    options[key] = tokens[position + 2][1]
+                    options[key] = tokens_at_position[2][1]
             if columns == ["content", "tool_name", "tool_calls"]:
                 expected_options = {
                     "content": (
@@ -2274,11 +2322,11 @@ class SessionDB:
         if standard in ("missing", "current"):
             if trigram not in ("missing", "current"):
                 return "ambiguous"
-            # A present current trigram table requires its exact filtered
-            # source view. If the table is absent, no view is safe (the
-            # canonical DDL creates it), while an existing malformed view is
-            # unsafe because CREATE VIEW IF NOT EXISTS would preserve it.
-            if trigram == "current" and view_valid is not True:
+            # A malformed present view is unsafe because IF NOT EXISTS would
+            # preserve it. A missing view is safely repairable even when the
+            # current trigram table already exists: canonical DDL recreates
+            # only the external-content view and preserves the index.
+            if trigram == "current" and view_valid is False:
                 return "ambiguous"
             if trigram == "missing" and view_valid is False:
                 return "ambiguous"
@@ -2689,10 +2737,13 @@ class SessionDB:
         ):
             return False
 
-        try:
-            cursor.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError:
-            return False
+        connection = getattr(cursor, "connection", cursor)
+        owns_transaction = not connection.in_transaction
+        if owns_transaction:
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                return False
 
         try:
             # The preflight is intentionally non-authoritative. Layout and
@@ -2722,13 +2773,15 @@ class SessionDB:
             for name in broad:
                 cursor.execute(f'DROP TRIGGER IF EXISTS "{name}"')
                 cursor.execute(create_statements[name])
-            cursor.execute("COMMIT")
+            if owns_transaction:
+                cursor.execute("COMMIT")
             return bool(broad)
         except BaseException:
-            try:
-                cursor.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
+            if owns_transaction:
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
             raise
 
     @staticmethod
@@ -2836,13 +2889,20 @@ class SessionDB:
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
             return False
+        savepoint = "hermes_fts_ensure"
+        cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             # Run even when the virtual table exists so any dropped or missing
             # triggers are recreated after a previous no-FTS5 runtime disabled
-            # them to keep message writes working.
-            cursor.executescript(ddl)
+            # them to keep message writes working. Execute statements
+            # individually: executescript would commit the initializer's
+            # authoritative BEGIN IMMEDIATE transaction.
+            self._execute_ddl_statements(cursor, ddl)
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             return True
         except sqlite3.OperationalError as exc:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             if not self._is_fts5_unavailable_error(exc):
                 raise
             # Only disable FTS entirely when the whole FTS5 module is missing.
@@ -2853,6 +2913,10 @@ class SessionDB:
             else:
                 self._warn_fts5_unavailable(exc)
             return False
+        except BaseException:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
 
     def _execute_write(
         self,
@@ -4109,6 +4173,12 @@ class SessionDB:
             pass  # Index already exists
 
         if fts5_available:
+            # Classification, DDL selection/repair, and any required rebuild
+            # are one authoritative schema migration. A concurrent optimizer
+            # cannot change legacy/current layout between these decisions.
+            self._conn.commit()
+            cursor.execute("BEGIN IMMEDIATE")
+
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.

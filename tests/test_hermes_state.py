@@ -57,6 +57,11 @@ class _NoFtsExistingTableConnection(sqlite3.Connection):
 class _NoTrigramCursor(sqlite3.Cursor):
     """Simulate a SQLite build with FTS5 but without the trigram tokenizer."""
 
+    def execute(self, sql, parameters=()):
+        if "tokenize='trigram'" in sql:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
     def executescript(self, sql_script):
         if "tokenize='trigram'" in sql_script:
             raise sqlite3.OperationalError("no such tokenizer: trigram")
