@@ -842,23 +842,15 @@ def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
     *,
-    interactive: bool = True,
+    internal: bool,
 ) -> str:
     """Build the resume-pending recovery system note for an interrupted turn.
 
     ``reason`` is the session's ``resume_reason`` (``restart_timeout``,
     ``shutdown_timeout``, or anything else → generic interruption phrasing).
-    ``message`` is the user's NEW message text; empty means this is the
-    startup auto-resume turn synthesized by
-    ``_schedule_resume_pending_sessions`` with no human message attached.
-
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``message`` is the rendered event text. ``internal`` is the source of
+    truth for whether the event was synthesized: real attachment events can
+    have empty text, while internal events can render nonempty text.
     """
     reason_phrase = (
         "a gateway restart"
@@ -867,19 +859,10 @@ def build_resume_recovery_note(
         if reason == "shutdown_timeout"
         else "a gateway interruption"
     )
-    if message:
+    if not internal:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus "
             "on what the user is asking now."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
-        )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
         )
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any "
@@ -7605,14 +7588,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return redelivered
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
-        """Auto-continue fresh restart-interrupted sessions after startup.
+        """Auto-continue fresh non-interactive sessions after startup.
 
         ``resume_pending`` already preserves the transcript AND the existing
         ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+        injects a reason-aware recovery system note on the next turn.
+        Non-interactive adapters synthesize that next turn once they are back
+        online. Interactive adapters keep ``resume_pending`` intact and wait
+        for a real user event instead of scheduling an empty model turn.
 
         Adapters that are not yet ready (adapter missing from
         ``self.adapters``) are skipped silently; their sessions stay
@@ -7653,6 +7636,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
         # this catches every other SIGTERM source (e.g. a raw `terminal(
         # "launchctl kickstart ai.hermes.gateway")`).
+        # Interactive adapters defer recovery until the next real user event.
+        # Filter them before restart-loop accounting so deferred sessions do
+        # not count as startup auto-resume attempts.
+        candidates = [
+            entry
+            for entry in candidates
+            if not bool(
+                getattr(
+                    self._adapter_for_source(entry.origin),
+                    "interactive_resume",
+                    True,
+                )
+            )
+        ]
         if candidates:
             try:
                 from gateway import restart_loop_guard as _rlg
@@ -12404,7 +12401,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        if _is_shared_multi_user and source.user_name and not event.internal:
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before
@@ -22162,20 +22159,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _is_resume_pending:
                 _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
                 _persist_user_message_override = message
-                # The empty-message case is the auto-resume startup turn
-                # synthesized by _schedule_resume_pending_sessions — there is
-                # no NEW user message to address.  Guidance is adapter-aware:
-                # interactive platforms report the restore and ask what next;
-                # non-interactive event platforms (webhook, API server)
-                # continue the interrupted work instead, because nobody is
-                # present to answer and an acknowledgement would silently
-                # abandon the task (#57056).
-                _resume_adapter = self._adapter_for_source(source)
-                _interactive_resume = bool(
-                    getattr(_resume_adapter, "interactive_resume", True)
-                )
+                # MessageEvent.internal is the source of truth: a real
+                # attachment can render as empty text, while a synthetic event
+                # can render nonempty text.
                 message = build_resume_recovery_note(
-                    _reason, message, interactive=_interactive_resume,
+                    _reason,
+                    message,
+                    internal=event.internal,
                 )
             elif _has_fresh_tool_tail:
                 _persist_user_message_override = message
@@ -22216,13 +22206,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sn_reason = (
                     getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
                 )
-                _sn_adapter = self._adapter_for_source(source)
                 message = build_resume_recovery_note(
                     _sn_reason,
                     "",
-                    interactive=bool(
-                        getattr(_sn_adapter, "interactive_resume", True)
-                    ),
+                    internal=event.internal,
                 )
 
             _approval_session_key = session_key or ""
