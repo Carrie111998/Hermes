@@ -104,6 +104,7 @@ class UsageRefreshHook:
 
         # === CRITICAL SECTION: Task selection/creation (lock held) ===
         task_to_await: asyncio.Task[Any] | None = None
+        was_initiated_by_this_caller: bool = False
         async with self._refresh_lock:
             # Recheck throttle window INSIDE lock (prevents duplicate-refresh race)
             if self._last_refresh_at is not None:
@@ -122,6 +123,7 @@ class UsageRefreshHook:
             if self._refresh_in_progress is not None and not self._refresh_in_progress.done():
                 # Coalesce: reuse existing task
                 task_to_await = self._refresh_in_progress
+                was_initiated_by_this_caller = False
             else:
                 # No in-flight task; create one
                 if self.refresh_fn is None:
@@ -143,10 +145,15 @@ class UsageRefreshHook:
                         return {"ok": ok}
                     except Exception as exc:
                         logger.exception("Usage refresh failed: %s", exc)
-                        return {"ok": False, "error": type(exc).__name__}
+                        return {
+                            "ok": False,
+                            "error": type(exc).__name__,
+                            "error_detail": str(exc),
+                        }
 
                 task_to_await = asyncio.create_task(_do_refresh())
                 self._refresh_in_progress = task_to_await
+                was_initiated_by_this_caller = True
         # === END CRITICAL SECTION (lock released) ===
 
         # Await OUTSIDE lock with shield so multiple callers coalesce on same task
@@ -157,19 +164,47 @@ class UsageRefreshHook:
                 asyncio.shield(task_to_await),
                 timeout=self.timeout_seconds,
             )
-            # Refresh completed successfully
+            # Refresh task completed (check if it succeeded or failed)
             self._last_refresh_at = now
             # Clear task only if it's still our reference (race-safe)
             if task_to_await is self._refresh_in_progress:
                 self._refresh_in_progress = None
-            return {
-                "ok": refresh_result.get("ok", False),
-                "refreshed": True,
-                "cached": False,
-                "reason": "ok",
-                "detail": "Refresh completed successfully",
-                "checked_at": checked_at,
-            }
+
+            # Distinguish between initiators and coalesced callers
+            if was_initiated_by_this_caller:
+                # This caller initiated the refresh
+                if refresh_result.get("ok", False):
+                    return {
+                        "ok": True,
+                        "refreshed": True,
+                        "cached": False,
+                        "reason": "ok",
+                        "detail": "Refresh completed successfully",
+                        "checked_at": checked_at,
+                    }
+                else:
+                    # Refresh task failed (exception or returned ok=False)
+                    error_msg = f"{refresh_result.get('error', 'Unknown')}"
+                    if refresh_result.get("error_detail"):
+                        error_msg += f": {refresh_result.get('error_detail')}"
+                    return {
+                        "ok": False,
+                        "refreshed": False,
+                        "cached": False,
+                        "reason": "failed",
+                        "detail": error_msg,
+                        "checked_at": checked_at,
+                    }
+            else:
+                # This caller coalesced on an existing refresh
+                return {
+                    "ok": refresh_result.get("ok", False),
+                    "refreshed": False,
+                    "cached": True,
+                    "reason": "coalesced",
+                    "detail": "Coalesced on in-flight refresh",
+                    "checked_at": checked_at,
+                }
         except asyncio.TimeoutError:
             # Timeout: task continues in background (shielded), throttle applies next
             self._last_refresh_at = now
