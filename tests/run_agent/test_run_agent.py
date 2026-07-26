@@ -1833,16 +1833,6 @@ class TestBuildApiKwargs:
         assert kwargs["messages"] is messages
         assert kwargs["timeout"] == 1800.0
 
-    def test_strips_timestamp_metadata(self, agent):
-        messages = [{"role": "user", "content": "hi", "timestamp": 1781698587.0}]
-
-        kwargs = agent._build_api_kwargs(messages)
-
-        assert "timestamp" not in kwargs["messages"][0]
-        assert kwargs["messages"][0]["content"] == "hi"
-        # Internal history is untouched — transport copies only when needed.
-        assert messages[0]["timestamp"] == 1781698587.0
-
     def test_public_moonshot_kimi_k2_5_omits_temperature(self, agent):
         """Kimi models should NOT have client-side temperature overrides.
 

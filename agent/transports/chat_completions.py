@@ -163,11 +163,6 @@ class ChatCompletionsTransport(ProviderTransport):
           ``Extra inputs are not permitted, field: 'messages[N].tool_name'``.
           Permissive providers (OpenRouter, MiniMax) silently ignore the
           field, which masked the bug for months.
-        - ``timestamp`` on gateway/session messages — useful internal
-          metadata for replay and persistence, but not part of the Chat
-          Completions message schema. Strict OpenAI-compatible routes reject
-          it with ``Extra inputs are not permitted, field:
-          'messages[N].timestamp'``.
         - Hermes-internal scaffolding markers — any top-level message key
           starting with ``_`` (e.g. ``_empty_recovery_synthetic``,
           ``_empty_terminal_sentinel``, ``_thinking_prefill``). These are
@@ -219,6 +214,7 @@ class ChatCompletionsTransport(ProviderTransport):
         for msg_idx, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
+
             copied_msg: dict[str, Any] | None = None
 
             def mutable_msg() -> dict[str, Any]:
@@ -243,6 +239,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("effect_disposition", None)
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
+
+
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
             # OpenAI's message schema has no ``_``-prefixed fields, so this
             # is safe and future-proofs against new markers being added.
