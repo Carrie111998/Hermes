@@ -3154,8 +3154,27 @@ def create_task(
     if dispatch_decision is not None:
         validate_dispatch_decision(dispatch_decision)
         if "route" in dispatch_decision:
+            dd_route = str(dispatch_decision["route"]).strip()
             dd_model = str(dispatch_decision["model"]).strip()
             dd_provider = str(dispatch_decision["provider"]).strip()
+            # FD-004: route identity must equal the canonical assignee.
+            # The dispatcher spawns the assignee, not the route value, so any
+            # divergence between route and assignee makes routing evidence
+            # false.  Fail closed before DB write.
+            if not assignee:
+                raise ValueError(
+                    "dispatch_decision route requires a non-empty assignee. "
+                    "Set assignee to match the route profile "
+                    f"(route={dd_route!r}, assignee missing)."
+                )
+            canonical_route = _canonical_assignee(dd_route)
+            if assignee != canonical_route:
+                raise ValueError(
+                    f"dispatch_decision route {dd_route!r} "
+                    f"(canonical: {canonical_route!r}) does not match "
+                    f"assignee {assignee!r}. "
+                    f"The route must equal the canonical assignee profile."
+                )
             if model_override is not None and model_override != dd_model:
                 raise ValueError(
                     f"dispatch_decision route model {dd_model!r} conflicts with "

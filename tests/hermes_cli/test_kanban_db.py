@@ -5065,6 +5065,7 @@ class TestDispatchDecision:
             tid = kb.create_task(
                 conn,
                 title="order test",
+                assignee="worker-terra",
                 dispatch_decision={
                     "route": "worker-terra",
                     "model": "deepseek-v4-flash",
@@ -5435,3 +5436,192 @@ class TestDispatchIdempotency:
                 dispatch_decision=decision,
             )
         assert tid1 != tid2, "Different keys must produce distinct tasks"
+
+
+# ---------------------------------------------------------------------------
+# FD-004: Route identity must match assignee — dispatch_decision route
+# must equal the canonicalized assignee.  A mismatch or missing assignee
+# fails closed before DB write.
+# ---------------------------------------------------------------------------
+
+
+class TestRouteAssigneeMatch:
+    """dispatch_decision route must equal the canonical assignee.
+
+    A caller could record route=worker-terra/model=deepseek-v4-flash while
+    assignee=worker-sol or omitting assignee entirely, making routing
+    evidence false.  The dispatcher spawns the assignee, not the route, so
+    any divergence between route and assignee must fail closed before DB
+    write.
+    """
+
+    def test_route_without_assignee_raises(self, kanban_home):
+        """A route decision requires a non-empty assignee matching the route."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="assignee"):
+                kb.create_task(
+                    conn,
+                    title="missing assignee",
+                    dispatch_decision={
+                        "route": "worker-terra",
+                        "model": "deepseek-v4-flash",
+                        "provider": "new-api",
+                    },
+                )
+
+    def test_route_mismatched_assignee_raises(self, kanban_home):
+        """Route must match the canonical assignee."""
+        with kb.connect() as conn:
+            with pytest.raises(ValueError, match="does not match"):
+                kb.create_task(
+                    conn,
+                    title="mismatch",
+                    assignee="worker-sol",
+                    dispatch_decision={
+                        "route": "worker-terra",
+                        "model": "deepseek-v4-flash",
+                        "provider": "new-api",
+                    },
+                )
+
+    def test_route_matching_assignee_succeeds(self, kanban_home):
+        """Matching route and assignee creates task successfully."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="matching route",
+                assignee="worker-terra",
+                dispatch_decision={
+                    "route": "worker-terra",
+                    "model": "deepseek-v4-flash",
+                    "provider": "new-api",
+                },
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "worker-terra"
+        assert task.model_override == "deepseek-v4-flash"
+        assert task.provider_override == "new-api"
+        events = kb.list_events(conn, tid)
+        assert "dispatch_routed" in [e.kind for e in events]
+
+    def test_route_canonical_variant_succeeds(self, kanban_home):
+        """Route with different case still matches after canonicalization."""
+        with kb.connect() as conn:
+            # "Worker-Terra" → canonical assignee "worker-terra"
+            tid = kb.create_task(
+                conn,
+                title="case variance",
+                assignee="worker-terra",
+                dispatch_decision={
+                    "route": "Worker-Terra",
+                    "model": "deepseek-v4-flash",
+                    "provider": "new-api",
+                },
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "worker-terra"
+
+
+# ---------------------------------------------------------------------------
+# FD-005: End-to-end create -> dispatch_decision binding -> spawn argv
+# proof.  Creates a task using dispatch_decision route, reads the task back,
+# patches subprocess.Popen, calls _default_spawn, and asserts the resulting
+# argv includes the correct profile, -m, and --provider flags.
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchDecisionSpawnArgv:
+    """dispatch_decision route binding produces correct spawn argv."""
+
+    def _spawn_and_capture(self, monkeypatch, tmp_path, task):
+        monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+        captured = {}
+
+        class FakeProc:
+            pid = 4245
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["cmd"] = list(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        workspace = tmp_path / "ws"
+        workspace.mkdir(exist_ok=True)
+        kb._default_spawn(task, str(workspace))
+        return captured["cmd"]
+
+    def test_dispatch_decision_route_binds_model_and_provider_in_spawn_argv(
+        self, kanban_home, monkeypatch, tmp_path,
+    ):
+        """Create via dispatch_decision -> verify spawn argv has -m and --provider."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="fd-005 spawn test",
+                assignee="worker-terra",
+                dispatch_decision={
+                    "route": "worker-terra",
+                    "model": "deepseek-v4-flash",
+                    "provider": "new-api",
+                },
+            )
+            task = kb.get_task(conn, tid)
+
+        # Precondition: binding propagated to task row
+        assert task is not None
+        assert task.model_override == "deepseek-v4-flash"
+        assert task.provider_override == "new-api"
+
+        # Spawn and capture argv
+        cmd = self._spawn_and_capture(monkeypatch, tmp_path, task)
+
+        # Profile arg matches the assignee/route
+        p_idx = cmd.index("-p")
+        assert cmd[p_idx + 1] == "worker-terra", (
+            f"Expected profile worker-terra, got {cmd[p_idx + 1]!r}"
+        )
+
+        # Model override flag
+        m_idx = cmd.index("-m")
+        assert cmd[m_idx + 1] == "deepseek-v4-flash", (
+            f"Expected model deepseek-v4-flash, got {cmd[m_idx + 1]!r}"
+        )
+
+        # Provider flag immediately follows model
+        prov_idx = cmd.index("--provider")
+        assert prov_idx == m_idx + 2, (
+            f"--provider at index {prov_idx}, expected {m_idx + 2} "
+            f"(immediately after -m deepseek-v4-flash)"
+        )
+        assert cmd[prov_idx + 1] == "new-api", (
+            f"Expected provider new-api, got {cmd[prov_idx + 1]!r}"
+        )
+
+    def test_dispatch_decision_spawn_keeps_assignee_even_without_override(
+        self, kanban_home, monkeypatch, tmp_path,
+    ):
+        """Exemption-only dispatch leaves assignee intact, no -m/--provider."""
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="fd-005 exemption spawn",
+                assignee="worker-terra",
+                dispatch_decision={"exemption": "tiny"},
+            )
+            task = kb.get_task(conn, tid)
+
+        assert task is not None
+        assert task.model_override is None
+        assert task.provider_override is None
+
+        cmd = self._spawn_and_capture(monkeypatch, tmp_path, task)
+        p_idx = cmd.index("-p")
+        assert cmd[p_idx + 1] == "worker-terra"
+        assert "-m" not in cmd, (
+            f"Exemption task must not have -m in argv: {cmd}"
+        )
+        assert "--provider" not in cmd, (
+            f"Exemption task must not have --provider in argv: {cmd}"
+        )
