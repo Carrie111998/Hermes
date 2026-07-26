@@ -335,11 +335,33 @@ export function useMessageStream({
 
       mutateStream(
         sessionId,
-        parts => (replace ? applyReasoningAvailable(parts, delta) : appendReasoningPart(parts, delta)),
+        (parts, message) => {
+          if (chatMessageText(message).trim()) {
+            return parts
+          }
+
+          return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta)]
+        },
         () => [reasoningPart(delta)]
       )
     },
     [flushQueuedDeltas, mutateStream, queueDelta]
+  )
+
+  const appendReasoningAvailable = useCallback(
+    (sessionId: string, text: string) => {
+      if (!text) {
+        return
+      }
+
+      flushQueuedDeltas(sessionId)
+      mutateStream(
+        sessionId,
+        parts => applyReasoningAvailable(parts, text),
+        () => [reasoningPart(text)]
+      )
+    },
+    [flushQueuedDeltas, mutateStream]
   )
 
   const upsertToolCall = useCallback(
@@ -651,6 +673,7 @@ export function useMessageStream({
   const handleGatewayEvent = useGatewayEventHandler({
     activeGatewayProfile,
     appendAssistantDelta,
+    appendReasoningAvailable,
     appendReasoningDelta,
     activeSessionIdRef,
     compactedTurnRef,
