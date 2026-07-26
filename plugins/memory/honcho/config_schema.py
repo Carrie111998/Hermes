@@ -298,6 +298,53 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Initialize the session eagerly in tools mode instead of on first tool call.",
             group="Recall",
         ),
+        # — Retrieval —
+        # Honcho splits the conclusion budget three ways: semantic (query-driven),
+        # most-frequent, and recent (`ORDER BY created_at DESC`). Only the first
+        # depends on the query, so the defaults inject a majority of conclusions
+        # the conversation never asked for. Setting searchTopK >= maxConclusions
+        # drives the other two slices to zero.
+        ProviderField(
+            key="searchTopK",
+            label="Search top K",
+            kind=KIND_NUMBER,
+            description=(
+                "Number of semantically relevant conclusions to retrieve. Set it to at "
+                "least Max conclusions so no query-independent conclusions are injected."
+            ),
+            placeholder="(server default: a third of the budget)",
+            group="Retrieval",
+        ),
+        ProviderField(
+            key="maxConclusions",
+            label="Max conclusions",
+            kind=KIND_NUMBER,
+            description="Ceiling on conclusions included in the representation.",
+            placeholder="(server default: 25)",
+            group="Retrieval",
+        ),
+        ProviderField(
+            key="searchMaxDistance",
+            label="Search max distance",
+            kind=KIND_NUMBER,
+            description=(
+                "Semantic distance cutoff, 0.0-1.0. The only relevance threshold in the "
+                "retrieval path. Lower is stricter; around 0.3 is 'very close'."
+            ),
+            placeholder="(server default)",
+            group="Retrieval",
+        ),
+        ProviderField(
+            key="includeMostFrequent",
+            label="Include most frequent",
+            kind=KIND_BOOL,
+            description=(
+                "Include the most-frequent conclusions slice. Disabling it does NOT "
+                "reduce noise on its own: that budget moves to the recent slice, which "
+                "ignores the query too. Use searchTopK for that."
+            ),
+            group="Retrieval",
+        ),
         # — Limits —
         ProviderField(
             key="messageMaxChars",

@@ -48,6 +48,8 @@ def clone_honcho_for_profile(profile_name: str) -> bool:
                 "sessionPeerPrefix", "contextTokens", "dialecticReasoningLevel",
                 "dialecticDynamic", "dialecticMaxChars", "messageMaxChars",
                 "dialecticMaxInputChars", "saveMessages", "observation",
+                "searchTopK", "searchMaxDistance", "maxConclusions",
+                "includeMostFrequent",
                 "pinUserPeer", "userPeerAliases", "runtimePeerPrefix"):
         val = default_block.get(key)
         if val is not None:
@@ -117,7 +119,8 @@ def cmd_enable(args) -> None:
         for key in ("recallMode", "writeFrequency", "sessionStrategy",
                     "contextTokens", "dialecticReasoningLevel", "dialecticDynamic",
                     "dialecticMaxChars", "messageMaxChars", "dialecticMaxInputChars",
-                    "saveMessages", "observation"):
+                    "saveMessages", "observation", "searchTopK", "searchMaxDistance",
+                    "maxConclusions", "includeMostFrequent"):
             val = default_block.get(key)
             if val is not None and key not in block:
                 block[key] = val
@@ -1203,6 +1206,17 @@ def cmd_status(args) -> None:
     heuristic_on = "on" if hcfg.reasoning_heuristic else "off"
     print(f"  Reasoning:      base={hcfg.dialectic_reasoning_level}, cap={reasoning_cap}, heuristic={heuristic_on}")
     print(f"  Observation:    user(me={hcfg.user_observe_me},others={hcfg.user_observe_others}) ai(me={hcfg.ai_observe_me},others={hcfg.ai_observe_others})")
+    _gated = (
+        hcfg.search_top_k is not None
+        and hcfg.max_conclusions is not None
+        and hcfg.search_top_k >= hcfg.max_conclusions
+    )
+    print(
+        f"  Retrieval:      topK={hcfg.search_top_k or '(default)'} "
+        f"maxConclusions={hcfg.max_conclusions or '(default)'} "
+        f"maxDistance={hcfg.search_max_distance if hcfg.search_max_distance is not None else '(default)'}"
+        + ("  [all query-gated]" if _gated else "  [includes query-independent conclusions]")
+    )
     print(f"  Write freq:     {hcfg.write_frequency}")
 
     if hcfg.enabled and (hcfg.api_key or hcfg.base_url):

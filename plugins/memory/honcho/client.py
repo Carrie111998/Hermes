@@ -153,6 +153,46 @@ def _parse_context_tokens(host_val, root_val) -> int | None:
     return None
 
 
+def _parse_optional_int(host_val, root_val) -> int | None:
+    """Parse an optional integer config: host wins, then root, then None.
+
+    None means "do not send this parameter", preserving Honcho's server-side
+    default. Used for the representation retrieval knobs, where omitting the
+    field must behave exactly as before it existed.
+    """
+    for val in (host_val, root_val):
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _parse_optional_float(host_val, root_val) -> float | None:
+    """Parse an optional float config: host wins, then root, then None."""
+    for val in (host_val, root_val):
+        if val is not None:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _parse_optional_bool(host_val, root_val) -> bool | None:
+    """Parse an optional bool config: host wins, then root, then None.
+
+    Distinct from ``_resolve_bool``, which collapses an unset field onto a
+    default. Here the tri-state is load-bearing: None must stay None so the
+    parameter is left out of the API call entirely.
+    """
+    for val in (host_val, root_val):
+        if val is not None:
+            return bool(val)
+    return None
+
+
 def _parse_int_config(host_val, root_val, default: int) -> int:
     """Parse an integer config: host wins, then root, then default."""
     for val in (host_val, root_val):
@@ -392,6 +432,21 @@ class HonchoClientConfig:
     write_frequency: str | int = "async"
     # Prefetch budget (None = no cap; set to an integer to bound auto-injected context)
     context_tokens: int | None = None
+    # Representation retrieval knobs. All None by default: omitted from the call,
+    # so Honcho's server-side defaults apply and behaviour is unchanged.
+    #
+    # Honcho splits the conclusion budget three ways (crud/representation.py):
+    #     semantic = search_top_k or max_conclusions // 3   # driven by the query
+    #     frequent = max_conclusions // 3                   # ignores the query
+    #     recent   = max_conclusions - semantic - frequent  # ignores the query
+    # With the defaults that is 8 + 8 + 9 of 25, i.e. 17 of 25 conclusions that no
+    # query influenced, drawn by `ORDER BY created_at DESC`. Setting
+    # search_top_k >= max_conclusions drives `frequent` and `recent` to zero, so
+    # every injected conclusion is one the query actually selected.
+    search_top_k: int | None = None
+    search_max_distance: float | None = None
+    max_conclusions: int | None = None
+    include_most_frequent: bool | None = None
     # Dialectic (peer.chat) settings
     # reasoning_level: "minimal" | "low" | "medium" | "high" | "max"
     dialectic_reasoning_level: str = "low"
@@ -624,6 +679,22 @@ class HonchoClientConfig:
             context_tokens=_parse_context_tokens(
                 host_block.get("contextTokens"),
                 raw.get("contextTokens"),
+            ),
+            search_top_k=_parse_optional_int(
+                host_block.get("searchTopK"),
+                raw.get("searchTopK"),
+            ),
+            search_max_distance=_parse_optional_float(
+                host_block.get("searchMaxDistance"),
+                raw.get("searchMaxDistance"),
+            ),
+            max_conclusions=_parse_optional_int(
+                host_block.get("maxConclusions"),
+                raw.get("maxConclusions"),
+            ),
+            include_most_frequent=_parse_optional_bool(
+                host_block.get("includeMostFrequent"),
+                raw.get("includeMostFrequent"),
             ),
             dialectic_reasoning_level=(
                 host_block.get("dialecticReasoningLevel")

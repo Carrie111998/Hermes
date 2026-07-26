@@ -133,6 +133,18 @@ class HonchoSessionManager:
         self._user_observe_others: bool = config.user_observe_others if config else True
         self._ai_observe_me: bool = config.ai_observe_me if config else True
         self._ai_observe_others: bool = config.ai_observe_others if config else True
+        # Representation retrieval knobs. None = omit the parameter, keeping
+        # Honcho's server-side default. See HonchoClientConfig for the budget
+        # arithmetic that makes search_top_k >= max_conclusions the setting
+        # which eliminates query-independent conclusions.
+        self._search_top_k: int | None = config.search_top_k if config else None
+        self._search_max_distance: float | None = (
+            config.search_max_distance if config else None
+        )
+        self._max_conclusions: int | None = config.max_conclusions if config else None
+        self._include_most_frequent: bool | None = (
+            config.include_most_frequent if config else None
+        )
         self._message_max_chars: int = (
             config.message_max_chars if config else 25000
         )
@@ -957,6 +969,23 @@ class HonchoSessionManager:
 
         return []
 
+    def _retrieval_kwargs(self) -> dict[str, Any]:
+        """Retrieval knobs to forward to peer.context() / peer.representation().
+
+        Only non-None values are included, so an unconfigured deployment sends
+        nothing extra and keeps Honcho's server-side defaults.
+        """
+        kwargs: dict[str, Any] = {}
+        if self._search_top_k is not None:
+            kwargs["search_top_k"] = self._search_top_k
+        if self._search_max_distance is not None:
+            kwargs["search_max_distance"] = self._search_max_distance
+        if self._max_conclusions is not None:
+            kwargs["max_conclusions"] = self._max_conclusions
+        if self._include_most_frequent is not None:
+            kwargs["include_most_frequent"] = self._include_most_frequent
+        return kwargs
+
     def _fetch_peer_context(
         self,
         peer_id: str,
@@ -975,6 +1004,7 @@ class HonchoSessionManager:
                 context_kwargs["target"] = target
             if search_query is not None:
                 context_kwargs["search_query"] = search_query
+            context_kwargs.update(self._retrieval_kwargs())
             ctx = peer.context(**context_kwargs) if context_kwargs else peer.context()
             representation = (
                 getattr(ctx, "representation", None)
@@ -987,9 +1017,12 @@ class HonchoSessionManager:
 
         if not representation:
             try:
-                representation = (
-                    peer.representation(target=target) if target is not None else peer.representation()
-                ) or ""
+                repr_kwargs: dict[str, Any] = dict(self._retrieval_kwargs())
+                if target is not None:
+                    repr_kwargs["target"] = target
+                if search_query is not None:
+                    repr_kwargs["search_query"] = search_query
+                representation = peer.representation(**repr_kwargs) or ""
             except Exception as e:
                 logger.debug("Direct peer.representation() failed for '%s': %s", peer_id, e)
 
