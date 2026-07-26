@@ -6792,6 +6792,134 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
+    def retry_failed_bound_sidebar_job(
+        self,
+        *,
+        job_id: str,
+        source_session_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+        confirmation: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """Requeue one exact failed bound task without permitting replacement."""
+
+        from .sidebar import sidebar_bridge_id, sidebar_idempotency_key
+
+        supplied_job_id = _exact_nonempty_text(job_id, "sidebar job ID")
+        source_id = _exact_nonempty_text(
+            source_session_id,
+            "sidebar source session ID",
+        )
+        thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
+        error_code = _exact_nonempty_text(
+            expected_error_code,
+            "expected sidebar failure",
+        )
+        authority = _exact_nonempty_text(
+            confirmation,
+            "bound sidebar retry confirmation",
+        )
+        if (
+            error_code != "native_task_not_indexed"
+            or authority != "PRESERVE_EXACT_BOUND_TASK"
+        ):
+            raise ValueError("expected bound sidebar failure does not match")
+        retry_time = _finite_number(now, "now")
+        idempotency_key = sidebar_idempotency_key(source_id)
+        bridge_id = sidebar_bridge_id(source_id)
+        expected_job_id = (
+            f"sidebar-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
+        )
+        if supplied_job_id != expected_job_id:
+            raise ValueError("expected bound sidebar failure does not match")
+
+        def _write(conn):
+            if not self._sidebar_terminal_resolution_ledger_is_valid(conn):
+                raise ValueError("expected bound sidebar failure does not match")
+            jobs = conn.execute(
+                """SELECT * FROM session_sidebar_jobs
+                   WHERE source_session_id = ? ORDER BY id LIMIT 2""",
+                (source_id,),
+            ).fetchall()
+            job = jobs[0] if len(jobs) == 1 else None
+            if job is None:
+                raise ValueError("expected bound sidebar failure does not match")
+            terminal_resolution = conn.execute(
+                "SELECT 1 FROM session_sidebar_terminal_resolutions "
+                "WHERE job_id = ? LIMIT 1",
+                (job["id"],),
+            ).fetchone()
+            precreate_resolution = conn.execute(
+                "SELECT 1 FROM session_sidebar_precreate_resolutions "
+                "WHERE job_id = ? LIMIT 1",
+                (job["id"],),
+            ).fetchone()
+            reservation_row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (_sidebar_create_reservation_state_key(source_id),),
+            ).fetchone()
+            reservation = (
+                None
+                if reservation_row is None
+                else _decode_sidebar_create_reservation(
+                    reservation_row["value_json"],
+                    expected_source_session_id=source_id,
+                )
+            )
+            if (
+                job["id"] != expected_job_id
+                or job["idempotency_key"] != idempotency_key
+                or job["bridge_id"] != bridge_id
+                or job["codex_thread_id"] != thread_id
+                or job["state"] != SidebarJobState.FAILED.value
+                or job["error_code"] != error_code
+                or job["lease_digest"] is not None
+                or job["lease_expires_at"] is not None
+                or job["completion_digest"] is not None
+                or job["visible_at"] is not None
+                or terminal_resolution is not None
+                or precreate_resolution is not None
+                or reservation is None
+                or reservation["job_id"] != expected_job_id
+                or reservation["source_session_id"] != source_id
+                or reservation["bridge_id"] != bridge_id
+            ):
+                raise ValueError("expected bound sidebar failure does not match")
+            cursor = conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, attempts = 0, next_attempt_at = ?,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       error_code = NULL, updated_at = ?
+                   WHERE id = ? AND idempotency_key = ? AND bridge_id = ?
+                     AND source_session_id = ? AND codex_thread_id = ?
+                     AND state = ? AND error_code = ?
+                     AND lease_digest IS NULL AND lease_expires_at IS NULL
+                     AND completion_digest IS NULL AND visible_at IS NULL""",
+                (
+                    SidebarJobState.RETRY.value,
+                    retry_time,
+                    retry_time,
+                    expected_job_id,
+                    idempotency_key,
+                    bridge_id,
+                    source_id,
+                    thread_id,
+                    SidebarJobState.FAILED.value,
+                    error_code,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("expected bound sidebar failure does not match")
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                    (expected_job_id,),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
     def retry_failed_sidebar_job(
         self,
         *,

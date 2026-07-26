@@ -6918,6 +6918,49 @@ def _failed_bound_ambiguous_sidebar(
     return store, candidate, failed, reservation
 
 
+def _failed_bound_not_indexed_sidebar(
+    db: SessionDB,
+    *,
+    native_id: str,
+    thread_id: str,
+) -> tuple[SessionBridgeStore, SidebarCandidate, dict[str, object], dict[str, object]]:
+    tokens = tuple(f"{native_id}-token-{attempt}" for attempt in range(1, 7))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(*tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=native_id)
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=f"hermes-session-bridge-create-v1:{native_id}",
+        now=110.0,
+    )
+    store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=120.0,
+    )
+    failed: dict[str, object] | None = None
+    for _attempt in range(5):
+        failed = store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="native_task_not_indexed",
+            codex_thread_id=thread_id,
+            now=150.0 if failed is None else float(failed["next_attempt_at"]),
+        )
+        if failed["state"] == SidebarJobState.RETRY.value:
+            lease = store.claim_sidebar_jobs(
+                now=float(failed["next_attempt_at"]),
+                limit=1,
+            )[0]
+    assert failed is not None
+    assert failed["state"] == SidebarJobState.FAILED.value
+    return store, candidate, failed, reservation
+
+
 def _acknowledge_terminal_resolution(
     store: SessionBridgeStore,
     failed: dict[str, object],
@@ -9556,6 +9599,193 @@ def test_sidebar_release_returns_an_active_lease_to_pending(db) -> None:
     assert released["next_attempt_at"] == 175.0
     assert released["lease_digest"] is None
     assert released["error_code"] is None
+
+
+def test_bound_sidebar_operator_retry_preserves_exact_task_and_reservation(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "bound-retry-token-1",
+            "bound-retry-token-2",
+            "bound-retry-token-3",
+            "bound-retry-token-4",
+            "bound-retry-token-5",
+            "bound-retry-token-recovered",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="bound-operator-retry")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key="hermes-session-bridge-create-v1:bound-operator-retry",
+        now=110.0,
+    )
+    thread_id = "019f-bound-retry-thread"
+    store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=120.0,
+    )
+
+    failed = None
+    for _attempt in range(5):
+        failed = store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="native_task_not_indexed",
+            codex_thread_id=thread_id,
+            now=150.0 if failed is None else failed["next_attempt_at"],
+        )
+        if failed["state"] == SidebarJobState.RETRY.value:
+            lease = store.claim_sidebar_jobs(
+                now=failed["next_attempt_at"],
+                limit=1,
+            )[0]
+
+    assert failed is not None
+    assert failed["state"] == SidebarJobState.FAILED.value
+    assert failed["attempts"] == 5
+
+    retried = store.retry_failed_bound_sidebar_job(
+        job_id=failed["id"],
+        source_session_id=candidate.source_session_id,
+        codex_thread_id=thread_id,
+        expected_error_code="native_task_not_indexed",
+        confirmation="PRESERVE_EXACT_BOUND_TASK",
+        now=1_000.0,
+    )
+
+    assert retried["state"] == SidebarJobState.RETRY.value
+    assert retried["attempts"] == 0
+    assert retried["next_attempt_at"] == 1_000.0
+    assert retried["error_code"] is None
+    assert retried["codex_thread_id"] == thread_id
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) == (
+        reservation
+    )
+    claimed = store.claim_sidebar_jobs(now=1_000.0, limit=1)[0]
+    assert claimed["codex_thread_id"] == thread_id
+    assert claimed["lease_token"] == "bound-retry-token-recovered"
+
+
+@pytest.mark.parametrize(
+    ("argument", "replacement"),
+    (
+        ("job_id", "sidebar-job:" + "f" * 64),
+        ("source_session_id", "claude:different-bound-source"),
+        ("codex_thread_id", "019f-different-bound-thread"),
+        ("expected_error_code", "marker_conflict"),
+        ("confirmation", "REPLACE_BOUND_TASK"),
+    ),
+)
+def test_bound_sidebar_operator_retry_rejects_stale_authority_without_mutation(
+    db,
+    argument: str,
+    replacement: str,
+) -> None:
+    thread_id = "019f-bound-authority-thread"
+    store, candidate, failed, reservation = _failed_bound_not_indexed_sidebar(
+        db,
+        native_id=f"bound-authority-{argument}",
+        thread_id=thread_id,
+    )
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    arguments = {
+        "job_id": failed["id"],
+        "source_session_id": candidate.source_session_id,
+        "codex_thread_id": thread_id,
+        "expected_error_code": "native_task_not_indexed",
+        "confirmation": "PRESERVE_EXACT_BOUND_TASK",
+        "now": 1_000.0,
+    }
+    arguments[argument] = replacement
+
+    with pytest.raises(ValueError):
+        store.retry_failed_bound_sidebar_job(**arguments)
+
+    assert store.get_sidebar_job_for_source(candidate.source_session_id) == before
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) == (
+        reservation
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario", "mutation"),
+    (
+        (
+            "missing-reservation",
+            """DELETE FROM session_bridge_state
+               WHERE key LIKE 'session-bridge:sidebar-create:%'""",
+        ),
+        (
+            "completion-digest",
+            """UPDATE session_sidebar_jobs
+               SET completion_digest = 'stale-completion'
+               WHERE source_session_id = ?""",
+        ),
+        (
+            "visible-timestamp",
+            """UPDATE session_sidebar_jobs
+               SET visible_at = 999
+               WHERE source_session_id = ?""",
+        ),
+    ),
+)
+def test_bound_sidebar_operator_retry_rejects_unsafe_persisted_state(
+    db,
+    scenario: str,
+    mutation: str,
+) -> None:
+    thread_id = f"019f-bound-unsafe-{scenario}"
+    store, candidate, failed, _reservation = _failed_bound_not_indexed_sidebar(
+        db,
+        native_id=f"bound-unsafe-{scenario}",
+        thread_id=thread_id,
+    )
+    parameters = () if scenario == "missing-reservation" else (
+        candidate.source_session_id,
+    )
+    db._execute_write(lambda conn: conn.execute(mutation, parameters))
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+
+    with pytest.raises(ValueError):
+        store.retry_failed_bound_sidebar_job(
+            job_id=failed["id"],
+            source_session_id=candidate.source_session_id,
+            codex_thread_id=thread_id,
+            expected_error_code="native_task_not_indexed",
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+            now=1_000.0,
+        )
+
+    assert store.get_sidebar_job_for_source(candidate.source_session_id) == before
+
+
+def test_bound_sidebar_operator_retry_is_single_use(db) -> None:
+    thread_id = "019f-bound-single-use-thread"
+    store, candidate, failed, reservation = _failed_bound_not_indexed_sidebar(
+        db,
+        native_id="bound-single-use",
+        thread_id=thread_id,
+    )
+    arguments = {
+        "job_id": failed["id"],
+        "source_session_id": candidate.source_session_id,
+        "codex_thread_id": thread_id,
+        "expected_error_code": "native_task_not_indexed",
+        "confirmation": "PRESERVE_EXACT_BOUND_TASK",
+        "now": 1_000.0,
+    }
+
+    first = store.retry_failed_bound_sidebar_job(**arguments)
+    with pytest.raises(ValueError):
+        store.retry_failed_bound_sidebar_job(**arguments)
+
+    assert store.get_sidebar_job_for_source(candidate.source_session_id) == first
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) == (
+        reservation
+    )
 
 
 def test_sidebar_operator_retry_requeues_only_the_expected_failed_job(db) -> None:
