@@ -2403,6 +2403,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # Protected model tools fail before request middleware or plugin hooks can
+    # observe, rewrite, or independently act on an unauthorized invocation.
+    from tools.registry import registry
+
+    authenticated_dispatch_error = registry.authenticated_gateway_dispatch_error(
+        function_name,
+        function_args,
+        getattr(agent, "_authenticated_gateway_context", None),
+    )
+    if authenticated_dispatch_error is not None:
+        return authenticated_dispatch_error
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -2583,6 +2595,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                **(
+                    {"authenticated_gateway_context": authenticated_context}
+                    if (
+                        authenticated_context := getattr(
+                            agent, "_authenticated_gateway_context", None
+                        )
+                    ) is not None
+                    else {}
+                ),
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware

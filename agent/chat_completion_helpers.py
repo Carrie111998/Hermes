@@ -983,7 +983,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    tools_for_api = agent.tools
+    from tools.registry import registry
+
+    tools_for_api: Any = (
+        registry.filter_authenticated_gateway_tool_definitions(
+            agent.tools,
+            getattr(agent, "_authenticated_gateway_context", None),
+        )
+        if agent.tools is not None
+        else None
+    )
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

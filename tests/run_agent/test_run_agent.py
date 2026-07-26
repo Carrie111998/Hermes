@@ -3689,7 +3689,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
 
         inline_names = self._extract_dispatch_chain_names(
-            tool_executor.execute_tool_calls_sequential
+            tool_executor._execute_tool_calls_sequential
         )
         assert inline_names, (
             "Could not find the dispatch chain (anchored on "
@@ -3719,7 +3719,7 @@ class TestAgentRuntimePostHookOwnershipSync:
             agent_runtime_helpers.invoke_tool
         )
         inline_names = self._extract_dispatch_chain_names(
-            tool_executor.execute_tool_calls_sequential
+            tool_executor._execute_tool_calls_sequential
         )
         assert invoke_tool_names == inline_names, (
             "Static `function_name == \"...\"` branches diverged between "

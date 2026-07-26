@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 def _make_registry(captured: dict):
     """Return a mock registry whose dispatch records the kwargs it receives."""
     registry = MagicMock()
+    registry.get_tool_entry.return_value = MagicMock()
+    registry.authenticated_gateway_dispatch_error.return_value = None
 
     def _dispatch(name, args, **kwargs):
         captured.update(kwargs)

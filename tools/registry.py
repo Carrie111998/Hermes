@@ -15,6 +15,7 @@ Import chain (circular-import safe):
 """
 
 import ast
+from contextlib import nullcontext
 import importlib
 import json
 import logging
@@ -25,6 +26,43 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+_AUTHENTICATED_GATEWAY_RESERVED_FIELDS = frozenset({
+    "authenticated_gateway_context",
+    "tool_context",
+})
+
+
+def _schema_contains_authenticated_gateway_field(value) -> bool:
+    """Return whether any nested JSON-schema property claims host provenance."""
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            if _AUTHENTICATED_GATEWAY_RESERVED_FIELDS.intersection(properties):
+                return True
+        return any(_schema_contains_authenticated_gateway_field(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_schema_contains_authenticated_gateway_field(item) for item in value)
+    return False
+
+
+def _args_contain_authenticated_gateway_field(value) -> bool:
+    """Return whether model-controlled arguments contain reserved identity keys."""
+    if isinstance(value, dict):
+        if _AUTHENTICATED_GATEWAY_RESERVED_FIELDS.intersection(value):
+            return True
+        return any(_args_contain_authenticated_gateway_field(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_args_contain_authenticated_gateway_field(item) for item in value)
+    return False
+
+
+def _authenticated_gateway_error(message: str) -> str:
+    return json.dumps({
+        "error": message,
+        "error_type": "authenticated_gateway_required",
+    })
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -91,11 +129,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "requires_authenticated_gateway",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 requires_authenticated_gateway=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -114,6 +154,7 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.requires_authenticated_gateway = requires_authenticated_gateway
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +317,44 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
+    def authenticated_gateway_dispatch_error(
+        self,
+        name: str,
+        args: dict,
+        context: object,
+        *,
+        tool_call_id: Optional[str] = None,
+        allow_admitted_claim: bool = True,
+    ) -> Optional[str]:
+        """Return a fail-closed error for a denied protected tool call."""
+        entry = self.get_entry(name)
+        if not entry or not entry.requires_authenticated_gateway:
+            return None
+        if _args_contain_authenticated_gateway_field(args):
+            return _authenticated_gateway_error(
+                "Model arguments may not contain gateway provenance fields"
+            )
+        from gateway.authenticated_dispatch import (
+            current_authenticated_gateway_tool_claim_authorizes,
+            validate_authenticated_gateway_tool_dispatch,
+        )
+
+        if not (
+            (
+                allow_admitted_claim
+                and current_authenticated_gateway_tool_claim_authorizes(
+                    context,
+                    name,
+                    tool_call_id=tool_call_id,
+                )
+            )
+            or validate_authenticated_gateway_tool_dispatch(context)
+        ):
+            return _authenticated_gateway_error(
+                "Authenticated gateway tool dispatch required"
+            )
+        return None
+
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
         return sorted({entry.toolset for entry in self._snapshot_entries()})
@@ -376,6 +455,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        requires_authenticated_gateway: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -385,6 +465,15 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        if type(requires_authenticated_gateway) is not bool:
+            raise TypeError("requires_authenticated_gateway must be a built-in bool")
+        if (
+            requires_authenticated_gateway
+            and _schema_contains_authenticated_gateway_field(schema)
+        ):
+            raise ValueError(
+                "Authenticated gateway provenance fields must not be model-visible"
+            )
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -445,6 +534,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                requires_authenticated_gateway=requires_authenticated_gateway,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -573,6 +663,16 @@ class ToolRegistry:
                         "using static schema",
                         name, exc,
                     )
+            if (
+                entry.requires_authenticated_gateway
+                and _schema_contains_authenticated_gateway_field(schema_with_name)
+            ):
+                logger.error(
+                    "Protected tool %s dynamic schema contains reserved gateway fields; "
+                    "omitting it from the model surface",
+                    name,
+                )
+                continue
             result.append({"type": "function", "function": schema_with_name})
         return result
 
@@ -623,25 +723,72 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
-        try:
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
+
+        # The authenticated capability is always host transport.  Legacy
+        # ``tool_context`` kwargs remain part of the ordinary dispatch API, but
+        # protected tools must receive only the host-issued context below.
+        authenticated_context = kwargs.pop("authenticated_gateway_context", None)
+        authenticated_tool_call_id = kwargs.pop(
+            "authenticated_gateway_tool_call_id", None
+        )
+        lease_use = nullcontext(True)
+        if entry.requires_authenticated_gateway:
+            kwargs.pop("tool_context", None)
+            if _args_contain_authenticated_gateway_field(args):
+                return _authenticated_gateway_error(
+                    "Model arguments may not contain gateway provenance fields"
+                )
+            from gateway.authenticated_dispatch import (
+                current_authenticated_gateway_tool_claim_authorizes,
+                current_authenticated_gateway_tool_claim_is_bound,
+                use_authenticated_gateway_tool_dispatch,
+            )
+
+            if current_authenticated_gateway_tool_claim_authorizes(
+                authenticated_context,
+                name,
+                tool_call_id=authenticated_tool_call_id,
+                consume=True,
+            ):
+                lease_use = nullcontext(True)
+            elif current_authenticated_gateway_tool_claim_is_bound():
+                # A bound claim is invocation-specific. Mismatch or reuse must
+                # fail closed rather than minting replacement authority from the
+                # still-live turn lease.
+                lease_use = nullcontext(False)
             else:
-                result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
-        except Exception as e:
-            logger.exception("Tool %s dispatch error: %s", name, e)
-            # Route through the sanitizer so framing tokens / CDATA / fences
-            # in exception strings don't reach the model as structural noise.
-            # See model_tools._sanitize_tool_error for rationale.
-            raw = f"Tool execution failed: {type(e).__name__}: {e}"
+                lease_use = use_authenticated_gateway_tool_dispatch(
+                    authenticated_context,
+                    name,
+                    tool_call_id=authenticated_tool_call_id,
+                )
+
+        with lease_use as authorized:
+            if entry.requires_authenticated_gateway:
+                if not authorized:
+                    return _authenticated_gateway_error(
+                        "Authenticated gateway tool dispatch required"
+                    )
+                kwargs["tool_context"] = authenticated_context
             try:
-                from model_tools import _sanitize_tool_error
-                sanitized = _sanitize_tool_error(raw)
-            except Exception:
-                sanitized = raw  # defensive: never let the sanitizer block error propagation
-            return json.dumps({"error": sanitized})
+                if entry.is_async:
+                    from model_tools import _run_async
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
+                return self._normalize_handler_result(name, result)
+            except Exception as e:
+                logger.exception("Tool %s dispatch error: %s", name, e)
+                # Route through the sanitizer so framing tokens / CDATA / fences
+                # in exception strings don't reach the model as structural noise.
+                # See model_tools._sanitize_tool_error for rationale.
+                raw = f"Tool execution failed: {type(e).__name__}: {e}"
+                try:
+                    from model_tools import _sanitize_tool_error
+                    sanitized = _sanitize_tool_error(raw)
+                except Exception:
+                    sanitized = raw  # defensive: never let the sanitizer block error propagation
+                return json.dumps({"error": sanitized})
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)
@@ -656,6 +803,47 @@ class ToolRegistry:
             return default
         from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
         return DEFAULT_RESULT_SIZE_CHARS
+
+    def filter_authenticated_gateway_tool_definitions(
+        self,
+        definitions: Optional[List[dict]],
+        authenticated_gateway_context: object = None,
+    ) -> List[dict]:
+        """Return the per-request model surface allowed by a live tool lease.
+
+        The registry snapshot and the caller's cached definition list remain
+        untouched. Command leases are deliberately ineligible.
+        """
+        definitions = list(definitions or [])
+        try:
+            from gateway.authenticated_dispatch import (
+                validate_authenticated_gateway_tool_dispatch,
+            )
+
+            if validate_authenticated_gateway_tool_dispatch(
+                authenticated_gateway_context
+            ):
+                return definitions
+        except Exception:
+            pass
+
+        protected_names = {
+            entry.name
+            for entry in self._snapshot_entries()
+            if entry.requires_authenticated_gateway
+        }
+        if not protected_names:
+            return definitions
+
+        filtered = []
+        for definition in definitions:
+            function = definition.get("function") if isinstance(definition, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if name is None and isinstance(definition, dict):
+                name = definition.get("name")
+            if name not in protected_names:
+                filtered.append(definition)
+        return filtered
 
     def get_all_tool_names(self) -> List[str]:
         """Return sorted list of all registered tool names."""

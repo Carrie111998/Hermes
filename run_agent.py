@@ -405,6 +405,11 @@ class AIAgent:
     for AI models that support function calling.
     """
 
+    # Exact-version capability checked by the gateway before passing a
+    # host-authenticated turn lease. Agent substitutes without this capability
+    # remain backward compatible and receive no protected authority.
+    authenticated_gateway_tool_dispatch_version = 1
+
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
@@ -2992,7 +2997,12 @@ class AIAgent:
                 self._pending_steer = None
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(
+        self,
+        text: str,
+        *,
+        before_mutation: Optional[Callable[[], None]] = None,
+    ) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3019,16 +3029,25 @@ class AIAgent:
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
+            if before_mutation is not None:
+                before_mutation()
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if before_mutation is not None:
+                before_mutation()
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
 
-    def redirect(self, text: str) -> bool:
+    def redirect(
+        self,
+        text: str,
+        *,
+        before_mutation: Optional[Callable[[], None]] = None,
+    ) -> bool:
         """Redirect the active turn without converting it into a new task.
 
         During a normal Hermes model request this cancels only that request;
@@ -3069,7 +3088,10 @@ class AIAgent:
         # existing steer drain puts it on the final tool result before the next
         # model decision, including delegate_task children.
         if getattr(self, "_executing_tools", False):
-            return self.steer(cleaned)
+            return self.steer(
+                cleaned,
+                before_mutation=before_mutation,
+            )
 
         _model_active = getattr(self, "_model_request_active", None)
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
@@ -3079,6 +3101,8 @@ class AIAgent:
             existing = getattr(self, "_pending_redirect", None)
             if self._interrupt_requested and not existing:
                 return False
+            if before_mutation is not None:
+                before_mutation()
             self._pending_redirect = (
                 f"{existing}\n\n[Additional user correction]\n{cleaned}"
                 if existing
@@ -3094,6 +3118,8 @@ class AIAgent:
                     return False
                 if self._interrupt_requested and not self._pending_redirect:
                     return False
+                if before_mutation is not None:
+                    before_mutation()
                 if self._pending_redirect:
                     self._pending_redirect = (
                         f"{self._pending_redirect}\n\n"
@@ -6620,6 +6646,7 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        authenticated_gateway_context: object = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6631,41 +6658,54 @@ class AIAgent:
             reset_conversation_context,
             set_conversation_context,
         )
-        # Publish the conversation id for ambient Nous Portal tagging. Every
-        # LLM call made inside this turn — main loop, compression, vision,
-        # web_extract, session_search, MoA slots, background-review forks
-        # (which copy this Context into their thread) — inherits the
-        # ``conversation=<root>`` tag with zero per-call-site plumbing.
-        token = set_conversation_context(self._conversation_root_id())
-        # Publish the session accounting handles the same way so auxiliary
-        # calls record their token usage into session_model_usage (task
-        # dimension) — the fix for aux spend being invisible in analytics
-        # (issue #23270).
-        acct_token = set_accounting_context(
-            getattr(self, "_session_db", None), getattr(self, "session_id", None)
-        )
-        from agent.auxiliary_client import scoped_runtime_main
 
-        # The outer token restores the caller's Context even though turn setup
-        # replaces the value with the live runtime after fallback restoration.
-        # Keep the scope local instead of storing ContextVar tokens on the agent,
-        # which may be observed from another thread.
-        with scoped_runtime_main({}):
-            try:
-                return run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    moa_config=moa_config,
-                )
-            finally:
-                reset_accounting_context(acct_token)
-                reset_conversation_context(token)
+        # Bind authority to this one top-level Hermes turn. Codex app-server
+        # runs outside Hermes' tool dispatcher and intentionally receives none.
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            authenticated_gateway_context = None
+        from gateway.authenticated_dispatch import (
+            bind_authenticated_gateway_dispatch,
+        )
+
+        with bind_authenticated_gateway_dispatch(
+            self,
+            authenticated_gateway_context,
+        ):
+            # Publish the conversation id for ambient Nous Portal tagging. Every
+            # LLM call made inside this turn — main loop, compression, vision,
+            # web_extract, session_search, MoA slots, background-review forks
+            # (which copy this Context into their thread) — inherits the
+            # ``conversation=<root>`` tag with zero per-call-site plumbing.
+            token = set_conversation_context(self._conversation_root_id())
+            # Publish the session accounting handles the same way so auxiliary
+            # calls record their token usage into session_model_usage (task
+            # dimension) — the fix for aux spend being invisible in analytics
+            # (issue #23270).
+            acct_token = set_accounting_context(
+                getattr(self, "_session_db", None), getattr(self, "session_id", None)
+            )
+            from agent.auxiliary_client import scoped_runtime_main
+
+            # The outer token restores the caller's Context even though turn setup
+            # replaces the value with the live runtime after fallback restoration.
+            # Keep the scope local instead of storing ContextVar tokens on the agent,
+            # which may be observed from another thread.
+            with scoped_runtime_main({}):
+                try:
+                    return run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        moa_config=moa_config,
+                    )
+                finally:
+                    reset_accounting_context(acct_token)
+                    reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

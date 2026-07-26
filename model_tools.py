@@ -1081,6 +1081,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    authenticated_gateway_context: object = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1111,6 +1112,15 @@ def handle_function_call(
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+
+    authenticated_dispatch_error = registry.authenticated_gateway_dispatch_error(
+        function_name,
+        function_args,
+        authenticated_gateway_context,
+        tool_call_id=tool_call_id,
+    )
+    if authenticated_dispatch_error is not None:
+        return authenticated_dispatch_error
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
@@ -1143,6 +1153,10 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
             ) or []
+            current_defs = registry.filter_authenticated_gateway_tool_definitions(
+                current_defs,
+                authenticated_gateway_context,
+            )
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
@@ -1185,6 +1199,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                authenticated_gateway_context=authenticated_gateway_context,
             )
 
     _tool_original_args = dict(function_args)
@@ -1311,6 +1326,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        authenticated_gateway_context=authenticated_gateway_context,
+                        authenticated_gateway_tool_call_id=tool_call_id,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1319,6 +1336,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        authenticated_gateway_context=authenticated_gateway_context,
+                        authenticated_gateway_tool_call_id=tool_call_id,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
