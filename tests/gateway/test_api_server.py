@@ -3089,6 +3089,61 @@ class TestResponsesEndpoint:
             )
             assert resp.status == 400
 
+    @pytest.mark.asyncio
+    async def test_previous_response_id_resolves_compression_tip(self, adapter, tmp_path):
+        """previous_response_id chaining must resolve compressed-away session to the live tip (#44004)."""
+        from hermes_state import SessionDB
+
+        db_path = tmp_path / "test_state.db"
+        sdb = SessionDB(db_path)
+        sdb.create_session("stale-parent", "api_server")
+        sdb.append_message("stale-parent", "user", "before compression")
+        sdb.end_session("stale-parent", "compression")
+        sdb.create_session("live-child", "api_server", parent_session_id="stale-parent")
+        sdb.append_message("live-child", "user", "compressed summary")
+        sdb.append_message("live-child", "assistant", "post-compression reply")
+
+        # Pre-store a response whose stored_session_id points at the stale parent.
+        # Previous_response_id chaining would normally create this in a prior turn.
+        resp0_id = "resp_stale_parent_store"
+        adapter._response_store.put(resp0_id, {
+            "response": {"id": resp0_id, "object": "response", "status": "completed"},
+            "conversation_history": [{"role": "user", "content": "old turn"}],
+            "session_id": "stale-parent",
+        })
+
+        mock_result = {
+            "final_response": "continuing on tip",
+            "messages": [{"role": "assistant", "content": "continuing on tip"}],
+            "api_calls": 1,
+        }
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+                patch.object(adapter, "_ensure_session_db", return_value=sdb),
+            ):
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "continue here",
+                        "previous_response_id": resp0_id,
+                    },
+                )
+
+        assert resp.status == 200, await resp.text()
+        agent_session_id = mock_run.call_args.kwargs["session_id"]
+        assert agent_session_id == "live-child", (
+            f"Expected session_id to resolve to 'live-child', got {agent_session_id!r}"
+        )
+
+        # Verify the response header also carries the resolved session_id
+        assert resp.headers.get("X-Hermes-Session-Id") == "live-child"
+
 
 class TestResponsesStreaming:
     @pytest.mark.asyncio

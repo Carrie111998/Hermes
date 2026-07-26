@@ -4919,7 +4919,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
-        session_id = stored_session_id or str(uuid.uuid4())
+        # Resolve compression tip so that a rotated session_id (after
+        # context compression) doesn't resume the stale parent (#44004).
+        session_id = self._resolve_session_tip(stored_session_id) or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
