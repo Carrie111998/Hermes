@@ -3158,6 +3158,18 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Worker-bridge terminal notifications injected into the configured
+    # gateway conversation. Disabled unless an operator opts in.
+    "worker_bridge": {
+        "gateway_alerts": {
+            "enabled": False,
+            "interval_seconds": 15,
+            "statuses": ["succeeded", "failed", "timed_out"],
+            "platform": "",
+            "chat_id": "",
+        },
+    },
+
     # Real-time token streaming to messaging platforms (Telegram, Discord,
     # Slack, etc.). Read at the top level by the gateway; absent this block the
     # gateway falls back to these same defaults, so adding it here only makes

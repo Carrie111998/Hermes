@@ -1926,6 +1926,7 @@ from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.worker_bridge_watchers import GatewayWorkerBridgeWatchersMixin
 from gateway.worker_task_dispatcher import GatewayWorkerTaskDispatcherMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
@@ -3061,6 +3062,7 @@ def _reconnect_backoff(attempt: int) -> int:
 class GatewayRunner(
     GatewayAuthorizationMixin,
     GatewayKanbanWatchersMixin,
+    GatewayWorkerBridgeWatchersMixin,
     GatewayWorkerTaskDispatcherMixin,
     GatewaySlashCommandsMixin,
 ):
@@ -8119,12 +8121,7 @@ class GatewayRunner(
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
 
-        # Start created worker-bridge tasks without requiring an explicit
-        # `hermes worker tasks start` command.
-        self._spawn_supervised(
-            self._worker_task_dispatcher_watcher,
-            "worker_task_dispatcher_watcher",
-        )
+        self._start_worker_bridge_watchers()
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -8190,6 +8187,46 @@ class GatewayRunner(
     # be permanently abandoned (NS: silent loss of platform-reconnect / kanban /
     # handoff for the rest of the process life).
     _SUPERVISED_HEALTHY_SECS = 300
+
+    def _start_worker_bridge_watchers(self) -> None:
+        """Start the created-task dispatcher and configured alert watcher."""
+        # This thin dispatcher remains the sole owner of ``created`` tasks.
+        self._spawn_supervised(
+            self._worker_task_dispatcher_watcher,
+            "worker_task_dispatcher_watcher",
+        )
+
+        config = _load_gateway_config()
+        worker_bridge = (
+            config.get("worker_bridge", {}) if isinstance(config, dict) else {}
+        )
+        gateway_alerts = (
+            worker_bridge.get("gateway_alerts", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
+        failure_successors = (
+            worker_bridge.get("failure_successors", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
+        alerts_enabled = (
+            isinstance(gateway_alerts, dict)
+            and gateway_alerts.get("enabled") is True
+        )
+        successors_enabled = not (
+            isinstance(failure_successors, dict)
+            and failure_successors.get("enabled") is False
+        )
+        if not alerts_enabled and not successors_enabled:
+            return
+
+        # The recovered watcher handles terminal notifications, orphaned
+        # ``queued`` tasks, idle nudges, and bounded failure successors.
+        self._spawn_supervised(
+            self._worker_bridge_notifier_watcher,
+            "worker_bridge_notifier_watcher",
+        )
 
     def _spawn_supervised(self, coro_factory, name, *, restart=True, _attempt=0):
         """Launch a long-lived background task with task-level supervision.
