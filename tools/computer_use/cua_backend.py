@@ -1163,13 +1163,28 @@ class _CuaDriverSession:
 
     @staticmethod
     def _is_closed_session_error(exc: Exception) -> bool:
-        """Return True for MCP/stdio failures that are recoverable by reconnecting."""
+        """Return True for MCP/stdio failures that are recoverable by reconnecting.
+
+        cua-driver surfaces a dead interactive session as a *semantic* error
+        (e.g. ``session 'hermes-xxxx' has ended; Call start_session ... to
+        revive it``) carried in a regular McpError/Exception — not as one of
+        the stdio transport exception classes below. Matching it by message
+        lets the reconnect-once path (call_tool) rebuild the session instead
+        of raising the dead id to the caller. Mirrors the by-message matching
+        already used in ``_is_transient_daemon_error``.
+        """
         name = exc.__class__.__name__
         module = getattr(exc.__class__, "__module__", "")
-        return (
+        if (
             name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
             or (module.startswith("anyio") and "Resource" in name)
             or isinstance(exc, (BrokenPipeError, EOFError))
+        ):
+            return True
+        msg = str(exc)
+        return (
+            ("has ended" in msg and "start_session" in msg)
+            or ("session" in msg and "revive" in msg)
         )
 
     @staticmethod
