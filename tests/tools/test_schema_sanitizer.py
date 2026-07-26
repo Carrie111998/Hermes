@@ -867,3 +867,124 @@ def test_unrename_passes_unknown_keys_through():
 def test_sanitize_property_key_empty_falls_back():
     assert sanitize_property_key("~~~") == "___"
     assert sanitize_property_key("") == "param"
+
+
+def test_unrename_tool_args_prefixItems_basic():
+    original_params = {
+        "type": "object",
+        "properties": {
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "object",
+                        "properties": {"bad~key": {"type": "string"}},
+                    }
+                ],
+            }
+        },
+    }
+    model_args = {"tuple": [{"bad_key": "test"}]}
+    restored = unrename_tool_args(original_params, model_args)
+    assert restored["tuple"][0] == {"bad~key": "test"}
+
+
+def test_unrename_tool_args_prefixItems_positional():
+    original_params = {
+        "type": "object",
+        "properties": {
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "object",
+                        "properties": {"first~key": {"type": "string"}},
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"second~key": {"type": "string"}},
+                    },
+                ],
+            }
+        },
+    }
+    model_args = {"tuple": [{"first_key": "a"}, {"second_key": "b"}]}
+    restored = unrename_tool_args(original_params, model_args)
+    assert restored["tuple"][0] == {"first~key": "a"}
+    assert restored["tuple"][1] == {"second~key": "b"}
+
+
+def test_unrename_tool_args_prefixItems_and_items():
+    original_params = {
+        "type": "object",
+        "properties": {
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "object",
+                        "properties": {"pos~key": {"type": "string"}},
+                    }
+                ],
+                "items": {
+                    "type": "object",
+                    "properties": {"trail~key": {"type": "string"}},
+                },
+            }
+        },
+    }
+    model_args = {"tuple": [{"pos_key": "a"}, {"trail_key": "b"}, {"trail_key": "c"}]}
+    restored = unrename_tool_args(original_params, model_args)
+    assert restored["tuple"][0] == {"pos~key": "a"}
+    assert restored["tuple"][1] == {"trail~key": "b"}
+    assert restored["tuple"][2] == {"trail~key": "c"}
+
+
+def test_unrename_tool_args_nested_prefixItems():
+    original_params = {
+        "type": "object",
+        "properties": {
+            "tuple": {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "array",
+                        "prefixItems": [
+                            {
+                                "type": "object",
+                                "properties": {"bad~key": {"type": "string"}},
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+    model_args = {"tuple": [[{"bad_key": "value"}]]}
+
+    assert unrename_tool_args(original_params, model_args) == {
+        "tuple": [[{"bad~key": "value"}]]
+    }
+
+
+def test_unrename_tool_args_nested_homogeneous_items():
+    original_params = {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"bad~key": {"type": "string"}},
+                    },
+                },
+            }
+        },
+    }
+    model_args = {"rows": [[{"bad_key": "a"}], [{"bad_key": "b"}]]}
+
+    assert unrename_tool_args(original_params, model_args) == {
+        "rows": [[{"bad~key": "a"}], [{"bad~key": "b"}]]
+    }
