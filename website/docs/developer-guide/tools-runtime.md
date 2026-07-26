@@ -160,6 +160,37 @@ All tool execution is wrapped in error handling at two levels:
 
 This ensures the model always receives a well-formed JSON string, never an unhandled exception.
 
+### Terminal MCP results
+
+An MCP tool may explicitly declare that its result is already the
+participant-facing answer. Hermes detects this capability from the tool's
+advertised `outputSchema`; it is not inferred from the runtime payload alone.
+
+The output schema must require these fields:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "delivery_semantics": {
+      "type": "string",
+      "const": "terminal_verbatim"
+    },
+    "answer": {"type": "string"},
+    "answer_sha256": {"type": "string"}
+  },
+  "required": ["delivery_semantics", "answer", "answer_sha256"]
+}
+```
+
+When such a tool returns a valid result, Hermes verifies the lowercase SHA-256
+digest of the UTF-8 answer and ends the turn with the answer unchanged. It does
+not make another model call to rewrite or summarize the result. A missing,
+malformed, or mismatched terminal envelope fails the turn visibly instead of
+falling back to model synthesis.
+
+Ordinary MCP tools retain the normal tool-result-to-model continuation flow.
+
 ### Agent-loop tools
 
 Four tools are intercepted before registry dispatch because they need agent-level state (TodoStore, MemoryStore, etc.):
