@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Download Foundrly — Intelliverse X</title>
+    <meta
+      name="description"
+      content="Official Foundrly desktop download. macOS, Windows, and Linux installers from the Foundrly release feed only."
+    />
+    <style>
+      :root {
+        --bg: #0b1220;
+        --panel: #121a2b;
+        --panel-2: #182235;
+        --border: #243044;
+        --text: #e7ecf5;
+        --muted: #9aa6bd;
+        --muted-2: #6b7488;
+        --accent: #14b8a6;
+        --accent-2: #0d9488;
+        --ok: #34d399;
+        --warn: #fbbf24;
+        --radius: 14px;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; }
+      body {
+        background:
+          radial-gradient(1100px 520px at 50% -12%, rgba(20, 184, 166, 0.16), transparent 58%),
+          var(--bg);
+        color: var(--text);
+        font: 15px/1.55 "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        min-height: 100vh;
+      }
+      .wrap { max-width: 820px; margin: 0 auto; padding: 56px 20px 80px; }
+      header { text-align: center; margin-bottom: 36px; }
+      .logo {
+        width: 60px; height: 60px; border-radius: 16px; margin: 0 auto 18px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        display: grid; place-items: center; font-size: 28px; font-weight: 800; color: #041016;
+        box-shadow: 0 12px 40px rgba(20, 184, 166, 0.28);
+      }
+      h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.02em; }
+      .sub { color: var(--muted); margin: 0 auto; max-width: 520px; }
+      .verpill {
+        display: inline-flex; align-items: center; gap: 8px; margin-top: 16px;
+        padding: 6px 14px; border: 1px solid var(--border); border-radius: 999px;
+        background: var(--panel); color: var(--muted); font-size: 13px;
+      }
+      .verpill b { color: var(--text); font-weight: 600; }
+      .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+
+      .primary { margin: 28px 0 8px; }
+      .primary-card {
+        display: flex; align-items: center; gap: 18px; justify-content: space-between;
+        padding: 22px 24px; border: 1px solid var(--border); border-radius: var(--radius);
+        background: linear-gradient(180deg, var(--panel-2), var(--panel));
+        flex-wrap: wrap;
+      }
+      .primary-card .who { display: flex; align-items: center; gap: 16px; }
+      .os-ico { font-size: 32px; }
+      .primary-card h2 { margin: 0; font-size: 18px; }
+      .primary-card p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+      .btn {
+        display: inline-flex; align-items: center; gap: 9px; cursor: pointer;
+        padding: 12px 22px; border-radius: 10px; border: 0; text-decoration: none;
+        font-weight: 700; font-size: 15px; color: #041016;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        box-shadow: 0 8px 24px rgba(20, 184, 166, 0.28); transition: transform 0.06s ease, opacity 0.2s;
+      }
+      .btn:hover { opacity: 0.94; }
+      .btn:active { transform: translateY(1px); }
+      .btn[aria-disabled="true"] { opacity: 0.45; pointer-events: none; }
+      a:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+
+      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 24px; }
+      @media (max-width: 720px) {
+        .grid { grid-template-columns: 1fr; }
+        .wrap { padding: 28px 14px 56px; }
+        .primary-card { align-items: flex-start; }
+        .btn { width: 100%; justify-content: center; }
+      }
+      .card {
+        border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel);
+        padding: 20px; display: flex; flex-direction: column; gap: 12px;
+      }
+      .card h3 { margin: 0; font-size: 15px; }
+      .card .files { display: flex; flex-direction: column; gap: 8px; }
+      .file {
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        padding: 9px 12px; border: 1px solid var(--border); border-radius: 9px;
+        background: var(--panel-2); text-decoration: none; color: var(--text); font-size: 13px;
+      }
+      .file:hover { border-color: var(--accent); }
+      .file .ext { font-weight: 600; }
+      .file .sz { color: var(--muted-2); font-size: 12px; }
+
+      section.steps { margin-top: 40px; }
+      section.steps h2 { font-size: 16px; margin: 0 0 14px; }
+      ol.steps-list { margin: 0; padding-left: 20px; color: var(--muted); }
+      ol.steps-list li { margin-bottom: 8px; }
+      ol.steps-list b { color: var(--text); font-weight: 600; }
+      .note {
+        margin-top: 28px; border: 1px solid var(--border); border-left: 3px solid var(--accent);
+        border-radius: 10px; background: var(--panel); padding: 16px 18px; color: var(--muted); font-size: 13px;
+      }
+      .note b { color: var(--text); }
+      .note a { color: var(--accent); }
+      footer { margin-top: 48px; text-align: center; color: var(--muted-2); font-size: 12px; }
+      footer a { color: var(--muted); }
+      .err { color: var(--warn); }
+      .availability {
+        margin: 0 0 22px; border: 1px solid var(--border); border-radius: 10px;
+        background: var(--panel); padding: 14px 16px; color: var(--muted); font-size: 13px;
+      }
+      .availability[data-state="ready"] { border-left: 3px solid var(--ok); }
+      .availability[data-state="waiting"] { border-left: 3px solid var(--warn); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="availability" id="scope-banner" data-state="ready" role="status">
+        <b style="color: var(--text)">Foundrly only</b> —
+        this page serves the Foundrly product desktop. It does not list IX Agency or QuizVerse installers.
+      </div>
+
+      <header>
+        <div class="logo" aria-hidden="true">F</div>
+        <h1>Download Foundrly</h1>
+        <p class="sub">
+          AI co-founder desktop for local businesses — Hermes chat plus the Foundrly workspace.
+          App ID <b style="color: var(--text)">ai.intelli-verse-x.foundrly</b>
+        </p>
+        <div class="verpill">
+          <span class="dot" aria-hidden="true"></span>
+          <span>Latest version <b id="version">…</b></span>
+          <span id="reldate"></span>
+        </div>
+      </header>
+
+      <div class="primary">
+        <div class="primary-card">
+          <div class="who">
+            <div class="os-ico" id="primary-ico" aria-hidden="true">💻</div>
+            <div>
+              <h2 id="primary-title">Detecting your platform…</h2>
+              <p id="primary-sub">Pick your download below.</p>
+            </div>
+          </div>
+          <a class="btn" id="primary-btn" href="#" aria-disabled="true">Download</a>
+        </div>
+      </div>
+
+      <div class="grid" id="downloads">
+        <div class="card">
+          <h3>🍎 macOS</h3>
+          <div class="files" id="mac-files"><span class="err">Loading feed…</span></div>
+        </div>
+        <div class="card">
+          <h3>🪟 Windows</h3>
+          <div class="files" id="win-files"><span class="err">Loading feed…</span></div>
+        </div>
+        <div class="card">
+          <h3>🐧 Linux</h3>
+          <div class="files" id="linux-files"><span class="err">Loading feed…</span></div>
+        </div>
+      </div>
+
+      <section class="steps">
+        <h2>After install</h2>
+        <ol class="steps-list">
+          <li><b>Open Foundrly</b> from Applications / Start menu (product name is Foundrly — not IX Agency).</li>
+          <li>Use the <b>Foundrly</b> rail item for the product workspace; Hermes chat for ops questions.</li>
+          <li>From the workspace cards, open <b>Foundrly web</b> or the scoped <b>admin portal</b> when you have a Foundrly grant.</li>
+          <li>Updates come from the Foundrly feed only (<code>foundrly/</code> on this bucket).</li>
+        </ol>
+      </section>
+
+      <div class="note">
+        <b>Admin access</b> (optional, separate from this installer):
+        if you were invited as a Foundrly operator, sign in at
+        <a href="https://admin.intelli-verse-x.ai" target="_blank" rel="noreferrer">admin.intelli-verse-x.ai</a>
+        with your work email + OTP. That is the web console — you do <b>not</b> need the IX Agency desktop for Foundrly product use.
+        Product site:
+        <a href="https://foundrly.intelli-verse-x.ai" target="_blank" rel="noreferrer">foundrly.intelli-verse-x.ai</a>
+      </div>
+
+      <footer>
+        Official Foundrly desktop · feed
+        <a href="https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/latest-mac.yml">foundrly/</a>
+        · share
+        <a href="https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/index.html">this page</a>
+      </footer>
+    </div>
+
+    <script>
+      const FEED = "https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/";
+      const MANIFESTS = { mac: "latest-mac.yml", win: "latest.yml", linux: "latest-linux.yml" };
+      const EXT_LABEL = {
+        dmg: "Disk image (.dmg)",
+        zip: "Zip (.zip)",
+        exe: "Installer (.exe)",
+        msi: "MSI (.msi)",
+        AppImage: "AppImage",
+        deb: "Debian (.deb)",
+        rpm: "RPM (.rpm)"
+      };
+
+      function detectOs() {
+        const ua = navigator.userAgent || "";
+        if (/Mac|iPhone|iPad|iPod/i.test(ua)) return "mac";
+        if (/Win/i.test(ua)) return "win";
+        if (/Linux|X11/i.test(ua)) return "linux";
+        return "mac";
+      }
+
+      function parseYamlLite(text) {
+        const out = { version: "", path: "", files: [], releaseDate: "" };
+        const lines = text.split(/\r?\n/);
+        let inFiles = false;
+        let cur = null;
+        for (const raw of lines) {
+          const line = raw.replace(/\t/g, "  ");
+          if (/^version:\s*/.test(line)) {
+            out.version = line.replace(/^version:\s*/, "").trim().replace(/^['"]|['"]$/g, "");
+            inFiles = false;
+            continue;
+          }
+          if (/^path:\s*/.test(line)) {
+            out.path = line.replace(/^path:\s*/, "").trim().replace(/^['"]|['"]$/g, "");
+            inFiles = false;
+            continue;
+          }
+          if (/^releaseDate:\s*/.test(line)) {
+            out.releaseDate = line.replace(/^releaseDate:\s*/, "").trim().replace(/^['"]|['"]$/g, "");
+            inFiles = false;
+            continue;
+          }
+          if (/^files:\s*$/.test(line)) {
+            inFiles = true;
+            continue;
+          }
+          if (inFiles && /^\s*-\s+url:\s*/.test(line)) {
+            cur = { url: line.replace(/^\s*-\s+url:\s*/, "").trim().replace(/^['"]|['"]$/g, ""), size: 0 };
+            out.files.push(cur);
+            continue;
+          }
+          if (inFiles && cur && /^\s+size:\s*/.test(line)) {
+            cur.size = Number(line.replace(/^\s+size:\s*/, "").trim()) || 0;
+          }
+        }
+        return out;
+      }
+
+      function humanSize(n) {
+        if (!n) return "";
+        const u = ["B", "KB", "MB", "GB"];
+        let i = 0;
+        let v = n;
+        while (v >= 1024 && i < u.length - 1) {
+          v /= 1024;
+          i += 1;
+        }
+        return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${u[i]}`;
+      }
+
+      function extOf(name) {
+        if (name.endsWith(".AppImage")) return "AppImage";
+        const i = name.lastIndexOf(".");
+        return i >= 0 ? name.slice(i + 1) : name;
+      }
+
+      function preferPrimary(os, files) {
+        const order =
+          os === "mac" ? ["dmg", "zip"] : os === "win" ? ["exe", "msi", "zip"] : ["AppImage", "deb", "rpm"];
+        for (const ext of order) {
+          const hit = files.find((f) => extOf(f.url) === ext);
+          if (hit) return hit;
+        }
+        return files[0] || null;
+      }
+
+      function renderFiles(el, files) {
+        el.innerHTML = "";
+        if (!files.length) {
+          el.innerHTML = '<span class="err">No artifacts in feed yet.</span>';
+          return;
+        }
+        for (const f of files) {
+          const a = document.createElement("a");
+          a.className = "file";
+          a.href = FEED + f.url;
+          a.setAttribute("download", "");
+          a.innerHTML = `<span class="ext">${EXT_LABEL[extOf(f.url)] || f.url}</span><span class="sz">${humanSize(f.size)}</span>`;
+          el.appendChild(a);
+        }
+      }
+
+      async function loadFeed(name) {
+        const res = await fetch(FEED + name, { cache: "no-store" });
+        if (!res.ok) throw new Error(`${name} ${res.status}`);
+        return parseYamlLite(await res.text());
+      }
+
+      (async () => {
+        const os = detectOs();
+        const banner = document.getElementById("scope-banner");
+        try {
+          const [mac, win, linux] = await Promise.all([
+            loadFeed(MANIFESTS.mac),
+            loadFeed(MANIFESTS.win),
+            loadFeed(MANIFESTS.linux)
+          ]);
+          const version = mac.version || win.version || linux.version || "—";
+          document.getElementById("version").textContent = version;
+          const rd = mac.releaseDate || win.releaseDate || linux.releaseDate;
+          if (rd) {
+            const d = new Date(rd);
+            document.getElementById("reldate").textContent = Number.isNaN(d.getTime())
+              ? ""
+              : `· ${d.toLocaleDateString()}`;
+          }
+          renderFiles(document.getElementById("mac-files"), mac.files);
+          renderFiles(document.getElementById("win-files"), win.files);
+          renderFiles(document.getElementById("linux-files"), linux.files);
+
+          const byOs = { mac: mac.files, win: win.files, linux: linux.files };
+          const primary = preferPrimary(os, byOs[os] || []);
+          const titles = { mac: "macOS Apple Silicon", win: "Windows x64", linux: "Linux x86_64" };
+          const icons = { mac: "🍎", win: "🪟", linux: "🐧" };
+          document.getElementById("primary-ico").textContent = icons[os] || "💻";
+          document.getElementById("primary-title").textContent = titles[os] || "Your platform";
+          const btn = document.getElementById("primary-btn");
+          if (primary) {
+            document.getElementById("primary-sub").textContent = EXT_LABEL[extOf(primary.url)] || primary.url;
+            btn.href = FEED + primary.url;
+            btn.removeAttribute("aria-disabled");
+            btn.textContent = `Download ${version}`;
+          } else {
+            document.getElementById("primary-sub").textContent = "Choose an installer from the cards below.";
+            btn.setAttribute("aria-disabled", "true");
+          }
+          banner.dataset.state = "ready";
+        } catch (err) {
+          banner.dataset.state = "waiting";
+          banner.innerHTML =
+            '<b style="color: var(--text)">Feed unavailable</b> — try again shortly, or ask your admin for a direct installer.';
+          document.getElementById("version").textContent = "—";
+          document.getElementById("primary-sub").textContent = String(err.message || err);
+          for (const id of ["mac-files", "win-files", "linux-files"]) {
+            document.getElementById(id).innerHTML = '<span class="err">Feed unavailable</span>';
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>
