@@ -4014,6 +4014,46 @@ class SlackAdapter(BasePlatformAdapter):
         )
         return name
 
+    async def _resolve_interactive_channel_type(
+        self, channel_id: str, team_id: str = ""
+    ) -> Optional[str]:
+        """Resolve callback channel type before consuming a one-time card.
+
+        Slack message events carry ``channel_type`` directly, but Block Kit
+        callback payloads do not reliably include it.  A 1:1 IM can be
+        identified by its stable ``D`` prefix; other conversations require
+        ``conversations.info`` so ``G``-prefixed MPIMs are not mistaken for
+        ordinary group channels.  Failure returns ``None`` so callers can
+        reject without consuming rather than bypass DM/channel policy.
+        """
+        if channel_id.startswith("D"):
+            return "im"
+        try:
+            response = await self._get_client(
+                channel_id, team_id=team_id or None
+            ).conversations_info(channel=channel_id)
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Failed to classify interactive callback channel %s: %s",
+                channel_id,
+                exc,
+            )
+            return None
+        if not isinstance(response, dict) or not response.get("ok"):
+            logger.warning(
+                "[Slack] Could not classify interactive callback channel %s",
+                channel_id,
+            )
+            return None
+        channel = response.get("channel") or {}
+        if not isinstance(channel, dict):
+            return None
+        if channel.get("is_im"):
+            return "im"
+        if channel.get("is_mpim"):
+            return "mpim"
+        return "channel"
+
     async def _humanize_user_mentions(
         self, text: str, chat_id: str = "", team_id: str = ""
     ) -> str:
@@ -6993,11 +7033,37 @@ class SlackAdapter(BasePlatformAdapter):
         if not all(isinstance(value, dict) for value in (message, channel, user)):
             return
 
-        channel_id = str(channel.get("id") or "")
-        message_ts = str(message.get("ts") or "")
-        user_id = str(user.get("id") or "")
-        button_token = str(action.get("value") or "")
-        if not channel_id or not message_ts or not user_id or not button_token:
+        channel_id = channel.get("id")
+        message_ts = message.get("ts")
+        user_id = user.get("id")
+        button_token = action.get("value")
+        required_fields = (channel_id, message_ts, user_id, button_token)
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in required_fields
+        ):
+            return
+
+        if self._is_ignored_channel(channel_id):
+            return
+
+        team_id = self._event_team_id({}, body)
+        if not team_id:
+            team_id = self._channel_team.get(channel_id, "")
+        channel_type = await self._resolve_interactive_channel_type(
+            channel_id, team_id=team_id
+        )
+        if channel_type is None:
+            return
+        is_dm = channel_type in {"im", "mpim"}
+        if is_dm and self._slack_disable_dms():
+            return
+        allowed_channels = self._slack_allowed_channels()
+        if (
+            channel_type != "im"
+            and allowed_channels
+            and channel_id not in allowed_channels
+        ):
             return
 
         accepted = self._interactive_reply_store.consume(
@@ -7006,9 +7072,6 @@ class SlackAdapter(BasePlatformAdapter):
         if accepted is None:
             return
 
-        team_id = self._event_team_id({}, body)
-        if not team_id:
-            team_id = self._channel_team.get(channel_id, "")
         if team_id:
             self._remember_channel_team(channel_id, team_id)
 
@@ -7022,7 +7085,7 @@ class SlackAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_name,
-            chat_type="dm" if channel_id.startswith("D") else "group",
+            chat_type="dm" if is_dm else "group",
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
@@ -7052,19 +7115,29 @@ class SlackAdapter(BasePlatformAdapter):
         # card's action block is only a presentation update: a Slack API
         # failure must neither restore the record nor suppress the user turn.
         original_blocks = message.get("blocks") or []
-        updated_blocks = [
-            block
-            for block in original_blocks
-            if not (
-                isinstance(block, dict)
-                and block.get("type") == "actions"
-                and any(
+        if not isinstance(original_blocks, list):
+            original_blocks = []
+        updated_blocks = []
+        for block in original_blocks:
+            if not isinstance(block, dict) or block.get("type") != "actions":
+                updated_blocks.append(block)
+                continue
+            elements = block.get("elements")
+            if not isinstance(elements, list):
+                updated_blocks.append(block)
+                continue
+            remaining_elements = [
+                element
+                for element in elements
+                if not (
                     isinstance(element, dict)
                     and element.get("action_id") == "hermes_interactive_reply"
-                    for element in (block.get("elements") or [])
                 )
-            )
-        ]
+            ]
+            if len(remaining_elements) == len(elements):
+                updated_blocks.append(block)
+            elif remaining_elements:
+                updated_blocks.append({**block, "elements": remaining_elements})
         try:
             await self._get_client(
                 channel_id, team_id=team_id or None

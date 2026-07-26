@@ -72,6 +72,14 @@ def _click_body(
     }
 
 
+class _StringifiesTo:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def __str__(self) -> str:
+        return self._value
+
+
 def test_parse_valid_directive_strips_it_and_preserves_visible_reply():
     reply = parse_interactive_reply(
         "Approved lead.\n[[slack_buttons: Enroll:enroll, Skip:skip]]"
@@ -390,3 +398,263 @@ async def test_failed_card_update_does_not_reopen_or_duplicate_event(tmp_path, m
 
     assert adapter.handle_message.await_count == 1
     assert client.chat_update.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ignored_channel_click_does_not_consume_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    adapter.config.extra["ignored_channels"] = ["C1"]
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        "C1", "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        _click_body(),
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    client.conversations_info.assert_not_awaited()
+    assert (
+        adapter._interactive_reply_store.consume(
+            prepared.buttons[0].token, "C1", "M1"
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_id", "channel_record"),
+    [
+        ("D1", {"id": "D1", "is_im": True, "user": "U1"}),
+        ("G1", {"id": "G1", "name": "mpdm-team", "is_mpim": True}),
+    ],
+)
+async def test_disabled_dm_click_does_not_consume_card(
+    tmp_path, monkeypatch, channel_id, channel_record
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    adapter.config.extra.update(
+        {"disable_dms": True, "allowed_channels": [channel_id]}
+    )
+    client.conversations_info = AsyncMock(
+        return_value={"ok": True, "channel": channel_record}
+    )
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        channel_id, "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        _click_body(channel=channel_id),
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert (
+        adapter._interactive_reply_store.consume(
+            prepared.buttons[0].token, channel_id, "M1"
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_allowed_channel_click_does_not_consume_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    adapter.config.extra["allowed_channels"] = ["C1"]
+    client.conversations_info = AsyncMock(
+        return_value={
+            "ok": True,
+            "channel": {"id": "C2", "name": "other-channel"},
+        }
+    )
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        "C2", "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        _click_body(channel="C2"),
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert (
+        adapter._interactive_reply_store.consume(
+            prepared.buttons[0].token, "C2", "M1"
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["channel", "message_ts", "user", "token"])
+async def test_non_string_required_callback_field_does_not_consume_card(
+    tmp_path, monkeypatch, field
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    client.conversations_info = AsyncMock(
+        return_value={
+            "ok": True,
+            "channel": {"id": "123", "name": "numbers"},
+        }
+    )
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        "123", "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "456")
+    body = _click_body(channel="123", message_ts="456", user="789")
+    action = {
+        "action_id": "hermes_interactive_reply",
+        "value": prepared.buttons[0].token,
+    }
+    if field == "channel":
+        body["channel"]["id"] = 123
+    elif field == "message_ts":
+        body["message"]["ts"] = 456
+    elif field == "user":
+        body["user"]["id"] = 789
+    else:
+        action["value"] = _StringifiesTo(prepared.buttons[0].token)
+
+    await adapter._handle_interactive_reply_action(AsyncMock(), body, action)
+
+    adapter.handle_message.assert_not_awaited()
+    assert (
+        adapter._interactive_reply_store.consume(
+            prepared.buttons[0].token, "123", "456"
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_wrong_message_timestamp_does_not_consume_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, _client = _make_adapter()
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        "C1", "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        _click_body(message_ts="M2"),
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert (
+        adapter._interactive_reply_store.consume(
+            prepared.buttons[0].token, "C1", "M1"
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_card_cleanup_preserves_unrelated_control_in_shared_actions_block(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        "C1", "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+    body = _click_body()
+    body["message"]["blocks"][-1]["elements"].append(
+        {
+            "type": "button",
+            "action_id": "unrelated_control",
+            "value": "keep",
+        }
+    )
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        body,
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    updated_blocks = client.chat_update.await_args.kwargs["blocks"]
+    actions = [block for block in updated_blocks if block["type"] == "actions"]
+    assert len(actions) == 1
+    assert [element["action_id"] for element in actions[0]["elements"]] == [
+        "unrelated_control"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_id", "channel_record", "allowed_channels"),
+    [
+        (
+            "D1",
+            {"id": "D1", "is_im": True, "user": "U1"},
+            ["C_OTHER"],
+        ),
+        (
+            "G1",
+            {"id": "G1", "is_mpim": True, "name": "mpdm-team"},
+            ["G1"],
+        ),
+    ],
+)
+async def test_im_and_mpim_clicks_use_dm_source_classification(
+    tmp_path, monkeypatch, channel_id, channel_record, allowed_channels
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    adapter.config.extra["allowed_channels"] = allowed_channels
+    client.conversations_info = AsyncMock(
+        return_value={"ok": True, "channel": channel_record}
+    )
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        channel_id, "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        _click_body(channel=channel_id),
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "dm"
