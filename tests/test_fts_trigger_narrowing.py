@@ -1329,6 +1329,147 @@ def test_missing_tables_with_pending_gap_and_no_trigram_fail_closed(
         capable.close()
 
 
+@pytest.mark.parametrize("legacy_layout", ["inline", "external"])
+def test_missing_legacy_standard_table_uses_surviving_trigram_layout(
+    db_path, monkeypatch, legacy_layout
+):
+    """A surviving legacy trigram table proves how to repair base FTS."""
+    import hermes_state
+    from hermes_state import (
+        LEGACY_EXTERNAL_FTS_SQL,
+        LEGACY_EXTERNAL_FTS_TRIGRAM_SQL,
+        LEGACY_FTS_SQL,
+        LEGACY_FTS_TRIGRAM_SQL,
+        SessionDB,
+    )
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("legacy-missing-base", "test")
+    seeded.append_message(
+        "legacy-missing-base",
+        "user",
+        content="legacy searchable payload",
+        tool_name="oldmetadata",
+    )
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+        )
+        if legacy_layout == "external":
+            ddl = LEGACY_EXTERNAL_FTS_SQL + "\n" + LEGACY_EXTERNAL_FTS_TRIGRAM_SQL
+            backfill = (
+                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');"
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                "VALUES('rebuild');"
+            )
+        else:
+            ddl = LEGACY_FTS_SQL + "\n" + LEGACY_FTS_TRIGRAM_SQL
+            backfill = (
+                "INSERT INTO messages_fts(rowid, content) "
+                "VALUES(1, 'legacy searchable payload oldmetadata');"
+                "INSERT INTO messages_fts_trigram(rowid, content) "
+                "VALUES(1, 'legacy searchable payload oldmetadata');"
+            )
+        conn.executescript(ddl + "\n" + backfill)
+        conn.execute("DROP TABLE messages_fts")
+        conn.commit()
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == legacy_layout
+
+    real_connect = sqlite3.connect
+
+    def connect_without_trigram(*args, **kwargs):
+        kwargs["factory"] = _NoTrigramConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", connect_without_trigram)
+    database = SessionDB(db_path=db_path)
+    try:
+        message_id = database.append_message(
+            "legacy-missing-base", "user", content="write remains safe"
+        )
+        assert message_id > 1
+        with database._lock:
+            hit = database._conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'legacy'"
+            ).fetchall()
+            assert [row[0] for row in hit] == [1]
+            database._conn.execute(
+                "UPDATE messages SET content='updated safe payload' WHERE id=1"
+            )
+            database._conn.commit()
+            old_hit = database._conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'legacy'"
+            ).fetchall()
+            new_hit = database._conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'updated'"
+            ).fetchall()
+            assert old_hit == []
+            assert [row[0] for row in new_hit] == [1]
+    finally:
+        database.close()
+
+
+def test_both_missing_tables_with_surviving_legacy_triggers_fails_write_safe(
+    db_path, monkeypatch
+):
+    """Unprovable table layout must disable dangling triggers before writes."""
+    import hermes_state
+    from hermes_state import LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL, SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("missing-both", "test")
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+            + LEGACY_FTS_SQL
+            + "\n"
+            + LEGACY_FTS_TRIGRAM_SQL
+        )
+        conn.execute("DROP TABLE messages_fts")
+        conn.execute("DROP TABLE messages_fts_trigram")
+        conn.commit()
+
+    real_connect = sqlite3.connect
+
+    def connect_without_trigram(*args, **kwargs):
+        kwargs["factory"] = _NoTrigramConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", connect_without_trigram)
+    database = SessionDB(db_path=db_path)
+    try:
+        message_id = database.append_message(
+            "missing-both", "user", content="safe after ambiguity"
+        )
+        assert message_id > 0
+    finally:
+        database.close()
+
+
 def test_cjk_schema_ensure_keeps_writer_out_until_triggers_exist(
     db_path, monkeypatch
 ):

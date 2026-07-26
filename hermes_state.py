@@ -2327,6 +2327,22 @@ class SessionDB:
         standard = _table_layout("messages_fts")
         trigram = _table_layout("messages_fts_trigram")
         view_valid = _current_trigram_view_is_valid()
+        if standard == "missing" and trigram == "missing":
+            placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+            surviving_triggers = cursor.execute(
+                f"SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                f"AND name IN ({placeholders}) LIMIT 1",
+                _FTS_TRIGGERS,
+            ).fetchone()
+            if surviving_triggers and view_valid is not True:
+                # With no vtable declarations, only the exact canonical v23
+                # source view can prove current storage semantics. Otherwise
+                # legacy/current trigger bodies are insufficient evidence.
+                return "ambiguous"
+        if standard == "missing" and trigram in ("inline", "external"):
+            # The surviving trigram vtable proves the supported legacy family;
+            # recreate and rebuild the matching standard table.
+            return trigram
         if standard in ("missing", "current"):
             if trigram not in ("missing", "current"):
                 return "ambiguous"
@@ -4258,7 +4274,19 @@ class SessionDB:
                 )
                 self._fts_enabled = False
                 self._trigram_available = False
+                # Preserve ambiguous live layouts for offline inspection, but
+                # remove maintenance triggers whose target table is absent so
+                # canonical message writes cannot fail.
+                if self._fts_table_probe(cursor, "messages_fts") is False:
+                    for trigger in _FTS_TRIGGERS[:3]:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                if self._fts_table_probe(cursor, "messages_fts_trigram") is False:
+                    for trigger in _FTS_TRIGRAM_TRIGGERS:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             elif legacy_layout is not None:
+                base_table_missing = (
+                    self._fts_table_probe(cursor, "messages_fts") is False
+                )
                 if legacy_layout == "external":
                     base_ddl = LEGACY_EXTERNAL_FTS_SQL
                     trigram_ddl = LEGACY_EXTERNAL_FTS_TRIGRAM_SQL
@@ -4291,7 +4319,9 @@ class SessionDB:
                         cursor, "messages_fts_trigram", trigram_ddl
                     )
                     self._trigram_available = trigram_enabled
-                    needs_base_rebuild = base_triggers_need_repair
+                    needs_base_rebuild = (
+                        base_table_missing or base_triggers_need_repair
+                    )
                     needs_full_rebuild = triggers_need_repair or trigram_stale
                     if not trigram_enabled:
                         self._mark_trigram_stale(cursor)
