@@ -17,6 +17,7 @@ import {
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForProfile,
+  primaryProfileKey,
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
@@ -391,10 +392,14 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
-
+    // Tag primary events from the registry's OWN primary key, read at emit time
+    // — NOT a snapshot taken at wiring time. setPrimaryGateway on this same path
+    // uses survivor?.profile ?? active, which diverges from a wiring-time
+    // snapshot on the HMR-survivor and gateway-rebuild paths; reading at emit
+    // time keeps primary events tagged with the primary's profile even while a
+    // secondary is active (blocker #1).
     const offEvent = gateway.onEvent(event =>
-      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
+      callbacksRef.current.handleGatewayEvent({ ...event, profile: primaryProfileKey() })
     )
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the

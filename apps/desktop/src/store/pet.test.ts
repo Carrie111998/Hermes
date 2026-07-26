@@ -11,7 +11,8 @@ import {
   flashPetActivity,
   replacePetActivity,
   setPetActivity,
-  setPetReplyText
+  setPetReplyText,
+  shouldMarkUnread
 } from './pet'
 
 describe('derivePetState', () => {
@@ -116,5 +117,37 @@ describe('replyText', () => {
     const long = 'a'.repeat(250)
     setPetReplyText(long)
     expect($petReplyText.get()?.length).toBe(200)
+  })
+})
+
+describe('shouldMarkUnread (pure)', () => {
+  const base = {
+    activeProfile: 'default',
+    activeSessionId: 's1',
+    profile: 'default',
+    sessionId: 's1',
+    windowFocused: true
+  }
+
+  it('does not mark the active session unread while the window is focused', () => {
+    expect(shouldMarkUnread(base)).toBe(false)
+  })
+
+  it('marks unread when the window is unfocused', () => {
+    expect(shouldMarkUnread({ ...base, windowFocused: false })).toBe(true)
+  })
+
+  it('marks a background profile unread even while focused (pinned mode, test 22)', () => {
+    expect(shouldMarkUnread({ ...base, profile: 'apollo', sessionId: 's2' })).toBe(true)
+  })
+
+  it('marks a non-active session in the active profile unread while focused', () => {
+    expect(shouldMarkUnread({ ...base, sessionId: 's2' })).toBe(true)
+  })
+
+  it('a sessionless event (null sessionId) on the active profile does not mark unread while focused', () => {
+    // The session clause requires sessionId !== null, so a global/sessionless
+    // event on the active profile stays quiet while the window is focused.
+    expect(shouldMarkUnread({ ...base, sessionId: null })).toBe(false)
   })
 })

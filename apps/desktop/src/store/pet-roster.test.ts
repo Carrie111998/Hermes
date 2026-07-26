@@ -1,6 +1,9 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
+import { $activeGatewayProfile } from '@/store/profile'
 
 import {
+  $observedPetProfiles,
   $petRoster,
   PINNED_HARD_CAP,
   PINNED_SOFT_CAP,
@@ -23,6 +26,11 @@ beforeEach(() => {
   // Reset the live atom to the default follow-active roster so cases are isolated
   // (the atom is module-cached and otherwise leaks state between tests).
   $petRoster.set({ entries: [], initialized: true, mode: 'follow-active' })
+  $activeGatewayProfile.set('default')
+})
+
+afterEach(() => {
+  $activeGatewayProfile.set('default')
 })
 
 describe('normalizeStoredPetRoster', () => {
@@ -145,5 +153,33 @@ describe('roster mutation APIs reuse the invariant', () => {
     const restored = $petRoster.get().entries.find(e => e.profile === 'apollo')
     expect(restored?.enabled).toBe(true)
     expect(restored?.unavailable).toBeUndefined()
+  })
+})
+
+describe('$observedPetProfiles', () => {
+  it('follow-active with empty entries still observes the active profile (test 44)', () => {
+    $petRoster.set({ entries: [], initialized: true, mode: 'follow-active' })
+    $activeGatewayProfile.set('apollo')
+
+    expect($observedPetProfiles.get()).toEqual(new Set(['apollo']))
+  })
+
+  it('follow-active observes only the active profile, never background ones', () => {
+    $petRoster.set({ entries: [entry('nova', true)], initialized: true, mode: 'follow-active' })
+    $activeGatewayProfile.set('default')
+
+    // The pinned entry is ignored in follow-active mode.
+    expect($observedPetProfiles.get()).toEqual(new Set(['default']))
+  })
+
+  it('pinned mode observes every enabled, available entry', () => {
+    $petRoster.set({
+      entries: [entry('apollo', true), entry('nova', false), entry('gone', true, true)],
+      initialized: true,
+      mode: 'pinned'
+    })
+
+    // nova is disabled, gone is unavailable → only apollo is observed.
+    expect($observedPetProfiles.get()).toEqual(new Set(['apollo']))
   })
 })

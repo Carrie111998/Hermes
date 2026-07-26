@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react'
 
-import { setPetActivity } from '@/store/pet'
+import { petProfile } from '@/store/pet'
 import { setPetScale } from '@/store/pet-gallery'
+import { setProfileManualAwaitingInput } from '@/store/pet-multi'
 import { setPetOverlayOpenAppHandler, setPetOverlayScaleHandler, setPetOverlaySubmitHandler } from '@/store/pet-overlay'
 import { $sessions } from '@/store/session'
 import { $attentionSessionIds } from '@/store/session-states'
@@ -56,10 +57,12 @@ export function usePetBridge({ requestGateway, resumeSession, submitText }: PetB
     }
   }, [])
 
-  // Mirror "a session is blocked on the user" (clarify/approval) into the pet's
-  // awaitingInput flag so it shows the `waiting` pose.
+  // Mirror "a session is blocked on the user" (clarify/approval) into the active
+  // profile's awaitingInput so its pet shows the `waiting` pose. Routed through
+  // the manual-awaiting channel (OR-ed into the derived activity) so per-session
+  // routing never overwrites it.
   useEffect(() => {
-    const sync = () => setPetActivity({ awaitingInput: $attentionSessionIds.get().length > 0 })
+    const sync = () => setProfileManualAwaitingInput(petProfile(), $attentionSessionIds.get().length > 0)
 
     sync()
 

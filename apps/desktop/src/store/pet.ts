@@ -131,6 +131,30 @@ export function petProfile(): string {
 }
 
 /**
+ * Pure decision for "should this finished turn light up a pet's unread hint?".
+ * Inputs are parameters (not free variables) so it is testable and callable from
+ * the event path without a React ref in scope. Unread fires when the window is
+ * unfocused, OR the turn is on a non-active profile, OR on a non-active session.
+ *
+ * Mode caveat: in follow-active mode only the active profile is observed, so the
+ * profile clause can never fire — background profiles get no unread there. The
+ * "background activity animates its pet" criterion holds in pinned mode only.
+ */
+export function shouldMarkUnread(input: {
+  activeProfile: string
+  activeSessionId: string | null
+  profile: string
+  sessionId: string | null
+  windowFocused: boolean
+}): boolean {
+  return (
+    !input.windowFocused ||
+    normalizeProfileKey(input.profile) !== normalizeProfileKey(input.activeProfile) ||
+    (input.sessionId !== null && input.sessionId !== input.activeSessionId)
+  )
+}
+
+/**
  * Pet-local "you have a new message" flag, surfaced as the overlay's mail icon.
  * Deliberately not real unread tracking: it flips on when a turn finishes while
  * the app isn't focused, and off when the user opens the app via the mail icon

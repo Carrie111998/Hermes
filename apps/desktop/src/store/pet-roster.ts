@@ -1,7 +1,7 @@
-import { atom } from 'nanostores'
+import { atom, computed } from 'nanostores'
 
 import { readJson, writeJson } from '@/lib/storage'
-import { normalizeProfileKey } from '@/store/profile'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
 /**
  * Device-scoped multi-pet visibility roster.
@@ -228,3 +228,23 @@ export function isProfilePetEnabled(profile: string): boolean {
 
   return $petRoster.get().entries.some(entry => entry.profile === key && entry.enabled && !entry.unavailable)
 }
+
+/**
+ * The set of profiles whose pets are OBSERVED (events route to their pet slice).
+ * One shared derivation used by leases, polling, and event routing. A computed
+ * store avoids rebuilding the set per event and avoids module-level subscribe()
+ * callbacks that would multiply across HMR evaluations.
+ *
+ * - follow-active: only the active profile is observed (so background profiles
+ *   get no activity/unread — the current single-pet behavior).
+ * - pinned: every enabled, available roster entry.
+ */
+export const $observedPetProfiles = computed(
+  [$petRoster, $activeGatewayProfile],
+  (roster, activeProfile): ReadonlySet<string> =>
+    roster.mode === 'follow-active'
+      ? new Set([normalizeProfileKey(activeProfile)])
+      : new Set(roster.entries.filter(entry => entry.enabled && !entry.unavailable).map(entry => normalizeProfileKey(entry.profile)))
+)
+
+export const observedPetProfiles = (): ReadonlySet<string> => $observedPetProfiles.get()

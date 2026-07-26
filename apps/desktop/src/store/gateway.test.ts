@@ -7,6 +7,7 @@ import {
   ensureGatewayForProfile,
   isActivePrimary,
   leaseProfileGateway,
+  primaryProfileKey,
   pruneSecondaryGateways,
   reconnectPrimaryGateway,
   releaseProfileGateway,
@@ -166,6 +167,28 @@ describe('requestGatewayForProfile — primary reconnect extraction (blocker #2)
     // The foreground connection was NOT clobbered (activeKey is apollo, so the
     // background primary reconnect must not call setConnection).
     expect($connection.get()).toBe(sentinel)
+
+    primary.close()
+  })
+})
+
+describe('primary event tagging source (blocker #1)', () => {
+  it('primaryProfileKey tracks the registry primary, not the active secondary (test 53)', async () => {
+    const primary = new HermesGateway()
+    setPrimaryGateway(primary, 'default')
+    expect(primaryProfileKey()).toBe('default')
+
+    // Activate a secondary: the active key moves, but the primary key the boot
+    // hook reads at EMIT time must stay the primary's profile — otherwise primary
+    // events get tagged with the secondary's profile after a rebuild.
+    await settle(ensureGatewayForProfile('apollo'))
+    expect(isActivePrimary()).toBe(false)
+    expect(primaryProfileKey()).toBe('default')
+
+    // A rebuild re-sets the primary; the emit-time read follows the registry's
+    // primary key, never the active secondary.
+    setPrimaryGateway(primary, 'default')
+    expect(primaryProfileKey()).toBe('default')
 
     primary.close()
   })

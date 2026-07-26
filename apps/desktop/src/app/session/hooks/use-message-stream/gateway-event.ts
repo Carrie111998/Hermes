@@ -26,7 +26,19 @@ import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding, requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { revealDesktopPane } from '@/store/pane-focus'
-import { flashPetActivity, markPetUnread, setPetActivity, setPetReplyText } from '@/store/pet'
+import { shouldMarkUnread } from '@/store/pet'
+import {
+  bindSessionStoredId,
+  completeTool,
+  markProfilePetUnread,
+  setProfilePetReplyText,
+  setSessionAwaitingInput,
+  setSessionBusy,
+  setSessionReasoning,
+  startTool,
+  terminateSession
+} from '@/store/pet-multi'
+import { observedPetProfiles } from '@/store/pet-roster'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { followActiveSessionCwd } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
@@ -234,6 +246,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       const sessionId = route.sessionId
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
+      // Multi-pet routing: the event's owning profile (tagged by the gateway
+      // registry) and whether that profile's pet is observed. Activity + unread
+      // writes are gated on `observed` so follow-active (only the active profile
+      // observed) cannot accumulate hidden background state, while pinned mode
+      // animates every enabled profile's pet from its own sessions.
+      const eventProfile = event.profile ? normalizeProfileKey(event.profile) : null
+      const observedPet = Boolean(eventProfile && observedPetProfiles().has(eventProfile))
+
       // Mid-turn compaction does not emit another message.start. The first
       // model output or tool event proves summarization has finished and the
       // turn has resumed, so retire the phase label without waiting for the
@@ -411,6 +431,25 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           )
         }
 
+        // Mirror the running transition into the observed profile's pet activity.
+        // running=false is the authoritative terminal (the backend's finally emits
+        // it on interrupt/clear/turn-end); running=true re-arms busy unless the
+        // user interrupted (stale heartbeat guard — mirrors the ClientSessionState
+        // guard above so an interrupted session never re-arms busy; test 41).
+        if (runningChanged && sessionId && observedPet && eventProfile) {
+          if (payload?.stored_session_id) {
+            bindSessionStoredId(eventProfile, sessionId, payload.stored_session_id)
+          }
+
+          if (payload!.running) {
+            if (!sessionStateByRuntimeIdRef.current.get(sessionId)?.interrupted) {
+              setSessionBusy(eventProfile, sessionId, true)
+            }
+          } else {
+            terminateSession(eventProfile, sessionId)
+          }
+        }
+
         if (payload?.usage && (!explicitSid || isActiveEvent)) {
           setCurrentUsage(current => ({ ...current, ...payload.usage }))
         }
@@ -509,16 +548,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           appendReasoningDelta(sessionId, coerceThinkingText(payload?.text))
         }
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
+        if (observedPet && eventProfile && sessionId) {
+          setSessionReasoning(eventProfile, sessionId, true)
         }
       } else if (event.type === 'reasoning.available') {
         if (sessionId) {
           appendReasoningDelta(sessionId, coerceThinkingText(payload?.text), true)
         }
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
+        if (observedPet && eventProfile && sessionId) {
+          setSessionReasoning(eventProfile, sessionId, true)
         }
       } else if (event.type === 'moa.reference') {
         // MoA reference-model output — surface as a labelled thinking chunk
@@ -553,14 +592,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
         }
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
+        if (observedPet && eventProfile && sessionId) {
+          setSessionReasoning(eventProfile, sessionId, true)
         }
       } else if (event.type === 'moa.aggregating') {
         // Status transition only; the aggregator's reply arrives via the normal
         // message stream. No reasoning/transcript mutation here.
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
+        if (observedPet && eventProfile && sessionId) {
+          setSessionReasoning(eventProfile, sessionId, true)
         }
       } else if (event.type === 'moa.progress') {
         // Live reference fan-out progress ("refs k/n") — surfaced in the same
@@ -579,8 +618,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           flushQueuedDeltas(sessionId)
         }
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
+        if (observedPet && eventProfile && sessionId) {
+          setSessionReasoning(eventProfile, sessionId, true)
         }
       } else if (event.type === 'moa.phase') {
         // Phase transition — currently only phase="aggregator" (fan-out done,
@@ -591,8 +630,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           flushQueuedDeltas(sessionId)
         }
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
+        if (observedPet && eventProfile && sessionId) {
+          setSessionReasoning(eventProfile, sessionId, true)
         }
       } else if (event.type === 'message.complete') {
         if (!sessionId) {
@@ -639,23 +678,31 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (isActiveEvent) {
           setTurnStartedAt(null)
+        }
 
-          // Pet beat: a finished turn always celebrates — go straight to the
-          // jump, never linger on the run/reason pose. One atom update (clears
-          // toolRunning/reasoning AND sets celebrate together) so no stray "run"
-          // frame leaks to the sprite — including the popped-out overlay, which
-          // mirrors each activity change. The jump runs ~2 loops, then settles.
-          flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+        // Multi-pet terminal transition + unread, gated on the OBSERVED profile
+        // (not the active session). A finished turn clears that session's steady
+        // state and beats on its own profile's pet — celebrate on a clean finish,
+        // error on a failed one (status:"error"). Unread lights up per
+        // shouldMarkUnread (unfocused window, non-active profile, or non-active
+        // session). playCompletionSound / native notifications above stay
+        // ungated — they're session-scoped, not active-gated.
+        if (observedPet && eventProfile && sessionId) {
+          terminateSession(eventProfile, sessionId, failure ? { error: true } : { celebrate: true })
 
-          // Light up the pet's mail icon if the user wasn't looking when the turn
-          // finished - a glanceable "new message" hint on the popped-out overlay.
-          // Cleared when they open the app via the mail icon or refocus the window.
-          // Also push the reply text so the overlay can show it in the speech
-          // bubble instead of a bare mail icon.
-          if (typeof document !== 'undefined' && !document.hasFocus()) {
-            markPetUnread()
+          if (
+            shouldMarkUnread({
+              activeProfile: $activeGatewayProfile.get(),
+              activeSessionId: activeSessionIdRef.current,
+              profile: eventProfile,
+              sessionId,
+              windowFocused: typeof document === 'undefined' ? false : document.hasFocus()
+            })
+          ) {
+            markProfilePetUnread(eventProfile, sessionId)
+
             if (finalText) {
-              setPetReplyText(finalText)
+              setProfilePetReplyText(eventProfile, finalText, sessionId)
             }
           }
         }
@@ -689,22 +736,26 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         flushQueuedDeltas(sessionId)
         upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type)
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: false, toolRunning: true })
+        if (observedPet && eventProfile && sessionId) {
+          startTool(eventProfile, sessionId, payload?.tool_id || payload?.name)
         }
       } else if (event.type === 'tool.complete') {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type)
 
-          if (isActiveEvent) {
-            setPetActivity({ toolRunning: false })
+          if (observedPet && eventProfile && sessionId) {
+            completeTool(eventProfile, sessionId, payload?.tool_id || payload?.name)
           }
 
           // A pending clarify blocks the turn, so the first tool.complete after
           // one is the clarify resolving — drop the "needs input" flag here so
           // the sidebar indicator clears as soon as it's answered, not only at
           // message.complete.
+          if (sessionStateByRuntimeIdRef.current.get(sessionId)?.needsInput && observedPet && eventProfile) {
+            setSessionAwaitingInput(eventProfile, sessionId, false)
+          }
+
           updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
 
           // terminal/process tool calls are the only things that spawn or reap
@@ -782,6 +833,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             // "needs input" indicator on its row — works for the active session
             // too, and survives alt-tab / window blur (unlike a toast).
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
+
+            // The pet shows the `waiting` pose while a clarify blocks the turn.
+            if (observedPet && eventProfile) {
+              setSessionAwaitingInput(eventProfile, sessionId, true)
+            }
           }
 
           dispatchNativeNotification({
@@ -815,6 +871,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (sessionId) {
           updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
+
+          // The pet shows the `waiting` pose while an approval blocks the turn.
+          if (observedPet && eventProfile) {
+            setSessionAwaitingInput(eventProfile, sessionId, true)
+          }
         }
 
         dispatchNativeNotification({
@@ -987,9 +1048,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           compactedTurnRef.current.delete(sessionId)
         }
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: false, toolRunning: false })
-          flashPetActivity({ error: true })
+        if (observedPet && eventProfile && sessionId) {
+          terminateSession(eventProfile, sessionId, { error: true })
         }
 
         dispatchNativeNotification({
