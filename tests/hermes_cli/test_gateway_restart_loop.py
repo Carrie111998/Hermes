@@ -28,6 +28,18 @@ class TestGatewayLifecyclePattern:
     @pytest.mark.parametrize("text", [
         "hermes gateway restart",
         "hermes gateway stop",
+        "hermes -p alex gateway restart",
+        "hermes --profile alex gateway stop",
+        "hermes --profile=alex gateway restart",
+        "hermes gateway -p alex restart",
+        "hermes gateway --profile=alex stop",
+        "hermes gateway start --all",
+        "hermes gateway start --system --all",
+        "hermes -p alex gateway start --all",
+        "hermes gateway start -p alex --all",
+        "hermes gateway start --all --profile alex",
+        "hermes gateway start --a",          # argparse abbreviation for --all
+        "hermes gateway start --al",         # argparse abbreviation for --all
         "hermes  gateway  restart",         # double spaces
         "Hermez Gateway Restart".lower().replace("z", "s"),  # case handled
         "HERMES GATEWAY RESTART",           # uppercase
@@ -62,12 +74,15 @@ class TestGatewayLifecyclePattern:
         "echo 'just a normal cron job'",
         "run the backup script",
         "gateway is running fine",
-        # `hermes gateway start` is benign — starting a gateway from inside a
-        # gateway is a no-op / "already running", and a legit cron job may
-        # start a sibling profile's gateway. Only restart/stop/kill are the
-        # foot-gun (#30719 lists only those).
+        # Plain `hermes gateway start` is benign — starting the current
+        # profile is a no-op / "already running", and a legit cron job may
+        # start a sibling profile's gateway. `start --all` is different: it
+        # kills processes across every profile before starting one service.
         "hermes gateway start",
-        "hermes gateway start --all",
+        "hermes -p alex gateway start",
+        "hermes --profile alex gateway start",
+        "hermes --profile=alex gateway start",
+        "hermes gateway start && echo --all",  # --all belongs to another command
         # Tightened launchctl/systemctl branches: ops on NON-gateway hermes
         # services must not be falsely blocked (the old `.*hermes` matched any
         # hermes token).
@@ -217,7 +232,33 @@ class TestCronCreateLifecycleBlock:
 # ---------------------------------------------------------------------------
 
 class TestGatewaySelfTargetingGuard:
-    """Verify hermes gateway stop/restart refuse when _HERMES_GATEWAY=1."""
+    """Verify destructive gateway lifecycle commands refuse in a gateway."""
+
+    def test_start_all_refuses_inside_gateway(self, monkeypatch):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        from hermes_cli.gateway import gateway_command
+        args = Namespace(gateway_command="start", all=True, system=False)
+        with pytest.raises(SystemExit) as exc_info:
+            gateway_command(args)
+        assert exc_info.value.code == 1
+
+    def test_plain_start_allows_inside_gateway(self, monkeypatch):
+        # Plain start is intentionally allowed: it is profile-scoped, so a
+        # gateway may start a stopped sibling profile. Stop before any real
+        # service-manager call by sentineling the first downstream dispatch.
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        import hermes_cli.gateway as gw
+
+        class _Reached(Exception):
+            pass
+
+        def _sentinel(*a, **k):
+            raise _Reached()
+
+        monkeypatch.setattr(gw, "_dispatch_via_service_manager_if_s6", _sentinel)
+        args = Namespace(gateway_command="start", all=False, system=False)
+        with pytest.raises(_Reached):
+            gw.gateway_command(args)
 
     def test_stop_refuses_inside_gateway(self, monkeypatch):
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
@@ -315,6 +356,15 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl --user restart hermes-gateway",
         "systemctl stop hermes-gateway.service",
         "hermes gateway restart",
+        "hermes -p alex gateway restart",
+        "hermes --profile alex gateway stop",
+        "hermes gateway -p alex restart",
+        "hermes gateway --profile=alex stop",
+        "hermes gateway start --all",
+        "hermes -p alex gateway start --all",
+        "hermes gateway start --all --profile alex",
+        "hermes gateway start --a",
+        "hermes gateway start --al",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         "pkill -f hermes.*gateway",
     ])
@@ -358,6 +408,27 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == ["systemctl status nginx"]
 
+    def test_plain_sibling_start_passes_through_inside_gateway(self, monkeypatch):
+        """Profile-scoped start without --all is intentionally allowed."""
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "starting...", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True})
+
+        command = "hermes -p alex gateway start"
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
     def test_guard_inactive_outside_gateway(self, monkeypatch):
         """Without _HERMES_GATEWAY=1 the lifecycle guard must not fire."""
         import tools.terminal_tool as tt
@@ -398,6 +469,27 @@ class TestLifecycleGuardModule:
         from cron.lifecycle_guard import check_gateway_lifecycle
         check_gateway_lifecycle("research the gateway architecture", None)
         check_gateway_lifecycle("check server health and restart watchers", None)
+
+    @pytest.mark.parametrize("command", [
+        "hermes -p alex gateway start --all",
+        "hermes gateway -p alex start --all",
+        "hermes gateway start --all --profile alex",
+        "hermes gateway start --a",
+        "hermes gateway start --al",
+    ])
+    def test_profile_scoped_start_all_raises(self, command):
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle(command, None)
+
+    @pytest.mark.parametrize("command", [
+        "hermes -p alex gateway start",
+        "hermes gateway -p alex start",
+        "hermes gateway start --profile=alex",
+    ])
+    def test_plain_sibling_start_does_not_raise(self, command):
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        check_gateway_lifecycle(command, None)
 
     def test_script_with_command_raises(self, tmp_path, monkeypatch):
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
