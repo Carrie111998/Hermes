@@ -12,6 +12,7 @@ import {
   type PetInfo,
   petProfile
 } from '@/store/pet'
+import { $profilePets, type ProfileConnection } from '@/store/pet-multi'
 import { normalizeProfileKey } from '@/store/profile'
 import { $awaitingResponse, $busy } from '@/store/session'
 
@@ -61,6 +62,9 @@ export interface PetOverlayStatePayload {
   replyText: string | null
   /** Latest reaction - bumping its id forwards a burst to the overlay. */
   reaction: PetReaction | null
+  /** The profile's gateway connection state — the overlay desaturates + badges
+   *  a disconnect glyph when offline/reauth so a down backend never looks happy. */
+  connection: ProfileConnection
 }
 
 export type PetOverlayControl =
@@ -171,7 +175,8 @@ function currentPayload(): PetOverlayStatePayload {
     awaiting: $awaitingResponse.get(),
     unread: $petUnread.get(),
     replyText: $petReplyText.get(),
-    reaction: $petReaction.get()
+    reaction: $petReaction.get(),
+    connection: $profilePets.get().get(normalizeProfileKey(petProfile()))?.connection ?? 'open'
   }
 }
 
@@ -221,7 +226,8 @@ function openOverlay(profile: string, request: PetOverlayOpenRequest): void {
     $awaitingResponse.subscribe(pushNow),
     $petUnread.subscribe(pushNow),
     $petReplyText.subscribe(pushNow),
-    $petReaction.subscribe(pushNow)
+    $petReaction.subscribe(pushNow),
+    $profilePets.subscribe(pushNow)
   ]
 }
 

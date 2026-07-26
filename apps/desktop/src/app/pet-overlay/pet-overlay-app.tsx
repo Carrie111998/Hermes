@@ -7,6 +7,7 @@ import { PetSprite } from '@/components/pet/pet-sprite'
 import { type PetZoomAnchor, usePetZoomGesture } from '@/components/pet/use-pet-zoom-gesture'
 import { Mail } from '@/lib/icons'
 import { $petInfo, replacePetActivity, setPetInfo } from '@/store/pet'
+import { type ProfileConnection } from '@/store/pet-multi'
 import { overlayWindowSize } from '@/store/pet-overlay'
 import { setAwaitingResponse, setBusy } from '@/store/session'
 
@@ -69,6 +70,9 @@ export function PetOverlayApp() {
   // Mirrored reply text - when set, shows in the speech bubble instead of the
   // mail icon. Cleared on click (opens app) or when the main window focuses.
   const [replyText, setReplyTextState] = useState<string | null>(null)
+  // Mirrored gateway connection state — offline/reauth desaturates the sprite +
+  // badges a disconnect glyph so a down backend never looks happy.
+  const [connection, setConnection] = useState<ProfileConnection>('open')
 
   const dragRef = useRef<DragState | null>(null)
   // Last Alt+wheel anchor, consumed by the resize effect to zoom toward the
@@ -98,6 +102,7 @@ export function PetOverlayApp() {
       setAwaitingResponse(Boolean(payload.awaiting))
       setUnread(Boolean(payload.unread))
       setReplyTextState(payload.replyText ?? null)
+      setConnection(payload.connection ?? 'open')
 
       // Play a reaction on a new id (ignore the first sync, which just primes it).
       const reaction = payload.reaction ?? null
@@ -367,6 +372,12 @@ export function PetOverlayApp() {
     return null
   }
 
+  // Offline/reauth treatment mirrors the in-window PetSlot: desaturate the
+  // sprite and badge a disconnect glyph (reason on hover) so a down backend
+  // never reads as a happy, idle pet.
+  const offline = connection === 'offline' || connection === 'reauth-required'
+  const offlineReason = connection === 'reauth-required' ? 'Needs sign-in' : 'Backend unreachable'
+
   return (
     <div
       onPointerDown={e => {
@@ -434,8 +445,32 @@ export function PetOverlayApp() {
         <div style={{ marginBottom: 4 }}>
           <PetBubble />
         </div>
-        <div style={{ lineHeight: 0, position: 'relative' }}>
-          <PetSprite info={info} />
+        <div style={{ lineHeight: 0, position: 'relative' }} title={offline ? offlineReason : undefined}>
+          <span
+            style={{
+              display: 'inline-block',
+              filter: offline ? 'grayscale(1) opacity(0.55)' : undefined,
+              lineHeight: 0
+            }}
+          >
+            <PetSprite info={info} />
+          </span>
+
+          {offline && (
+            <span
+              aria-label={offlineReason}
+              style={{
+                bottom: 6,
+                color: connection === 'reauth-required' ? '#f59e0b' : '#9ca3af',
+                fontSize: 12,
+                lineHeight: 1,
+                position: 'absolute',
+                right: 2
+              }}
+            >
+              {connection === 'reauth-required' ? '🔑' : '⏻'}
+            </span>
+          )}
 
           {/* Hearts on the popped-out pet — identical to in-window. */}
           <PetHeartField
