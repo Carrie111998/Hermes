@@ -13,13 +13,14 @@ import pytest
 
 from hermes_cli.fleet.adapters.live_routes import (
     AntigravityAdapter,
+    ClaudeCodeAdapter,
     live_adapters,
 )
 from hermes_cli.fleet.adapters.native_provider import NativeProviderAdapter
 from hermes_cli.fleet.capacity import BridgeUsageAdapter
 from hermes_cli.fleet.live import FleetQualificationDoctor, _PROOF_CACHE_SCHEMA
 from hermes_cli.fleet.profiles import profile_map
-from hermes_cli.fleet.types import OverageState, TaskSpec
+from hermes_cli.fleet.types import AdapterRequest, OverageState, Qualification, TaskSpec
 from hermes_cli.subcommands.fleet import _default_service
 
 
@@ -218,6 +219,90 @@ def test_live_doctor_rejects_forbidden_api_key_without_exposing_value():
     assert not qualification.qualified
     assert "OPENAI_API_KEY" in qualification.detail
     assert "do-not-expose-this" not in qualification.detail
+
+
+def test_live_claude_adapter_executes_cli_and_never_calls_native_inference(tmp_path):
+    native_calls = []
+
+    def forbidden_native_runner(**kwargs):
+        native_calls.append(kwargs)
+        raise AssertionError("native Anthropic inference must remain disabled")
+
+    profile = profile_map()["claude_code"]
+    executable = str(Path(sys.executable).resolve())
+    qualification = Qualification(
+        qualified=True,
+        captured_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+        auth_kind="oauth_subscription",
+        auth_source="anthropic:claude_code_oauth",
+        overage_disabled=True,
+        provider_id="anthropic",
+        models=profile.ordered_models,
+        efforts=profile.supported_efforts,
+        fast_off_supported=True,
+        capabilities=profile.capabilities,
+        executable=executable,
+        version="synthetic-claude-code",
+        evidence_id="synthetic-cli-qualification",
+        subscription_only_proven=True,
+        paid_fallback_absent=True,
+        overage_state=OverageState.OFF,
+    )
+    adapters = live_adapters(
+        native_runner=forbidden_native_runner,
+        qualifications={"claude_code": qualification},
+    )
+    adapter = adapters["claude_code"]
+    assert isinstance(adapter, ClaudeCodeAdapter)
+    assert not isinstance(adapter, NativeProviderAdapter)
+
+    process_calls = []
+
+    def process(argv, **kwargs):
+        process_calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "claude CLI complete",
+                    "modelUsage": {profile.ordered_models[0]: {}},
+                }
+            ),
+            stderr="",
+        )
+
+    adapter._run_process = process
+    request = AdapterRequest(
+        task_id="claude-cli-isolation",
+        cwd=tmp_path,
+        prompt="bounded Claude CLI task",
+        profile=profile,
+        model=profile.ordered_models[0],
+        effort="high",
+        timeout_seconds=17,
+    )
+
+    result = adapter.execute(request, qualification)
+
+    assert result.ok
+    assert result.output == "claude CLI complete"
+    assert native_calls == []
+    assert len(process_calls) == 1
+    argv, kwargs = process_calls[0]
+    assert argv == [
+        executable,
+        "-p",
+        "--model",
+        "claude-opus-4-8",
+        "--effort",
+        "high",
+        "--output-format",
+        "json",
+    ]
+    assert kwargs["input"] == "bounded Claude CLI task"
+    assert kwargs["timeout"] == 17
+    assert kwargs["shell"] is False
 
 
 @pytest.mark.parametrize(

@@ -749,18 +749,76 @@ def redeem_codex_reset_credit(
 
 
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
-    """Fetch Anthropic OAuth usage — DISABLED for CLI-based lanes.
+    """Measure subscription usage with OAuth; never perform Anthropic inference."""
+    token = resolve_anthropic_token()
+    if not token:
+        return None
+    if not _is_oauth_token(token):
+        return AccountUsageSnapshot(
+            provider="anthropic",
+            source="local_credentials",
+            fetched_at=_utc_now(),
+            unavailable_reason=(
+                "Anthropic API keys do not expose Claude subscription usage."
+            ),
+        )
 
-    Claude Code (claude_code lane) uses the CLI executable path, not the OAuth API.
-    The OAuth usage endpoint (api.anthropic.com/api/oauth/usage) is policy-restricted
-    and not available for third-party tools. Usage qualification for claude_code is
-    determined by the CLI executable's own health check instead.
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.0",
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+    if not isinstance(payload, dict):
+        return None
 
-    Returns None to defer the usage decision to the lane's CLI health probe.
-    """
-    # API path is disabled entirely per GOAL A requirements.
-    # All Anthropic usage qualification flows through the CLI executable.
-    return None
+    windows: list[AccountUsageWindow] = []
+    for key, label in (
+        ("five_hour", "Current session"),
+        ("seven_day", "Current week"),
+        ("seven_day_opus", "Opus week"),
+        ("seven_day_sonnet", "Sonnet week"),
+    ):
+        window = payload.get(key)
+        if window is None:
+            continue
+        if not isinstance(window, dict):
+            return None
+        raw_utilization = window.get("utilization")
+        if isinstance(raw_utilization, bool) or not isinstance(
+            raw_utilization, (int, float)
+        ):
+            continue
+        try:
+            used_percent = float(raw_utilization)
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if not math.isfinite(used_percent):
+            continue
+        if 0.0 <= used_percent <= 1.0:
+            used_percent *= 100.0
+        if not 0.0 <= used_percent <= 100.0:
+            continue
+        windows.append(
+            AccountUsageWindow(
+                label=label,
+                used_percent=used_percent,
+                reset_at=_parse_dt(window.get("resets_at")),
+            )
+        )
+    return AccountUsageSnapshot(
+        provider="anthropic",
+        source="oauth_usage_api",
+        fetched_at=_utc_now(),
+        windows=tuple(windows),
+    )
 
 
 def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:

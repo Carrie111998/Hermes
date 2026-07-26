@@ -68,6 +68,75 @@ def test_real_main_parser_keeps_fleet_registered(
     assert "fleet" in main_module._BUILTIN_SUBCOMMANDS
 
 
+def test_refresh_usage_json_reports_measured_numeric_claude_lane(
+    tmp_path, capsys, monkeypatch
+):
+    from agent import account_usage
+
+    token = "cc-synthetic-cli-refresh-token-never-real"
+    http_calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "seven_day": {"utilization": 0.14},
+                "seven_day_opus": {"utilization": 0.22},
+            }
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def get(self, url, headers, **kwargs):
+            http_calls.append(
+                {"method": "GET", "url": url, "headers": headers, "kwargs": kwargs}
+            )
+            return Response()
+
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("CLI refresh must never invoke Anthropic inference")
+
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: token)
+    monkeypatch.setattr(account_usage, "_fetch_codex_account_usage", lambda **_kwargs: None)
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "hermes_cli.fleet.usage_refresh._probe_console_lane_health",
+        lambda lane_id: (None, f"{lane_id} disabled in CLI contract test"),
+    )
+    path = tmp_path / "usage-weekly.json"
+    args = _parser().parse_args(
+        [
+            "fleet",
+            "refresh-usage",
+            "--path",
+            str(path),
+            "--no-mirror",
+            "--json",
+        ]
+    )
+    service, _, _ = _service(tmp_path)
+
+    code = fleet_command(args, service=service)
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert code == 0
+    claude = next(lane for lane in payload["lanes"] if lane["lane_id"] == "claude_code")
+    assert claude["updated"] is True
+    assert claude["weekly_pct_used"] == 22.0
+    assert claude["checked_at"] is not None
+    assert claude["detail"] == "ok"
+    assert payload["ok"] is True
+    assert token not in output
+    assert [call["method"] for call in http_calls] == ["GET"]
+
+
 def test_plan_json_is_stable_provenance_rich_and_read_only(tmp_path, capsys):
     service, _, _ = _service(tmp_path)
     task = tmp_path / "task.txt"

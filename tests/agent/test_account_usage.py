@@ -32,6 +32,59 @@ class _FakeClient:
         return _FakeResponse(self.payload)
 
 
+class _AnthropicUsageClient:
+    """Strict usage-only transport: any non-GET request fails the test."""
+
+    def __init__(self, calls, payload=None, *, get_error=None, json_error=None):
+        self.calls = calls
+        self.payload = payload
+        self.get_error = get_error
+        self.json_error = json_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers, **kwargs):
+        self.calls.append(
+            {
+                "method": "GET",
+                "url": url,
+                "headers": headers,
+                "kwargs": kwargs,
+            }
+        )
+        if self.get_error is not None:
+            raise self.get_error
+        if self.json_error is not None:
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: (_ for _ in ()).throw(self.json_error),
+            )
+        return _FakeResponse(self.payload)
+
+    def post(self, *args, **kwargs):
+        self.calls.append({"method": "POST", "args": args, "kwargs": kwargs})
+        raise AssertionError("Anthropic account usage must never make an inference POST")
+
+
+def _mock_anthropic_usage(monkeypatch, payload, *, token="cc-synthetic-oauth-token", **client_kwargs):
+    calls = []
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: token)
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _AnthropicUsageClient(
+            calls,
+            payload,
+            **client_kwargs,
+        ),
+    )
+    return calls
+
+
 @pytest.fixture
 def codex_usage_payload():
     return {
@@ -235,6 +288,162 @@ def test_codex_usage_treats_wham_used_percent_as_used_not_remaining(monkeypatch)
     assert "14% used" in rendered
     assert "15% used" not in rendered
     assert "86% used" not in rendered
+
+
+def test_anthropic_usage_is_one_secret_safe_get_with_no_body_or_inference(
+    monkeypatch, caplog, capsys
+):
+    token = "cc-synthetic-oauth-token-never-real"
+    calls = _mock_anthropic_usage(
+        monkeypatch,
+        {
+            "five_hour": {
+                "utilization": 0.05,
+                "resets_at": "2026-07-26T20:00:00Z",
+            },
+            "seven_day": {"utilization": 0.125},
+            "seven_day_opus": {"utilization": 0.8},
+            "seven_day_sonnet": {"utilization": 1.0},
+        },
+        token=token,
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    assert snapshot.available
+    assert snapshot.provider == "anthropic"
+    assert snapshot.source == "oauth_usage_api"
+    assert [window.label for window in snapshot.windows] == [
+        "Current session",
+        "Current week",
+        "Opus week",
+        "Sonnet week",
+    ]
+    assert [window.used_percent for window in snapshot.windows] == [
+        5.0,
+        12.5,
+        80.0,
+        100.0,
+    ]
+    assert snapshot.windows[0].reset_at is not None
+    assert calls == [
+        {
+            "method": "GET",
+            "url": "https://api.anthropic.com/api/oauth/usage",
+            "headers": {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
+                "User-Agent": "claude-code/2.1.0",
+            },
+            "kwargs": {},
+        }
+    ]
+    assert token not in caplog.text
+    captured = capsys.readouterr()
+    assert token not in captured.out
+    assert token not in captured.err
+    assert token not in repr(snapshot)
+
+
+@pytest.mark.parametrize(
+    "invalid_utilization",
+    [
+        True,
+        False,
+        -0.01,
+        101,
+        10**400,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "0.5",
+    ],
+)
+def test_anthropic_usage_rejects_invalid_or_non_finite_percentages(
+    monkeypatch, invalid_utilization
+):
+    calls = _mock_anthropic_usage(
+        monkeypatch,
+        {"seven_day": {"utilization": invalid_utilization}},
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    assert snapshot.windows == ()
+    assert not snapshot.available
+    assert [call["method"] for call in calls] == ["GET"]
+
+
+def test_anthropic_usage_missing_token_makes_no_request(monkeypatch):
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: None)
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing credentials must not make a request")
+        ),
+    )
+
+    assert account_usage.fetch_account_usage("anthropic") is None
+
+
+def test_anthropic_usage_api_key_is_never_used_for_subscription_query(monkeypatch):
+    token = "sk-ant-api03-synthetic-never-real"
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: token)
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("API keys must not be sent to the OAuth usage endpoint")
+        ),
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    assert not snapshot.available
+    assert snapshot.unavailable_reason
+    assert token not in snapshot.unavailable_reason
+    assert token not in repr(snapshot)
+
+
+def test_anthropic_usage_http_failure_fails_closed(monkeypatch):
+    calls = _mock_anthropic_usage(
+        monkeypatch,
+        None,
+        get_error=account_usage.httpx.TimeoutException("synthetic timeout"),
+    )
+
+    assert account_usage.fetch_account_usage("anthropic") is None
+    assert [call["method"] for call in calls] == ["GET"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"unexpected": "array"}],
+        {"seven_day": ["unexpected", "array"]},
+    ],
+)
+def test_anthropic_usage_malformed_payload_fails_closed(monkeypatch, payload):
+    calls = _mock_anthropic_usage(monkeypatch, payload)
+
+    assert account_usage.fetch_account_usage("anthropic") is None
+    assert [call["method"] for call in calls] == ["GET"]
+
+
+def test_anthropic_usage_json_failure_fails_closed(monkeypatch):
+    calls = _mock_anthropic_usage(
+        monkeypatch,
+        None,
+        json_error=ValueError("synthetic invalid JSON"),
+    )
+
+    assert account_usage.fetch_account_usage("anthropic") is None
+    assert [call["method"] for call in calls] == ["GET"]
 
 
 # ── Banked rate-limit reset credits (`/usage reset`) ─────────────────────────

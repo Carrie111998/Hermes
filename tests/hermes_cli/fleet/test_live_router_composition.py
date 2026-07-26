@@ -369,6 +369,142 @@ def test_live_usage_uses_only_lane_relevant_weekly_windows(
     assert read.snapshot.used_pct == expected_used
 
 
+def test_oauth_refresh_persists_capacity_and_heavy_routing_selects_claude(
+    tmp_path, monkeypatch
+):
+    from agent import account_usage
+    from hermes_cli.fleet.usage_refresh import refresh_usage_document
+
+    token = "cc-synthetic-routing-oauth-token-never-real"
+    bridge = tmp_path / "usage-weekly.json"
+    bridge.write_text(
+        json.dumps(
+            {
+                "schema_version": "plans-1",
+                "checked_at": NOW.isoformat(),
+                "source": "controlled-prior-evidence",
+                "plans": [
+                    {
+                        "label": "ChatGPT Pro · Codex",
+                        "weekly_pct_used": 90,
+                        "checked_at": NOW.isoformat(),
+                        "health_status": "UP",
+                        "health_checked_at": NOW.isoformat(),
+                        "measurement_kind": "measured",
+                        "comparability_group": "subscription-weekly",
+                        "quota_window_id": "subscription-weekly",
+                        "overage_disabled": True,
+                    },
+                    {
+                        "label": "Claude Max 20x",
+                        "weekly_pct_used": 90,
+                        "checked_at": NOW.isoformat(),
+                        "health_status": "UP",
+                        "health_checked_at": NOW.isoformat(),
+                        "measurement_kind": "measured",
+                        "comparability_group": "subscription-weekly",
+                        "quota_window_id": "subscription-weekly",
+                        "overage_disabled": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    http_calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "five_hour": {"utilization": 0.99},
+                "seven_day": {"utilization": 0.10},
+                "seven_day_opus": {"utilization": 0.15},
+                "seven_day_sonnet": {"utilization": 0.95},
+            }
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def get(self, url, headers, **kwargs):
+            http_calls.append(
+                {"method": "GET", "url": url, "headers": headers, "kwargs": kwargs}
+            )
+            return Response()
+
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("routing refresh must never invoke Anthropic inference")
+
+    codex_snapshot = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="synthetic-codex-usage",
+        fetched_at=NOW,
+        windows=(
+            account_usage.AccountUsageWindow(label="Weekly", used_percent=60.0),
+        ),
+    )
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: token)
+    monkeypatch.setattr(
+        account_usage,
+        "_fetch_codex_account_usage",
+        lambda **_kwargs: codex_snapshot,
+    )
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: Client())
+    monkeypatch.setattr(
+        "hermes_cli.fleet.usage_refresh._probe_console_lane_health",
+        lambda lane_id: (None, f"{lane_id} disabled in routing contract test"),
+    )
+
+    report = refresh_usage_document(path=bridge, mirror_path=None, now=NOW)
+
+    claude_refresh = next(
+        lane for lane in report.lanes if lane.lane_id == "claude_code"
+    )
+    assert claude_refresh.updated is True
+    assert claude_refresh.weekly_pct_used == 15.0
+    assert claude_refresh.detail == "ok"
+
+    service = build_fleet_service(
+        config_data={
+            "fleet": {
+                "enabled": True,
+                "bridge_usage_file": str(bridge),
+                "switch_delta_pct": 20.0,
+                "lanes": {
+                    "chatgpt_codex": {"enabled": True},
+                    "claude_code": {"enabled": True},
+                    "grok": {"enabled": False},
+                    "antigravity": {"enabled": False},
+                    "kimi": {"enabled": False},
+                },
+            }
+        },
+        doctor=_Doctor(),
+        adapters={"chatgpt_codex": object(), "claude_code": object()},
+        capacity_source=BridgeUsageAdapter(bridge),
+        store_path=tmp_path / "state.db",
+        now=lambda: NOW,
+    )
+
+    decision = service.plan(TASK)
+
+    assert decision.lane_id == "claude_code"
+    assert decision.switch_applied
+    by_lane = {item.lane_id: item for item in decision.evaluations}
+    assert by_lane["claude_code"].capacity is not None
+    assert by_lane["claude_code"].capacity.used_pct == Decimal("15.000")
+    assert by_lane["chatgpt_codex"].capacity is not None
+    assert by_lane["chatgpt_codex"].capacity.used_pct == Decimal("60.000")
+    assert [call["method"] for call in http_calls] == ["GET"]
+    assert token not in bridge.read_text(encoding="utf-8")
+
+
 def test_lane_scoped_inspection_fetches_requested_live_usage_once(tmp_path):
     bridge = tmp_path / "usage-weekly.json"
     bridge.write_text(
