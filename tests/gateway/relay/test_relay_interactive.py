@@ -27,6 +27,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+from gateway.relay.ws_transport import _event_from_wire
 from gateway.session import SessionSource, build_session_key
 
 from tests.gateway.relay.stub_connector import StubConnector
@@ -419,95 +420,206 @@ async def test_cancelled_outcome_removes_eyes_without_verdict():
 # ── owner-scoped prompt authorization (CWE-639) ──────────────────────────
 
 
-def _channel_event(prompt_id, option_id, user_id, chat_id="chan42", scope_id="guild9"):
+def _inbound_channel_event(user_id, *, platform="discord", chat_id="chan42", **src_kw):
+    """A normal inbound channel message, built through the real wire decoder.
+
+    ``_event_from_wire`` keeps the UNDERLYING platform (``discord``), which is
+    what makes the session key differ from the one a Discord button press
+    normalizes to — the split this authorization has to survive.
+    """
+    src = {
+        "platform": platform,
+        "chat_id": chat_id,
+        "chat_type": "channel",
+        "scope_id": "guild9",
+        "user_id": user_id,
+    }
+    src.update(src_kw)
+    return _event_from_wire({"text": "hi", "message_type": "text", "source": src})
+
+
+def _prompt_response_event(base_event, prompt_id, option_id):
+    """The same conversation's source answering a prompt on the inbound lane."""
     return MessageEvent(
         text=f"/{option_id}",
         message_type=MessageType.COMMAND,
-        source=SessionSource(
-            platform="relay",
-            chat_id=chat_id,
-            chat_type="channel",
-            scope_id=scope_id,
-            user_id=user_id,
-        ),
+        source=base_event.source,
         prompt_response={"prompt_id": prompt_id, "option_id": option_id},
     )
 
 
-def _owner_source():
-    return SessionSource(
-        platform="relay", chat_id="chan42", chat_type="channel",
-        scope_id="guild9", user_id="owner",
+def _discord_button_forward(prompt_id, option_id, user_id, channel_id="chan42"):
+    """A real Discord component press as the passthrough plane delivers it."""
+
+    class Forward:
+        platform = "discord"
+        method = "POST"
+        path = "/interactions/bot1"
+        body = (
+            '{"type": 3, "id": "i1", "channel_id": "%s", "guild_id": "guild9",'
+            ' "message": {"id": "pm55"},'
+            ' "member": {"user": {"id": "%s", "username": "%s"}},'
+            ' "data": {"custom_id": "hp1:%s:%s"}}'
+            % (channel_id, user_id, user_id, prompt_id, option_id)
+        ).encode()
+
+    return Forward()
+
+
+def _own_a_session(adapter, event) -> str:
+    """Run ``event`` through the inbound capture and return its session key."""
+    adapter._capture_scope(event)
+    return build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
     )
 
 
+@pytest.fixture
+def approval_calls(monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda sk, choice, **kw: calls.append((sk, choice)) or 1,
+    )
+    return calls
+
+
 @pytest.mark.asyncio
-async def test_prompt_response_rejects_non_owner_in_per_user_channel(monkeypatch):
+async def test_prompt_response_rejects_non_owner_in_per_user_channel(approval_calls):
     """A co-member must not resolve another user's approval in a per-user
     channel session — the relay analog of the native adapters' interaction
     owner check. Resolution runs before handle_message, so without this the
     normal auth gate never fires for the click."""
     adapter, _stub = _adapter()
     adapter.config.extra["group_sessions_per_user"] = True
-    owner_key = build_session_key(_owner_source(), group_sessions_per_user=True)
+    owner_key = _own_a_session(adapter, _inbound_channel_event("owner"))
     pid = adapter._mint_prompt(
         "exec_approval", {"session_key": owner_key, "chat_id": "chan42"}
     )
 
-    calls: list = []
-    monkeypatch.setattr(
-        "tools.approval.resolve_gateway_approval",
-        lambda sk, choice, **kw: calls.append((sk, choice)) or 1,
-    )
+    attacker = _inbound_channel_event("attacker")
     consumed = await adapter._consume_prompt_response(
-        _channel_event(pid, "always", user_id="attacker")
+        _prompt_response_event(attacker, pid, "always")
     )
     assert consumed is True  # dropped, not re-dispatched as the attacker's chat
-    assert calls == []  # the victim's approval was NOT resolved
+    assert approval_calls == []  # the victim's approval was NOT resolved
     assert pid in adapter._pending_prompts  # left intact for its real owner
 
 
 @pytest.mark.asyncio
-async def test_prompt_response_allows_owner_in_per_user_channel(monkeypatch):
+async def test_prompt_response_allows_owner_in_per_user_channel(approval_calls):
     adapter, _stub = _adapter()
     adapter.config.extra["group_sessions_per_user"] = True
-    owner_key = build_session_key(_owner_source(), group_sessions_per_user=True)
+    owner = _inbound_channel_event("owner")
+    owner_key = _own_a_session(adapter, owner)
     pid = adapter._mint_prompt(
         "exec_approval", {"session_key": owner_key, "chat_id": "chan42"}
     )
 
-    calls: list = []
-    monkeypatch.setattr(
-        "tools.approval.resolve_gateway_approval",
-        lambda sk, choice, **kw: calls.append((sk, choice)) or 1,
-    )
     consumed = await adapter._consume_prompt_response(
-        _channel_event(pid, "always", user_id="owner")
+        _prompt_response_event(owner, pid, "always")
     )
     assert consumed is True
-    assert calls == [(owner_key, "always")]
+    assert approval_calls == [(owner_key, "always")]
     assert pid not in adapter._pending_prompts
 
 
 @pytest.mark.asyncio
-async def test_prompt_response_shared_channel_allows_any_member(monkeypatch):
+async def test_prompt_response_shared_channel_allows_any_member(approval_calls):
     """A shared session (group_sessions_per_user=False) has no participant id in
     its key, so every co-member is a legitimate responder — the fix must not
     regress that."""
     adapter, _stub = _adapter()
     adapter.config.extra["group_sessions_per_user"] = False
-    shared_key = build_session_key(_owner_source(), group_sessions_per_user=False)
+    shared_key = _own_a_session(adapter, _inbound_channel_event("owner"))
+    assert adapter._session_owner_by_key == {}  # a shared key is never owned
     pid = adapter._mint_prompt(
         "exec_approval", {"session_key": shared_key, "chat_id": "chan42"}
     )
 
-    calls: list = []
-    monkeypatch.setattr(
-        "tools.approval.resolve_gateway_approval",
-        lambda sk, choice, **kw: calls.append((sk, choice)) or 1,
-    )
+    other = _inbound_channel_event("someone_else")
     consumed = await adapter._consume_prompt_response(
-        _channel_event(pid, "always", user_id="someone_else")
+        _prompt_response_event(other, pid, "always")
     )
     assert consumed is True
-    assert calls == [(shared_key, "always")]
+    assert approval_calls == [(shared_key, "always")]
+
+
+@pytest.mark.asyncio
+async def test_prompt_response_unowned_session_still_resolves(approval_calls):
+    """A session this adapter never saw inbound (cron-/API-started turn) has no
+    recorded owner and must keep resolving — the gate adds a check, it must not
+    add a dead end."""
+    adapter, _stub = _adapter()
+    pid = adapter._mint_prompt(
+        "exec_approval", {"session_key": "agent:main:discord:channel:elsewhere", "chat_id": "chan42"}
+    )
+    assert await adapter._consume_prompt_response(
+        _prompt_response_event(_inbound_channel_event("whoever"), pid, "once")
+    ) is True
+    assert approval_calls == [("agent:main:discord:channel:elsewhere", "once")]
+
+
+# ── the same guard across the two relay lanes ────────────────────────────
+#
+# A Discord conversation arrives over the connector inbound lane, which KEEPS
+# the underlying platform (agent:main:discord:…), but its buttons come back on
+# the passthrough plane, where _discord_interaction_to_event normalizes to
+# Platform.RELAY and drops thread_id (agent:main:relay:channel:…). Ownership
+# must therefore be decided on the participant id, not on a re-derived key.
+
+
+@pytest.mark.asyncio
+async def test_discord_button_owner_resolves_across_relay_lanes(approval_calls):
+    adapter, _stub = _adapter(platform="discord")
+    adapter.config.extra["group_sessions_per_user"] = True
+    owner = _inbound_channel_event("owner")
+    owner_key = _own_a_session(adapter, owner)
+    assert owner_key.startswith("agent:main:discord:")  # the inbound lane's key
+    pid = adapter._mint_prompt(
+        "exec_approval", {"session_key": owner_key, "chat_id": "chan42"}
+    )
+
+    await adapter._on_passthrough(_discord_button_forward(pid, "always", "owner"))
+    assert approval_calls == [(owner_key, "always")]
+    assert pid not in adapter._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_discord_button_non_owner_rejected_across_relay_lanes(approval_calls):
+    adapter, _stub = _adapter(platform="discord")
+    adapter.config.extra["group_sessions_per_user"] = True
+    owner_key = _own_a_session(adapter, _inbound_channel_event("owner"))
+    pid = adapter._mint_prompt(
+        "exec_approval", {"session_key": owner_key, "chat_id": "chan42"}
+    )
+
+    await adapter._on_passthrough(_discord_button_forward(pid, "always", "attacker"))
+    assert approval_calls == []
+    assert pid in adapter._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_button_owner_resolves_across_relay_lanes(approval_calls):
+    """The lanes disagree about threads too: the connector sends a Discord
+    thread as chat_type=thread + thread_id, while the interaction body only has
+    the thread's channel_id. Per-user threads (thread_sessions_per_user) are the
+    case where that key would diverge on two segments, not just the platform."""
+    adapter, _stub = _adapter(platform="discord")
+    adapter.config.extra["group_sessions_per_user"] = True
+    adapter.config.extra["thread_sessions_per_user"] = True
+    owner = _inbound_channel_event(
+        "owner", chat_id="th9", chat_type="thread", thread_id="th9"
+    )
+    owner_key = _own_a_session(adapter, owner)
+    assert owner_key == "agent:main:discord:thread:th9:th9:owner"
+    pid = adapter._mint_prompt(
+        "exec_approval", {"session_key": owner_key, "chat_id": "th9"}
+    )
+
+    await adapter._on_passthrough(
+        _discord_button_forward(pid, "once", "owner", channel_id="th9")
+    )
+    assert approval_calls == [(owner_key, "once")]

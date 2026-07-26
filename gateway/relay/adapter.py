@@ -31,6 +31,11 @@ from gateway.session import SessionSource, build_session_key
 
 logger = logging.getLogger(__name__)
 
+# Cap on _session_owner_by_key (one small string pair per per-user channel
+# session this gateway has seen). Comfortably above the per-user session count
+# of any single relayed workspace, so trimming only ever drops long-idle rows.
+_SESSION_OWNER_CACHE_MAX = 2048
+
 
 def _utf16_len(text: str) -> int:
     """Count UTF-16 code units (Telegram's length unit)."""
@@ -103,6 +108,19 @@ class RelayAdapter(BasePlatformAdapter):
         # Entries expire lazily (see _pop_prompt) so an unanswered prompt
         # never leaks. Keyed by our own minted 8-hex ids.
         self._pending_prompts: Dict[str, Dict[str, Any]] = {}
+        # session_key -> the participant id that session belongs to, for keys
+        # that isolate ONE member (per-user group/channel sessions). Recorded
+        # from the inbound source that minted the key (_remember_session_owner)
+        # rather than re-derived when an answer arrives, because a prompt answer
+        # can come back on a DIFFERENT lane whose source normalizes differently:
+        # a Discord component press travels the passthrough plane, where
+        # _discord_interaction_to_event stamps Platform.RELAY and carries no
+        # thread_id, so build_session_key over it yields a different STRING for
+        # the very same conversation (agent:main:relay:channel:… vs
+        # agent:main:discord:thread:…). Participant ids are identical on both
+        # lanes, so ownership is compared on them. Shared sessions are never
+        # recorded — an absent entry means "no single owner" and fails open.
+        self._session_owner_by_key: Dict[str, str] = {}
 
     # ── capability surface (from descriptor) ─────────────────────────────
     @property
@@ -314,6 +332,10 @@ class RelayAdapter(BasePlatformAdapter):
             egress guard declines the reply as 'target not routed to an
             onboarded tenant'. See gateway-gateway routedEgressGuard.ts /
             discordTenant.ts (makeDiscordTenantOf).
+
+        Also the capture point for per-user session ownership
+        (_remember_session_owner) — same "learn it from the inbound source"
+        shape, read back when an interactive prompt is answered.
         """
         try:
             src = getattr(event, "source", None)
@@ -344,8 +366,49 @@ class RelayAdapter(BasePlatformAdapter):
             scope = getattr(src, "scope_id", None)
             if scope:
                 self._scope_by_chat[str(chat)] = str(scope)
+            self._remember_session_owner(src)
         except Exception:  # noqa: BLE001 - scope tracking must never break inbound
             pass
+
+    def _remember_session_owner(self, src) -> None:
+        """Record which participant owns this event's session key (Phase 3 authz).
+
+        Only keys that ISOLATE one member are recorded. ``build_session_key``
+        appends the participant id last and only when isolation applies, so a
+        key ending in this sender's own id is per-user; anything else (a shared
+        group/channel, a shared thread, a DM) is deliberately left unowned so
+        every member can still answer its prompts.
+
+        Captured here — on the lane that CREATED the session — because the lane
+        that answers a prompt may normalize the same conversation to a different
+        key (see ``_session_owner_by_key``). Never raises: this runs inside
+        ``_capture_scope``'s inbound-safe try.
+        """
+        if getattr(src, "chat_type", None) == "dm":
+            return
+        participant = getattr(src, "user_id_alt", None) or getattr(src, "user_id", None)
+        if not participant:
+            return
+        key = build_session_key(
+            src,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        )
+        if not key.endswith(f":{participant}"):
+            return  # shared session — no single owner to protect
+        self._session_owner_by_key[str(key)] = str(participant)
+        # Bounded: an entry is only useful while a prompt for that session can
+        # still be answered (_pop_prompt expires them), so trimming the oldest
+        # insertions can never strand a live prompt for long. Dicts preserve
+        # insertion order, so the tail is the most recently seen.
+        excess = len(self._session_owner_by_key) - _SESSION_OWNER_CACHE_MAX
+        if excess > 0:
+            for stale in list(self._session_owner_by_key)[:excess]:
+                self._session_owner_by_key.pop(stale, None)
 
     def _with_scope(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Ensure the outbound metadata carries the discriminator(s) the connector's
@@ -1353,36 +1416,48 @@ class RelayAdapter(BasePlatformAdapter):
         )
 
     def _caller_owns_prompt_session(self, event, session_key: str) -> bool:
-        """True when the prompt answer's author owns ``session_key``.
+        """True when the prompt answer's author may resolve ``session_key``.
 
         ``_consume_prompt_response`` resolves a click *before* ``handle_message``
         (see ``_on_passthrough``), so the normal ``_is_user_authorized`` gate
-        never runs for a consumed prompt. Re-derive the caller's session key the
-        same way ``handle_message`` does and require an exact match: a shared
-        (non-per-user) session collapses every member's source to one key so all
-        stay allowed, while a per-user key carries the participant id so only its
-        owner matches. DMs are 1:1 (their key has no participant id) and fail
-        open; an empty ``session_key`` fails open, a derivation error fails
-        closed.
+        never runs for a consumed prompt. Compare the clicker against the owner
+        ``_remember_session_owner`` recorded for that session — the same
+        ``operator == session_user`` shape the native qqbot adapter uses, but
+        without its session-key parser (``build_session_key``'s trailing segment
+        is a participant id or a thread id depending on the shape above it, which
+        is exactly why ``gateway/run.py``'s ``_parse_session_key`` refuses to
+        interpret it).
+
+        Ownership is compared on the participant id rather than on a re-derived
+        session key because the two relay lanes normalize the same conversation
+        differently — see ``_session_owner_by_key``.
+
+        Fails open where there is no single owner to protect: an empty
+        ``session_key``, a shared group/thread session, a DM (1:1 by
+        construction), or a session this adapter never saw inbound (a cron- or
+        API-started turn, which is unchanged from before this gate existed).
+        A prompt answer carrying no author at all fails closed.
         """
         if not session_key:
             return True
-        source = getattr(event, "source", None)
-        if source is None or getattr(source, "chat_type", None) == "dm":
+        owner = self._session_owner_by_key.get(str(session_key))
+        if not owner:
             return True
-        try:
-            caller_key = build_session_key(
-                source,
-                group_sessions_per_user=self.config.extra.get(
-                    "group_sessions_per_user", True
-                ),
-                thread_sessions_per_user=self.config.extra.get(
-                    "thread_sessions_per_user", False
-                ),
-            )
-        except Exception:  # noqa: BLE001 - a derivation failure must fail closed
+        source = getattr(event, "source", None)
+        if source is None:
             return False
-        return caller_key == session_key
+        # Either identifier the same authenticated author can present: the
+        # connector may send a platform-stable alt id inbound (Signal UUID,
+        # Feishu union_id) where the passthrough lane only has the raw user id.
+        caller_ids = {
+            str(candidate)
+            for candidate in (
+                getattr(source, "user_id_alt", None),
+                getattr(source, "user_id", None),
+            )
+            if candidate
+        }
+        return owner in caller_ids
 
     async def _consume_prompt_response(self, event) -> bool:
         """Route an inbound prompt_response to its waiting primitive.
