@@ -14,6 +14,11 @@ const isEscapedAt = (text: string, index: number) => {
   return slashCount % 2 === 1
 }
 
+const isUnescapedDollarAt = (text: string, index: number) => text[index] === '$' && !isEscapedAt(text, index)
+
+export const unescapeMarkdownDollars = (text: string) =>
+  text.replace(/(\\+)\$/g, (_match, slashes: string) => `${'\\'.repeat(Math.floor(slashes.length / 2))}$`)
+
 const isLikelyNumericInlineMath = (body: string, followingCharacter: string) => {
   const value = body.trim()
 
@@ -66,10 +71,9 @@ const findNextUnescapedDollar = (text: string, fromIndex: number) => {
 export const findNextInlineMath = (text: string, fromIndex = 0): InlineMathSpan | null => {
   for (let openingIndex = fromIndex; openingIndex < text.length; openingIndex += 1) {
     if (
-      text[openingIndex] !== '$' ||
-      isEscapedAt(text, openingIndex) ||
-      text[openingIndex - 1] === '$' ||
-      text[openingIndex + 1] === '$'
+      !isUnescapedDollarAt(text, openingIndex) ||
+      isUnescapedDollarAt(text, openingIndex - 1) ||
+      isUnescapedDollarAt(text, openingIndex + 1)
     ) {
       continue
     }
@@ -91,8 +95,8 @@ export const findNextInlineMath = (text: string, fromIndex = 0): InlineMathSpan 
     const body = text.slice(openingIndex + 1, closingIndex)
 
     if (
-      text[closingIndex - 1] === '$' ||
-      text[closingIndex + 1] === '$' ||
+      isUnescapedDollarAt(text, closingIndex - 1) ||
+      isUnescapedDollarAt(text, closingIndex + 1) ||
       !body ||
       /^\s/u.test(body) ||
       /\s$/u.test(body) ||

@@ -185,12 +185,17 @@ describe('inline math tokenization', () => {
     expect(dollarMatches(String.raw`three slashes: \\\$x$`)).toEqual([])
   })
 
+  it('allows escaped literal dollars next to inline math delimiters', () => {
+    expect(dollarMatches(String.raw`\$$x$`)).toEqual(['$x$'])
+    expect(dollarMatches(String.raw`$x\$$`)).toEqual([String.raw`$x\$$`])
+  })
+
   it('keeps dollar math inside inline code verbatim', () => {
     const rendered = renderPlain(
-      React.createElement(Md, { t: DEFAULT_THEME, text: 'code: `$x^2$`; math: $x^2$' })
+      React.createElement(Md, { t: DEFAULT_THEME, text: 'code: `$x^2$ and \\$x$`; math: $x^2$' })
     ).join('\n')
 
-    expect(rendered).toContain('code: $x^2$; math: x²')
+    expect(rendered).toContain(String.raw`code: $x^2$ and \$x$; math: x²`)
   })
 
   it.each(['$4$', '$2/3$', '$5x=10$', '$4xy$', '$10kg$'])('preserves numeric inline math: %s', input => {
@@ -230,8 +235,18 @@ describe('inline math tokenization', () => {
     expect(rendered).toContain('x² is valid math')
     expect(rendered).toContain('it costs $5 and $10')
     expect(rendered).toContain('$5-$10')
-    expect(rendered).toContain('literal \\$x$')
+    expect(rendered).toContain('literal $x$')
+    expect(rendered).not.toContain('literal \\$x$')
     expect(rendered).toContain('formula x + $5')
+  })
+
+  it('renders escaped literal dollars adjacent to math without leaking escapes', () => {
+    const text = [String.raw`literal then math: \$$x$`, String.raw`math then literal: $x\$$`].join('\n')
+    const rendered = renderPlain(React.createElement(Md, { t: DEFAULT_THEME, text })).join('\n')
+
+    expect(rendered).toContain('literal then math: $x')
+    expect(rendered).toContain('math then literal: x$')
+    expect(rendered).not.toContain('\\$')
   })
 })
 

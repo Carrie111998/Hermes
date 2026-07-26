@@ -3,7 +3,12 @@ import { Fragment, memo, type ReactNode, useMemo } from 'react'
 
 import { ensureEmojiPresentation } from '../lib/emoji.js'
 import { normalizeExternalUrl, urlSlugTitleLabel, useLinkTitle } from '../lib/externalLink.js'
-import { findNextInlineMath, type InlineMathSpan, stripInlineMathDelimiters } from '../lib/inlineMath.js'
+import {
+  findNextInlineMath,
+  type InlineMathSpan,
+  stripInlineMathDelimiters,
+  unescapeMarkdownDollars
+} from '../lib/inlineMath.js'
 import { BOX_CLOSE, BOX_OPEN, texToUnicode } from '../lib/mathUnicode.js'
 import { highlightLine, isHighlightable } from '../lib/syntax.js'
 import type { Theme } from '../theme.js'
@@ -603,7 +608,7 @@ function MdInline({ color, t, text }: { color?: string; t: Theme; text: string }
     const k = parts.length
 
     if (i > last) {
-      parts.push(<Text key={k}>{text.slice(last, i)}</Text>)
+      parts.push(<Text key={k}>{unescapeMarkdownDollars(text.slice(last, i))}</Text>)
     }
 
     if (token.kind === 'math') {
@@ -714,12 +719,12 @@ function MdInline({ color, t, text }: { color?: string; t: Theme; text: string }
   }
 
   if (last < text.length) {
-    parts.push(<Text key={parts.length}>{text.slice(last)}</Text>)
+    parts.push(<Text key={parts.length}>{unescapeMarkdownDollars(text.slice(last))}</Text>)
   }
 
   return (
     <Text {...(color ? { color } : {})} wrap="wrap-trim">
-      {parts.length ? parts : text}
+      {parts.length ? parts : unescapeMarkdownDollars(text)}
     </Text>
   )
 }
