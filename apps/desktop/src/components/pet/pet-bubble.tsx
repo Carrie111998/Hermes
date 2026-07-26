@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useState } from 'react'
 
 import { AlertCircle, Clock, type IconComponent } from '@/lib/icons'
-import { $petActivity, $petState, type PetState } from '@/store/pet'
+import { $petActivity, $petState, type PetActivity, type PetState } from '@/store/pet'
 
 /**
  * Speech bubble + status glyph for the popped-out pet overlay — the
@@ -88,9 +88,23 @@ function pick(lines: string[], prev: string): string {
   return next
 }
 
-export function PetBubble() {
-  const state = useStore($petState)
-  const activity = useStore($petActivity)
+interface PetBubbleProps {
+  /** Per-profile override; falls back to the global `$petState` when absent. */
+  state?: PetState
+  /** Per-profile override; falls back to the global `$petActivity` when absent. */
+  activity?: PetActivity
+}
+
+/**
+ * The bubble derives everything from `state` / `activity`. When those props are
+ * absent it reads the global atoms (the single-pet overlay path); a multi-pet
+ * slot injects its own profile's slice so one component serves both surfaces.
+ */
+export function PetBubble({ state: stateProp, activity: activityProp }: PetBubbleProps) {
+  const globalState = useStore($petState)
+  const globalActivity = useStore($petActivity)
+  const state = stateProp ?? globalState
+  const activity = activityProp ?? globalActivity
   const [line, setLine] = useState('')
 
   // Finish beats are carried by the sprite/mail icon; idle only speaks up when

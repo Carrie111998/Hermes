@@ -19,10 +19,12 @@ import {
 } from '@/store/pet'
 import { resetPetGallery, setPetScale } from '@/store/pet-gallery'
 import { $petOverlayActive, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
+import { $petRoster } from '@/store/pet-roster'
 import { $gatewayState } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
 
+import { MultiPetContainer } from './multi-pet-container'
 import { PetSprite, roamWalkRow } from './pet-sprite'
 import { usePetRoam } from './use-pet-roam'
 import { type PetZoomAnchor, usePetZoomGesture } from './use-pet-zoom-gesture'
@@ -111,7 +113,24 @@ function loadPosition(): Point {
 const PET_POLL_MS = 3000
 const PET_ACTIVE_REFRESH_MS = 15000
 
+/**
+ * The floating mascot, branched on the roster MODE (not entry count). `pinned`
+ * mode renders the multi-pet row; `follow-active` keeps the legacy single pet
+ * that tracks `$activeGatewayProfile` (zero behavior change). The branch lives
+ * in this wrapper so each path keeps a stable hook order (rules-of-hooks) — the
+ * follow-active body below is unchanged.
+ */
 export function FloatingPet() {
+  const mode = useStore($petRoster).mode
+
+  if (mode === 'pinned') {
+    return <MultiPetContainer />
+  }
+
+  return <FollowActiveFloatingPet />
+}
+
+function FollowActiveFloatingPet() {
   const { requestGateway } = useGatewayRequest()
   const { resolvedMode } = useTheme()
   const gatewayState = useStore($gatewayState)
