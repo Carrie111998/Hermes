@@ -614,7 +614,7 @@ class GatewayAuthorizationMixin:
         platform_allowlist = _auth_env(platform_env_map.get(source.platform, ""))
         group_user_allowlist = ""
         group_chat_allowlist = ""
-        if source.chat_type in {"group", "forum"}:
+        if source.chat_type in {"group", "forum", "channel"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
             group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
@@ -686,8 +686,12 @@ class GatewayAuthorizationMixin:
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
-        # the sender user ID for group/forum messages.
-        if group_chat_allowlist and source.chat_type in {"group", "forum"} and source.chat_id:
+        # the sender user ID for group/forum/channel messages.
+        if (
+            group_chat_allowlist
+            and source.chat_type in {"group", "forum", "channel"}
+            and source.chat_id
+        ):
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_chat_allowlist.split(",") if chat_id.strip()
             }
@@ -703,7 +707,7 @@ class GatewayAuthorizationMixin:
         if (
             source.platform == Platform.TELEGRAM
             and group_user_allowlist
-            and source.chat_type in {"group", "forum"}
+            and source.chat_type in {"group", "forum", "channel"}
             and source.chat_id
         ):
             legacy_chat_ids = {
@@ -724,7 +728,7 @@ class GatewayAuthorizationMixin:
                 if source.chat_id in legacy_chat_ids:
                     return True
 
-        # Check if user is in any allowlist. In group/forum chats,
+        # Check if user is in any allowlist. In group/forum/channel chats,
         # TELEGRAM_GROUP_ALLOWED_USERS is the scoped allowlist and should not
         # imply DM access; TELEGRAM_ALLOWED_USERS remains the platform-wide
         # allowlist and still works everywhere for backward compatibility.

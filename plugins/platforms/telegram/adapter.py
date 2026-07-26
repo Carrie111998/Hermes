@@ -260,7 +260,7 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
-from gateway.authz_mixin import _telegram_config_authorizes_source
+from gateway.authz_mixin import _auth_env, _telegram_config_authorizes_source
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -997,7 +997,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     def _telegram_auth_env_configured(self) -> bool:
-        """Return True when Telegram auth env vars make an early decision safe."""
+        """Return True when profile-scoped auth vars make an early decision safe."""
         keys = (
             "TELEGRAM_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -1006,7 +1006,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "GATEWAY_ALLOWED_USERS",
             "GATEWAY_ALLOW_ALL_USERS",
         )
-        return any(os.getenv(key, "").strip() for key in keys)
+        return any(_auth_env(key) for key in keys)
 
     def _is_user_authorized_from_message(self, message: Message) -> bool:
         """Check if the sender of a Telegram message is authorized.
@@ -1054,13 +1054,32 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        auth_is_configured = (
+            config_authorized is not None or self._telegram_auth_env_configured()
+        )
+
+        # The gateway registers a profile-bound callback on every adapter.
+        # Prefer it over introspecting the message handler: multiplex handlers
+        # are closures, not bound runner methods, while this callback preserves
+        # the profile's pairing store and secret scope.
+        registered_auth = getattr(self, "_authorization_check", None)
+        if callable(registered_auth) and auth_is_configured:
+            try:
+                return bool(registered_auth(user_id, source.chat_type, source.chat_id))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Falling back after registered auth failed for user %s",
+                    user_id,
+                    exc_info=True,
+                )
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             # Only make an early decision via the runner when an allowlist
             # actually exists; otherwise unknown DMs must reach the pairing
             # flow rather than being default-denied here.
-            if config_authorized is None and not self._telegram_auth_env_configured():
+            if not auth_is_configured:
                 return True
             try:
                 return bool(auth_fn(source))
@@ -1071,9 +1090,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        if os.getenv("TELEGRAM_ALLOW_ALL_USERS", "").lower().strip() in {"true", "1", "yes"}:
+        if _auth_env("TELEGRAM_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower().strip() in {"true", "1", "yes"}:
+        if _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
 
         # Bare adapters have no runner to combine config and environment
@@ -1084,13 +1103,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 "allow_from": ",".join(
                     value
                     for value in (
-                        os.getenv("TELEGRAM_ALLOWED_USERS", "").strip(),
-                        os.getenv("GATEWAY_ALLOWED_USERS", "").strip(),
+                        _auth_env("TELEGRAM_ALLOWED_USERS"),
+                        _auth_env("GATEWAY_ALLOWED_USERS"),
                     )
                     if value
                 ),
-                "group_allow_from": os.getenv("TELEGRAM_GROUP_ALLOWED_USERS", "").strip(),
-                "group_allowed_chats": os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "").strip(),
+                "group_allow_from": _auth_env("TELEGRAM_GROUP_ALLOWED_USERS"),
+                "group_allowed_chats": _auth_env("TELEGRAM_GROUP_ALLOWED_CHATS"),
             },
         )
         if env_authorized is True:
