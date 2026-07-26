@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -148,6 +149,37 @@ def test_warm_roots_probes_in_parallel_and_fills_the_cache(monkeypatch):
     before = live["calls"]
     assert git_probe.repo_root("/repo0") == "/repo0"
     assert live["calls"] == before
+
+
+def test_resolve_normalizes_both_roots(monkeypatch):
+    # `resolve()` must normpath both roots so the two probe sources agree on
+    # one spelling. On Windows `--show-toplevel` prints forward slashes while
+    # common_repo_root() (via realpath) returns backslashes; unnormalized, the
+    # downstream main-checkout comparison always fails and every main checkout
+    # is misclassified as a linked worktree (issue #71837).
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "/repo/sub/..")
+    monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "/repo/./")
+
+    assert git_probe.resolve("/repo/x") == {"repo_root": "/repo", "worktree_root": "/repo"}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific regression (issue #71837)")
+def test_resolve_folds_forward_slash_toplevel_into_backslash_common_root(monkeypatch):
+    # The exact defect from issue #71837: git prints `C:/Users/x/repo`,
+    # realpath spells the common root `C:\Users\x\repo`. After normalization
+    # both fields must agree so the main checkout classifies as main.
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "C:/Users/x/repo")
+    monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "C:\\Users\\x\\repo")
+
+    info = git_probe.resolve("C:\\Users\\x\\repo")
+
+    assert info["repo_root"] == info["worktree_root"] == "C:\\Users\\x\\repo"
 
 
 def test_create_list_roundtrip(tmp_path):

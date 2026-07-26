@@ -212,7 +212,14 @@ def _place_by_heuristic(path: str) -> Optional[dict]:
         repo_path = _with_base_name(path, m.group(1))
         return _placement(repo_path, path, m.group(2), path, False, False)
 
-    return _placement(path, path, base, path, True, False)
+    # Emit the canonical `<root>::branch::main` lane id, NOT the raw path: the
+    # desktop's live overlay computes `branchLaneId(root, 'main')` for every
+    # live session and only falls back to isMain+label matching — a path-keyed
+    # lane matches neither, so it would inject a duplicate synthetic "main"
+    # lane next to this one (issue #71837).
+    return _placement(
+        path, _branch_lane_id(path, DEFAULT_BRANCH_LABEL), DEFAULT_BRANCH_LABEL, path, True, False
+    )
 
 
 def _place(cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: str) -> Optional[dict]:
@@ -221,7 +228,11 @@ def _place(cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: st
     if info and info.get("repo_root") and info.get("worktree_root"):
         repo_root = info["repo_root"]
         worktree_root = info["worktree_root"]
-        is_main = worktree_root == repo_root or bool(info.get("is_main"))
+        # Separator/case-agnostic comparison: a resolver may spell the two
+        # roots differently on Windows (git prints `C:/x/repo`, realpath
+        # returns `C:\x\repo`). A raw `==` would misclassify every main
+        # checkout as a linked worktree (issue #71837).
+        is_main = _path_key(worktree_root) == _path_key(repo_root) or bool(info.get("is_main"))
 
         if is_main:
             # Unrecorded branch folds into the one trunk lane, so a repo never

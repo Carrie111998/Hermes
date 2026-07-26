@@ -193,7 +193,10 @@ def test_non_git_cwd_preserves_legacy_workspace_grouping():
     assert project["isAuto"] is True
     assert project["label"] == "notes"
     assert project["sessionCount"] == 1
-    assert _lane_ids(project) == ["/work/notes"]
+    # Canonical branch-lane id, NOT the raw path: the desktop live overlay
+    # matches lanes by `<root>::branch::main` (or isMain + "main" label) and
+    # injects a duplicate lane when neither matches (issue #71837).
+    assert _lane_ids(project) == ["/work/notes::branch::main"]
     assert tree["scoped_session_ids"] == [legacy["id"]]
 
 
@@ -579,3 +582,47 @@ def test_colliding_repo_basenames_disambiguate_labels():
     labels = sorted(p["label"] for p in tree["projects"])
 
     assert labels == ["x/proj", "y/proj"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #71837 — Windows duplicate branch lanes (backend/frontend lane-id
+# mismatch): mixed-separator roots and heuristic (non-git) lane ids.
+# ---------------------------------------------------------------------------
+
+
+def test_windows_mixed_separator_roots_still_classify_as_main_checkout():
+    # On Windows `git rev-parse --show-toplevel` prints forward slashes while
+    # the common-root probe goes through realpath and returns backslashes.
+    # Placement must not depend on byte equality of the two spellings, or the
+    # main checkout degrades to a path-keyed worktree lane the desktop live
+    # overlay cannot match — which then injects a duplicate "main" lane.
+    repo_bs = r"C:\Users\alice\repo"
+    resolve = _resolver({repo_bs: (repo_bs, "C:/Users/alice/repo")})
+    sessions = [_session(repo_bs, branch="main")]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = tree["projects"][0]
+    lanes = [g for repo in project["repos"] for g in repo["groups"]]
+
+    assert len(lanes) == 1
+    assert lanes[0]["id"] == repo_bs + "::branch::main"
+    assert lanes[0]["isMain"] is True
+    assert lanes[0]["label"] == "main"
+
+
+def test_non_git_folder_lane_uses_canonical_branch_lane_id():
+    # Heuristic (non-git) folders must emit `<root>::branch::main` with an
+    # isMain "main" label — the same convention the desktop live overlay
+    # computes via branchLaneId(root, 'main') — instead of a raw path lane id
+    # labeled by the folder basename, which matches neither of the overlay's
+    # lookups and produces a second synthetic lane with the same sessions.
+    cwd = r"C:\Users\alice\workspace\notes"
+    sessions = [_session(cwd)]
+
+    tree = pt.build_tree([], sessions, [], resolve=lambda _cwd: None, hydrate=True)
+    project = tree["projects"][0]
+    lane = project["repos"][0]["groups"][0]
+
+    assert lane["id"] == cwd + "::branch::main"
+    assert lane["label"] == "main"
+    assert lane["isMain"] is True
