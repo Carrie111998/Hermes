@@ -926,6 +926,54 @@ def load_on_disk_store() -> "MemoryStore":
     return store
 
 
+def _validate_batch_operations(operations: List[Dict[str, Any]]) -> Optional[str]:
+    """Reject malformed batch operations before approval can stage their payload."""
+    for index, operation in enumerate(operations):
+        prefix = f"Operation {index + 1}"
+        if not isinstance(operation, dict):
+            return tool_error(f"{prefix} must be an object with an action.", success=False)
+        action = operation.get("action")
+        if not isinstance(action, str) or action not in {"add", "replace", "remove"}:
+            return tool_error(f"{prefix}: unknown action. Use add, replace, or remove.", success=False)
+        content = operation.get("content")
+        old_text = operation.get("old_text")
+        if action in {"add", "replace"} and (not isinstance(content, str) or not content.strip()):
+            return tool_error(f"{prefix}: content is required.", success=False)
+        if action in {"replace", "remove"} and (not isinstance(old_text, str) or not old_text.strip()):
+            return tool_error(f"{prefix}: old_text is required.", success=False)
+    return None
+
+
+def _preflight_memory_content(action: str, content: Optional[str]) -> Optional[str]:
+    """Reject unsafe new memory content before approval can stage it on disk.
+
+    Store-level scanning remains the durable final defense. This preflight only
+    closes the approval-gate ordering gap for add/replace requests.
+    """
+    if action not in {"add", "replace"} or not isinstance(content, str):
+        return None
+    scan_error = _scan_memory_content(content)
+    if scan_error:
+        return tool_error(scan_error, success=False)
+    return None
+
+
+def _preflight_batch_memory_content(operations: List[Dict[str, Any]]) -> Optional[str]:
+    """Reject any unsafe add/replace payload before a batch can be staged."""
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, dict):
+            continue  # Existing store validation owns malformed operation errors.
+        result = _preflight_memory_content(
+            operation.get("action"), operation.get("content"),
+        )
+        if result is not None:
+            return tool_error(
+                f"Operation {index + 1}: {json.loads(result)['error']}",
+                success=False,
+            )
+    return None
+
+
 def _apply_write_gate(action: str, target: str, content: Optional[str],
                       old_text: Optional[str]) -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
@@ -1096,6 +1144,12 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        batch_validation = _validate_batch_operations(operations)
+        if batch_validation is not None:
+            return batch_validation
+        preflight_result = _preflight_batch_memory_content(operations)
+        if preflight_result is not None:
+            return preflight_result
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1118,6 +1172,10 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+
+    preflight_result = _preflight_memory_content(action, content)
+    if preflight_result is not None:
+        return preflight_result
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
