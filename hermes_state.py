@@ -2180,12 +2180,18 @@ class SessionDB:
 
         def _table_layout(name: str) -> str:
             row = cursor.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='table' AND name=? COLLATE NOCASE",
                 (name,),
             ).fetchone()
             if row is None:
                 return "missing"
-            sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+            actual_name = str(row[0]).lower()
+            sql_value = row[1]
+            if isinstance(row, sqlite3.Row):
+                actual_name = str(row["name"]).lower()
+                sql_value = row["sql"]
+            sql = sql_value or ""
             columns = [
                 str(item[1]).lower()
                 for item in cursor.execute(
@@ -2215,7 +2221,11 @@ class SessionDB:
                 ("value", "exists"),
             ]:
                 position += 3
-            if position >= len(tokens) or tokens[position] != ("value", name):
+            if (
+                actual_name != name.lower()
+                or position >= len(tokens)
+                or tokens[position] != ("value", actual_name)
+            ):
                 return "ambiguous"
             position += 1
             if tokens[position : position + 3] != [
@@ -2324,12 +2334,20 @@ class SessionDB:
 
         def _current_trigram_view_is_valid() -> Optional[bool]:
             row = cursor.execute(
-                "SELECT sql FROM sqlite_master "
-                "WHERE type='view' AND name='messages_fts_trigram_src'"
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='view' "
+                "AND name='messages_fts_trigram_src' COLLATE NOCASE"
             ).fetchone()
             if row is None:
                 return None
-            sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
+            actual_name = str(row[0]).lower()
+            sql_value = row[1]
+            if isinstance(row, sqlite3.Row):
+                actual_name = str(row["name"]).lower()
+                sql_value = row["sql"]
+            if actual_name != "messages_fts_trigram_src":
+                return False
+            sql = sql_value or ""
             tokens = _tokens(sql)
             if not tokens:
                 return False
@@ -2368,7 +2386,7 @@ class SessionDB:
             placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
             surviving_triggers = cursor.execute(
                 f"SELECT 1 FROM sqlite_master WHERE type='trigger' "
-                f"AND name IN ({placeholders}) LIMIT 1",
+                f"AND lower(name) IN ({placeholders}) LIMIT 1",
                 _FTS_TRIGGERS,
             ).fetchone()
             if surviving_triggers and view_valid is not True:
@@ -2498,15 +2516,15 @@ class SessionDB:
         """
         cjk_present = bool(cursor.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'messages_fts_cjk'"
+            "AND name = 'messages_fts_cjk' COLLATE NOCASE"
         ).fetchone())
 
         cjk_live = []
         if cjk_present:
             cjk_live = [
                 r[0] for r in cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                    f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                    "SELECT lower(name) FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND lower(name) IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
                     _FTS_CJK_TRIGGERS,
                 ).fetchall()
             ]
@@ -2644,7 +2662,7 @@ class SessionDB:
         placeholders = ",".join("?" for _ in names)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
-            f"WHERE type = 'trigger' AND name IN ({placeholders})",
+            f"WHERE type = 'trigger' AND lower(name) IN ({placeholders})",
             names,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
@@ -2661,20 +2679,20 @@ class SessionDB:
         locked_ddl_resolver: Optional[
             Callable[[sqlite3.Cursor], str]
         ] = None,
+        repair_state: Optional[Dict[str, bool]] = None,
     ) -> bool:
-        """Atomically replace pre-column-list FTS UPDATE triggers.
+        """Atomically converge FTS maintenance triggers to proven-layout DDL.
 
         A cheap read-only preflight keeps already-converged opens free of a
-        write lock. Any apparent broad trigger is classified again only after
+        write lock. Any apparent mismatch is classified again only after
         ``BEGIN IMMEDIATE`` so two initializers cannot race. SQLite DDL is
         transactional; dropping and recreating each affected trigger before
-        COMMIT leaves no triggerless writer window and requires no FTS rebuild.
+        COMMIT leaves no triggerless writer window. Header-only UPDATE OF
+        narrowing does not require a rebuild; any body mismatch is reported to
+        the caller because prior writes may have left an indexing gap.
         """
-        candidate_names = (
-            "messages_fts_update",
-            "messages_fts_trigram_update",
-            "messages_fts_cjk_update",
-        )
+        candidate_names = _FTS_TRIGGERS + _FTS_CJK_TRIGGERS
+
         def _trigger_header_tokens(sql: str):
             """Lex CREATE TRIGGER SQL through BEGIN, preserving identifiers."""
             tokens = []
@@ -2795,9 +2813,143 @@ class SessionDB:
                 return frozenset(columns)
             return frozenset()
 
+        def _semantic_tokens(sql: str):
+            """Normalize SQL syntax while preserving literal values."""
+            tokens = []
+            index = 0
+            while index < len(sql):
+                char = sql[index]
+                if char.isspace():
+                    index += 1
+                    continue
+                if sql.startswith("--", index):
+                    newline = sql.find("\n", index + 2)
+                    index = len(sql) if newline < 0 else newline + 1
+                    continue
+                if sql.startswith("/*", index):
+                    end = sql.find("*/", index + 2)
+                    if end < 0:
+                        return None
+                    index = end + 2
+                    continue
+                if char in ("'", '"', "`", "["):
+                    closing = "]" if char == "[" else char
+                    value = []
+                    index += 1
+                    while index < len(sql):
+                        if sql[index] != closing:
+                            value.append(sql[index])
+                            index += 1
+                            continue
+                        if index + 1 < len(sql) and sql[index + 1] == closing:
+                            value.append(closing)
+                            index += 2
+                            continue
+                        index += 1
+                        break
+                    else:
+                        return None
+                    if char == "'":
+                        tokens.append(("string", "".join(value)))
+                    else:
+                        tokens.append(("word", "".join(value).lower()))
+                    continue
+                if char.isalpha() or char == "_":
+                    start = index
+                    index += 1
+                    while index < len(sql) and (
+                        sql[index].isalnum() or sql[index] in "_$"
+                    ):
+                        index += 1
+                    tokens.append(("word", sql[start:index].lower()))
+                    continue
+                tokens.append((char, char))
+                index += 1
+            while tokens and tokens[-1] == (";", ";"):
+                tokens.pop()
+            return tokens
+
+        def _trigger_semantics(sql: str):
+            """Return full trigger behavior, allowing only cosmetic SQL changes."""
+            tokens = _semantic_tokens(sql)
+            if not tokens:
+                return None
+            try:
+                position = 0
+                if tokens[position : position + 2] != [
+                    ("word", "create"),
+                    ("word", "trigger"),
+                ]:
+                    return None
+                position += 2
+                if tokens[position : position + 3] == [
+                    ("word", "if"),
+                    ("word", "not"),
+                    ("word", "exists"),
+                ]:
+                    position += 3
+                if position >= len(tokens) or tokens[position][0] != "word":
+                    return None
+                declared_name = tokens[position][1]
+                position += 1
+                if tokens[position] != ("word", "after"):
+                    return None
+                event = tokens[position + 1][1]
+                if event not in ("insert", "delete", "update"):
+                    return None
+                position += 2
+                columns = None
+                if event == "update" and tokens[position] == ("word", "of"):
+                    position += 1
+                    parsed_columns = set()
+                    expect_column = True
+                    while position < len(tokens) and tokens[position] != (
+                        "word",
+                        "on",
+                    ):
+                        kind, value = tokens[position]
+                        if expect_column:
+                            if kind != "word":
+                                return None
+                            parsed_columns.add(value)
+                        elif kind != ",":
+                            return None
+                        expect_column = not expect_column
+                        position += 1
+                    if expect_column or not parsed_columns:
+                        return None
+                    columns = frozenset(parsed_columns)
+                if position >= len(tokens) or tokens[position] != ("word", "on"):
+                    return None
+                position += 1
+                if position >= len(tokens) or tokens[position][0] != "word":
+                    return None
+                table_name = tokens[position][1]
+                position += 1
+                try:
+                    begin = tokens.index(("word", "begin"), position)
+                except ValueError:
+                    return None
+                header_tail = tuple(tokens[position:begin])
+                body = tokens[begin + 1 :]
+                while body and body[-1] == (";", ";"):
+                    body.pop()
+                if not body or body[-1] != ("word", "end"):
+                    return None
+                return (
+                    declared_name,
+                    event,
+                    columns,
+                    table_name,
+                    header_tail,
+                    tuple(body),
+                )
+            except (IndexError, ValueError):
+                return None
+
         def _parse_ddl(
             schema_ddl: str,
-        ) -> tuple[Dict[str, str], Dict[str, frozenset[str]]]:
+        ) -> tuple[Dict[str, str], Dict[str, tuple]]:
             statements: Dict[str, str] = {}
             statement = ""
             for line in schema_ddl.splitlines(keepends=True):
@@ -2811,33 +2963,53 @@ class SessionDB:
                         statements[name] = statement.strip()
                         break
                 statement = ""
-            columns = {name: _columns(sql) for name, sql in statements.items()}
-            return statements, columns
+            semantics = {
+                name: _trigger_semantics(sql) for name, sql in statements.items()
+            }
+            return statements, semantics
 
-        create_statements, expected_columns = _parse_ddl(ddl)
+        create_statements, expected_semantics = _parse_ddl(ddl)
         trigger_names = tuple(
             name for name in candidate_names if name in create_statements
         )
         if not trigger_names:
-            logger.warning("Could not locate narrowed FTS UPDATE trigger DDL")
+            logger.warning("Could not locate narrowed FTS trigger DDL")
             return False
-        if not all(expected_columns.values()):
-            logger.warning("Could not parse narrowed FTS UPDATE trigger DDL")
+        if not all(expected_semantics.values()):
+            logger.warning(
+                "Could not parse narrowed FTS trigger DDL: %s",
+                [name for name, value in expected_semantics.items() if value is None],
+            )
             return False
 
-        def _is_narrowed(name: str, sql: str) -> bool:
-            return _columns(sql) == expected_columns[name]
+        def _is_converged(name: str, sql: str) -> bool:
+            return _trigger_semantics(sql) == expected_semantics[name]
+
+        def _is_header_only_narrowing(name: str, sql: str) -> bool:
+            """True only when canonical behavior differs solely by UPDATE OF."""
+            actual = _trigger_semantics(sql)
+            expected = expected_semantics[name]
+            if actual is None or expected is None:
+                return False
+            if actual[1] != "update" or expected[1] != "update":
+                return False
+            return (
+                actual[0] == expected[0]
+                and actual[1] == expected[1]
+                and actual[3:] == expected[3:]
+                and actual[2] != expected[2]
+            )
 
         placeholders = ",".join("?" for _ in trigger_names)
 
         def _read_trigger_sql() -> Dict[str, str]:
             rows = cursor.execute(
-                f"SELECT name, sql FROM sqlite_master "
-                f"WHERE type = 'trigger' AND name IN ({placeholders})",
+                f"SELECT lower(name), sql FROM sqlite_master "
+                f"WHERE type = 'trigger' AND lower(name) IN ({placeholders})",
                 trigger_names,
             ).fetchall()
             return {
-                str(row[0]): str(row[1])
+                str(row[0]).lower(): str(row[1])
                 for row in rows
                 if row[1]
             }
@@ -2847,7 +3019,7 @@ class SessionDB:
         except sqlite3.OperationalError:
             return False
         if not any(
-            name in preflight and not _is_narrowed(name, preflight[name])
+            name in preflight and not _is_converged(name, preflight[name])
             for name in trigger_names
         ):
             return False
@@ -2867,30 +3039,35 @@ class SessionDB:
             # tables to v23 between the caller's layout read and this point.
             if locked_ddl_resolver is not None:
                 authoritative_ddl = locked_ddl_resolver(cursor)
-                create_statements, expected_columns = _parse_ddl(
+                create_statements, expected_semantics = _parse_ddl(
                     authoritative_ddl
                 )
                 trigger_names = tuple(
                     name for name in candidate_names if name in create_statements
                 )
-                if not trigger_names or not all(expected_columns.values()):
+                if not trigger_names or not all(expected_semantics.values()):
                     raise sqlite3.OperationalError(
                         "could not resolve authoritative FTS trigger DDL"
                     )
                 placeholders = ",".join("?" for _ in trigger_names)
 
             locked = _read_trigger_sql()
-            broad = [
+            mismatched = [
                 name
                 for name in trigger_names
-                if name in locked and not _is_narrowed(name, locked[name])
+                if name in locked and not _is_converged(name, locked[name])
             ]
-            for name in broad:
+            if repair_state is not None and any(
+                not _is_header_only_narrowing(name, locked[name])
+                for name in mismatched
+            ):
+                repair_state["requires_rebuild"] = True
+            for name in mismatched:
                 cursor.execute(f'DROP TRIGGER IF EXISTS "{name}"')
                 cursor.execute(create_statements[name])
             if owns_transaction:
                 cursor.execute("COMMIT")
-            return bool(broad)
+            return bool(mismatched)
         except BaseException:
             if owns_transaction:
                 try:
@@ -3633,15 +3810,15 @@ class SessionDB:
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
             had = bool(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('messages_fts', 'messages_fts_trigram') "
-                "AND sql LIKE 'CREATE VIRTUAL TABLE%' LIMIT 1"
+                "AND lower(name) IN ('messages_fts', 'messages_fts_trigram') "
+                "AND lower(sql) LIKE 'create virtual table%' LIMIT 1"
             ).fetchone())
             if had:
                 conn.execute("PRAGMA writable_schema=ON")
                 conn.execute(
                     "DELETE FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('messages_fts', 'messages_fts_trigram') "
-                    "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+                    "AND lower(name) IN ('messages_fts', 'messages_fts_trigram') "
+                    "AND lower(sql) LIKE 'create virtual table%'"
                 )
                 conn.execute("PRAGMA writable_schema=RESET")
                 shadows = [
@@ -4368,10 +4545,12 @@ class SessionDB:
                     for trigger in _FTS_TRIGRAM_TRIGGERS:
                         cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
 
+                trigger_repair_state: Dict[str, bool] = {}
                 self._migrate_broad_fts_update_triggers(
                     cursor,
                     base_ddl + "\n" + trigram_ddl,
                     locked_ddl_resolver=_authoritative_trigger_ddl,
+                    repair_state=trigger_repair_state,
                 )
                 base_triggers_need_repair = (
                     self._named_trigger_count(cursor, _FTS_TRIGGERS[:3]) < 3
@@ -4399,12 +4578,15 @@ class SessionDB:
                     )
                     self._trigram_available = trigram_enabled
                     needs_base_rebuild = (
-                        base_table_missing or base_triggers_need_repair
+                        base_table_missing
+                        or base_triggers_need_repair
+                        or trigger_repair_state.get("requires_rebuild", False)
                     )
                     needs_full_rebuild = (
                         trigram_table_missing
                         or triggers_need_repair
                         or trigram_stale
+                        or trigger_repair_state.get("requires_rebuild", False)
                     )
                     if not trigram_enabled:
                         self._mark_trigram_stale(cursor)
@@ -4443,10 +4625,12 @@ class SessionDB:
                 if trigram_table_missing:
                     for trigger in _FTS_TRIGRAM_TRIGGERS:
                         cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                trigger_repair_state: Dict[str, bool] = {}
                 self._migrate_broad_fts_update_triggers(
                     cursor,
                     migration_ddl,
                     locked_ddl_resolver=_authoritative_trigger_ddl,
+                    repair_state=trigger_repair_state,
                 )
                 base_triggers_need_repair = (
                     self._named_trigger_count(cursor, _FTS_TRIGGERS[:3]) < 3
@@ -4483,7 +4667,11 @@ class SessionDB:
                         # missing table. Disable writes to trigram and force a
                         # complete rebuild on the next capable open.
                         self._mark_trigram_stale(cursor)
-                        if base_table_missing or base_triggers_need_repair:
+                        if (
+                            base_table_missing
+                            or base_triggers_need_repair
+                            or trigger_repair_state.get("requires_rebuild", False)
+                        ):
                             self._rebuild_fts_indexes(
                                 cursor,
                                 include_trigram=False,
@@ -4493,6 +4681,7 @@ class SessionDB:
                         or base_table_missing
                         or trigram_table_missing
                         or trigram_stale
+                        or trigger_repair_state.get("requires_rebuild", False)
                     ):
                         # Shared progress markers govern both current indexes.
                         # Any repair or stale trigram breadcrumb therefore

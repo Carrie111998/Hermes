@@ -1849,6 +1849,219 @@ DROP TABLE IF EXISTS messages_fts;
         repaired.close()
 
 
+def test_present_current_tables_replace_legacy_inline_trigger_bodies(db_path):
+    """Canonical names cannot hide inline bodies on external-content storage."""
+    from hermes_state import LEGACY_FTS_SQL, SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("current-wrong-body", "test")
+    seeded.append_message(
+        "current-wrong-body", "user", content="oldbodyneedle"
+    )
+    seeded.close()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        for suffix in ("insert", "delete", "update"):
+            conn.execute(f"DROP TRIGGER messages_fts_{suffix}")
+        # Install the complete opposite-family standard trigger set while
+        # retaining exact current vtables and current trigram triggers.
+        statements = []
+        statement = ""
+        for line in LEGACY_FTS_SQL.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                if "CREATE TRIGGER" in statement:
+                    statements.append(statement)
+                statement = ""
+        for statement in statements:
+            conn.execute(statement.lower())
+        conn.commit()
+
+    repaired = SessionDB(db_path=db_path)
+    try:
+        with repaired._lock:
+            repaired._conn.execute(
+                "UPDATE messages SET content='newbodyneedle' WHERE id=1"
+            )
+            repaired._conn.commit()
+            assert repaired._conn.execute(
+                "SELECT rowid FROM messages_fts "
+                "WHERE messages_fts MATCH 'oldbodyneedle'"
+            ).fetchall() == []
+            assert [
+                row[0]
+                for row in repaired._conn.execute(
+                    "SELECT rowid FROM messages_fts "
+                    "WHERE messages_fts MATCH 'newbodyneedle'"
+                ).fetchall()
+            ] == [1]
+            repaired._conn.execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')"
+            )
+    finally:
+        repaired.close()
+
+
+def test_present_legacy_inline_tables_replace_current_trigger_bodies(db_path):
+    """External-content bodies cannot survive on exact inline tables."""
+    from hermes_state import (
+        FTS_SQL,
+        LEGACY_FTS_SQL,
+        LEGACY_FTS_TRIGRAM_SQL,
+        SessionDB,
+    )
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("inline-wrong-body", "test")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+            + LEGACY_FTS_SQL
+            + "\n"
+            + LEGACY_FTS_TRIGRAM_SQL
+        )
+        for suffix in ("insert", "delete", "update"):
+            conn.execute(f"DROP TRIGGER messages_fts_{suffix}")
+        statement = ""
+        for line in FTS_SQL.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                if "CREATE TRIGGER" in statement and "messages_fts_trigram" not in statement:
+                    conn.execute(statement)
+                statement = ""
+        conn.commit()
+
+    repaired = SessionDB(db_path=db_path)
+    try:
+        message_id = repaired.append_message(
+            "inline-wrong-body", "user", content="inlinewriteworks"
+        )
+        assert message_id > 0
+        with repaired._lock:
+            assert [
+                row[0]
+                for row in repaired._conn.execute(
+                    "SELECT rowid FROM messages_fts "
+                    "WHERE messages_fts MATCH 'inlinewriteworks'"
+                ).fetchall()
+            ] == [message_id]
+    finally:
+        repaired.close()
+
+
+def test_uppercase_unindexed_table_fails_closed(db_path):
+    """SQLite's case-insensitive object identity cannot bypass table grammar."""
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("uppercase-table", "test")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TABLE messages_fts;
+CREATE VIRTUAL TABLE MESSAGES_FTS USING fts5(
+  content, tool_name UNINDEXED, tool_calls,
+  content='messages', content_rowid='id'
+);
+"""
+        )
+        conn.commit()
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+    database = SessionDB(db_path=db_path)
+    try:
+        assert database._fts_enabled is False
+        assert database.append_message(
+            "uppercase-table", "tool", content="", tool_name="hiddenupperterm"
+        ) > 0
+    finally:
+        database.close()
+
+
+def test_uppercase_unfiltered_trigram_view_fails_closed(db_path):
+    """Mixed-case canonical view names still require the role predicate."""
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("uppercase-view", "test")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DROP VIEW messages_fts_trigram_src")
+        conn.execute(
+            "CREATE VIEW MESSAGES_FTS_TRIGRAM_SRC AS "
+            "SELECT id, role, content, tool_name, tool_calls FROM messages"
+        )
+        conn.commit()
+        assert SessionDB._legacy_fts_layout(conn.cursor()) == "ambiguous"
+
+    database = SessionDB(db_path=db_path)
+    try:
+        assert database._fts_enabled is False
+        assert database.append_message(
+            "uppercase-view", "tool", content="uppertoolneedle"
+        ) > 0
+    finally:
+        database.close()
+
+
+def test_uppercase_wrong_update_trigger_body_is_replaced(db_path):
+    """Case variants participate in full semantic trigger convergence."""
+    from hermes_state import SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("uppercase-trigger", "test")
+    seeded.append_message("uppercase-trigger", "user", content="upperoldbody")
+    seeded.close()
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DROP TRIGGER messages_fts_update")
+        conn.executescript(
+            """
+CREATE TRIGGER MESSAGES_FTS_UPDATE
+AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
+  DELETE FROM messages_fts WHERE rowid = old.id;
+  INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+"""
+        )
+        conn.commit()
+
+    repaired = SessionDB(db_path=db_path)
+    try:
+        with repaired._lock:
+            repaired._conn.execute(
+                "UPDATE messages SET content='uppernewbody' WHERE id=1"
+            )
+            repaired._conn.commit()
+            assert repaired._conn.execute(
+                "SELECT rowid FROM messages_fts "
+                "WHERE messages_fts MATCH 'upperoldbody'"
+            ).fetchall() == []
+            assert [
+                row[0]
+                for row in repaired._conn.execute(
+                    "SELECT rowid FROM messages_fts "
+                    "WHERE messages_fts MATCH 'uppernewbody'"
+                ).fetchall()
+            ] == [1]
+    finally:
+        repaired.close()
+
+
 def test_cjk_schema_ensure_keeps_writer_out_until_triggers_exist(
     db_path, monkeypatch
 ):
