@@ -243,6 +243,43 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 
 
+_FEISHU_MENU_ACK_TEXT_ZH: Dict[str, str] = {
+    "/new": "已接收：新会话，正在创建…",
+    "/status": "已接收：状态，正在查询…",
+    "/help": "已接收：帮助，正在整理命令…",
+    "/agents": "已接收：任务，正在查询…",
+    "/cron": "已接收：定时任务，正在查询…",
+    "/sessions": "已接收：会话列表，正在查询…",
+    "/memory": "已接收：记忆，正在查询…",
+    "/model": "已接收：模型，正在查询…",
+}
+
+_FEISHU_MENU_ACK_TEXT_EN: Dict[str, str] = {
+    "/new": "Received: New session — creating…",
+    "/status": "Received: Status — checking…",
+    "/help": "Received: Help — listing commands…",
+    "/agents": "Received: Tasks — checking…",
+    "/cron": "Received: Scheduled tasks — checking…",
+    "/sessions": "Received: Sessions — checking…",
+    "/memory": "Received: Memory — checking…",
+    "/model": "Received: Model — checking…",
+}
+
+
+def _bot_menu_ack_text(event_key: str, *, domain_name: str) -> str:
+    """Return a localized immediate acknowledgement for a menu click."""
+    normalized = str(event_key or "").strip()
+    if str(domain_name or "").strip().lower() == "lark":
+        return _FEISHU_MENU_ACK_TEXT_EN.get(
+            normalized,
+            f"Received: {normalized or 'menu command'} — processing…",
+        )
+    return _FEISHU_MENU_ACK_TEXT_ZH.get(
+        normalized,
+        f"已接收：{normalized or '菜单命令'}，正在处理…",
+    )
+
+
 async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> bytes:
     """Read at most ``max_bytes`` from an aiohttp request body."""
     try:
@@ -2703,6 +2740,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 event_key,
                 open_id,
             )
+            ack_result = await self.send(
+                open_id,
+                _bot_menu_ack_text(event_key, domain_name=self._domain_name),
+            )
+            if not ack_result.success:
+                logger.warning(
+                    "[Feishu] Bot menu acknowledgement failed for key=%r user=%s: %s",
+                    event_key,
+                    open_id,
+                    ack_result.error or "unknown error",
+                )
             await self._handle_message_with_guards(synthetic_event)
 
         self._submit_on_loop(loop, _handle_bot_menu())

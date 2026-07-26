@@ -190,8 +190,11 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 "user_id_alt": None,
             }
         )
-        adapter._handle_message_with_guards = AsyncMock()
-        return adapter
+        send_mock = AsyncMock()
+        adapter.send = send_mock
+        handle_message_mock = AsyncMock()
+        adapter._handle_message_with_guards = handle_message_mock
+        return adapter, send_mock, handle_message_mock
 
     @staticmethod
     def _bot_menu_data(event_id="evt_menu_1", event_key="/status"):
@@ -225,10 +228,10 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
     def test_bot_menu_event_routes_event_key_to_operator_p2p(self):
         from gateway.platforms.base import MessageType
 
-        adapter = self._bot_menu_adapter()
+        adapter, send_mock, handle_message_mock = self._bot_menu_adapter()
         self._dispatch_bot_menu(adapter, self._bot_menu_data())
 
-        event = adapter._handle_message_with_guards.await_args.args[0]
+        event = handle_message_mock.await_args.args[0]
         self.assertEqual(event.text, "/status")
         self.assertEqual(event.message_type, MessageType.TEXT)
         self.assertEqual(event.message_id, "evt_menu_1")
@@ -237,36 +240,68 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(event.source.chat_type, "dm")
         self.assertEqual(event.source.user_id, "ou_user")
         self.assertIsNone(_reply_anchor_for_event(event))
+        send_mock.assert_awaited_once_with(
+            "ou_user",
+            "已接收：状态，正在查询…",
+        )
+        handle_message_mock.assert_awaited_once_with(event)
         adapter._admit.assert_called_once()
 
     def test_bot_menu_event_rejected_by_dm_admission_is_dropped(self):
-        adapter = self._bot_menu_adapter(admit_reason="dm_policy_rejected")
+        adapter, send_mock, handle_message_mock = self._bot_menu_adapter(admit_reason="dm_policy_rejected")
         self._dispatch_bot_menu(adapter, self._bot_menu_data())
 
-        adapter._handle_message_with_guards.assert_not_awaited()
+        send_mock.assert_not_awaited()
+        handle_message_mock.assert_not_awaited()
         adapter._resolve_sender_profile.assert_not_awaited()
 
+    def test_bot_menu_event_dispatches_even_if_acknowledgement_fails(self):
+        from gateway.platforms.base import SendResult
+
+        adapter, send_mock, handle_message_mock = self._bot_menu_adapter()
+        send_mock.return_value = SendResult(success=False, error="send failed")
+        self._dispatch_bot_menu(adapter, self._bot_menu_data())
+
+        send_mock.assert_awaited_once_with(
+            "ou_user",
+            "已接收：状态，正在查询…",
+        )
+        handle_message_mock.assert_awaited_once()
+
+    def test_lark_bot_menu_acknowledgement_uses_english(self):
+        adapter, send_mock, _handle_message_mock = self._bot_menu_adapter()
+        adapter._domain_name = "lark"
+
+        self._dispatch_bot_menu(adapter, self._bot_menu_data())
+
+        send_mock.assert_awaited_once_with(
+            "ou_user",
+            "Received: Status — checking…",
+        )
+
     def test_duplicate_bot_menu_event_is_dropped(self):
-        adapter = self._bot_menu_adapter()
+        adapter, send_mock, handle_message_mock = self._bot_menu_adapter()
         adapter._is_duplicate.side_effect = [False, True]
         data = self._bot_menu_data()
 
         self._dispatch_bot_menu(adapter, data)
         self._dispatch_bot_menu(adapter, data)
 
-        self.assertEqual(adapter._handle_message_with_guards.await_count, 1)
+        self.assertEqual(send_mock.await_count, 1)
+        self.assertEqual(handle_message_mock.await_count, 1)
         adapter._is_duplicate.assert_called_with("feishu_bot_menu:evt_menu_1")
 
     def test_distinct_bot_menu_event_ids_are_both_dispatched(self):
-        adapter = self._bot_menu_adapter()
+        adapter, send_mock, handle_message_mock = self._bot_menu_adapter()
 
         self._dispatch_bot_menu(adapter, self._bot_menu_data(event_id="evt_menu_1"))
         self._dispatch_bot_menu(adapter, self._bot_menu_data(event_id="evt_menu_2"))
 
-        self.assertEqual(adapter._handle_message_with_guards.await_count, 2)
+        self.assertEqual(send_mock.await_count, 2)
+        self.assertEqual(handle_message_mock.await_count, 2)
         message_ids = [
             call.args[0].message_id
-            for call in adapter._handle_message_with_guards.await_args_list
+            for call in handle_message_mock.await_args_list
         ]
         self.assertEqual(message_ids, ["evt_menu_1", "evt_menu_2"])
 
