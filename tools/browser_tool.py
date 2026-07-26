@@ -365,7 +365,7 @@ def _format_browser_timeout_error(
         hints.append(
             "Chromium sandbox launch failed. Set AGENT_BROWSER_ARGS="
             "'--no-sandbox,--disable-dev-shm-usage' in your environment, "
-            "or run: npx agent-browser install --with-deps"
+            "or reinstall Chromium with: npx agent-browser install"
         )
     elif command == "open" and _is_local_mode():
         if _running_in_docker():
@@ -377,9 +377,9 @@ def _format_browser_timeout_error(
         else:
             hints.append(
                 "The browser daemon may still be starting, or Chromium may be "
-                "missing system libraries. Install/repair with: "
-                "npx agent-browser install --with-deps "
-                "(or: npx playwright install --with-deps chromium)"
+                "missing. Install/repair it with: npx agent-browser install. "
+                "If it still fails, install Chromium system libraries with your "
+                "distribution's package manager."
             )
     if hints:
         parts.extend(hints)
@@ -771,9 +771,7 @@ from hermes_constants import is_termux as _is_termux_environment
 
 
 def _browser_install_hint() -> str:
-    if _is_termux_environment():
-        return "npm install -g agent-browser && agent-browser install"
-    return "npm install -g agent-browser && agent-browser install --with-deps"
+    return "npm install -g agent-browser && agent-browser install"
 
 
 def _requires_real_termux_browser_install(browser_cmd: str) -> bool:
@@ -1076,8 +1074,7 @@ def _run_chrome_fallback_command(
         else:
             hint = (
                 "Chrome fallback requires Chromium, but it is missing. Install it with: "
-                "npx agent-browser install --with-deps "
-                "(or: npx playwright install --with-deps chromium)"
+                "npx agent-browser install"
             )
         return {"success": False, "error": hint}
 
@@ -2354,8 +2351,7 @@ def _run_browser_command(
         else:
             hint = (
                 "Chromium browser is missing. Install it with: "
-                "npx agent-browser install --with-deps "
-                "(or: npx playwright install --with-deps chromium)"
+                "npx agent-browser install"
             )
         logger.warning("browser command blocked: %s", hint)
         return {"success": False, "error": hint}
@@ -4835,8 +4831,7 @@ if __name__ == "__main__":
                     print("       docker pull ghcr.io/nousresearch/hermes-agent:latest")
                 else:
                     print("     Install it with:")
-                    print("       npx agent-browser install --with-deps")
-                    print("     Or:  npx playwright install --with-deps chromium")
+                    print("       npx agent-browser install")
         except FileNotFoundError:
             print("   - agent-browser CLI not found")
             print(f"     Install: {_browser_install_hint()}")

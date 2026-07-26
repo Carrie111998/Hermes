@@ -1301,7 +1301,7 @@ def _run_post_setup(post_setup_key: str):
 
         if not npx_bin:
             _print_warning(
-                "    npx not found - install Chromium manually: npx agent-browser install --with-deps"
+                "    npx not found - install Chromium manually: npx agent-browser install"
             )
             return
 
@@ -1316,9 +1316,9 @@ def _run_post_setup(post_setup_key: str):
             if local_ab_win.exists():
                 local_ab = local_ab_win
         install_cmd = (
-            [str(local_ab), "install", "--with-deps"]
+            [str(local_ab), "install"]
             if local_ab.exists()
-            else [npx_bin, "-y", "agent-browser", "install", "--with-deps"]
+            else [npx_bin, "-y", "agent-browser", "install"]
         )
         try:
             result = subprocess.run(
@@ -1337,13 +1337,13 @@ def _run_post_setup(post_setup_key: str):
                 tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
                 for line in tail:
                     _print_info(f"      {line[:200]}")
-                _print_info("    Run manually: npx agent-browser install --with-deps")
+                _print_info("    Run manually: npx agent-browser install")
         except subprocess.TimeoutExpired:
             _print_warning("    Chromium install timed out (>10min)")
-            _print_info("    Run manually: npx agent-browser install --with-deps")
+            _print_info("    Run manually: npx agent-browser install")
         except Exception as exc:
             _print_warning(f"    Chromium install failed: {exc}")
-            _print_info("    Run manually: npx agent-browser install --with-deps")
+            _print_info("    Run manually: npx agent-browser install")
 
     elif post_setup_key == "camofox":
         camofox_dir = PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser"

@@ -1849,19 +1849,12 @@ def run_doctor(args):
                         check_ok("Playwright Chromium", "(browser engine)")
                     else:
                         check_warn(
-                            "Playwright Chromium not installed",
+                            "Chromium browser not installed",
                             "(browser_* tools will be hidden from the agent)",
                         )
-                        if sys.platform == "win32":
-                            check_info(
-                                f"Install with: cd {PROJECT_ROOT} && "
-                                "npx playwright install chromium"
-                            )
-                        else:
-                            check_info(
-                                f"Install with: cd {PROJECT_ROOT} && "
-                                "npx playwright install --with-deps chromium"
-                            )
+                        check_info(
+                            f"Install with: cd {PROJECT_ROOT} && npx agent-browser install"
+                        )
     elif _is_termux():
         check_info("Node.js not found (browser tools are optional in the tested Termux path)")
         check_info("Install Node.js on Termux with: pkg install nodejs")
