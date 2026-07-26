@@ -161,6 +161,8 @@ class WorkflowNode:
     Supported operators:
       ==, !=, >, <, >=, <=, contains, starts_with, in, and, or, not
     """
+    max_retries: int | None = None
+    """Max times each reviewer can review this node. None = use workflow default."""
     attachment: Optional[str] = None
     """Attachment selector. E.g. "attachments[0]" picks the first
     workflow attachment for this node. If None, all attachments
@@ -230,6 +232,9 @@ class NodeState:
     """Current index in the review pipeline (which reviewer is active)."""
     review_body: Optional[str] = None
     """Body of the card when it moved to review status."""
+    review_counts: dict = field(default_factory=dict)
+    """Tracks how many times each reviewer has reviewed this node.
+    Key: reviewer node ID, Value: count."""
     validation_warnings: list[str] = field(default_factory=list)
 
 # ── Engine core ──────────────────────────────────────────────────
@@ -382,6 +387,7 @@ class WorkflowEngine:
                 triage=bool(node_data.get("triage", False)),
                 when=node_data.get("when", ""),
                 reviews=node_data.get("reviews", []),
+                max_retries=node_data.get("max_retries"),
                 attachment=node_data.get("attachment"),
             )
 
@@ -2297,6 +2303,11 @@ class WorkflowEngine:
             or self._get_session_info()
         )
 
+        # Resolve max_retries: env var > workflow default > engine default
+        env_retries = os.environ.get("HERMES_WORKFLOW_MAX_RETRIES")
+        if env_retries and env_retries.isdigit():
+            workflow.max_retries = int(env_retries)
+
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
             has_loops = len(loop_layers) > 0
@@ -2875,23 +2886,61 @@ class WorkflowEngine:
                             # Node blocked itself pending review — find reviewer
                             node = workflow.nodes.get(nid)
                             if node and node.reviews:
-                                reviewer_nid = node.reviews[0]  # First reviewer in pipeline
-                                print(f"   📋 {nid} pending review → dispatching {reviewer_nid}")
-                                # Create the reviewer card
-                                reviewer_node = workflow.nodes.get(reviewer_nid)
-                                if reviewer_node:
-                                    try:
-                                        reviewer_card_id = self.dispatch_node(
-                                            states[reviewer_nid], reviewer_node, context,
-                                            workflow=workflow, states=states, layers=layers,
-                                        )
-                                        if reviewer_card_id:
-                                            states[reviewer_nid].kanban_card_id = reviewer_card_id
-                                            states[reviewer_nid].status = "running"
-                                            states[reviewer_nid].started_at = datetime.now(timezone.utc).isoformat()
-                                            print(f"   ✓ {reviewer_nid} → card {reviewer_card_id}")
-                                    except Exception as e:
-                                        print(f"   ⚠  Failed to dispatch reviewer: {e}")
+                                # Determine which reviewer to dispatch (next in pipeline)
+                                # and check retry limits
+                                dispatched = False
+                                for review_entry in node.reviews:
+                                    # Support both string and dict review entries
+                                    if isinstance(review_entry, dict):
+                                        rev_id = review_entry.get("review", "")
+                                        per_review_max = review_entry.get("max_retries")
+                                    else:
+                                        rev_id = review_entry
+                                        per_review_max = None
+
+                                    if not rev_id:
+                                        continue
+
+                                    # Check if this reviewer has already been dispatched
+                                    rev_state = states.get(rev_id)
+                                    if rev_state and rev_state.status in ("running", "done"):
+                                        continue  # Skip — already dispatched or completed
+
+                                    # Resolve max retries: per-review > node > workflow > engine default
+                                    max_retries = per_review_max or node.max_retries or workflow.max_retries
+
+                                    # Check retry count
+                                    current_count = state.review_counts.get(rev_id, 0)
+                                    if current_count >= max_retries:
+                                        print(f"   ⚠ {nid} → {rev_id} hit max retries ({current_count}/{max_retries})")
+                                        continue
+
+                                    # Dispatch the reviewer
+                                    print(f"   📋 {nid} pending review → dispatching {rev_id} (attempt {current_count + 1}/{max_retries})")
+                                    reviewer_node = workflow.nodes.get(rev_id)
+                                    if reviewer_node:
+                                        try:
+                                            reviewer_card_id = self.dispatch_node(
+                                                states[rev_id], reviewer_node, context,
+                                                workflow=workflow, states=states, layers=layers,
+                                            )
+                                            if reviewer_card_id:
+                                                states[rev_id].kanban_card_id = reviewer_card_id
+                                                states[rev_id].status = "running"
+                                                states[rev_id].started_at = datetime.now(timezone.utc).isoformat()
+                                                state.review_counts[rev_id] = current_count + 1
+                                                print(f"   ✓ {rev_id} → card {reviewer_card_id}")
+                                                dispatched = True
+                                                break  # Dispatch one reviewer at a time
+                                        except Exception as e:
+                                            print(f"   ⚠  Failed to dispatch reviewer: {e}")
+                                if not dispatched:
+                                    # All reviewers exhausted or already dispatched
+                                    state.status = "blocked"
+                                    state.error = f"Blocked: all reviewers exhausted for {nid}"
+                                    results[nid] = "blocked"
+                                    print(f"   🚫 {nid} BLOCKED — all reviewers exhausted")
+                                    pending.discard(nid)
                             else:
                                 # No reviews attribute — treat as genuine blocker
                                 state.status = "blocked"
