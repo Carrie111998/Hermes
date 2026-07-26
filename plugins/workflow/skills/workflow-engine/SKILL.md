@@ -103,6 +103,22 @@ nodes:
       - recommendation
 ```
 
+### Inputs
+
+Declare expected inputs for progressive disclosure:
+
+```yaml
+inputs:
+  - name: grill_artifact
+    required: true
+    description: "Path to the grill artifact file"
+  - name: topic
+    required: false
+    description: "Research topic"
+```
+
+`workflow_show` returns the inputs list so agents discover what parameters are needed before triggering.
+
 ### Node Fields
 
 | Field | Required | Description |

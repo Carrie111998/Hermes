@@ -556,6 +556,7 @@ def handle_workflow_show(args: Dict[str, Any], **kwargs: Any) -> str:
         "description": wf.description,
         "layers": len(layers),
         "nodes": len(wf.nodes),
+        "inputs": getattr(wf, "inputs", []),
         "structure": nodes,
     })
 

@@ -185,6 +185,9 @@ class Workflow:
     nodes: dict[str, WorkflowNode] = field(default_factory=dict)
     run_id: str = ""              # Generated at execute() time
     kanban_board: str = ""         # Per-pipeline board override (empty = engine default)
+    inputs: list = field(default_factory=list)
+                                    # Declared inputs for this workflow.
+                                    # Each entry: {"name": str, "required": bool, "description": str}
     scope: str = "project"         # "project" (default) — creates kanban cards per node.
                                     # "global" — in-process only, no cards created.
                                     # Used for maintenance / notification / heartbeat
@@ -306,6 +309,7 @@ class WorkflowEngine:
             description=raw.get("description", ""),
             trigger_events=raw.get("trigger_events", []),
             kanban_board=raw.get("kanban_board", ""),
+            inputs=raw.get("inputs", []),
             scope=raw.get("scope", "project"),
             single_flight=bool(raw.get("single_flight", False)),
 
