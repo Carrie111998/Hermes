@@ -2651,7 +2651,6 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
-    source: str = "",
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -2771,7 +2770,6 @@ def _run_approval_gate(
                 "description": redact_sensitive_text(description),
                 "allow_permanent": True,
                 "allow_session": True,
-                                "source": source,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -2878,8 +2876,7 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
 
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None,
-                            has_host_access: bool = False,
-                            source: str = "") -> dict:
+                            has_host_access: bool = False) -> dict:
     """Check if a command is dangerous and handle approval.
 
     This is the main entry point called by terminal_tool before executing
@@ -2944,7 +2941,6 @@ def check_dangerous_command(command: str, env_type: str,
         autoapprove_log_prefix=(
             "AUTO-APPROVED dangerous command in non-interactive non-gateway context"
         ),
-        source=source,
     )
 
 
@@ -2954,7 +2950,6 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
-    source: str = "",
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3033,7 +3028,6 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
-        source=source,
     )
 
 
@@ -3185,8 +3179,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False,
-                             source: str = "") -> dict:
+                             has_host_access: bool = False) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -3477,7 +3470,6 @@ def check_all_command_guards(command: str, env_type: str,
                 # already caps scope at session. Adapters use this to render
                 # a session tier independently of the permanent tier.
                 "allow_session": not smart_denied_for_owner,
-                "source": source,
             }
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
@@ -3560,7 +3552,6 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "pattern_keys": all_keys,
             "description": _disp_combined_desc,
-            "source": source,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)

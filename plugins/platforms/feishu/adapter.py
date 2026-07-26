@@ -2006,12 +2006,11 @@ class FeishuAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
-        source: str = "",
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
         The buttons carry ``hermes_action`` in their value dict so that
-        ``_handle_card_action_events`` can intercept them and call
+        ``_handle_card_action_event`` can intercept them and call
         ``resolve_gateway_approval()`` to unblock the waiting agent thread.
         """
         if not self._client:

@@ -6352,7 +6352,6 @@ class SlackAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
-        source: str = "",
     ) -> SendResult:
         """Send a Block Kit approval prompt with interactive buttons.
 
