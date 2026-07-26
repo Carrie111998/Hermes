@@ -2817,6 +2817,8 @@ def _validate_persistent_workspace_path(
     """Normalize and validate a workspace path before it is persisted."""
     if workspace_path is not None:
         workspace_path = str(workspace_path).strip() or None
+    if workspace_kind == "dir" and not workspace_path:
+        raise ValueError("workspace_path is required for dir workspaces")
     if not workspace_path or workspace_kind not in {"dir", "worktree"}:
         return workspace_path
 

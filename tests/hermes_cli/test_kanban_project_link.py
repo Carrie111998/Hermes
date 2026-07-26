@@ -101,3 +101,20 @@ def test_unknown_project_id_falls_back_gracefully(kanban_conn):
     task = kb.get_task(kanban_conn, tid)
     assert task.workspace_kind == "scratch"
     assert task.project_id is None
+
+
+def test_dir_workspace_requires_path(kanban_conn):
+    """dir workspaces must have a non-empty workspace_path."""
+    with pytest.raises(ValueError, match="workspace_path is required for dir workspaces"):
+        kb.create_task(kanban_conn, title="missing path", workspace_kind="dir")
+
+
+def test_dir_workspace_rejects_blank_path(kanban_conn):
+    """A whitespace-only workspace_path must be rejected for dir workspaces."""
+    with pytest.raises(ValueError, match="workspace_path is required for dir workspaces"):
+        kb.create_task(
+            kanban_conn,
+            title="blank path",
+            workspace_kind="dir",
+            workspace_path="    ",
+        )

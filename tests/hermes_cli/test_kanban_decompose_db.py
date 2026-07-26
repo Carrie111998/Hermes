@@ -254,3 +254,49 @@ def test_decompose_rejects_invalid_child_workspace_before_inserts(kanban_home):
 
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
         assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_decompose_dir_child_requires_path_atomic(kanban_home):
+    """A dir child with missing/blank path must be rejected atomically."""
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        # Case 1: missing workspace_path
+        with pytest.raises(ValueError, match="workspace_path is required for dir workspaces"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[
+                    {"title": "valid child"},
+                    {
+                        "title": "dir child without path",
+                        "workspace_kind": "dir",
+                    },
+                ],
+                author="decomposer",
+            )
+
+        # Atomicity: no child rows inserted
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+        assert kb.get_task(conn, tid).status == "triage"
+
+        # Case 2: blank workspace_path
+        with pytest.raises(ValueError, match="workspace_path is required for dir workspaces"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[
+                    {
+                        "title": "dir child with blank path",
+                        "workspace_kind": "dir",
+                        "workspace_path": "    ",
+                    },
+                ],
+                author="decomposer",
+            )
+
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+        assert kb.get_task(conn, tid).status == "triage"
