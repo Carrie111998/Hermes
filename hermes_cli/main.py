@@ -7488,6 +7488,64 @@ def _update_via_zip(args):
         _kill_stale_dashboard_processes(restart_managed=True)
 
 
+_CARRIED_COMMIT_PREVIEW = 10
+
+
+def _warn_about_carried_commits(
+    git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str
+) -> int:
+    """Warn when switching branches would leave committed work behind.
+
+    ``hermes update`` targets ``main`` by default and checks it out when the
+    install is on another branch. For a git install carrying local commits —
+    a fork branch, a patch series, a cherry-picked fix — the rebuilt install
+    then silently does NOT contain that work. Nothing is lost from git, but
+    the running install changes underneath the user with no indication, and
+    the omission usually surfaces much later as "the fix I made is gone".
+
+    This does not block the update: the switch is long-standing, intended
+    behaviour, and update paths run unattended. It just makes the omission
+    visible, and names the flag that preserves the work.
+
+    Returns the number of commits that would be left behind (0 when the
+    branch is already contained in the target, or when git can't tell).
+    """
+    if not current_branch or current_branch == "HEAD":
+        return 0
+
+    result = subprocess.run(
+        git_cmd + ["log", "--no-merges", "--oneline", f"{target_branch}..{current_branch}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        # Target ref may not exist locally yet; nothing useful to say.
+        return 0
+
+    commits = [line for line in result.stdout.splitlines() if line.strip()]
+    if not commits:
+        return 0
+
+    plural = "commit" if len(commits) == 1 else "commits"
+    print(
+        f"  ⚠ '{current_branch}' has {len(commits)} {plural} not in "
+        f"'{target_branch}'. The updated install will NOT include them:"
+    )
+    for line in commits[:_CARRIED_COMMIT_PREVIEW]:
+        print(f"      {line}")
+    if len(commits) > _CARRIED_COMMIT_PREVIEW:
+        print(f"      … and {len(commits) - _CARRIED_COMMIT_PREVIEW} more")
+    print(
+        f"    They remain on '{current_branch}'. To update while keeping them, "
+        f"cancel and run: hermes update --branch {current_branch}"
+    )
+
+    return len(commits)
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
@@ -11440,6 +11498,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else f"branch '{current_branch}'"
             )
             print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
+            _warn_about_carried_commits(git_cmd, PROJECT_ROOT, current_branch, branch)
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
             checkout_result = subprocess.run(

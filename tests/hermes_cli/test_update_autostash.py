@@ -1162,3 +1162,88 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+# ----------------------------------------------------------------------
+# Warning when a branch switch would leave committed work behind.
+# ----------------------------------------------------------------------
+
+
+def _fake_git(stdout="", returncode=0):
+    """Capture the git argv and return a canned result."""
+    calls = []
+
+    def run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+    return run, calls
+
+
+def test_warns_and_lists_commits_left_behind(monkeypatch, capsys):
+    from hermes_cli import main as hermes_main
+
+    log = "abc1234 fix(desktop): keep sessions alive\ndef5678 fix(desktop): restore embeds\n"
+    run, calls = _fake_git(stdout=log)
+    monkeypatch.setattr(hermes_main.subprocess, "run", run)
+
+    left = hermes_main._warn_about_carried_commits(
+        ["git"], Path("/repo"), "my-fork", "main"
+    )
+
+    assert left == 2
+    out = capsys.readouterr().out
+    assert "2 commits not in 'main'" in out
+    assert "will NOT include them" in out
+    assert "abc1234" in out and "def5678" in out
+    # Must name the escape hatch, with the branch pre-filled.
+    assert "hermes update --branch my-fork" in out
+    # Must ask git for the right range.
+    assert any("main..my-fork" in part for cmd in calls for part in cmd)
+
+
+def test_silent_when_branch_is_contained_in_target(monkeypatch, capsys):
+    from hermes_cli import main as hermes_main
+
+    run, _ = _fake_git(stdout="")
+    monkeypatch.setattr(hermes_main.subprocess, "run", run)
+
+    left = hermes_main._warn_about_carried_commits(
+        ["git"], Path("/repo"), "stale-branch", "main"
+    )
+
+    assert left == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_silent_on_detached_head_and_when_git_fails(monkeypatch, capsys):
+    from hermes_cli import main as hermes_main
+
+    # Detached HEAD: no branch name to reason about, and no git call needed.
+    run, calls = _fake_git(stdout="whatever")
+    monkeypatch.setattr(hermes_main.subprocess, "run", run)
+    assert hermes_main._warn_about_carried_commits(["git"], Path("/repo"), "HEAD", "main") == 0
+    assert calls == []
+
+    # Unknown target ref: stay quiet rather than guessing.
+    run2, _ = _fake_git(stdout="", returncode=128)
+    monkeypatch.setattr(hermes_main.subprocess, "run", run2)
+    assert hermes_main._warn_about_carried_commits(["git"], Path("/repo"), "f", "nope") == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_truncates_a_long_commit_list(monkeypatch, capsys):
+    from hermes_cli import main as hermes_main
+
+    log = "".join(f"c{i:06d} commit {i}\n" for i in range(25))
+    run, _ = _fake_git(stdout=log)
+    monkeypatch.setattr(hermes_main.subprocess, "run", run)
+
+    left = hermes_main._warn_about_carried_commits(
+        ["git"], Path("/repo"), "big", "main"
+    )
+
+    assert left == 25
+    out = capsys.readouterr().out
+    assert "25 commits not in 'main'" in out
+    assert "… and 15 more" in out
