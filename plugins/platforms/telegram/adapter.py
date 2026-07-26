@@ -9193,6 +9193,38 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             return None
 
+    @staticmethod
+    def _extract_forwarded_text(message: Message) -> str:
+        """Extract text from a forwarded message when ``message.text`` is empty.
+
+        Handles two edge cases Telegram may present forwarded messages:
+        1. Caption-only media forwards where ``message.text`` is empty but
+           ``message.caption`` carries the forwarded caption.
+        2. Rare API cases where the text lives in ``forward_origin.api_kwargs``
+           (observed when forwarding channel posts to new DM topics).
+
+        Returns the best available text, or empty string.
+        """
+        # Caption is the common fallback for forwarded media
+        caption = getattr(message, "caption", None)
+        if caption:
+            return caption
+
+        # Deep probe: some forward API payloads store text in origin api_kwargs
+        fwd = getattr(message, "forward_origin", None)
+        if fwd is not None:
+            try:
+                kwargs = fwd.api_kwargs or {}
+                # Check known forward origin sub-types for a text field
+                for key in ("text", "caption"):
+                    val = kwargs.get(key)
+                    if val and isinstance(val, str):
+                        return val
+            except Exception:
+                pass
+
+        return ""
+
     def _build_message_event(
         self,
         message: Message,
@@ -9347,8 +9379,16 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        # Extract text with fallback chain for forwarded messages.
+        # Primary: message.text (populated for text forwards).
+        # Fallback: message.caption (populated for media forwards with caption).
+        # Deep fallback: _extract_forwarded_text probes forward_origin.api_kwargs
+        # for edge cases (e.g. channel-post forwards to new DM topics).
+        _forwarded = self._extract_forwarded_text(message)
+        event_text = message.text or message.caption or _forwarded or ""
+
         return MessageEvent(
-            text=message.text or "",
+            text=event_text,
             message_type=msg_type,
             source=source,
             raw_message=message,
