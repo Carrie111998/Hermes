@@ -74,9 +74,10 @@ export function usePetBridge({ requestGateway, resumeSession, submitText }: PetB
     // own gateway (the overlay has none) so it survives restart.
     setPetOverlayScaleHandler((profile, scale) => setPetScale(profileRequest(profile), scale))
     // Mail icon: open the overlay's OWN profile session. Prefer its durable
-    // source (survives compression/rehoming); until that is wired (Layer 6c) the
-    // active profile falls back to the most-recent thread ($sessions is
-    // most-recent-first) — the legacy single-pet target, so follow-active is
+    // source (survives compression/rehoming) when known. `sourceDurableSessionId`
+    // is read here but not yet populated anywhere (TODO PR4), so the active
+    // profile currently falls back to the most-recent thread ($sessions is
+    // most-recent-first) — the legacy single-pet target, keeping follow-active
     // unchanged. Clear that profile's unread/reply (source-session scoped so a
     // different session's unread in the same profile survives).
     setPetOverlayOpenAppHandler(profile => {

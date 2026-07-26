@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ComposerAttachment } from './composer'
 import {
@@ -20,7 +20,37 @@ import {
 } from './composer-queue'
 
 const SESSION_KEY = 'session-abc'
-const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+// PR3 persists under v2 (nested { version, byProfile, legacy }); v1 is read only
+// as a migration source.
+const QUEUE_STORAGE_KEY_V1 = 'hermes.desktop.composerQueue.v1'
+const QUEUE_STORAGE_KEY_V2 = 'hermes.desktop.composerQueue.v2'
+
+// The test runtime ships without a usable localStorage; install an in-memory one
+// so the persistence/migration assertions actually exercise the v2 storage path.
+function installLocalStorageMock(): void {
+  const store = new Map<string, string>()
+  const mock = {
+    clear: () => store.clear(),
+    getItem: (key: string) => store.get(key) ?? null,
+    removeItem: (key: string) => void store.delete(key),
+    setItem: (key: string, value: string) => void store.set(key, String(value))
+  }
+
+  try {
+    Object.defineProperty(window, 'localStorage', { configurable: true, value: mock, writable: true })
+  } catch {
+    ;(window as { localStorage?: unknown }).localStorage = mock
+  }
+}
+
+beforeAll(() => {
+  installLocalStorageMock()
+})
+
+function clearQueueStorage(): void {
+  window.localStorage.removeItem(QUEUE_STORAGE_KEY_V1)
+  window.localStorage.removeItem(QUEUE_STORAGE_KEY_V2)
+}
 
 function attachment(id: string, kind: ComposerAttachment['kind'] = 'file'): ComposerAttachment {
   return {
@@ -33,7 +63,7 @@ function attachment(id: string, kind: ComposerAttachment['kind'] = 'file'): Comp
 
 describe('composer queue store', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    clearQueueStorage()
     $queuedPromptsBySession.set({})
   })
 
@@ -108,23 +138,33 @@ describe('composer queue store', () => {
 
     expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
     expect($queuedPromptsBySession.get()[SESSION_KEY]).toBeUndefined()
-    expect(window.localStorage.getItem(QUEUE_STORAGE_KEY)).toBeNull()
+    // An empty queue removes the v2 key entirely.
+    expect(window.localStorage.getItem(QUEUE_STORAGE_KEY_V2)).toBeNull()
   })
 
-  it('persists queue entries into local storage', () => {
+  it('persists queue entries into local storage (v2, profile-nested)', () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'persist me' })
 
-    const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY)
+    const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY_V2)
     expect(raw).toBeTruthy()
 
-    const parsed = JSON.parse(String(raw)) as Record<string, { text: string }[]>
-    expect(parsed[SESSION_KEY]?.[0]?.text).toBe('persist me')
+    // Foreground entries carry no profile, so they nest under `legacy` keyed by
+    // storedSessionId; profile-targeted entries would nest under `byProfile`.
+    const parsed = JSON.parse(String(raw)) as {
+      version: number
+      byProfile: Record<string, Record<string, { text: string }[]>>
+      legacy: Record<string, { text: string }[]>
+    }
+
+    expect(parsed.version).toBe(2)
+    expect(parsed.legacy[SESSION_KEY]?.[0]?.text).toBe('persist me')
   })
 })
 
 describe('migrateQueuedPrompts', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY_V1)
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY_V2)
     $queuedPromptsBySession.set({})
   })
 
@@ -185,7 +225,8 @@ describe('shouldAutoDrain', () => {
 
 describe('parked queue sessions', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY_V1)
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY_V2)
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
   })
@@ -245,5 +286,33 @@ describe('parked queue sessions', () => {
     migrateQueuedPrompts('rt-old', 'rt-new')
 
     expect(isQueueParked('rt-new')).toBe(false)
+  })
+})
+
+describe('v1 → v2 storage migration', () => {
+  it('migrates flat v1 buckets into v2 legacy and removes the v1 key only after the write', async () => {
+    // Seed a flat v1 queue as an older build would have left it.
+    window.localStorage.setItem(
+      QUEUE_STORAGE_KEY_V1,
+      JSON.stringify({ 'stored-1': [{ attachments: [], id: 'q-1', queuedAt: 1, text: 'legacy prompt' }] })
+    )
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY_V2)
+
+    // A fresh module load runs the migration in load().
+    vi.resetModules()
+    const migrated = await import('./composer-queue')
+
+    // The legacy bucket loads under its bare storedSessionId, profile-less.
+    expect(migrated.getQueuedPrompts('stored-1').map(entry => entry.text)).toEqual(['legacy prompt'])
+
+    // Persisted as nested v2 under `legacy`; the v1 key is gone.
+    const v2 = JSON.parse(String(window.localStorage.getItem(QUEUE_STORAGE_KEY_V2))) as {
+      legacy: Record<string, { text: string }[]>
+      version: number
+    }
+
+    expect(v2.version).toBe(2)
+    expect(v2.legacy['stored-1']?.[0]?.text).toBe('legacy prompt')
+    expect(window.localStorage.getItem(QUEUE_STORAGE_KEY_V1)).toBeNull()
   })
 })
