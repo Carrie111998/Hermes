@@ -398,8 +398,24 @@ def _cwd_marker(session_id: str) -> str:
 #
 # Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
 # with one of these prefixes.
+#
+# HERMES_DELEGATED_CHILD_CONTEXT is invocation-scoped in the same way but
+# reaches the child from a different place: agent.delegation_context marks a
+# delegate_task child with a ContextVar, and delegated_child_subprocess_env()
+# materializes the marker into the env of every subprocess spawned while that
+# context is active. tools/terminal_tool.py::_resolve_container_task_id()
+# deliberately collapses ordinary delegated children onto the "default"
+# environment key, so parent and child share ONE LocalEnvironment and one
+# snapshot — and ``export -p`` in the child dumped the marker into it. The
+# next ordinary command sourced that declaration and was indistinguishable
+# from a delegated child to the Kanban mutation guards in hermes_cli/kanban.py
+# and kanban_db.py, which deny dispatcher-owned mutations for delegated
+# children (issue #71941). Dropping it here is lossless for the same reason as
+# the bridged vars: delegated_child_subprocess_env() re-supplies it on every
+# spawn that genuinely is delegated.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_"
+    "|HERMES_DELEGATED_CHILD_CONTEXT)"
 )
 
 
