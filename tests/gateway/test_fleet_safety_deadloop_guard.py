@@ -73,6 +73,18 @@ def test_rate_window_prunes_old_samples():
     assert not tripped
 
 
+def test_counter_reset_starts_a_new_rate_epoch():
+    th = GuardThresholds(
+        max_calls_per_window=100,
+        max_tokens_per_window=4_000_000,
+        max_runtime_seconds=1e9,
+    )
+    guard = RunawayGuard(th)
+    assert guard.observe(_obs(calls=90, tokens=3_000_000), now=0.0) is None
+    assert guard.observe(_obs(calls=2, tokens=20_000), now=1.0) is None
+    assert guard.observe(_obs(calls=20, tokens=500_000), now=2.0) is None
+
+
 # -- (a) call-rate ------------------------------------------------------------
 
 
@@ -242,3 +254,19 @@ def test_thresholds_from_config_coerces_and_defaults():
 def test_thresholds_from_config_survives_garbage():
     th = GuardThresholds.from_config({"max_runtime_seconds": "not-a-number"})
     assert th.max_runtime_seconds == GuardThresholds().max_runtime_seconds
+
+
+def test_thresholds_reject_nonpositive_nonfinite_and_string_enabled_values():
+    defaults = GuardThresholds()
+    th = GuardThresholds.from_config(
+        {
+            "window_seconds": 0,
+            "max_calls_per_window": -1,
+            "max_runtime_seconds": "nan",
+            "enabled": "false",
+        }
+    )
+    assert th.window_seconds == defaults.window_seconds
+    assert th.max_calls_per_window == defaults.max_calls_per_window
+    assert th.max_runtime_seconds == defaults.max_runtime_seconds
+    assert th.enabled is defaults.enabled

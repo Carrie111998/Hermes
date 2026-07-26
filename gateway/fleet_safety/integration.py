@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.usage_provenance import UsageProvenance, usage_aggregate_from_mapping
+
 from gateway.fleet_safety.deadloop_guard import (
     GuardThresholds,
     RunawayGuard,
@@ -91,11 +93,11 @@ def _get_or_create_guard(runner: Any, thresholds: GuardThresholds) -> RunawayGua
 
 def _collect_observations(
     runner: Any, now: float, assumed_context_tokens: int
-) -> Tuple[List[SessionObservation], Dict[str, Tuple[str, Any]]]:
+) -> Tuple[List[SessionObservation], Dict[str, Tuple[str, Any, Optional[int]]]]:
     """Sample every running agent into observations keyed by the agent's
     session_id. Returns (observations, {session_id: (session_key, agent)})."""
     observations: List[SessionObservation] = []
-    mapping: Dict[str, Tuple[str, Any]] = {}
+    mapping: Dict[str, Tuple[str, Any, Optional[int]]] = {}
 
     running = getattr(runner, "_running_agents", {}) or {}
     started_ts = getattr(runner, "_running_agents_ts", {}) or {}
@@ -108,20 +110,47 @@ def _collect_observations(
     for session_key, agent in list(running.items()):
         if agent is _AGENT_PENDING_SENTINEL or agent is None:
             continue
+        if bool(getattr(agent, "_hermes_guard_interrupt_pending", False)):
+            continue
         try:
             summary = agent.get_activity_summary() or {}
         except Exception:
             summary = {}
-        session_id = getattr(agent, "session_id", None) or session_key
+        session_id = str(getattr(agent, "session_id", None) or session_key).strip()
         started_at = float(started_ts.get(session_key, now) or now)
         api_calls = int(summary.get("api_call_count", 0) or 0)
-        # No live per-session token meter is exposed; estimate from call count
-        # and the assumed per-call context size. Deliberately conservative.
-        tokens_used = api_calls * int(assumed_context_tokens)
-        # State hash changes only on forward progress: new activity or a new
-        # tool. Re-sending the same context with the same activity ts and tool
-        # (calls climbing, nothing new happening) reads as "no progress".
-        state_hash = f"{summary.get('last_activity_ts')}:{summary.get('current_tool')}"
+        attempt_seq = summary.get("attempt_seq")
+        failure_seq = summary.get("failure_seq")
+        progress_seq = summary.get("progress_seq")
+        turn_generation = summary.get("turn_generation")
+        is_non_retryable = bool(summary.get("is_non_retryable_failure", False))
+        last_error_code = summary.get("last_error_code")
+        terminal_session_id = (
+            summary.get("last_session_id") or summary.get("session_id") or session_id
+        )
+        usage = usage_aggregate_from_mapping(
+            session_id,
+            summary.get("usage"),
+            default_component_id="activity-summary-usage",
+            fallback_session_id=str(terminal_session_id or ""),
+            missing_reason="missing_activity_usage",
+        )
+        # Prefer sanitized backend receipts. When none exist, retain the
+        # conservative call-count estimate for the rate detector only.
+        estimated_tokens = api_calls * int(assumed_context_tokens)
+        tokens_used = (
+            usage.total_tokens
+            if usage.usage_verified
+            else max(usage.total_tokens, estimated_tokens)
+        )
+        try:
+            context_tokens = max(0, int(summary.get("context_tokens", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            context_tokens = 0
+        # No-progress is about verified state advancement, not heartbeat/API
+        # activity. Timestamps and current-tool labels would change during a
+        # dead loop and falsely reset the stall detector.
+        state_hash = f"progress:{progress_seq}"
 
         observations.append(
             SessionObservation(
@@ -129,15 +158,42 @@ def _collect_observations(
                 started_at=started_at,
                 api_call_count=api_calls,
                 tokens_used=tokens_used,
-                context_tokens=int(assumed_context_tokens),
+                token_count_provenance=(
+                    UsageProvenance.MEASURED
+                    if usage.usage_verified
+                    else UsageProvenance.ESTIMATED
+                ),
+                context_tokens=context_tokens,
                 state_hash=state_hash,
-                error_code=None,  # runtime doesn't surface last error here yet
+                error_code=last_error_code if is_non_retryable else None,
+                turn_generation=(
+                    int(turn_generation) if turn_generation is not None else None
+                ),
+                attempt_seq=(int(attempt_seq) if attempt_seq is not None else None),
+                progress_seq=(int(progress_seq) if progress_seq is not None else None),
+                failure_seq=(int(failure_seq) if failure_seq is not None else None),
+                failure_streak=int(summary.get("failure_streak", 0) or 0),
+                is_non_retryable_failure=is_non_retryable,
+                last_event_id=summary.get("last_event_id"),
+                last_event_sequence=summary.get("last_event_sequence"),
+                last_call_id=summary.get("last_call_id"),
+                last_adapter=summary.get("last_adapter"),
+                last_source=summary.get("last_source"),
+                last_retryability=summary.get("last_retryability"),
+                last_status=summary.get("last_status"),
+                usage=usage,
+                terminal_session_id=terminal_session_id,
                 provider=str(getattr(agent, "provider", "") or ""),
                 model=str(getattr(agent, "model", "") or ""),
                 effort=_agent_effort(agent),
             )
         )
-        mapping[session_id] = (session_key, agent)
+        generation = getattr(agent, "_hermes_run_generation", None)
+        mapping[session_id] = (
+            session_key,
+            agent,
+            int(generation) if generation is not None else None,
+        )
 
     return observations, mapping
 
@@ -155,89 +211,131 @@ def _agent_effort(agent: Any) -> str:
 class _LiveKillActions(KillActions):
     """Adapts the running gateway to the enforcer's three effects."""
 
-    def __init__(self, runner: Any, loop: Any, mapping: Dict[str, Tuple[str, Any]]) -> None:
+    def __init__(
+        self,
+        runner: Any,
+        loop: Any,
+        mapping: Dict[str, Tuple[str, Any, Optional[int]]],
+    ) -> None:
         self._runner = runner
         self._loop = loop
         self._mapping = mapping
+        self._notification_target: Optional[str] = None
+        self.interrupt_pending = False
 
     def interrupt(self, session_id: str, reason: str) -> bool:
         entry = self._mapping.get(session_id)
         if not entry:
             return False
-        _session_key, agent = entry
+        session_key, agent, generation = entry
+        self._notification_target = session_id
+        if generation is None:
+            logger.warning(
+                "dead-loop guard: refusing unbound interrupt for %s", session_id
+            )
+            return False
+        is_current = getattr(self._runner, "_is_session_run_current", None)
+        if not callable(is_current) or not is_current(session_key, generation):
+            return False
         try:
             agent.interrupt(reason)
+            self.interrupt_pending = True
+            setattr(agent, "_hermes_guard_interrupt_pending", True)
+            evict = getattr(self._runner, "_evict_cached_agent", None)
+            if callable(evict):
+                evict(session_key)
+
+            # ``AIAgent.interrupt`` is cooperative. Keep the generation-owned
+            # running slot and turn lease until the worker actually drains;
+            # otherwise a new turn can overlap a still-executing tool.
+            try:
+                timeout = float(
+                    getattr(self._runner, "_guard_interrupt_drain_timeout_s", 2.5)
+                )
+            except (TypeError, ValueError, OverflowError):
+                timeout = 2.5
+            deadline = time.monotonic() + max(0.0, min(timeout, 30.0))
+            running = getattr(self._runner, "_running_agents", {})
+            while running.get(session_key) is agent and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if running.get(session_key) is agent:
+                return False
+
+            invalidate = getattr(
+                self._runner, "_invalidate_session_run_generation_if_current", None
+            )
+            if callable(invalidate):
+                invalidate(
+                    session_key,
+                    generation,
+                    reason="deadloop_guard_drained",
+                )
+            self.interrupt_pending = False
             return True
         except Exception as e:
             logger.warning("dead-loop guard: interrupt failed for %s: %s", session_id, e)
             return False
 
     def release_lease(self, session_id: str) -> bool:
-        registry = getattr(self._runner, "_turn_leases", None)
-        tokens = getattr(self._runner, "_turn_lease_tokens", None)
-        if registry is None or not isinstance(tokens, dict):
+        entry = self._mapping.get(session_id)
+        if not entry:
             return False
-        released = False
-        # Release any held lease token whose resolved session_id matches. The
-        # registry's release() is idempotent and ownership-checked, so this is
-        # safe even if the turn's own finally releases concurrently.
-        for token in list(tokens.values()):
-            try:
-                if getattr(token, "session_id", None) == session_id:
-                    if registry.release(token):
-                        released = True
-            except Exception as e:
-                logger.debug("dead-loop guard: lease release error for %s: %s", session_id, e)
-        return released
+        session_key, _agent, generation = entry
+        if generation is None:
+            return False
+        release = getattr(self._runner, "_release_turn_lease", None)
+        if not callable(release):
+            return False
+        return bool(release(session_key, generation))
 
     def notify(self, text: str) -> bool:
         # 1) Always log at ERROR — guaranteed to surface in errors.log and the
         #    desktop/gateway log views. A kill is never silent even if no
         #    messaging channel is reachable.
         logger.error("FLEET-SAFETY DEAD-LOOP KILL\n%s", text)
-        # 2) Best-effort fan-out to every configured home channel (Telegram +
-        #    desktop) on the gateway loop.
-        delivered = False
+        # 2) Best-effort delivery only to the originating route. Broadcasting
+        #    session/provider details to unrelated home channels crosses tenant
+        #    and project boundaries.
         try:
-            delivered = self._broadcast_home_channels(text)
+            return self._notify_origin(text)
         except Exception as e:  # pragma: no cover - defensive
-            logger.debug("dead-loop guard: home-channel broadcast failed: %s", e)
-        return True  # logged ⇒ reported; `delivered` is a bonus, not required
+            logger.debug("dead-loop guard: origin notification failed: %s", e)
+            return False
 
-    def _broadcast_home_channels(self, text: str) -> bool:
+    def _notify_origin(self, text: str) -> bool:
         runner = self._runner
         loop = self._loop
-        config = getattr(runner, "config", None)
-        adapters = getattr(runner, "adapters", None)
-        if config is None or loop is None:
+        entry = self._mapping.get(self._notification_target or "")
+        if not entry or loop is None:
+            return False
+        session_key, _agent, _generation = entry
+        get_source = getattr(runner, "_get_cached_session_source", None)
+        source = get_source(session_key) if callable(get_source) else None
+        if source is None:
+            return False
+        get_adapter = getattr(runner, "_adapter_for_source", None)
+        adapter = get_adapter(source) if callable(get_adapter) else None
+        if adapter is None:
             return False
         try:
-            from gateway.delivery import resolve_delivery_transport
             from gateway.run import safe_schedule_threadsafe
         except Exception:
             return False
 
-        platforms = getattr(config, "platforms", {}) or {}
-
-        async def _send_all() -> bool:
-            any_ok = False
-            for platform, platform_cfg in platforms.items():
-                home = getattr(platform_cfg, "home_channel", None)
-                if not home or not getattr(home, "chat_id", None):
-                    continue
-                transport = resolve_delivery_transport(platform, config, adapters)
-                if transport is None:
-                    continue
-                try:
-                    result = await transport.adapter.send(str(home.chat_id), text)
-                    if result is None or getattr(result, "success", True) is not False:
-                        any_ok = True
-                except Exception as e:
-                    logger.debug("dead-loop guard: send to %s failed: %s", platform, e)
-            return any_ok
+        async def _send_origin() -> bool:
+            try:
+                metadata = runner._thread_metadata_for_source(source)
+            except Exception:
+                metadata = None
+            result = await adapter.send(source.chat_id, text, metadata=metadata)
+            if result is False:
+                return False
+            if isinstance(result, dict):
+                return result.get("success", True) is not False
+            return result is None or getattr(result, "success", True) is not False
 
         fut = safe_schedule_threadsafe(
-            _send_all(), loop,
+            _send_origin(), loop,
             logger=logger,
             log_message="dead-loop guard alert scheduling error",
         )
@@ -263,8 +361,15 @@ def run_guard_tick(runner: Any, loop: Any = None, now: Optional[float] = None) -
         if not thresholds.enabled:
             return
 
-        assumed = int(guard_cfg.get("assumed_context_tokens", DEFAULT_ASSUMED_CONTEXT_TOKENS) or
-                      DEFAULT_ASSUMED_CONTEXT_TOKENS)
+        try:
+            assumed = int(
+                guard_cfg.get("assumed_context_tokens", DEFAULT_ASSUMED_CONTEXT_TOKENS)
+                or DEFAULT_ASSUMED_CONTEXT_TOKENS
+            )
+            if assumed <= 0:
+                raise ValueError("assumed context must be positive")
+        except (TypeError, ValueError, OverflowError):
+            assumed = DEFAULT_ASSUMED_CONTEXT_TOKENS
         guard = _get_or_create_guard(runner, thresholds)
 
         observations, mapping = _collect_observations(runner, now, assumed)

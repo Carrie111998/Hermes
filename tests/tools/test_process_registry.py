@@ -1110,6 +1110,34 @@ class TestCheckpoint:
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
 
+    def test_completion_identity_survives_checkpoint_restore(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        session = _make_session()
+        session.pid = os.getpid()
+        session.notify_on_complete = True
+        registry._running[session.id] = session
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            registry._write_checkpoint()
+            payload = json.loads(checkpoint.read_text())
+            stream_id = payload[0]["event_stream_id"]
+            assert stream_id
+            assert payload[0]["event_sequence"] == 0
+
+            restored = ProcessRegistry()
+            with patch.object(restored, "_host_pid_is_ours", return_value=True):
+                assert restored.recover_from_checkpoint() == 1
+            recovered = restored.get(session.id)
+            assert recovered.event_stream_id == stream_id
+
+            restored._move_to_finished(recovered)
+            event = restored.completion_queue.get_nowait()
+
+        assert event["event_stream_id"] == stream_id
+        assert event["event_sequence"] == 1
+        assert event["event_seq"] == 1
+        assert event["event_id"] == f"{stream_id}:completion:1"
+
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{

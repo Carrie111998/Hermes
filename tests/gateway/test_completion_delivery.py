@@ -21,6 +21,27 @@ from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
+def test_terminal_delivery_identity_is_scoped_to_producer_session():
+    first = GatewayRunner._completion_delivery_identity(
+        {"event_id": "process:completed:1", "session_id": "session-a"}
+    )
+    replay = GatewayRunner._completion_delivery_identity(
+        {"event_id": "process:completed:1", "session_id": "session-a"}
+    )
+    independent = GatewayRunner._completion_delivery_identity(
+        {"event_id": "process:completed:1", "session_id": "session-b"}
+    )
+
+    assert first == replay
+    assert independent != first
+
+
+def test_unscoped_terminal_event_fails_open_for_delivery():
+    assert GatewayRunner._completion_delivery_identity(
+        {"event_id": "locally-generated-id"}
+    ) is None
+
+
 @pytest.fixture(autouse=True)
 def isolated_registry(tmp_path, monkeypatch):
     """Any current/future durable compatibility path must stay in tmp state."""
@@ -68,8 +89,8 @@ def _async_event(delegation_id="deleg_duplicate"):
     }
 
 
-def _completion_event(*, started_at, session_id="proc_reused"):
-    return {
+def _completion_event(*, started_at, session_id="proc_reused", **metadata):
+    event = {
         "type": "completion",
         "session_id": session_id,
         "session_key": "agent:main:telegram:dm:123",
@@ -82,6 +103,8 @@ def _completion_event(*, started_at, session_id="proc_reused"):
         "completion_reason": "exited",
         "output": "done\n",
     }
+    event.update(metadata)
+    return event
 
 
 def _stop_after_sleeps(monkeypatch, runner, count):
@@ -363,6 +386,47 @@ def test_distinct_process_incarnations_are_not_deduplicated():
     assert adapter.handle_message.await_count == 2
 
 
+def test_explicit_terminal_event_identity_and_sequence_gate_delivery():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    newest = _completion_event(
+        started_at=10.0,
+        event_id="gateway-event-2",
+        event_seq=2,
+        event_stream_id="process:proc_reused:10.0",
+    )
+    replay = dict(newest)
+    stale_distinct = _completion_event(
+        started_at=10.0,
+        event_id="gateway-event-1",
+        event_seq=1,
+        event_stream_id="process:proc_reused:10.0",
+    )
+    distinct_same_sequence = _completion_event(
+        started_at=10.0,
+        event_id="gateway-event-2b",
+        event_seq=2,
+        event_stream_id="process:proc_reused:10.0",
+    )
+
+    async def _exercise():
+        return (
+            await runner._deliver_completion_notification("newest", newest),
+            await runner._deliver_completion_notification("replay", replay),
+            await runner._deliver_completion_notification("stale", stale_distinct),
+            await runner._deliver_completion_notification(
+                "distinct", distinct_same_sequence
+            ),
+        )
+
+    assert asyncio.run(_exercise()) == (True, None, None, None)
+    assert adapter.handle_message.await_count == 1
+    delivered = adapter.handle_message.await_args_list[0].args[0]
+    assert delivered.metadata["terminal_event"]["event_id"] == "gateway-event-2"
+    assert delivered.metadata["terminal_event"]["call_id"] == "proc_reused"
+    assert delivered.metadata["terminal_event"]["event_seq"] == 2
+
+
 def test_delivered_identity_retention_is_bounded():
     """Lifecycle dedupe cannot grow without bound in a long-running gateway."""
     adapter = SimpleNamespace(handle_message=AsyncMock())
@@ -431,6 +495,46 @@ def test_async_completion_uses_canonical_origin_routing(monkeypatch, isolated_re
 
     delivered = adapter.handle_message.await_args.args[0]
     assert delivered.source == canonical
+
+
+def test_gateway_process_watcher_emits_registry_scoped_completion_identity(
+    monkeypatch, isolated_registry,
+):
+    session = ProcessSession(
+        id="proc_gateway_identity",
+        command="echo done",
+        task_id="task",
+        session_key="agent:main:telegram:dm:123",
+        started_at=10.0,
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+    )
+    isolated_registry._finished[session.id] = session
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _instant_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": session.session_key,
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    delivered = adapter.handle_message.await_args.args[0]
+    terminal = delivered.metadata["terminal_event"]
+    expected = isolated_registry.completion_event_identity(session)
+    assert terminal["event_id"] == expected["event_id"]
+    assert terminal["event_stream_id"] == expected["event_stream_id"]
+    assert terminal["event_sequence"] == 1
 
 
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):
@@ -579,6 +683,7 @@ def test_unobserved_normal_completion_still_notifies(monkeypatch):
     class _Registry:
         def get(self, _session_id):
             return SimpleNamespace(
+                id="proc_unobserved",
                 output_buffer="done\n",
                 exited=True,
                 exit_code=0,
@@ -588,6 +693,14 @@ def test_unobserved_normal_completion_still_notifies(monkeypatch):
 
         def is_completion_consumed(self, _session_id):
             return False
+
+        def completion_event_identity(self, session):
+            return {
+                "event_id": f"process:{session.id}:completion:1",
+                "event_stream_id": f"process:{session.id}",
+                "event_sequence": 1,
+                "event_seq": 1,
+            }
 
     monkeypatch.setattr(pr_module, "process_registry", _Registry())
     adapter = SimpleNamespace(handle_message=AsyncMock())

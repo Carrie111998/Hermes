@@ -3456,6 +3456,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+        self._session_run_generation_lock = threading.RLock()
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -3482,6 +3483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_delivery_lock = threading.Lock()
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
+        self._completion_delivery_sequences: "OrderedDict[str, int]" = OrderedDict()
         self._completion_delivery_retention = 2048
 
         # Cache AIAgent instances per session to preserve prompt caching.
@@ -17946,6 +17948,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            terminal_event = self._completion_terminal_event(evt)
+            if terminal_event is not None:
+                metadata["terminal_event"] = terminal_event
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -17967,15 +17972,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
     @staticmethod
-    def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
-        """Return a producer-stable identity when one is available.
+    def _completion_terminal_event(evt: dict) -> Optional[dict]:
+        event_id = str(evt.get("event_id") or "").strip()
+        if not event_id:
+            return None
+        event_seq = evt.get("event_seq", evt.get("event_sequence"))
+        try:
+            event_seq = int(event_seq) if event_seq is not None else None
+        except (TypeError, ValueError):
+            event_seq = None
+        return {
+            "event_id": event_id,
+            "event_seq": event_seq,
+            "event_sequence": event_seq,
+            "event_stream_id": str(evt.get("event_stream_id") or "").strip() or None,
+            "call_id": str(
+                evt.get("call_id") or evt.get("session_id") or evt.get("delegation_id") or ""
+            ).strip(),
+            "adapter": str(evt.get("adapter") or "gateway").strip(),
+            "source": str(evt.get("source") or evt.get("type") or "gateway").strip(),
+            "status": evt.get("status") or (
+                "failure" if evt.get("exit_code") not in (None, 0) else "success"
+            ),
+            "result": evt.get("result", evt.get("output")),
+            "retryability": evt.get("retryability", "unknown"),
+            "error_code": evt.get("error_code"),
+            "usage": evt.get("usage"),
+            "session_id": evt.get("session_id"),
+        }
 
-        Delegation UUIDs identify one producer completion. Process session IDs
-        are normally unique too, but include the persisted spawn epoch so an
-        explicitly reused ID represents a distinct process incarnation. Legacy
-        process events without ``started_at`` are delivered without deduplication
-        rather than risking suppression of a real completion.
+    @staticmethod
+    def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
+        """Return a stable terminal-event identity when one is available.
+
+        Explicit event IDs own replay identity. Legacy producers retain their
+        prior identity only when they have not adopted terminal events yet.
         """
+        event_id = str(evt.get("event_id") or "").strip()
+        if event_id:
+            producer_scope = str(
+                evt.get("event_stream_id")
+                or evt.get("parent_session_id")
+                or evt.get("session_id")
+                or evt.get("delegation_id")
+                or evt.get("call_id")
+                or ""
+            ).strip()
+            # An event ID is only unique inside its producer stream. Without a
+            # scope, fail open for delivery rather than suppressing an unrelated
+            # session that happens to reuse the same locally generated ID.
+            return (
+                ("terminal_event", producer_scope, event_id)
+                if producer_scope
+                else None
+            )
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
@@ -18052,6 +18102,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         guarantee is claimed.
         """
         identity = self._completion_delivery_identity(evt)
+        terminal_event = self._completion_terminal_event(evt)
+        event_stream_id = ""
+        event_sequence = None
+        if terminal_event is not None:
+            event_stream_id = str(terminal_event.get("event_stream_id") or "")
+            event_sequence = terminal_event.get("event_sequence")
         durable_claim_id = ""
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
@@ -18121,6 +18177,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or identity in self._completion_deliveries_delivered
                 ):
                     return None
+                sequences = getattr(self, "_completion_delivery_sequences", None)
+                if sequences is None:
+                    sequences = OrderedDict()
+                    self._completion_delivery_sequences = sequences
+                if event_stream_id and event_sequence is not None:
+                    highwater = sequences.get(event_stream_id)
+                    if highwater is not None and event_sequence <= highwater:
+                        return None
                 self._completion_deliveries_inflight.add(identity)
 
         accepted = False
@@ -18134,11 +18198,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
                     self._completion_deliveries_delivered[identity] = None
+                    if event_stream_id and event_sequence is not None:
+                        sequences = self._completion_delivery_sequences
+                        highwater = sequences.get(event_stream_id)
+                        sequences[event_stream_id] = (
+                            event_sequence
+                            if highwater is None
+                            else max(highwater, event_sequence)
+                        )
+                        sequences.move_to_end(event_stream_id)
                     while (
                         len(self._completion_deliveries_delivered)
                         > self._completion_delivery_retention
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
+                    while (
+                        len(self._completion_delivery_sequences)
+                        > self._completion_delivery_retention
+                    ):
+                        self._completion_delivery_sequences.popitem(last=False)
 
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it
@@ -18336,6 +18414,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "completion_reason": getattr(session, "completion_reason", "exited"),
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
+                        **_pr_check.completion_event_identity(session),
                     }
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
@@ -18763,20 +18842,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return False
-        if run_generation is not None and not self._is_session_run_current(
-            session_key, run_generation
-        ):
-            return False
-        lease = getattr(self, "_active_session_leases", {}).pop(session_key, None)
-        if lease is not None:
-            try:
-                lease.release()
-            except Exception:
-                logger.debug("Failed to release active session slot", exc_info=True)
-        self._running_agents.pop(session_key, None)
-        self._running_agents_ts.pop(session_key, None)
-        if hasattr(self, "_busy_ack_ts"):
-            self._busy_ack_ts.pop(session_key, None)
+        with self._get_session_run_generation_lock():
+            if run_generation is not None and not self._is_session_run_current(
+                session_key, run_generation
+            ):
+                return False
+            lease = getattr(self, "_active_session_leases", {}).pop(session_key, None)
+            if lease is not None:
+                try:
+                    lease.release()
+                except Exception:
+                    logger.debug("Failed to release active session slot", exc_info=True)
+            self._running_agents.pop(session_key, None)
+            self._running_agents_ts.pop(session_key, None)
+            if hasattr(self, "_busy_ack_ts"):
+                self._busy_ack_ts.pop(session_key, None)
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
@@ -18929,6 +19009,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 e,
             )
 
+    def _get_session_run_generation_lock(self):
+        """Return the lock protecting generation checks plus running-slot mutation."""
+        lock = self.__dict__.get("_session_run_generation_lock")
+        if lock is None:
+            lock = threading.RLock()
+            self._session_run_generation_lock = lock
+        return lock
+
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh run generation token for ``session_key``.
 
@@ -18939,13 +19027,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return 0
-        generations = self.__dict__.get("_session_run_generation")
-        if generations is None:
-            generations = {}
-            self._session_run_generation = generations
-        next_generation = int(generations.get(session_key, 0)) + 1
-        generations[session_key] = next_generation
-        return next_generation
+        with self._get_session_run_generation_lock():
+            generations = self.__dict__.get("_session_run_generation")
+            if generations is None:
+                generations = {}
+                self._session_run_generation = generations
+            next_generation = int(generations.get(session_key, 0)) + 1
+            generations[session_key] = next_generation
+            return next_generation
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
@@ -18959,12 +19048,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return generation
 
+    def _invalidate_session_run_generation_if_current(
+        self,
+        session_key: str,
+        generation: int,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Atomically invalidate only the generation the caller observed."""
+        if not session_key:
+            return False
+        with self._get_session_run_generation_lock():
+            generations = self.__dict__.get("_session_run_generation") or {}
+            if int(generations.get(session_key, 0)) != int(generation):
+                return False
+            generations[session_key] = int(generation) + 1
+        if reason:
+            logger.info(
+                "Invalidated run generation for %s → %d (%s)",
+                session_key,
+                int(generation) + 1,
+                reason,
+            )
+        return True
+
     def _is_session_run_current(self, session_key: str, generation: int) -> bool:
         """Return True when ``generation`` is still current for ``session_key``."""
         if not session_key:
             return True
-        generations = self.__dict__.get("_session_run_generation") or {}
-        return int(generations.get(session_key, 0)) == int(generation)
+        with self._get_session_run_generation_lock():
+            generations = self.__dict__.get("_session_run_generation") or {}
+            return int(generations.get(session_key, 0)) == int(generation)
 
     def _bind_adapter_run_generation(
         self,
@@ -22537,6 +22651,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation,
                 )
                 return
+            setattr(agent_holder[0], "_hermes_run_generation", run_generation)
             self._running_agents[session_key] = agent_holder[0]
             if self._draining:
                 self._update_runtime_status("draining")

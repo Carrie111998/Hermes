@@ -24,26 +24,79 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.tool_result_classification import tool_result_verified_progress
 
 logger = logging.getLogger(__name__)
 
 
-def _coerce_usage_int(value: Any) -> int:
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return max(value, 0)
-    if isinstance(value, float):
-        return max(int(value), 0)
-    if isinstance(value, str):
-        try:
-            return max(int(value), 0)
-        except ValueError:
-            return 0
-    return 0
+def _register_codex_app_server_usage_attempt(
+    agent,
+    *,
+    effective_task_id: str,
+) -> str:
+    """Reserve one fail-closed usage component before Codex dispatch."""
+
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    turn_scope = str(
+        getattr(agent, "_current_turn_id", "") or effective_task_id or "unknown"
+    ).strip()
+    component_id = f"codex-app-server-attempt:{turn_scope}"
+    telemetry = getattr(agent, "_progress_telemetry", None)
+    if telemetry is not None and session_id:
+        if not getattr(telemetry, "session_id", ""):
+            telemetry.bind_session_id(session_id)
+        elif telemetry.session_id != session_id:
+            raise RuntimeError(
+                "codex usage producer session does not match telemetry binding"
+            )
+        telemetry.record_usage_component(
+            component_id=component_id,
+            source="codex_app_server_response",
+            session_id=session_id,
+            provenance="unknown",
+            authority="provider_response",
+            authoritative=False,
+            accepted_event_id=turn_scope,
+            details={"api_mode": "codex_app_server"},
+            reason="provider_attempt_in_progress",
+            pending=True,
+        )
+    agent.session_api_calls += 1
+    return component_id
 
 
-def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
+def _complete_codex_app_server_unknown_attempt(
+    agent,
+    *,
+    usage_component_id: str,
+    reason: str,
+) -> None:
+    """Terminally close a pre-registered attempt without numeric usage."""
+
+    telemetry = getattr(agent, "_progress_telemetry", None)
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    if telemetry is None or not session_id:
+        return
+    telemetry.record_usage_component(
+        component_id=usage_component_id,
+        source="codex_app_server_response",
+        session_id=session_id,
+        provenance="unknown",
+        authority="provider_response",
+        authoritative=False,
+        accepted_event_id=usage_component_id,
+        details={"api_mode": "codex_app_server"},
+        reason=reason,
+        complete_pending=True,
+    )
+
+
+def _record_codex_app_server_usage(
+    agent,
+    turn,
+    *,
+    usage_component_id: str | None = None,
+) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
     Codex app-server reports usage via thread/tokenUsage/updated as:
@@ -57,18 +110,40 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
     """
-    agent.session_api_calls += 1
+    telemetry = getattr(agent, "_progress_telemetry", None)
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    if telemetry is not None and session_id:
+        if not getattr(telemetry, "session_id", ""):
+            telemetry.bind_session_id(session_id)
+        elif telemetry.session_id != session_id:
+            raise RuntimeError(
+                "codex usage producer session does not match telemetry binding"
+            )
+    turn_id = str(getattr(turn, "turn_id", "") or "").strip()
+    if not turn_id:
+        thread_id = str(getattr(turn, "thread_id", "") or "").strip()
+        turn_id = f"{thread_id or 'unknown'}:{agent.session_api_calls}"
+    usage_component_id = usage_component_id or f"codex-app-server-response:{turn_id}"
 
-    usage = getattr(turn, "token_usage_last", None)
-    if not isinstance(usage, dict) or not usage:
+    def _record_unknown(reason: str) -> dict[str, Any]:
+        if telemetry is not None and session_id:
+            telemetry.record_usage_component(
+                component_id=usage_component_id,
+                source="codex_app_server_response",
+                session_id=session_id,
+                provenance="unknown",
+                authority="provider_response",
+                authoritative=False,
+                accepted_event_id=turn_id,
+                details={"api_mode": "codex_app_server"},
+                reason=reason,
+                complete_pending=True,
+            )
         compressor = getattr(agent, "context_compressor", None)
         if (
             compressor is not None
             and getattr(compressor, "awaiting_real_usage_after_compression", False)
         ):
-            # No usage means this turn cannot adjudicate the pending compaction.
-            # Consume the marker so a later unrelated reading is not charged to
-            # it and preflight deferral cannot stay latched indefinitely.
             compressor.update_from_response({})
         if agent._session_db and agent.session_id:
             try:
@@ -85,17 +160,34 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             except Exception as exc:
                 logger.debug(
                     "Codex app-server api-call persistence failed (session=%s): %s",
-                    agent.session_id, exc,
+                    agent.session_id,
+                    exc,
                 )
         return {}
 
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    usage = getattr(turn, "token_usage_last", None)
+    if not isinstance(usage, dict) or not usage:
+        return _record_unknown("provider_usage_missing")
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
-    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
-    output_tokens = _coerce_usage_int(usage.get("outputTokens"))
-    reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
-    reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    from agent.usage_provenance import nonnegative_token_count
+
+    required_fields = ("inputTokens", "outputTokens", "totalTokens")
+    optional_fields = ("cachedInputTokens", "reasoningOutputTokens")
+    parsed = {
+        field: nonnegative_token_count(usage.get(field))
+        for field in (*required_fields, *optional_fields)
+    }
+    if any(field not in usage or parsed[field] is None for field in required_fields) or any(
+        field in usage and parsed[field] is None for field in optional_fields
+    ):
+        return _record_unknown("provider_usage_malformed")
+
+    input_tokens = parsed["inputTokens"]
+    cache_read_tokens = parsed["cachedInputTokens"] or 0
+    output_tokens = parsed["outputTokens"]
+    reasoning_tokens = parsed["reasoningOutputTokens"] or 0
+    reported_total = parsed["totalTokens"]
 
     canonical_usage = CanonicalUsage(
         input_tokens=input_tokens,
@@ -107,7 +199,33 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     )
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
-    total_tokens = reported_total or canonical_usage.total_tokens
+    total_tokens = reported_total
+    if telemetry is not None and session_id:
+        telemetry.record_usage_component(
+            component_id=usage_component_id,
+            source="codex_app_server_response",
+            session_id=session_id,
+            provenance="measured",
+            authority="provider_response",
+            authoritative=True,
+            accepted_event_id=turn_id,
+            input_tokens=canonical_usage.input_tokens,
+            output_tokens=canonical_usage.output_tokens,
+            total_tokens=total_tokens,
+            cache_read_tokens=canonical_usage.cache_read_tokens,
+            cache_write_tokens=canonical_usage.cache_write_tokens,
+            reasoning_tokens=canonical_usage.reasoning_tokens,
+            details={
+                "api_mode": "codex_app_server",
+                "input_tokens": canonical_usage.input_tokens,
+                "output_tokens": canonical_usage.output_tokens,
+                "total_tokens": total_tokens,
+                "cache_read_tokens": canonical_usage.cache_read_tokens,
+                "cache_write_tokens": canonical_usage.cache_write_tokens,
+                "reasoning_tokens": canonical_usage.reasoning_tokens,
+            },
+            complete_pending=True,
+        )
     usage_dict = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -505,7 +623,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                     "tool_start_callback raised for %s", name, exc_info=True,
                 )
 
-    def _fire_tool_completed(item: dict) -> None:
+    def _fire_tool_completed(
+        item: dict, event_sequence: int | None = None,
+    ) -> None:
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
         prior = started.pop(item_id, None)
@@ -520,11 +640,60 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         elif prior is not None:
             duration = time.monotonic() - prior[2]
         result, is_error = _codex_item_completion_payload(item)
+        args = prior[1] if prior is not None else _codex_item_to_args(item)
+        completion = None
+        observe = getattr(agent, "_observe_guardrail_completion", None)
+        if item_id and observe is not None:
+            try:
+                completion = observe(
+                    name,
+                    args,
+                    result,
+                    failed=is_error,
+                    event_id=f"codex:item/completed:{item_id}",
+                    event_sequence=event_sequence,
+                    call_id=_stable_call_id(item, name),
+                    adapter="codex_app_server",
+                    source="codex_app_server",
+                    verified_progress=tool_result_verified_progress(
+                        name,
+                        args,
+                        result,
+                        failed=is_error,
+                    ),
+                )
+            except Exception:
+                logger.debug(
+                    "terminal completion observation raised for %s",
+                    name,
+                    exc_info=True,
+                )
+            if completion is not None:
+                if getattr(completion, "replayed", False):
+                    return
+                result = getattr(completion, "result", result)
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
-                cb("tool.completed", name, None, None,
-                   duration=duration, is_error=is_error, result=result)
+                terminal_metadata = {}
+                snapshot = getattr(completion, "snapshot", None)
+                if snapshot:
+                    terminal_metadata = {
+                        "event_id": getattr(completion, "event_id", None),
+                        "event_sequence": getattr(completion, "event_sequence", None),
+                        "call_id": _stable_call_id(item, name),
+                        "adapter": snapshot.get("last_adapter"),
+                        "source": snapshot.get("last_source"),
+                        "status": snapshot.get("last_status"),
+                        "retryability": snapshot.get("last_retryability"),
+                        "error_code": snapshot.get("last_error_code"),
+                        "activity_snapshot": snapshot,
+                    }
+                cb(
+                    "tool.completed", name, None, None,
+                    duration=duration, is_error=is_error, result=result,
+                    **terminal_metadata,
+                )
             except Exception:
                 logger.debug(
                     "tool_progress_callback raised on tool.completed for %s",
@@ -532,7 +701,6 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 )
         complete_cb = getattr(agent, "tool_complete_callback", None)
         if complete_cb is not None:
-            args = prior[1] if prior is not None else _codex_item_to_args(item)
             try:
                 complete_cb(_stable_call_id(item, name), name, args, result)
             except Exception:
@@ -605,7 +773,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         if method == "item/completed":
             if item_type in _CODEX_TOOL_ITEM_TYPES:
-                _fire_tool_completed(item)
+                _fire_tool_completed(item, note.get("sequence"))
             elif item_type == "agentMessage":
                 _fire_agent_message_completed(item)
 
@@ -691,10 +859,19 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    usage_component_id = _register_codex_app_server_usage_attempt(
+        agent,
+        effective_task_id=effective_task_id,
+    )
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
+        _complete_codex_app_server_unknown_attempt(
+            agent,
+            usage_component_id=usage_component_id,
+            reason="provider_request_failed",
+        )
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -718,7 +895,7 @@ def run_codex_app_server_turn(
                 f"Fall back to default runtime with `/codex-runtime auto`."
             ),
             "messages": messages,
-            "api_calls": 0,
+            "api_calls": 1,
             "completed": False,
             "partial": True,
             "interrupted": _user_interrupted,
@@ -797,7 +974,11 @@ def run_codex_app_server_turn(
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
     _record_codex_app_server_compaction(agent, turn)
-    usage_result = _record_codex_app_server_usage(agent, turn)
+    usage_result = _record_codex_app_server_usage(
+        agent,
+        turn,
+        usage_component_id=usage_component_id,
+    )
     api_calls = 1
 
     # Now check the skill nudge AFTER iters were incremented — same

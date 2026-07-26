@@ -119,12 +119,88 @@ class TestGoalMigratesOnRotation:
             goals._DB_CACHE.clear()
 
 
+class TestCompressionTelemetryRotation:
+    def test_committed_child_gets_fresh_telemetry_and_parent_ledger_is_frozen(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_TELEMETRY_ROT"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+        parent_telemetry = agent._progress_telemetry
+        parent_telemetry.record_attempt_completion(
+            "read_file",
+            {"path": "parent.txt"},
+            "parent evidence",
+            is_failure=False,
+            event_id="parent-event",
+            session_id=parent,
+        )
+        parent_snapshot = parent_telemetry.get_activity_snapshot()
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = agent.session_id
+        child_telemetry = agent._progress_telemetry
+        assert child != parent
+        assert child_telemetry is not parent_telemetry
+        assert child_telemetry.session_id == child
+        assert agent._progress_telemetry_lineage[parent] is parent_telemetry
+        assert parent_telemetry.frozen is True
+
+        # Both provider-neutral tool events and Codex app-server usage must bind
+        # to the committed child rather than raising a session mismatch.
+        child_telemetry.record_attempt_completion(
+            "read_file",
+            {"path": "child.txt"},
+            "child evidence",
+            is_failure=False,
+            event_id="child-event",
+            session_id=child,
+        )
+        from agent.codex_runtime import _record_codex_app_server_usage
+
+        _record_codex_app_server_usage(
+            agent,
+            type(
+                "Turn",
+                (),
+                {
+                    "turn_id": "child-codex-turn",
+                    "thread_id": "child-codex-thread",
+                    "token_usage_last": None,
+                },
+            )(),
+        )
+        assert child_telemetry.attempt_seq == 1
+        assert parent_telemetry.get_activity_snapshot() == parent_snapshot
+        with pytest.raises(RuntimeError, match="frozen"):
+            parent_telemetry.record_attempt_completion(
+                "read_file",
+                {"path": "child.txt"},
+                "must not land",
+                is_failure=False,
+                event_id="late-child-event",
+                session_id=child,
+            )
+
+
 class TestOrphanRollbackOnCreateFailure:
     def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_ORPHAN_ROT"
         db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
+        parent_telemetry = agent._progress_telemetry
+        parent_telemetry.record_attempt_completion(
+            "read_file",
+            {"path": "parent.txt"},
+            "parent evidence",
+            is_failure=False,
+            event_id="parent-event",
+            session_id=parent,
+        )
+        parent_snapshot = parent_telemetry.get_activity_snapshot()
 
         # Atomic publication failure must leave the live parent and caller's
         # original list untouched even when a plugin compressor mutates in place.
@@ -147,6 +223,10 @@ class TestOrphanRollbackOnCreateFailure:
             )
 
         assert agent.session_id == parent
+        assert agent._progress_telemetry is parent_telemetry
+        assert parent_telemetry.get_activity_snapshot() == parent_snapshot
+        assert getattr(parent_telemetry, "frozen", False) is False
+        assert parent not in getattr(agent, "_progress_telemetry_lineage", {})
         assert [(m["role"], m["content"]) for m in returned] == [
             (m["role"], m["content"]) for m in _msgs()
         ]

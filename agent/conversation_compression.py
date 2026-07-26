@@ -2081,6 +2081,18 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
+                    from agent.progress_telemetry import ProgressTelemetry
+
+                    parent_telemetry = getattr(agent, "_progress_telemetry", None)
+                    child_telemetry = ProgressTelemetry(
+                        session_id=new_session_id,
+                        context_id=new_session_id,
+                    )
+                    telemetry_lineage = dict(
+                        getattr(agent, "_progress_telemetry_lineage", {}) or {}
+                    )
+                    if parent_telemetry is not None:
+                        telemetry_lineage[old_session_id] = parent_telemetry
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
@@ -2095,7 +2107,16 @@ def compress_context(
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
                     )
-                    agent.session_id = new_session_id
+                    if parent_telemetry is not None:
+                        parent_telemetry.freeze()
+                    # Publish the new identity and its immutable ledger binding
+                    # together. Child producers can never observe a committed
+                    # child id paired with the parent's ledger.
+                    agent.__dict__.update(
+                        session_id=new_session_id,
+                        _progress_telemetry=child_telemetry,
+                        _progress_telemetry_lineage=telemetry_lineage,
+                    )
                     try:
                         from gateway.session_context import set_current_session_id
 
