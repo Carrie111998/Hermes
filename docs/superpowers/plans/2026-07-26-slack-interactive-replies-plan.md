@@ -40,7 +40,7 @@
 - Produces: `InteractiveReplyStore.bind_message(card_id: str, message_ts: str) -> bool`, `discard(card_id: str) -> None`, and `consume(button_token: str, channel_id: str, message_ts: str) -> ConsumedInteractiveAction | None`.
 - Produces: `append_actions_block(blocks: list[dict], prepared: PreparedInteractiveReply) -> list[dict]`.
 
-- [ ] **Step 1: Write the failing parser and store tests**
+- [x] **Step 1: Write the failing parser and store tests**
 
 ```python
 def test_parse_valid_directive_strips_it_and_preserves_visible_reply():
@@ -60,13 +60,13 @@ def test_consume_requires_bound_message_and_is_single_use(tmp_path, monkeypatch)
     assert store.consume(prepared.buttons[0].token, "C1", "M1") is None
 ```
 
-- [ ] **Step 2: Run the focused tests to verify they fail**
+- [x] **Step 2: Run the focused tests to verify they fail**
 
 Run: `scripts/run_tests.sh tests/gateway/test_slack_interactive_replies.py -q`
 
 Expected: FAIL because the module and its contract do not exist.
 
-- [ ] **Step 3: Write the minimal parser and store**
+- [x] **Step 3: Write the minimal parser and store**
 
 ```python
 @dataclass(frozen=True)
@@ -84,13 +84,13 @@ class InteractiveReplyStore:
 
 Use a random opaque value for each button, a card record with expected channel/thread/message and action mapping, atomic replacement for writes, and the repository's `fcntl`/`msvcrt` lock fallback. Clean expired cards while holding the lock. Reject blank labels, duplicate action IDs, invalid identifier characters, over-limit button counts, and malformed syntax by returning `None` so callers retain literal content.
 
-- [ ] **Step 4: Run the focused tests to verify they pass**
+- [x] **Step 4: Run the focused tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/gateway/test_slack_interactive_replies.py -q`
 
 Expected: PASS for parser validity, malformed literal fallback, expiry, binding, cross-channel rejection, and replay rejection.
 
-- [ ] **Step 5: Commit the isolated contract**
+- [x] **Step 5: Commit the isolated contract**
 
 ```bash
 git add plugins/platforms/slack/interactive_replies.py tests/gateway/test_slack_interactive_replies.py
@@ -109,7 +109,7 @@ git commit -m "feat: add Slack interactive reply store"
 - Consumes: `parse_interactive_reply`, `InteractiveReplyStore.create_card`, `bind_message`, `discard`, and `append_actions_block` from Task 1.
 - Produces: an outbound Slack payload with non-empty `text`, visible content without a valid directive, and one `hermes_interactive_reply` actions block.
 
-- [ ] **Step 1: Write failing adapter and standalone-send tests**
+- [x] **Step 1: Write failing adapter and standalone-send tests**
 
 ```python
 @pytest.mark.asyncio
@@ -127,13 +127,13 @@ def test_standalone_send_posts_the_same_action_block(monkeypatch, _standalone_se
     assert fake_session.calls[0][1]["blocks"][-1]["type"] == "actions"
 ```
 
-- [ ] **Step 2: Run the focused tests to verify they fail**
+- [x] **Step 2: Run the focused tests to verify they fail**
 
 Run: `scripts/run_tests.sh tests/gateway/test_slack_interactive_replies.py tests/tools/test_send_message_slack.py -q`
 
 Expected: FAIL because neither send path interprets the directive.
 
-- [ ] **Step 3: Integrate the helper without changing ordinary messages**
+- [x] **Step 3: Integrate the helper without changing ordinary messages**
 
 ```python
 interactive = parse_interactive_reply(content)
@@ -148,13 +148,13 @@ if interactive is not None:
 
 Use `interactive.visible_content` for formatting, truncation, block rendering, and accessibility fallback. Bind the card only after `chat_postMessage` returns its timestamp; discard it after any post or retry failure. In `_standalone_send`, use the same helper and bind/discard lifecycle around the direct Web API call. Preserve ordinary text and current rich/markdown block behavior when parsing returns `None`.
 
-- [ ] **Step 4: Run the focused tests to verify they pass**
+- [x] **Step 4: Run the focused tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/gateway/test_slack_interactive_replies.py tests/tools/test_send_message_slack.py -q`
 
 Expected: PASS; both sends produce real buttons, retain `text`, and leave malformed directives literal.
 
-- [ ] **Step 5: Commit outbound rendering**
+- [x] **Step 5: Commit outbound rendering**
 
 ```bash
 git add plugins/platforms/slack/adapter.py tests/gateway/test_slack_interactive_replies.py tests/tools/test_send_message_slack.py
@@ -173,7 +173,7 @@ git commit -m "feat: render Slack interactive reply buttons"
 - Produces: `SlackAdapter._handle_interactive_reply_action(ack, body, action) -> None`.
 - Produces: a regular `MessageEvent` with `text == "Slack button action: go"` and `internal is False`.
 
-- [ ] **Step 1: Write failing callback tests**
+- [x] **Step 1: Write failing callback tests**
 
 ```python
 @pytest.mark.asyncio
@@ -196,13 +196,13 @@ async def test_forged_or_replayed_click_never_reaches_handle_message(adapter):
     adapter.handle_message.assert_not_awaited()
 ```
 
-- [ ] **Step 2: Run the focused callback tests to verify they fail**
+- [x] **Step 2: Run the focused callback tests to verify they fail**
 
 Run: `scripts/run_tests.sh tests/gateway/test_slack_interactive_replies.py -q`
 
 Expected: FAIL because no generic interactive action handler is registered or implemented.
 
-- [ ] **Step 3: Register and implement the fail-closed callback**
+- [x] **Step 3: Register and implement the fail-closed callback**
 
 ```python
 self._app.action("hermes_interactive_reply")(self._handle_interactive_reply_action)
@@ -226,13 +226,13 @@ async def _handle_interactive_reply_action(self, ack, body, action) -> None:
 
 Build `source`, prompt, skills, workspace scope, and thread metadata from the callback using the same adapter helpers used for normal messages. Update the clicked card to remove its action block after consumption; failure to update must not restore the record or emit another event. Never set `internal=True` and never resolve an action name directly from the Slack payload.
 
-- [ ] **Step 4: Run callback and regression tests to verify they pass**
+- [x] **Step 4: Run callback and regression tests to verify they pass**
 
 Run: `scripts/run_tests.sh tests/gateway/test_slack_interactive_replies.py tests/gateway/test_slack_approval_buttons.py tests/gateway/test_slack_clarify_buttons.py tests/gateway/test_slack_plugin_action_handlers.py -q`
 
 Expected: PASS; valid clicks relay once, invalid clicks fail closed, and existing controls remain wired.
 
-- [ ] **Step 5: Commit click routing**
+- [x] **Step 5: Commit click routing**
 
 ```bash
 git add plugins/platforms/slack/adapter.py tests/gateway/test_slack_interactive_replies.py
@@ -297,6 +297,29 @@ git commit -m "docs: record Slack interactive reply verification"
 ```
 
 Expected: the whitespace check passes and the worktree is clean after the commit.
+
+### Final review outcome (2026-07-26)
+
+The initial final review was **BLOCKED** on three issues:
+
+1. The generic callback consumed its opaque one-time record before applying
+   the existing interactive-user authorization rule, so an unauthorized viewer
+   could prevent a later authorized selection.
+2. The slash interactive helper selected a client without the resolved
+   `team_id`, so an ambiguous Slack-local channel ID shared by two workspaces
+   could fall back to the primary workspace client.
+3. The post-consumption card update preserved unrelated controls but did not
+   add an immutable non-action acknowledgement naming the clicker.
+
+Commit `24ce52719` (`fix: secure Slack interactive reply completion`) remediated
+all three findings test-first. The RED gate produced 3 expected failures; the
+targeted GREEN gate passed 3/3; and a fresh affected regression run passed 118
+tests with 0 failures. The scoped re-review then **APPROVED** the remediation.
+
+The repository-wide local suite remains **NON-PASS**: 45,497 tests passed and
+596 environment/platform-dependent tests failed, as recorded in Step 3 above.
+A successful upstream GitHub CI run is still required and is pending; no CI
+pass is claimed here. No live Slack action or Sorpio action was performed.
 
 ## Plan Self-Review
 
