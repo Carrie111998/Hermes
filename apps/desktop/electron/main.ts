@@ -6168,7 +6168,7 @@ async function freshGatewayWsUrl(profile) {
   if (connection.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(connection.baseUrl)
 
-    return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+    return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket, profile)
   }
 
   // Local/token: the cached wsUrl already carries the (long-lived) token.
@@ -6886,7 +6886,8 @@ async function buildRemoteConnection(
   source,
   remoteHost?,
   remoteKind = 'url',
-  remoteIdentity?
+  remoteIdentity?,
+  profile?
 ) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
   // For token/oauth remotes the meaningful host is the real backend URL; for
@@ -6945,7 +6946,7 @@ async function buildRemoteConnection(
       remoteKind,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
-      wsUrl: buildGatewayWsUrlWithTicket(baseUrl, ticket)
+      wsUrl: buildGatewayWsUrlWithTicket(baseUrl, ticket, profile)
     }
   }
 
@@ -6965,7 +6966,7 @@ async function buildRemoteConnection(
     remoteIdentity,
     remoteKind,
     token,
-    wsUrl: buildGatewayWsUrl(baseUrl, token)
+    wsUrl: buildGatewayWsUrl(baseUrl, token, profile)
   }
 }
 
@@ -7275,7 +7276,9 @@ async function resolveRemoteBackend(profile) {
       token,
       'profile',
       undefined,
-      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url'
+      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url',
+      undefined,
+      profile
     )
   }
 
