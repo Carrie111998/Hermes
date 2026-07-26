@@ -261,12 +261,10 @@ class TestDiscordSendClarify:
 
 
     @pytest.mark.asyncio
-    async def test_unwrap_does_not_pick_value_or_name_alone(self):
-        # 'name' and 'value' are Discord-component-shaped fields that could
-        # accidentally appear in dicts not intended as choices (e.g., a
-        # developer-error in the gateway wiring). The renderer should not
-        # surface them as button labels — only the well-known LLM tool-call
-        # keys (label, description, text, title) should win.
+    async def test_unwrap_accepts_value_alone_but_rejects_name_value_components(self):
+        # A lone value is accepted because some model bridges emit that shape.
+        # Component-shaped {name, value} mappings remain rejected because the
+        # value may be a raw enum identifier rather than a user-facing label.
         adapter = _make_adapter()
         channel = MagicMock()
         sent_msg = MagicMock()
@@ -279,7 +277,8 @@ class TestDiscordSendClarify:
             question="?",
             choices=[
                 {"name": "only_name_here"},   # should be filtered out
-                {"value": "only_value_here"},  # should be filtered out
+                {"value": "value-only choice"},
+                {"name": "component", "value": "raw-enum"},
                 {"description": "real choice"},
             ],
             clarify_id="cidNV",
@@ -288,11 +287,13 @@ class TestDiscordSendClarify:
         kwargs = channel.send.call_args.kwargs
         view = kwargs["view"]
         choice_labels = [b.label for b in view.children[:-1]]  # exclude Other
-        # Only the well-formed dict survives.
-        assert len(choice_labels) == 1, (
-            f"Expected 1 choice, got {len(choice_labels)}: {choice_labels!r}"
+        # The lone value and canonical description survive; component shapes do not.
+        assert len(choice_labels) == 2, (
+            f"Expected 2 choices, got {len(choice_labels)}: {choice_labels!r}"
         )
-        assert "real choice" in choice_labels[0]
+        assert any("value-only choice" in label for label in choice_labels)
+        assert all("raw-enum" not in label for label in choice_labels)
+        assert any("real choice" in label for label in choice_labels)
         for label in choice_labels:
             assert "only_name_here" not in label, f"name leaked: {label!r}"
             assert "only_value_here" not in label, f"value leaked: {label!r}"
