@@ -41,6 +41,7 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     mock_builder.register_p2_im_message_reaction_created_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_im_message_reaction_deleted_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_card_action_trigger = Mock(return_value=mock_builder)
+    mock_builder.register_p2_application_bot_menu_v6 = Mock(return_value=mock_builder)
     mock_builder.build = Mock(return_value=object())
     mock_handler_class.builder = Mock(return_value=mock_builder)
     return mock_builder
@@ -174,6 +175,99 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    def _bot_menu_adapter(self, *, admit_reason=None):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = object()
+        adapter._admit = Mock(return_value=admit_reason)
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "ou_user",
+                "user_name": "Menu User",
+                "user_id_alt": None,
+            }
+        )
+        adapter._handle_message_with_guards = AsyncMock()
+        return adapter
+
+    @staticmethod
+    def _bot_menu_data(event_id="evt_menu_1", event_key="/status"):
+        return SimpleNamespace(
+            header=SimpleNamespace(event_id=event_id),
+            event=SimpleNamespace(
+                event_key=event_key,
+                timestamp=1785063000,
+                operator=SimpleNamespace(
+                    operator_name="Menu User",
+                    operator_id=SimpleNamespace(
+                        open_id="ou_user",
+                        user_id=None,
+                        union_id=None,
+                    ),
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _dispatch_bot_menu(adapter, data):
+        def run_submitted(_loop, coroutine):
+            asyncio.run(coroutine)
+
+        with (
+            patch.object(adapter, "_loop_accepts_callbacks", return_value=True),
+            patch.object(adapter, "_submit_on_loop", side_effect=run_submitted),
+        ):
+            adapter._on_bot_menu_event(data)
+
+    def test_bot_menu_event_routes_event_key_to_operator_p2p(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._bot_menu_adapter()
+        self._dispatch_bot_menu(adapter, self._bot_menu_data())
+
+        event = adapter._handle_message_with_guards.await_args.args[0]
+        self.assertEqual(event.text, "/status")
+        self.assertEqual(event.message_type, MessageType.TEXT)
+        self.assertEqual(event.message_id, "evt_menu_1")
+        self.assertEqual(event.source.chat_id, "ou_user")
+        self.assertEqual(event.source.chat_type, "dm")
+        self.assertEqual(event.source.user_id, "ou_user")
+        adapter._admit.assert_called_once()
+
+    def test_bot_menu_event_rejected_by_dm_admission_is_dropped(self):
+        adapter = self._bot_menu_adapter(admit_reason="dm_policy_rejected")
+        self._dispatch_bot_menu(adapter, self._bot_menu_data())
+
+        adapter._handle_message_with_guards.assert_not_awaited()
+        adapter._resolve_sender_profile.assert_not_awaited()
+
+    def test_duplicate_bot_menu_event_is_dropped(self):
+        adapter = self._bot_menu_adapter()
+        adapter._is_duplicate.side_effect = [False, True]
+        data = self._bot_menu_data()
+
+        self._dispatch_bot_menu(adapter, data)
+        self._dispatch_bot_menu(adapter, data)
+
+        self.assertEqual(adapter._handle_message_with_guards.await_count, 1)
+        adapter._is_duplicate.assert_called_with("feishu_bot_menu:evt_menu_1")
+
+    def test_distinct_bot_menu_event_ids_are_both_dispatched(self):
+        adapter = self._bot_menu_adapter()
+
+        self._dispatch_bot_menu(adapter, self._bot_menu_data(event_id="evt_menu_1"))
+        self._dispatch_bot_menu(adapter, self._bot_menu_data(event_id="evt_menu_2"))
+
+        self.assertEqual(adapter._handle_message_with_guards.await_count, 2)
+        message_ids = [
+            call.args[0].message_id
+            for call in adapter._handle_message_with_guards.await_args_list
+        ]
+        self.assertEqual(message_ids, ["evt_menu_1", "evt_menu_2"])
+
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
     def test_websocket_sdk_accepts_channel_ua_tag(self):
         """The shipped SDK must support the Channel signaling argument."""
@@ -773,6 +867,10 @@ class TestAdapterBehavior(unittest.TestCase):
                 calls.append(f"customized:{event_key}")
                 return self
 
+            def register_p2_application_bot_menu_v6(self, _handler):
+                calls.append("bot_menu")
+                return self
+
             def build(self):
                 calls.append("build")
                 return "handler"
@@ -802,6 +900,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 "message_recalled",
                 "customized:drive.notice.comment_add_v1",
                 "customized:vc.bot.meeting_invited_v1",
+                "bot_menu",
                 "build",
             ],
         )
