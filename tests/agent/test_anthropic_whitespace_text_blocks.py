@@ -17,6 +17,7 @@ from agent.anthropic_adapter import (
     _safe_text,
     _sanitize_replay_block,
     _convert_assistant_message,
+    _ensure_leading_user_turn,
 )
 
 
@@ -116,3 +117,34 @@ class TestConvertAssistantMessageWhitespace:
         out = _convert_assistant_message(msg)
         thinking = [b for b in out["content"] if b.get("type") == "thinking"]
         assert thinking == [{"type": "thinking", "thinking": "  ", "signature": "sig-B"}]
+
+
+class TestEnsureLeadingUserTurn:
+    """A compacted window can start with an assistant turn; Anthropic requires
+    messages[0].role == user, so a placeholder user turn is prepended. That
+    placeholder's text MUST be non-whitespace or the request 400s on every turn
+    and the session wedges permanently. Ref #69512 / whitespace-block deadlock.
+    """
+
+    def test_prepends_user_turn_when_first_is_assistant(self):
+        result = [{"role": "assistant", "content": [{"type": "text", "text": "summary"}]}]
+        _ensure_leading_user_turn(result)
+        assert result[0]["role"] == "user"
+        assert len(result) == 2
+
+    def test_placeholder_text_is_non_whitespace(self):
+        result = [{"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
+        _ensure_leading_user_turn(result)
+        _assert_no_blank_text(result[0])
+        assert _text_blocks(result[0]) == [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]
+
+    def test_noop_when_first_is_already_user(self):
+        result = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        _ensure_leading_user_turn(result)
+        assert len(result) == 1
+        assert result[0]["content"] == [{"type": "text", "text": "hi"}]
+
+    def test_empty_list_is_left_alone(self):
+        result = []
+        _ensure_leading_user_turn(result)
+        assert result == []

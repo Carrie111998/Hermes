@@ -10,6 +10,7 @@ import pytest
 
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
+    _EMPTY_TEXT_PLACEHOLDER,
     _is_azure_anthropic_endpoint,
     _is_oauth_token,
     _refresh_oauth_token,
@@ -1414,7 +1415,7 @@ class TestConvertMessages:
 
         assert system == "You are helpful."
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == [{"type": "text", "text": " "}]
+        assert result[0]["content"] == [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]
         assert result[1]["role"] == "assistant"
         assert any(
             m["role"] == "assistant" and "Context compaction summary" in str(m["content"])
@@ -1438,7 +1439,7 @@ class TestConvertMessages:
 
         assert system is None
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == [{"type": "text", "text": " "}]
+        assert result[0]["content"] == [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]
         assert result[1]["role"] == "assistant"
         assert "Context compaction summary" in str(result[1]["content"])
 

@@ -2529,7 +2529,19 @@ def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
     (convert_messages_to_converse).
     """
     if result and result[0].get("role") != "user":
-        result.insert(0, {"role": "user", "content": [{"type": "text", "text": " "}]})
+        # NOTE: the placeholder text MUST be non-whitespace. Anthropic's
+        # Messages API rejects text content blocks that are empty or
+        # whitespace-only ("messages: text content blocks must contain
+        # non-whitespace text", HTTP 400). A single space here deadlocks
+        # any conversation whose compacted window starts with an assistant
+        # turn — the bad block is re-sent every turn and never self-heals.
+        result.insert(
+            0,
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}],
+            },
+        )
 
 
 def convert_messages_to_anthropic(
