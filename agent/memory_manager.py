@@ -61,6 +61,14 @@ def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]], disable
     """
     if disabled_toolsets and "memory" in disabled_toolsets:
         return False
+    if enabled_toolsets is None:
+        return True
+    if not enabled_toolsets:
+        return False
+    # Any non-empty toolset list allows external memory providers (#45422)
+    return True
+
+
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     """Return a function-tool dict with a resolvable top-level ``name``.
 
@@ -92,16 +100,6 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     if not name or not isinstance(name, str):
         return None
     return schema
-
-
-def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
-    """Return whether external memory-provider tools should be exposed."""
-    if enabled_toolsets is None:
-        return True
-    if not enabled_toolsets:
-        return False
-    # Any non-empty toolset list allows external memory providers (#45422)
-    return True
 
 
 def inject_memory_provider_tools(agent: Any) -> int:

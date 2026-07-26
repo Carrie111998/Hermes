@@ -4684,7 +4684,7 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         if callable(get_mem_schemas):
             # Honor the same enablement gate inject_memory_provider_tools uses.
             from agent.memory_manager import memory_provider_tools_enabled
-            if "memory" in name_set or memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None)):
+            if "memory" in name_set or memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None)):
                 for schema in get_mem_schemas():
                     if isinstance(schema, dict):
                         _add(schema)
