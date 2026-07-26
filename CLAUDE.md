@@ -80,11 +80,14 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   `secrets/index.md`: Discord de Nous → repo propio (precedente faq:844). desktop.md:
   "Nous Research" (botón/enlace OAuth) → Digital Services LLC por coherencia con
   web-dashboard.md ya commiteado.
-- Lote 6 (este commit): `messaging/` (32 .md). Sin anclas que reapuntar (headings
+- Lote 6 `a675ede0c`: `messaging/` (32 .md). Sin anclas que reapuntar (headings
   Hermes no referenciados). Preservado header `X-Hermes-Session-Id` (matrix.md).
   Cosmético `signal-cli link -n "HermesAgent"` → `"IYARI"`. Advisory GHSA en
   telegram.md repunta al repo fork (tradeoff conocido de la regla de repo).
-- Sub-lotes user-guide/ restantes: 7=`configuration.md` (~2131 líneas),
-  8=`skills/bundled/`+google-workspace (74, dividir en 2), 9-10=`skills/optional/` (101, dividir).
+- Lote 7 (este commit): `configuration.md` (2131 líneas, 93 "Hermes" → IYARI). Sin
+  anclas (headings son config-keys). Preservados `HermesSweEnv` (nombre de entorno
+  benchmark RL) y `Nous-managed gateway` (servicio Nous).
+- Sub-lotes user-guide/ restantes: 8=`skills/bundled/`+google-workspace (74, dividir en 2),
+  9-10=`skills/optional/` (101, dividir).
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
