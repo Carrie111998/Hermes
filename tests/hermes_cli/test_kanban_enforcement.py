@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -800,3 +801,116 @@ class TestHookRegistration:
         assert ke.dispatch_enforcement_is_established("test_endsesh")
         ke._on_session_end_enforcement(session_id="test_endsesh")
         assert not ke.dispatch_enforcement_is_established("test_endsesh")
+
+# ---------------------------------------------------------------------------
+# FD-018: Real plugin discovery + invoke_hook integration
+# ---------------------------------------------------------------------------
+
+
+class TestPluginIntegration:
+    """Real plugin discovery, hook invocation, and dual opt-in enforcement."""
+
+    def _setup_temp_hermes_home(self, tmp_path, monkeypatch, *, enabled=True):
+        """Create a temp HERMES_HOME with enforced config and bundled plugin."""
+        import yaml
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        plugins_dir = home / "plugins"
+        plugins_dir.mkdir()
+
+        config = {
+            "kanban": {"enforce_dispatch_routing": True},
+            "plugins": {"enabled": ["kanban-enforcement"] if enabled else []},
+        }
+        (home / "config.yaml").write_text(yaml.dump(config))
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        # Point to the repo's bundled plugins so kanban-enforcement is found.
+        repo_plugins = (
+            Path(__file__).resolve().parent.parent.parent / "plugins"
+        )
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(repo_plugins))
+        # Force fresh discovery in tests.
+        from hermes_cli.plugins import get_plugin_manager
+
+        pm = get_plugin_manager()
+        pm._discovered = False
+        pm._plugins.clear()
+        pm._hooks.clear()
+        return home
+
+    def test_plugin_enabled_blocks_substantial(self, tmp_path, monkeypatch):
+        """With plugins.enabled=['kanban-enforcement'] and enforce_dispatch_routing=true,
+        discover_plugins + invoke_hook returns a block for terminal."""
+        self._setup_temp_hermes_home(tmp_path, monkeypatch, enabled=True)
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        results = invoke_hook("pre_tool_call", tool_name="terminal")
+        assert len(results) == 1, f"expected 1 block result, got {len(results)}"
+        assert results[0]["action"] == "block"
+        assert "BLOCKED" in results[0]["message"]
+
+    def test_plugin_disabled_no_block(self, tmp_path, monkeypatch):
+        """With plugins.enabled=[] (empty), discover_plugins does not load the
+        enforcement plugin, so invoke_hook returns no results."""
+        self._setup_temp_hermes_home(tmp_path, monkeypatch, enabled=False)
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        results = invoke_hook("pre_tool_call", tool_name="terminal")
+        assert results == [], "no plugin loaded -> no block"
+
+    def test_config_disabled_no_block(self, tmp_path, monkeypatch):
+        """With plugins.enabled but enforce_dispatch_routing=false in config,
+        the hook callback runs but returns None (no block)."""
+        import yaml
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        home.joinpath("plugins").mkdir()
+        config = {
+            "kanban": {"enforce_dispatch_routing": False},
+            "plugins": {"enabled": ["kanban-enforcement"]},
+        }
+        (home / "config.yaml").write_text(yaml.dump(config))
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        repo_plugins = (
+            Path(__file__).resolve().parent.parent.parent / "plugins"
+        )
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(repo_plugins))
+        from hermes_cli.plugins import get_plugin_manager
+
+        pm = get_plugin_manager()
+        pm._discovered = False
+        pm._plugins.clear()
+        pm._hooks.clear()
+
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        results = invoke_hook("pre_tool_call", tool_name="terminal")
+        assert results == [], "config disabled -> no block"
+
+    def test_allowed_tool_not_blocked(self, tmp_path, monkeypatch):
+        """With enforcement active, read-only tools are still allowed."""
+        self._setup_temp_hermes_home(tmp_path, monkeypatch, enabled=True)
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        results = invoke_hook("pre_tool_call", tool_name="read_file")
+        assert results == [], "read_file is always allowed"
+
+    def test_on_session_hooks_registered(self, tmp_path, monkeypatch):
+        """After discovery, on_session_start/end hooks are registered."""
+        self._setup_temp_hermes_home(tmp_path, monkeypatch, enabled=True)
+        from hermes_cli.plugins import discover_plugins, has_hook
+
+        discover_plugins()
+        assert has_hook("pre_tool_call"), "pre_tool_call should be registered"
+        assert has_hook("post_tool_call"), "post_tool_call should be registered"
+        assert has_hook("post_llm_call"), "post_llm_call should be registered"
+        assert has_hook("on_session_start"), "on_session_start should be registered"
+        assert has_hook("on_session_end"), "on_session_end should be registered"
