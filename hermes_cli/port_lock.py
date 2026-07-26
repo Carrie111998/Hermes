@@ -228,13 +228,13 @@ def _get_process_start_time(pid: int) -> Optional[int]:
         # Unix: read /proc/<pid>/stat field 22 (start_time in jiffies since
         # boot).  We convert to epoch ms by adding boot time.
         try:
-            with open(f"/proc/{pid}/stat", "r") as f:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
                 fields = f.read().split()
             # Field 22 (0-indexed: 21) is start_time in jiffies since boot.
             if len(fields) < 22:
                 return None
             # Get boot time from /proc/stat "btime" field.
-            with open("/proc/stat", "r") as f:
+            with open("/proc/stat", "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("btime "):
                         btime_secs = int(line.split()[1])

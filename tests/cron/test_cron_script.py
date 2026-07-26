@@ -253,7 +253,7 @@ class TestRunJobScript:
         assert captured["kwargs"]["errors"] == "replace"
 
     @pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: encoding is always set on Windows")
-    def test_non_windows_script_preserves_default_text_decoding(self, cron_env, monkeypatch):
+    def test_non_windows_script_pins_text_decoding(self, cron_env, monkeypatch):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
 
@@ -277,8 +277,8 @@ class TestRunJobScript:
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
-        assert "encoding" not in captured["kwargs"]
-        assert "errors" not in captured["kwargs"]
+        assert captured["kwargs"]["encoding"] == "utf-8"
+        assert captured["kwargs"]["errors"] == "replace"
 
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script

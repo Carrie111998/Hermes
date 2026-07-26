@@ -81,6 +81,8 @@ def _build_sha() -> str:
             ["git", "rev-parse", "HEAD"],
             cwd=str(_repo_root()),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stderr=subprocess.DEVNULL,
             timeout=2,
         ).strip()
@@ -121,6 +123,7 @@ def _pid_command(pid: int) -> str:
         return subprocess.check_output(
             ["ps", "-p", str(pid), "-o", "command="],
             text=True,
+            errors="replace",
             stderr=subprocess.DEVNULL,
             timeout=2,
         ).strip()
