@@ -45,15 +45,20 @@ declare global {
       // the mascot. The main renderer drives it (open/close/drag + state push);
       // the overlay sends control messages back (pop-in, composer submit).
       petOverlay: {
-        open: (request: PetOverlayOpenRequest) => Promise<{ ok: boolean; bounds?: PetOverlayBounds }>
-        close: () => Promise<{ ok: boolean }>
+        // Lifecycle + state are profile-addressed (one overlay per profile) and
+        // PRIMARY-RENDERER-ONLY — main verifies the sender.
+        open: (profile: string, request: PetOverlayOpenRequest) => Promise<{ ok: boolean; bounds?: PetOverlayBounds }>
+        close: (profile: string) => Promise<{ ok: boolean }>
+        // Per-window channels are BOUND-OVERLAY-ONLY: main derives the profile
+        // from the sender, so no profile is supplied here.
         setBounds: (bounds: PetOverlayBounds) => void
         setIgnoreMouse: (ignore: boolean) => void
         setFocusable: (focusable: boolean) => void
-        pushState: (payload: PetOverlayStatePayload) => void
+        pushState: (profile: string, payload: PetOverlayStatePayload) => void
         control: (payload: PetOverlayControl) => void
         onState: (callback: (payload: PetOverlayStatePayload) => void) => () => void
-        onControl: (callback: (payload: PetOverlayControl) => void) => () => void
+        // main attaches the sender-derived `profile` before forwarding control.
+        onControl: (callback: (payload: PetOverlayControl & { profile?: string }) => void) => () => void
       }
       getBootProgress: () => Promise<DesktopBootProgress>
       getConnectionConfig: (profile?: null | string) => Promise<DesktopConnectionConfig>

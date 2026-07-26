@@ -1,7 +1,17 @@
 import { atom } from 'nanostores'
 
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
-import { $petActivity, $petInfo, $petReplyText, $petUnread, clearPetUnread, clearPetReplyText, type PetActivity, type PetInfo } from '@/store/pet'
+import {
+  $petActivity,
+  $petInfo,
+  $petReplyText,
+  $petUnread,
+  clearPetUnread,
+  clearPetReplyText,
+  type PetActivity,
+  type PetInfo,
+  petProfile
+} from '@/store/pet'
 import { $awaitingResponse, $busy } from '@/store/session'
 
 /**
@@ -138,9 +148,14 @@ export function overlayWindowSize(frameW: number, frameH: number, scale: number)
 
 let stateUnsubs: Array<() => void> = []
 let controlUnsub: (() => void) | null = null
-let submitHandler: ((text: string) => void) | null = null
-let openAppHandler: (() => void) | null = null
-let scaleHandler: ((scale: number) => void) | null = null
+let submitHandler: ((profile: string, text: string) => void) | null = null
+let openAppHandler: ((profile: string) => void) | null = null
+let scaleHandler: ((profile: string, scale: number) => void) | null = null
+
+// The profile whose pet the popped-out overlay currently shows. The single-pet
+// path mirrors the active profile's global atoms, so this is the active profile
+// captured at pop-out time; main addresses the overlay window by it.
+let overlayProfile = 'default'
 
 function currentPayload(): PetOverlayStatePayload {
   return {
@@ -155,7 +170,7 @@ function currentPayload(): PetOverlayStatePayload {
 }
 
 function pushNow(): void {
-  window.hermesDesktop?.petOverlay?.pushState(currentPayload())
+  window.hermesDesktop?.petOverlay?.pushState(overlayProfile, currentPayload())
 }
 
 /**
@@ -163,15 +178,16 @@ function pushNow(): void {
  * process echoes back the actual screen bounds it used, which we persist so the
  * pet reopens exactly where the user left it.
  */
-function openOverlay(request: PetOverlayOpenRequest): void {
+function openOverlay(profile: string, request: PetOverlayOpenRequest): void {
   const api = window.hermesDesktop?.petOverlay
 
   if (!api || stateUnsubs.length) {
     return
   }
 
+  overlayProfile = profile
   $petOverlayActive.set(true)
-  void api.open(request).then(res => {
+  void api.open(profile, request).then(res => {
     if (res?.bounds) {
       saveBounds(res.bounds)
     }
@@ -206,7 +222,7 @@ export function popOutPet(petRect: PetOverlayBounds): void {
   const saved = loadSavedBounds()
 
   if (saved) {
-    openOverlay({ bounds: saved, screen: true })
+    openOverlay(petProfile(), { bounds: saved, screen: true })
 
     return
   }
@@ -218,7 +234,7 @@ export function popOutPet(petRect: PetOverlayBounds): void {
   const x = Math.round(petRect.x - (width - petRect.width) / 2)
   const y = Math.round(petRect.y - (height - petRect.height) / 2)
 
-  openOverlay({ bounds: { height, width, x, y }, screen: false })
+  openOverlay(petProfile(), { bounds: { height, width, x, y }, screen: false })
 }
 
 /**
@@ -239,7 +255,7 @@ export function restorePetOverlay(): void {
     return
   }
 
-  openOverlay({ bounds: saved, screen: true })
+  openOverlay(petProfile(), { bounds: saved, screen: true })
 }
 
 /** Pop the pet back into the window (closes the overlay window). */
@@ -250,21 +266,22 @@ export function popInPet(): void {
 
   stateUnsubs = []
   $petOverlayActive.set(false)
-  void window.hermesDesktop?.petOverlay?.close()
+  void window.hermesDesktop?.petOverlay?.close(overlayProfile)
 }
 
-/** Register the handler that turns an overlay composer submit into a real send. */
-export function setPetOverlaySubmitHandler(fn: ((text: string) => void) | null): void {
+/** Register the handler that turns an overlay composer submit into a real send.
+ *  The profile is sender-derived by main (never trusted from the renderer). */
+export function setPetOverlaySubmitHandler(fn: ((profile: string, text: string) => void) | null): void {
   submitHandler = fn
 }
 
 /** Register the handler that opens the app to the most recent thread (mail icon). */
-export function setPetOverlayOpenAppHandler(fn: (() => void) | null): void {
+export function setPetOverlayOpenAppHandler(fn: ((profile: string) => void) | null): void {
   openAppHandler = fn
 }
 
 /** Register the handler that persists a scale resized via the overlay's Alt+wheel gesture. */
-export function setPetOverlayScaleHandler(fn: ((scale: number) => void) | null): void {
+export function setPetOverlayScaleHandler(fn: ((profile: string, scale: number) => void) | null): void {
   scaleHandler = fn
 }
 
@@ -280,13 +297,17 @@ export function initPetOverlayBridge(): () => void {
   }
 
   controlUnsub = api.onControl(payload => {
+    // main derives the profile from the overlay's webContents.id and attaches it
+    // before forwarding; fall back to the profile this controller popped out.
+    const profile = payload?.profile ?? overlayProfile
+
     if (payload?.type === 'pop-in') {
       popInPet()
     } else if (payload?.type === 'ready') {
       // The overlay just mounted — hand it the current frame.
       pushNow()
     } else if (payload?.type === 'submit' && typeof payload.text === 'string') {
-      submitHandler?.(payload.text)
+      submitHandler?.(profile, payload.text)
     } else if (payload?.type === 'bounds' && payload.bounds) {
       // The user dragged the overlay to a new desktop spot — remember it.
       saveBounds(payload.bounds)
@@ -294,14 +315,14 @@ export function initPetOverlayBridge(): () => void {
       // The user resized the popped-out pet (Alt+wheel) — persist it through
       // the main renderer's gateway; the new scale rides $petInfo back to the
       // overlay on the next push, keeping both surfaces in sync.
-      scaleHandler?.(payload.scale)
+      scaleHandler?.(profile, payload.scale)
     } else if (payload?.type === 'open-app') {
       // Mail icon / reply bubble: surface the app on the most recent thread
       // (main.ts already focused the window before forwarding this) and mark
       // it read.
       clearPetUnread()
       clearPetReplyText()
-      openAppHandler?.()
+      openAppHandler?.(profile)
     }
   })
 

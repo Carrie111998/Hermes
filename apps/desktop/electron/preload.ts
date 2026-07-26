@@ -9,16 +9,20 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
   petOverlay: {
-    // Main renderer → main process: window lifecycle + drag. `request` is
-    // `{ bounds, screen }`; resolves with the screen bounds it actually used.
-    open: request => ipcRenderer.invoke('hermes:pet-overlay:open', request),
-    close: () => ipcRenderer.invoke('hermes:pet-overlay:close'),
+    // Main renderer → main process: window lifecycle + drag, addressed by
+    // profile (one overlay per profile). `request` is `{ bounds, screen }`;
+    // open resolves with the screen bounds it actually used. These three are
+    // PRIMARY-RENDERER-ONLY — main verifies the sender.
+    open: (profile, request) => ipcRenderer.invoke('hermes:pet-overlay:open', profile, request),
+    close: profile => ipcRenderer.invoke('hermes:pet-overlay:close', profile),
+    // The per-window channels below are BOUND-OVERLAY-ONLY: the overlay sends
+    // them and main derives the profile from the sender (never a supplied field).
     setBounds: bounds => ipcRenderer.send('hermes:pet-overlay:set-bounds', bounds),
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:pet-overlay:ignore-mouse', ignore),
     // Flip the overlay focusable (and focus it) while the composer needs keys.
     setFocusable: focusable => ipcRenderer.send('hermes:pet-overlay:set-focusable', focusable),
-    // Main renderer → overlay (forwarded by main): push the latest pet state.
-    pushState: payload => ipcRenderer.send('hermes:pet-overlay:state', payload),
+    // Main renderer → overlay (forwarded by main): push one profile's pet state.
+    pushState: (profile, payload) => ipcRenderer.send('hermes:pet-overlay:state', profile, payload),
     // Overlay → main renderer (forwarded by main): pop back in / composer submit.
     control: payload => ipcRenderer.send('hermes:pet-overlay:control', payload),
     // Overlay subscribes to state pushes.

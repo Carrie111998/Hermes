@@ -119,6 +119,7 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
+import { isPrimarySender, overlayProfileKey, PetOverlayRegistry } from './pet-overlay-registry'
 import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './native-auth-decisions'
 import {
   nativeRefreshUrl,
@@ -8416,17 +8417,37 @@ function createInstanceWindow() {
 // connection of its own — the main renderer is the single source of truth and
 // pushes pet state over IPC (hermes:pet-overlay:state); the overlay just renders
 // it. Control flows back (pop-in, composer submit) via hermes:pet-overlay:control.
-let petOverlayWindow = null
+//
+// Multi-pet: one overlay window PER PROFILE, keyed by normalized profile name.
+// `overlayProfileByWebContentsId` maps a window's webContents.id back to its
+// profile so main can derive the sender's identity from `event.sender.id`
+// (the shared preload exposes every petOverlay.* API to every renderer, so the
+// renderer-supplied profile is NEVER trusted — "same process family" is not a
+// trust boundary). Capture the wcId at creation: webContents is destroyed by the
+// time 'closed' fires, so it can't be read there.
+const petOverlayRegistry = new PetOverlayRegistry()
+// Aliases keep the existing per-profile map accesses readable; both are backed
+// by the registry so its sender-authentication methods see the same entries.
+const petOverlayWindows = petOverlayRegistry.windows
+const overlayProfileByWebContentsId = petOverlayRegistry.profileByWebContentsId
 
-function petOverlayUrl() {
+function petOverlayUrl(profile) {
+  const q = profile ? `&profile=${encodeURIComponent(profile)}` : ''
+
   if (DEV_SERVER) {
-    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/?win=overlay#/`
+    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/?win=overlay${q}#/`
   }
 
-  return `${pathToFileURL(resolveRendererIndex()).toString()}?win=overlay#/`
+  return `${pathToFileURL(resolveRendererIndex()).toString()}?win=overlay${q}#/`
 }
 
-function spawnPetOverlayWindow(bounds) {
+// The main window's webContents.id, or null when there is no live main window
+// — fed to isPrimarySender so the primary-renderer-only channels can authenticate.
+function primaryWebContentsId() {
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.id : null
+}
+
+function spawnPetOverlayWindow(profile, bounds) {
   const win = new BrowserWindow({
     width: Math.max(80, Math.round(bounds?.width || 220)),
     height: Math.max(80, Math.round(bounds?.height || 220)),
@@ -8503,28 +8524,33 @@ function spawnPetOverlayWindow(bounds) {
     }
   })
 
+  // Capture the webContents.id NOW (via register) — webContents is destroyed by
+  // the time 'closed' fires, so the profile mapping is removed via the captured id.
+  const wcId = petOverlayRegistry.register(profile, win)
+
   win.on('closed', () => {
-    if (petOverlayWindow === win) {
-      petOverlayWindow = null
-    }
+    petOverlayRegistry.unregister(profile, wcId)
 
     // If the overlay went away on its own (e.g. ⌘W), tell the main renderer to
-    // pop the pet back in so it doesn't stay hidden. Harmless echo when we're
-    // the ones who closed it (popInPet already cleared the active flag).
+    // pop that profile's pet back in so it doesn't stay hidden. Harmless echo
+    // when we're the ones who closed it (popInPet already cleared the flag).
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('hermes:pet-overlay:control', { type: 'pop-in' })
+      mainWindow.webContents.send('hermes:pet-overlay:control', { profile, type: 'pop-in' })
     }
   })
 
-  win.loadURL(petOverlayUrl())
+  win.loadURL(petOverlayUrl(profile))
 
   return win
 }
 
-function openPetOverlay(bounds) {
-  if (petOverlayWindow && !petOverlayWindow.isDestroyed()) {
+function openPetOverlay(profile, bounds) {
+  const key = overlayProfileKey(profile)
+  const existing = petOverlayWindows.get(key)
+
+  if (existing && !existing.isDestroyed()) {
     if (bounds) {
-      petOverlayWindow.setBounds({
+      existing.setBounds({
         x: Math.round(bounds.x),
         y: Math.round(bounds.y),
         width: Math.max(80, Math.round(bounds.width)),
@@ -8532,22 +8558,30 @@ function openPetOverlay(bounds) {
       })
     }
 
-    petOverlayWindow.showInactive()
+    existing.showInactive()
 
-    return petOverlayWindow
+    return existing
   }
 
-  petOverlayWindow = spawnPetOverlayWindow(bounds)
-
-  return petOverlayWindow
+  return spawnPetOverlayWindow(key, bounds)
 }
 
-function closePetOverlay() {
-  if (petOverlayWindow && !petOverlayWindow.isDestroyed()) {
-    petOverlayWindow.close()
+function closePetOverlay(profile) {
+  const key = overlayProfileKey(profile)
+  const win = petOverlayWindows.get(key)
+
+  if (win && !win.isDestroyed()) {
+    win.close()
   }
 
-  petOverlayWindow = null
+  petOverlayWindows.delete(key)
+}
+
+// Close every profile's overlay (app quit / main-window teardown).
+function closeAllPetOverlays() {
+  for (const key of [...petOverlayWindows.keys()]) {
+    closePetOverlay(key)
+  }
 }
 
 function createWindow() {
@@ -8658,7 +8692,7 @@ function createWindow() {
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   const createdMainWindow = mainWindow
   mainWindow.on('closed', () => {
-    closePetOverlay()
+    closeAllPetOverlays()
 
     if (mainWindow === createdMainWindow) {
       mainWindow = null
@@ -8864,12 +8898,29 @@ ipcMain.on('hermes:zoom:set-percent', (event, percent) => {
 })
 
 // --- Pet overlay (pop-out mascot) -----------------------------------------
+// Sender-role enforcement: the shared preload exposes every petOverlay.* API to
+// EVERY renderer, so "same process family" is not a trust boundary. The
+// lifecycle/state channels (open/close/state) are PRIMARY-RENDERER-ONLY; the
+// per-window channels (set-bounds/ignore-mouse/set-focusable/control) are
+// BOUND-OVERLAY-ONLY — main derives the profile from `event.sender.id`, never
+// from a renderer-supplied field. Unknown senders are rejected.
+
+// The overlay window owned by the sender, or null when the sender is not a
+// registered overlay (rejects the primary window AND any unknown renderer).
+function overlayWindowForSender(event) {
+  return petOverlayRegistry.windowForSender(event.sender)
+}
+
 // `request` is `{ bounds, screen }`. A fresh pop-out passes viewport-space
 // bounds (screen=false): convert to screen space by adding the main window's
 // content origin so the pet lands where it sat in-window. A remembered/dragged
 // spot passes screen-space bounds (screen=true) and is used as-is. We return the
 // resolved screen bounds so the renderer can persist exactly where it opened.
-ipcMain.handle('hermes:pet-overlay:open', async (_event, request) => {
+ipcMain.handle('hermes:pet-overlay:open', async (event, profile, request) => {
+  if (!isPrimarySender(event.sender, primaryWebContentsId())) {
+    return { ok: false }
+  }
+
   const bounds = request && request.bounds ? request.bounds : request
   const isScreen = Boolean(request && request.screen)
   let screenBounds = bounds
@@ -8888,12 +8939,16 @@ ipcMain.handle('hermes:pet-overlay:open', async (_event, request) => {
     // Fall back to raw bounds if the window geometry is unavailable.
   }
 
-  openPetOverlay(screenBounds)
+  openPetOverlay(profile, screenBounds)
 
   return { ok: true, bounds: screenBounds }
 })
-ipcMain.handle('hermes:pet-overlay:close', async () => {
-  closePetOverlay()
+ipcMain.handle('hermes:pet-overlay:close', async (event, profile) => {
+  if (!isPrimarySender(event.sender, primaryWebContentsId())) {
+    return { ok: false }
+  }
+
+  closePetOverlay(profile)
 
   return { ok: true }
 })
@@ -8903,12 +8958,13 @@ ipcMain.handle('hermes:pet-overlay:close', async () => {
 // The window is created non-resizable (no stray edge-drag on the transparent
 // frameless panel), which on Windows/Linux also blocks programmatic setBounds
 // sizing — so briefly flip resizable on whenever the size actually changes.
-ipcMain.on('hermes:pet-overlay:set-bounds', (_event, bounds) => {
-  if (!petOverlayWindow || petOverlayWindow.isDestroyed() || !bounds) {
+ipcMain.on('hermes:pet-overlay:set-bounds', (event, bounds) => {
+  const win = overlayWindowForSender(event)
+
+  if (!win || !bounds) {
     return
   }
 
-  const win = petOverlayWindow
   const width = Math.max(80, Math.round(bounds.width))
   const height = Math.max(80, Math.round(bounds.height))
   const [curW, curH] = win.getSize()
@@ -8927,36 +8983,55 @@ ipcMain.on('hermes:pet-overlay:set-bounds', (_event, bounds) => {
 // Click-through: the overlay window is a full rectangle but only the pet pixels
 // should be interactive. The renderer toggles this as the cursor enters/leaves
 // the sprite so transparent margins pass clicks to whatever is behind.
-ipcMain.on('hermes:pet-overlay:ignore-mouse', (_event, ignore) => {
-  if (petOverlayWindow && !petOverlayWindow.isDestroyed()) {
-    petOverlayWindow.setIgnoreMouseEvents(Boolean(ignore), { forward: true })
+ipcMain.on('hermes:pet-overlay:ignore-mouse', (event, ignore) => {
+  const win = overlayWindowForSender(event)
+
+  if (win) {
+    win.setIgnoreMouseEvents(Boolean(ignore), { forward: true })
   }
 })
 // The overlay is a non-activating panel (focusable:false) so it never steals
 // the app's cmd/alt-tab anchor from the main window. But the pop-up composer
 // needs the keyboard, so the renderer asks us to flip it focusable + focus it
 // while the composer is open, then back to non-activating when it closes.
-ipcMain.on('hermes:pet-overlay:set-focusable', (_event, focusable) => {
-  if (!petOverlayWindow || petOverlayWindow.isDestroyed()) {
+ipcMain.on('hermes:pet-overlay:set-focusable', (event, focusable) => {
+  const win = overlayWindowForSender(event)
+
+  if (!win) {
     return
   }
 
-  petOverlayWindow.setFocusable(Boolean(focusable))
+  win.setFocusable(Boolean(focusable))
 
   if (focusable) {
-    petOverlayWindow.focus()
+    win.focus()
   }
 })
-// Main renderer → overlay: forward the latest pet state for the overlay to render.
-ipcMain.on('hermes:pet-overlay:state', (_event, payload) => {
-  if (petOverlayWindow && !petOverlayWindow.isDestroyed()) {
-    petOverlayWindow.webContents.send('hermes:pet-overlay:state', payload)
+// Main renderer → overlay: forward the latest pet state for ONE profile's
+// overlay to render. Primary-renderer-only; the profile selects the target.
+ipcMain.on('hermes:pet-overlay:state', (event, profile, payload) => {
+  if (!isPrimarySender(event.sender, primaryWebContentsId())) {
+    return
+  }
+
+  const win = petOverlayWindows.get(overlayProfileKey(profile))
+
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('hermes:pet-overlay:state', payload)
   }
 })
 // Overlay → main renderer: control messages (pop back in, composer submit).
-ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
+// Bound-overlay-only: the profile is derived from the sender (never trusted from
+// the payload) and attached so the main renderer routes to the right pet.
+ipcMain.on('hermes:pet-overlay:control', (event, payload) => {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
+  }
+
+  const profile = petOverlayRegistry.profileForSender(event.sender)
+
+  if (!profile) {
+    return // unknown sender — not a registered overlay
   }
 
   // Double-click toggles the app window: hide it away if it's up front, bring it
@@ -8984,7 +9059,7 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
     mainWindow.focus()
   }
 
-  mainWindow.webContents.send('hermes:pet-overlay:control', payload)
+  mainWindow.webContents.send('hermes:pet-overlay:control', { ...payload, profile })
 })
 ipcMain.handle('hermes:bootstrap:reset', async () => {
   // Renderer's "Reload and retry" path. Clear the latched failure and
@@ -10918,9 +10993,9 @@ app.on('before-quit', event => {
     }
   }
 
-  // The always-on-top overlay isn't a "real" app window; close it so a stray
+  // The always-on-top overlays aren't "real" app windows; close them so a stray
   // pet can't keep the process alive or float over a quit app.
-  closePetOverlay()
+  closeAllPetOverlays()
 
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {

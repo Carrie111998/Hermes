@@ -1,14 +1,26 @@
 import { useEffect, useRef } from 'react'
 
+import { requestGatewayForProfile } from '@/store/gateway'
+import { notify } from '@/store/notifications'
 import { petProfile } from '@/store/pet'
 import { setPetScale } from '@/store/pet-gallery'
 import { setProfileManualAwaitingInput } from '@/store/pet-multi'
 import { setPetOverlayOpenAppHandler, setPetOverlayScaleHandler, setPetOverlaySubmitHandler } from '@/store/pet-overlay'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $sessions } from '@/store/session'
 import { $attentionSessionIds } from '@/store/session-states'
 import { isSecondaryWindow } from '@/store/windows'
 
 import type { GatewayRequester } from '../types'
+
+/** A GatewayRequester bound to one profile (routes through its own socket, never
+ *  the active gateway). */
+function profileRequest(profile: string): GatewayRequester {
+  const key = normalizeProfileKey(profile)
+
+  return (method, params, timeoutMs, signal) =>
+    requestGatewayForProfile(key, method, { ...params, profile: key }, timeoutMs, signal)
+}
 
 interface PetBridgeParams {
   requestGateway: GatewayRequester
@@ -36,10 +48,27 @@ export function usePetBridge({ requestGateway, resumeSession, submitText }: PetB
       return
     }
 
-    setPetOverlaySubmitHandler(text => void submitTextRef.current(text))
-    // Alt+wheel resize from the popped-out pet — persist through this window's
-    // gateway (the overlay has none) so it survives restart.
-    setPetOverlayScaleHandler(scale => setPetScale(requestGatewayRef.current, scale))
+    // Overlay submit, addressed by the sender-derived profile. The active
+    // profile routes through the full existing submit pipeline (optimistic
+    // messages, locks, queue recovery). A background profile's submit needs the
+    // SubmitExecution seam (PR3) — until then it surfaces a clear notice rather
+    // than a reduced parallel path that would bypass that pipeline.
+    setPetOverlaySubmitHandler((profile, text) => {
+      if (normalizeProfileKey(profile) === normalizeProfileKey($activeGatewayProfile.get())) {
+        void submitTextRef.current(text)
+
+        return
+      }
+
+      // TODO(PR3): backgroundSubmitExecution(profile) + submitTextForProfile.
+      notify({
+        kind: 'warning',
+        message: `Replying to ${normalizeProfileKey(profile)} from its overlay arrives in a future update.`
+      })
+    })
+    // Alt+wheel resize from the popped-out pet — persist through the profile's
+    // own gateway (the overlay has none) so it survives restart.
+    setPetOverlayScaleHandler((profile, scale) => setPetScale(profileRequest(profile), scale))
     // Mail icon: $sessions is most-recent-first; the pet is global, so "most
     // recent" is the right target.
     setPetOverlayOpenAppHandler(() => {
