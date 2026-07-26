@@ -353,6 +353,7 @@ class TestShowStatusXaiOAuth:
         assert "xAI OAuth" in out
         assert "not logged in (run: hermes auth add xai-oauth)" in out
 
+
 def test_show_status_reports_gateway_session_last_activity(monkeypatch, capsys, tmp_path):
     """hermes status should surface freshest gateway last_active (#72016)."""
     from hermes_cli import status as status_mod
