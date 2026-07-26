@@ -460,6 +460,7 @@ class TestWebServerEndpoints:
         Guards against "fix" it by hardcoding True somewhere: with every rung
         declining, both surfaces must report the gateway down.
         """
+        import hermes_cli.gateway as gateway_cli
         import hermes_cli.web_server as web_server
 
         monkeypatch.setattr(web_server, "get_running_pid_cached", lambda *a, **k: None)
@@ -469,6 +470,10 @@ class TestWebServerEndpoints:
             web_server, "get_runtime_status_running_pid", lambda *a, **k: None
         )
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+        # Fork process-scan rung (opt-in on dashboard) must also decline, or a
+        # live developer gateway on the machine falsely reports "running".
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda: [])
+        monkeypatch.setattr(web_server, "scan_gateway_process_pid", lambda: None)
 
         status_running = self.client.get("/api/status").json()["gateway_running"]
         platforms = self.client.get("/api/messaging/platforms").json()["platforms"]
@@ -8023,6 +8028,7 @@ class TestStatusRemoteGateway:
 
     def test_status_bounds_the_complete_remote_probe(self, monkeypatch):
         """Two serial HTTP attempts cannot consume more than the route budget."""
+        import hermes_cli.gateway as gateway_cli
         import hermes_cli.web_server as ws
 
         probe_started = threading.Event()
@@ -8034,6 +8040,8 @@ class TestStatusRemoteGateway:
 
         monkeypatch.setattr(ws, "get_running_pid_cached", lambda: None)
         monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda: [])
+        monkeypatch.setattr(ws, "scan_gateway_process_pid", lambda: None)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_ROUTE_TIMEOUT", 0.02)
         monkeypatch.setattr(ws, "_probe_gateway_health", slow_probe)

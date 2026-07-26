@@ -97,6 +97,7 @@ from gateway.status import (
     parse_active_agents,
     read_runtime_status,
     resolve_gateway_liveness,
+    scan_gateway_process_pid,
 )
 from utils import env_var_enabled
 
@@ -3212,6 +3213,10 @@ async def get_status(profile: Optional[str] = None):
                 pid_probe=get_running_pid_cached,
                 runtime_reader=read_runtime_status,
                 runtime_pid_probe=get_runtime_status_running_pid,
+                # Fork overlay: PID-file races stay truthful for Desktop /
+                # dashboard (1f147e98bf). Opt-in so unit tests of the shared
+                # ladder remain hermetic.
+                process_scan=scan_gateway_process_pid,
             )
         )
         gateway_running = liveness.running
@@ -9032,6 +9037,7 @@ def _messaging_platform_payload(
         pid_probe=get_running_pid_cached,
         runtime_reader=read_runtime_status,
         runtime_pid_probe=get_runtime_status_running_pid,
+        process_scan=scan_gateway_process_pid,
     )
     gateway_running = liveness.running
     env_vars = []

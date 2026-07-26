@@ -1193,6 +1193,28 @@ class GatewayLiveness:
     probe_error: bool = False
 
 
+def scan_gateway_process_pid() -> Optional[int]:
+    """Fall back to a live process scan when the PID file is missing.
+
+    PID file races (crash/restart) can leave the gateway alive with no
+    ``gateway.pid``. Desktop / dashboard status must stay truthful in that
+    case (fork: ``1f147e98bf``). Resolve via the ``hermes_cli.gateway``
+    module attribute so tests can monkeypatch ``find_gateway_pids``.
+    """
+    try:
+        from hermes_cli import gateway as gateway_cli
+
+        pids = gateway_cli.find_gateway_pids()
+    except Exception:
+        return None
+    if not pids:
+        return None
+    try:
+        return int(next(iter(pids)))
+    except (TypeError, ValueError, StopIteration):
+        return None
+
+
 def resolve_gateway_liveness(
     *,
     profile_dir: Optional[Path] = None,
@@ -1202,6 +1224,7 @@ def resolve_gateway_liveness(
     pid_probe: Optional[Callable[..., Optional[int]]] = None,
     runtime_reader: Optional[Callable[..., Optional[dict[str, Any]]]] = None,
     runtime_pid_probe: Optional[Callable[..., Optional[int]]] = None,
+    process_scan: Optional[Callable[[], Optional[int]]] = None,
 ) -> GatewayLiveness:
     """Single source of truth for "is the gateway up?" across dashboard surfaces.
 
@@ -1226,6 +1249,11 @@ def resolve_gateway_liveness(
     3. **Runtime status PID** — validated against the live process table with
        ``expected_home`` so a recycled PID belonging to a *different*
        profile's gateway is never reported as this one's.
+    4. **Process scan** (opt-in) — when ``process_scan`` is supplied and earlier
+       rungs decline, scan for a live gateway process. Used by the dashboard
+       so Desktop status stays truthful when ``gateway.pid`` is missing after
+       a crash/restart race (fork: ``1f147e98bf``). Off by default so the
+       shared ladder stays hermetic for unit tests and non-dashboard callers.
 
     Rung 3 only ever runs against a LOCAL state record: the probe body's PID
     belongs to another host, and ``os.kill``-ing a remote PID is both wrong
@@ -1237,6 +1265,8 @@ def resolve_gateway_liveness(
     passes its ``hermes_cli.web_server`` bindings so the long-standing
     monkeypatch seam in the test-suite keeps working; production callers
     leave them ``None`` and get this module's implementations.
+    ``process_scan`` is opt-in (pass ``scan_gateway_process_pid`` or a test
+    double); monkeypatch ``hermes_cli.gateway.find_gateway_pids`` as needed.
     """
     _pid_probe = pid_probe or (
         get_running_pid_cached if use_cache else get_running_pid
@@ -1303,6 +1333,24 @@ def resolve_gateway_liveness(
             source="runtime_status",
             health_body=health_body,
         )
+
+    # Opt-in process scan (dashboard / Desktop): PID file can be missing after
+    # a crash/restart race while the gateway process is still alive
+    # (fork: 1f147e98bf). Off unless the caller passes process_scan=.
+    if process_scan is not None:
+        try:
+            scanned_pid = process_scan()
+        except Exception:
+            scanned_pid = None
+            probe_error = True
+        if scanned_pid is not None:
+            return GatewayLiveness(
+                running=True,
+                pid=scanned_pid,
+                source="process_scan",
+                health_body=health_body,
+                probe_error=probe_error,
+            )
 
     return GatewayLiveness(
         running=False,
