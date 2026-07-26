@@ -11,6 +11,8 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+
+from hermes_cli._subprocess_compat import windows_hide_flags
 from typing import Any
 
 from hermes_constants import get_hermes_home
@@ -538,12 +540,14 @@ def _ensure_pgvector(host: str = "localhost", port: int = 5432) -> dict | None:
             result = subprocess.run(
                 ["docker", "inspect", _PGVECTOR_CONTAINER, "--format", "{{.State.Status}}"],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10, stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
             if result.returncode == 0 and "exited" in result.stdout:
                 print(f"  Found stopped container '{_PGVECTOR_CONTAINER}', restarting...")
                 subprocess.run(["docker", "start", _PGVECTOR_CONTAINER],
                                capture_output=True, timeout=15,
-                               stdin=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL,
+                               creationflags=windows_hide_flags())
                 _wait_for_port(host, port, timeout=15)
                 ok, _ = _check_pgvector(host, port)
                 if ok:
@@ -570,12 +574,14 @@ def _start_pgvector_docker(host: str, port: int) -> dict | None:
         print(f"  Pulling {_PGVECTOR_IMAGE}...")
         subprocess.run(["docker", "pull", _PGVECTOR_IMAGE],
                        capture_output=True, timeout=120,
-                       stdin=subprocess.DEVNULL)
+                       stdin=subprocess.DEVNULL,
+                       creationflags=windows_hide_flags())
 
         # Remove existing container if present
         subprocess.run(["docker", "rm", "-f", _PGVECTOR_CONTAINER],
                        capture_output=True, timeout=10,
-                       stdin=subprocess.DEVNULL)
+                       stdin=subprocess.DEVNULL,
+                       creationflags=windows_hide_flags())
 
         print(f"  Starting container '{_PGVECTOR_CONTAINER}' on port {port}...")
         subprocess.run([
@@ -584,7 +590,8 @@ def _start_pgvector_docker(host: str, port: int) -> dict | None:
             "-e", f"POSTGRES_PASSWORD={_PGVECTOR_PASSWORD}",
             "-p", f"{port}:5432",
             _PGVECTOR_IMAGE,
-        ], capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL)
+        ], capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL,
+           creationflags=windows_hide_flags())
 
         _wait_for_port(host, port, timeout=20)
         ok, _ = _check_pgvector(host, port)
@@ -866,6 +873,7 @@ def _install_provider_deps(llm_id: str, embedder_id: str, vector_id: str) -> Non
             subprocess.run(
                 ["uv", "pip", "install", "--python", sys.executable, dep],
                 capture_output=True, timeout=60,
+                creationflags=windows_hide_flags(),
             )
             print(f"  ✓ Installed {dep}")
         except Exception:
