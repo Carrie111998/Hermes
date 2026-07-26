@@ -5482,11 +5482,27 @@ class BasePlatformAdapter(ABC):
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
                             import json as _json
+                            import tempfile as _tf
+                            import uuid as _uuid
                             speech_text = self.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
+                            # Force .ogg output for Telegram (voice bubbles need
+                            # Opus).  TTS picks format from output_path extension,
+                            # bypassing the ContextVar lookup which is empty at this
+                            # point because _clear_session_env already ran.
+                            _tts_out = None
+                            if self.platform == Platform.TELEGRAM:
+                                _tts_out = os.path.join(
+                                    _tf.gettempdir(), "hermes_voice",
+                                    f"auto_tts_{_uuid.uuid4().hex[:12]}.ogg"
+                                )
+                                os.makedirs(os.path.dirname(_tts_out), exist_ok=True)
+                            tts_kwargs = {"text": speech_text}
+                            if _tts_out:
+                                tts_kwargs["output_path"] = _tts_out
                             tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
+                                text_to_speech_tool, **tts_kwargs
                             )
                             tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")
