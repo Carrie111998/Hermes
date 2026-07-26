@@ -84,6 +84,11 @@ class TestInstallCuaDriverUpgrade:
                  return_value=MagicMock(returncode=0, stderr=""),
              ), \
              patch("subprocess.Popen", return_value=fake_proc), \
+             patch.object(
+                 tools_config.shutil,
+                 "which",
+                 return_value="/usr/local/bin/cua-driver",
+             ), \
              patch.object(tools_config, "_clear_stale_cua_install_lock"), \
              patch.object(tools_config, "_print_info") as info:
             assert tools_config._run_cua_driver_installer(
@@ -111,6 +116,11 @@ class TestInstallCuaDriverUpgrade:
                  return_value=MagicMock(returncode=0, stderr=""),
              ), \
              patch("subprocess.Popen", return_value=fake_proc), \
+             patch.object(
+                 tools_config.shutil,
+                 "which",
+                 return_value="/usr/local/bin/cua-driver",
+             ), \
              patch.object(tools_config, "_clear_stale_cua_install_lock"), \
              patch.object(tools_config, "_print_info") as info:
             assert tools_config._run_cua_driver_installer(
