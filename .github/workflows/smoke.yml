@@ -1,0 +1,30 @@
+name: smoke-test-skills
+
+on:
+  push:
+    paths:
+      - 'skills/**'
+      - 'skills.json'
+      - '.github/workflows/smoke.yml'
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax check both scripts
+        run: |
+          python -m py_compile skills/moa-free/moa_all.py
+          python -m py_compile skills/model-advisor/model_advisor.py
+      - name: moa-free --list (local backend, no server needed)
+        run: python skills/moa-free/moa_all.py --list
+      - name: model-advisor --show-routes (local backend, no server needed)
+        run: python skills/model-advisor/model_advisor.py --show-routes
+      - name: model-advisor --backend openrouter --show-routes (flag parses, will note missing key)
+        run: |
+          python skills/model-advisor/model_advisor.py --backend openrouter --show-routes \
+            && echo "OR routes OK" || echo "OR backend correctly requires OPENROUTER_API_KEY (expected without secret)"

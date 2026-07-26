@@ -1,0 +1,31 @@
+{
+  "schema": "hermes-skills-registry/v1",
+  "name": "hermes-free-tier-skills",
+  "version": "0.2.0",
+  "description": "Local-first (Ollama) Hermes skills: quota-aware-free MOA + task-aware model router. Truly $0 and uncapped by default; optional OpenRouter :free fallback.",
+  "license": "MIT",
+  "skills": [
+    {
+      "name": "moa-free",
+      "category": "mlops",
+      "summary": "Mixture of Agents: fan a prompt across several models, synthesize into one answer.",
+      "entrypoint": "skills/moa-free/moa_all.py",
+      "skill_md": "skills/moa-free/SKILL.md",
+      "tags": ["MOA", "Ollama", "synthesis", "agent"],
+      "platforms": ["windows", "linux", "macos"],
+      "dependencies": "stdlib-only; Ollama (http://localhost:11434) for default backend",
+      "install": "cp -r skills/moa-free ~/.hermes/skills/mlops/moa-free"
+    },
+    {
+      "name": "model-advisor",
+      "category": "mlops",
+      "summary": "Task-aware router: classify prompt (code/creative/research/long/chat), route to best model.",
+      "entrypoint": "skills/model-advisor/model_advisor.py",
+      "skill_md": "skills/model-advisor/SKILL.md",
+      "tags": ["routing", "advisor", "model-selection", "Ollama"],
+      "platforms": ["windows", "linux", "macos"],
+      "dependencies": "stdlib-only; Ollama (http://localhost:11434) for default backend",
+      "install": "cp -r skills/model-advisor ~/.hermes/skills/mlops/model-advisor"
+    }
+  ]
+}
