@@ -590,6 +590,10 @@ def _validate(
     assert "LOW confidence" in joined
     assert "runtime supplies" in joined
     assert "current-turn refs when they are omitted" in joined
+    assert "exact date-only source string in receiptDate" in joined
+    assert "Do not calculate midnight or dueAt" in joined
+    assert "runtime mechanically normalizes receiptDate" in joined
+    assert "actual timestamp, pass it as receivedAt" in joined
     # Stage-1 roll-forward (2026-07-20): placeholder sourceRefs ban + the
     # evidence-attach justification contract with refs-preserving retry.
     assert "Never write a placeholder token" in joined

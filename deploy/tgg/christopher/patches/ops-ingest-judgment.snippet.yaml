@@ -95,7 +95,11 @@
       merely because the ids are not shown in the prompt. Never write a placeholder token
       such as current_turn in sourceRefs — a placeholder is not a message id, and the
       runtime treats it as omitted; when the real ids are not visible, omit sourceRefs
-      entirely and the runtime binds them. Do not search message history for
+      entirely and the runtime binds them. On create, pass the job sheet''s exact
+      date-only source string in receiptDate. Do not calculate midnight or dueAt:
+      the runtime mechanically normalizes receiptDate to midnight Asia/Singapore
+      and computes dueAt. When the source supplies an actual timestamp, pass it
+      as receivedAt. Do not search message history for
       the current source id; call the observation and let the runtime bind it. Do not put earlier-turn ids in
       sourceRefs, and do not use fields.evidence_refs as a substitute.
 

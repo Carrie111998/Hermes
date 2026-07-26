@@ -1893,6 +1893,7 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "reportedJobNo": "PG/JOB/2605/0973",
+            "receivedAt": 1_784_476_800,
         })
         assert captured.get("jobNo") == "PG/JOB/2605/0973"
         assert "reportedJobNo" not in captured
@@ -1910,6 +1911,7 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "confirmNoJobNo": True,
+            "receivedAt": 1_784_476_800,
             "evidence": {"messageText": "previous job SK/JOB/2603/1709 not attended"},
         })
         assert "JOB_NO_OMITTED" not in result
@@ -1932,6 +1934,7 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "confirmNoJobNo": True,
+            "receivedAt": 1_784_476_800,
             "evidence": {"messageText": "tenant reports leak, no job sheet"},
         })
         assert "JOB_NO_REQUIRED" not in result
@@ -1953,5 +1956,131 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "jobNo": "SK/JOB/2605/2564",
+            "receivedAt": 1_784_476_800,
         })
         assert captured.get("jobNo") == "SK/JOB/2605/2564"
+
+    def test_date_only_receipt_is_byte_identical_across_repeat_runs(
+        self, monkeypatch
+    ):
+        args = {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receiptDate": "20 July 2026",
+        }
+        first_result, first = self._create(monkeypatch, args)
+        second_result, second = self._create(monkeypatch, args)
+
+        assert json.loads(first_result)["ok"] is True
+        assert first["receivedAt"] == 1_784_476_800
+        assert first["dueAt"] == 1_787_068_800
+        assert "receiptDate" not in first
+        assert json.dumps(first, sort_keys=True).encode() == json.dumps(
+            second, sort_keys=True
+        ).encode()
+        assert first_result.encode() == second_result.encode()
+
+    def test_invalid_explicit_receipt_date_fails_closed(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receivedAt": 1_784_509_200,
+            "receiptDate": "sometime last Monday",
+        })
+        assert "receiptDate must be a date only" in result
+        assert captured == {}
+
+    def test_explicit_receipt_source_precedes_broader_evidence_text(
+        self, monkeypatch
+    ):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receiptDate": "20 July 2026",
+            "evidence": {
+                "messageText": "Previous case receipt date: 1 June 2026."
+            },
+        })
+        assert json.loads(result)["ok"] is True
+        assert captured["receivedAt"] == 1_784_476_800
+        assert captured["dueAt"] == 1_787_068_800
+
+    def test_explicit_evidence_receipt_date_overrides_model_epoch(
+        self, monkeypatch
+    ):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receivedAt": 1_784_509_200,
+            "evidence": {
+                "receipt_date": "20 July 2026",
+                "messageText": "Previous case receipt date: 1 June 2026.",
+            },
+        })
+        assert json.loads(result)["ok"] is True
+        assert captured["receivedAt"] == 1_784_476_800
+        assert captured["dueAt"] == 1_787_068_800
+
+    def test_generic_case_create_preparation_uses_same_runtime_contract(self):
+        import tools.pa_business_tools as pbt
+
+        prepared = pbt._prepare_case_create_receipt({
+            "receivedAt": 1_784_509_200,
+            "receipt_date": "20 July 2026",
+            "dueAt": 42,
+        })
+        assert isinstance(prepared, dict)
+        assert prepared["receivedAt"] == 1_784_476_800
+        assert prepared["dueAt"] == 1_787_068_800
+        assert "receipt_date" not in prepared
+
+    def test_runtime_overwrites_model_due_at(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receiptDate": "20 July 2026",
+            "dueAt": 42,
+        })
+        assert json.loads(result)["ok"] is True
+        assert captured["dueAt"] == 1_787_068_800
+
+    def test_create_requires_epoch_or_date_source(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+        })
+        assert "requires receivedAt" in result
+        assert captured == {}
+
+    def test_schema_exposes_receipt_date_without_model_due_at(self):
+        import tools.pa_business_tools as pbt
+
+        parameters = pbt.TGG_CASE_CREATE_SCHEMA["parameters"]
+        assert parameters["properties"]["receiptDate"]["type"] == "string"
+        assert parameters["properties"]["receivedAt"]["type"] == "integer"
+        assert "dueAt" not in parameters["properties"]
+
+    def test_generated_runtime_slots_carry_receipt_date_instruction(self):
+        slots_root = (
+            Path(__file__).parents[1]
+            / "deploy"
+            / "tgg"
+            / "christopher"
+            / "runtime-slots"
+        )
+        for slot in ("gpt-5.4-mini", "gpt-5.6-luna", "gpt-5.6-luna-low"):
+            constitution = yaml.safe_load(
+                (slots_root / slot / "christopher_tgg_constitution.yaml").read_text()
+            )
+            joined = "\n".join(
+                constitution["job_briefs"]["tgg_ops_ingest"]["instructions"]
+            )
+            assert "exact date-only source string in receiptDate" in joined
+            assert "Do not calculate midnight or dueAt" in joined
+            assert "runtime mechanically normalizes receiptDate" in joined
