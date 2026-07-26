@@ -24,6 +24,7 @@ setup`):
                        store. When unset, the gateway-native id (e.g. Telegram
                        numeric id, Discord snowflake) is used instead.
   agent_id           — Agent identifier (default: hermes)
+  filter_by_agent_id — When true, scope memory reads to the configured agent_id
 
 The matching MEM0_MODE / MEM0_USER_ID / MEM0_AGENT_ID environment variables are
 still read as a backward-compatible fallback, but mem0.json is the canonical
@@ -205,6 +206,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._host = ""
         self._user_id = _DEFAULT_USER_ID
         self._agent_id = "hermes"
+        self._filter_by_agent_id = False
         self._rerank_default = False
         self._channel = "cli"  # gateway channel name (cli/telegram/discord/...)
         self._sync_thread = None

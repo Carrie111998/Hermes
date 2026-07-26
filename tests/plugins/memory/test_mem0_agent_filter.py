@@ -2,13 +2,16 @@
 
 import json
 
-import pytest
-
 from plugins.memory.mem0 import Mem0MemoryProvider, _load_config
 
 
 class TestReadFiltersDefault:
     """Default behavior when filter_by_agent_id is not set or False."""
+
+    def test_filter_by_agent_id_defaults_false_before_initialize(self):
+        provider = Mem0MemoryProvider()
+
+        assert provider._filter_by_agent_id is False
 
     def test_read_filters_user_id_only_by_default(self, monkeypatch):
         """Without filter_by_agent_id, _read_filters() returns only user_id."""
