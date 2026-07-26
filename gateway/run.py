@@ -14406,6 +14406,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # Snapshot media already present before this turn. The post-stream
+            # delivery path runs in this handler after _run_agent returns, so it
+            # must use a dedup set defined in this scope (not the private local
+            # created inside _run_agent).
+            _history_media_paths = _collect_history_media_paths(history)
+
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
             # below; a /new or another lifecycle transition may move
