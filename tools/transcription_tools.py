@@ -172,7 +172,7 @@ def _get_local_command_template() -> Optional[str]:
         quoted_binary = shlex.quote(whisper_binary)
         return (
             f"{quoted_binary} {{input_path}} --model {{model}} --output_format txt "
-            "--output_dir {output_dir} --language {language}"
+            "--output_dir {output_dir}"
         )
     return None
 
@@ -1155,14 +1155,18 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             _local_model_name = model_name
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
+        local_config = _load_stt_config().get("local") or {}
         _forced_lang = (
-            (_load_stt_config().get("local") or {}).get("language")
+            local_config.get("language")
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
             or None
         )
+        _initial_prompt = local_config.get("initial_prompt") or None
         transcribe_kwargs = {"beam_size": 5}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
+        if _initial_prompt:
+            transcribe_kwargs["initial_prompt"] = _initial_prompt
 
         try:
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
@@ -1237,11 +1241,17 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             ),
         }
 
-    # Language: config.yaml (stt.local.language) > env var > "en" default.
+    # Language: config.yaml (stt.local.language) > env var > auto-detect.
+    local_config = _load_stt_config().get("local") or {}
     language = (
-        (_load_stt_config().get("local") or {}).get("language")
+        local_config.get("language")
         or os.getenv(LOCAL_STT_LANGUAGE_ENV)
-        or DEFAULT_LOCAL_STT_LANGUAGE
+        or ""
+    )
+    initial_prompt = local_config.get("initial_prompt") or ""
+    language_args = f"--language {shlex.quote(language)}" if language else ""
+    initial_prompt_args = (
+        f"--initial_prompt {shlex.quote(initial_prompt)}" if initial_prompt else ""
     )
     normalized_model = _normalize_local_command_model(model_name)
 
@@ -1255,10 +1265,17 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
                 input_path=shlex.quote(prepared_input),
                 output_dir=shlex.quote(output_dir),
                 language=shlex.quote(language),
+                language_args=language_args,
+                initial_prompt=shlex.quote(initial_prompt),
+                initial_prompt_args=initial_prompt_args,
                 model=shlex.quote(normalized_model),
             )
             # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
             use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
+            if not use_shell:
+                command = " ".join(
+                    part for part in (command, language_args, initial_prompt_args) if part
+                )
             if use_shell:
                 subprocess.run(command, shell=True, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
             else:
