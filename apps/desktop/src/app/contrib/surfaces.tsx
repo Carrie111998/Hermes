@@ -33,6 +33,7 @@ import type { SidebarActions, WiringActions } from './types'
 const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')).ArtifactsView }))
 const CalendarView = lazy(async () => ({ default: (await import('../calendar')).CalendarView }))
 const EmailView = lazy(async () => ({ default: (await import('../email')).EmailView }))
+const KanbanView = lazy(async () => ({ default: (await import('../kanban')).KanbanView }))
 const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
 const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
 const TodoView = lazy(async () => ({ default: (await import('../todo')).TodoView }))
@@ -186,6 +187,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={page(<CalendarView />)} path="calendar" />
       <Route element={page(<EmailView />)} path="email" />
       <Route element={page(<TodoView />)} path="todo" />
+      <Route element={page(<KanbanView />)} path="kanban" />
       <Route element={null} path="agents" />
       <Route element={null} path="command-center" />
       <Route element={null} path="cron" />

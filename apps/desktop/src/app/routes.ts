@@ -17,6 +17,7 @@ export const STARMAP_ROUTE = '/starmap'
 export const CALENDAR_ROUTE = '/calendar'
 export const EMAIL_ROUTE = '/email'
 export const TODO_ROUTE = '/todo'
+export const KANBAN_ROUTE = '/kanban'
 
 export type AppView =
   | 'agents'
@@ -27,6 +28,7 @@ export type AppView =
   | 'cron'
   | 'email'
   | 'extension'
+  | 'kanban'
   | 'messaging'
   | 'profiles'
   | 'settings'
@@ -48,6 +50,7 @@ export type AppRouteId =
   | 'skills'
   | 'starmap'
   | 'todo'
+  | 'kanban'
 
 export interface AppRoute {
   id: AppRouteId
@@ -68,7 +71,8 @@ export const APP_ROUTES = [
   { id: 'profiles', path: PROFILES_ROUTE, view: 'profiles' },
   { id: 'agents', path: AGENTS_ROUTE, view: 'agents' },
   { id: 'starmap', path: STARMAP_ROUTE, view: 'starmap' },
-  { id: 'todo', path: TODO_ROUTE, view: 'todo' }
+  { id: 'todo', path: TODO_ROUTE, view: 'todo' },
+  { id: 'kanban', path: KANBAN_ROUTE, view: 'kanban' }
 ] as const satisfies readonly AppRoute[]
 
 const APP_VIEW_BY_PATH = new Map<string, AppView>(APP_ROUTES.map(route => [route.path, route.view]))

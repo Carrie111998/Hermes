@@ -21,6 +21,14 @@ cd "$DESKTOP_DIR" || exit 1
 # These come from git stash merge during hermes update — upstream's ***
 # placeholders leak into valid variable names. Restore from git if found.
 MAIN_TS="$DESKTOP_DIR/electron/main.ts"
+
+# HTML default guard: Hermes.desktop claims text/html in MimeType, it overrides
+# Chrome as the default HTML handler after desktop-file scans. Strip it here so
+# it auto-heals on the next Hermes launch if an update re-introduces the claim.
+HERMES_DESKTOP_FILE="$HOME/.local/share/applications/Hermes.desktop"
+if grep -q 'text/html' "$HERMES_DESKTOP_FILE" 2>/dev/null; then
+  sed -i 's/;text\/html//g; s/text\/html;//g; s/^MimeType=;/MimeType=/g' "$HERMES_DESKTOP_FILE"
+fi
 if grep -q '<<<<<<<\|>>>>>>>\|token: \*\*\*\|wsUrl.*token=\*\*\*\|supportsPassword: \*\*\*' "$MAIN_TS" 2>/dev/null; then
   echo "[hermes-launcher] Merge artifacts detected in main.ts — restoring clean copy..."
   git checkout HEAD -- "$MAIN_TS" 2>/dev/null

@@ -98,7 +98,7 @@ import {
 } from '@/store/session'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 
-import { type AppView, ARTIFACTS_ROUTE, CALENDAR_ROUTE, EMAIL_ROUTE, MESSAGING_ROUTE, SIDEBAR_NAV_AREA, type SidebarNavContribution, SKILLS_ROUTE, TODO_ROUTE } from '../../routes'
+import { type AppView, ARTIFACTS_ROUTE, CALENDAR_ROUTE, EMAIL_ROUTE, KANBAN_ROUTE, MESSAGING_ROUTE, SIDEBAR_NAV_AREA, type SidebarNavContribution, SKILLS_ROUTE, TODO_ROUTE } from '../../routes'
 import type { SidebarNavItem } from '../../types'
 
 import { countLabel } from './chrome'
@@ -181,6 +181,13 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="checklist" {...props} />,
     route: TODO_ROUTE,
     keybindActionId: 'nav.todo'
+  },
+  {
+    id: 'kanban',
+    label: '',
+    icon: props => <Codicon name="project" {...props} />,
+    route: KANBAN_ROUTE,
+    keybindActionId: 'nav.kanban'
   }
 ]
 
