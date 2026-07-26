@@ -322,10 +322,13 @@ export interface SessionSteerResponse {
 // ── Prompt / submission ──────────────────────────────────────────────
 
 export interface PromptSubmitResponse {
+  ack?: string
   ok?: boolean
   /** Set when the submitted text was a bare voice stop phrase consumed
    *  server-side to end the voice chat instead of starting a turn. */
   voice_stopped?: boolean
+  route?: 'ambiguous' | 'control' | 'dependent' | 'independent' | 'related'
+  status?: 'queued' | 'smart_parallel' | 'smart_queued' | 'smart_related' | 'streaming'
 }
 
 export interface BackgroundStartResponse {

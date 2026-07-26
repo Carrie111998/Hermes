@@ -108,6 +108,35 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
 
     expect(calls).toContain('prompt.submit')
   })
+
+  it('surfaces a SMART routing acknowledgement returned by prompt.submit', async () => {
+    const sys = vi.fn()
+
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'input.detect_drop') {
+          return Promise.resolve({ matched: false })
+        }
+
+        if (method === 'prompt.submit') {
+          return Promise.resolve({
+            status: 'smart_related',
+            route: 'related',
+            ack: 'SMART related; active mission continues.'
+          })
+        }
+
+        return Promise.resolve({})
+      })
+    } as unknown as GatewayClient
+
+    submitPrompt('same mission update', makeDeps(gw, { sys }))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(sys).toHaveBeenCalledWith('SMART related; active mission continues.')
+  })
 })
 
 describe('submissionCore.markSubmitting', () => {

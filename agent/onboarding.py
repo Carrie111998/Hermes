@@ -59,6 +59,13 @@ def busy_input_hint_gateway(mode: str) -> str:
             "Send `/busy queue` to wait for a separate turn, or `/busy status` "
             "to check. This notice won't appear again."
         )
+    if mode == "smart":
+        return (
+            "💡 First-time tip — I classified your message and safely steered, "
+            "parallelized, or queued it without interrupting the active mission. "
+            "Send `/busy interrupt` to force legacy interrupt behavior, or "
+            "`/busy status` to check. This notice won't appear again."
+        )
     return (
         "💡 First-time tip — I just interrupted my current task to answer you. "
         "Send `/busy queue` to queue follow-ups for after the current task instead, "
@@ -86,6 +93,12 @@ def busy_input_hint_cli(mode: str) -> str:
             "(tip) Your correction redirected the current run without discarding "
             "completed work. Use /stop to cancel or /busy queue to wait for a "
             "separate turn. This tip only shows once."
+        )
+    if mode == "smart":
+        return (
+            "(tip) Your message was classified and safely steered, parallelized, "
+            "or queued without interrupting the active mission. Use /busy interrupt "
+            "for legacy interrupt behavior. This tip only shows once."
         )
     return (
         "(tip) Your message interrupted the current run. "

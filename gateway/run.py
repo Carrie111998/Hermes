@@ -5577,6 +5577,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
+        # SMART busy routing keeps only bounded mission summaries and one
+        # asyncio lock per active session. The lock preserves arrival order
+        # when a platform delivers multiple follow-ups concurrently.
+        self._smart_active_missions: Dict[str, str] = {}
+        self._smart_route_locks: Dict[str, asyncio.Lock] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -7336,10 +7341,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "restarting" if self._restart_requested else "shutting down"
 
     def _queue_during_drain_enabled(self) -> bool:
-        # Both "queue" and "steer" modes imply the user doesn't want messages
+        # Queue, steer and smart modes imply the user doesn't want messages
         # to be lost during restart — queue them for the newly-spawned gateway
         # process to pick up.  "interrupt" mode drops them (current behaviour).
-        return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
+        return self._restart_requested and self._busy_input_mode in {
+            "queue",
+            "steer",
+            "smart",
+        }
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -7396,6 +7405,331 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # No adapter — push back so we don't silently drop the item.
             overflow.insert(0, next_queued)
         return pending_event
+
+    def _prioritize_leftover_steer(
+        self,
+        *,
+        session_key: str,
+        adapter: Any,
+        pending_event: Optional["MessageEvent"],
+        pending_text: Optional[str],
+        result: Optional[dict],
+    ) -> tuple[Optional["MessageEvent"], Optional[str]]:
+        """Deliver a late steer before queued turns without dropping FIFO items.
+
+        A steer arriving during the final model call is returned as
+        ``result['pending_steer']``. If a normal queued event was already drained,
+        stage that event back at the FIFO head and run the steer as the immediate
+        next turn. Any event already promoted into the adapter slot is moved to
+        the front of overflow, preserving the chain selected → staged → overflow.
+        """
+        leftover = str((result or {}).get("pending_steer") or "").strip()
+        if not leftover:
+            return pending_event, pending_text
+        if pending_event is None:
+            if not pending_text:
+                return None, leftover
+            return pending_event, pending_text
+
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            # Cannot safely restage a structured media/text event; keep the
+            # existing event and let the agent result's leftover remain visible
+            # to logs instead of discarding the event.
+            return pending_event, pending_text
+
+        staged = pending_slot.pop(session_key, None)
+        pending_slot[session_key] = pending_event
+        if staged is not None and staged is not pending_event:
+            # Write through the canonical SessionState. Assigning an empty dict
+            # through the legacy mapping descriptor and then mutating the local
+            # copy would silently lose the staged event.
+            state = self._session_state(session_key)
+            state.conversation.queued_events.insert(0, staged)
+        return None, leftover
+
+    async def _classify_smart_busy_message(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        running_agent: Any,
+    ) -> tuple[Any, str]:
+        """Classify a busy-time text off the gateway event loop.
+
+        The shared classifier is fail-closed.  This wrapper adds bounded
+        activity context and an outer timeout so a provider outage cannot hold
+        a platform adapter forever.
+        """
+        from hermes_cli.smart_orchestrator import classify_smart_message
+
+        cfg = _load_gateway_runtime_config()
+        raw_threshold = cfg_get(
+            cfg,
+            "orchestration",
+            "smart",
+            "confidence_threshold",
+            default=0.78,
+        )
+        raw_timeout = cfg_get(
+            cfg,
+            "orchestration",
+            "smart",
+            "classifier_timeout_seconds",
+            default=12.0,
+        )
+        try:
+            threshold = max(0.0, min(1.0, float(raw_threshold)))
+        except (TypeError, ValueError):
+            threshold = 0.78
+        try:
+            timeout = max(1.0, min(60.0, float(raw_timeout)))
+        except (TypeError, ValueError):
+            timeout = 12.0
+
+        active_goal = getattr(self, "_smart_active_missions", {}).get(session_key, "")
+        if not active_goal and running_agent not in {None, _AGENT_PENDING_SENTINEL}:
+            try:
+                for message in reversed(getattr(running_agent, "messages", []) or []):
+                    if isinstance(message, dict) and message.get("role") == "user":
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            active_goal = content
+                            break
+            except Exception:
+                active_goal = ""
+
+        activity: Any = {}
+        if running_agent not in {None, _AGENT_PENDING_SENTINEL}:
+            try:
+                summary = running_agent.get_activity_summary()
+                if isinstance(summary, dict):
+                    activity = {
+                        key: summary.get(key)
+                        for key in (
+                            "api_call_count",
+                            "max_iterations",
+                            "current_tool",
+                            "last_activity_desc",
+                        )
+                        if summary.get(key) is not None
+                    }
+            except Exception:
+                activity = {}
+
+        main_runtime: dict[str, Any] = {}
+        if running_agent not in {None, _AGENT_PENDING_SENTINEL}:
+            for key in (
+                "provider",
+                "model",
+                "api_key",
+                "base_url",
+                "api_mode",
+                "auth_mode",
+                "credential_pool",
+            ):
+                value = getattr(running_agent, key, None)
+                if value is not None:
+                    main_runtime[key] = value
+        if not main_runtime.get("provider") or not main_runtime.get("model"):
+            main_runtime = {}
+
+        classify_kwargs = {
+            "active_goal": active_goal,
+            "incoming_text": event.text or "",
+            "activity_summary": json.dumps(activity, ensure_ascii=False, default=str),
+            "confidence_threshold": threshold,
+            "classifier_timeout_seconds": timeout,
+            "main_runtime": main_runtime or None,
+        }
+        def _run_classifier() -> tuple[Any, str]:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(event.source)
+                with _profile_runtime_scope(profile_home):
+                    return classify_smart_message(**classify_kwargs)
+            return classify_smart_message(**classify_kwargs)
+
+        return await asyncio.wait_for(
+            asyncio.to_thread(_run_classifier),
+            timeout=timeout + 2.0,
+        )
+
+    async def _send_smart_busy_ack(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        adapter: Any,
+        decision: Any,
+    ) -> None:
+        """Acknowledge every SMART route without exposing session identifiers."""
+        cfg = _load_gateway_runtime_config()
+        env_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED")
+        configured_enabled = cfg_get(
+            cfg,
+            "display",
+            "busy_ack_enabled",
+            default=True,
+        )
+        raw_enabled = configured_enabled if env_enabled is None else env_enabled
+        ack_enabled = str(raw_enabled).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "enabled",
+        }
+        if not ack_enabled:
+            return
+
+        from hermes_cli.smart_orchestrator import format_smart_ack
+
+        prefix = str(
+            cfg_get(
+                cfg,
+                "orchestration",
+                "smart",
+                "ack_prefix",
+                default="",
+            )
+            or ""
+        ).strip()
+        try:
+            import hashlib
+
+            mission_id = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:8].upper()
+            mission_label = f"[M-{mission_id}]"
+        except Exception:
+            mission_label = "[MISSÃO ATIVA]"
+        ack_prefix = f"{prefix}\n{mission_label}" if prefix else mission_label
+        message = format_smart_ack(decision, prefix=ack_prefix)
+
+        reply_anchor = self._reply_anchor_for_event(event)
+        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        try:
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=message,
+                reply_to=(
+                    reply_anchor
+                    if event.source.platform == Platform.TELEGRAM
+                    and event.source.chat_type == "dm"
+                    and event.source.thread_id
+                    else (
+                        None
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.thread_id
+                        else event.message_id
+                    )
+                ),
+                metadata=thread_meta,
+            )
+        except Exception as exc:
+            logger.debug("Failed to send SMART busy ack: %s", exc)
+
+    async def _handle_smart_busy_message(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        running_agent: Any,
+        adapter: Any,
+    ) -> bool:
+        """Route one busy-time message without ever interrupting the active run."""
+        from hermes_cli.smart_orchestrator import (
+            ROUTE_AMBIGUOUS,
+            ROUTE_INDEPENDENT,
+            ROUTE_RELATED,
+            SmartRouteDecision,
+            build_parallel_steer_payload,
+        )
+
+        locks = getattr(self, "_smart_route_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._smart_route_locks = locks
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[session_key] = lock
+
+        async with lock:
+            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+                decision = SmartRouteDecision(
+                    route=ROUTE_AMBIGUOUS,
+                    confidence=1.0,
+                    reason="The active agent is still starting; using the safe queue fallback.",
+                    source="policy",
+                )
+                self._queue_or_replace_pending_event(session_key, event)
+                await self._send_smart_busy_ack(event, session_key, adapter, decision)
+                return True
+
+            # Attachments retain their native event object and are always queued;
+            # steer accepts text only and must never discard media metadata.
+            if event.message_type != MessageType.TEXT or not (event.text or "").strip():
+                decision = SmartRouteDecision(
+                    route="dependent",
+                    confidence=1.0,
+                    reason="Attachments are preserved for the next full turn.",
+                    source="policy",
+                )
+                self._queue_or_replace_pending_event(session_key, event)
+                await self._send_smart_busy_ack(event, session_key, adapter, decision)
+                if session_key not in self._running_agents:
+                    locks.pop(session_key, None)
+                return True
+
+            try:
+                decision, payload = await self._classify_smart_busy_message(
+                    event,
+                    session_key,
+                    running_agent,
+                )
+            except Exception:
+                decision = SmartRouteDecision(
+                    route=ROUTE_AMBIGUOUS,
+                    confidence=0.0,
+                    reason="Classifier unavailable; using the safe queue fallback.",
+                    source="fallback",
+                )
+                payload = event.text or ""
+
+            # The active turn may finish while classification is in flight.  An
+            # old result must never steer a replacement turn.
+            current_agent = self._running_agents.get(session_key)
+            same_active_run = (
+                current_agent is running_agent
+                and current_agent is not None
+                and current_agent is not _AGENT_PENDING_SENTINEL
+            )
+
+            steered = False
+            if same_active_run and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+                steer_payload = payload
+                if decision.route == ROUTE_INDEPENDENT:
+                    steer_payload = build_parallel_steer_payload(payload)
+                if steer_payload and hasattr(running_agent, "steer"):
+                    try:
+                        steered = bool(running_agent.steer(steer_payload))
+                    except Exception as exc:
+                        logger.warning(
+                            "SMART steer failed for session %s: %s",
+                            session_key,
+                            exc,
+                        )
+
+            if not steered:
+                self._queue_or_replace_pending_event(session_key, event)
+                if decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+                    decision = SmartRouteDecision(
+                        route=ROUTE_AMBIGUOUS,
+                        confidence=0.0,
+                        reason="The active checkpoint closed before steering; queued safely.",
+                        source="fallback",
+                    )
+
+            await self._send_smart_busy_ack(event, session_key, adapter, decision)
+            if session_key not in self._running_agents:
+                locks.pop(session_key, None)
+            return True
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
@@ -7949,6 +8283,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "queue"
         if mode == "steer":
             return "steer"
+        if mode == "smart":
+            return "smart"
         return "interrupt"
 
     @staticmethod
@@ -8523,6 +8859,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = _busy_state.turn.agent if _busy_state else None
 
         effective_mode = self._busy_input_mode
+        if effective_mode == "smart":
+            return await self._handle_smart_busy_message(
+                event,
+                session_key,
+                running_agent,
+                adapter,
+            )
+
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
         if (
             event.message_type == MessageType.TEXT
@@ -14050,6 +14394,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await self._dispatch_busy_slash_command(
                     event, _cmd_def_inner, _quick_key, source,
                 )
+
+            # SMART reuses the canonical busy handler so authorization,
+            # approval replies and internal-event guards remain identical to
+            # the non-priority path. Never fall through to legacy interrupt.
+            if self._busy_input_mode == "smart":
+                if await self._handle_active_session_busy_message(event, _quick_key):
+                    return None
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -21866,6 +22217,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # are deliberately NOT cleared here — _release_turn_lease owns
             # them (#64934).
             state.turn.clear()
+        smart_missions = getattr(self, "_smart_active_missions", None)
+        if isinstance(smart_missions, dict):
+            smart_missions.pop(session_key, None)
+        smart_locks = getattr(self, "_smart_route_locks", None)
+        if isinstance(smart_locks, dict):
+            smart_lock = smart_locks.get(session_key)
+            if smart_lock is not None and not smart_lock.locked():
+                smart_locks.pop(session_key, None)
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
@@ -23107,6 +23466,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        if session_key:
+            # Keep only a bounded in-process summary; the shared classifier
+            # force-redacts it again before any provider call.
+            smart_missions = getattr(self, "_smart_active_missions", None)
+            if not isinstance(smart_missions, dict):
+                smart_missions = {}
+                self._smart_active_missions = smart_missions
+            smart_missions[session_key] = str(message or "")[:8_000]
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -24368,15 +24736,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
-            # Leftover /steer: if a steer arrived after the last tool batch
-            # (e.g. during the final API call), the agent couldn't inject it
-            # and returned it in result["pending_steer"]. Deliver it as the
-            # next user turn so it isn't silently dropped.
-            if result and not pending and not pending_event:
-                _leftover_steer = result.get("pending_steer")
-                if _leftover_steer:
-                    pending = _leftover_steer
-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+            # Leftover /steer: if a steer arrived after the last tool batch,
+            # prioritize it as the next turn. Restage any event already
+            # dequeued at the FIFO head so neither message is lost.
+            if result:
+                _before_leftover_pending = pending
+                pending_event, pending = self._prioritize_leftover_steer(
+                    session_key=session_key,
+                    adapter=adapter,
+                    pending_event=pending_event,
+                    pending_text=pending,
+                    result=result,
+                )
+                if (
+                    pending
+                    and pending != _before_leftover_pending
+                    and result.get("pending_steer")
+                ):
+                    logger.debug(
+                        "Delivering leftover /steer as next turn: '%s...'",
+                        pending[:40],
+                    )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent

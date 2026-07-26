@@ -4274,15 +4274,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             max_lines=CLI_CONFIG["display"].get("persistent_output_max_lines", 200),
         )
         # busy_input_mode: "interrupt" (Enter redirects current run),
-        # "queue" (Enter queues for next turn), or "steer" (Enter injects
-        # mid-run via /steer, arriving after the next tool call).
+        # "queue" (Enter queues for next turn), "steer" (Enter injects
+        # mid-run after the next tool call), or "smart" (classify first and
+        # choose steer/parallel/queue without interrupting).
         _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "interrupt")).strip().lower()
         if _bim == "queue":
             self.busy_input_mode = "queue"
         elif _bim == "steer":
             self.busy_input_mode = "steer"
+        elif _bim == "smart":
+            self.busy_input_mode = "smart"
         else:
             self.busy_input_mode = "interrupt"
+        self._smart_cli_input_queue = queue.Queue()
+        self._smart_cli_worker_lock = threading.Lock()
+        self._smart_cli_worker = None
 
         # self.verbose ONLY controls global DEBUG logging (root logger level).
         # display.tool_progress="verbose" controls tool-call rendering (full args,
@@ -7161,12 +7167,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Regular prompt: route through the same queues the Enter handler uses.
         if self._agent_running:
-            # Agent busy → honour the configured busy-input behaviour by
-            # queueing for the next turn (the safe default; interrupt/steer
-            # remain reachable via the normal Enter path).
-            self._interrupt_queue.put(text) if self.busy_input_mode == "interrupt" else self._pending_input.put(text)
-            preview = text[:80] + ("..." if len(text) > 80 else "")
-            _cprint(f"  Queued for the next turn: {preview}")
+            if self.busy_input_mode == "smart":
+                self._enqueue_smart_cli_input(text)
+                preview = text[:80] + ("..." if len(text) > 80 else "")
+                _cprint(f"  {_ACCENT}🧭 SMART routing: '{preview}'{_RST}")
+            elif self.busy_input_mode == "interrupt":
+                self._interrupt_queue.put(text)
+            else:
+                self._pending_input.put(text)
+                preview = text[:80] + ("..." if len(text) > 80 else "")
+                _cprint(f"  Queued for the next turn: {preview}")
         else:
             self._pending_input.put(text)
 
@@ -7205,7 +7215,140 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    def _route_smart_cli_input(self, text: str) -> str:
+        """Classify and route one CLI follow-up without using interrupt."""
+        from hermes_cli.smart_orchestrator import (
+            ROUTE_AMBIGUOUS,
+            ROUTE_INDEPENDENT,
+            ROUTE_RELATED,
+            SmartRouteDecision,
+            build_parallel_steer_payload,
+            classify_smart_message,
+            format_smart_ack,
+        )
 
+        smart_cfg = CLI_CONFIG.get("orchestration", {}).get("smart", {})
+        if not isinstance(smart_cfg, dict):
+            smart_cfg = {}
+        try:
+            threshold = float(smart_cfg.get("confidence_threshold", 0.78))
+        except (TypeError, ValueError):
+            threshold = 0.78
+        try:
+            timeout = float(smart_cfg.get("classifier_timeout_seconds", 12.0))
+        except (TypeError, ValueError):
+            timeout = 12.0
+
+        agent = getattr(self, "agent", None)
+        active_goal = ""
+        if agent is not None:
+            try:
+                for message in reversed(getattr(agent, "messages", []) or []):
+                    if isinstance(message, dict) and message.get("role") == "user":
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            active_goal = content
+                            break
+            except Exception:
+                active_goal = ""
+        activity = {}
+        if agent is not None:
+            try:
+                summary = agent.get_activity_summary()
+                if isinstance(summary, dict):
+                    activity = {
+                        key: summary.get(key)
+                        for key in ("api_call_count", "max_iterations", "current_tool")
+                        if summary.get(key) is not None
+                    }
+            except Exception:
+                activity = {}
+
+        main_runtime = {}
+        if agent is not None:
+            for key in (
+                "provider",
+                "model",
+                "api_key",
+                "base_url",
+                "api_mode",
+                "auth_mode",
+                "credential_pool",
+            ):
+                value = getattr(agent, key, None)
+                if value is not None:
+                    main_runtime[key] = value
+        if not main_runtime.get("provider") or not main_runtime.get("model"):
+            main_runtime = {}
+
+        decision, payload = classify_smart_message(
+            active_goal=active_goal,
+            incoming_text=text,
+            activity_summary=json.dumps(activity, ensure_ascii=False, default=str),
+            confidence_threshold=max(0.0, min(1.0, threshold)),
+            classifier_timeout_seconds=max(1.0, min(60.0, timeout)),
+            main_runtime=main_runtime or None,
+        )
+
+        steered = False
+        if (
+            getattr(self, "_agent_running", False)
+            and agent is getattr(self, "agent", None)
+            and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}
+        ):
+            steer_payload = payload
+            if decision.route == ROUTE_INDEPENDENT:
+                steer_payload = build_parallel_steer_payload(payload)
+            if steer_payload and hasattr(agent, "steer"):
+                try:
+                    steered = bool(agent.steer(steer_payload))
+                except Exception:
+                    steered = False
+
+        if not steered:
+            self._pending_input.put(text)
+            if decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+                decision = SmartRouteDecision(
+                    route=ROUTE_AMBIGUOUS,
+                    confidence=0.0,
+                    reason="The active checkpoint closed before steering; queued safely.",
+                    source="fallback",
+                )
+
+        prefix = str(smart_cfg.get("ack_prefix", "") or "").strip()
+        _cprint(format_smart_ack(decision, prefix=prefix))
+        return decision.route
+
+    def _smart_cli_worker_loop(self) -> None:
+        """Drain SMART follow-ups in FIFO order on one classifier worker."""
+        while True:
+            try:
+                text = self._smart_cli_input_queue.get_nowait()
+            except queue.Empty:
+                with self._smart_cli_worker_lock:
+                    if self._smart_cli_input_queue.empty():
+                        self._smart_cli_worker = None
+                        return
+                continue
+            try:
+                self._route_smart_cli_input(text)
+            finally:
+                self._smart_cli_input_queue.task_done()
+
+    def _enqueue_smart_cli_input(self, text: str) -> None:
+        """Submit a SMART follow-up without blocking prompt_toolkit's UI thread."""
+        self._smart_cli_input_queue.put(text)
+        with self._smart_cli_worker_lock:
+            worker = getattr(self, "_smart_cli_worker", None)
+            if worker is not None and worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._smart_cli_worker_loop,
+                name="hermes-smart-cli-router",
+                daemon=True,
+            )
+            self._smart_cli_worker = worker
+            worker.start()
 
     def _install_tool_callbacks(self) -> None:
         """Install tool callbacks that need the live prompt UI."""
@@ -15088,6 +15231,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        self._smart_cli_input_queue = queue.Queue()
+        self._smart_cli_worker_lock = threading.Lock()
+        self._smart_cli_worker = None
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
@@ -15377,6 +15523,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self._agent_running and not _is_local_dispatch:
                     _effective_mode = self.busy_input_mode
                     redirected = False
+                    if _effective_mode == "smart":
+                        # Preserve media for a full next turn. Text is routed by
+                        # one FIFO worker so provider latency never freezes the UI
+                        # and concurrent follow-ups retain arrival order.
+                        if images or not text:
+                            _effective_mode = "queue"
+                        else:
+                            self._enqueue_smart_cli_input(text)
+                            preview = text[:80] + ("..." if len(text) > 80 else "")
+                            _cprint(f"  {_ACCENT}🧭 SMART routing: '{preview}'{_RST}")
                     if _effective_mode == "steer":
                         # Route Enter through /steer — inject mid-run after the
                         # next tool call.  Images can't ride along (steer only
@@ -16462,7 +16618,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
             if cli_ref._agent_running:
-                return "msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
+                return f"msg={cli_ref.busy_input_mode} · /queue · /bg · /steer · Ctrl+C cancel"
             if cli_ref._voice_mode:
                 _label = cli_ref._voice_record_key_label()
                 return f"type or {_label} to record"

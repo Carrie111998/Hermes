@@ -598,14 +598,14 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: 'control busy enter mode [queue|steer|interrupt|status]',
+    help: 'control busy enter mode [smart|queue|steer|interrupt|status]',
     name: 'busy',
     run: (arg, ctx) => {
       const mode = arg.trim().toLowerCase()
-      const valid = new Set(['', 'status', 'queue', 'steer', 'interrupt'])
+      const valid = new Set(['', 'status', 'smart', 'queue', 'steer', 'interrupt'])
 
       if (!valid.has(mode)) {
-        return ctx.transcript.sys('usage: /busy [queue|steer|interrupt|status]')
+        return ctx.transcript.sys('usage: /busy [smart|queue|steer|interrupt|status]')
       }
 
       if (!mode || mode === 'status') {

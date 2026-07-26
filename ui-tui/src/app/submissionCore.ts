@@ -80,12 +80,18 @@ export function submitPrompt(
 
     deps.gw
       .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
-      .then(r => {
+      .then(result => {
+        if (result?.ack) {
+          deps.sys(result.ack)
+        }
+
         // The gateway consumed a typed voice stop phrase server-side (voice
         // chat ended, no turn started) — release the busy latch; the
         // voice.transcript {stop_phrase} event handles the mode flags + notice.
-        if (r?.voice_stopped) {
+        if (result?.voice_stopped) {
           patchUiState({ busy: false, status: 'ready' })
+        } else if (result?.status === 'smart_queued' || result?.status === 'queued') {
+          patchUiState({ busy: true, status: 'queued for next turn' })
         }
       })
       .catch((e: Error) => {

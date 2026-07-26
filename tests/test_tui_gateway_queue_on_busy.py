@@ -242,6 +242,126 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     ]
 
 
+def _smart_decision(route):
+    from hermes_cli.smart_orchestrator import SmartRouteDecision
+
+    return SmartRouteDecision(
+        route=route,
+        confidence=0.95,
+        reason=f"reason-{route}",
+        source="classifier",
+    )
+
+def test_busy_smart_related_steers_without_interrupt(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "smart")
+    steered = []
+    interrupted = []
+    agent = types.SimpleNamespace(
+        steer=lambda text: steered.append(text) or True,
+        interrupt=lambda *a, **k: interrupted.append(True),
+        messages=[{"role": "user", "content": "Fix gateway"}],
+        get_activity_summary=lambda: {"current_tool": "terminal"},
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        inflight_turn={"user": "Fix gateway", "assistant": "", "streaming": True},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.smart_orchestrator.classify_smart_message",
+        lambda **_kwargs: (_smart_decision("related"), "add tests"),
+    )
+
+    resp = server._handle_busy_submit("r1", "sid", session, "add tests", "ws-1")
+
+    assert resp["result"]["status"] == "smart_related"
+    assert resp["result"]["route"] == "related"
+    assert "continua" in resp["result"]["ack"].lower()
+    assert steered == ["add tests"]
+    assert interrupted == []
+    assert session.get("queued_prompt") is None
+
+def test_busy_smart_independent_injects_parallel_directive(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "smart")
+    steered = []
+    agent = types.SimpleNamespace(
+        steer=lambda text: steered.append(text) or True,
+        interrupt=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not interrupt")),
+        messages=[],
+        get_activity_summary=lambda: {},
+    )
+    session = _session(agent=agent, running=True, inflight_turn={"user": "Build API"})
+    monkeypatch.setattr(
+        "hermes_cli.smart_orchestrator.classify_smart_message",
+        lambda **_kwargs: (_smart_decision("independent"), "research market"),
+    )
+
+    resp = server._handle_busy_submit("r1", "sid", session, "research market", "ws-1")
+
+    assert resp["result"]["status"] == "smart_parallel"
+    assert "SMART ORCHESTRATOR" in steered[0]
+    assert "delegate_task" in steered[0]
+    assert "research market" in steered[0]
+    assert session.get("queued_prompt") is None
+
+def test_busy_smart_dependent_and_classifier_failure_queue_without_interrupt(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "smart")
+    interrupted = []
+    agent = types.SimpleNamespace(
+        steer=lambda text: (_ for _ in ()).throw(AssertionError("must not steer")),
+        interrupt=lambda *a, **k: interrupted.append(True),
+        messages=[],
+        get_activity_summary=lambda: {},
+    )
+
+    for classifier in (
+        lambda **_kwargs: (_smart_decision("dependent"), "deploy later"),
+        lambda **_kwargs: (_ for _ in ()).throw(TimeoutError("provider down")),
+    ):
+        session = _session(
+            agent=agent,
+            running=True,
+            inflight_turn={"user": "Build artifact"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.smart_orchestrator.classify_smart_message",
+            classifier,
+        )
+        resp = server._handle_busy_submit("r1", "sid", session, "deploy later", "ws-1")
+        assert resp["result"]["status"] == "smart_queued"
+        assert session["queued_prompt"]["text"] == "deploy later"
+
+    assert interrupted == []
+
+def test_busy_smart_rechecks_live_turn_after_classifier_race(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "smart")
+    steered = []
+    interrupted = []
+    agent = types.SimpleNamespace(
+        steer=lambda text: steered.append(text) or True,
+        interrupt=lambda *a, **k: interrupted.append(True),
+        messages=[],
+        get_activity_summary=lambda: {},
+    )
+    session = _session(agent=agent, running=True, inflight_turn={"user": "Fix gateway"})
+
+    def finish_turn_during_classification(**_kwargs):
+        session["running"] = False
+        return _smart_decision("related"), "late update"
+
+    monkeypatch.setattr(
+        "hermes_cli.smart_orchestrator.classify_smart_message",
+        finish_turn_during_classification,
+    )
+
+    resp = server._handle_busy_submit("r1", "sid", session, "late update", "ws-1")
+
+    assert resp["result"]["status"] == "smart_queued"
+    assert session["queued_prompt"]["text"] == "late update"
+    assert steered == []
+    assert interrupted == []
+
+
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):

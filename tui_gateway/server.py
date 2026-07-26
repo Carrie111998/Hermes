@@ -461,7 +461,7 @@ def _load_busy_input_mode() -> str:
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    return raw if raw in {"queue", "steer", "smart", "interrupt"} else "interrupt"
 
 
 def _load_interim_assistant_messages() -> bool:
@@ -7233,6 +7233,172 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
+def _handle_smart_busy_submit(
+    rid: Any,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    image_paths: list[str] | None = None,
+) -> dict:
+    """Classify a busy TUI prompt and never interrupt the active turn."""
+    from hermes_cli.smart_orchestrator import (
+        ROUTE_AMBIGUOUS,
+        ROUTE_INDEPENDENT,
+        ROUTE_RELATED,
+        SmartRouteDecision,
+        build_parallel_steer_payload,
+        classify_smart_message,
+        format_smart_ack,
+    )
+
+    cfg = _load_cfg()
+    smart_cfg = cfg.get("orchestration", {}).get("smart", {})
+    if not isinstance(smart_cfg, dict):
+        smart_cfg = {}
+    try:
+        threshold = max(
+            0.0,
+            min(1.0, float(smart_cfg.get("confidence_threshold", 0.78))),
+        )
+    except (TypeError, ValueError):
+        threshold = 0.78
+    try:
+        timeout = max(
+            1.0,
+            min(60.0, float(smart_cfg.get("classifier_timeout_seconds", 12.0))),
+        )
+    except (TypeError, ValueError):
+        timeout = 12.0
+
+    agent = session.get("agent")
+    inflight = session.get("inflight_turn")
+    active_goal = ""
+    if isinstance(inflight, dict):
+        active_goal = str(inflight.get("user") or "")
+    if not active_goal and agent is not None:
+        try:
+            for message in reversed(getattr(agent, "messages", []) or []):
+                if isinstance(message, dict) and message.get("role") == "user":
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        active_goal = content
+                        break
+        except Exception:
+            active_goal = ""
+
+    activity = {}
+    if agent is not None:
+        try:
+            summary = agent.get_activity_summary()
+            if isinstance(summary, dict):
+                activity = {
+                    key: summary.get(key)
+                    for key in ("api_call_count", "max_iterations", "current_tool")
+                    if summary.get(key) is not None
+                }
+        except Exception:
+            activity = {}
+
+    main_runtime = {}
+    if agent is not None:
+        for key in (
+            "provider",
+            "model",
+            "api_key",
+            "base_url",
+            "api_mode",
+            "auth_mode",
+            "credential_pool",
+        ):
+            value = getattr(agent, key, None)
+            if value is not None:
+                main_runtime[key] = value
+    if not main_runtime.get("provider") or not main_runtime.get("model"):
+        main_runtime = {}
+
+    image_paths = list(image_paths or [])
+    if image_paths or not _is_text_only_busy_payload(text):
+        decision = SmartRouteDecision(
+            route="dependent",
+            confidence=1.0,
+            reason="Attachments are preserved for the next full turn.",
+            source="policy",
+        )
+        payload = str(text or "")
+    else:
+        try:
+            decision, payload = classify_smart_message(
+                active_goal=active_goal,
+                incoming_text=str(text or ""),
+                activity_summary=json.dumps(activity, ensure_ascii=False, default=str),
+                confidence_threshold=threshold,
+                classifier_timeout_seconds=timeout,
+                main_runtime=main_runtime or None,
+            )
+        except Exception:
+            decision = SmartRouteDecision(
+                route=ROUTE_AMBIGUOUS,
+                confidence=0.0,
+                reason="Classifier unavailable; using the safe queue fallback.",
+                source="fallback",
+            )
+            payload = str(text or "")
+
+    if decision is None:
+        decision = SmartRouteDecision(
+            route=ROUTE_AMBIGUOUS,
+            confidence=0.0,
+            reason="Classifier unavailable; using the safe queue fallback.",
+            source="fallback",
+        )
+        payload = str(text or "")
+
+    steered = False
+    same_active_run = (
+        not image_paths
+        and bool(session.get("running"))
+        and session.get("agent") is agent
+    )
+    if (
+        same_active_run
+        and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}
+        and agent is not None
+    ):
+        steer_payload = payload
+        if decision.route == ROUTE_INDEPENDENT:
+            steer_payload = build_parallel_steer_payload(payload)
+        if steer_payload and hasattr(agent, "steer"):
+            try:
+                steered = bool(agent.steer(steer_payload))
+            except Exception:
+                steered = False
+
+    if steered:
+        status = "smart_parallel" if decision.route == ROUTE_INDEPENDENT else "smart_related"
+    else:
+        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        status = "smart_queued"
+        if decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+            decision = SmartRouteDecision(
+                route=ROUTE_AMBIGUOUS,
+                confidence=0.0,
+                reason="The active checkpoint closed before steering; queued safely.",
+                source="fallback",
+            )
+
+    prefix = str(smart_cfg.get("ack_prefix", "") or "").strip()
+    session["last_active"] = time.time()
+    return _ok(
+        rid,
+        {
+            "status": status,
+            "route": decision.route,
+            "ack": format_smart_ack(decision, prefix=prefix),
+        },
+    )
+
+
 def _handle_busy_submit(
     rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
 ) -> dict | None:
@@ -7246,7 +7412,8 @@ def _handle_busy_submit(
 
     Modes: ``interrupt`` (default) → redirect the live turn, falling back to
     hard interrupt + queue for older agents; ``queue`` → queue without
-    interrupting; ``steer`` → inject after the current atomic action.
+    interrupting; ``steer`` → inject after the current atomic action;
+    ``smart`` → classify into related/parallel/dependent without interrupting.
 
     ``queued=True`` (client's queue drain, ``prompt.submit`` param) overrides
     the mode entirely: the message was explicitly queued as "run after", so it
@@ -7272,6 +7439,20 @@ def _handle_busy_submit(
             session["attached_images"] = []
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
+    if mode == "smart":
+        route_lock: Any = session.get("smart_route_lock")
+        if not hasattr(route_lock, "acquire"):
+            route_lock = threading.Lock()
+            session["smart_route_lock"] = route_lock
+        with route_lock:
+            return _handle_smart_busy_submit(
+                rid,
+                sid,
+                session,
+                text,
+                transport,
+                image_paths=image_paths,
+            )
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
         try:
             if agent.steer(plain_text):
