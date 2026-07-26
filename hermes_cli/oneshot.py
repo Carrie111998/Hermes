@@ -173,6 +173,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    skills: object = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +188,8 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        skills: Optional comma-separated string or iterable of skill names
+            to preload into the system prompt.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -248,6 +251,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    skills=skills,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -310,12 +314,35 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _parse_skills_for_oneshot(skills: object) -> list[str]:
+    """Normalize skills argument into a list of skill identifiers."""
+    if not skills:
+        return []
+    if isinstance(skills, str):
+        raw_values = [skills]
+    elif isinstance(skills, (list, tuple)):
+        raw_values = [str(item) for item in skills if item is not None]
+    else:
+        raw_values = [str(skills)]
+    parsed = []
+    seen = set()
+    for raw in raw_values:
+        for part in raw.split(","):
+            normalized = part.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            parsed.append(normalized)
+    return parsed
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    skills: object = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -396,6 +423,21 @@ def _run_agent(
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     session_db = _create_session_db_for_oneshot()
+
+    # Preload skills into system prompt (#71759)
+    skills_prompt = ""
+    if skills:
+        try:
+            from agent.skill_commands import build_preloaded_skills_prompt
+            parsed_skills = _parse_skills_for_oneshot(skills)
+            if parsed_skills:
+                skills_prompt, _loaded, _missing = build_preloaded_skills_prompt(
+                    parsed_skills,
+                    task_id=None,
+                )
+        except Exception:
+            pass  # Best-effort: don't crash oneshot over skill loading
+
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -420,6 +462,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            ephemeral_system_prompt=skills_prompt or None,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction
