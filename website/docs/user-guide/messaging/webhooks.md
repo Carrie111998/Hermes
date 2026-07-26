@@ -87,6 +87,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+| `completion_callback` | No | Signed lifecycle callback emitted at `running` and after terminal response delivery. Requires `url`, a separate 32+ character `secret`, and 1–8 scalar `include_payload_fields`; optional `max_attempts` (1–5, default 3) and `timeout_seconds` (1–30, default 5). Terminal callbacks are persisted mode-0600 and replayed after restart until acknowledged with 2xx. |
 
 ### Full example
 
@@ -123,6 +124,32 @@ platforms:
               equals: "refs/heads/main"
           deliver: "telegram"
 ```
+
+### Completion callbacks
+
+Use `completion_callback` when the system that submitted a webhook must durably learn whether the
+agent run and its final response delivery completed. The callback is sent from the processing
+lifecycle boundary—not from the model prompt—and contains only explicitly selected scalar fields:
+
+```yaml
+completion_callback:
+  url: "http://100.64.0.10:8765/v1/jobs/completion"
+  secret: "use-a-separate-random-secret-of-at-least-32-characters"
+  include_payload_fields: ["job_id", "thread_id"]
+  max_attempts: 3
+  timeout_seconds: 5
+```
+
+Callbacks use `X-Webhook-Timestamp` plus `X-Webhook-Signature-V2`, an HMAC-SHA256 over
+`<timestamp>.<raw-body>`. The body contains `delivery_id`, route, status, occurred time, a fixed
+sanitized error code, and the selected fields under `correlation`. Receivers should enforce the
+five-minute timestamp window and use `(delivery_id,status)` as an idempotency key.
+
+`running` is best effort. Before a terminal callback is sent, Hermes atomically writes it beneath
+`~/.hermes/webhook_callback_outbox/` with directory mode 0700 and file mode 0600. Only a 2xx
+response removes it; non-2xx responses, timeout, process exit, or restart leave it available for
+replay. The spool contains the callback body and route name but never the callback URL or secret.
+Redirects are not followed, preventing signature forwarding to a different host.
 
 ### Payload Filters
 
