@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 from collections.abc import Mapping
@@ -41,6 +42,7 @@ from session_bridge.models import (
     Relation,
     SessionLink,
     SessionProjection,
+    SidebarHydrationState,
     SidebarJobState,
     canonical_session_id,
     encode_bridge_marker,
@@ -6878,6 +6880,158 @@ def _sidebar_candidate(
         worktree_id="worktree-1",
         eligible_at=eligible_at,
     )
+
+
+def _visible_sidebar_for_hydration(
+    db: SessionDB,
+    *,
+    native_id: str = "hydration-source",
+) -> tuple[SessionBridgeStore, SidebarCandidate]:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "sidebar-visible-lease",
+            "hydration-lease",
+            "hydration-reconcile-lease",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=native_id)
+    store.enqueue_sidebar_job(candidate)
+    sidebar_lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.commit_sidebar_job(
+        lease_token=sidebar_lease["lease_token"],
+        codex_thread_id=f"codex-{native_id}",
+        now=110.0,
+    )
+    return store, candidate
+
+
+def _seed_hydration(
+    store: SessionBridgeStore,
+    candidate: SidebarCandidate,
+    *,
+    now: float = 120.0,
+) -> dict[str, object]:
+    return store.seed_sidebar_hydration_job(
+        source_session_id=candidate.source_session_id,
+        bridge_id=candidate.bridge_id,
+        codex_thread_id=f"codex-{candidate.source_session_id.removeprefix('claude:')}",
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        preview_version=1,
+        preview_digest="a" * 64,
+        hydration_marker="HERMES_SESSION_HYDRATION_V1:canonical.marker",
+        now=now,
+    )
+
+
+def test_sidebar_hydration_seed_is_visible_only_idempotent_and_isolated(db) -> None:
+    store, candidate = _visible_sidebar_for_hydration(db)
+    sidebar_before = store.get_sidebar_job_for_source(candidate.source_session_id)
+
+    first = _seed_hydration(store, candidate)
+    replay = _seed_hydration(store, candidate, now=125.0)
+
+    assert replay == first
+    assert first["state"] == SidebarHydrationState.PENDING.value
+    assert store.get_sidebar_job_for_source(candidate.source_session_id) == sidebar_before
+    with pytest.raises(ValueError, match="identity"):
+        store.seed_sidebar_hydration_job(
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            codex_thread_id="different-task",
+            source_cursor="cursor-1",
+            source_hash="hash-1",
+            preview_version=1,
+            preview_digest="a" * 64,
+            hydration_marker="HERMES_SESSION_HYDRATION_V1:canonical.marker",
+            now=130.0,
+        )
+
+    pending_store = SessionBridgeStore(db)
+    pending_candidate = _sidebar_candidate(db, native_id="hydration-pending")
+    pending_store.enqueue_sidebar_job(pending_candidate)
+    with pytest.raises(ValueError, match="visible"):
+        pending_store.seed_sidebar_hydration_job(
+            source_session_id=pending_candidate.source_session_id,
+            bridge_id=pending_candidate.bridge_id,
+            codex_thread_id="codex-pending",
+            source_cursor="cursor-1",
+            source_hash="hash-1",
+            preview_version=1,
+            preview_digest="b" * 64,
+            hydration_marker="HERMES_SESSION_HYDRATION_V1:pending.marker",
+            now=130.0,
+        )
+
+
+def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) -> None:
+    store, candidate = _visible_sidebar_for_hydration(
+        db,
+        native_id="hydration-ambiguous",
+    )
+    seeded = _seed_hydration(store, candidate)
+    sidebar_before = store.get_sidebar_job_for_source(candidate.source_session_id)
+
+    claim = store.claim_sidebar_hydration_jobs(now=125.0, limit=1)[0]
+    assert store.claim_sidebar_hydration_jobs(now=125.0, limit=1) == []
+    assert claim["send_reserved"] is False
+    reserved = store.reserve_sidebar_hydration_send(
+        lease_token=claim["lease_token"],
+        now=126.0,
+    )
+    replay = store.reserve_sidebar_hydration_send(
+        lease_token=claim["lease_token"],
+        now=127.0,
+    )
+    assert replay["send_reserved_at"] == reserved["send_reserved_at"] == 126.0
+
+    failed = store.fail_sidebar_hydration_job(
+        lease_token=claim["lease_token"],
+        error_code="hydration_send_ambiguous",
+        codex_thread_id=seeded["codex_thread_id"],
+        now=128.0,
+    )
+    assert failed["state"] == SidebarHydrationState.RETRY.value
+    assert failed["send_reserved_at"] == 126.0
+
+    reclaimed = store.claim_sidebar_hydration_jobs(now=129.0, limit=1)[0]
+    assert reclaimed["send_reserved"] is True
+    assert reclaimed["source_cursor"] == "cursor-1"
+    assert reclaimed["source_hash"] == "hash-1"
+    assert reclaimed["preview_digest"] == "a" * 64
+    with pytest.raises(ValueError, match="marker"):
+        store.commit_sidebar_hydration_job(
+            lease_token=reclaimed["lease_token"],
+            codex_thread_id=seeded["codex_thread_id"],
+            hydration_marker="HERMES_SESSION_HYDRATION_V1:different.marker",
+            now=130.0,
+        )
+
+    committed = store.commit_sidebar_hydration_job(
+        lease_token=reclaimed["lease_token"],
+        codex_thread_id=seeded["codex_thread_id"],
+        hydration_marker=seeded["hydration_marker"],
+        now=131.0,
+    )
+    replay_commit = store.commit_sidebar_hydration_job(
+        lease_token=reclaimed["lease_token"],
+        codex_thread_id=seeded["codex_thread_id"],
+        hydration_marker=seeded["hydration_marker"],
+        now=132.0,
+    )
+    assert replay_commit == committed
+    assert committed["state"] == SidebarHydrationState.VISIBLE.value
+    assert committed["completion_digest"] == hmac.new(
+        b"session-sidebar-hydration-completion-v1",
+        b"hydration-reconcile-lease",
+        hashlib.sha256,
+    ).hexdigest()
+    assert store.get_sidebar_job_for_source(candidate.source_session_id) == sidebar_before
+    status = store.sidebar_hydration_status(now=132.0)
+    assert status["counts"][SidebarHydrationState.VISIBLE.value] == 1
+    assert status["active_lease"] is False
 
 
 def _token_factory(*tokens: str):

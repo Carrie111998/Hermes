@@ -42,6 +42,7 @@ from .models import (
     Relation,
     SessionLink,
     SessionProjection,
+    SidebarHydrationState,
     SidebarJobState,
     UpsertResult,
     canonical_session_id,
@@ -73,6 +74,10 @@ _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY = (
     "session-bridge:sidebar:create-reservation-cutover:v1"
 )
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
+_SIDEBAR_HYDRATION_LEASE_SECONDS = 300
+_SIDEBAR_HYDRATION_LEASE_KEY = b"session-sidebar-hydration-lease-v1"
+_SIDEBAR_HYDRATION_COMPLETION_KEY = b"session-sidebar-hydration-completion-v1"
+_SIDEBAR_HYDRATION_MAX_ATTEMPTS = 5
 _CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
 _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION = 2
 _CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX = 100
@@ -203,6 +208,19 @@ SIDEBAR_FATAL_ERRORS = frozenset({
     "source_cwd_missing",
     "permission_preflight_failed",
     "retry_budget_exhausted",
+})
+HYDRATION_RETRYABLE_ERRORS = frozenset({
+    "codex_tool_unavailable",
+    "native_task_not_indexed",
+    "hydration_send_ambiguous",
+    "bridge_temporarily_unavailable",
+    "broker_time_budget",
+})
+HYDRATION_FATAL_ERRORS = frozenset({
+    "marker_conflict",
+    "source_identity_mismatch",
+    "codex_thread_conflict",
+    "preview_digest_mismatch",
 })
 SIDEBAR_EXCLUSION_REASONS = frozenset({"source_cwd_missing"})
 SIDEBAR_TERMINAL_RESOLUTION_CODE = "native_thread_unrecoverable"
@@ -7404,6 +7422,419 @@ class SessionBridgeStore:
             "git_branch": session.get("git_branch"),
         }
 
+    def seed_sidebar_hydration_job(
+        self,
+        source_session_id: str,
+        bridge_id: str,
+        codex_thread_id: str,
+        source_cursor: str,
+        source_hash: str,
+        preview_version: int,
+        preview_digest: str,
+        hydration_marker: str,
+        now: float,
+    ) -> dict[str, Any]:
+        source_id = _exact_nonempty_text(source_session_id, "hydration source ID")
+        normalized_bridge = _exact_nonempty_text(bridge_id, "hydration bridge ID")
+        thread_id = _exact_nonempty_text(
+            codex_thread_id,
+            "hydration Codex thread ID",
+        )
+        cursor = _exact_nonempty_text(source_cursor, "hydration source cursor")
+        source_identity_hash = _exact_nonempty_text(
+            source_hash,
+            "hydration source hash",
+        )
+        if type(preview_version) is not int or preview_version != 1:
+            raise ValueError("hydration preview version must be 1")
+        digest = _lowercase_sha256(preview_digest, "hydration preview digest")
+        marker = _exact_nonempty_text(hydration_marker, "hydration marker")
+        seeded_at = _finite_number(now, "hydration seed time")
+        job_id = "sidebar-hydration:" + hashlib.sha256(
+            f"{normalized_bridge}\0{thread_id}".encode("utf-8")
+        ).hexdigest()
+
+        def _write(conn):
+            sidebar = conn.execute(
+                """SELECT source_session_id, bridge_id, codex_thread_id, state
+                     FROM session_sidebar_jobs
+                    WHERE source_session_id = ? AND bridge_id = ?""",
+                (source_id, normalized_bridge),
+            ).fetchone()
+            if sidebar is None or sidebar["state"] != SidebarJobState.VISIBLE.value:
+                raise ValueError("sidebar hydration requires a visible sidebar job")
+            if sidebar["codex_thread_id"] != thread_id:
+                raise ValueError("sidebar hydration task identity mismatch")
+            conn.execute(
+                """INSERT OR IGNORE INTO session_sidebar_hydration_jobs (
+                       id, source_session_id, bridge_id, codex_thread_id,
+                       source_cursor, source_hash, preview_version, preview_digest,
+                       hydration_marker, state, attempts, next_attempt_at,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                (
+                    job_id,
+                    source_id,
+                    normalized_bridge,
+                    thread_id,
+                    cursor,
+                    source_identity_hash,
+                    preview_version,
+                    digest,
+                    marker,
+                    SidebarHydrationState.PENDING.value,
+                    seeded_at,
+                    seeded_at,
+                    seeded_at,
+                ),
+            )
+            row = conn.execute(
+                """SELECT * FROM session_sidebar_hydration_jobs
+                   WHERE source_session_id = ?""",
+                (source_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("sidebar hydration seed failed")
+            result = dict(row)
+            expected = {
+                "id": job_id,
+                "source_session_id": source_id,
+                "bridge_id": normalized_bridge,
+                "codex_thread_id": thread_id,
+                "source_cursor": cursor,
+                "source_hash": source_identity_hash,
+                "preview_version": preview_version,
+                "preview_digest": digest,
+                "hydration_marker": marker,
+            }
+            if any(result[key] != value for key, value in expected.items()):
+                raise ValueError("sidebar hydration seed identity conflict")
+            return result
+
+        return self.db._execute_write(_write)
+
+    def claim_sidebar_hydration_jobs(
+        self,
+        *,
+        now: float,
+        limit: int = 1,
+    ) -> list[dict[str, Any]]:
+        claim_time = _finite_number(now, "hydration claim time")
+        if type(limit) is not int or not 1 <= limit <= 10:
+            raise ValueError("hydration claim limit must be between 1 and 10")
+
+        def _write(conn):
+            conn.execute(
+                """UPDATE session_sidebar_hydration_jobs
+                   SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+                       lease_expires_at = NULL, updated_at = ?
+                   WHERE state = ? AND lease_expires_at <= ?""",
+                (
+                    SidebarHydrationState.RETRY.value,
+                    claim_time,
+                    claim_time,
+                    SidebarHydrationState.LEASED.value,
+                    claim_time,
+                ),
+            )
+            active = conn.execute(
+                """SELECT 1 FROM session_sidebar_hydration_jobs
+                   WHERE state = ? AND lease_expires_at > ? LIMIT 1""",
+                (SidebarHydrationState.LEASED.value, claim_time),
+            ).fetchone()
+            if active is not None:
+                return []
+            row = conn.execute(
+                """SELECT * FROM session_sidebar_hydration_jobs
+                   WHERE state IN (?, ?) AND next_attempt_at <= ?
+                   ORDER BY CASE WHEN send_reserved_at IS NOT NULL THEN 0 ELSE 1 END,
+                            next_attempt_at, created_at, id
+                   LIMIT 1""",
+                (
+                    SidebarHydrationState.PENDING.value,
+                    SidebarHydrationState.RETRY.value,
+                    claim_time,
+                ),
+            ).fetchone()
+            if row is None:
+                return []
+            token = _exact_nonempty_text(
+                self._sidebar_token_factory(),
+                "hydration lease token",
+            )
+            lease_digest = _hydration_lease_digest(token)
+            duplicate = conn.execute(
+                """SELECT 1 FROM session_sidebar_hydration_jobs
+                   WHERE lease_digest = ? OR completion_digest = ? LIMIT 1""",
+                (lease_digest, _hydration_completion_digest(token)),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError("hydration lease token factory returned a duplicate")
+            cursor = conn.execute(
+                """UPDATE session_sidebar_hydration_jobs
+                   SET state = ?, lease_digest = ?, lease_expires_at = ?,
+                       error_code = NULL, updated_at = ?
+                   WHERE id = ? AND state = ? AND attempts = ?""",
+                (
+                    SidebarHydrationState.LEASED.value,
+                    lease_digest,
+                    claim_time + _SIDEBAR_HYDRATION_LEASE_SECONDS,
+                    claim_time,
+                    row["id"],
+                    row["state"],
+                    row["attempts"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale sidebar hydration claim")
+            claimed = dict(
+                conn.execute(
+                    "SELECT * FROM session_sidebar_hydration_jobs WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+            )
+            claimed["lease_token"] = token
+            claimed["send_reserved"] = claimed["send_reserved_at"] is not None
+            return [claimed]
+
+        return self.db._execute_write(_write)
+
+    def reserve_sidebar_hydration_send(
+        self,
+        *,
+        lease_token: str,
+        now: float,
+    ) -> dict[str, Any]:
+        token_digest = _hydration_lease_digest(lease_token)
+        reserved_at = _finite_number(now, "hydration reservation time")
+
+        def _write(conn):
+            job = _find_sidebar_hydration_by_lease(conn, token_digest)
+            if job is None:
+                raise ValueError("invalid hydration lease token")
+            if float(job["lease_expires_at"]) <= reserved_at:
+                _recover_expired_sidebar_hydration(conn, job, now=reserved_at)
+                return None, True
+            if job["send_reserved_at"] is None:
+                cursor = conn.execute(
+                    """UPDATE session_sidebar_hydration_jobs
+                       SET send_reserved_at = ?, updated_at = ?
+                       WHERE id = ? AND state = ? AND lease_digest = ?""",
+                    (
+                        reserved_at,
+                        reserved_at,
+                        job["id"],
+                        SidebarHydrationState.LEASED.value,
+                        token_digest,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("stale hydration send reservation")
+            result = dict(
+                conn.execute(
+                    "SELECT * FROM session_sidebar_hydration_jobs WHERE id = ?",
+                    (job["id"],),
+                ).fetchone()
+            )
+            result["send_reserved"] = True
+            return result, False
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("hydration lease has expired")
+        return result
+
+    def commit_sidebar_hydration_job(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+        hydration_marker: str,
+        now: float,
+    ) -> dict[str, Any]:
+        lease_digest = _hydration_lease_digest(lease_token)
+        completion_digest = _hydration_completion_digest(lease_token)
+        thread_id = _exact_nonempty_text(
+            codex_thread_id,
+            "hydration Codex thread ID",
+        )
+        marker = _exact_nonempty_text(hydration_marker, "hydration marker")
+        committed_at = _finite_number(now, "hydration commit time")
+
+        def _write(conn):
+            job, matched_completion = _find_sidebar_hydration_for_completion(
+                conn,
+                lease_digest=lease_digest,
+                completion_digest=completion_digest,
+            )
+            if job is None:
+                raise ValueError("invalid hydration lease token")
+            if (
+                job["codex_thread_id"] != thread_id
+                or not hmac.compare_digest(job["hydration_marker"], marker)
+            ):
+                raise ValueError("hydration task or marker mismatch")
+            if matched_completion:
+                if job["state"] != SidebarHydrationState.VISIBLE.value:
+                    raise ValueError("invalid hydration completion state")
+                return dict(job), False
+            if float(job["lease_expires_at"]) <= committed_at:
+                _recover_expired_sidebar_hydration(conn, job, now=committed_at)
+                return None, True
+            if job["send_reserved_at"] is None:
+                raise ValueError("hydration send was not reserved")
+            cursor = conn.execute(
+                """UPDATE session_sidebar_hydration_jobs
+                   SET state = ?, lease_digest = NULL, lease_expires_at = NULL,
+                       sent_at = COALESCE(sent_at, ?), verified_at = ?,
+                       completion_digest = ?, error_code = NULL, updated_at = ?
+                   WHERE id = ? AND state = ? AND lease_digest = ?""",
+                (
+                    SidebarHydrationState.VISIBLE.value,
+                    committed_at,
+                    committed_at,
+                    completion_digest,
+                    committed_at,
+                    job["id"],
+                    SidebarHydrationState.LEASED.value,
+                    lease_digest,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale hydration completion")
+            return (
+                dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_hydration_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                ),
+                False,
+            )
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("hydration lease has expired")
+        return result
+
+    def fail_sidebar_hydration_job(
+        self,
+        *,
+        lease_token: str,
+        error_code: str,
+        codex_thread_id: str,
+        now: float,
+    ) -> dict[str, Any]:
+        if (
+            type(error_code) is not str
+            or error_code not in HYDRATION_RETRYABLE_ERRORS | HYDRATION_FATAL_ERRORS
+        ):
+            raise ValueError("hydration error code is not in the fixed allowlist")
+        token_digest = _hydration_lease_digest(lease_token)
+        thread_id = _exact_nonempty_text(
+            codex_thread_id,
+            "hydration Codex thread ID",
+        )
+        failure_time = _finite_number(now, "hydration failure time")
+
+        def _write(conn):
+            job = _find_sidebar_hydration_by_lease(conn, token_digest)
+            if job is None:
+                raise ValueError("invalid hydration lease token")
+            if job["codex_thread_id"] != thread_id:
+                raise ValueError("hydration task identity mismatch")
+            if float(job["lease_expires_at"]) <= failure_time:
+                _recover_expired_sidebar_hydration(conn, job, now=failure_time)
+                return None, True
+            if (
+                error_code == "hydration_send_ambiguous"
+                and job["send_reserved_at"] is None
+            ):
+                raise ValueError("ambiguous hydration send was not reserved")
+            attempts = int(job["attempts"]) + 1
+            if error_code in HYDRATION_FATAL_ERRORS:
+                state = SidebarHydrationState.FAILED
+                next_attempt_at = float(job["next_attempt_at"])
+            elif attempts >= _SIDEBAR_HYDRATION_MAX_ATTEMPTS:
+                state = SidebarHydrationState.FAILED
+                next_attempt_at = failure_time
+            else:
+                state = SidebarHydrationState.RETRY
+                delay = (
+                    0.0
+                    if error_code
+                    in {"hydration_send_ambiguous", "broker_time_budget"}
+                    else min(300.0, 5.0 * (2 ** (attempts - 1)))
+                )
+                next_attempt_at = failure_time + delay
+            cursor = conn.execute(
+                """UPDATE session_sidebar_hydration_jobs
+                   SET state = ?, attempts = ?, next_attempt_at = ?,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       error_code = ?, updated_at = ?
+                   WHERE id = ? AND state = ? AND lease_digest = ?""",
+                (
+                    state.value,
+                    attempts,
+                    next_attempt_at,
+                    error_code,
+                    failure_time,
+                    job["id"],
+                    SidebarHydrationState.LEASED.value,
+                    token_digest,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale hydration failure")
+            return (
+                dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_hydration_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                ),
+                False,
+            )
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("hydration lease has expired")
+        return result
+
+    def sidebar_hydration_status(self, now: float) -> dict[str, Any]:
+        checked_at = _finite_number(now, "hydration status time")
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            counts = {
+                state.value: 0
+                for state in SidebarHydrationState
+            }
+            for row in conn.execute(
+                """SELECT state, COUNT(*) AS count
+                   FROM session_sidebar_hydration_jobs GROUP BY state"""
+            ).fetchall():
+                counts[row["state"]] = int(row["count"])
+            active = conn.execute(
+                """SELECT 1 FROM session_sidebar_hydration_jobs
+                   WHERE state = ? AND lease_expires_at > ? LIMIT 1""",
+                (SidebarHydrationState.LEASED.value, checked_at),
+            ).fetchone()
+            reserved_reconciliation = conn.execute(
+                """SELECT COUNT(*) AS count
+                   FROM session_sidebar_hydration_jobs
+                   WHERE send_reserved_at IS NOT NULL AND state IN (?, ?)""",
+                (
+                    SidebarHydrationState.LEASED.value,
+                    SidebarHydrationState.RETRY.value,
+                ),
+            ).fetchone()
+        return {
+            "counts": counts,
+            "active_lease": active is not None,
+            "reserved_reconciliation": int(reserved_reconciliation["count"]),
+        }
+
     def ensure_sidebar_lineage(
         self,
         *,
@@ -8487,6 +8918,100 @@ def _sha256_text(value: object, label: str) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
         raise ValueError(f"{label} must be lowercase SHA-256")
     return normalized
+
+
+def _lowercase_sha256(value: object, label: str) -> str:
+    normalized = _exact_nonempty_text(value, label)
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise ValueError(f"{label} must be lowercase SHA-256")
+    return normalized
+
+
+def _hydration_lease_digest(lease_token: object) -> str:
+    token = _exact_nonempty_text(lease_token, "hydration lease token")
+    return hmac.new(
+        _SIDEBAR_HYDRATION_LEASE_KEY,
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _hydration_completion_digest(lease_token: object) -> str:
+    token = _exact_nonempty_text(lease_token, "hydration lease token")
+    return hmac.new(
+        _SIDEBAR_HYDRATION_COMPLETION_KEY,
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _find_sidebar_hydration_by_lease(
+    conn: Any,
+    lease_digest: str,
+) -> Mapping[str, Any] | None:
+    rows = conn.execute(
+        """SELECT * FROM session_sidebar_hydration_jobs
+           WHERE lease_digest = ? LIMIT 2""",
+        (lease_digest,),
+    ).fetchall()
+    matches = [
+        row
+        for row in rows
+        if isinstance(row["lease_digest"], str)
+        and hmac.compare_digest(row["lease_digest"], lease_digest)
+    ]
+    if len(matches) > 1:
+        raise ValueError("ambiguous hydration lease token")
+    return matches[0] if matches else None
+
+
+def _find_sidebar_hydration_for_completion(
+    conn: Any,
+    *,
+    lease_digest: str,
+    completion_digest: str,
+) -> tuple[Mapping[str, Any] | None, bool]:
+    lease = _find_sidebar_hydration_by_lease(conn, lease_digest)
+    completion_rows = conn.execute(
+        """SELECT * FROM session_sidebar_hydration_jobs
+           WHERE completion_digest = ? LIMIT 2""",
+        (completion_digest,),
+    ).fetchall()
+    completion = [
+        row
+        for row in completion_rows
+        if isinstance(row["completion_digest"], str)
+        and hmac.compare_digest(row["completion_digest"], completion_digest)
+    ]
+    matches = ([] if lease is None else [(lease, False)]) + [
+        (row, True) for row in completion
+    ]
+    if len(matches) > 1:
+        raise ValueError("ambiguous hydration lease token")
+    return matches[0] if matches else (None, False)
+
+
+def _recover_expired_sidebar_hydration(
+    conn: Any,
+    job: Mapping[str, Any],
+    *,
+    now: float,
+) -> None:
+    cursor = conn.execute(
+        """UPDATE session_sidebar_hydration_jobs
+           SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+               lease_expires_at = NULL, updated_at = ?
+           WHERE id = ? AND state = ?""",
+        (
+            SidebarHydrationState.RETRY.value,
+            now,
+            now,
+            job["id"],
+            SidebarHydrationState.LEASED.value,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("stale expired hydration lease")
 
 
 def _sidebar_lease_digest(lease_token: object) -> str:

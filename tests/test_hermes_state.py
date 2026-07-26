@@ -4118,6 +4118,45 @@ class TestSchemaInit:
                 )
 
 
+def test_session_sidebar_hydration_schema_contains_durable_identity_and_state(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "hydration-schema.db")
+    try:
+        columns = {
+            row["name"]
+            for row in db._conn.execute(
+                "PRAGMA table_info(session_sidebar_hydration_jobs)"
+            )
+        }
+    finally:
+        db.close()
+
+    assert {
+        "id",
+        "source_session_id",
+        "bridge_id",
+        "codex_thread_id",
+        "source_cursor",
+        "source_hash",
+        "preview_version",
+        "preview_digest",
+        "hydration_marker",
+        "state",
+        "attempts",
+        "next_attempt_at",
+        "lease_digest",
+        "lease_expires_at",
+        "send_reserved_at",
+        "sent_at",
+        "verified_at",
+        "completion_digest",
+        "error_code",
+        "created_at",
+        "updated_at",
+    }.issubset(columns)
+
+
 class TestTitleUniqueness:
     """Tests for unique title enforcement and title-based lookups."""
 

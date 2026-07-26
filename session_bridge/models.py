@@ -45,6 +45,14 @@ class SidebarJobState(StrEnum):
     FAILED = "sidebar_failed"
 
 
+class SidebarHydrationState(StrEnum):
+    PENDING = "hydration_pending"
+    LEASED = "hydration_leased"
+    RETRY = "hydration_retry"
+    VISIBLE = "hydration_visible"
+    FAILED = "hydration_failed"
+
+
 @dataclass(frozen=True)
 class ProjectedMessage:
     native_event_id: str

@@ -1162,6 +1162,68 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS session_sidebar_hydration_jobs (
+    id TEXT PRIMARY KEY,
+    source_session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+    bridge_id TEXT NOT NULL UNIQUE,
+    codex_thread_id TEXT NOT NULL UNIQUE,
+    source_cursor TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    preview_version INTEGER NOT NULL CHECK (preview_version = 1),
+    preview_digest TEXT NOT NULL UNIQUE CHECK (
+        length(preview_digest) = 64
+        AND preview_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    hydration_marker TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'hydration_pending', 'hydration_leased', 'hydration_retry',
+            'hydration_visible', 'hydration_failed'
+        )
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at REAL NOT NULL,
+    lease_digest TEXT UNIQUE,
+    lease_expires_at REAL,
+    send_reserved_at REAL,
+    sent_at REAL,
+    verified_at REAL,
+    completion_digest TEXT UNIQUE,
+    error_code TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    CHECK (
+        (state = 'hydration_leased'
+            AND lease_digest IS NOT NULL
+            AND lease_expires_at IS NOT NULL)
+        OR (state != 'hydration_leased'
+            AND lease_digest IS NULL
+            AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        state != 'hydration_visible'
+        OR (
+            send_reserved_at IS NOT NULL
+            AND sent_at IS NOT NULL
+            AND verified_at IS NOT NULL
+            AND completion_digest IS NOT NULL
+        )
+    ),
+    CHECK (
+        state = 'hydration_visible'
+        OR completion_digest IS NULL
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_hydration_due
+    ON session_sidebar_hydration_jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_hydration_lease
+    ON session_sidebar_hydration_jobs(lease_digest)
+    WHERE lease_digest IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_hydration_completion
+    ON session_sidebar_hydration_jobs(completion_digest)
+    WHERE completion_digest IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS session_sidebar_terminal_resolutions (
     job_id TEXT PRIMARY KEY
         REFERENCES session_sidebar_jobs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
