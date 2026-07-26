@@ -94,10 +94,6 @@ def _capture_session_for_engine() -> dict:
         _hermes_home = os.environ.get("HERMES_HOME", "")
         _derived = (_P(_hermes_home).name
                     if "profiles/" in _hermes_home else "default")
-        from pathlib import Path as _P
-        _dbg = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session_debug.log"
-        _dbg.parent.mkdir(parents=True, exist_ok=True)
-        _dbg.write_text(f"cv_profile={_cv_profile!r} env_profile={_env_profile!r} hermes_home={_hermes_home!r} derived={_derived!r}\n")
         _profile = _cv_profile or _env_profile or _derived
         _session_key = get_session_env("HERMES_SESSION_KEY", "")
         # Rebuild session_key with profile if it's missing from ContextVar
@@ -112,11 +108,8 @@ def _capture_session_for_engine() -> dict:
                 "profile": _profile,
                 "session_key": _session_key,
             }
-    except Exception as e:
-        from pathlib import Path as _P
-        _dbg = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session_debug.log"
-        _dbg.parent.mkdir(parents=True, exist_ok=True)
-        _dbg.write_text(f"capture failed: {e}\n")
+    except Exception:
+        pass
     return {}
 
 
