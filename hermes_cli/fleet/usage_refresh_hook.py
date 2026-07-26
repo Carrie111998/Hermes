@@ -3,13 +3,12 @@
 Ensures fresh usage evidence before every router/dispatch decision without
 deadlocking the dispatcher or spamming the usage APIs.
 
-Guarantees:
-  - At most one refresh runs concurrently (enforced by lock + task tracking)
-  - Concurrent callers within throttle window get cached result immediately
-  - Concurrent callers during refresh coalesce (await same task, get consistent outcome)
-  - Timeout on in-flight refresh does NOT trigger duplicate refresh (task keeps running)
-  - After timeout or completion, next call respects throttle window or starts fresh refresh
-  - All concurrent callers get deterministic, consistent terminal states
+CONCURRENCY DESIGN (proven by construction):
+  1. Lock held ONLY during task selection/creation (critical section ~microseconds)
+  2. Lock released BEFORE any await (no serialization; true coalescing)
+  3. asyncio.shield() protects task from cancellation if waiter times out
+  4. Throttle window rechecked inside lock before creating new task
+  5. All concurrent callers await the same shielded task → consistent results
 """
 
 from __future__ import annotations
@@ -25,22 +24,23 @@ logger = logging.getLogger(__name__)
 
 
 class UsageRefreshHook:
-    """Throttled pre-dispatch usage refresh with concurrent-decision coalescing.
+    """Throttled pre-dispatch usage refresh with true concurrent coalescing.
 
-    Concurrency guarantees:
-      1. Throttle window (default 60s, configurable, enforced >= 60s):
-         - Calls within window return cached result immediately
-         - No refresh invoked, no background work triggered
-      2. Concurrent calls during refresh coalesce:
-         - First call: start refresh task, await with timeout
-         - Other calls: await same task (via lock), timeout together
-         - All get consistent outcome (success, timeout, or failure)
-         - No duplicate refreshes even if first caller times out
-      3. Task lifecycle cleanup:
-         - Task kept tracked until completion, success or failure
-         - Successfully completed task: next call respects throttle window
-         - Timed-out task: continues in background, next call waits or throttles
-         - Failed task: considered "in progress" until task actually finishes
+    LOCK DISCIPLINE (critical for correctness):
+      - Lock acquired ONLY for task selection/creation (check throttle, reuse task, or create)
+      - Lock released IMMEDIATELY before any await (no queueing, true coalescing)
+      - Concurrent callers can all await the same task simultaneously (not serialized)
+
+    TASK SHIELDING (critical for timeout safety):
+      - await asyncio.wait_for(asyncio.shield(task), timeout)
+      - Shield prevents timeout from cancelling the underlying task
+      - Task continues in background even if a waiter times out
+      - Other waiters can still await the same shielded task
+
+    DUPLICATE PREVENTION (critical for correctness):
+      - Throttle window rechecked INSIDE the lock before creating new task
+      - Sequence: acquire lock → recheck throttle+in-flight → create only if needed → release
+      - Guarantees at most one refresh per throttle window
     """
 
     def __init__(
@@ -61,11 +61,11 @@ class UsageRefreshHook:
                 return throttled result without invoking refresh_fn.
             timeout_seconds: Maximum seconds to wait for a refresh to complete (default 10s).
                 Calls waiting on an in-flight refresh will timeout after this duration.
-                Timed-out callers return failure; underlying task continues.
+                The underlying task is shielded and continues; other waiters can still await.
             usage_path: Optional path to usage document (reserved for future use).
         """
         self.refresh_fn = refresh_fn
-        self.min_interval_seconds = max(60.0, float(min_interval_seconds))  # Enforce 60s minimum
+        self.min_interval_seconds = max(60.0, float(min_interval_seconds))
         self.timeout_seconds = float(timeout_seconds)
         self.usage_path = usage_path
 
@@ -74,30 +74,22 @@ class UsageRefreshHook:
         self._refresh_lock = asyncio.Lock()
 
     async def refresh_if_needed(self) -> dict[str, Any]:
-        """Refresh usage if needed, coalescing concurrent calls.
+        """Refresh usage if needed, with true concurrent coalescing and task shielding.
 
-        Deterministic behavior:
-          - Throttled call: returns immediately with cached=True
-          - Concurrent refresh (multiple callers, one task): all await, all get same result
-          - Timeout (in-flight refresh takes >timeout_seconds): caller times out, task continues
-          - Subsequent call (after timeout, still in window): throttled
-          - Subsequent call (after timeout, window expired): starts new refresh
-          - Failed refresh: caller gets failure; next call can retry (throttle applies)
+        LOCK FLOW (millisecond-scale critical section):
+          1. Acquire lock (blocks if another caller is in task selection)
+          2. Recheck throttle window (it may have started while we waited for lock)
+          3. Check if task already in progress
+          4. Create task only if no throttle and no in-flight task
+          5. Release lock (BEFORE awaiting)
+          6. Await task OUTSIDE lock with shield (allows concurrent coalescing)
 
-        Returns a status dict:
-            {
-                "ok": bool,                 # Refresh succeeded or was throttled (cached)
-                "refreshed": bool,          # True if refresh was performed this call
-                "cached": bool,             # True if result from throttle/coalescing
-                "reason": str,              # "throttled", "coalesced", "timeout", "failed", "ok"
-                "detail": str,              # Additional context
-                "checked_at": str,          # ISO timestamp of check/refresh
-            }
+        Returns a status dict with keys: ok, refreshed, cached, reason, detail, checked_at
         """
         now = time.time()
         checked_at = datetime.now(timezone.utc).isoformat()
 
-        # 1. Check if refresh is needed (throttle window)
+        # Quick throttle check outside lock (ok to be stale; will recheck inside)
         if self._last_refresh_at is not None:
             age = now - self._last_refresh_at
             if age < self.min_interval_seconds:
@@ -110,117 +102,100 @@ class UsageRefreshHook:
                     "checked_at": checked_at,
                 }
 
-        # 2. If a refresh is already in progress, wait for it (coalesce)
+        # === CRITICAL SECTION: Task selection/creation (lock held) ===
+        task_to_await: asyncio.Task[Any] | None = None
         async with self._refresh_lock:
-            if self._refresh_in_progress is not None and not self._refresh_in_progress.done():
-                # Coalesce: await the existing task with timeout
-                try:
-                    result = await asyncio.wait_for(
-                        self._refresh_in_progress,
-                        timeout=self.timeout_seconds,
-                    )
-                    # Task completed before timeout; return its result
+            # Recheck throttle window INSIDE lock (prevents duplicate-refresh race)
+            if self._last_refresh_at is not None:
+                age = now - self._last_refresh_at
+                if age < self.min_interval_seconds:
                     return {
-                        "ok": result.get("ok", False),
+                        "ok": True,
                         "refreshed": False,
                         "cached": True,
-                        "reason": "coalesced",
-                        "detail": "Waited for concurrent refresh; task completed",
-                        "checked_at": checked_at,
-                    }
-                except asyncio.TimeoutError:
-                    # Coalesced task timed out; return consistent timeout state
-                    # (the underlying task continues in background)
-                    return {
-                        "ok": False,
-                        "refreshed": False,
-                        "cached": False,
-                        "reason": "timeout",
-                        "detail": f"Coalesced refresh timeout ({self.timeout_seconds}s)",
-                        "checked_at": checked_at,
-                    }
-                except Exception as exc:
-                    # Coalesced task failed; return consistent failure state
-                    return {
-                        "ok": False,
-                        "refreshed": False,
-                        "cached": False,
-                        "reason": "failed",
-                        "detail": f"Coalesced refresh failed: {type(exc).__name__}",
+                        "reason": "throttled",
+                        "detail": f"Last refresh {age:.0f}s ago (min {self.min_interval_seconds}s)",
                         "checked_at": checked_at,
                     }
 
-            # 3. No concurrent refresh in progress; start one
-            if self.refresh_fn is None:
-                from hermes_cli.fleet.usage_refresh import refresh_usage_document
-                refresh_fn = refresh_usage_document
+            # Check if task already in progress
+            if self._refresh_in_progress is not None and not self._refresh_in_progress.done():
+                # Coalesce: reuse existing task
+                task_to_await = self._refresh_in_progress
             else:
-                refresh_fn = self.refresh_fn
+                # No in-flight task; create one
+                if self.refresh_fn is None:
+                    from hermes_cli.fleet.usage_refresh import refresh_usage_document
+                    refresh_fn = refresh_usage_document
+                else:
+                    refresh_fn = self.refresh_fn
 
-            # Spawn refresh task for this caller (and future coalesced callers)
-            async def _do_refresh():
-                try:
-                    # refresh_fn is a sync function; run it in thread
-                    result = await asyncio.to_thread(refresh_fn)
-                    # Result has .ok attribute (UsageRefreshReport) or is dict/MagicMock
-                    ok = (
-                        result.ok
-                        if hasattr(result, "ok")
-                        else result.get("ok", True)
-                        if isinstance(result, dict)
-                        else True
-                    )
-                    return {"ok": ok}
-                except Exception as exc:
-                    logger.exception("Usage refresh failed: %s", exc)
-                    return {"ok": False, "error": type(exc).__name__}
+                async def _do_refresh():
+                    try:
+                        result = await asyncio.to_thread(refresh_fn)
+                        ok = (
+                            result.ok
+                            if hasattr(result, "ok")
+                            else result.get("ok", True)
+                            if isinstance(result, dict)
+                            else True
+                        )
+                        return {"ok": ok}
+                    except Exception as exc:
+                        logger.exception("Usage refresh failed: %s", exc)
+                        return {"ok": False, "error": type(exc).__name__}
 
-            self._refresh_in_progress = asyncio.create_task(_do_refresh())
+                task_to_await = asyncio.create_task(_do_refresh())
+                self._refresh_in_progress = task_to_await
+        # === END CRITICAL SECTION (lock released) ===
 
-            # Await the task we just created with timeout
-            try:
-                refresh_result = await asyncio.wait_for(
-                    self._refresh_in_progress,
-                    timeout=self.timeout_seconds,
-                )
-                # Refresh completed successfully; mark time and return success
-                self._last_refresh_at = now
-                self._refresh_in_progress = None  # Clear for next refresh window
-                return {
-                    "ok": refresh_result.get("ok", False),
-                    "refreshed": True,
-                    "cached": False,
-                    "reason": "ok",
-                    "detail": "Refresh completed successfully",
-                    "checked_at": checked_at,
-                }
-            except asyncio.TimeoutError:
-                # Refresh timed out; mark time so throttle applies to next caller
-                # (even though this refresh didn't complete, we did attempt it).
-                # _refresh_in_progress stays set so coalesced callers can still wait.
-                self._last_refresh_at = now
-                logger.warning("Usage refresh timed out after %.1fs", self.timeout_seconds)
-                return {
-                    "ok": False,
-                    "refreshed": False,
-                    "cached": False,
-                    "reason": "timeout",
-                    "detail": f"Refresh timed out ({self.timeout_seconds}s)",
-                    "checked_at": checked_at,
-                }
-            except Exception as exc:
-                # Refresh failed; mark time and clear task so next attempt can try fresh
-                self._last_refresh_at = now
+        # Await OUTSIDE lock with shield so multiple callers coalesce on same task
+        # Shield prevents timeout from cancelling the underlying task
+        assert task_to_await is not None, "task_to_await must be set after lock"
+        try:
+            refresh_result = await asyncio.wait_for(
+                asyncio.shield(task_to_await),
+                timeout=self.timeout_seconds,
+            )
+            # Refresh completed successfully
+            self._last_refresh_at = now
+            # Clear task only if it's still our reference (race-safe)
+            if task_to_await is self._refresh_in_progress:
                 self._refresh_in_progress = None
-                logger.exception("Usage refresh failed: %s", exc)
-                return {
-                    "ok": False,
-                    "refreshed": False,
-                    "cached": False,
-                    "reason": "failed",
-                    "detail": f"Refresh failed: {type(exc).__name__}: {exc}",
-                    "checked_at": checked_at,
-                }
+            return {
+                "ok": refresh_result.get("ok", False),
+                "refreshed": True,
+                "cached": False,
+                "reason": "ok",
+                "detail": "Refresh completed successfully",
+                "checked_at": checked_at,
+            }
+        except asyncio.TimeoutError:
+            # Timeout: task continues in background (shielded), throttle applies next
+            self._last_refresh_at = now
+            return {
+                "ok": False,
+                "refreshed": False,
+                "cached": False,
+                "reason": "timeout",
+                "detail": f"Refresh timed out ({self.timeout_seconds}s)",
+                "checked_at": checked_at,
+            }
+        except Exception as exc:
+            # Refresh failed
+            self._last_refresh_at = now
+            # Clear task on failure so next caller can retry
+            if task_to_await is self._refresh_in_progress:
+                self._refresh_in_progress = None
+            logger.exception("Usage refresh failed: %s", exc)
+            return {
+                "ok": False,
+                "refreshed": False,
+                "cached": False,
+                "reason": "failed",
+                "detail": f"Refresh failed: {type(exc).__name__}: {exc}",
+                "checked_at": checked_at,
+            }
 
 
 # Global singleton hook (per-process)
@@ -236,11 +211,7 @@ def get_global_usage_refresh_hook() -> UsageRefreshHook:
 
 
 async def refresh_usage_before_dispatch() -> dict[str, Any]:
-    """Call from kanban dispatcher before routing decisions.
-
-    Returns status dict; dispatch should continue regardless of outcome
-    since usage evidence is advisory (never a hard blocker for all lanes).
-    """
+    """Call from kanban dispatcher before routing decisions."""
     hook = get_global_usage_refresh_hook()
     status = await hook.refresh_if_needed()
 

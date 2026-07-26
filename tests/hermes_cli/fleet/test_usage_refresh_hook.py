@@ -277,9 +277,8 @@ class TestConcurrentTimeoutAdversarial(unittest.TestCase):
                 assert result["reason"] in ("timeout", "throttled"), f"Result {i}: {result['reason']}"
                 assert "checked_at" in result, f"Result {i}: missing checked_at"
 
-            # Refresh started exactly once (or possibly more if timing/scheduling varies,
-            # but importantly: no exceptions, no deadlocks)
-            assert call_started >= 1, f"Refresh never started: {call_started}"
+            # Refresh started exactly once (strict: proves no duplicates, no queuing)
+            assert call_started == 1, f"Expected exactly 1 refresh, got {call_started}"
 
         asyncio.run(run())
 
