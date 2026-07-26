@@ -242,6 +242,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
     "tool.trace_upload": ("huggingface-hub==1.2.3",),
+    # Semantic session search — sqlite-vec powers the vector half of hybrid
+    # BM25 + cosine retrieval (config: session_search.semantic). Matches the
+    # ``semantic-search`` extra in pyproject.toml; keep the pin in sync there.
+    "tool.session_semantic": ("sqlite-vec==0.1.9",),
 }
 
 

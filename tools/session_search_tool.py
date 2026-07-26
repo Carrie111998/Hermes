@@ -656,25 +656,56 @@ def _discover(
     current_session_id: str = None,
     link_profile: str = None,
 ) -> str:
-    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+    """Discovery shape: FTS5 + hybrid (BM25 + vector) + anchored window + bookends per hit.
+
+    When ``session_search.semantic`` is enabled and the vector extension is
+    available, this first tries hybrid BM25 + vector retrieval via
+    :func:`~tools.session_semantic.hybrid_search`. If hybrid is unavailable
+    (disabled, missing sqlite-vec, no provider), it falls back to the existing
+    FTS5-only path, preserving current behavior exactly.
+    """
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
 
+    # Hybrid (BM25 + vector) search — returns None when unavailable, in which
+    # case the FTS5-only fallback runs below.
+    raw_results = None
+    search_mode = "fts"
     try:
-        raw_results = db.search_messages(
+        from tools.session_semantic import hybrid_search
+        hybrid_results = hybrid_search(
+            db,
             query=query,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
-            # distinct sessions AND so interactive matches buried under a wall
-            # of cron rows are still in hand for the demotion pass below.
-            offset=0,
+            limit=_DISCOVER_SCAN_LIMIT,
             sort=sort,
         )
+        if hybrid_results is not None:
+            raw_results = hybrid_results
+            search_mode = "hybrid"
     except Exception as e:
-        logging.error("FTS5 search failed: %s", e, exc_info=True)
-        return tool_error(f"Search failed: {e}", success=False)
+        logging.warning(
+            "Hybrid search failed; falling back to FTS5: %s", e, exc_info=True
+        )
+        raw_results = None
+
+    if raw_results is None:
+        try:
+            raw_results = db.search_messages(
+                query=query,
+                role_filter=role_list,
+                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
+                # distinct sessions AND so interactive matches buried under a wall
+                # of cron rows are still in hand for the demotion pass below.
+                offset=0,
+                sort=sort,
+            )
+        except Exception as e:
+            logging.error("FTS5 search failed: %s", e, exc_info=True)
+            return tool_error(f"Search failed: {e}", success=False)
 
     # Demote automation (cron) rows below interactive ones before dedup, so a
     # high-volume cron corpus can't starve the user's own sessions out of the
@@ -686,6 +717,7 @@ def _discover(
         _empty_payload = {
             "success": True,
             "mode": "discover",
+            "search_mode": search_mode,
             "query": query,
             "results": [],
             "count": 0,
@@ -787,6 +819,8 @@ def _discover(
         }
         if lineage_root and lineage_root != hit_sid:
             entry["parent_session_id"] = lineage_root
+        if match_info.get("match_type"):
+            entry["match_type"] = match_info["match_type"]
         results.append(entry)
 
     for entry in results:
@@ -795,6 +829,7 @@ def _discover(
     _final_payload = {
         "success": True,
         "mode": "discover",
+        "search_mode": search_mode,
         "query": query,
         "results": results,
         "count": len(results),

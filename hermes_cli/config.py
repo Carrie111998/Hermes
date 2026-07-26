@@ -1876,7 +1876,30 @@ DEFAULT_CONFIG = {
             # NOTE: no reasoning_effort here by design — see moa_reference above.
         },
     },
-    
+
+    # Session search — hybrid semantic retrieval (#44075). When ``semantic``
+    # is true, session_search discovery queries combine the existing FTS5
+    # BM25 ranking with embedding cosine similarity (sqlite-vec), merged by
+    # weighted reciprocal rank fusion. Requires an OpenAI-compatible
+    # /embeddings endpoint: either a named provider (``embedding_provider``,
+    # resolved through the auxiliary provider chain) or a direct
+    # ``embedding_base_url`` + ``embedding_api_key`` pair (e.g. a local
+    # fastembed/ollama server). When disabled, sqlite-vec is missing, or no
+    # provider resolves, search falls back to FTS5-only — current behavior.
+    # One-time backfill of existing history:
+    #   python scripts/backfill_session_embeddings.py
+    "session_search": {
+        "semantic": False,
+        "embedding_provider": "",   # "" = auto-detect via provider chain
+        "embedding_model": "text-embedding-3-small",
+        "embedding_base_url": "",   # direct OpenAI-compatible endpoint (takes precedence)
+        "embedding_api_key": "",    # API key for embedding_base_url
+        "hybrid_weight_vector": 0.7,  # weight of cosine-similarity ranking
+        "hybrid_weight_bm25": 0.3,    # weight of FTS5 BM25 ranking
+        "min_similarity": 0.25,     # drop vector hits below this cosine similarity
+        "index_batch_size": 96,     # new messages embedded per search call
+    },
+
     "display": {
         "compact": False,
         "personality": "",
