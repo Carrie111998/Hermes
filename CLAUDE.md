@@ -73,14 +73,18 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   faq.md decididos: L20 (atribución de Nous Portal a Nous Research) se dejó intacto;
   L844 (antes Discord de Nous) ahora apunta a `github.com/digital-services-llc/iyari`
   + `team@iyari.io`.
-- Lote 5 (este commit): `user-guide/` sueltos (15, sin configuration.md) + `secrets/`
+- Lote 5 `1c0ebbdf4`: `user-guide/` sueltos (15, sin configuration.md) + `secrets/`
   (3) = 18 archivos + ancla `env-vars.md#how-iyari-runs-shell-commands-on-windows`.
   Preservados nuevos identificadores funcionales: header HTTP `X-Hermes-Session-Token`,
   flag instalador `-HermesHome`, tarea schtasks `HermesGateway` (heredados del código).
   `secrets/index.md`: Discord de Nous → repo propio (precedente faq:844). desktop.md:
   "Nous Research" (botón/enlace OAuth) → Digital Services LLC por coherencia con
   web-dashboard.md ya commiteado.
-- Sub-lotes user-guide/ restantes: 6=`messaging/` (33), 7=`configuration.md` (~2131 líneas),
+- Lote 6 (este commit): `messaging/` (32 .md). Sin anclas que reapuntar (headings
+  Hermes no referenciados). Preservado header `X-Hermes-Session-Id` (matrix.md).
+  Cosmético `signal-cli link -n "HermesAgent"` → `"IYARI"`. Advisory GHSA en
+  telegram.md repunta al repo fork (tradeoff conocido de la regla de repo).
+- Sub-lotes user-guide/ restantes: 7=`configuration.md` (~2131 líneas),
   8=`skills/bundled/`+google-workspace (74, dividir en 2), 9-10=`skills/optional/` (101, dividir).
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
