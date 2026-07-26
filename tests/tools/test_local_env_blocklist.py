@@ -469,6 +469,23 @@ class TestSanePathIncludesHomebrew:
     """Verify _SANE_PATH includes macOS Homebrew directories."""
 
     @pytest.fixture(autouse=True)
+    def _posix_path_semantics(self, monkeypatch):
+        """Describe the POSIX PATH branch regardless of the host OS.
+
+        ``_IS_WINDOWS`` is decided at import, so on a Windows host these cases
+        would exercise the Windows branch and never see the homebrew merge
+        they assert. The two Windows-specific cases below re-pin it to True
+        themselves, so they still get the branch they want.
+
+        ``_git_bash_bin_dirs_cache`` is a process-global; on Windows an earlier
+        call may have filled it with real Git-Bash dirs that would then be
+        prepended here. Reset it so the asserted PATH layout is deterministic.
+        """
+        from tools.environments import local as local_mod
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        monkeypatch.setattr(local_mod, "_git_bash_bin_dirs_cache", [])
+
+    @pytest.fixture(autouse=True)
     def _disable_hermes_bin_injection(self):
         """These tests assert the sane-path merge in isolation. Disable the
         hermes-install-dir prepend (a separate concern, covered by
@@ -586,6 +603,11 @@ class TestHermesBinDirOnPath:
     def _reset_cache(self):
         from tools.environments import local as local_mod
         local_mod._HERMES_BIN_DIR = local_mod._SENTINEL
+        # Process-global: on Windows an earlier call fills this with real
+        # Git-Bash dirs, which _prepend_git_bash_dirs would then push to the
+        # front of the PATH these cases assert on. The cache is consulted
+        # before the _IS_WINDOWS check, so pinning that flag is not enough.
+        local_mod._git_bash_bin_dirs_cache = []
 
     def test_resolves_via_which(self, monkeypatch):
         from tools.environments import local as local_mod
@@ -619,7 +641,9 @@ class TestHermesBinDirOnPath:
         from tools.environments import local as local_mod
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
-        out = local_mod._prepend_hermes_bin_dir("/usr/bin:/bin")
+        # Join with os.pathsep to match how the result is split below; a
+        # hardcoded ":" only lines up with the split on POSIX.
+        out = local_mod._prepend_hermes_bin_dir(os.pathsep.join(["/usr/bin", "/bin"]))
         assert out.split(os.pathsep)[0] == "/opt/hermes/bin"
         assert "/usr/bin" in out.split(os.pathsep)
 
@@ -645,7 +669,8 @@ class TestHermesBinDirOnPath:
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
-        with patch.dict(os.environ, {**PLATFORM_ENV, "PATH": "/usr/bin:/bin"}, clear=True):
+        seed = {**PLATFORM_ENV, "PATH": os.pathsep.join(["/usr/bin", "/bin"])}
+        with patch.dict(os.environ, seed, clear=True):
             result = _make_run_env({})
         entries = result["PATH"].split(os.pathsep)
         assert entries[0] == "/opt/hermes/bin"

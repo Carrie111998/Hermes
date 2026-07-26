@@ -17,6 +17,21 @@ from tools.tirith_security import check_command_security, ensure_installed
 
 
 @pytest.fixture(autouse=True)
+def _assume_supported_platform():
+    """Exercise the POSIX logic regardless of the host OS.
+
+    tirith ships no Windows build, so ``_detect_target()`` returns None there
+    and every behavioural assertion in this file collapses to
+    "unsupported_platform" instead of testing anything. Present a supported
+    target; the tests that specifically cover the unsupported path patch
+    ``is_platform_supported`` / ``_detect_target`` themselves and still win.
+    """
+    with patch.object(_tirith_mod.platform, "system", return_value="Linux"), \
+         patch.object(_tirith_mod.platform, "machine", return_value="x86_64"):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_resolved_path():
     """Pre-set cached path to skip auto-install in scan tests.
     Tests that specifically test ensure_installed / resolve behavior
@@ -1176,7 +1191,12 @@ class TestHermesHomeIsolation:
         from tools.tirith_security import _failure_marker_path
         with patch.dict(os.environ, {"HERMES_HOME": "/custom/hermes"}):
             result = _failure_marker_path()
-        assert result == "/custom/hermes/.tirith-install-failed"
+        # get_hermes_home() normalises the path, so on Windows the separators
+        # come back as backslashes. Compare normalised forms rather than a
+        # hardcoded POSIX literal.
+        assert os.path.normpath(result) == os.path.normpath(
+            "/custom/hermes/.tirith-install-failed"
+        )
 
     def test_conftest_isolation_prevents_real_home_writes(self):
         """The conftest autouse fixture sets HERMES_HOME; verify it's active."""
@@ -1185,14 +1205,20 @@ class TestHermesHomeIsolation:
         assert "hermes_test" in hermes_home, "Should point to test temp dir"
 
     def test_get_hermes_home_fallback(self):
-        """Without HERMES_HOME set, falls back to the active OS home."""
+        """Without HERMES_HOME set, falls back to the platform's default home.
+
+        The default is ``~/.hermes`` on POSIX but not on Windows, so derive it
+        from the shared resolver rather than hardcoding the POSIX layout —
+        that is also the property worth asserting: tirith must not invent its
+        own home path.
+        """
+        from hermes_cli.profiles import _get_default_hermes_home
         from tools.tirith_security import _get_hermes_home
         with patch.dict(os.environ, PLATFORM_ENV, clear=True):
-            # Remove HERMES_HOME entirely. With HOME also absent, expanduser
-            # falls back to the account database; compute expected under the
-            # same environment instead of after patch.dict restores HOME.
+            # Remove HERMES_HOME entirely and compute the expectation under
+            # the same environment, before patch.dict restores it.
             os.environ.pop("HERMES_HOME", None)
-            expected = os.path.join(os.path.expanduser("~"), ".hermes")
+            expected = str(_get_default_hermes_home())
             result = _get_hermes_home()
         assert result == expected
 

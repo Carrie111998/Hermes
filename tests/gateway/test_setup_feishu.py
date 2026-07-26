@@ -248,7 +248,7 @@ class TestSetupFeishuAdapterIntegration:
         """QR setup → adapter initializes with websocket mode."""
         env = self._make_env_from_setup()
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, **env}, clear=True):
             from gateway.config import PlatformConfig
             from plugins.platforms.feishu.adapter import FeishuAdapter
             adapter = FeishuAdapter(PlatformConfig())
@@ -262,7 +262,7 @@ class TestSetupFeishuAdapterIntegration:
         """Setup with 'allow all DMs' → adapter sees allow-all flag."""
         env = self._make_env_from_setup(dm_idx=1)
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, **env}, clear=True):
             from plugins.platforms.feishu.adapter import FeishuAdapter
             from gateway.config import PlatformConfig
             # Verify adapter initializes without error and env var is correct.
@@ -274,7 +274,7 @@ class TestSetupFeishuAdapterIntegration:
         """Setup with 'open groups' → adapter group_policy is 'open'."""
         env = self._make_env_from_setup(group_idx=0)
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, **env}, clear=True):
             from gateway.config import PlatformConfig
             from plugins.platforms.feishu.adapter import FeishuAdapter
             adapter = FeishuAdapter(PlatformConfig())
