@@ -104,6 +104,22 @@ platforms:
 
 Telegram allows up to 100 BotCommands, but large command payloads can fail. Hermes defaults to 60 for reliability and clamps configured values to `1..100`; use `/commands` for the full command list.
 
+### Cold-boot update catchup (Optional)
+
+By default, when the gateway starts fresh (not a watcher-recovered reconnect), Hermes preserves any Telegram updates that queued while it was offline — bounded by Telegram's own ~24h retention window. This matters most on a laptop or desktop: the machine being shut down or asleep is a cold boot from the gateway's point of view, so without this a reboot silently discarded any command sent while the machine was off.
+
+To opt back into the old behavior — dropping the queue on every fresh start — set:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        catchup_on_startup: false
+```
+
+The gateway logs which choice it made on every cold boot (`Cold boot: preserving...` / `Cold boot: dropping...`), so you can confirm the setting took effect.
+
 ## Step 3: Privacy Mode (Critical for Groups)
 
 Telegram bots have a **privacy mode** that is **enabled by default**. This is the single most common source of confusion when using bots in groups.

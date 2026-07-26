@@ -645,9 +645,32 @@ def _build_polling_app(monkeypatch, adapter):
 
 
 @pytest.mark.asyncio
-async def test_cold_connect_drops_pending_updates(monkeypatch):
-    """A cold first boot (is_reconnect=False) drops the stale Bot API queue."""
+async def test_cold_connect_preserves_pending_updates_by_default(monkeypatch):
+    """Regression (issue #71811): a cold first boot (is_reconnect=False) now
+    preserves the queue by default, the same as a reconnect -- Telegram's
+    own ~24h retention bounds the replay. Every real-machine reboot runs
+    this cold-boot path, so dropping by default silently discarded commands
+    sent while the machine was off/asleep."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    captured = _build_polling_app(monkeypatch, adapter)
+
+    ok = await adapter.connect()  # default is_reconnect=False
+
+    assert ok is True
+    assert captured["drop_pending_updates"] is False
+    await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
+async def test_cold_connect_drops_pending_updates_when_catchup_disabled(monkeypatch):
+    """platforms.telegram.catchup_on_startup: false opts back into the old
+    drop-on-cold-boot behavior, for operators who explicitly want it."""
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={"catchup_on_startup": False},
+        )
+    )
     captured = _build_polling_app(monkeypatch, adapter)
 
     ok = await adapter.connect()  # default is_reconnect=False
@@ -658,9 +681,29 @@ async def test_cold_connect_drops_pending_updates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cold_connect_catchup_disabled_string_form(monkeypatch):
+    """YAML-string 'false' must also disable catchup (config values coming
+    from config.yaml are often strings, not native bools)."""
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={"catchup_on_startup": "false"},
+        )
+    )
+    captured = _build_polling_app(monkeypatch, adapter)
+
+    ok = await adapter.connect()
+
+    assert ok is True
+    assert captured["drop_pending_updates"] is True
+    await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
 async def test_reconnect_preserves_pending_updates(monkeypatch):
     """A watcher reconnect (is_reconnect=True) preserves the queue Telegram
-    accumulated during the outage — the core of #46621."""
+    accumulated during the outage — the core of #46621. Unaffected by
+    catchup_on_startup, which only governs the cold-boot path."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     captured = _build_polling_app(monkeypatch, adapter)
 
@@ -668,6 +711,47 @@ async def test_reconnect_preserves_pending_updates(monkeypatch):
 
     assert ok is True
     assert captured["drop_pending_updates"] is False
+    await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_ignores_catchup_on_startup_false(monkeypatch):
+    """catchup_on_startup: false must only affect the cold-boot path --
+    a reconnect must still preserve the queue regardless (#46621's
+    guarantee must not regress for operators who opt out of cold-boot
+    catchup)."""
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={"catchup_on_startup": False},
+        )
+    )
+    captured = _build_polling_app(monkeypatch, adapter)
+
+    ok = await adapter.connect(is_reconnect=True)
+
+    assert ok is True
+    assert captured["drop_pending_updates"] is False
+    await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
+async def test_cold_connect_logs_the_catchup_decision(monkeypatch, caplog):
+    """Regression (#71811): 'nothing is logged when the queue is dropped'
+    was part of the reported bug -- the decision must now be visible in
+    logs either way, so an operator debugging a missing command can see
+    what happened."""
+    import logging
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    _build_polling_app(monkeypatch, adapter)
+
+    with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+        await adapter.connect()
+
+    assert any(
+        "preserving" in r.message.lower() and "pending-update" in r.message.lower()
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
     await _cancel_heartbeat(adapter)
 
 

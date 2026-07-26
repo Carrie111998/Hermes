@@ -698,6 +698,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
+        # platforms.telegram.catchup_on_startup (default True): whether a
+        # COLD boot (is_reconnect=False) preserves Telegram's server-side
+        # pending-update queue instead of dropping it. Telegram retains
+        # undelivered updates for ~24h regardless, so this only controls
+        # whether Hermes asks for them back after a fresh process start --
+        # the dominant real-world cold-boot case on a laptop/desktop is the
+        # machine having been off/asleep, which is exactly the outage #46621
+        # already preserves the queue for on the *reconnect* path. Without
+        # this, every reboot silently discarded commands sent while the
+        # machine was off, with no log line (issue #71811).
+        self._catchup_on_startup: bool = self._coerce_bool_extra(
+            "catchup_on_startup", True
+        )
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -3889,6 +3902,25 @@ class TelegramAdapter(BasePlatformAdapter):
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 
+            # Reconnect (watcher-recovered outage) always preserves the
+            # queue (#46621). Cold boot (fresh process) preserves it too
+            # unless the operator opted out via catchup_on_startup: false --
+            # see the field comment on self._catchup_on_startup above.
+            drop_pending = (not is_reconnect) and not self._catchup_on_startup
+            if not is_reconnect:
+                if drop_pending:
+                    logger.info(
+                        "[%s] Cold boot: dropping any Telegram updates queued "
+                        "while offline (platforms.telegram.catchup_on_startup: false)",
+                        self.name,
+                    )
+                else:
+                    logger.info(
+                        "[%s] Cold boot: preserving Telegram's pending-update "
+                        "queue (delivered within its ~24h retention window)",
+                        self.name,
+                    )
+
             if webhook_url:
                 # ── Webhook mode ─────────────────────────────────────
                 # Telegram pushes updates to our HTTP endpoint.  This
@@ -3928,9 +3960,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     allowed_updates=Update.ALL_TYPES,
                     # Webhooks are push-based — Telegram does not hold a
                     # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    # in practice. Mirror the polling path's cold-boot/
+                    # reconnect/catchup_on_startup semantics for consistency.
+                    drop_pending_updates=drop_pending,
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -3981,10 +4013,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_error_callback_ref = _polling_error_callback
 
                 polling_started = await self._start_polling_resilient(
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    # Preserve the pending-update queue on both cold boot
+                    # and watcher reconnect by default (#46621, #71811) --
+                    # Telegram's own ~24h retention bounds the replay.
+                    # Opt out via platforms.telegram.catchup_on_startup: false.
+                    drop_pending_updates=drop_pending,
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )
