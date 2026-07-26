@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import weakref
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -773,21 +775,26 @@ def _on_session_end_enforcement(
 # Hook registration (called by plugin __init__.py)
 # ---------------------------------------------------------------------------
 
-_registered: bool = False
+_registered: bool = False  # Backward-compatible observability flag only.
+_registered_managers: "weakref.WeakSet[Any]" = weakref.WeakSet()
 _registration_lock = threading.Lock()
 
 
 def register_enforcement_hooks(ctx: Any) -> None:
     """Register enforcement hooks through the supported PluginContext path.
 
-    Called from ``plugins/kanban-enforcement/__init__.py``'s ``register()``
-    function.  Idempotent — safe to call multiple times.
+    Registration is idempotent per PluginContext. A newly discovered
+    PluginManager receives a new context and must register its own callbacks;
+    a process-global boolean would incorrectly skip registration after plugin
+    rediscovery or manager replacement.
     """
     global _registered
-    if _registered:
-        return
+    manager = getattr(ctx, "_manager", None)
+    if manager is None:
+        raise ValueError("PluginContext is missing its manager")
     with _registration_lock:
-        if _registered:
+        if manager in _registered_managers:
+            _registered = True
             return
         try:
             ctx.register_hook("pre_tool_call", _pre_tool_call_enforcement)
@@ -795,6 +802,7 @@ def register_enforcement_hooks(ctx: Any) -> None:
             ctx.register_hook("post_llm_call", _post_llm_call_enforcement)
             ctx.register_hook("on_session_start", _on_session_start_enforcement)
             ctx.register_hook("on_session_end", _on_session_end_enforcement)
+            _registered_managers.add(manager)
             _registered = True
             logger.info("dispatch enforcement hooks registered via plugin path")
         except Exception:
