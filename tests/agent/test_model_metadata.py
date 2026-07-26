@@ -20,6 +20,7 @@ from agent.model_metadata import (
     CONTEXT_PROBE_TIERS,
     DEFAULT_CONTEXT_LENGTHS,
     DEFAULT_FALLBACK_CONTEXT,
+    _extract_context_length,
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
@@ -174,6 +175,9 @@ class TestEstimateRequestTokensRough:
 # =========================================================================
 
 class TestDefaultContextLengths:
+    def test_extracts_openai_compatible_camelcase_context_window(self):
+        assert _extract_context_length({"contextWindow": 200_000}) == 200_000
+
     def test_k3_context_is_scoped_to_confirmed_coding_endpoint(self):
         """The bare ``k3`` slug's 1 Mi context must not leak to unverified endpoints.
 
