@@ -33,11 +33,19 @@ def _auth_env(name: str, default: str = "") -> str:
     if not name:
         return default
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import UnscopedSecretError, get_secret
+    except Exception:
+        return (os.getenv(name) or default).strip()
 
+    try:
         val = get_secret(name)
         if val is not None and str(val).strip():
             return str(val).strip()
+    except UnscopedSecretError:
+        # Multiplex mode intentionally rejects unscoped credential reads. Do
+        # not defeat that isolation boundary by falling through to another
+        # profile's process-global environment.
+        return default
     except Exception:
         pass
     return (os.getenv(name) or default).strip()
