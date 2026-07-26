@@ -650,6 +650,24 @@ Sessions with **active background processes** are never auto-reset, regardless o
 
 The SQLite database uses WAL mode for concurrent readers and a single writer, which suits the gateway's multi-platform architecture well.
 
+:::warning Sessions are per profile
+The paths above are relative to the **active profile's** `HERMES_HOME`, not to a single
+shared database. `~/.hermes/state.db` holds the default profile's sessions; a session
+started under profile `work` lives in `~/.hermes/profiles/work/state.db` and is invisible
+from any other profile. `hermes sessions list`, `/sessions`, `session_search`, and the
+dashboard all read the active profile's database only.
+
+So if a session has vanished, check the other profiles before concluding it was lost:
+
+```bash
+hermes profile list
+hermes --profile work sessions list
+```
+
+Profile-scoped storage is also why `hermes profile create --clone-all` excludes
+`state.db` — history belongs to the source profile. See [Profiles](/user-guide/profiles).
+:::
+
 :::warning `sessions.json` is not the session list
 `~/.hermes/sessions/sessions.json` is the **gateway routing index** — it maps
 messaging session keys (`agent:main:<platform>:...`) to active session IDs.
