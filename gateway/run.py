@@ -534,6 +534,32 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+# Issue #72131: track provider-error status text sent via the plain-send fallback
+# so that _sanitize_gateway_final_response can dedup identical final responses.
+_last_sent_provider_error_status: Optional[str] = None
+# Set to True when _sanitize_gateway_final_response suppresses output due to dedup.
+_deduped_provider_error: bool = False
+
+
+def _record_provider_error_status(text: str) -> None:
+    """Record a provider-error status that was sent as a persistent message.
+
+    Called when _send_or_update_status_coro falls back to plain send() (adapter
+    lacks send_or_update_status) and the content is a provider-error reply.
+    """
+    global _last_sent_provider_error_status, _deduped_provider_error
+    _last_sent_provider_error_status = text
+    _deduped_provider_error = False  # reset; only meaningful after sanitize
+
+
+def _should_dedup_final_response(text: str) -> bool:
+    """Return True if text duplicates a provider-error status already sent."""
+    return bool(
+        _last_sent_provider_error_status
+        and text == _last_sent_provider_error_status
+    )
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -556,7 +582,17 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
+        result = _gateway_provider_error_reply(redacted)
+        # Issue #72131: if this identical provider-error text was already
+        # delivered as a mid-run status (via the plain-send fallback),
+        # suppress the duplicate final response.
+        global _deduped_provider_error
+        if _should_dedup_final_response(result):
+            _deduped_provider_error = True
+            return ""
+        _deduped_provider_error = False
+        return result
+    _deduped_provider_error = False
     return redacted
 
 
@@ -611,10 +647,18 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     Issue #30045: adapters that implement send_or_update_status (currently
     Telegram) edit the previous bubble for the same status_key instead of
     appending a new one. Adapters without the method fall back to plain send.
+
+    Issue #72131: when the fallback plain-send path is used and the content
+    is a provider-error reply, record it so the final-response dedup can
+    suppress the identical persistent message that would otherwise follow.
     """
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
+    # Fallback: plain send() → status becomes a persistent message.
+    # If it's a provider-error reply, record it for final-response dedup.
+    if _looks_like_gateway_provider_error(content):
+        _record_provider_error_status(content)
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
@@ -22391,7 +22435,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result, final_response or "", history_len=len(agent_history),
                 )
                 final_response = _sanitize_gateway_final_response(source.platform, final_response)
-                if not final_response:
+                # Issue #72131: if dedup suppressed a provider-error final
+                # response (already delivered as status), do NOT fall back to
+                # the raw error text — the user already has the sanitized reply.
+                if not final_response and not _deduped_provider_error:
                     final_response = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
                     "final_response": final_response,
