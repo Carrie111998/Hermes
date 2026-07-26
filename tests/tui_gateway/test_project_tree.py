@@ -193,8 +193,28 @@ def test_non_git_cwd_preserves_legacy_workspace_grouping():
     assert project["isAuto"] is True
     assert project["label"] == "notes"
     assert project["sessionCount"] == 1
-    assert _lane_ids(project) == ["/work/notes"]
+    # A non-git folder's main lane uses the canonical ``<root>::branch::main``
+    # lane id (not the raw path) so the desktop live overlay matches it instead
+    # of injecting a duplicate synthetic "main" lane.
+    assert _lane_ids(project) == ["/work/notes::branch::main"]
+    lane = project["repos"][0]["groups"][0]
+    assert lane["label"] == "main"
+    assert lane["isMain"] is True
     assert tree["scoped_session_ids"] == [legacy["id"]]
+
+
+def test_non_git_folder_main_lane_matches_frontend_overlay_convention():
+    # Regression for the desktop duplicate-branch-lane bug: the backend heuristic
+    # lane for a plain folder must equal what the frontend live overlay computes
+    # (``branchLaneId(repoRoot, 'main')``); otherwise the overlay can't match it
+    # and pushes a second "main" lane holding the same sessions.
+    path = "/work/scratch"
+    legacy = _session(path)
+
+    tree = pt.build_tree([], [legacy], [], resolve=lambda _cwd: None, hydrate=True)
+    project = tree["projects"][0]
+
+    assert _lane_ids(project) == [pt._branch_lane_id(path, "main")]
 
 
 def test_non_git_windows_cwd_preserves_legacy_workspace_grouping():

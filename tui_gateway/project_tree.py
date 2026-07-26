@@ -212,7 +212,14 @@ def _place_by_heuristic(path: str) -> Optional[dict]:
         repo_path = _with_base_name(path, m.group(1))
         return _placement(repo_path, path, m.group(2), path, False, False)
 
-    return _placement(path, path, base, path, True, False)
+    # A plain (non-git) folder is still a "main" lane. Use the canonical
+    # ``<root>::branch::main`` lane id and ``main`` label so the desktop live
+    # overlay (``overlayRepoLanes`` -> ``branchLaneId(repoRoot, 'main')``)
+    # matches this lane instead of injecting a second synthetic ``main`` lane
+    # for the same sessions.
+    return _placement(
+        path, _branch_lane_id(path, DEFAULT_BRANCH_LABEL), DEFAULT_BRANCH_LABEL, path, True, False
+    )
 
 
 def _place(cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: str) -> Optional[dict]:

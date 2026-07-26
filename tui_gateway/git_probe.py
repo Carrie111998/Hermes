@@ -162,11 +162,21 @@ def resolve(cwd: str) -> dict | None:
     Returns ``{"repo_root": <common root>, "worktree_root": <this checkout>}``
     or ``None`` when ``cwd`` is not in a git repo. ``build_tree`` treats
     ``worktree_root == repo_root`` as the main checkout.
+
+    Both roots are ``os.path.normpath``-normalized so the main-checkout test
+    holds on Windows: ``repo_root`` comes from ``git rev-parse --show-toplevel``
+    (forward slashes, e.g. ``C:/Users/x/repo``) while ``common_repo_root`` runs
+    the result through ``os.path.realpath`` (backslashes, ``C:\\Users\\x\\repo``).
+    Without normalization the two never compare equal there, so a repo's own
+    main checkout is misclassified as a linked worktree and gets a path-keyed
+    lane instead of the canonical ``<root>::branch::main`` lane.
     """
     worktree_root = repo_root(cwd)
     if not worktree_root:
         return None
-    return {"repo_root": common_repo_root(cwd) or worktree_root, "worktree_root": worktree_root}
+    worktree_root = os.path.normpath(worktree_root)
+    repo = os.path.normpath(common_repo_root(cwd) or worktree_root)
+    return {"repo_root": repo, "worktree_root": worktree_root}
 
 
 def warm_roots(cwds: Iterable[str], max_workers: int = _WARM_WORKERS) -> None:
