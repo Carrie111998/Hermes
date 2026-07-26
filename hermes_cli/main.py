@@ -3626,13 +3626,16 @@ def _aux_config_menu() -> None:
 def _aux_select_for_task(task: str) -> None:
     """Pick a provider + model for a single auxiliary task and persist it.
 
-    Uses ``list_authenticated_providers()`` to only show providers the user
-    has already configured. This avoids re-running OAuth/credential flows
-    inside the aux picker — users set up new providers through the normal
-    ``hermes model`` flow, then route aux tasks to them here.
+    Provider rows come from ``build_aux_picker_rows()`` — the shared aux-picker
+    substrate — so this surface shows exactly what every other aux picker
+    shows: authenticated built-ins, the user's own ``providers:`` /
+    ``custom_providers:`` endpoints, and providers whose credential pool is
+    temporarily exhausted. Only already-configured providers appear; users set
+    up new ones through the normal ``hermes model`` flow, then route aux tasks
+    to them here.
     """
     from hermes_cli.config import load_config
-    from hermes_cli.model_switch import list_authenticated_providers
+    from hermes_cli.inventory import build_aux_picker_rows, format_aux_picker_entries
 
     cfg = load_config()
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
@@ -3645,7 +3648,7 @@ def _aux_select_for_task(task: str) -> None:
 
     # Gather authenticated providers (has credentials + curated model list)
     try:
-        providers = list_authenticated_providers(
+        providers = build_aux_picker_rows(
             current_provider=current_provider,
             current_model=current_model,
             current_base_url=current_base_url,
@@ -3661,16 +3664,13 @@ def _aux_select_for_task(task: str) -> None:
     )
     entries.append(("__auto__", f"auto (recommended){auto_marker}", []))
 
-    for p in providers:
-        slug = p.get("slug", "")
-        name = p.get("name") or slug
-        total = p.get("total_models", 0)
-        models = p.get("models") or []
-        model_hint = f" — {total} models" if total else ""
-        marker = (
-            "  ← current" if slug == current_provider and not current_base_url else ""
+    entries.extend(
+        format_aux_picker_entries(
+            providers,
+            current_provider=current_provider,
+            current_base_url=current_base_url,
         )
-        entries.append((slug, f"{name}{model_hint}{marker}", list(models)))
+    )
 
     # Custom endpoint (raw base_url)
     custom_marker = "  ← current" if current_base_url else ""
@@ -5556,26 +5556,15 @@ _PE_MACHINE_NAMES = {
     _PE_MACHINE_ARM64: "ARM64",
 }
 
-# SYSTEM_INFO.wProcessorArchitecture values (winnt.h). Used by
-# GetNativeSystemInfo as a second OS-native probe when IsWow64Process2 is
-# unavailable or fails under a mistyped ctypes HANDLE.
-_PROCESSOR_ARCHITECTURE_INTEL = 0
-_PROCESSOR_ARCHITECTURE_ARM = 5
-_PROCESSOR_ARCHITECTURE_AMD64 = 9
-_PROCESSOR_ARCHITECTURE_ARM64 = 12
-
 _PE_MACHINE_TO_NAME = {
     _PE_MACHINE_ARM64: "ARM64",
     _PE_MACHINE_AMD64: "AMD64",
     _PE_MACHINE_I386: "X86",
 }
 
-_SYSTEM_INFO_ARCH_TO_NAME = {
-    _PROCESSOR_ARCHITECTURE_ARM64: "ARM64",
-    _PROCESSOR_ARCHITECTURE_AMD64: "AMD64",
-    _PROCESSOR_ARCHITECTURE_INTEL: "X86",
-    _PROCESSOR_ARCHITECTURE_ARM: "ARM",
-}
+# MACHINE_ATTRIBUTES bits (processthreadsapi.h). UserEnabled means the host
+# can run user-mode code of that machine type — natively or under emulation.
+_MACHINE_ATTRIBUTE_USER_ENABLED = 0x00000001
 
 
 def _windows_native_machine_from_iswow64() -> Optional[str]:
@@ -5615,39 +5604,37 @@ def _windows_native_machine_from_iswow64() -> Optional[str]:
     return _PE_MACHINE_TO_NAME.get(native_machine.value)
 
 
-def _windows_native_machine_from_native_system_info() -> Optional[str]:
-    """GetNativeSystemInfo — truthful under x64-on-ARM64 when IsWow64 fails.
+def _windows_user_runnable_pe_machines() -> Optional[set]:
+    """PE machines this host can run in user mode, via GetMachineTypeAttributes.
 
-    Unlike ``PROCESSOR_ARCHITECTURE`` (process/emulation view) this reports
-    the OS-native architecture, so it covers the residual #71218 failure mode
-    where ``IsWow64Process2`` returns FALSE and the env-var fallback would
-    otherwise lie as AMD64.
+    This asks the question the integrity gate actually cares about — "can this
+    Windows host load a PE of machine X?" — instead of inferring it from a
+    host-architecture name. It is also the only documented API that reports
+    AMD64-on-ARM64 emulation support; ``IsWow64GuestMachineSupported`` only
+    answers for 32-bit guests.
+
+    Returns None when the API is unavailable (pre-Windows-11 build 22000) or
+    reports nothing runnable, so callers fall back to name-based detection.
     """
     import ctypes
     from ctypes import wintypes
 
-    class _SYSTEM_INFO(ctypes.Structure):
-        _fields_ = [
-            ("wProcessorArchitecture", wintypes.WORD),
-            ("wReserved", wintypes.WORD),
-            ("dwPageSize", wintypes.DWORD),
-            ("lpMinimumApplicationAddress", ctypes.c_void_p),
-            ("lpMaximumApplicationAddress", ctypes.c_void_p),
-            ("dwActiveProcessorMask", ctypes.c_size_t),
-            ("dwNumberOfProcessors", wintypes.DWORD),
-            ("dwProcessorType", wintypes.DWORD),
-            ("dwAllocationGranularity", wintypes.DWORD),
-            ("wProcessorLevel", wintypes.WORD),
-            ("wProcessorRevision", wintypes.WORD),
-        ]
-
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetNativeSystemInfo.argtypes = [ctypes.POINTER(_SYSTEM_INFO)]
-    kernel32.GetNativeSystemInfo.restype = None
+    kernel32.GetMachineTypeAttributes.argtypes = [
+        wintypes.USHORT,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    kernel32.GetMachineTypeAttributes.restype = ctypes.c_long
 
-    info = _SYSTEM_INFO()
-    kernel32.GetNativeSystemInfo(ctypes.byref(info))
-    return _SYSTEM_INFO_ARCH_TO_NAME.get(info.wProcessorArchitecture)
+    runnable = set()
+    for machine in (_PE_MACHINE_ARM64, _PE_MACHINE_AMD64, _PE_MACHINE_I386):
+        attributes = ctypes.c_int(0)
+        # HRESULT: zero is success, any nonzero value is a failure.
+        if kernel32.GetMachineTypeAttributes(machine, ctypes.byref(attributes)):
+            continue
+        if attributes.value & _MACHINE_ATTRIBUTE_USER_ENABLED:
+            runnable.add(machine)
+    return runnable or None
 
 
 def _windows_native_machine() -> str:
@@ -5661,26 +5648,26 @@ def _windows_native_machine() -> str:
     (#69179 follow-up report). Probe order:
 
     1. ``IsWow64Process2`` with a correctly-typed current-process HANDLE
-       (#71218 + HANDLE-truncation fix).
-    2. ``GetNativeSystemInfo`` — still OS-native when (1) fails under
-       x64-on-ARM64 emulation (env vars alone cannot cover that case).
-    3. ``PROCESSOR_ARCHITEW6432`` / ``PROCESSOR_ARCHITECTURE`` — WOW64
-       (32-bit) hosts and pre-1511 Windows 10 without the newer APIs.
-    4. ``platform.machine()``.
+       (#71218 + HANDLE-truncation fix). This is the only API that tells the
+       truth from an x64 process emulated on ARM64.
+    2. ``PROCESSOR_ARCHITEW6432`` / ``PROCESSOR_ARCHITECTURE`` — WOW64
+       (32-bit) hosts and pre-1511 Windows 10 without the newer API.
+    3. ``platform.machine()``.
+
+    Note ``GetNativeSystemInfo`` is deliberately NOT used: Microsoft documents
+    that it "also returns emulated processor details when run from an app
+    under emulation", so on the very WoA hosts this function exists to serve
+    it reports AMD64 — no better than the env-var rung below it.
     """
     if sys.platform == "win32":
-        for probe in (
-            _windows_native_machine_from_iswow64,
-            _windows_native_machine_from_native_system_info,
-        ):
-            try:
-                name = probe()
-            except (OSError, AttributeError, TypeError, ValueError):
-                # API missing (pre-1511), DLL load failure in tests, or a
-                # mistyped ctypes binding — try the next probe.
-                name = None
-            if name:
-                return name
+        try:
+            name = _windows_native_machine_from_iswow64()
+        except (OSError, AttributeError, TypeError, ValueError):
+            # API missing (pre-1511), DLL load failure in tests, or a
+            # mistyped ctypes binding — fall through to the env vars.
+            name = None
+        if name:
+            return name
         env_arch = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get(
             "PROCESSOR_ARCHITECTURE"
         )
@@ -5694,12 +5681,23 @@ def _windows_native_machine() -> str:
 def _expected_windows_pe_machines() -> set:
     """PE machine values the current Windows host can natively load.
 
-    AMD64 hosts run x64 and (via WOW64) x86. ARM64 hosts run ARM64 and
-    (Windows 11 emulation) x64. 32-bit x86 hosts run only x86. Unknown
-    machines return the permissive full set so the integrity gate can never
-    brick launch on exotic hosts. Host detection uses the OS-native machine
-    (see ``_windows_native_machine``), not the process architecture.
+    Preferred source is ``GetMachineTypeAttributes``, which answers this
+    question directly (including AMD64-on-ARM64 emulation) instead of
+    inferring it from an architecture name.
+
+    Fallback is name-based: AMD64 hosts run x64 and (via WOW64) x86. ARM64
+    hosts run ARM64 and (Windows 11 emulation) x64. 32-bit x86 hosts run only
+    x86. Unknown machines return the permissive full set so the integrity gate
+    can never brick launch on exotic hosts. Host detection uses the OS-native
+    machine (see ``_windows_native_machine``), not the process architecture.
     """
+    if sys.platform == "win32":
+        try:
+            runnable = _windows_user_runnable_pe_machines()
+        except (OSError, AttributeError, TypeError, ValueError):
+            runnable = None
+        if runnable:
+            return runnable
     machine = _windows_native_machine().upper()
     if machine in ("AMD64", "X86_64", "X64"):
         return {_PE_MACHINE_AMD64, _PE_MACHINE_I386}
@@ -16053,6 +16051,14 @@ def main():
         help="Rows committed per recovery batch (default: 1000)",
     )
     sessions_recover.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=(
+            "Best-effort salvage across damaged row ranges; the output remains "
+            "separate and every skipped range is recorded"
+        ),
+    )
+    sessions_recover.add_argument(
         "--report",
         type=Path,
         help="JSON report path (defaults to <output>.recovery.json)",
@@ -16065,6 +16071,29 @@ def main():
     )
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
+
+    sessions_retitle = sessions_subparsers.add_parser(
+        "retitle-skills",
+        help="Re-title sessions whose auto-title came from a /skill's own text",
+        description=(
+            "Sessions opened with a /skill were auto-titled from the expanded "
+            "message, which embeds the whole skill body — so the title "
+            "describes the SKILL, not the request. This regenerates those "
+            "titles from what the user actually typed. Lists what it would "
+            "change unless --apply is passed."
+        ),
+    )
+    sessions_retitle.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the new titles (default: dry run)",
+    )
+    sessions_retitle.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum sessions to examine (default: 200)",
+    )
 
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
@@ -16161,9 +16190,13 @@ def main():
             source = args.source
             output = getattr(args, "output", None)
             inspect_only = bool(getattr(args, "inspect_only", False))
+            allow_partial = bool(getattr(args, "allow_partial", False))
             report_path = getattr(args, "report", None)
             if inspect_only and output is not None:
                 print("Error: --output cannot be used with --inspect-only.")
+                return 2
+            if inspect_only and allow_partial:
+                print("Error: --allow-partial cannot be used with --inspect-only.")
                 return 2
             if not inspect_only and output is None:
                 print("Error: --output is required unless --inspect-only is used.")
@@ -16205,6 +16238,7 @@ def main():
                         work_dir=getattr(args, "work_dir", None),
                         chunk_size=getattr(args, "chunk_size", 1000),
                         progress_cb=_recovery_progress,
+                        allow_partial=allow_partial,
                     )
                     if last_progress["table"] is not None:
                         print()
@@ -16229,6 +16263,20 @@ def main():
                 print(f"✓ Recovered database verified at: {output}")
                 print("  The active session database was not changed.")
                 print("  Review the JSON report before installing this database.")
+                return 0
+            if allow_partial and report.get("verified"):
+                counts = report.get("verification", {}).get("table_counts", {})
+                print(f"✓ Partial recovery output verified at: {output}")
+                print(
+                    "  Recovered "
+                    f"{int(counts.get('sessions') or 0):,} sessions and "
+                    f"{int(counts.get('messages') or 0):,} messages."
+                )
+                print("  The active session database was not changed.")
+                print(
+                    "  This output is incomplete. Review every skipped range "
+                    "and orphan count in the JSON report before installing it."
+                )
                 return 0
             print("✗ Recovery output did not pass every verification check.")
             print("  Do not install it. Review the JSON report for partial data or errors.")
@@ -16926,6 +16974,67 @@ def main():
                     print(f"Session '{args.session_id}' not found.")
             except ValueError as e:
                 print(f"Error: {e}")
+
+        elif action == "retitle-skills":
+            from agent.skill_commands import describe_skill_invocation
+            from agent.title_generator import generate_title
+
+            limit = max(1, int(getattr(args, "limit", 200) or 200))
+            apply_changes = bool(getattr(args, "apply", False))
+
+            def _is_titlelike(candidate: str) -> bool:
+                """Reject a candidate that isn't a title at all.
+
+                An auxiliary model occasionally answers the prompt instead of
+                titling it and echoes the assistant's output ('$ df -h /'). The
+                live path has no alternative and takes what it gets, but this is
+                a REPAIR — replacing a serviceable title with command output
+                would make things worse, so keep the old one.
+                """
+                return bool(candidate) and candidate[0].isalnum()
+
+            candidates = db.list_skill_scaffolded_sessions(limit=limit)
+            if not candidates:
+                print("No sessions were titled from a /skill invocation.")
+                return
+
+            print(
+                f"{len(candidates)} session(s) opened with a /skill"
+                f"{'' if apply_changes else ' (dry run — pass --apply to write)'}:"
+            )
+            changed = 0
+            for row in candidates:
+                session_id = row["id"]
+                typed = describe_skill_invocation(row["content"]) or ""
+                first_reply = db.get_first_assistant_text(session_id) or ""
+                new_title = generate_title(typed, first_reply)
+                if not new_title or new_title == row["title"]:
+                    continue
+                if not _is_titlelike(new_title):
+                    print(f"  {session_id}\n    kept {row['title']!r} — got {new_title!r}")
+                    continue
+                print(f"  {session_id}\n    {row['title']!r}\n    → {new_title!r}")
+                changed += 1
+                if not apply_changes:
+                    continue
+                try:
+                    db.set_session_title(session_id, new_title)
+                except ValueError:
+                    # Unique-title collision. Dedupe the same way the live
+                    # auto-titler does (base #2, base #3, ...) rather than
+                    # leaving the leaked title in place.
+                    deduped = db.get_next_title_in_lineage(new_title)
+                    try:
+                        db.set_session_title(session_id, deduped)
+                        print(f"    (renamed to {deduped!r} — title was taken)")
+                    except ValueError as e:
+                        print(f"    skipped: {e}")
+                        changed -= 1
+
+            if not changed:
+                print("  every title already reflects the user's request.")
+            elif apply_changes:
+                print(f"✓ Re-titled {changed} session(s).")
 
         elif action == "browse":
             limit = getattr(args, "limit", 500) or 500
