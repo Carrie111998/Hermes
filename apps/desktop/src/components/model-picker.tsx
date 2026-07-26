@@ -65,7 +65,6 @@ export function ModelPickerDialog({
   const providers = modelOptions.data?.providers ?? []
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
-    !!sessionId,
     { model: currentModel, provider: currentProvider },
     modelOptions.data
   )

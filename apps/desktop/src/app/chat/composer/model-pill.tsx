@@ -12,7 +12,7 @@ import { displayEntityName } from '@/lib/display-name'
 import { ChevronDown } from '@/lib/icons'
 import { displayProviderLabel, formatModelStatusLabel } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
-import { $currentModelSource, setModelPickerOpen } from '@/store/session'
+import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
 
 import type { ChatBarState } from './types'
 
@@ -50,6 +50,7 @@ export function ModelPill({
   const fastMode = useStore(view.$fast)
   const reasoningEffort = useStore(view.$reasoningEffort)
   const modelSource = useStore($currentModelSource)
+  const defaultEffort = useStore($defaultReasoningEffort)
   const runtimeId = useStore(view.$runtimeId)
   const [open, setOpen] = useState(false)
 
@@ -78,6 +79,7 @@ export function ModelPill({
         <span className="truncate">
           {formatModelStatusLabel(currentModel, {
             displayName: isMoa ? displayEntityName(currentModel, t) : undefined,
+            defaultEffort,
             fastMode,
             reasoningEffort
           })}

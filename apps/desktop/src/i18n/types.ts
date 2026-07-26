@@ -507,6 +507,8 @@ export interface Translations {
       modeTitle: string
       localTitle: string
       localDesc: string
+      inheritTitle: string
+      inheritDesc: string
       remoteTitle: string
       remoteDesc: string
       remoteAuthHint: string
@@ -1547,6 +1549,8 @@ export interface Translations {
     }
     blueprints: {
       tab: string
+      startFrom: string
+      custom: string
       subtitle: string
       dialogDesc: string
       scheduleIt: string
@@ -2078,7 +2082,6 @@ export interface Translations {
       editModels: string
       refreshModels: string
       fast: string
-      medium: string
       moaPresets: string
     }
     modelOptions: {
