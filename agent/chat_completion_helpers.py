@@ -1109,6 +1109,29 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     _is_tokenhub = base_url_host_matches(agent._base_url_lower, "tokenhub.tencentmaas.com")
     _is_lmstudio = (agent.provider or "").strip().lower() == "lmstudio"
 
+    # Moonshot's endpoint (Kimi models, direct or routed through Nous /
+    # OpenRouter) rejects tool schemas containing anyOf lists made up of
+    # empty object branches (HTTP 400 "Check the model name and other
+    # parameters"), most commonly shipped by MCP-derived tools. The
+    # construct is a no-op, so strip it for any Kimi-bound request.
+    # Deep-copy first: the sanitizer mutates in place and ``tools_for_api``
+    # references the shared ``agent.tools`` registry (see #27907).
+    _model_l = (agent.model or "").lower()
+    if tools_for_api and (_is_kimi or "kimi" in _model_l):
+        try:
+            import copy as _copy
+            from tools.schema_sanitizer import strip_degenerate_anyof
+            _tools_copy, _n_stripped = strip_degenerate_anyof(
+                _copy.deepcopy(tools_for_api)
+            )
+            if _n_stripped:
+                tools_for_api = _tools_copy
+        except Exception as exc:
+            logger.warning(
+                "%s⚠️ Failed to sanitize tool schemas for Kimi/Moonshot: %s",
+                getattr(agent, "log_prefix", ""), exc,
+            )
+
     # Temperature: _fixed_temperature_for_model may return OMIT_TEMPERATURE
     # sentinel (temperature omitted entirely), a numeric override, or None.
     try:

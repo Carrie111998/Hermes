@@ -11,6 +11,7 @@ import copy
 
 from tools.schema_sanitizer import (
     sanitize_tool_schemas,
+    strip_degenerate_anyof,
     strip_pattern_and_format,
     strip_slash_enum,
 )
@@ -867,3 +868,130 @@ def test_unrename_passes_unknown_keys_through():
 def test_sanitize_property_key_empty_falls_back():
     assert sanitize_property_key("~~~") == "___"
     assert sanitize_property_key("") == "param"
+# ─────────────────────────────────────────────────────────────────────────
+# strip_degenerate_anyof — Moonshot/Kimi strict-validation recovery.
+# Moonshot's chat-completions endpoint (Kimi K2.x/K3, direct or routed via
+# Nous/OpenRouter) 400s the whole request when a tool schema contains an
+# anyOf/oneOf made up solely of empty object branches (e.g. Apollo MCP's
+# tasks_bulk_create array items).
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_strip_degenerate_anyof_all_empty_branches_removed():
+    """The Apollo MCP shape: anyOf of empty object schemas inside array items."""
+    tools = [_tool("bulk_create", {
+        "type": "object",
+        "required": ["tasks_attributes"],
+        "properties": {
+            "tasks_attributes": {
+                "type": "array",
+                "items": {
+                    "required": ["user_id", "type"],
+                    "anyOf": [
+                        {"type": "object", "properties": {}, "required": []},
+                        {"type": "object", "properties": {}, "required": []},
+                        {"type": "object", "properties": {}, "required": []},
+                    ],
+                    "properties": {
+                        "user_id": {"type": "string"},
+                        "type": {"type": "string"},
+                    },
+                },
+            },
+        },
+    })]
+    _, stripped = strip_degenerate_anyof(tools)
+    assert stripped == 1
+    items = tools[0]["function"]["parameters"]["properties"]["tasks_attributes"]["items"]
+    assert "anyOf" not in items
+    # Sibling keys survive intact
+    assert items["required"] == ["user_id", "type"]
+    assert items["properties"]["user_id"]["type"] == "string"
+
+
+def test_strip_degenerate_anyof_mixed_branches_untouched():
+    """A real constrained branch alongside an empty one → leave the anyOf alone."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "value": {
+                "anyOf": [
+                    {"type": "object", "properties": {}, "required": []},
+                    {"type": "string", "enum": ["a", "b"]},
+                ],
+            },
+        },
+    })]
+    _, stripped = strip_degenerate_anyof(tools)
+    assert stripped == 0
+    assert len(tools[0]["function"]["parameters"]["properties"]["value"]["anyOf"]) == 2
+
+
+def test_strip_degenerate_oneof_all_empty_branches_removed():
+    """Same treatment for oneOf."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "value": {
+                "oneOf": [{}, {"type": "object"}],
+            },
+        },
+    })]
+    _, stripped = strip_degenerate_anyof(tools)
+    assert stripped == 1
+    assert "oneOf" not in tools[0]["function"]["parameters"]["properties"]["value"]
+
+
+def test_strip_degenerate_anyof_real_union_untouched():
+    """Legitimate type unions (string | integer) must survive."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "id": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+        },
+    })]
+    _, stripped = strip_degenerate_anyof(tools)
+    assert stripped == 0
+    assert len(tools[0]["function"]["parameters"]["properties"]["id"]["anyOf"]) == 2
+
+
+def test_strip_degenerate_anyof_responses_format_tool():
+    """Responses-format tools ({"name", "parameters"}) are also walked."""
+    tools = [{
+        "type": "function",
+        "name": "t",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"anyOf": [{"type": "object", "properties": {}, "required": []}]},
+            },
+        },
+    }]
+    _, stripped = strip_degenerate_anyof(tools)
+    assert stripped == 1
+    assert "anyOf" not in tools[0]["parameters"]["properties"]["x"]
+
+
+def test_strip_degenerate_anyof_is_idempotent():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "x": {"anyOf": [{"type": "object", "properties": {}, "required": []}]},
+        },
+    })]
+    _, first = strip_degenerate_anyof(tools)
+    _, second = strip_degenerate_anyof(tools)
+    assert first == 1
+    assert second == 0
+
+
+def test_strip_degenerate_anyof_empty_returns_zero():
+    tools, stripped = strip_degenerate_anyof([])
+    assert tools == []
+    assert stripped == 0
+
+
+def test_strip_degenerate_anyof_none_returns_zero():
+    tools, stripped = strip_degenerate_anyof(None)
+    assert tools is None
+    assert stripped == 0
