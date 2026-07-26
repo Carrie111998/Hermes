@@ -22,6 +22,7 @@ from plugins.memory.hindsight import (
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
     _load_config,
+    _load_simple_env,
     _build_embedded_profile_env,
     _normalize_observation_scopes,
     _normalize_retain_tags,
@@ -81,6 +82,66 @@ def _make_mock_client():
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
     return client
+
+
+def _provider_for_mode(tmp_path, monkeypatch, mode: str):
+    """Create an initialized provider without pre-seeding its client."""
+    config = {
+        "mode": mode,
+        "apiKey": "test-key",
+        "api_url": "http://localhost:9999",
+        "bank_id": "test-bank",
+        "budget": "mid",
+        "memory_mode": "hybrid",
+    }
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config))
+
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+    )
+
+    provider = HindsightMemoryProvider()
+    provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+    return provider
+
+
+def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mode: str):
+    """Cloud/local-external clients must ensure lazy deps before importing."""
+    import builtins
+
+    provider = _provider_for_mode(tmp_path, monkeypatch, mode)
+    ensure_calls = []
+
+    def fake_ensure(feature, prompt=True):
+        ensure_calls.append((feature, prompt))
+
+    class FakeHindsight:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hindsight_client":
+            if ensure_calls != [("memory.hindsight", False)]:
+                raise ModuleNotFoundError("No module named 'hindsight_client'")
+            return SimpleNamespace(Hindsight=FakeHindsight)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    client = provider._get_client()
+
+    assert ensure_calls == [("memory.hindsight", False)]
+    assert isinstance(client, FakeHindsight)
+    assert client.kwargs == {
+        "base_url": "http://localhost:9999",
+        "timeout": 120.0,
+        "api_key": "test-key",
+    }
 
 
 class _FakeSessionDB:
@@ -232,6 +293,14 @@ class TestSchemas:
 
 
 class TestConfig:
+    def test_cloud_client_lazy_installs_dependency_before_import(self, tmp_path, monkeypatch):
+        _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, "cloud")
+
+    def test_local_external_client_lazy_installs_dependency_before_import(self, tmp_path, monkeypatch):
+        _assert_cloud_client_lazy_installed_before_import(
+            tmp_path, monkeypatch, "local_external"
+        )
+
     def test_default_values(self, provider):
         assert provider._auto_retain is True
         assert provider._auto_recall is True
@@ -1751,3 +1820,62 @@ def test_save_config_sets_owner_only_permissions(tmp_path):
     assert config_file.exists()
     mode = stat.S_IMODE(config_file.stat().st_mode)
     assert mode == 0o600, f"Expected 0o600 (owner-only), got {oct(mode)}"
+
+
+class TestLoadSimpleEnv:
+    def test_bom_first_key_is_recognized(self, tmp_path):
+        """A Notepad-edited .env carries a BOM; the first key must still parse
+        instead of becoming '\ufeffHINDSIGHT_LLM_API_KEY'."""
+        env_path = tmp_path / ".env"
+        env_path.write_bytes("﻿HINDSIGHT_LLM_API_KEY=sk-test\n".encode("utf-8"))
+        values = _load_simple_env(env_path)
+        assert values.get("HINDSIGHT_LLM_API_KEY") == "sk-test"
+
+    def test_non_ascii_values_read_intact(self, tmp_path):
+        env_path = tmp_path / ".env"
+        env_path.write_bytes("PROXY_NOTE=café-zürich-完了\n".encode("utf-8"))
+        values = _load_simple_env(env_path)
+        assert values["PROXY_NOTE"] == "café-zürich-完了"
+
+
+class TestPostSetupEnvEncoding:
+    def _run_cloud_post_setup(self, tmp_path, monkeypatch):
+        """Drive post_setup through the cloud path with piped stdin."""
+        import io
+        import shutil as shutil_mod
+
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select",
+                            lambda *a, **kw: 0)  # cloud mode
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda c: None)
+        monkeypatch.setattr(shutil_mod, "which", lambda *_: None)  # skip uv install
+        # First line: API key prompt (readline). Second line: API URL (input).
+        monkeypatch.setattr(sys, "stdin", io.StringIO("sk-new\n\n"))
+
+        provider = HindsightMemoryProvider()
+        provider.post_setup(str(tmp_path), {"memory": {}})
+
+    def test_bom_first_key_updated_in_place(self, tmp_path, monkeypatch):
+        """The setup writer reads the existing .env BOM-tolerantly, so a
+        BOM'd first key is matched and rewritten, not duplicated."""
+        env_path = tmp_path / ".env"
+        env_path.write_bytes("﻿HINDSIGHT_API_KEY=old\n".encode("utf-8"))
+
+        self._run_cloud_post_setup(tmp_path, monkeypatch)
+
+        content = env_path.read_text(encoding="utf-8")
+        assert content.count("HINDSIGHT_API_KEY=") == 1
+        assert "HINDSIGHT_API_KEY=sk-new" in content
+        assert "old" not in content
+        assert "﻿" not in content
+
+    def test_non_ascii_lines_survive_round_trip(self, tmp_path, monkeypatch):
+        """Unrelated non-ASCII .env content must be copied through as UTF-8
+        (the locale codec would crash or mangle it on Windows)."""
+        env_path = tmp_path / ".env"
+        env_path.write_bytes("PROXY_NOTE=café-zürich-完了\n".encode("utf-8"))
+
+        self._run_cloud_post_setup(tmp_path, monkeypatch)
+
+        content = env_path.read_text(encoding="utf-8")
+        assert "PROXY_NOTE=café-zürich-完了" in content
+        assert "HINDSIGHT_API_KEY=sk-new" in content
