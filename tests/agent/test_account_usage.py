@@ -290,7 +290,7 @@ def test_codex_usage_treats_wham_used_percent_as_used_not_remaining(monkeypatch)
     assert "86% used" not in rendered
 
 
-def test_anthropic_usage_is_one_secret_safe_get_with_no_body_or_inference(
+def test_anthropic_usage_preserves_decimal_percentages_in_secret_safe_get(
     monkeypatch, caplog, capsys
 ):
     token = "cc-synthetic-oauth-token-never-real"
@@ -301,9 +301,9 @@ def test_anthropic_usage_is_one_secret_safe_get_with_no_body_or_inference(
                 "utilization": 0.05,
                 "resets_at": "2026-07-26T20:00:00Z",
             },
-            "seven_day": {"utilization": 0.125},
-            "seven_day_opus": {"utilization": 0.8},
-            "seven_day_sonnet": {"utilization": 1.0},
+            "seven_day": {"utilization": 0.5},
+            "seven_day_opus": {"utilization": 80.0},
+            "seven_day_sonnet": {"utilization": 100.0},
         },
         token=token,
     )
@@ -321,8 +321,8 @@ def test_anthropic_usage_is_one_secret_safe_get_with_no_body_or_inference(
         "Sonnet week",
     ]
     assert [window.used_percent for window in snapshot.windows] == [
-        5.0,
-        12.5,
+        0.05,
+        0.5,
         80.0,
         100.0,
     ]

@@ -419,10 +419,10 @@ def test_oauth_refresh_persists_capacity_and_heavy_routing_selects_claude(
 
         def json(self):
             return {
-                "five_hour": {"utilization": 0.99},
-                "seven_day": {"utilization": 0.10},
-                "seven_day_opus": {"utilization": 0.15},
-                "seven_day_sonnet": {"utilization": 0.95},
+                "five_hour": {"utilization": 99.0},
+                "seven_day": {"utilization": 10.0},
+                "seven_day_opus": {"utilization": 15.0},
+                "seven_day_sonnet": {"utilization": 95.0},
             }
 
     class Client:

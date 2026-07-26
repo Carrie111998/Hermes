@@ -802,8 +802,6 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
             continue
         if not math.isfinite(used_percent):
             continue
-        if 0.0 <= used_percent <= 1.0:
-            used_percent *= 100.0
         if not 0.0 <= used_percent <= 100.0:
             continue
         windows.append(

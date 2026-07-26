@@ -82,8 +82,8 @@ def test_refresh_usage_json_reports_measured_numeric_claude_lane(
 
         def json(self):
             return {
-                "seven_day": {"utilization": 0.14},
-                "seven_day_opus": {"utilization": 0.22},
+                "seven_day": {"utilization": 14.0},
+                "seven_day_opus": {"utilization": 22.0},
             }
 
     class Client:
