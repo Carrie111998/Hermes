@@ -119,6 +119,23 @@ inputs:
 
 `workflow_show` returns the inputs list so agents discover what parameters are needed before triggering.
 
+### Attachment Selection
+
+Nodes can select which workflow attachment they receive:
+
+```yaml
+inputs:
+  - name: grill_artifact
+  - name: acceptance_criteria
+nodes:
+  enrich-artifact:
+    attachment: attachments[0]   # gets grill_artifact
+  spec-author:
+    attachment: attachments[1]   # gets acceptance_criteria
+```
+
+If `attachment` is set, only that specific file is attached to the card. If omitted, all attachments are attached (first layer) or none (other layers).
+
 ### Node Fields
 
 | Field | Required | Description |

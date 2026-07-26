@@ -1803,6 +1803,16 @@ class WorkflowEngine:
                         f"Node '{nid}' has invalid max_retries={node.max_retries}"
                     )
 
+        # Check attachment syntax
+        import re as _re
+        for nid, node in workflow.nodes.items():
+            if node.attachment is not None:
+                if not _re.match(r"attachments\[\d+\]", node.attachment):
+                    result["issues"].append(
+                        f"Node '{nid}' has invalid attachment='{node.attachment}' — "
+                        f"expected format: attachments[N]"
+                    )
+
         # incomplete_branch rule (adapted from itechmeat/hermes-workflows).
         # Catches non-terminal nodes that rely on the implicit default
         # ``fallback_on_timeout="skip"`` — which silently cascades skip to
