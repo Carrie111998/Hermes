@@ -35,16 +35,14 @@ if (new URLSearchParams(window.location.search).get('win') === 'overlay') {
           <I18nProvider>
             <ThemeProvider>
               <HapticsProvider>
-                {/* useTransitions={false}: react-router v7's HashRouter wraps every
-                    route state update in React.startTransition() by default. In
-                    React 19's concurrent renderer, transitions are non-urgent — React
-                    can yield mid-render and resume later. When the app is under load
-                    (streaming token deltas, gateway events, store updates), those
-                    higher-priority updates keep interrupting the transition, starving
-                    the route change commit. The session sidebar highlight + main pane
-                    both freeze for seconds despite the main thread being free.
-                    Disabling transitions makes navigate() commit at default priority. */}
-                <HashRouter useTransitions={false}>
+                {/* react-router-dom is intentionally pinned to 7.11.0. Later v7
+                    releases enabled transition-backed HashRouter updates and exposed
+                    useTransitions={false}; under React 19 those non-urgent route commits
+                    can be starved by streaming token and gateway updates. Version 7.11
+                    predates that behavior, so its plain HashRouter keeps navigation at
+                    default priority without the later-only prop. Keep the pin and this
+                    invariant together when upgrading after the advisory is fixed. */}
+                <HashRouter>
                   <App />
                 </HashRouter>
               </HapticsProvider>
