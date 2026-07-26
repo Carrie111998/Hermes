@@ -1,3 +1,6 @@
+import { Link } from 'react-router-dom'
+
+import { ARTIFACTS_ROUTE, SKILLS_ROUTE } from '@/app/routes'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
@@ -24,6 +27,19 @@ export const PRIMARY_ICON_BTN = cn(
   'bg-foreground text-background hover:bg-foreground/90',
   'disabled:bg-foreground/30 disabled:text-background disabled:opacity-100'
 )
+
+const QUICK_ROUTE_PILL = cn(
+  'h-(--composer-control-size) rounded-full px-2.5 text-xs font-medium',
+  'border border-[color-mix(in_srgb,var(--dt-composer-ring)_22%,var(--dt-input))]',
+  'bg-[color-mix(in_srgb,var(--dt-card)_74%,transparent)] text-(--ui-text-secondary)',
+  'hover:bg-[color-mix(in_srgb,var(--dt-accent)_58%,transparent)] hover:text-(--dt-primary)'
+)
+
+const QUICK_ROUTES = [
+  { label: 'Tools', to: `${SKILLS_ROUTE}?tab=toolsets` },
+  { label: 'Artifacts', to: ARTIFACTS_ROUTE },
+  { label: 'Skills', to: SKILLS_ROUTE }
+] as const
 
 interface ConversationProps {
   active: boolean
@@ -77,6 +93,7 @@ export function ComposerControls({
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
+      <QuickRoutePills compact={compactModelPill} />
       <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
       <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
       <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
@@ -151,6 +168,20 @@ export function ComposerControls({
         </Tip>
       )}
     </div>
+  )
+}
+
+function QuickRoutePills({ compact }: { compact: boolean }) {
+  return (
+    <nav aria-label="Composer shortcuts" className={cn('flex items-center gap-1', compact && 'hidden')}>
+      {QUICK_ROUTES.map(route => (
+        <Button asChild className={QUICK_ROUTE_PILL} key={route.label} size="inline" variant="ghost">
+          <Link aria-label={route.label} to={route.to}>
+            {route.label}
+          </Link>
+        </Button>
+      ))}
+    </nav>
   )
 }
 
