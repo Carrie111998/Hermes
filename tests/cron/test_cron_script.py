@@ -300,6 +300,26 @@ class TestRunJobScript:
         assert success is False
         assert "timed out" in output.lower()
 
+    def test_zero_timeout_disables_wall_clock_limit(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "long_running.py"
+        script.write_text('print("eventually done")\n')
+        captured = {}
+
+        def fake_run(*_args, **kwargs):
+            captured.update(kwargs)
+            return type("Result", (), {"stdout": "eventually done\n", "stderr": "", "returncode": 0})()
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = _run_job_script(str(script), timeout_seconds=0)
+
+        assert success is True
+        assert output == "eventually done"
+        assert captured["timeout"] is None
+
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
         from cron.scheduler import _run_job_script
