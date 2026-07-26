@@ -2858,12 +2858,61 @@ def _apply_managed(cfg: dict) -> dict:
         return cfg
 
 
+def _require_parseable_config_for_write(path: Path) -> None:
+    """Refuse to replace an existing config.yaml that cannot be parsed as a mapping.
+
+    ``_load_cfg`` fail-opens to ``{}`` on YAML errors so the TUI can still start.
+    Writers that mutate that empty dict and call ``_save_cfg`` would otherwise
+    wipe model/provider/gateway/plugin overrides with a near-empty document.
+    ``atomic_config_write`` only checks byte readability, so corrupt-but-readable
+    YAML must be rejected here before any full-file replacement.
+    """
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(
+            f"Refusing to overwrite {path}: existing config.yaml cannot be accessed "
+            f"({exc}). Fix the file permissions or move it aside first."
+        ) from exc
+
+    import yaml
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        from hermes_cli.config import _backup_corrupt_config
+
+        _backup_corrupt_config(path)
+        raise RuntimeError(
+            f"Refusing to overwrite {path}: existing config.yaml contains invalid YAML "
+            f"({exc}). Fix the syntax error first, then retry."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Refusing to overwrite {path}: existing config.yaml cannot be read "
+            f"({exc}). Fix the file permissions or move it aside first."
+        ) from exc
+
+    if raw is not None and not isinstance(raw, dict):
+        from hermes_cli.config import _backup_corrupt_config
+
+        _backup_corrupt_config(path)
+        raise RuntimeError(
+            f"Refusing to overwrite {path}: existing config.yaml root must be a mapping "
+            f"(got {type(raw).__name__}). Fix the file, then retry."
+        )
+
+
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
 
     from hermes_cli.config import atomic_config_write
 
     path = _hermes_home / "config.yaml"
+    _require_parseable_config_for_write(path)
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)

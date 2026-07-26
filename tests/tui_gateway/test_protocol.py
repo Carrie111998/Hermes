@@ -425,6 +425,53 @@ def test_config_roundtrip(server, tmp_path):
     assert server._load_cfg()["model"] == "test/model"
 
 
+def _reset_cfg_cache(server):
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+
+
+def test_write_config_key_refuses_unparseable_yaml(server, tmp_path):
+    """Corrupt-but-readable YAML must not be replaced by a one-key document."""
+    server._hermes_home = tmp_path
+    _reset_cfg_cache(server)
+    original = "model:\n  default: precious/model\nbroken: [unterminated\n"
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="invalid YAML"):
+        server._write_config_key("display.busy_input_mode", "steer")
+
+    assert cfg_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("config.yaml.corrupt.*.bak")), "expected corrupt backup"
+
+
+def test_save_cfg_refuses_non_mapping_root(server, tmp_path):
+    server._hermes_home = tmp_path
+    _reset_cfg_cache(server)
+    original = "- just\n- a\n- list\n"
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="mapping"):
+        server._save_cfg({"display": {"busy_input_mode": "steer"}})
+
+    assert cfg_path.read_text(encoding="utf-8") == original
+
+
+def test_write_config_key_allows_valid_empty_mapping(server, tmp_path):
+    server._hermes_home = tmp_path
+    _reset_cfg_cache(server)
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    server._write_config_key("display.busy_input_mode", "steer")
+
+    import yaml
+
+    disk = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert disk == {"display": {"busy_input_mode": "steer"}}
+
+
 # ── _cli_exec_blocked ────────────────────────────────────────────────
 
 
