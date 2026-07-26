@@ -1546,7 +1546,7 @@ def test_create_rejects_non_list_skills(worker_env):
     assert json.loads(out).get("error")
 
 
-def test_link_happy_path(worker_env):
+def test_link_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -1554,6 +1554,11 @@ def test_link_happy_path(worker_env):
         b = kb.create_task(conn, title="B", assignee="x")
     finally:
         conn.close()
+    # Wiring two unrelated tasks is an orchestrator operation: a task-scoped
+    # worker may only link its own task (see
+    # test_worker_link_rejects_foreign_child_task). The fixture is used here
+    # for its DB setup, so drop the worker scope it also sets.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from tools import kanban_tools as kt
     out = kt._handle_link({"parent_id": a, "child_id": b})
     d = json.loads(out)
@@ -1881,6 +1886,75 @@ def test_worker_heartbeat_rejects_foreign_task_id(worker_env):
     out = kt._handle_heartbeat({"task_id": other})
     d = json.loads(out)
     assert "refusing to mutate" in d.get("error", "")
+
+
+def test_worker_link_rejects_foreign_child_task(worker_env):
+    """A worker cannot pull a foreign task under its own parent (#19534).
+
+    ``link_tasks`` mutates the child: a ``ready`` child is demoted to ``todo``
+    (the dispatcher stops promoting it) and it inherits the parent's notify
+    subscriptions. Without an ownership gate a task-scoped worker can stall a
+    sibling/cross-tenant task and redirect its terminal notifications to the
+    parent's subscribers.
+    """
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        victim = kb.create_task(conn, title="sibling", assignee="peer")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (victim,))
+        conn.commit()
+        kb.add_notify_sub(
+            conn, task_id=worker_env, platform="telegram", chat_id="attacker-chat",
+        )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_link({"parent_id": worker_env, "child_id": victim})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d.get("error", "")
+
+    conn = kb.connect()
+    try:
+        # Still schedulable, and it did not inherit the worker's subscribers.
+        assert kb.get_task(conn, victim).status == "ready"
+        assert kb.list_notify_subs(conn, victim) == []
+    finally:
+        conn.close()
+
+
+def test_worker_can_link_its_own_task_under_a_parent(worker_env):
+    """The gate is on the mutated (child) end — a worker may still attach
+    its own task to a parent, and orchestrators stay unrestricted."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        epic = kb.create_task(conn, title="epic", assignee="peer")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_link({"parent_id": epic, "child_id": worker_env})
+    d = json.loads(out)
+    assert d.get("ok") is True, f"linking own task must succeed: {d}"
+
+
+def test_orchestrator_can_link_foreign_tasks(monkeypatch, worker_env):
+    """No HERMES_KANBAN_TASK => orchestrator context, graph edits allowed."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        a = kb.create_task(conn, title="a", assignee="peer")
+        b = kb.create_task(conn, title="b", assignee="peer")
+    finally:
+        conn.close()
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    out = kt._handle_link({"parent_id": a, "child_id": b})
+    d = json.loads(out)
+    assert d.get("ok") is True, f"orchestrator link must succeed: {d}"
 
 
 def test_worker_can_comment_on_foreign_task(worker_env):

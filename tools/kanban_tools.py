@@ -1421,6 +1421,17 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
+    # link_tasks mutates the CHILD: a ``ready`` child is demoted back to
+    # ``todo`` (the dispatcher stops promoting it) and it inherits the
+    # parent's notify subscriptions. That is run-lifecycle state, so it falls
+    # under the same worker scope rule as complete / block / heartbeat /
+    # attach (#19534) — without it a task-scoped worker can stall a sibling
+    # or cross-tenant task and redirect its terminal notifications to its own
+    # parent's subscribers. Orchestrators (no HERMES_KANBAN_TASK) are
+    # unaffected, and a worker may still attach its own task to a parent.
+    ownership_err = _enforce_worker_task_ownership(str(child_id))
+    if ownership_err:
+        return ownership_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
