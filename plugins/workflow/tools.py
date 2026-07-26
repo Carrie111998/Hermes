@@ -551,21 +551,11 @@ def handle_workflow_show(args: Dict[str, Any], **kwargs: Any) -> str:
             "timeout_min": node.timeout_minutes,
             "layer": next((i for i, l in enumerate(layers) if nid in l), None),
         })
-    # Collect inputs if declared
-    inputs = []
-    for inp in getattr(wf, "inputs", []) or []:
-        inputs.append({
-            "name": inp.get("name", ""),
-            "required": inp.get("required", False),
-            "description": inp.get("description", ""),
-        })
-
     return _ok({
         "name": wf.name,
         "description": wf.description,
         "layers": len(layers),
         "nodes": len(wf.nodes),
-        "inputs": inputs,
         "structure": nodes,
     })
 
