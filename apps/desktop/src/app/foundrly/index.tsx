@@ -30,9 +30,36 @@ export function FoundrlyView(props: React.ComponentProps<'section'>) {
       data-foundrly-workspace="persist:foundrly-home"
     >
       <header className="border-b border-white/10 px-8 py-6">
-        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-teal-300/90">Foundrly home</p>
-        <h1 className="mt-2 text-2xl font-semibold tracking-tight">{BRAND.productName}</h1>
-        <p className="mt-2 max-w-xl text-sm text-white/65">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <img
+              alt=""
+              className="h-10 w-10 rounded-xl border border-teal-500/30 object-cover"
+              height={40}
+              src="/foundrly/mark-512.png"
+              width={40}
+            />
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-teal-300/90">
+                Foundrly home
+              </p>
+              <h1 className="mt-1 text-2xl font-semibold tracking-tight">{BRAND.productName}</h1>
+            </div>
+          </div>
+          <a
+            className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-semibold text-white/70 hover:border-teal-500/40 hover:text-white"
+            href="https://intelli-verse-x.ai"
+            onClick={event => {
+              event.preventDefault()
+              void openExternal('https://intelli-verse-x.ai')
+            }}
+            rel="noreferrer"
+            target="_blank"
+          >
+            Built on Intelliverse
+          </a>
+        </div>
+        <p className="mt-3 max-w-xl text-sm text-white/65">
           AI co-founder desktop for local businesses — Hermes chat on the left rail, Foundrly product
           surfaces here. Overnight visibility and growth workflows land in this workspace.
         </p>
