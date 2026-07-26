@@ -5,9 +5,11 @@ Diagnoses issues with Hermes Agent setup.
 """
 
 import os
+import ssl
 import sys
 import subprocess
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
@@ -554,6 +556,182 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
 
 
 _APIKEY_PROVIDERS_CACHE: list | None = None
+
+
+@dataclass(frozen=True)
+class _CustomProviderProbeSpec:
+    """Resolved, secret-bearing inputs for one custom-provider health check."""
+
+    label: str
+    base_url: str
+    api_key: str | None
+    api_mode: str
+    extra_headers: dict[str, str]
+    ssl_ca_cert: str | None = None
+    ssl_verify: bool | str | None = None
+    resolution_error: bool = False
+
+
+@dataclass(frozen=True)
+class _CustomProviderProbeResult:
+    """Sanitized custom-provider probe result safe for doctor output."""
+
+    kind: str
+    status_code: int | None = None
+
+
+def _build_custom_provider_probe_specs() -> list[_CustomProviderProbeSpec]:
+    """Resolve all enabled custom providers exactly as the agent runtime does."""
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            load_config_readonly,
+        )
+        from hermes_cli.providers import custom_provider_slug
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        config = load_config_readonly()
+        custom_providers = get_compatible_custom_providers(config)
+    except Exception:
+        return []
+
+    specs: list[_CustomProviderProbeSpec] = []
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("name") or entry.get("provider_key") or "").strip()
+        identity = str(entry.get("provider_key") or label).strip()
+        if not label or not identity:
+            continue
+
+        try:
+            runtime = resolve_runtime_provider(
+                requested=custom_provider_slug(identity),
+            )
+            api_key = str(runtime.get("api_key") or "").strip()
+            if api_key == "no-key-required":
+                api_key = ""
+            specs.append(
+                _CustomProviderProbeSpec(
+                    label=label,
+                    base_url=str(runtime.get("base_url") or entry.get("base_url") or "").strip(),
+                    api_key=api_key or None,
+                    api_mode=str(runtime.get("api_mode") or "chat_completions"),
+                    extra_headers=dict(runtime.get("extra_headers") or {}),
+                    ssl_ca_cert=(str(entry.get("ssl_ca_cert") or "").strip() or None),
+                    ssl_verify=entry.get("ssl_verify"),
+                )
+            )
+        except Exception:
+            # Resolution errors are surfaced without echoing exception text:
+            # it may contain a credential-bearing URL or provider header.
+            specs.append(
+                _CustomProviderProbeSpec(
+                    label=label,
+                    base_url="",
+                    api_key=None,
+                    api_mode="chat_completions",
+                    extra_headers={},
+                    resolution_error=True,
+                )
+            )
+    return specs
+
+
+def _exception_contains_ssl_error(exc: BaseException) -> bool:
+    """Identify wrapped TLS failures without exposing exception text."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return True
+        message = str(current).lower()
+        if "certificate verify failed" in message or "ssl certificate" in message:
+            return True
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+def _probe_custom_provider_health(
+    spec: _CustomProviderProbeSpec,
+    *,
+    timeout: float = 5.0,
+) -> _CustomProviderProbeResult:
+    """Probe a custom provider's free model catalog and classify the result."""
+    if spec.resolution_error or not spec.base_url:
+        return _CustomProviderProbeResult("configuration_error")
+
+    import httpx
+    from agent.ssl_verify import resolve_httpx_verify
+    from hermes_cli.models import (
+        _api_models_probe_candidates,
+        _api_models_probe_headers,
+    )
+
+    normalized = spec.base_url.strip().rstrip("/")
+    candidates, _alternate = _api_models_probe_candidates(normalized)
+    headers = _api_models_probe_headers(
+        spec.api_key,
+        normalized,
+        api_mode=spec.api_mode,
+        request_headers=spec.extra_headers,
+    )
+    verify = resolve_httpx_verify(
+        ca_bundle=spec.ssl_ca_cert,
+        ssl_verify=spec.ssl_verify,
+        base_url=normalized,
+    )
+
+    statuses: list[int] = []
+    try:
+        with httpx.Client(
+            verify=verify,
+            timeout=timeout,
+            follow_redirects=False,
+        ) as client:
+            for candidate_base, _is_fallback in candidates:
+                try:
+                    response = client.get(
+                        candidate_base.rstrip("/") + "/models",
+                        headers=headers,
+                    )
+                except httpx.TimeoutException:
+                    return _CustomProviderProbeResult("timeout")
+                except httpx.RequestError as exc:
+                    return _CustomProviderProbeResult(
+                        "ssl_error" if _exception_contains_ssl_error(exc) else "unreachable"
+                    )
+
+                status = response.status_code
+                if 200 <= status < 300:
+                    return _CustomProviderProbeResult("reachable", status)
+                statuses.append(status)
+    except Exception as exc:
+        return _CustomProviderProbeResult(
+            "ssl_error" if _exception_contains_ssl_error(exc) else "configuration_error"
+        )
+
+    for status in statuses:
+        if status in {401, 403}:
+            return _CustomProviderProbeResult("authentication_rejected", status)
+    for status in statuses:
+        if 500 <= status < 600:
+            return _CustomProviderProbeResult("provider_failure", status)
+    for status in statuses:
+        if 400 <= status < 500 and status not in {404, 405}:
+            return _CustomProviderProbeResult("http_warning", status)
+    for status in statuses:
+        if status in {404, 405}:
+            return _CustomProviderProbeResult("models_unsupported", status)
+    if statuses:
+        return _CustomProviderProbeResult("http_warning", statuses[0])
+    return _CustomProviderProbeResult("unreachable")
 
 
 def _build_apikey_providers_list() -> list:
@@ -2210,6 +2388,77 @@ def run_doctor(args):
                 [],
             )
 
+    def _probe_custom_provider(
+        spec: _CustomProviderProbeSpec,
+    ) -> _ConnectivityResult:
+        result = _probe_custom_provider_health(spec)
+        label = spec.label.ljust(20)
+        if result.kind == "reachable":
+            return _ConnectivityResult(
+                spec.label,
+                [(color("✓", Colors.GREEN), label,
+                  color("(reachable)", Colors.DIM))],
+                [],
+            )
+        if result.kind == "authentication_rejected":
+            return _ConnectivityResult(
+                spec.label,
+                [(color("✗", Colors.RED), label,
+                  color(f"(authentication rejected: HTTP {result.status_code})", Colors.DIM))],
+                [
+                    f"Custom provider '{spec.label}' rejected authentication — "
+                    "check its configured API key and custom auth headers"
+                ],
+            )
+        if result.kind == "models_unsupported":
+            return _ConnectivityResult(
+                spec.label,
+                [(color("⚠", Colors.YELLOW), label,
+                  color(
+                      f"(reachable; /models unsupported: HTTP {result.status_code})",
+                      Colors.DIM,
+                  ))],
+                [],
+            )
+        if result.kind == "http_warning":
+            return _ConnectivityResult(
+                spec.label,
+                [(color("⚠", Colors.YELLOW), label,
+                  color(f"(reachable; HTTP {result.status_code})", Colors.DIM))],
+                [],
+            )
+        if result.kind == "provider_failure":
+            return _ConnectivityResult(
+                spec.label,
+                [(color("✗", Colors.RED), label,
+                  color(f"(provider failure: HTTP {result.status_code})", Colors.DIM))],
+                [
+                    f"Custom provider '{spec.label}' returned HTTP {result.status_code} "
+                    "from its model-health endpoint"
+                ],
+            )
+        if result.kind == "ssl_error":
+            return _ConnectivityResult(
+                spec.label,
+                [(color("⚠", Colors.YELLOW), label,
+                  color("(SSL certificate error)", Colors.DIM))],
+                [
+                    f"Custom provider '{spec.label}' failed TLS certificate verification — "
+                    "configure its ssl_ca_cert with the trusted CA when required"
+                ],
+            )
+        if result.kind == "timeout":
+            detail = "(unreachable: connection timeout)"
+        elif result.kind == "configuration_error":
+            detail = "(health-check configuration could not be resolved)"
+        else:
+            detail = "(unreachable: connection failed)"
+        return _ConnectivityResult(
+            spec.label,
+            [(color("✗", Colors.RED), label, color(detail, Colors.DIM))],
+            [f"Custom provider '{spec.label}' is unreachable — check its configuration and network path"],
+        )
+
     def _probe_bedrock() -> _ConnectivityResult:
         try:
             from agent.bedrock_adapter import (
@@ -2357,6 +2606,14 @@ def run_doctor(args):
         _probes.append((_pname, lambda p=_pname, e=_env_vars, u=_default_url,
                                        b=_base_env, s=_supports:
                                 _probe_apikey_provider(p, e, u, b, s)))
+
+    for _custom_spec in _build_custom_provider_probe_specs():
+        _probes.append(
+            (
+                _custom_spec.label,
+                lambda spec=_custom_spec: _probe_custom_provider(spec),
+            )
+        )
 
     _probes.append(("AWS Bedrock", _probe_bedrock))
     _probes.append(("Azure Foundry (Entra ID)", _probe_azure_entra))

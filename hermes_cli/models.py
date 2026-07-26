@@ -3899,32 +3899,15 @@ def probe_api_models(
             "used_fallback": False,
         }
 
-    if normalized.endswith("/v1"):
-        alternate_base = normalized[:-3].rstrip("/")
-    else:
-        alternate_base = normalized + "/v1"
-
-    candidates: list[tuple[str, bool]] = [(normalized, False)]
-    if alternate_base and alternate_base != normalized:
-        candidates.append((alternate_base, True))
+    candidates, alternate_base = _api_models_probe_candidates(normalized)
 
     tried: list[str] = []
-    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
-        headers["X-Goog-Api-Client"] = f"hermes-agent/{_HERMES_VERSION}"
-    if api_key and api_mode == "anthropic_messages":
-        headers["x-api-key"] = api_key
-        headers["anthropic-version"] = "2023-06-01"
-    elif api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if normalized.startswith(COPILOT_BASE_URL):
-        headers.update(copilot_default_headers())
-    if isinstance(request_headers, dict):
-        # Per-provider custom headers can contain auth/proxy secrets. Merge
-        # last so endpoint-specific config wins, and never log the values.
-        from hermes_cli.config import normalize_extra_headers
-
-        headers.update(normalize_extra_headers(request_headers))
+    headers = _api_models_probe_headers(
+        api_key,
+        normalized,
+        api_mode=api_mode,
+        request_headers=request_headers,
+    )
 
     for candidate_base, is_fallback in candidates:
         url = candidate_base.rstrip("/") + "/models"
@@ -3950,6 +3933,52 @@ def probe_api_models(
         "suggested_base_url": alternate_base if alternate_base != normalized else None,
         "used_fallback": False,
     }
+
+
+def _api_models_probe_candidates(
+    normalized_base_url: str,
+) -> tuple[list[tuple[str, bool]], str]:
+    """Return the normal and ``/v1`` fallback bases for a models probe."""
+    if normalized_base_url.endswith("/v1"):
+        alternate_base = normalized_base_url[:-3].rstrip("/")
+    else:
+        alternate_base = normalized_base_url + "/v1"
+
+    candidates: list[tuple[str, bool]] = [(normalized_base_url, False)]
+    if alternate_base and alternate_base != normalized_base_url:
+        candidates.append((alternate_base, True))
+    return candidates, alternate_base
+
+
+def _api_models_probe_headers(
+    api_key: Optional[str],
+    normalized_base_url: str,
+    *,
+    api_mode: Optional[str] = None,
+    request_headers: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+    """Build auth and custom headers shared by model-health probes.
+
+    Custom header values may contain credentials. Callers must never log the
+    returned mapping or include it in error output.
+    """
+    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
+    if urllib.parse.urlparse(normalized_base_url).hostname == "generativelanguage.googleapis.com":
+        headers["X-Goog-Api-Client"] = f"hermes-agent/{_HERMES_VERSION}"
+    if api_key and api_mode == "anthropic_messages":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if normalized_base_url.startswith(COPILOT_BASE_URL):
+        headers.update(copilot_default_headers())
+    if isinstance(request_headers, dict):
+        # Per-provider custom headers can contain auth/proxy secrets. Merge
+        # last so endpoint-specific config wins, and never log the values.
+        from hermes_cli.config import normalize_extra_headers
+
+        headers.update(normalize_extra_headers(request_headers))
+    return headers
 
 
 # Legacy filter — used when an item has no surface tag (rolling out
