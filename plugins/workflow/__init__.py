@@ -693,6 +693,10 @@ def _start_completion_watcher():
                         marker_path = Path(marker_path_str)
                         data = json.loads(marker_path.read_text())
 
+                        # Skip already-processed markers (kept as job logs)
+                        if data.get("processed_at"):
+                            continue
+
                         platform_str = data.get("platform", "")
                         chat_id = data.get("chat_id", "")
                         thread_id = data.get("thread_id")
@@ -789,7 +793,10 @@ def _start_completion_watcher():
                             "wf-completion watcher: injected notification into %s/%s profile=%s",
                             platform_str, chat_id, profile or "default",
                         )
-                        marker_path.unlink(missing_ok=True)
+                        # Mark as processed — keep the file as a job log
+                        from datetime import datetime, timezone
+                        data["processed_at"] = datetime.now(timezone.utc).isoformat()
+                        marker_path.write_text(json.dumps(data, indent=2, default=str))
 
                     except Exception as _proc_exc:
                         logger.warning(
