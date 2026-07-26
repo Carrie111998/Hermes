@@ -168,15 +168,30 @@ def _is_official_optional_adapter(matched_source) -> bool:
     return source_id() == "official"
 
 
+_RESERVED_SCAN_PROVENANCE = frozenset({"official", "agent-created"})
+
+
 def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> str:
     """Choose the scanner trust identity for an install/audit scan."""
     if _is_official_optional_adapter(matched_source):
         return "official"
-    return (
+    candidate = (
         getattr(bundle, "identifier", "")
         or getattr(meta, "identifier", "")
         or identifier
+        or ""
     )
+    # Reserved tokens unlock privileged trust in skills_guard._resolve_trust_level.
+    # Only OptionalSkillSource may supply them; never honor them from other adapters
+    # (e.g. unsigned hermes-index echoing identifier="official").
+    if candidate in _RESERVED_SCAN_PROVENANCE:
+        source_id = getattr(matched_source, "source_id", None)
+        if callable(source_id):
+            sid = source_id()
+            if sid and sid not in _RESERVED_SCAN_PROVENANCE:
+                return sid
+        return "community"
+    return candidate
 
 
 def _derive_category_from_install_path(install_path: str) -> str:
