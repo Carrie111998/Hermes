@@ -513,6 +513,29 @@ def sqlite_source_id() -> str:
     return str(row[0])
 
 
+def _is_on_apfs() -> bool:
+    """Check if running on APFS (macOS Copy-on-Write filesystem).
+
+    APFS is a CoW filesystem where WAL mode checkpoint operations can cause
+    intermittent disk I/O errors during concurrent writes (#71498). Similar
+    to BTRFS on Linux, WAL mode should be avoided on APFS.
+
+    Detection: on macOS, check if the root filesystem is APFS via diskutil.
+    Result is cached for the process lifetime.  Best-effort: never raises.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["diskutil", "info", "/"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "APFS" in result.stdout
+    except Exception:
+        return False
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
@@ -548,6 +571,16 @@ def apply_wal_with_fallback(
     # Vulnerable SQLite: do not enable WAL on new/non-WAL files.
     if is_sqlite_wal_reset_vulnerable():
         return _apply_delete_for_wal_reset_bug(conn, db_label=db_label)
+
+    # APFS (macOS CoW): WAL mode causes intermittent disk I/O errors during
+    # concurrent writes.  Fall back to DELETE mode like BTRFS on Linux (#71498).
+    if _is_on_apfs():
+        existing = _on_disk_journal_mode(conn)
+        if existing == "wal":
+            # Don't downgrade if another process already set WAL on disk.
+            return "wal"
+        conn.execute("PRAGMA journal_mode=DELETE")
+        return "delete"
 
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
