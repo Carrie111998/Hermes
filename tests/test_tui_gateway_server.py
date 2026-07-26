@@ -5196,6 +5196,171 @@ def test_setup_runtime_check_honors_requested_provider(monkeypatch):
     assert default["result"]["provider"] == "anthropic"
 
 
+# ---------------------------------------------------------------------------
+# setup.runtime_check — fallback-aware default readiness poll (#71923)
+# ---------------------------------------------------------------------------
+
+
+def test_setup_runtime_check_default_uses_fallback_when_primary_auth_errors(monkeypatch):
+    """Unscoped readiness poll returns ok=True via the healthy fallback chain
+    (#71923). The previous behaviour raised ``ok=False`` whenever the primary
+    had an AuthError even though the agent's session-creation path was already
+    serving turns off the chain — so the Desktop / dashboard pushed the user
+    into re-onboarding while chat worked."""
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
+
+    primary_attempts = {"n": 0}
+    fallback_runtime = {
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "api_key": "fb-tok",
+        "source": "env/fallback",
+    }
+    primary_attempts = {"n": 0}
+    fallback_resolutions = {"n": 0}
+
+    def fake_resolve(**kwargs):
+        if kwargs.get("requested") in (None, "openai-codex"):
+            primary_attempts["n"] += 1
+            raise AuthError("Rate limit on primary (#71923 repro)")
+        fallback_resolutions["n"] += 1
+        return fallback_runtime
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_fallback_model",
+        lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "setup.runtime_check", "params": {}}
+    )
+
+    assert resp["result"]["ok"] is True, resp["result"]
+    assert resp["result"]["provider"] == "deepseek"
+    assert resp["result"]["model"] == "deepseek-v4-pro"
+    # Mirror the agent-side distinction: a fallback resolution must surface
+    # in the payload so Focus Context / Desktop can render a truthful
+    # "served via fallback" hint instead of the dangling FULL pill.
+    assert resp["result"]["used_fallback"] is True
+    assert resp["result"]["fallback_provider"] == "deepseek"
+    assert resp["result"]["fallback_model"] == "deepseek-v4-pro"
+    # Primary was tried exactly once (no chained retry on the same key)
+    # and the fallback resolver walked the chain once. A second primary
+    # attempt would be the bug classes #61973 / #65153 were catching.
+    assert primary_attempts["n"] == 1
+    assert fallback_resolutions["n"] == 1
+
+
+def test_setup_runtime_check_scoped_provider_never_falls_back(monkeypatch):
+    """When ``provider`` is passed (onboarding validating the credential the
+    user just connected), the probe stays strict and the chain is NOT
+    consulted — otherwise a healthy unrelated fallback would silence a
+    genuine broken-credential (#71923 follow-on trap)."""
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
+    fallback_called = {"n": 0}
+
+    def fake_resolve(**kwargs):
+        if kwargs.get("requested") == "openai-codex":
+            raise AuthError("No Codex credentials stored")
+        fallback_called["n"] += 1
+        return {
+            "provider": kwargs.get("requested") or "elsewhere",
+            "api_key": "fb-tok",
+            "source": "env/fallback",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_fallback_model",
+        lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "setup.runtime_check",
+            "params": {"provider": "openai-codex"},
+        }
+    )
+
+    assert resp["result"]["ok"] is False
+    assert "No Codex credentials stored" in resp["result"]["error"]
+    assert fallback_called["n"] == 0, (
+        "scoped probe MUST NOT walk the fallback chain — that would mask a "
+        "genuine credential failure and push the user into onboarding-loop"
+    )
+    # scoped payload keeps the pre-#71923 shape — no fallback fields leak.
+    assert "used_fallback" not in resp["result"]
+    assert "fallback_provider" not in resp["result"]
+
+
+def test_setup_runtime_check_default_ok_false_when_fallback_chain_empty(monkeypatch):
+    """If neither the primary nor any chain entry yields a runtime, the
+    probe reports ok=False with the original error string — matching
+    session creation's ``_make_agent`` failure mode (#71923 parity)."""
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
+
+    def _always_raise(**kwargs):
+        raise AuthError("primary plus chain exhausted")
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _always_raise
+    )
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: [])
+
+    resp = server.handle_request(
+        {"id": "1", "method": "setup.runtime_check", "params": {}}
+    )
+
+    assert resp["result"]["ok"] is False
+    assert resp["result"]["error"] == "primary plus chain exhausted"
+
+
+def test_setup_runtime_check_default_payload_omits_fallback_fields_when_unused(monkeypatch):
+    """Without a chain hit, the result dict matches the pre-#71923 payload
+    shape modulo the new ``used_fallback=False`` field. Clients that already
+    key on ``provider`` / ``model`` / ``source`` keep working — additive,
+    never breaking."""
+    monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "openai",
+            "model": "gpt-5",
+            "api_key": "sk-x",
+            "source": "env/config",
+        },
+    )
+    monkeypatch.setattr(server, "_load_fallback_model", lambda: [])
+
+    resp = server.handle_request(
+        {"id": "1", "method": "setup.runtime_check", "params": {}}
+    )
+
+    result = resp["result"]
+    assert result["ok"] is True
+    assert result["provider"] == "openai"
+    assert result["model"] == "gpt-5"
+    assert result["used_fallback"] is False
+    # No fallback fields leak when no fallback was actually used — keeps
+    # the JSON shape predictable for cached struct parsers.
+    assert "fallback_provider" not in result
+    assert "fallback_model" not in result
+
+
 def test_complete_slash_drops_removed_provider_alias():
     # `/provider` was folded into a single `/model` command, so autocomplete
     # must no longer offer the dead alias...

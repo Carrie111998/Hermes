@@ -14280,20 +14280,58 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Strict provider check: does the configured/default model actually resolve to a usable runtime?
 
-    Unlike setup.status (which returns True if ANY provider auth state is
-    discoverable, including indirect fallbacks like ``gh auth token`` for
-    Copilot), this runs the same resolve_runtime_provider() call the agent
-    uses on session creation. It returns ok=False with the auth error message
-    when the user's configured model cannot actually be served, so UIs can
-    surface onboarding before the user submits a doomed prompt.
+    Falls back to the user's ``fallback_model`` chain when the unscoped
+    readiness poll is requested AND the primary fails with AuthError —
+    mirroring what ``_resolve_runtime_with_fallback`` already does for
+    session creation (#71923). When the caller passes a ``provider`` param
+    (onboarding validating a freshly-added credential) the check stays
+    strict: reporting ok for some *other* provider would mask a genuinely
+    broken credential and invite the user into a config-rewrite loop
+    they shouldn't have to make.
     """
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
         from hermes_cli.auth import has_usable_secret
         from hermes_cli.main import _has_any_provider_configured
 
         requested = str(params.get("provider") or "").strip() or None
-        runtime = resolve_runtime_provider(requested=requested)
+        used_fallback = False
+        fallback_provider: str | None = None
+        fallback_model: str | None = None
+
+        if requested:
+            # Scoped probe — never falls back. Mirrors
+            # session-create-strict semantics: a connected-provider
+            # onboarding check must not be silenced by an unrelated chain
+            # entry that's healthy.
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(requested=requested)
+        else:
+            # Default readiness poll — must agree with _make_agent so a
+            # rate-limited primary with a healthy chain does not push
+            # the UI to onboarding while chat is actually serving
+            # turns (#71923).
+            resolution = _resolve_runtime_with_fallback()
+            runtime = resolution.runtime
+            used_fallback = resolution.used_fallback
+            if used_fallback:
+                fallback_model = resolution.selected_model
+                # ``selected_model`` is the model the fallback entry
+                # named; the actual provider/model served live on the
+                # resolved runtime are the runtime's own fields. Surface
+                # both so clients can show "served via fallback" without
+                # re-parsing logs.
+                fallback_provider = (
+                    runtime.get("provider") if isinstance(runtime, dict) else None
+                )
+
+        if not isinstance(runtime, dict):
+            # Defensive — _resolve_runtime_with_fallback always returns
+            # a dict in its success path, but a third-party resolver
+            # could diverge in the future. Coverage here pins the
+            # contract before any client reads ``runtime.get(...)``.
+            return _ok(rid, {"ok": False, "error": "Runtime resolution returned no payload."})
+
         provider_configured = bool(_has_any_provider_configured())
         provider = runtime.get("provider") or "provider"
         source = str(runtime.get("source") or "")
@@ -14333,15 +14371,25 @@ def _(rid, params: dict) -> dict:
                 },
             )
 
-        return _ok(
-            rid,
-            {
-                "ok": True,
-                "provider": runtime.get("provider"),
-                "model": runtime.get("model"),
-                "source": runtime.get("source"),
-            },
-        )
+        # Result payload includes the no-impact additions the iOS / Desktop
+        # Focus Context surface already treats as optional. Clients that
+        # don't yet read ``used_fallback`` keep treating the response as
+        # a boolean readiness pill; clients that do can render a
+        # "served via <fallback_provider>" hint and stop pushing
+        # onboarding on a healthy-fallback state (#71923).
+        result = {
+            "ok": True,
+            "provider": runtime.get("provider"),
+            "model": runtime.get("model"),
+            "source": runtime.get("source"),
+            "used_fallback": used_fallback,
+        }
+        if used_fallback and fallback_provider:
+            result["fallback_provider"] = fallback_provider
+        if used_fallback and fallback_model:
+            result["fallback_model"] = fallback_model
+
+        return _ok(rid, result)
     except Exception as e:
         return _ok(rid, {"ok": False, "error": str(e)})
 
