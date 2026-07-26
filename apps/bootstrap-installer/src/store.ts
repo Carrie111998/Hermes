@@ -83,6 +83,7 @@ export const $progress = computed($bootstrap, b => {
   if (total === 0) {
     return { done: 0, total: 0, fraction: 0 }
   }
+
   let done = 0
 
   for (const name of b.stageOrder) {
@@ -359,11 +360,13 @@ export async function launchHermesDesktop(): Promise<void> {
   if (fakeMode()) {
     throw new Error('Preview mode — launching is disabled.')
   }
+
   const installRoot = $bootstrap.get().installRoot
 
   if (!installRoot) {
     throw new Error('no install root')
   }
+
   await invoke('launch_hermes_desktop', { installRoot })
 }
 
@@ -371,6 +374,7 @@ export async function openLogDir(): Promise<void> {
   if (fakeMode()) {
     return
   }
+
   await invoke('open_log_dir')
 }
 
@@ -391,6 +395,7 @@ function fakeMode(): FakeMode | null {
   if (!import.meta.env.DEV || typeof window === 'undefined') {
     return null
   }
+
   const v = new URLSearchParams(window.location.search).get('fake')
 
   return v === 'install' || v === 'update' || v === 'failure' ? v : null
@@ -435,6 +440,7 @@ async function runFakeBoot(kind: FakeMode): Promise<void> {
   if (fakeRunning) {
     return
   }
+
   fakeRunning = true
   fakeCancelled = false
 
@@ -445,6 +451,7 @@ async function runFakeBoot(kind: FakeMode): Promise<void> {
       if (!fakeCancelled) {
         return false
       }
+
       fakeFail(kind === 'update' ? 'Update cancelled.' : 'Install cancelled.')
       $route.set('failure')
 
@@ -471,6 +478,7 @@ async function runFakeBoot(kind: FakeMode): Promise<void> {
       if (cancelled()) {
         return
       }
+
       fakeStage(s.name, 'running')
 
       const durationMs = 700 + Math.floor(Math.random() * 2200)
@@ -482,6 +490,7 @@ async function runFakeBoot(kind: FakeMode): Promise<void> {
         if (cancelled()) {
           return
         }
+
         fakeLog(s.name, `[${s.name}] ${s.title.toLowerCase()} — step ${l + 1}/${lines}…`)
       }
 

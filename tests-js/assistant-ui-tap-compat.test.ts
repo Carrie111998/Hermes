@@ -53,6 +53,7 @@ function caretSatisfies(version: string, spec: string): boolean {
       .replace(/^[^0-9]+/, '')
       .split('-')[0]
       .split('+')[0]
+
     const parts = core.split('.').slice(0, 3)
 
     while (parts.length < 3) {
@@ -81,6 +82,7 @@ function caretSatisfies(version: string, spec: string): boolean {
       ) {
         continue
       }
+
       let hi: [number, number, number]
 
       if (lo[0] > 0) {
@@ -119,6 +121,7 @@ function lockPackages(): Record<string, LockPackage> {
   if (!fs.existsSync(LOCK_PATH)) {
     return {}
   }
+
   const lock = JSON.parse(fs.readFileSync(LOCK_PATH, 'utf-8'))
 
   return (lock.packages ?? {}) as Record<string, LockPackage>
@@ -169,11 +172,13 @@ test("every @assistant-ui/* package's tap requirement is satisfiable", () => {
     if (!name.startsWith('@assistant-ui/') || name === TAP) {
       continue
     }
+
     const peerMeta = (meta.peerDependenciesMeta ?? {})[TAP]
 
     if (peerMeta?.optional) {
       continue
     }
+
     const spec = (meta.dependencies ?? {})[TAP] || (meta.peerDependencies ?? {})[TAP]
 
     if (!spec) {
