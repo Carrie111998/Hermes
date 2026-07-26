@@ -86,6 +86,64 @@ export interface HermesSystemStatus {
   readonly brokerSubmissionAvailable: false
 }
 
+interface LocalDesktopBridgeError {
+  readonly ok: false
+  readonly error: string
+  readonly message: string
+}
+
+interface LocalDesktopBackendStatus {
+  readonly bridge_version: string
+  readonly status: string
+  readonly mode: string
+  readonly environment: string
+  readonly simulation: boolean
+  readonly execution_authorized: boolean
+  readonly broker_submission_available: boolean
+  readonly supported_commands: readonly string[]
+}
+
+interface LocalDesktopProposalExplanation {
+  readonly kind: 'proposal-explanation'
+  readonly summary: string
+  readonly explanation: string
+  readonly model_route: string
+  readonly source: 'local'
+  readonly confidence: number
+  readonly evidence_references: readonly HermesEvidenceReference[]
+  readonly generated_at: string
+  readonly execution_authorized: false
+  readonly broker_submission_available: false
+}
+
+type LocalDesktopBridgeResponse<T> =
+  | {
+      readonly ok: true
+      readonly result: T
+    }
+  | LocalDesktopBridgeError
+
+interface LocalDesktopBridge {
+  getBackendStatus(): Promise<LocalDesktopBridgeResponse<LocalDesktopBackendStatus>>
+
+  explainProposal(payload: {
+    readonly proposal_id: string
+    readonly symbol: string
+    readonly side: 'BUY' | 'SELL'
+    readonly estimated_notional: number
+    readonly strategy: string
+    readonly evidence_references: readonly HermesEvidenceReference[]
+  }): Promise<LocalDesktopBridgeResponse<LocalDesktopProposalExplanation>>
+}
+
+function localDesktopBridge(): LocalDesktopBridge | undefined {
+  return (
+    window as typeof window & {
+      readonly sigilDesktop?: LocalDesktopBridge
+    }
+  ).sigilDesktop
+}
+
 export interface SigilHermesEngine {
   readonly status: HermesEngineStatus
 
@@ -254,10 +312,8 @@ export class DisconnectedHermesEngine implements SigilHermesEngine {
 export class LocalHermesEngine extends DisconnectedHermesEngine {
   override readonly status: HermesEngineStatus = 'connected'
 
-  override async explainProposal(
-    context: HermesProposalContext
-  ): Promise<HermesAnalysisResult> {
-    const bridge = window.sigilDesktop
+  override async explainProposal(context: HermesProposalContext): Promise<HermesAnalysisResult> {
+    const bridge = localDesktopBridge()
 
     if (!bridge) {
       return super.explainProposal(context)
@@ -301,7 +357,7 @@ export class LocalHermesEngine extends DisconnectedHermesEngine {
   }
 
   override async getSystemStatus(): Promise<HermesSystemStatus> {
-    const bridge = window.sigilDesktop
+    const bridge = localDesktopBridge()
 
     if (!bridge) {
       return super.getSystemStatus()
@@ -344,10 +400,7 @@ export class LocalHermesEngine extends DisconnectedHermesEngine {
         status: 'degraded',
         source: 'local',
         modelRoute: 'local-backend-error',
-        message:
-          reason instanceof Error
-            ? reason.message
-            : 'The local Sigil backend status could not be verified.',
+        message: reason instanceof Error ? reason.message : 'The local Sigil backend status could not be verified.',
         generatedAt: now(),
         executionAuthorized: false,
         brokerSubmissionAvailable: false

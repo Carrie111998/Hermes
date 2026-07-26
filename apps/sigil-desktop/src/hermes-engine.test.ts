@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { DisconnectedHermesEngine, LocalHermesEngine, type HermesProposalContext, type SigilHermesEngine } from './hermes-engine'
+import {
+  DisconnectedHermesEngine,
+  type HermesProposalContext,
+  LocalHermesEngine,
+  type SigilHermesEngine
+} from './hermes-engine'
 
 const proposal: HermesProposalContext = {
   proposalId: 'PRP-STEP36-0001',
@@ -102,6 +107,11 @@ describe('LocalHermesEngine', () => {
       productName: 'Sigil',
       persistenceNamespace: 'com.firecattechnology.sigil',
       brokerSubmissionAvailable: false,
+      explainProposal: async () => ({
+        ok: false,
+        error: 'not_used',
+        message: 'Proposal explanation is not used by this status test.'
+      }),
       getBackendStatus: async () => ({
         ok: true,
         result: {
@@ -138,6 +148,11 @@ describe('LocalHermesEngine', () => {
       productName: 'Sigil',
       persistenceNamespace: 'com.firecattechnology.sigil',
       brokerSubmissionAvailable: false,
+      explainProposal: async () => ({
+        ok: false,
+        error: 'not_used',
+        message: 'Proposal explanation is not used by this status test.'
+      }),
       getBackendStatus: async () => ({
         ok: false,
         error: 'backend_unavailable',

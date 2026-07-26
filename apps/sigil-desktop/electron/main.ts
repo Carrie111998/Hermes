@@ -131,6 +131,7 @@ export function runBridgeRequest<T>(
 
         if (parsed && typeof parsed === 'object' && 'ok' in parsed) {
           finish(parsed)
+
           return
         }
       } catch {

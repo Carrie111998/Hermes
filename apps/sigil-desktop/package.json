@@ -16,7 +16,9 @@
     "lint": "eslint src electron scripts",
     "build": "vite build && node scripts/bundle-electron.mjs",
     "dist:mac:zip": "npm run build && electron-builder --mac zip",
-    "dist:mac:dmg": "npm run build && electron-builder --mac dmg"
+    "dist:mac:dmg": "npm run build && electron-builder --mac dmg",
+    "check": "npm run typecheck && npm run test && npm run lint",
+    "fix": "eslint src electron scripts --fix"
   },
   "dependencies": {
     "@tabler/icons-react": "^3.41.1",
@@ -50,8 +52,14 @@
     "productName": "Sigil",
     "executableName": "Sigil",
     "artifactName": "Sigil-${version}-${os}-${arch}.${ext}",
-    "directories": { "output": "release" },
-    "files": ["dist/**", "assets/**", "package.json"],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "assets/**",
+      "package.json"
+    ],
     "asar": true,
     "mac": {
       "category": "public.app-category.finance",
@@ -64,6 +72,8 @@
       "hardenedRuntime": true,
       "gatekeeperAssess": false
     },
-    "dmg": { "title": "Install Sigil" }
+    "dmg": {
+      "title": "Install Sigil"
+    }
   }
 }

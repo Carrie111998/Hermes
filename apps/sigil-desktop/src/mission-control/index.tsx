@@ -12,10 +12,9 @@ import { SearchField } from '@/components/ui/search-field'
 import { cn } from '@/lib/utils'
 
 import {
-  DisconnectedHermesEngine,
-  LocalHermesEngine,
   type HermesAnalysisResult,
   type HermesSystemStatus,
+  LocalHermesEngine,
   type SigilHermesEngine
 } from '../hermes-engine'
 
