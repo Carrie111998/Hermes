@@ -145,12 +145,17 @@ Callbacks use `X-Webhook-Timestamp` plus `X-Webhook-Signature-V2`, an HMAC-SHA25
 sanitized error code, and the selected fields under `correlation`. Receivers should enforce the
 five-minute timestamp window and use `(delivery_id,status)` as an idempotency key.
 
-`running` is best effort. Before a terminal callback is sent, Hermes atomically writes it beneath
-`~/.hermes/webhook_callback_outbox/` with directory mode 0700 and file mode 0600. Only a 2xx
-response removes it; non-2xx responses, timeout, process exit, or restart leave it available for
-replay. Hermes retries retained entries every 60 seconds while the gateway is running; set global
+Terminal callbacks are durable; `running` is best effort. Before Hermes returns HTTP 202 for a
+callback-enabled route, it atomically writes an accepted-intent record beneath
+`~/.hermes/webhook_callback_outbox/`. If the gateway restarts before terminal processing, that
+unfinished intent becomes a signed `failed` callback instead of remaining stuck indefinitely.
+Before a normal terminal callback is sent, Hermes atomically replaces the intent with a terminal
+spool record. Files use mode 0600, the directory uses 0700, and file plus parent-directory metadata
+are fsynced. Only a 2xx response removes a terminal record; non-2xx responses, timeout, process
+exit, or restart leave it available for replay. Hermes retries retained entries every 60 seconds
+while the gateway is running; set global
 `platforms.webhook.extra.callback_replay_interval_seconds` to 10–3600 to adjust this. The spool
-contains the callback body and route name but never the callback URL or secret.
+contains correlation IDs, callback bodies, and route names but never the callback URL or secret.
 Redirects are not followed, preventing signature forwarding to a different host.
 
 ### Payload Filters

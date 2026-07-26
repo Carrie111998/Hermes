@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
@@ -71,6 +72,25 @@ def make_event(adapter: WebhookAdapter) -> MessageEvent:
     )
 
 
+def inbound_payload() -> dict:
+    return {
+        "delivery_id": DELIVERY,
+        "discord_thread_id": "1530677153690161303",
+        "event_type": "utility_review_investigation",
+        "investigation_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "requested_by": "234137250441592832",
+        "review_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    }
+
+
+async def webhook_client(adapter: WebhookAdapter) -> TestClient:
+    app = web.Application()
+    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    return client
+
+
 def test_completion_callback_config_fails_closed():
     adapter = make_adapter()
     with pytest.raises(ValueError, match="too short"):
@@ -87,6 +107,63 @@ def test_completion_callback_config_fails_closed():
                 )
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_callback_intent_is_durable_before_202(tmp_path):
+    adapter = make_adapter(callback_config())
+    adapter._callback_outbox_dir = lambda: tmp_path / "outbox"
+    adapter.handle_message = AsyncMock()
+    client = await webhook_client(adapter)
+    raw = json.dumps(inbound_payload(), separators=(",", ":")).encode()
+    signature = hmac.new(b"incoming-secret", raw, hashlib.sha256).hexdigest()
+    try:
+        response = await client.post(
+            f"/webhooks/{ROUTE}",
+            data=raw,
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-ID": DELIVERY,
+                "X-Webhook-Signature": signature,
+            },
+        )
+        assert response.status == 202
+        intents = list((tmp_path / "outbox").glob("intent-*.json"))
+        assert len(intents) == 1
+        assert stat.S_IMODE(intents[0].stat().st_mode) == 0o600
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_intent_persistence_failure_returns_503_without_consuming_delivery(
+    tmp_path,
+):
+    adapter = make_adapter(callback_config())
+    adapter._callback_outbox_dir = lambda: tmp_path / "outbox"
+    adapter.handle_message = AsyncMock()
+    original = adapter._spool_completion_intent
+
+    def fail_intent(*_args):
+        raise OSError("disk full")
+
+    adapter._spool_completion_intent = fail_intent
+    client = await webhook_client(adapter)
+    raw = json.dumps(inbound_payload(), separators=(",", ":")).encode()
+    signature = hmac.new(b"incoming-secret", raw, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Request-ID": DELIVERY,
+        "X-Webhook-Signature": signature,
+    }
+    try:
+        response = await client.post(f"/webhooks/{ROUTE}", data=raw, headers=headers)
+        assert response.status == 503
+        adapter._spool_completion_intent = original
+        response = await client.post(f"/webhooks/{ROUTE}", data=raw, headers=headers)
+        assert response.status == 202
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -193,6 +270,47 @@ async def test_failed_callback_survives_and_replays_after_restart(tmp_path):
     assert not list((tmp_path / "outbox").glob("*.json"))
     replayed = restarted._send_completion_callback.await_args.args[1]
     assert replayed == entry["body"]
+
+
+@pytest.mark.asyncio
+async def test_unfinished_accepted_intent_recovers_as_failed(tmp_path):
+    adapter = make_adapter(callback_config())
+    event = make_event(adapter)
+    adapter._callback_outbox_dir = lambda: tmp_path / "outbox"
+    intent = adapter._spool_completion_intent(
+        ROUTE, adapter._delivery_info[event.source.chat_id]
+    )
+    assert intent.exists()
+
+    restarted = make_adapter(callback_config())
+    restarted._callback_outbox_dir = lambda: tmp_path / "outbox"
+    await restarted._recover_completion_callback_intents()
+
+    assert not list((tmp_path / "outbox").glob("intent-*.json"))
+    terminal = list((tmp_path / "outbox").glob("*.json"))
+    assert len(terminal) == 1
+    recovered = json.loads(terminal[0].read_text())["body"]
+    assert recovered["status"] == "failed"
+    assert recovered["error_code"] == "processing_failed"
+
+
+@pytest.mark.asyncio
+async def test_existing_terminal_spool_wins_over_stale_intent(tmp_path):
+    adapter = make_adapter(callback_config())
+    event = make_event(adapter)
+    adapter._callback_outbox_dir = lambda: tmp_path / "outbox"
+    adapter._spool_completion_intent(
+        ROUTE, adapter._delivery_info[event.source.chat_id]
+    )
+    completed = adapter._completion_callback_body(event, "completed")
+    adapter._spool_completion_callback(ROUTE, completed)
+
+    await adapter._recover_completion_callback_intents()
+
+    assert not list((tmp_path / "outbox").glob("intent-*.json"))
+    terminal = list((tmp_path / "outbox").glob("*.json"))
+    assert len(terminal) == 1
+    assert json.loads(terminal[0].read_text())["body"]["status"] == "completed"
 
 
 @pytest.mark.asyncio

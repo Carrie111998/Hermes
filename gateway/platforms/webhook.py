@@ -898,6 +898,23 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
+        if callback_config:
+            try:
+                self._spool_completion_intent(route_name, deliver_config)
+            except Exception:
+                self._seen_deliveries.pop(delivery_id, None)
+                self._delivery_info.pop(session_chat_id, None)
+                self._delivery_info_created.pop(session_chat_id, None)
+                logger.exception(
+                    "[webhook] Refusing callback-enabled request because "
+                    "accepted intent could not be persisted route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {"error": "Completion callback intent could not be persisted"},
+                    status=503,
+                )
 
         # Build source and event
         source = self.build_source(
@@ -1044,11 +1061,14 @@ class WebhookAdapter(BasePlatformAdapter):
         body = self._completion_callback_body(event, status)
         if body is None:
             return
+        route_name = str(delivery["route_name"])
+        intent_path = self._completion_intent_path(
+            route_name, str(body["delivery_id"])
+        )
         path: Optional[Path] = None
+        delivered = False
         try:
-            path = self._spool_completion_callback(
-                self._delivery_info[event.source.chat_id]["route_name"], body
-            )
+            path = self._spool_completion_callback(route_name, body)
         except Exception:
             logger.exception(
                 "[webhook] Failed to persist completion callback delivery=%s status=%s",
@@ -1056,37 +1076,54 @@ class WebhookAdapter(BasePlatformAdapter):
                 status,
             )
         try:
-            if await self._send_completion_callback(event.source.chat_id, body) and path:
-                path.unlink(missing_ok=True)
+            delivered = await self._send_completion_callback(
+                event.source.chat_id, body
+            )
+            if delivered and path:
+                self._remove_callback_spool(path)
         except Exception:
             logger.exception(
                 "[webhook] Failed to emit completion callback delivery=%s status=%s",
                 body.get("delivery_id"),
                 status,
             )
+        finally:
+            if path is not None or delivered:
+                self._remove_callback_spool(intent_path)
 
     def _callback_outbox_dir(self) -> Path:
         return get_hermes_home() / "webhook_callback_outbox"
 
-    def _spool_completion_callback(self, route_name: str, body: dict) -> Path:
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            logger.debug("[webhook] Directory fsync unavailable for %s", path)
+
+    def _ensure_callback_outbox(self) -> Path:
         outbox = self._callback_outbox_dir()
+        created = not outbox.exists()
         outbox.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(outbox, 0o700)
-        key = hashlib.sha256(
-            f"{route_name}:{body['delivery_id']}:{body['status']}".encode()
-        ).hexdigest()
-        path = outbox / f"{key}.json"
-        entry = json.dumps(
-            {"body": body, "route": route_name},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
+        if created:
+            self._fsync_directory(outbox.parent)
+        return outbox
+
+    def _write_callback_spool(self, path: Path, entry: bytes) -> Path:
+        outbox = self._ensure_callback_outbox()
+        if path.parent != outbox:
+            raise ValueError("callback spool path outside outbox")
         if path.exists():
             existing = path.read_bytes()
             if existing != entry:
                 raise ValueError("completion callback spool conflict")
             return path
-        tmp = outbox / f".{key}.{os.getpid()}.{time.time_ns()}.tmp"
+        tmp = outbox / f".{path.stem}.{os.getpid()}.{time.time_ns()}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "wb") as handle:
@@ -1095,9 +1132,53 @@ class WebhookAdapter(BasePlatformAdapter):
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
             os.chmod(path, 0o600)
+            self._fsync_directory(outbox)
         finally:
             tmp.unlink(missing_ok=True)
         return path
+
+    def _remove_callback_spool(self, path: Path) -> None:
+        if path.exists():
+            path.unlink()
+            self._fsync_directory(path.parent)
+
+    def _completion_intent_path(self, route_name: str, delivery_id: str) -> Path:
+        key = hashlib.sha256(f"{route_name}:{delivery_id}".encode()).hexdigest()
+        return self._callback_outbox_dir() / f"intent-{key}.json"
+
+    def _completion_callback_path(
+        self, route_name: str, delivery_id: str, status: str
+    ) -> Path:
+        key = hashlib.sha256(
+            f"{route_name}:{delivery_id}:{status}".encode()
+        ).hexdigest()
+        return self._callback_outbox_dir() / f"{key}.json"
+
+    def _spool_completion_intent(self, route_name: str, delivery: dict) -> Path:
+        delivery_id = str(delivery["delivery_id"])
+        path = self._completion_intent_path(route_name, delivery_id)
+        entry = json.dumps(
+            {
+                "accepted_at": int(time.time()),
+                "correlation": delivery["completion_correlation"],
+                "delivery_id": delivery_id,
+                "route": route_name,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return self._write_callback_spool(path, entry)
+
+    def _spool_completion_callback(self, route_name: str, body: dict) -> Path:
+        path = self._completion_callback_path(
+            route_name, str(body["delivery_id"]), str(body["status"])
+        )
+        entry = json.dumps(
+            {"body": body, "route": route_name},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return self._write_callback_spool(path, entry)
 
     async def _send_completion_callback(
         self, session_chat_id: str, body: dict
@@ -1148,7 +1229,64 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         return False
 
+    async def _recover_completion_callback_intents(self) -> None:
+        outbox = self._callback_outbox_dir()
+        if not outbox.exists():
+            return
+        for path in sorted(outbox.glob("intent-*.json")):
+            try:
+                if path.is_symlink() or path.stat().st_mode & 0o077:
+                    logger.error(
+                        "[webhook] Refusing insecure callback intent file %s", path
+                    )
+                    continue
+                entry = json.loads(path.read_text())
+                if not isinstance(entry, dict) or set(entry) != {
+                    "accepted_at",
+                    "correlation",
+                    "delivery_id",
+                    "route",
+                }:
+                    raise ValueError("invalid callback intent schema")
+                route_name = entry["route"]
+                delivery_id = entry["delivery_id"]
+                correlation = entry["correlation"]
+                if (
+                    not isinstance(route_name, str)
+                    or not route_name
+                    or not isinstance(delivery_id, str)
+                    or not delivery_id
+                    or not isinstance(correlation, dict)
+                    or not isinstance(entry["accepted_at"], int)
+                ):
+                    raise ValueError("invalid callback intent values")
+                terminal_exists = any(
+                    self._completion_callback_path(
+                        route_name, delivery_id, terminal_status
+                    ).exists()
+                    for terminal_status in ("completed", "failed", "cancelled")
+                )
+                if not terminal_exists:
+                    self._spool_completion_callback(
+                        route_name,
+                        {
+                            "correlation": correlation,
+                            "delivery_id": delivery_id,
+                            "error_code": "processing_failed",
+                            "event_type": _CALLBACK_EVENT_TYPE,
+                            "occurred_at": int(time.time()),
+                            "route": route_name,
+                            "status": "failed",
+                        },
+                    )
+                self._remove_callback_spool(path)
+            except Exception:
+                logger.exception(
+                    "[webhook] Failed to recover callback intent %s", path
+                )
+
     async def _completion_callback_replay_loop(self) -> None:
+        await self._recover_completion_callback_intents()
         while True:
             try:
                 await self._replay_completion_callbacks()
@@ -1163,6 +1301,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if not outbox.exists():
             return
         for path in sorted(outbox.glob("*.json")):
+            if path.name.startswith("intent-"):
+                continue
             try:
                 if path.is_symlink() or path.stat().st_mode & 0o077:
                     logger.error(
@@ -1192,7 +1332,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
                 try:
                     if await self._send_completion_callback(session_chat_id, body):
-                        path.unlink(missing_ok=True)
+                        self._remove_callback_spool(path)
                 finally:
                     self._delivery_info.pop(session_chat_id, None)
             except Exception:
