@@ -3492,9 +3492,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # already worker-owned-closed by _close_request_client_once
                         # above; the next attempt builds a fresh one. The shared
                         # _anthropic_client is never closed from inside a request.
-                        # #70773: same FD-recycle corruption vector for OpenAI.
-                        # The shared client will be replaced lazily by
-                        # _ensure_primary_openai_client on the next attempt.
+                        # #70773: retire (not close) the shared client —
+                        # _retire_shared_openai_client is FD-safe from any
+                        # thread. The next _ensure_primary_openai_client
+                        # will build a fresh shared client with clean sockets.
+                        try:
+                            agent._retire_shared_openai_client(
+                                agent.client,
+                                reason="stream_mid_tool_retry_pool_cleanup",
+                            )
+                        except Exception:
+                            pass
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -3553,9 +3561,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # above; next attempt builds fresh), so the shared
                             # _anthropic_client is never closed from inside a
                             # request — only the OpenAI-wire primary is refreshed.
-                            # #70773: same FD-recycle corruption vector for OpenAI.
-                            # The shared client will be replaced lazily by
-                            # _ensure_primary_openai_client on the next attempt.
+                            # #70773: retire (not close) the shared client —
+                            # _retire_shared_openai_client is FD-safe from any
+                            # thread.
+                            try:
+                                agent._retire_shared_openai_client(
+                                    agent.client,
+                                    reason="stream_retry_pool_cleanup",
+                                )
+                            except Exception:
+                                pass
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
@@ -3798,15 +3813,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # FD-recycle corruption vector. Nothing further is needed.
                 pass
             else:
-                # #70773: same FD-recycle corruption vector as #67142.
-                # The shared OpenAI client's connection pool must NOT be
-                # closed from this watchdog/poll thread — worker threads
-                # from previous stale-killed attempts may still be
-                # unwinding their SSL BIOs.  The request-local client is
-                # already closed above via _close_request_client_once.
-                # The shared client will be replaced lazily by
-                # _ensure_primary_openai_client on the next request.
-                pass
+                # #70773: retire (not close) the shared client —
+                # _retire_shared_openai_client uses shutdown(SHUT_RDWR)
+                # which is FD-safe from any thread. The request-local
+                # client is already closed above.
+                try:
+                    agent._retire_shared_openai_client(
+                        agent.client,
+                        reason="stale_stream_pool_cleanup",
+                    )
+                except Exception:
+                    pass
             # Reset the timer so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
