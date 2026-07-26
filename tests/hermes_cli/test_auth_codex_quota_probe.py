@@ -390,7 +390,7 @@ def test_pool_entry_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
         auth_mod, "_probe_codex_quota_restored", lambda token, **kw: True
     )
 
-    available = pool._available_entries(clear_expired=True, refresh=False)
+    available, _pending = pool._available_entries(clear_expired=True, refresh=False)
     assert len(available) == 1
     assert available[0].last_status == "ok"
     assert available[0].last_error_reset_at is None
@@ -407,7 +407,8 @@ def test_pool_entry_stays_frozen_when_probe_negative(tmp_path, monkeypatch):
         auth_mod, "_probe_codex_quota_restored", lambda token, **kw: False
     )
 
-    assert pool._available_entries(clear_expired=True, refresh=False) == []
+    available, _pending = pool._available_entries(clear_expired=True, refresh=False)
+    assert available == []
 
 
 def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
@@ -451,7 +452,8 @@ def test_pool_readonly_enumeration_does_not_probe(tmp_path, monkeypatch):
         return True
 
     monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _spy)
-    assert pool._available_entries(clear_expired=False, refresh=False) == []
+    available, _pending = pool._available_entries(clear_expired=False, refresh=False)
+    assert available == []
     assert probes == []
 
 

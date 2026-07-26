@@ -1731,7 +1731,7 @@ def test_pool_exhausted_xai_entry_recovers_after_singleton_refresh(tmp_path, mon
 
     # _available_entries must sync from the singleton, lifting the
     # exhausted state for the seeded entry.
-    available = pool._available_entries(clear_expired=True, refresh=False)
+    available, _pending = pool._available_entries(clear_expired=True, refresh=False)
     assert len(available) == 1
     assert available[0].access_token == fresh_at
     assert available[0].refresh_token == "rt-fresh"

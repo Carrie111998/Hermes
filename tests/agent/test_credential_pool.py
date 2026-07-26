@@ -2815,7 +2815,7 @@ def test_nous_exhausted_entry_recovers_via_auth_store_sync(tmp_path, monkeypatch
         },
     )
 
-    available = pool._available_entries(clear_expired=True)
+    available, _pending = pool._available_entries(clear_expired=True)
     assert len(available) == 1
     assert available[0].refresh_token == "refresh-FRESH"
     assert available[0].last_status is None
@@ -2916,13 +2916,13 @@ def test_codex_exhausted_entry_recovers_via_auth_store_sync(tmp_path, monkeypatc
     # Sanity: before the reauth, _available_entries refuses to return
     # this entry because last_error_reset_at is in the future.
     # (clear_expired would only clear it AFTER exhausted_until elapsed.)
-    available_before = pool._available_entries(clear_expired=True, refresh=False)
+    available_before, _pending = pool._available_entries(clear_expired=True, refresh=False)
     assert available_before == []
 
     # Simulate `hermes model` / `hermes auth` refreshing the tokens.
     _write_auth_store(tmp_path, _codex_auth_store("access-FRESH", "refresh-FRESH"))
 
-    available = pool._available_entries(clear_expired=True, refresh=False)
+    available, _pending = pool._available_entries(clear_expired=True, refresh=False)
     assert len(available) == 1
     assert available[0].access_token == "access-FRESH"
     assert available[0].refresh_token == "refresh-FRESH"
@@ -2957,7 +2957,7 @@ def test_codex_exhausted_entry_stays_stuck_without_auth_store_update(tmp_path, m
 
     # auth.json unchanged → sync returns same entry → exhausted_until check
     # still skips it.
-    available = pool._available_entries(clear_expired=True, refresh=False)
+    available, _pending = pool._available_entries(clear_expired=True, refresh=False)
     assert available == []
 
 
