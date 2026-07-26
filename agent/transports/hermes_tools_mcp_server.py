@@ -37,7 +37,7 @@ What we DO NOT expose:
                                            drive them. See the inline
                                            comment on EXPOSED_TOOLS below.
 
-Exposed via STATELESS SHIMS (#26567) rather than the generic dispatcher:
+Exposed via STATELESS SHIMS (#26604) rather than the generic dispatcher:
   - memory                               — tools.memory_tool.load_on_disk_store()
                                            per call: native caps, drift guard,
                                            threat scan, locking all inherited
@@ -162,7 +162,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
-# --- Stateless agent-loop shims (#26567) ---------------------------------
+# --- Stateless agent-loop shims (#26604) ---------------------------------
 #
 # `memory` and `session_search` are `_AGENT_LOOP_TOOLS`: the generic
 # dispatcher refuses them because natively they receive live agent state
@@ -485,7 +485,7 @@ def _build_server() -> Any:
 
         exposed_count += 1
 
-    # Stateless agent-loop shims (#26567) — registered as dedicated
+    # Stateless agent-loop shims (#26604) — registered as dedicated
     # closures so handle_function_call's `_AGENT_LOOP_TOOLS` refusal stays
     # intact for every other caller. Same signature-from-schema mechanics
     # as the loop above so FastMCP serves the authoritative registry schema.

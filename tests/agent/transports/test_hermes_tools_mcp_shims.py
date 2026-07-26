@@ -1,5 +1,5 @@
 """Tests for the stateless memory/session_search shims in the hermes-tools
-MCP server (#26567).
+MCP server (#26604).
 
 Natively `memory` and `session_search` are `_AGENT_LOOP_TOOLS`: the generic
 dispatcher refuses them because they need live AIAgent state. The shims
