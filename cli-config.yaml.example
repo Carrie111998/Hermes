@@ -783,6 +783,30 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Claude Agent SDK provider runtime (provider: claude-agent-sdk).
+  # claude_agent_sdk:
+  #   # Emit the SDK's partial-message deltas into the gateway streaming
+  #   # pipeline (default off — upstream-conservative; the top-level
+  #   # streaming: block still governs how deltas are displayed).
+  #   streaming: false
+  #   # Subscription-only: environment credentials, endpoint overrides, and
+  #   # alternate metered backends are rejected before Claude starts.
+  #   # Optional operator persona/soul override. Empty loads the active
+  #   # HERMES_HOME/SOUL.md, falling back to Hermes' built-in identity.
+  #   append_file: ""
+  #   # add_dirs grants paths to Claude Code's native tools; it is not a
+  #   # read-only mount. Under default auto/acceptEdits, native edits and common
+  #   # filesystem mutations in added roots may be automatic. Removing Hermes
+  #   # MCP file/terminal tools does not remove Claude native tools. Therefore
+  #   # read-oriented headless profiles must use native_read_only: true and may
+  #   # additionally use HERMES_TERMINAL_SECURITY_MODE=approval-required.
+  #   # Paths are normalized/deduplicated; changes apply to new SDK sessions.
+  #   add_dirs: []
+  #   # Native read-only disables user/project/local Claude settings for that SDK
+  #   # session, allows only Read, Glob, and Grep natively, and makes mutating
+  #   # native tools unavailable rather than interactively approvable.
+  #   native_read_only: false
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

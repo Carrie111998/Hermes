@@ -200,6 +200,37 @@ def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     assert shell.api_mode == "codex_responses"
 
 
+def test_claude_agent_sdk_runtime_accepts_empty_base_url(monkeypatch):
+    cli = _import_cli()
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "claude-agent-sdk",
+            "api_mode": "claude_agent_sdk",
+            "base_url": "",
+            "api_key": "claude-subscription-oauth",
+            "source": "claude-agent-sdk",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.format_runtime_provider_error",
+        lambda exc: str(exc),
+    )
+
+    shell = cli.HermesCLI(
+        model="claude-opus-5",
+        provider="claude-agent-sdk",
+        compact=True,
+        max_turns=1,
+    )
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.provider == "claude-agent-sdk"
+    assert shell.api_mode == "claude_agent_sdk"
+    assert shell.base_url == ""
+
+
 def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     cli = _import_cli()
     shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)

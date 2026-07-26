@@ -232,3 +232,16 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+    assert sanitize_model_override(
+        {
+            "model": "claude-opus-5",
+            "provider": "claude-agent-sdk",
+            "base_url": "",
+            "api_key": "claude-subscription-oauth",
+            "api_mode": "claude_agent_sdk",
+        }
+    ) == {
+        "model": "claude-opus-5",
+        "provider": "claude-agent-sdk",
+        "base_url": "",
+    }

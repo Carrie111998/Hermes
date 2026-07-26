@@ -120,7 +120,7 @@ def strip_interrupted_tool_tails(
 def strip_dangling_tool_call_tail(
     agent_history: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Strip a trailing ``assistant(tool_calls)`` block left with NO answers.
+    """Reconcile a trailing ``assistant(tool_calls)`` block with its answers.
 
     When a tool call itself kills the gateway process (``docker restart``,
     ``systemctl restart``, ``kill``, ``hermes gateway restart``), the process
@@ -135,66 +135,102 @@ def strip_dangling_tool_call_tail(
     reboot loop in #49201.  ``strip_interrupted_tool_tails`` does not catch
     this because there is no tool result to inspect for an interrupt marker.
 
-    This strips that dangling tail at the source so there is nothing for the
-    model to re-execute.  It only acts when the tail is an
-    ``assistant(tool_calls)`` whose calls have NO corresponding ``tool``
-    results — a completed assistant→tool pair (any tool answers present) is
-    left untouched so genuine mid-progress tool loops still resume.
+    This strips or balances that dangling tail at the source so there is
+    nothing for the model to re-execute. A zero-result all-read-only batch is
+    erased as before. Side-effecting calls are preserved and recovered as
+    UNKNOWN. When only part of a multi-call batch was answered, the existing
+    results stay intact and only missing IDs receive recovery results.
     """
     if not agent_history:
         return agent_history
 
-    last = agent_history[-1]
+    # Walk backward over the trailing contiguous result block, then inspect the
+    # assistant batch immediately before it. With zero results this naturally
+    # points at the final row, preserving the original dangling-tail behavior.
+    tool_block_start = len(agent_history)
+    while tool_block_start > 0:
+        candidate = agent_history[tool_block_start - 1]
+        if not (isinstance(candidate, dict) and candidate.get("role") == "tool"):
+            break
+        tool_block_start -= 1
+
+    assistant_index = tool_block_start - 1
+    if assistant_index < 0:
+        return agent_history
+    assistant = agent_history[assistant_index]
     if not (
-        isinstance(last, dict)
-        and last.get("role") == "assistant"
-        and last.get("tool_calls")
+        isinstance(assistant, dict)
+        and assistant.get("role") == "assistant"
+        and assistant.get("tool_calls")
     ):
         return agent_history
 
-    tool_calls = last.get("tool_calls") or []
-    if any(
+    tool_calls = assistant.get("tool_calls") or []
+    answered_ids = {
+        str(result.get("tool_call_id") or result.get("call_id") or "")
+        for result in agent_history[tool_block_start:]
+        if isinstance(result, dict) and result.get("role") == "tool"
+    }
+    missing_calls = [
+        call
+        for call in tool_calls
+        if str(call.get("id") or call.get("call_id") or "") not in answered_ids
+    ]
+    if not missing_calls:
+        return agent_history
+
+    has_tool_results = tool_block_start < len(agent_history)
+    if not has_tool_results and not any(
         tool_may_have_side_effect(
             str((call.get("function") or {}).get("name") or "")
         )
-        for call in tool_calls
+        for call in missing_calls
     ):
-        recovered = list(agent_history)
-        for call in tool_calls:
-            function = call.get("function") or {}
-            name = str(function.get("name") or "unknown")
-            call_id = str(call.get("id") or call.get("call_id") or "")
-            disposition = "unknown" if tool_may_have_side_effect(name) else "none"
-            content = (
-                "[Orphan recovery: this tool may have executed before Hermes stopped; "
-                "its effect is UNKNOWN. Inspect current state before retrying.]"
-                if disposition == "unknown"
-                else "[Orphan recovery: this read-only tool did not complete and had no effect.]"
-            )
-            recovered.append(make_tool_result_message(
-                name, content, call_id, effect_disposition=disposition,
-            ))
+        logger.debug(
+            "Stripping dangling unanswered read-only assistant(tool_calls) tail (%d call(s))",
+            len(missing_calls),
+        )
+        return agent_history[:assistant_index]
+
+    recovered = list(agent_history)
+    recovered_side_effect = False
+    for call in missing_calls:
+        function = call.get("function") or {}
+        name = str(function.get("name") or "unknown")
+        call_id = str(call.get("id") or call.get("call_id") or "")
+        disposition = "unknown" if tool_may_have_side_effect(name) else "none"
+        recovered_side_effect = recovered_side_effect or disposition == "unknown"
+        content = (
+            "[Orphan recovery: this tool may have executed before Hermes stopped; "
+            "its effect is UNKNOWN. Inspect current state before retrying.]"
+            if disposition == "unknown"
+            else "[Orphan recovery: this read-only tool did not complete and had no effect.]"
+        )
+        recovered.append(make_tool_result_message(
+            name, content, call_id, effect_disposition=disposition,
+        ))
+
+    if recovered_side_effect:
         logger.warning(
             "Recovered dangling side-effecting tool call(s) as UNKNOWN instead of erasing them"
         )
-        return recovered
-
-    logger.debug(
-        "Stripping dangling unanswered read-only assistant(tool_calls) tail (%d call(s))",
-        len(tool_calls),
-    )
-    return agent_history[:-1]
+    else:
+        logger.debug(
+            "Recovered %d missing read-only tool result(s) to balance a partial batch",
+            len(missing_calls),
+        )
+    return recovered
 
 
 def sanitize_replay_history(
     agent_history: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Apply both replay-tail strippers in the canonical order.
+    """Apply both replay-tail cleanup passes in the canonical order.
 
     Convenience entry point for resume code paths: removes interrupted
-    assistant→tool blocks anywhere in the history, then removes a dangling
-    unanswered ``assistant(tool_calls)`` tail.  Returns the same list object
-    when there is nothing to strip.
+    assistant→tool blocks anywhere in the history, then strips or balances a
+    dangling ``assistant(tool_calls)`` tail. Returns the same list object when
+    there is nothing to clean up.
     """
     if not agent_history:
         return agent_history

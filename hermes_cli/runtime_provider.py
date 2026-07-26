@@ -357,6 +357,10 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Agent-loop runtime via the official claude-agent-sdk (Claude-managed
+    # subscription login; Hermes resolves no credentials). Selected by
+    # `provider: claude-agent-sdk`. See #25267.
+    "claude_agent_sdk",
 }
 
 
@@ -1671,6 +1675,22 @@ def resolve_runtime_provider(
             "base_url": "moa://local",
             "api_key": "moa-virtual-provider",
             "source": "moa-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
+    # claude-agent-sdk short-circuit: the official Agent SDK runtime reads
+    # Claude-managed subscription login storage inside the SDK subprocess.
+    # Nothing here must reach the credential pool or generic api_key resolver;
+    # environment credential routes are rejected before startup (#25267).
+    if requested_provider in {
+        "claude-agent-sdk", "claude-sdk", "claude-code-sdk", "claude_agent_sdk",
+    }:
+        return {
+            "provider": "claude-agent-sdk",
+            "api_mode": "claude_agent_sdk",
+            "base_url": "",
+            "api_key": "claude-subscription-oauth",
+            "source": "claude-agent-sdk",
             "requested_provider": requested_provider,
         }
 

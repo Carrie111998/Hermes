@@ -4873,11 +4873,45 @@ def _resolve_auto(
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
+    runtime_requested_provider = runtime.get("requested_provider", "")
     runtime_model = str(runtime.get("model") or "")
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
 
+
+    # ── Fail-closed subscription lane (claude-agent-sdk, #25267) ──
+    # When the MAIN provider is the claude-agent-sdk (subscription OAuth,
+    # never metered), auto-detection must NOT silently re-route auxiliary
+    # tasks (title generation, context compression, ...) onto metered
+    # fallback providers — that would break the provider's billing contract
+    # through the side door. Explicit `auxiliary.<task>.{provider,model}`
+    # config is resolved before this chain and remains the operator's
+    # deliberate opt-in; without it, aux features simply no-op.
+    from agent.claude_sdk_runtime import is_claude_agent_sdk_runtime
+
+    has_live_runtime_identity = bool(
+        runtime_provider or runtime_requested_provider or runtime_api_mode
+    )
+    configured_provider = (
+        str(_read_main_provider() or "") if not has_live_runtime_identity else ""
+    )
+    if (
+        is_claude_agent_sdk_runtime(
+            provider=runtime_provider,
+            api_mode=runtime_api_mode,
+        )
+        or is_claude_agent_sdk_runtime(provider=runtime_requested_provider)
+        or (
+            not has_live_runtime_identity
+            and is_claude_agent_sdk_runtime(provider=configured_provider)
+        )
+    ):
+        logger.debug(
+            "aux auto-detect disabled: main provider is claude-agent-sdk "
+            "(subscription lane, fail-closed)"
+        )
+        return None, None
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -4905,7 +4939,9 @@ def _resolve_auto(
     # on aggregators (OpenRouter, Nous) who previously got routed to a
     # cheap provider-side default.  Explicit per-task overrides set via
     # config.yaml (auxiliary.<task>.provider) still win over this.
-    main_provider = str(runtime_provider or _read_main_provider() or "")
+    main_provider = str(
+        runtime_provider or configured_provider or _read_main_provider() or ""
+    )
     main_model = str(runtime_model or _read_main_model() or "")
 
     # MoA virtual provider: the "model" is a preset name (e.g. "opus-gpt") and

@@ -114,7 +114,11 @@ class CLIAgentSetupMixin:
                 print("\n⚠️  Provider resolver returned an empty API key. "
                       "Set OPENROUTER_API_KEY or run: hermes setup")
                 return False
-        if not isinstance(base_url, str) or not base_url:
+        # Agent-loop runtimes own their transport and do not have an HTTP base
+        # URL.  Keep the guard for OpenAI-compatible/native HTTP providers,
+        # but allow the first-class Claude Agent SDK route through to AIAgent.
+        _clientless_runtime = resolved_api_mode == "claude_agent_sdk"
+        if (not isinstance(base_url, str) or not base_url) and not _clientless_runtime:
             print("\n⚠️  Provider resolver returned an empty base URL. "
                   "Check your provider config or run: hermes setup")
             return False

@@ -99,6 +99,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Native Anthropic SDK — needed when provider=anthropic (not via
     # OpenRouter / aggregators which use the openai SDK).
     "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
+    # Official Claude Agent SDK subscription runtime. Keep this exact pin in
+    # lockstep with the claude-agent-sdk optional dependency in pyproject.toml.
+    "provider.claude_agent_sdk": ("claude-agent-sdk==0.2.120",),
     # AWS Bedrock provider
     "provider.bedrock": ("boto3==1.42.89",),
     # Google Vertex AI provider — OAuth2 token minting for the Gemini

@@ -279,6 +279,97 @@ class TestResolveAutoMainFirst:
         assert mock_resolve.call_args.args[0] == "anthropic"
         assert mock_resolve.call_args.args[1] == "runtime-model"
 
+    @staticmethod
+    def _assert_claude_sdk_auto_fails_closed(
+        *, main_runtime, configured_provider="openrouter"
+    ):
+        blocked = AssertionError("metered auxiliary auto chain entered")
+        with patch(
+            "agent.auxiliary_client._read_main_provider",
+            return_value=configured_provider,
+        ), patch(
+            "agent.auxiliary_client._read_main_model",
+            return_value="configured-model",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=blocked,
+        ) as native_provider, patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            side_effect=blocked,
+        ) as configured_chain, patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            side_effect=blocked,
+        ) as main_chain, patch(
+            "agent.auxiliary_client._get_provider_chain",
+            side_effect=blocked,
+        ) as ambient_chain:
+            from agent.auxiliary_client import _resolve_auto
+
+            assert _resolve_auto(
+                main_runtime=main_runtime,
+                task="title_generation",
+            ) == (None, None)
+
+        native_provider.assert_not_called()
+        configured_chain.assert_not_called()
+        main_chain.assert_not_called()
+        ambient_chain.assert_not_called()
+
+    def test_claude_sdk_provider_only_runtime_fails_closed_without_api_mode(self):
+        self._assert_claude_sdk_auto_fails_closed(
+            main_runtime={
+                "provider": "claude-agent-sdk",
+                "model": "claude-opus-4-8",
+            }
+        )
+
+    def test_claude_sdk_requested_provider_only_runtime_fails_closed(self):
+        self._assert_claude_sdk_auto_fails_closed(
+            main_runtime={
+                "requested_provider": "claude-agent-sdk",
+                "model": "claude-opus-4-8",
+            }
+        )
+
+    def test_claude_sdk_config_only_main_provider_fails_closed_without_runtime(self):
+        self._assert_claude_sdk_auto_fails_closed(
+            main_runtime={},
+            configured_provider="claude-agent-sdk",
+        )
+
+    def test_claude_sdk_main_allows_deliberate_task_provider_override(self):
+        explicit_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "provider": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+            },
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(explicit_client, "claude-haiku-4-5-20251001"),
+        ) as explicit_resolver, patch(
+            "agent.auxiliary_client._resolve_auto",
+            side_effect=AssertionError("explicit override entered auto path"),
+        ) as auto_resolver:
+            from agent.auxiliary_client import get_text_auxiliary_client
+
+            client, model = get_text_auxiliary_client(
+                "title_generation",
+                main_runtime={
+                    "provider": "claude-agent-sdk",
+                    "model": "claude-opus-4-8",
+                },
+            )
+
+        assert client is explicit_client
+        assert model == "claude-haiku-4-5-20251001"
+        assert explicit_resolver.call_args.args[0] == "anthropic"
+        assert explicit_resolver.call_args.kwargs["model"] == (
+            "claude-haiku-4-5-20251001"
+        )
+        auto_resolver.assert_not_called()
+
     def test_resolve_provider_auto_returns_runtime_model_not_stale_config_default(self):
         """Blank auto aux requests must not pair a stale config model with live fallback provider."""
         runtime_client = MagicMock()

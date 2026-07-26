@@ -93,6 +93,58 @@ def test_strip_dangling_tool_call_tail_preserves_answered_pair():
     assert out == history  # answered -> untouched
 
 
+def test_sanitize_partial_mixed_batch_recovers_only_missing_side_effect():
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "read", "function": {"name": "read_file", "arguments": "{}"}},
+            {"id": "write", "function": {"name": "write_file", "arguments": "{}"}},
+        ],
+    }
+    answered_read = {
+        "role": "tool",
+        "tool_call_id": "read",
+        "content": "existing contents",
+    }
+    history = [_user("hi"), assistant, answered_read]
+
+    out = sanitize_replay_history(history)
+
+    assert out[:3] == history
+    results = [message for message in out if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in results] == ["read", "write"]
+    assert results[0] == answered_read
+    assert "effect_disposition" not in results[0]
+    assert results[1]["effect_disposition"] == "unknown"
+    assert "unknown" in results[1]["content"].lower()
+
+
+def test_sanitize_partial_read_only_batch_keeps_answered_sibling_balanced():
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "read-1", "function": {"name": "read_file", "arguments": "{}"}},
+            {"id": "read-2", "function": {"name": "search_files", "arguments": "{}"}},
+        ],
+    }
+    answered_read = {
+        "role": "tool",
+        "tool_call_id": "read-1",
+        "content": "existing contents",
+    }
+    history = [_user("hi"), assistant, answered_read]
+
+    out = sanitize_replay_history(history)
+
+    assert out[:3] == history
+    results = [message for message in out if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in results] == ["read-1", "read-2"]
+    assert results[1]["effect_disposition"] == "none"
+    assert "no effect" in results[1]["content"].lower()
+
+
 def test_strip_interrupted_tool_tails_removes_interrupted_read_only_block():
     history = [_user("hi"), _assistant_tc("read_file"), _tool("[Command interrupted]")]
     out = strip_interrupted_tool_tails(history)

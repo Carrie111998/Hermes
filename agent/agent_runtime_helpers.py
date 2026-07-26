@@ -2173,7 +2173,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # to keep the current URL. See #47828.
         old_norm_provider = (old_provider or "").strip().lower()
         new_norm_provider = (new_provider or "").strip().lower()
-        if base_url:
+        if api_mode == "claude_agent_sdk":
+            # The SDK owns a Claude CLI subprocess transport and intentionally
+            # has no HTTP endpoint.
+            agent.base_url = ""
+        elif base_url:
             agent.base_url = base_url
         elif old_norm_provider != new_norm_provider:
             raise ValueError(
@@ -2232,6 +2236,16 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.base_url = "moa://local"
             agent._client_kwargs = {}
             agent.client = build_moa_facade(agent, agent.model)
+        elif api_mode == "claude_agent_sdk":
+            # Clientless runtime: keep only the sentinel/API-mode state used by
+            # the normal SDK early-return path. Never construct an OpenAI or
+            # Anthropic HTTP client for it.
+            agent._anthropic_client = None
+            agent._anthropic_api_key = ""
+            agent._anthropic_base_url = None
+            agent._is_anthropic_oauth = False
+            agent.client = None
+            agent._client_kwargs = {}
         elif api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
@@ -2496,6 +2510,51 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         except Exception:
             logger.warning(
                 "Failed to persist billing route after model switch",
+                exc_info=True,
+            )
+
+    # Resuming an SDK conversation across an SDK <-> native/provider boundary
+    # would omit every intervening non-SDK turn. Clear only after the replacement
+    # runtime was built successfully. A model change within the SDK still resumes
+    # the same conversation, which the SDK supports with the new requested model.
+    from agent.claude_sdk_runtime import is_claude_agent_sdk_runtime
+
+    old_api_mode = _snapshot.get("api_mode")
+    if not isinstance(old_api_mode, str):
+        old_api_mode = None
+    crossed_sdk_boundary = is_claude_agent_sdk_runtime(
+        provider=old_provider,
+        api_mode=old_api_mode,
+    ) != is_claude_agent_sdk_runtime(
+        provider=agent.provider,
+        api_mode=getattr(agent, "api_mode", None),
+    )
+    if crossed_sdk_boundary and _session_db is not None and _session_id:
+        try:
+            _session_db.update_claude_sdk_session_id(_session_id, None)
+        except Exception:
+            logger.warning(
+                "Failed to clear Claude SDK continuity after provider boundary",
+                exc_info=True,
+            )
+
+    # A live SDK session owns a CLI subprocess configured for the runtime that
+    # created it. Retire it only after the replacement runtime is fully built,
+    # keeping failed HTTP switches rollback-safe. The next SDK turn lazily
+    # starts or resumes with the new provider/model state.
+    runtime_changed = (
+        old_model != new_model
+        or old_norm_provider != new_norm_provider
+        or _snapshot.get("api_mode") != api_mode
+    )
+    old_sdk_session = getattr(agent, "_claude_sdk_session", None)
+    if runtime_changed and old_sdk_session is not None:
+        agent._claude_sdk_session = None
+        try:
+            old_sdk_session.close()
+        except Exception:
+            logger.debug(
+                "Failed to close retired Claude Agent SDK session",
                 exc_info=True,
             )
 

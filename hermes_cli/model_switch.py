@@ -1067,14 +1067,41 @@ def switch_model(
     # =================================================================
     if explicit_provider:
         # Resolve the provider
+        runtime_profile = None
         pdef = resolve_provider_full(
             explicit_provider,
             user_providers,
             custom_providers,
         )
-        if pdef is None and explicit_provider.strip().lower() == "custom":
-            pdef = _bare_custom_provider_def(current_base_url)
         if pdef is None:
+            # Clientless first-class runtimes are registered as model-provider
+            # plugins rather than HTTP providers. Adapt the Claude Agent SDK
+            # identity here, then let resolve_runtime_provider() below supply
+            # its non-secret sentinel and api_mode without native Anthropic or
+            # generic HTTP credential resolution.
+            try:
+                from importlib import import_module
+
+                get_provider_profile = getattr(
+                    import_module("providers"), "get_provider_profile"
+                )
+                runtime_profile = get_provider_profile(
+                    explicit_provider.strip().lower()
+                )
+            except Exception:
+                runtime_profile = None
+            if (
+                runtime_profile is not None
+                and runtime_profile.api_mode != "claude_agent_sdk"
+            ):
+                runtime_profile = None
+        if (
+            pdef is None
+            and runtime_profile is None
+            and explicit_provider.strip().lower() == "custom"
+        ):
+            pdef = _bare_custom_provider_def(current_base_url)
+        if pdef is None and runtime_profile is None:
             _switch_err = (
                 f"Unknown provider '{explicit_provider}'. "
                 f"Check 'hermes model' for available providers, or define it "
@@ -1096,7 +1123,17 @@ def switch_model(
                 error_message=_switch_err,
             )
 
-        target_provider = pdef.id
+        if runtime_profile is not None:
+            target_provider = runtime_profile.name
+            resolved_provider_name = (
+                runtime_profile.display_name or runtime_profile.name
+            )
+            resolved_provider_base_url = runtime_profile.base_url
+        else:
+            assert pdef is not None
+            target_provider = pdef.id
+            resolved_provider_name = pdef.name
+            resolved_provider_base_url = pdef.base_url
         if target_provider == "moa" and not new_model:
             try:
                 from hermes_cli.config import load_config
@@ -1139,7 +1176,7 @@ def switch_model(
                 return ModelSwitchResult(
                     success=False,
                     target_provider=target_provider,
-                    provider_label=pdef.name,
+                    provider_label=resolved_provider_name,
                     is_global=is_global,
                     error_message=(
                         f"Provider '{_explicit_norm}' is an alias that routes "
@@ -1150,19 +1187,20 @@ def switch_model(
 
         # If no model specified, try auto-detect from endpoint
         if not new_model:
-            if pdef.base_url:
+            if resolved_provider_base_url:
                 from hermes_cli.runtime_provider import _auto_detect_local_model
-                detected = _auto_detect_local_model(pdef.base_url)
+                detected = _auto_detect_local_model(resolved_provider_base_url)
                 if detected:
                     new_model = detected
                 else:
                     return ModelSwitchResult(
                         success=False,
                         target_provider=target_provider,
-                        provider_label=pdef.name,
+                        provider_label=resolved_provider_name,
                         is_global=is_global,
                         error_message=(
-                            f"No model detected on {pdef.name} ({pdef.base_url}). "
+                            f"No model detected on {resolved_provider_name} "
+                            f"({resolved_provider_base_url}). "
                             f"Specify the model explicitly: /model <model-name> --provider {explicit_provider}"
                         ),
                     )
@@ -1170,10 +1208,10 @@ def switch_model(
                 return ModelSwitchResult(
                     success=False,
                     target_provider=target_provider,
-                    provider_label=pdef.name,
+                    provider_label=resolved_provider_name,
                     is_global=is_global,
                     error_message=(
-                        f"Provider '{pdef.name}' has no base URL configured. "
+                        f"Provider '{resolved_provider_name}' has no base URL configured. "
                         f"Specify a model: /model <model-name> --provider {explicit_provider}"
                     ),
                 )

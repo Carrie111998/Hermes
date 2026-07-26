@@ -1149,6 +1149,34 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+
+        # Claude Agent SDK provider runtime (selected with
+        # `provider: claude-agent-sdk`). These are the canonical defaults for
+        # the `agent.claude_agent_sdk` block; the provider reads them through
+        # load_config_readonly(). config.yaml is the only interface for these —
+        # they are behavioural settings, not secrets.
+        "claude_agent_sdk": {
+            # Emit the SDK's partial-message deltas into the gateway streaming
+            # pipeline (the top-level `streaming:` block still governs how the
+            # deltas are displayed). Default off — upstream-conservative.
+            "streaming": False,
+            # Optional operator persona/soul file appended to the system prompt
+            # ("" = none).
+            "append_file": "",
+            # `add_dirs` grants paths to Claude Code's native tools; it is not a
+            # read-only mount. Under default auto/acceptEdits, native edits and
+            # common filesystem mutations in added roots may be automatic.
+            # Removing Hermes MCP file/terminal tools does not remove Claude native
+            # tools. Therefore read-oriented headless profiles must use
+            # native_read_only: true and may additionally use
+            # HERMES_TERMINAL_SECURITY_MODE=approval-required.
+            # Paths are normalized/deduplicated; changes apply to new SDK sessions.
+            "add_dirs": [],
+            # Native read-only disables user/project/local Claude settings for that
+            # SDK session, allows only Read, Glob, and Grep natively, and makes
+            # mutating native tools unavailable rather than interactively approvable.
+            "native_read_only": False,
+        },
     },
 
     "terminal": {

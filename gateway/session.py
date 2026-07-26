@@ -738,6 +738,13 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    if (
+        cleaned.get("provider") == "claude-agent-sdk"
+        and override.get("base_url") == ""
+    ):
+        # The clientless SDK runtime intentionally has no HTTP endpoint. Keep
+        # that explicit empty URL while still excluding api_key/api_mode.
+        cleaned["base_url"] = ""
     return cleaned or None
 
 

@@ -103,6 +103,11 @@ class TestAllowlist:
     def test_feature_install_command_unknown(self):
         assert ld.feature_install_command("not.real") is None
 
+    def test_claude_agent_sdk_provider_uses_exact_runtime_pin(self):
+        assert ld.LAZY_DEPS["provider.claude_agent_sdk"] == (
+            "claude-agent-sdk==0.2.120",
+        )
+
 
 # ---------------------------------------------------------------------------
 # allow_lazy_installs gating
@@ -205,6 +210,38 @@ class TestEnsure:
         )
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
+
+    def test_claude_agent_sdk_missing_package_installs_without_network(
+        self, monkeypatch
+    ):
+        states = iter([False, True])
+        installed = []
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: next(states))
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda specs, **kwargs: (
+                installed.append(specs) or ld._InstallResult(True, "ok", "")
+            ),
+        )
+
+        ld.ensure("provider.claude_agent_sdk", prompt=False)
+
+        assert installed == [("claude-agent-sdk==0.2.120",)]
+
+    def test_claude_agent_sdk_disabled_has_exact_manual_remediation(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: False)
+
+        with pytest.raises(ld.FeatureUnavailable) as exc:
+            ld.ensure("provider.claude_agent_sdk", prompt=False)
+
+        message = str(exc.value)
+        assert "lazy installs disabled" in message
+        assert "claude-agent-sdk==0.2.120" in message
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +463,27 @@ class TestRefreshActiveFeatures:
         )
         result = ld.refresh_active_features()
         assert result == {"test.feat": "refreshed"}
+
+    def test_active_claude_agent_sdk_pin_refreshes_without_network(self, monkeypatch):
+        monkeypatch.setattr(
+            ld, "active_features", lambda: ["provider.claude_agent_sdk"]
+        )
+        states = iter([False, False, True])
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: next(states))
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        installed = []
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda specs, **kwargs: (
+                installed.append(specs) or ld._InstallResult(True, "ok", "")
+            ),
+        )
+
+        result = ld.refresh_active_features()
+
+        assert result == {"provider.claude_agent_sdk": "refreshed"}
+        assert installed == [("claude-agent-sdk==0.2.120",)]
 
     def test_install_failure_recorded_not_raised(self, monkeypatch):
         # A failed refresh must NOT raise out of hermes update.

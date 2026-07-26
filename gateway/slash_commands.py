@@ -103,6 +103,38 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    async def _clear_claude_sdk_continuity_on_boundary(
+        self,
+        *,
+        source: SessionSource,
+        old_provider: Optional[str],
+        old_api_mode: Optional[str],
+        new_provider: Optional[str],
+        new_api_mode: Optional[str],
+    ) -> None:
+        """Clear persisted SDK resume state when a switch crosses runtimes."""
+        from agent.claude_sdk_runtime import is_claude_agent_sdk_runtime
+
+        old_is_sdk = is_claude_agent_sdk_runtime(
+            provider=old_provider, api_mode=old_api_mode
+        )
+        new_is_sdk = is_claude_agent_sdk_runtime(
+            provider=new_provider, api_mode=new_api_mode
+        )
+        if old_is_sdk == new_is_sdk:
+            return
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+        try:
+            entry = await self.async_session_store.get_or_create_session(source)
+            await session_db.update_claude_sdk_session_id(entry.session_id, None)
+        except Exception:
+            logger.warning(
+                "Failed to clear Claude SDK continuity after gateway model switch",
+                exc_info=True,
+            )
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -1772,6 +1804,7 @@ class GatewaySlashCommandsMixin:
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
+        current_api_mode = ""
         user_provs = None
         custom_provs = None
         excluded_provs = []
@@ -1784,6 +1817,7 @@ class GatewaySlashCommandsMixin:
                     current_model = model_cfg.get("default", "")
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
+                    current_api_mode = model_cfg.get("api_mode", "")
                 user_provs = cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
@@ -1803,6 +1837,17 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        try:
+            rehydrate_override = getattr(
+                self, "_rehydrate_session_model_override", None
+            )
+            if callable(rehydrate_override):
+                rehydrate_override(session_key)
+        except Exception:
+            logger.debug(
+                "Failed to rehydrate session model override before /model",
+                exc_info=True,
+            )
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
@@ -1812,6 +1857,7 @@ class GatewaySlashCommandsMixin:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+            current_api_mode = override.get("api_mode", current_api_mode)
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -1851,6 +1897,7 @@ class GatewaySlashCommandsMixin:
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
                     _picker_profile_home = _command_profile_home
+                    _cur_api_mode = current_api_mode
 
                     async def _on_model_selected_scoped(
                         _chat_id: str, model_id: str, provider_slug: str
@@ -1930,6 +1977,14 @@ class GatewaySlashCommandsMixin:
                                         f"staying on {_cur_model}."
                                     ),
                                 )
+
+                        await _self._clear_claude_sdk_continuity_on_boundary(
+                            source=source,
+                            old_provider=_cur_provider,
+                            old_api_mode=_cur_api_mode,
+                            new_provider=result.target_provider,
+                            new_api_mode=result.api_mode,
+                        )
 
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
@@ -2234,6 +2289,14 @@ class GatewaySlashCommandsMixin:
                             f"staying on {current_model}."
                         ),
                     )
+
+            await self._clear_claude_sdk_continuity_on_boundary(
+                source=source,
+                old_provider=current_provider,
+                old_api_mode=current_api_mode,
+                new_provider=result.target_provider,
+                new_api_mode=result.api_mode,
+            )
 
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
