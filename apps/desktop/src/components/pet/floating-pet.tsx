@@ -25,6 +25,7 @@ import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
 
 import { MultiPetContainer } from './multi-pet-container'
+import { PET_ACTIVE_REFRESH_MS, PET_POLL_MS } from './pet-poll'
 import { PetSprite, roamWalkRow } from './pet-sprite'
 import { usePetRoam } from './use-pet-roam'
 import { type PetZoomAnchor, usePetZoomGesture } from './use-pet-zoom-gesture'
@@ -110,8 +111,6 @@ function loadPosition(): Point {
  * Promotion to a separate frameless OS-level window is a follow-up — the
  * sprite + state logic here is reused as-is, only the host changes.
  */
-const PET_POLL_MS = 3000
-const PET_ACTIVE_REFRESH_MS = 15000
 
 /**
  * The floating mascot, branched on the roster MODE (not entry count). `pinned`

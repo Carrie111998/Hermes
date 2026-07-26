@@ -27,6 +27,7 @@ import {
 } from '@/store/gateway'
 import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
+import { setProfileConnectionState } from '@/store/pet-multi'
 import { $activeGatewayProfile, normalizeProfileKey, touchActiveGatewayBackend } from '@/store/profile'
 import {
   $activeSessionId,
@@ -363,8 +364,14 @@ export function useGatewayBoot({
 
     callbacksRef.current.onGatewayReady(gateway)
     setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
-    // Secondary (background-profile) sockets funnel into the same handler.
-    configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
+    // Secondary (background-profile) sockets funnel into the same handler. The
+    // per-profile state sink projects every profile's socket state into its pet
+    // slice (Layer 8) so a dead pinned profile shows an offline pet — wired here
+    // (not in gateway.ts) to avoid a gateway → pet-store import cycle.
+    configureGatewayRegistry({
+      onEvent: event => callbacksRef.current.handleGatewayEvent(event),
+      onProfileState: (profile, state) => setProfileConnectionState(profile, state)
+    })
 
     const offState = gateway.onState(st => {
       // Mirror to the composer only while the primary is the active profile —

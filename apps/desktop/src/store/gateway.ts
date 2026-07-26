@@ -27,6 +27,17 @@ const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionSt
 
 interface RegistryConfig {
   onEvent: (event: GatewayEvent) => void
+  /** Per-profile connection-state sink (Layer 8). Boot wires this to the pet
+   *  store's setProfileConnectionState; declared as a callback so gateway.ts
+   *  never imports the pet store (which would be a cycle). Fires for primary and
+   *  secondary state changes, reconnect starts/stops, reauth, and disposal. The
+   *  active-only reportGatewayState mirroring into composer state is unchanged —
+   *  background states must never flip the foreground composer. */
+  onProfileState?: (
+    profile: string,
+    state: 'connecting' | 'offline' | 'open' | 'reauth-required',
+    reason?: 'attempt-limit' | 'reauth'
+  ) => void
 }
 
 // ── Secondary (pool) backends ──────────────────────────────────────────────
@@ -216,6 +227,30 @@ export function reportPrimaryGatewayState(state: ConnectionState): void {
   reportGatewayState(g.primaryProfile, state)
 }
 
+/** Pooled/background gateways retry a dead backend on a bounded backoff
+ *  (1s, 2s, 4s, 8s, 15s, 15s); a sixth failure stops the loop as 'attempt-limit'. */
+const MAX_BG_RETRIES = 6
+
+// Map a transport ConnectionState onto the pet store's connection vocabulary.
+function toProfileConnection(state: ConnectionState): 'connecting' | 'offline' | 'open' {
+  if (state === 'open') {
+    return 'open'
+  }
+
+  return state === 'connecting' ? 'connecting' : 'offline'
+}
+
+/** Report a profile's socket state to the per-profile sink (Layer 8). Every
+ *  profile (primary + secondary) flows through here; the callback is boot-wired
+ *  to the pet store, so a dead pinned profile shows an offline pet. */
+function reportProfileState(
+  profile: string,
+  state: 'connecting' | 'offline' | 'open' | 'reauth-required',
+  reason?: 'attempt-limit' | 'reauth'
+): void {
+  g.config?.onProfileState?.(normKey(profile), state, reason)
+}
+
 function setActive(profile: string): void {
   g.activeKey = normKey(profile)
   const gateway = activeGateway()
@@ -251,9 +286,21 @@ function scheduleReconnect(entry: Secondary): void {
     return
   }
 
+  // Bounded backoff (Layer 8): after six failed retries stop the loop, publish
+  // offline, and cancel the timer. A wake signal, manual retry, or
+  // disable/re-enable resets the stop (retryProfileGateway).
+  if (entry.reconnectAttempt >= MAX_BG_RETRIES) {
+    entry.retryStopped = 'attempt-limit'
+    clearTimer(entry)
+    reportProfileState(entry.profile, 'offline', 'attempt-limit')
+
+    return
+  }
+
   // 1s, 2s, 4s … capped at 15s — same backoff shape as the primary.
   const delay = Math.min(15_000, 1_000 * 2 ** Math.min(entry.reconnectAttempt, 4))
   entry.reconnectAttempt += 1
+  reportProfileState(entry.profile, 'connecting')
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null
     void reconnectSecondary(entry)
@@ -279,6 +326,7 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
       g.reauthErrors.set(entry.profile, error)
       entry.retryStopped = 'reauth'
       clearTimer(entry)
+      reportProfileState(entry.profile, 'reauth-required', 'reauth')
     }
   } finally {
     entry.reconnecting = false
@@ -307,6 +355,7 @@ function createSecondary(profile: string): Secondary {
   entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile }))
   entry.offState = gateway.onState(state => {
     reportGatewayState(profile, state)
+    reportProfileState(profile, toProfileConnection(state))
 
     if (state === 'open') {
       entry.reconnectAttempt = 0
@@ -434,6 +483,7 @@ function disposeSecondary(entry: Secondary): void {
   entry.offEvent()
   entry.offState()
   entry.gateway.close()
+  reportProfileState(entry.profile, 'offline')
 }
 
 // Close + evict secondaries whose profile is neither active nor in `keep`

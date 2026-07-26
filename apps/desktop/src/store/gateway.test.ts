@@ -12,6 +12,7 @@ import {
   reconnectPrimaryGateway,
   releaseProfileGateway,
   requestGatewayForProfile,
+  retryProfileGateway,
   setPrimaryGateway,
   updateGatewayKeepSet,
   withProfileGatewayLease
@@ -338,5 +339,69 @@ describe('lease lifecycle', () => {
     leaseProfileGateway('apollo')
     await flush()
     expect(opensFor('apollo')).toBe(1)
+  })
+})
+
+describe('Layer 8 — background retry policy (test 61)', () => {
+  type ProfileStateReport = [string, string, string | undefined]
+
+  function captureProfileState(): ProfileStateReport[] {
+    const reports: ProfileStateReport[] = []
+    configureGatewayRegistry({
+      onEvent: () => undefined,
+      onProfileState: (profile, state, reason) => reports.push([profile, state, reason])
+    })
+
+    return reports
+  }
+
+  it('a down background profile stops after six retries and publishes offline (attempt-limit)', async () => {
+    const reports = captureProfileState()
+    FakeWebSocket.mode = 'fail'
+
+    leaseProfileGateway('apollo')
+    await flush()
+
+    // Drive the bounded backoff (1s, 2s, 4s, 8s, 15s, 15s). Interleave timer
+    // advances with flushes so each failed reconnect settles before the next.
+    for (let i = 0; i < 8; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await vi.advanceTimersByTimeAsync(16_000)
+      // eslint-disable-next-line no-await-in-loop
+      await flush()
+    }
+
+    // The sixth failure stops the loop as attempt-limit and publishes offline.
+    expect(reports).toContainEqual(['apollo', 'offline', 'attempt-limit'])
+
+    // Bounded: advancing far more time spawns no further connect attempts.
+    const attemptsAtLimit = opensFor('apollo')
+    await vi.advanceTimersByTimeAsync(120_000)
+    await flush()
+    expect(opensFor('apollo')).toBe(attemptsAtLimit)
+  })
+
+  it('a wake / manual retry resets the attempt-limit stop and reconnects', async () => {
+    const reports = captureProfileState()
+    FakeWebSocket.mode = 'fail'
+
+    leaseProfileGateway('apollo')
+    await flush()
+
+    for (let i = 0; i < 8; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await vi.advanceTimersByTimeAsync(16_000)
+      // eslint-disable-next-line no-await-in-loop
+      await flush()
+    }
+
+    expect(reports).toContainEqual(['apollo', 'offline', 'attempt-limit'])
+
+    // The backend comes back; a manual retry resets the stop and reconnects.
+    FakeWebSocket.mode = 'open'
+    retryProfileGateway('apollo')
+    await flush()
+
+    expect(reports.some(([profile, state]) => profile === 'apollo' && state === 'open')).toBe(true)
   })
 })

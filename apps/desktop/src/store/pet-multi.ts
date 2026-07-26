@@ -40,6 +40,10 @@ export interface ProfileBeat {
   gen: number
 }
 
+/** A profile's gateway connection state, projected from its own socket (Layer 8).
+ *  A dead/reauth profile must not render a happy pet. */
+export type ProfileConnection = 'connecting' | 'offline' | 'open' | 'reauth-required'
+
 export interface ProfilePetState {
   info: PetInfo
   activity: PetActivity
@@ -49,11 +53,18 @@ export interface ProfilePetState {
   sourceSessionId?: string | null
   /** Durable session id for navigation (survives compression/rehoming). */
   sourceDurableSessionId?: string | null
+  /** Projected gateway connection state. Defaults to 'open' so the follow-active
+   *  pet is unchanged until a real report lands; pinned slots render an offline
+   *  treatment for 'offline' / 'reauth-required'. */
+  connection: ProfileConnection
+  /** Epoch ms the profile went offline/reauth (for a "down for Ns" affordance). */
+  offlineSince?: number
 }
 
 function defaultProfilePetState(): ProfilePetState {
   return {
     activity: {},
+    connection: 'open',
     info: { enabled: false },
     replyText: null,
     unread: false
@@ -352,6 +363,22 @@ export function clearProfilePetReplyText(profile: string, sourceSessionId?: stri
 
 export function setProfilePetInfo(profile: string, info: PetInfo): void {
   updateProfilePet(profile, prev => ({ ...prev, info }))
+}
+
+/**
+ * Project a profile's gateway connection state into its pet slice (Layer 8). The
+ * gateway registry reports every profile's socket state here (via the boot-wired
+ * onProfileState callback) so a dead/reauth pinned profile shows an offline pet
+ * instead of animating idle forever. Records `offlineSince` on the way down and
+ * clears it on recovery.
+ */
+export function setProfileConnectionState(profile: string, connection: ProfileConnection): void {
+  updateProfilePet(profile, prev => ({
+    ...prev,
+    connection,
+    offlineSince:
+      connection === 'offline' || connection === 'reauth-required' ? (prev.offlineSince ?? Date.now()) : undefined
+  }))
 }
 
 /** Profile-level "awaiting the user" sync (use-pet-bridge's global mirror). */

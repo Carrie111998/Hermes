@@ -48,12 +48,41 @@ export function PetSlot({ profile, stateOverride }: PetSlotProps) {
   }, [profile])
 
   if (!info.enabled || !info.spritesheetBase64) {
-    // Layer 8 renders an offline/degraded treatment here when the profile's
-    // connection is down; until then an unloaded pet simply renders nothing.
+    // An unloaded pet renders nothing until its spritesheet arrives.
     return null
   }
 
   const state = stateOverride ?? derivePetState(entry?.activity ?? {})
+  const connection = entry?.connection ?? 'open'
+  const offline = connection === 'offline' || connection === 'reauth-required'
 
-  return <PetSprite info={info} stateOverride={state} />
+  const sprite = <PetSprite info={info} stateOverride={state} />
+
+  if (!offline) {
+    return sprite
+  }
+
+  // Layer 8 offline treatment: a dead/reauth profile desaturates its pet and
+  // badges a disconnect glyph (with the reason on hover) instead of animating
+  // idle forever — "backend down" must read as down, not happy.
+  const reason = connection === 'reauth-required' ? 'Needs sign-in' : 'Backend unreachable'
+
+  return (
+    <span style={{ display: 'inline-block', position: 'relative' }} title={reason}>
+      <span style={{ filter: 'grayscale(1) opacity(0.55)', display: 'inline-block' }}>{sprite}</span>
+      <span
+        aria-label={reason}
+        style={{
+          bottom: 6,
+          color: connection === 'reauth-required' ? '#f59e0b' : '#9ca3af',
+          fontSize: 12,
+          lineHeight: 1,
+          position: 'absolute',
+          right: 2
+        }}
+      >
+        {connection === 'reauth-required' ? '🔑' : '⏻'}
+      </span>
+    </span>
+  )
 }
