@@ -17,6 +17,13 @@ model:
   default: "claude-opus-5"
   provider: "anthropic"
 
+# Bascule automatique mi-session si l'API Anthropic directe sature
+# (overloaded_error, cf. incident 2026-07-26) : même Opus 5 via OpenRouter
+# (OPENROUTER_API_KEY, var Railway), conversation préservée.
+fallback_providers:
+  - provider: openrouter
+    model: "anthropic/claude-opus-5"
+
 gateway:
   platforms:
     - discord
