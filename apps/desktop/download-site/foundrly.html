@@ -179,12 +179,6 @@
           </svg>
           Built on <em>Intelliverse</em>
         </a>
-        <span style="color: var(--muted-2); font-size: 12px">Foundrly product desktop · not IX Agency</span>
-      </div>
-
-      <div class="availability" id="scope-banner" data-state="ready" role="status">
-        <b style="color: var(--text)">Foundrly only</b> —
-        this page serves the Foundrly product desktop. It does not list IX Agency or QuizVerse installers.
       </div>
 
       <header>
@@ -235,7 +229,7 @@
       <section class="steps">
         <h2>After install</h2>
         <ol class="steps-list">
-          <li><b>Open Foundrly</b> from Applications / Start menu (product name is Foundrly — not IX Agency).</li>
+          <li><b>Open Foundrly</b> from Applications / Start menu.</li>
           <li>Use the <b>Foundrly</b> rail item for the product workspace; Hermes chat for ops questions.</li>
           <li>From the workspace cards, open <b>Foundrly web</b> or the scoped <b>admin portal</b> when you have a Foundrly grant.</li>
           <li>Updates come from the Foundrly feed only (<code>foundrly/</code> on this bucket).</li>
@@ -280,7 +274,7 @@
         <b>Admin access</b> (optional, separate from this installer):
         if you were invited as a Foundrly operator, sign in at
         <a href="https://admin.intelli-verse-x.ai" target="_blank" rel="noreferrer">admin.intelli-verse-x.ai</a>
-        with your work email + OTP. That is the web console — you do <b>not</b> need the IX Agency desktop for Foundrly product use.
+        with your work email + OTP.
         Product site:
         <a href="https://foundrly.intelli-verse-x.ai" target="_blank" rel="noreferrer">foundrly.intelli-verse-x.ai</a>
       </div>
@@ -421,7 +415,6 @@
 
       (async () => {
         const os = detectOs();
-        const banner = document.getElementById("scope-banner");
         try {
           const [mac, win, linux] = await Promise.all([
             loadFeed(MANIFESTS.mac),
@@ -457,13 +450,9 @@
             document.getElementById("primary-sub").textContent = "Choose an installer from the cards below.";
             btn.setAttribute("aria-disabled", "true");
           }
-          banner.dataset.state = "ready";
         } catch (err) {
-          banner.dataset.state = "waiting";
-          banner.innerHTML =
-            '<b style="color: var(--text)">Feed unavailable</b> — try again shortly, or ask your admin for a direct installer.';
           document.getElementById("version").textContent = "—";
-          document.getElementById("primary-sub").textContent = String(err.message || err);
+          document.getElementById("primary-sub").textContent = "Feed unavailable — try again shortly.";
           for (const id of ["mac-files", "win-files", "linux-files"]) {
             document.getElementById(id).innerHTML = '<span class="err">Feed unavailable</span>';
           }
