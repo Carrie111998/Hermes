@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 from unittest.mock import patch
 
 import pytest
@@ -172,6 +172,117 @@ def test_text_response_surfaces_fields_additively():
     }
     for k in ("effect", "escalation", "code", "verified", "path", "degraded", "delivery_mode"):
         assert k not in payload2
+
+
+def test_capture_after_preserves_semantic_refusal_fields():
+    from tools.computer_use.backend import ActionResult, CaptureResult, ComputerUseBackend
+    from tools.computer_use.tool import _maybe_follow_capture
+
+    class Backend:
+        _last_target = {"pid": 4242, "window_id": 7}
+
+        def capture(self, **kwargs):
+            assert kwargs["pid"] == 4242
+            assert kwargs["window_id"] == 7
+            return CaptureResult(mode="ax", width=800, height=600)
+
+    result = ActionResult(
+        ok=True,
+        action="click",
+        message="background delivery was refused",
+        verified=False,
+        effect="suspected_noop",
+        escalation={"recommended": "foreground"},
+        path="ax",
+        degraded=True,
+        delivery_mode="background",
+        code="background_unavailable",
+        meta={"reason": "occluded renderer"},
+    )
+
+    backend = cast(ComputerUseBackend, Backend())
+    payload = json.loads(_maybe_follow_capture(backend, result, True))
+    assert payload["ok"] is True
+    assert payload["effect"] == "suspected_noop"
+    assert payload["verified"] is False
+    assert payload["escalation"] == {"recommended": "foreground"}
+    assert payload["code"] == "background_unavailable"
+    assert payload["path"] == "ax"
+    assert payload["degraded"] is True
+    assert payload["delivery_mode"] == "background"
+    assert payload["meta"] == {"reason": "occluded renderer"}
+    assert payload["verdict"] == {
+        "decision": "escalate",
+        "recommended": "foreground",
+    }
+    assert payload["mode"] == "ax"
+    assert payload["width"] == 800
+    assert payload["height"] == 600
+    assert payload["elements"] == []
+    assert payload["total_elements"] == 0
+    assert "capture mode=ax 800x600" in payload["summary"]
+
+
+def test_multimodal_capture_after_embeds_complete_action_result():
+    from tools.computer_use.backend import ActionResult, CaptureResult, ComputerUseBackend
+    from tools.computer_use.tool import _maybe_follow_capture
+
+    class Backend:
+        _last_target = {}
+        _last_app = "Fixture"
+
+        def capture(self, **kwargs):
+            assert kwargs["app"] == "Fixture"
+            return CaptureResult(mode="vision", width=800, height=600)
+
+    response = {
+        "_multimodal": True,
+        "content": [
+            {"type": "text", "text": "capture"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,fixture"}},
+        ],
+        "text_summary": "capture",
+        "meta": {"mode": "vision", "width": 800, "height": 600},
+    }
+    result = ActionResult(
+        ok=True,
+        action="drag",
+        message="background delivery could not be verified",
+        effect="unverifiable",
+        verified=False,
+        path="ax",
+        degraded=True,
+        delivery_mode="background",
+        code="background_unavailable",
+        escalation={"recommended": "foreground"},
+        meta={"reason": "unverifiable renderer"},
+    )
+
+    with patch("tools.computer_use.tool._capture_response", return_value=response):
+        backend = cast(ComputerUseBackend, Backend())
+        payload = _maybe_follow_capture(backend, result, True)
+
+    expected_action = {
+        "ok": True,
+        "action": "drag",
+        "message": "background delivery could not be verified",
+        "meta": {"reason": "unverifiable renderer"},
+        "verified": False,
+        "effect": "unverifiable",
+        "escalation": {"recommended": "foreground"},
+        "path": "ax",
+        "degraded": True,
+        "delivery_mode": "background",
+        "code": "background_unavailable",
+        "verdict": {"decision": "verify_fresh_state"},
+    }
+    assert payload["action_result"] == expected_action
+    for delivered_text in (payload["content"][0]["text"], payload["text_summary"]):
+        action_line = delivered_text.split("\n\n", 1)[0]
+        # main prefixes the capture with the full JSON action payload
+        assert json.loads(action_line) == expected_action
+    assert payload["content"][1] == response["content"][1]
+    assert payload["meta"] == {"mode": "vision", "width": 800, "height": 600}
 
 
 # ---------------------------------------------------------------------------
