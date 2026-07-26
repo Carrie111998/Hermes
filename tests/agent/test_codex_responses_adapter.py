@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_responses_adapter import (
+    CALL_ID_MAX_LEN,
+    _cap_call_id,
     _chat_messages_to_responses_input,
     _format_responses_error,
     _normalize_codex_response,
@@ -537,3 +539,89 @@ def test_normalize_codex_response_xai_reasoning_without_marker_stays_incomplete(
 
     assert finish_reason == "incomplete"
     assert assistant_message.content == ""
+
+
+# ---------------------------------------------------------------------------
+# call_id length cap (Responses API rejects > 64 chars, non-retryably)
+# ---------------------------------------------------------------------------
+
+# Real ids observed from the codex app-server, which names MCP tool calls
+# codex_mcp__<server>__<tool>_exec-<uuid4>. 82 and 94 characters.
+_LONG_CALL_ID = (
+    "codex_mcp__hermes-tools__kanban_complete_exec-"
+    "34a055fe-2a0b-4d32-a499-dcd21100d76a"
+)
+_LONGER_CALL_ID = (
+    "codex_mcp__codex_apps__google_calendar.search_events_exec-"
+    "6450d423-18e8-4e0c-9b87-36124bb53370"
+)
+
+
+def test_preflight_caps_overlong_call_id_and_keeps_the_pair_matched():
+    """A function_call and its output must still reference the SAME id.
+
+    Without the cap the Responses API returns a non-retryable
+    HTTP 400 string_above_max_length and the entire call dies.
+    """
+    items = _preflight_codex_input_items([
+        {
+            "type": "function_call",
+            "call_id": _LONG_CALL_ID,
+            "name": "kanban_complete",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": _LONG_CALL_ID,
+            "output": "ok",
+        },
+    ])
+
+    call, output = items[0], items[1]
+    assert len(call["call_id"]) <= CALL_ID_MAX_LEN
+    assert call["call_id"] == output["call_id"], "pairing must survive the cap"
+    assert call["call_id"] != _LONG_CALL_ID
+
+
+def test_preflight_caps_multimodal_tool_output_call_id_too():
+    """The array-output branch is a separate write site — cap it as well."""
+    items = _preflight_codex_input_items([
+        {
+            "type": "function_call",
+            "call_id": _LONGER_CALL_ID,
+            "name": "search_events",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": _LONGER_CALL_ID,
+            "output": [{"type": "input_text", "text": "found"}],
+        },
+    ])
+
+    assert len(items[1]["call_id"]) <= CALL_ID_MAX_LEN
+    assert items[0]["call_id"] == items[1]["call_id"]
+
+
+def test_preflight_leaves_normal_call_ids_untouched():
+    items = _preflight_codex_input_items([
+        {
+            "type": "function_call",
+            "call_id": "call_abc123",
+            "name": "read_file",
+            "arguments": "{}",
+        },
+    ])
+
+    assert items[0]["call_id"] == "call_abc123"
+
+
+def test_cap_call_id_is_deterministic_and_collision_resistant():
+    a = _LONG_CALL_ID
+    # Differs only in the final uuid character — the truncated prefix is
+    # identical, so only the digest can keep these apart.
+    b = _LONG_CALL_ID[:-1] + ("0" if _LONG_CALL_ID[-1] != "0" else "1")
+
+    assert _cap_call_id(a) == _cap_call_id(a)
+    assert _cap_call_id(a) != _cap_call_id(b)
+    assert len(_cap_call_id(a)) == CALL_ID_MAX_LEN

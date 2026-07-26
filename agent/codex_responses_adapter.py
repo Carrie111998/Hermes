@@ -600,6 +600,40 @@ def _chat_messages_to_responses_input(
 # Input preflight / validation
 # ---------------------------------------------------------------------------
 
+#: The Responses API rejects a ``call_id`` longer than this with a
+#: non-retryable HTTP 400 ``string_above_max_length``.
+CALL_ID_MAX_LEN = 64
+
+
+def _cap_call_id(call_id: str) -> str:
+    """Fit ``call_id`` inside the Responses API's 64-character limit.
+
+    The codex app-server names MCP tool calls
+    ``codex_mcp__<server>__<tool>_exec-<uuid4>``, which runs 79-94 characters in
+    practice — a 36-char uuid plus ``_exec-`` already leaves only 22 for the
+    server and tool names. Replaying such a transcript over the Responses wire
+    (a background-review fork, or any codex_app_server -> codex_responses
+    downgrade) therefore fails with:
+
+        Invalid 'input[N].call_id': string too long. Expected a string with
+        maximum length 64, but got a string with length 78 instead.
+
+    That error is non-retryable, so the whole call dies. Shorten instead:
+    keep a readable prefix and append a digest of the FULL original id so
+    distinct calls can never collide. Purely a function of the input, so
+    replays and prefix caches stay stable (AGENTS.md Pitfall #16 —
+    deterministic IDs in tool call history).
+
+    Ids already within the limit are returned untouched, so the normal
+    ``call_...`` shape is unaffected.
+    """
+    if len(call_id) <= CALL_ID_MAX_LEN:
+        return call_id
+    digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:16]
+    keep = CALL_ID_MAX_LEN - len(digest) - 1
+    return f"{call_id[:keep]}_{digest}"
+
+
 def _preflight_codex_input_items(
     raw_items: Any,
     *,
@@ -633,7 +667,7 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call",
-                    "call_id": call_id.strip(),
+                    "call_id": _cap_call_id(call_id.strip()),
                     "name": name.strip(),
                     "arguments": arguments,
                 }
@@ -674,7 +708,7 @@ def _preflight_codex_input_items(
                 normalized.append(
                     {
                         "type": "function_call_output",
-                        "call_id": call_id.strip(),
+                        "call_id": _cap_call_id(call_id.strip()),
                         "output": cleaned if cleaned else "",
                     }
                 )
@@ -685,7 +719,7 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call_output",
-                    "call_id": call_id.strip(),
+                    "call_id": _cap_call_id(call_id.strip()),
                     "output": output,
                 }
             )
