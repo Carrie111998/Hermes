@@ -192,7 +192,15 @@ jobs:
           aws s3 cp apps/desktop/download-site/index.html s3://intelliverse-x-desktop/index.html \
             --content-type "text/html; charset=utf-8" \
             --cache-control "no-cache"
+          # Foundrly-only share page (no Agency/QuizVerse tabs) — client handover URL
+          aws s3 cp apps/desktop/download-site/foundrly.html s3://intelliverse-x-desktop/foundrly/index.html \
+            --content-type "text/html; charset=utf-8" \
+            --cache-control "no-cache"
+          aws s3 cp apps/desktop/download-site/foundrly.html s3://intelliverse-x-desktop/foundrly.html \
+            --content-type "text/html; charset=utf-8" \
+            --cache-control "no-cache"
           curl -sf https://intelliverse-x-desktop.s3.amazonaws.com/index.html >/dev/null
+          curl -sf https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/index.html >/dev/null
 
   # End-to-end feed check: after all platforms publish, confirm each brand's
   # public S3 feed serves the new version on every channel and every artifact

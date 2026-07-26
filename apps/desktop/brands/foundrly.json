@@ -14,7 +14,7 @@
   "markSvg": "foundrly/mark-512.png",
   "touchIcon": "foundrly/mark-512.png",
   "updateFeedUrl": "https://intelliverse-x-desktop.s3.amazonaws.com/foundrly",
-  "downloadPageUrl": "https://intelliverse-x-desktop.s3.amazonaws.com/index.html#foundrly",
+  "downloadPageUrl": "https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/index.html",
   "s3PublishPath": "foundrly",
   "workspace": "foundrly",
   "workspaceLabel": "Foundrly",
