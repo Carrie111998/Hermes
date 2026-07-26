@@ -11,6 +11,13 @@ import { Loader } from '@/components/ui/loader'
 import { SearchField } from '@/components/ui/search-field'
 import { cn } from '@/lib/utils'
 
+import {
+  DisconnectedHermesEngine,
+  type HermesAnalysisResult,
+  type HermesSystemStatus,
+  type SigilHermesEngine
+} from '../hermes-engine'
+
 import { sigilOperatorAdapter } from './mock-adapter'
 import type {
   AuditEvent,
@@ -452,11 +459,17 @@ function AuditTable({ events }: { events: AuditEvent[] }) {
   )
 }
 
+const disconnectedHermesEngine = new DisconnectedHermesEngine()
+
 interface SigilOperatorViewProps {
   adapter?: SigilOperatorAdapter
+  engine?: SigilHermesEngine
 }
 
-export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOperatorViewProps) {
+export function SigilOperatorView({
+  adapter = sigilOperatorAdapter,
+  engine = disconnectedHermesEngine
+}: SigilOperatorViewProps) {
   const [section, setSection] = useState<Section>('overview')
   const [snapshot, setSnapshot] = useState<SigilSnapshot | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -464,6 +477,10 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
   const [pendingAction, setPendingAction] = useState<SimulatedOperatorAction | null>(null)
   const [reloadGeneration, setReloadGeneration] = useState(0)
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null)
+  const [hermesStatus, setHermesStatus] = useState<HermesSystemStatus | null>(null)
+  const [hermesAnalysis, setHermesAnalysis] = useState<HermesAnalysisResult | null>(null)
+  const [hermesLoading, setHermesLoading] = useState(false)
+  const [hermesError, setHermesError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -485,6 +502,27 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
       cancelled = true
     }
   }, [adapter, reloadGeneration])
+
+  useEffect(() => {
+    let cancelled = false
+
+    void engine
+      .getSystemStatus()
+      .then(status => {
+        if (!cancelled) {
+          setHermesStatus(status)
+        }
+      })
+      .catch(reason => {
+        if (!cancelled) {
+          setHermesError(reason instanceof Error ? reason.message : String(reason))
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [engine])
 
   const confirmation = useMemo(() => {
     if (!pendingAction) {
@@ -551,6 +589,36 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
     snapshot.proposals.find(proposal => proposal.id === selectedProposalId) ??
     snapshot.proposals.find(proposal => proposal.status === 'pending') ??
     snapshot.proposals[0]
+
+  async function explainSelectedProposal(): Promise<void> {
+    if (!selectedProposal) {
+      return
+    }
+
+    setHermesLoading(true)
+    setHermesError(null)
+
+    try {
+      const result = await engine.explainProposal({
+        proposalId: selectedProposal.id,
+        symbol: selectedProposal.symbol,
+        side: selectedProposal.side,
+        estimatedNotional: Number(selectedProposal.estimatedNotional.replace(/[^0-9.-]/g, '')),
+        strategy: selectedProposal.strategy,
+        evidenceReferences: selectedProposal.evidenceReferences.map(reference => ({
+          id: reference,
+          label: reference,
+          source: 'sigil'
+        }))
+      })
+
+      setHermesAnalysis(result)
+    } catch (reason) {
+      setHermesError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setHermesLoading(false)
+    }
+  }
 
   return (
     <section
@@ -766,6 +834,84 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
             <p className="mt-4 text-xs text-(--ui-text-tertiary)">
               Broker credentials, live submission, and capital-limit controls are not available in this product.
             </p>
+
+            <section
+              aria-labelledby="hermes-intelligence-title"
+              className="mt-6 max-w-3xl border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-(--ui-stroke-tertiary) px-4 py-3">
+                <div>
+                  <h3 className="text-xs font-semibold uppercase tracking-[0.08em]" id="hermes-intelligence-title">
+                    Hermes Intelligence
+                  </h3>
+                  <p className="mt-1 text-[0.6875rem] text-(--ui-text-tertiary)">Analysis and explanation only</p>
+                </div>
+                <StatusLabel tone={hermesStatus?.status === 'connected' ? 'success' : 'danger'}>
+                  {(hermesStatus?.status ?? engine.status).toUpperCase()}
+                </StatusLabel>
+              </div>
+
+              <dl className="grid gap-px bg-(--ui-stroke-tertiary) sm:grid-cols-2">
+                {[
+                  ['Route', hermesStatus?.modelRoute ?? 'local-disconnected'],
+                  ['Mode', 'Analysis only'],
+                  ['Execution authorization', 'Never'],
+                  ['Broker submission', 'Unavailable']
+                ].map(([label, value]) => (
+                  <div className="bg-(--ui-bg-primary) px-4 py-3" key={label}>
+                    <dt className="text-[0.625rem] uppercase tracking-[0.1em] text-(--ui-text-tertiary)">{label}</dt>
+                    <dd className="mt-1 font-mono text-xs">{value}</dd>
+                  </div>
+                ))}
+              </dl>
+
+              <div className="px-4 py-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-medium">
+                      {selectedProposal
+                        ? `${selectedProposal.id} · ${selectedProposal.symbol} ${selectedProposal.side}`
+                        : 'No proposal selected'}
+                    </p>
+                    <p className="mt-1 text-[0.6875rem] text-(--ui-text-tertiary)">
+                      Explanation uses local proposal and evidence metadata.
+                    </p>
+                  </div>
+                  <Button
+                    disabled={!selectedProposal || hermesLoading}
+                    onClick={() => void explainSelectedProposal()}
+                    size="sm"
+                    variant="outline"
+                  >
+                    {hermesLoading ? 'Explaining…' : 'Explain selected proposal'}
+                  </Button>
+                </div>
+
+                {hermesError ? (
+                  <p className="mt-4 text-xs text-destructive" role="alert">
+                    {hermesError}
+                  </p>
+                ) : null}
+
+                {hermesAnalysis ? (
+                  <div className="mt-4 border-l-2 border-primary/60 pl-4" data-testid="hermes-analysis">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <StatusLabel tone="muted">{hermesAnalysis.source.toUpperCase()}</StatusLabel>
+                      <span className="font-mono text-[0.6875rem] text-(--ui-text-tertiary)">
+                        {hermesAnalysis.modelRoute}
+                      </span>
+                    </div>
+                    <p className="mt-3 text-xs font-semibold">{hermesAnalysis.summary}</p>
+                    <p className="mt-2 text-xs leading-relaxed text-(--ui-text-secondary)">
+                      {hermesAnalysis.explanation}
+                    </p>
+                    <p className="mt-3 font-mono text-[0.625rem] uppercase tracking-[0.08em] text-(--ui-text-tertiary)">
+                      Execution authorized: no · Broker submission available: no
+                    </p>
+                  </div>
+                ) : null}
+              </div>
+            </section>
           </div>
         ) : null}
       </div>
@@ -776,7 +922,7 @@ export function SigilOperatorView({ adapter = sigilOperatorAdapter }: SigilOpera
         )}
       >
         <span>No broker submission available · no live submit control · account identity masked</span>
-        <span>Adapter: local mock · Step 34 operator UI</span>
+        <span>Adapter: local mock · Hermes intelligence boundary · Step 36</span>
       </footer>
       <ConfirmDialog
         confirmLabel={confirmation?.label}

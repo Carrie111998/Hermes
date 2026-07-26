@@ -1,10 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 
-import {
-  INITIAL_SIGIL_SNAPSHOT,
-  MockSigilOperatorAdapter,
-  SIGIL_FIRST_LAUNCH_LIMIT
-} from './mock-adapter'
+import { INITIAL_SIGIL_SNAPSHOT, MockSigilOperatorAdapter, SIGIL_FIRST_LAUNCH_LIMIT } from './mock-adapter'
 
 import { SigilOperatorView } from './index'
 
@@ -49,6 +45,28 @@ describe('standalone Sigil Mission Control', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
     await waitFor(async () => expect((await adapter.readSnapshot()).proposals[0]?.status).toBe('approved'))
     expect((await adapter.readSnapshot()).auditEvents[0]?.details.broker_submission_attempted).toBe(false)
+  })
+
+  it('renders disconnected Hermes intelligence and explains the selected proposal locally', async () => {
+    render(<SigilOperatorView adapter={new MockSigilOperatorAdapter()} />)
+    await screen.findByTestId('sigil-operator')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+
+    expect(screen.getByText('Hermes Intelligence')).toBeTruthy()
+    expect(screen.getByText('local-disconnected')).toBeTruthy()
+    expect(screen.getByText('Analysis only')).toBeTruthy()
+    expect(screen.getByText('Never')).toBeTruthy()
+    expect(screen.getByText('Unavailable')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Explain selected proposal' }))
+
+    const analysis = await screen.findByTestId('hermes-analysis')
+
+    expect(analysis.textContent).toContain('Proposal PRP-20260725-0042 is governed and simulated.')
+    expect(analysis.textContent).toContain('it cannot be submitted to a broker')
+    expect(analysis.textContent).toContain('Execution authorized: no')
+    expect(analysis.textContent).toContain('Broker submission available: no')
   })
 
   it('contains no broker submission method in the adapter contract', () => {
