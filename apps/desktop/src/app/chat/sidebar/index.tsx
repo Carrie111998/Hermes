@@ -25,7 +25,7 @@ import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { BRAND, IS_QUIZVERSE_BRAND } from '@/lib/brand'
+import { BRAND, IS_FOUNDRLY_BRAND, IS_QUIZVERSE_BRAND } from '@/lib/brand'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { profileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
@@ -104,6 +104,7 @@ import {
   ARTIFACTS_ROUTE,
   IX_AGENCY_ROUTE,
   MESSAGING_ROUTE,
+  FOUNDRLY_ROUTE,
   QUIZVERSE_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
@@ -151,7 +152,14 @@ const BRAND_WORKSPACE_NAV: SidebarNavItem = IS_QUIZVERSE_BRAND
       icon: props => <Codicon name="mortar-board" {...props} />,
       route: QUIZVERSE_ROUTE
     }
-  : {
+  : IS_FOUNDRLY_BRAND
+    ? {
+        id: 'foundrly',
+        label: BRAND.workspaceLabel,
+        icon: props => <Codicon name="rocket" {...props} />,
+        route: FOUNDRLY_ROUTE
+      }
+    : {
       id: 'ix-agency',
       label: BRAND.workspaceLabel,
       icon: props => <Codicon name="organization" {...props} />,
@@ -1128,6 +1136,7 @@ export function ChatSidebar({
                   (item.id === 'artifacts' && currentView === 'artifacts') ||
                   (item.id === 'ix-agency' && currentView === 'ix-agency') ||
                   (item.id === 'quizverse' && currentView === 'quizverse') ||
+                  (item.id === 'foundrly' && currentView === 'foundrly') ||
                   // Contributed rows light up at their own route.
                   (Boolean(item.route) && pathname === item.route)
 

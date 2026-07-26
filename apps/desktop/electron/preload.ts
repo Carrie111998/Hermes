@@ -5,7 +5,7 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
 // namespace — including its channel strings — is dead-code-eliminated from
 // dist/electron-preload.js, not just left unregistered.
 // check-brand-separation.mjs asserts that on the bundle.
-import { IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from './brand-gates'
+import { IS_FOUNDRLY_BRAND, IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from './brand-gates'
 
 let voiceCaptureToken = ''
 ipcRenderer.on('hermes:voice:capture-authorized', (_event, token) => {
@@ -496,6 +496,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
             return () => ipcRenderer.removeListener('hermes:quizverse:tutor:event', listener)
           }
+        }
+      }
+    : {}),
+  // Foundrly: product workspace (MVP). Only the Foundrly brand exposes this.
+  ...(IS_FOUNDRLY_BRAND
+    ? {
+        foundrly: {
+          status: () => ipcRenderer.invoke('hermes:foundrly:status'),
+          openUrl: url => ipcRenderer.invoke('hermes:foundrly:open-url', url)
         }
       }
     : {})

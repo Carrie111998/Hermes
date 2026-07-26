@@ -2,11 +2,11 @@
 // apply-brand.mjs — resolve the build flavor (DESKTOP_BRAND) into concrete
 // build inputs so one repo ships multiple branded desktop apps.
 //
-// The repo hosts two strictly-separated desktop brands built from the same
-// Hermes core: `ix-agency` (default) and `quizverse`. A brand manifest in
-// apps/desktop/brands/<id>.json owns everything identity-shaped: appId,
-// productName, artifact naming, icons, update feed, S3 publish path, and
-// which brand workspace ships in the renderer.
+// The repo hosts strictly-separated desktop brands built from the same
+// Hermes core: `ix-agency` (default), `quizverse`, and `foundrly`. A brand
+// manifest in apps/desktop/brands/<id>.json owns everything identity-shaped:
+// appId, productName, artifact naming, icons, update feed, S3 publish path,
+// and which brand workspace ships in the renderer.
 //
 // Outputs (both under apps/desktop/build/, which is gitignored):
 //   build/brand.json                   — the resolved manifest (consumed by
@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const desktopRoot = path.resolve(here, '..')
 
-export const KNOWN_BRANDS = ['ix-agency', 'quizverse']
+export const KNOWN_BRANDS = ['ix-agency', 'quizverse', 'foundrly']
 export const DEFAULT_BRAND = 'ix-agency'
 
 export function resolveBrandId(raw = process.env.DESKTOP_BRAND) {
@@ -124,17 +124,43 @@ export function brandedBuilderConfig(brand, pkg) {
 
   build.files = [...(build.files || []), ...hermesArtExcludes]
 
-  // Per-brand asset dirs: QuizVerse art must not ship in IX builds and vice versa.
+  // Per-brand asset dirs: each brand's art must not ship in the others.
   if (brand.id === 'quizverse') {
     build.files = [
       ...(build.files || []),
       '!public/ix-agency-mark.svg',
       '!dist/ix-agency-mark.svg',
       '!public/apple-touch-icon.png',
-      '!dist/apple-touch-icon.png'
+      '!dist/apple-touch-icon.png',
+      '!public/foundrly',
+      '!public/foundrly/**',
+      '!dist/foundrly',
+      '!dist/foundrly/**'
+    ]
+  } else if (brand.id === 'foundrly') {
+    build.files = [
+      ...(build.files || []),
+      '!public/ix-agency-mark.svg',
+      '!dist/ix-agency-mark.svg',
+      '!public/apple-touch-icon.png',
+      '!dist/apple-touch-icon.png',
+      '!public/quizverse',
+      '!public/quizverse/**',
+      '!dist/quizverse',
+      '!dist/quizverse/**'
     ]
   } else {
-    build.files = [...(build.files || []), '!public/quizverse', '!public/quizverse/**', '!dist/quizverse', '!dist/quizverse/**']
+    build.files = [
+      ...(build.files || []),
+      '!public/quizverse',
+      '!public/quizverse/**',
+      '!dist/quizverse',
+      '!dist/quizverse/**',
+      '!public/foundrly',
+      '!public/foundrly/**',
+      '!dist/foundrly',
+      '!dist/foundrly/**'
+    ]
   }
 
   // The exe-stamp icon rides along as an extraResource; point it at the
@@ -168,6 +194,16 @@ export function brandedBuilderConfig(brand, pkg) {
       {
         from: 'brands/quizverse-skills',
         to: 'quizverse-skills'
+      }
+    ]
+  }
+
+  if (brand.id === 'foundrly') {
+    build.extraResources = [
+      ...(build.extraResources || []),
+      {
+        from: 'brands/foundrly-skills',
+        to: 'foundrly-skills'
       }
     ]
   }

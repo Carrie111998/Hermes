@@ -188,6 +188,9 @@
         <button class="product-tab" id="tab-ix" role="tab" aria-controls="panel-ix" aria-selected="true" tabindex="0">
           IX Agency
         </button>
+        <button class="product-tab" id="tab-foundrly" role="tab" aria-controls="panel-foundrly" aria-selected="false" tabindex="-1">
+          Foundrly
+        </button>
         <button class="product-tab" id="tab-quizverse" role="tab" aria-controls="panel-quizverse" aria-selected="false" tabindex="-1">
           QuizVerse
         </button>
@@ -526,6 +529,61 @@
         </footer>
       </main>
 
+      <main id="panel-foundrly" role="tabpanel" aria-labelledby="tab-foundrly" tabindex="0" hidden>
+      <header>
+        <div class="logo">F</div>
+        <h1>Download Foundrly</h1>
+        <p class="sub">
+          Foundrly product desktop — AI co-founder shell for local businesses (Hermes chat + Foundrly workspace).
+          Separate from IX Agency admin desktop. Scoped admin portal login still uses admin.intelli-verse-x.ai with a Foundrly grant.
+        </p>
+        <div class="verpill">
+          <span class="dot"></span>
+          <span>Feed <b>foundrly/</b> · App ID <b>ai.intelli-verse-x.foundrly</b></span>
+        </div>
+      </header>
+      <div class="grid" id="foundrly-downloads" style="margin-bottom: 28px">
+        <div class="card">
+          <h3>🍎 macOS</h3>
+          <div class="files">
+              <a class="file" href="https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/Foundrly-1.0.1-mac-arm64.dmg" download>
+                Foundrly-…-mac-arm64.dmg
+              </a>
+          </div>
+        </div>
+        <div class="card">
+          <h3>🪟 Windows</h3>
+          <div class="files">
+              <a class="file" href="https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/Foundrly-1.0.1-win-x64.exe" download>
+                Foundrly-…-win-x64.exe
+              </a>
+          </div>
+        </div>
+        <div class="card">
+          <h3>🐧 Linux</h3>
+          <div class="files">
+              <a class="file" href="https://intelliverse-x-desktop.s3.amazonaws.com/foundrly/Foundrly-1.0.1-linux-x86_64.AppImage" download>
+                Foundrly-…-linux-x86_64.AppImage
+              </a>
+          </div>
+        </div>
+      </div>
+      <section class="steps">
+        <h2>After install</h2>
+        <ol class="steps-list">
+          <li><b>Open Foundrly</b> — use the Foundrly rail item (not IX Agency).</li>
+          <li><b>Hermes chat</b> for ops; <b>Open Foundrly web</b> / admin from the workspace cards.</li>
+          <li>Installers appear after the first <code>foundrly</code> CI publish to S3. Until then links 404.</li>
+        </ol>
+      </section>
+      <p class="foot">
+          Product site:
+          <a href="https://foundrly.intelli-verse-x.ai" target="_blank" rel="noreferrer">foundrly.intelli-verse-x.ai</a>
+          · Portal:
+          <a href="https://admin.intelli-verse-x.ai" target="_blank" rel="noreferrer">admin.intelli-verse-x.ai</a>
+      </p>
+      </main>
+
       <main id="panel-admin" role="tabpanel" aria-labelledby="tab-admin" tabindex="0" hidden>
         <header>
           <div class="logo" aria-hidden="true" style="background: linear-gradient(135deg, #0ea5e9, #2563eb)">AD</div>
@@ -658,6 +716,7 @@
 
       function hashForTab(tabId) {
         if (tabId === "tab-quizverse") return "#quizverse";
+        if (tabId === "tab-foundrly") return "#foundrly";
         if (tabId === "tab-admin") return "#admin";
         return "#ix-agency";
       }
@@ -693,6 +752,8 @@
       const hash = location.hash.toLowerCase();
       if (hash === "#quizverse") {
         activateTab(document.getElementById("tab-quizverse"), { updateHash: false });
+      } else if (hash === "#foundrly") {
+        activateTab(document.getElementById("tab-foundrly"), { updateHash: false });
       } else if (hash === "#admin" || hash === "#admin-dashboard") {
         activateTab(document.getElementById("tab-admin"), { updateHash: false });
       }

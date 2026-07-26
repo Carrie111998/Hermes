@@ -21,6 +21,12 @@
  *
  * In dev (unbundled `electron .`) the plain env var applies at runtime with
  * the same default (ix-agency).
+ *
+ * Three brands: ix-agency (default), quizverse, foundrly. Agency is everything
+ * that is neither quizverse nor foundrly so unset/dev defaults stay Agency.
  */
 export const IS_QUIZVERSE_BRAND: boolean = process.env.HERMES_DESKTOP_BRAND === 'quizverse'
-export const IS_IX_AGENCY_BRAND: boolean = process.env.HERMES_DESKTOP_BRAND !== 'quizverse'
+export const IS_FOUNDRLY_BRAND: boolean = process.env.HERMES_DESKTOP_BRAND === 'foundrly'
+export const IS_IX_AGENCY_BRAND: boolean =
+  process.env.HERMES_DESKTOP_BRAND !== 'quizverse' &&
+  process.env.HERMES_DESKTOP_BRAND !== 'foundrly'

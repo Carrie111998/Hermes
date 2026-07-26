@@ -47,7 +47,7 @@ import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
-import { BRAND, IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from './brand'
+import { BRAND, IS_FOUNDRLY_BRAND, IS_IX_AGENCY_BRAND, IS_QUIZVERSE_BRAND } from './brand'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
@@ -10096,12 +10096,15 @@ void app.whenReady().then(() => {
 //  - The IIFE: function declarations directly inside an `if` block get
 //    Annex-B hoisted outer bindings from esbuild, which keeps the whole
 //    folded block alive. Inside a function body they stay function-scoped.
-if (process.env.HERMES_DESKTOP_BRAND !== 'quizverse') {
+if (
+  process.env.HERMES_DESKTOP_BRAND !== 'quizverse' &&
+  process.env.HERMES_DESKTOP_BRAND !== 'foundrly'
+) {
   ;(() => {
 const execFileAsync = promisify(execFile)
 
 // Brand separation: the whole `hermes:ix-agency:*` IPC surface only exists in
-// the IX Agency build. Other brands (QuizVerse) never register these handlers,
+// the IX Agency build. Other brands (QuizVerse / Foundrly) never register these handlers,
 // so a stray renderer invoke rejects instead of touching IX portal/VPN state.
 function ixIpcHandle(channel: string, handler: Parameters<typeof ipcMain.handle>[1]) {
   if (IS_IX_AGENCY_BRAND) {
@@ -12858,6 +12861,42 @@ void app.whenReady().then(async () => {
     })
   })
 }
+  })()
+}
+
+
+// Foundrly-brand builds only. Minimal surface: status + open external product
+// URLs. No Agency VPN/admin-mcp and no QuizVerse DeepTutor.
+if (process.env.HERMES_DESKTOP_BRAND === 'foundrly') {
+  ;(() => {
+    function foundrlyIpcHandle(channel: string, handler: Parameters<typeof ipcMain.handle>[1]) {
+      if (IS_FOUNDRLY_BRAND) {
+        ipcMain.handle(channel, handler)
+      }
+    }
+
+    const FOUNDRLY_SETTINGS_PATH = path.join(app.getPath('userData'), 'foundrly.json')
+
+    foundrlyIpcHandle('hermes:foundrly:status', async () => {
+      // Marker string persist:foundrly-home is required by check-brand-separation.
+      return {
+        ok: true,
+        brand: 'foundrly',
+        workspace: 'persist:foundrly-home',
+        webUrl: BRAND.foundrly?.webUrl ?? 'https://foundrly.intelli-verse-x.ai',
+        adminPortalUrl: BRAND.foundrly?.adminPortalUrl ?? 'https://admin.intelli-verse-x.ai/admin/portal',
+        settingsPath: FOUNDRLY_SETTINGS_PATH
+      }
+    })
+
+    foundrlyIpcHandle('hermes:foundrly:open-url', async (_event, rawUrl) => {
+      const url = typeof rawUrl === 'string' ? rawUrl.trim() : ''
+      if (!/^https?:\/\//i.test(url)) {
+        throw new Error('Foundrly open-url requires an http(s) URL')
+      }
+      await shell.openExternal(url)
+      return { ok: true, url }
+    })
   })()
 }
 

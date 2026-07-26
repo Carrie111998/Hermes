@@ -1,0 +1,25 @@
+{
+  "id": "foundrly",
+  "productName": "Foundrly",
+  "appId": "ai.intelli-verse-x.foundrly",
+  "artifactPrefix": "Foundrly",
+  "executableName": "foundrly",
+  "description": "Foundrly — AI co-founder desktop for local businesses.",
+  "author": "Intelliverse X",
+  "copyright": "Copyright © 2026 Intelliverse X",
+  "homepage": "https://foundrly.intelli-verse-x.ai",
+  "protocolScheme": "foundrly",
+  "icon": "assets/brands/foundrly/icon",
+  "iconIco": "assets/brands/foundrly/icon.ico",
+  "markSvg": "foundrly/mark-512.png",
+  "touchIcon": "foundrly/mark-512.png",
+  "updateFeedUrl": "https://intelliverse-x-desktop.s3.amazonaws.com/foundrly",
+  "downloadPageUrl": "https://intelliverse-x-desktop.s3.amazonaws.com/index.html#foundrly",
+  "s3PublishPath": "foundrly",
+  "workspace": "foundrly",
+  "workspaceLabel": "Foundrly",
+  "foundrly": {
+    "webUrl": "https://foundrly.intelli-verse-x.ai",
+    "adminPortalUrl": "https://admin.intelli-verse-x.ai/admin/portal"
+  }
+}

@@ -327,6 +327,17 @@ declare global {
       // QuizVerse: DeepTutor platform supervisor + settings + surface catalog.
       // Present in every build's preload, but the main-process handlers only
       // register for the QuizVerse brand (other brands reject every invoke).
+      foundrly?: {
+        status: () => Promise<{
+          ok: boolean
+          brand: string
+          workspace: string
+          webUrl: string
+          adminPortalUrl: string
+          settingsPath: string
+        }>
+        openUrl: (url: string) => Promise<{ ok: boolean; url: string }>
+      }
       quizverse?: {
         getSettings: () => Promise<QuizverseRendererSettings>
         saveSettings: (payload: QuizverseSettingsInput) => Promise<QuizverseRendererSettings>
