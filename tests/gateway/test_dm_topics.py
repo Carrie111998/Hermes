@@ -542,7 +542,7 @@ def test_cache_dm_topic_from_message_no_overwrite():
 
 def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id=None,
                        user_id=42, user_name="Test User", forum_topic_created=None,
-                       is_topic_message=None, is_forum=None):
+                       is_topic_message=None, is_forum=None, caption=None):
     """Create a mock Telegram Message for _build_message_event tests."""
     chat = SimpleNamespace(
         id=chat_id,
@@ -567,6 +567,7 @@ def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id
         chat=chat,
         from_user=user,
         text=text,
+        caption=caption,
         message_thread_id=thread_id,
         is_topic_message=is_topic_message,
         message_id=1001,
@@ -996,3 +997,109 @@ def test_build_message_event_dm_from_user_present_uses_user():
     # Normal case — from_user is used directly
     assert event.source.user_id == "99999"
     assert event.source.user_name == "Bob"
+
+
+# ── _extract_forwarded_text: forwarded message text fallback ──
+
+
+def test_extract_forwarded_text_empty_when_no_forward():
+    """No caption or forward_origin → empty string."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    msg = SimpleNamespace(text="", caption=None)
+    result = TelegramAdapter._extract_forwarded_text(msg)
+    assert result == ""
+
+
+def test_extract_forwarded_text_uses_caption():
+    """Caption is returned when text is empty but caption is present."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    msg = SimpleNamespace(text="", caption="photo caption here")
+    result = TelegramAdapter._extract_forwarded_text(msg)
+    assert result == "photo caption here"
+
+
+def test_extract_forwarded_text_forward_origin_api_kwargs():
+    """Deep probe: text in forward_origin.api_kwargs is extracted."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    fwd = SimpleNamespace(api_kwargs={"text": "forwarded channel post"})
+    msg = SimpleNamespace(text="", caption=None, forward_origin=fwd)
+    result = TelegramAdapter._extract_forwarded_text(msg)
+    assert result == "forwarded channel post"
+
+
+def test_extract_forwarded_text_forward_origin_caption_fallback():
+    """Deep probe falls back to caption key in api_kwargs."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    fwd = SimpleNamespace(api_kwargs={"caption": "forwarded media caption"})
+    msg = SimpleNamespace(text="", caption=None, forward_origin=fwd)
+    result = TelegramAdapter._extract_forwarded_text(msg)
+    assert result == "forwarded media caption"
+
+
+def test_extract_forwarded_text_forward_origin_no_text():
+    """forward_origin without text/caption in api_kwargs → empty string."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    fwd = SimpleNamespace(api_kwargs={"chat": "some_chat", "date": "2024-01-01"})
+    msg = SimpleNamespace(text="", caption=None, forward_origin=fwd)
+    result = TelegramAdapter._extract_forwarded_text(msg)
+    assert result == ""
+
+
+def test_extract_forwarded_text_forward_origin_empty_api_kwargs():
+    """forward_origin with empty api_kwargs → empty string."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    fwd = SimpleNamespace(api_kwargs={})
+    msg = SimpleNamespace(text="", caption=None, forward_origin=fwd)
+    result = TelegramAdapter._extract_forwarded_text(msg)
+    assert result == ""
+
+
+def test_extract_forwarded_text_forward_origin_none_api_kwargs():
+    """forward_origin with None api_kwargs → empty string (no crash)."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    fwd = SimpleNamespace(api_kwargs=None)
+    msg = SimpleNamespace(text="", caption=None, forward_origin=fwd)
+    result = TelegramAdapter._extract_forwarded_text(msg)
+    assert result == ""
+
+
+# ── _build_message_event: forwarded text fallback chain ──
+
+
+def test_build_message_event_uses_text_directly():
+    """Normal text message should use message.text directly."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_mock_message(text="normal hello")
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+    assert event.text == "normal hello"
+
+
+def test_build_message_event_fallback_to_caption():
+    """When text is empty, message.caption should be used."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_mock_message(text="", caption="caption text")
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+    assert event.text == "caption text"
+
+
+def test_build_message_event_fallback_to_forward_origin():
+    """When both text and caption are empty, forward_origin.api_kwargs is probed."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    fwd = SimpleNamespace(api_kwargs={"text": "deep forwarded text"})
+    msg = _make_mock_message(text="", caption=None)
+    msg.forward_origin = fwd
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+    assert event.text == "deep forwarded text"
