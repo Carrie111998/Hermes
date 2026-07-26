@@ -2479,6 +2479,235 @@ class TestWebServerEndpoints:
         assert payload["session_id"] == "desktop-tip"
         assert [m["content"] for m in payload["messages"]] == ["after compression"]
 
+    def test_fork_session_endpoint_copies_transcript_and_lineage(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="fork-source", source="cli")
+            db.set_session_title("fork-source", "Fork Source")
+            db.append_message("fork-source", "user", "hello")
+            db.append_message("fork-source", "assistant", "hi there")
+        finally:
+            db.close()
+
+        resp = self.client.post("/api/sessions/fork-source/fork", json={})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] != "fork-source"
+        assert data["message_count"] == 2
+        assert data["title"].startswith("Fork Source")
+
+        db = SessionDB()
+        try:
+            forked = db.get_session(data["id"])
+            assert forked is not None
+            assert forked["parent_session_id"] == "fork-source"
+            assert json.loads(forked["model_config"])["_branched_from"] == "fork-source"
+            assert [
+                message["content"] for message in db.get_messages(data["id"])
+            ] == ["hello", "hi there"]
+        finally:
+            db.close()
+
+    def test_fork_session_endpoint_honors_until_message_id(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="fork-cutoff", source="cli")
+            db.append_message("fork-cutoff", "user", "one")
+            second_id = db.append_message("fork-cutoff", "assistant", "two")
+            db.append_message("fork-cutoff", "user", "three")
+        finally:
+            db.close()
+
+        resp = self.client.post(
+            "/api/sessions/fork-cutoff/fork",
+            json={"id": "forked-cutoff", "until_message_id": second_id},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["id"] == "forked-cutoff"
+        db = SessionDB()
+        try:
+            assert [
+                message["content"] for message in db.get_messages("forked-cutoff")
+            ] == ["one", "two"]
+        finally:
+            db.close()
+
+    def test_fork_session_endpoint_follows_compression_tip(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="fork-root", source="cli")
+            db.end_session("fork-root", "compression")
+            db.create_session(
+                session_id="fork-tip",
+                source="cli",
+                parent_session_id="fork-root",
+            )
+            tip_message_id = db.append_message("fork-tip", "user", "tip message")
+        finally:
+            db.close()
+
+        resp = self.client.post(
+            "/api/sessions/fork-root/fork",
+            json={"id": "fork-from-tip", "until_message_id": tip_message_id},
+        )
+
+        assert resp.status_code == 200
+        db = SessionDB()
+        try:
+            forked = db.get_session("fork-from-tip")
+            assert forked["parent_session_id"] == "fork-tip"
+            assert [
+                message["content"] for message in db.get_messages("fork-from-tip")
+            ] == ["tip message"]
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        "billing_provider",
+        ["inference-gateway", "custom:team-relay"],
+    )
+    def test_fork_endpoint_child_resume_preserves_provider_route(
+        self, monkeypatch, billing_provider
+    ):
+        """Exercise the real REST fork row through the TUI resume resolver."""
+        from hermes_state import SessionDB
+        from tui_gateway import server
+
+        base_url = "https://relay.example.test/v1"
+        parent_db = SessionDB()
+        try:
+            parent_db.create_session(
+                session_id="provider-parent",
+                source="desktop",
+                model="test-model",
+                model_config={
+                    "base_url": base_url,
+                    "api_mode": "chat_completions",
+                },
+            )
+            parent_db.append_message(
+                "provider-parent", "user", "route this child"
+            )
+            parent_db.update_token_counts(
+                "provider-parent",
+                input_tokens=1,
+                billing_provider=billing_provider,
+                billing_base_url=base_url,
+                billing_mode="chat_completions",
+            )
+        finally:
+            parent_db.close()
+
+        response = self.client.post(
+            "/api/sessions/provider-parent/fork",
+            json={"id": "provider-child"},
+        )
+        assert response.status_code == 200
+
+        resume_db = SessionDB()
+        runtime_sid = None
+        try:
+            child = resume_db.get_session("provider-child")
+            assert child["billing_provider"] == billing_provider
+            assert child["billing_base_url"] == base_url
+            assert child["billing_mode"] == "chat_completions"
+
+            captured = {}
+
+            def fake_make_agent(*_args, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(model="test-model", provider=billing_provider)
+
+            monkeypatch.setattr(server, "_get_db", lambda: resume_db)
+            monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+            monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+            monkeypatch.setattr(
+                server, "_clear_session_context", lambda _tokens: None
+            )
+            monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+            monkeypatch.setattr(
+                server,
+                "_session_info",
+                lambda agent, *_args: {
+                    "model": agent.model,
+                    "provider": agent.provider,
+                },
+            )
+            monkeypatch.setattr(
+                server,
+                "_claim_active_session_slot",
+                lambda *_args, **_kwargs: (None, None),
+            )
+            monkeypatch.setattr(
+                server,
+                "_maybe_schedule_auto_continue",
+                lambda *_args, **_kwargs: None,
+            )
+
+            def fake_init_session(sid, key, agent, history, **_kwargs):
+                server._sessions[sid] = {
+                    "agent": agent,
+                    "history": history,
+                    "session_key": key,
+                }
+
+            monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+            resumed = server.handle_request(
+                {
+                    "id": "resume-provider-child",
+                    "method": "session.resume",
+                    "params": {
+                        "session_id": "provider-child",
+                        "eager_build": True,
+                    },
+                }
+            )
+
+            assert "error" not in resumed
+            assert resumed["result"]["resumed"] == "provider-child"
+            runtime_sid = resumed["result"]["session_id"]
+            assert captured["provider_override"] == billing_provider
+            assert captured["model_override"] == {
+                "model": "test-model",
+                "provider": billing_provider,
+                "base_url": base_url,
+                "api_mode": "chat_completions",
+            }
+        finally:
+            if runtime_sid:
+                server._sessions.pop(runtime_sid, None)
+            resume_db.close()
+
+    def test_fork_session_endpoint_returns_404_for_missing_source(self):
+        resp = self.client.post("/api/sessions/does-not-exist/fork", json={})
+        assert resp.status_code == 404
+
+    def test_fork_session_endpoint_rejects_unknown_until_message_id(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="fork-invalid", source="cli")
+            db.append_message("fork-invalid", "user", "hello")
+        finally:
+            db.close()
+
+        resp = self.client.post(
+            "/api/sessions/fork-invalid/fork",
+            json={"until_message_id": 999999},
+        )
+        assert resp.status_code == 400
+        assert "until_message_id" in resp.json()["detail"]
+
     def test_get_sessions_archived_is_boolean(self):
         from hermes_state import SessionDB
 

@@ -173,6 +173,7 @@ interface PromptActionsOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   branchCurrentSession: () => Promise<boolean>
+  branchStoredSession: (storedSessionId: string) => Promise<boolean>
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
@@ -204,6 +205,7 @@ export function usePromptActions({
   activeSessionIdRef,
   busyRef,
   branchCurrentSession,
+  branchStoredSession,
   createBackendSessionForSend,
   getRoutedStoredSessionId,
   getRuntimeIdForStoredSession,
@@ -495,6 +497,7 @@ export function usePromptActions({
     activeSessionIdRef,
     appendSessionTextMessage,
     branchCurrentSession,
+    branchStoredSession,
     busyRef,
     copy,
     createBackendSessionForSend,
@@ -917,8 +920,8 @@ export function usePromptActions({
   return {
     cancelRun,
     editMessage,
-    // Session tiles route their slash input here (targets THEIR session via
-    // options.sessionId; app-level effects — branch, handoff — act on main).
+    // Session tiles route slash input here with both runtime and durable ids,
+    // so session-scoped actions stay on the tile that invoked them.
     executeSlashCommand,
     handleThreadMessagesChange,
     handoffSession,

@@ -9,6 +9,7 @@ import {
 import { useStore } from '@nanostores/react'
 import { type FC, useCallback, useMemo } from 'react'
 
+import { SessionForkOriginNotice } from '@/app/chat/fork-origin-banner'
 import {
   contentHasVisibleText,
   messageContentText,
@@ -45,7 +46,8 @@ interface MessageActionProps {
 export const AssistantMessage: FC<{
   onBranchInNewChat?: (messageId: string) => void
   onDismissError?: (messageId: string) => void
-}> = ({ onBranchInNewChat, onDismissError }) => {
+  storedSessionId?: string | null
+}> = ({ onBranchInNewChat, onDismissError, storedSessionId = null }) => {
   const messageId = useAuiState(s => s.message.id)
   const messageRuntime = useMessageRuntime()
   const { t } = useI18n()
@@ -126,6 +128,13 @@ export const AssistantMessage: FC<{
       </div>
       {hasVisibleText && !isInterim && (
         <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />
+      )}
+      {storedSessionId && (
+        <SessionForkOriginNotice
+          className="px-(--message-text-indent)"
+          messageId={messageId}
+          storedSessionId={storedSessionId}
+        />
       )}
     </MessagePrimitive.Root>
   )

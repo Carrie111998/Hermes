@@ -517,6 +517,7 @@ export function ChatView({
             onRestoreToMessage={onRestoreToMessage}
             sessionId={activeSessionId}
             sessionKey={threadKey}
+            storedSessionId={selectedSessionId}
           />
           {resumeExhausted && routedSessionId && (
             <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">

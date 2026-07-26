@@ -1,6 +1,7 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
 import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
 
+import { SessionForkOriginNotice } from '@/app/chat/fork-origin-banner'
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
@@ -100,7 +101,8 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
 export const UserMessage: FC<{
   onCancel?: () => Promise<void> | void
   onRequestRestoreConfirm?: (messageId: string, target: RestoreMessageTarget) => void
-}> = ({ onCancel, onRequestRestoreConfirm }) => {
+  storedSessionId?: string | null
+}> = ({ onCancel, onRequestRestoreConfirm, storedSessionId = null }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
   const messageId = useAuiState(s => s.message.id)
@@ -359,6 +361,13 @@ export const UserMessage: FC<{
                 {copy.goForward}
               </BranchPickerPrimitive.Next>
             </BranchPickerPrimitive.Root>
+            {storedSessionId && (
+              <SessionForkOriginNotice
+                className="px-1.5 pt-1"
+                messageId={messageId}
+                storedSessionId={storedSessionId}
+              />
+            )}
           </div>
         </ActionBarPrimitive.Root>
       </StickyHumanMessageContainer>

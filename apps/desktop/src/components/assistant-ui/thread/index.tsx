@@ -28,6 +28,7 @@ export const Thread: FC<{
   onRestoreToMessage?: (messageId: string, target?: RestoreMessageTarget) => Promise<void> | void
   sessionId?: string | null
   sessionKey?: string | null
+  storedSessionId?: string | null
 }> = ({
   clampToComposer = false,
   cwd = null,
@@ -39,7 +40,8 @@ export const Thread: FC<{
   onDismissError,
   onRestoreToMessage,
   sessionId = null,
-  sessionKey
+  sessionKey,
+  storedSessionId = null
 }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
@@ -70,7 +72,11 @@ export const Thread: FC<{
   const messageComponents = useMemo(
     () => ({
       AssistantMessage: () => (
-        <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />
+        <AssistantMessage
+          onBranchInNewChat={onBranchInNewChat}
+          onDismissError={onDismissError}
+          storedSessionId={storedSessionId}
+        />
       ),
       SystemMessage,
       UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
@@ -78,10 +84,21 @@ export const Thread: FC<{
         <UserMessage
           onCancel={onCancel}
           onRequestRestoreConfirm={onRestoreToMessage ? requestRestoreConfirm : undefined}
+          storedSessionId={storedSessionId}
         />
       )
     }),
-    [cwd, gateway, onBranchInNewChat, onCancel, onDismissError, onRestoreToMessage, requestRestoreConfirm, sessionId]
+    [
+      cwd,
+      gateway,
+      onBranchInNewChat,
+      onCancel,
+      onDismissError,
+      onRestoreToMessage,
+      requestRestoreConfirm,
+      sessionId,
+      storedSessionId
+    ]
   )
 
   const emptyPlaceholder = intro ? (

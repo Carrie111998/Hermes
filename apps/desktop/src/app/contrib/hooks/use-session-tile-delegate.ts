@@ -51,8 +51,8 @@ export function useSessionTileDelegate({
       deleteSession: async storedSessionId => {
         await removeSession(storedSessionId)
       },
-      executeSlash: async (rawCommand, sessionId) => {
-        await executeSlashCommand(rawCommand, { sessionId })
+      executeSlash: async (rawCommand, sessionId, storedSessionId) => {
+        await executeSlashCommand(rawCommand, { sessionId, storedSessionId })
       },
       interruptSession: async runtimeId => {
         await requestGateway('session.interrupt', { session_id: runtimeId })

@@ -159,6 +159,14 @@ interface AppAtom<T> {
   set: (value: T) => void
 }
 
+export interface ForkOriginNotice {
+  createdAt: number
+  parentSessionId: string
+  // Forked children get fresh SQLite message ids, so re-find the boundary by
+  // its ordinal among visible user/assistant messages in the copied transcript.
+  branchMessageOrdinal: number
+}
+
 function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
   store.set(typeof next === 'function' ? (next as (current: T) => T)(store.get()) : next)
 }
@@ -302,6 +310,8 @@ export const $sessionProfileTotals = atom<Record<string, number>>({})
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
+// Transient renderer chrome, not durable session metadata.
+export const $forkOriginNotices = atom<Record<string, ForkOriginNotice>>({})
 export interface ActiveSessionStoredIdRotation {
   nextStoredSessionId: string
   previousStoredSessionId: string
@@ -403,6 +413,8 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   }
 }
 
+export const setForkOriginNotices = (next: Updater<Record<string, ForkOriginNotice>>) =>
+  updateAtom($forkOriginNotices, next)
 export const setMessages = (next: Updater<ChatMessage[]>) => updateAtom($messages, next)
 export const setFreshDraftReady = (next: Updater<boolean>) => updateAtom($freshDraftReady, next)
 export const setResumeFailedSessionId = (next: Updater<string | null>) => updateAtom($resumeFailedSessionId, next)
@@ -511,3 +523,50 @@ export const setIntroSeed = (next: Updater<number>) => updateAtom($introSeed, ne
 export const setContextSuggestions = (next: Updater<ContextSuggestion[]>) => updateAtom($contextSuggestions, next)
 export const setModelPickerOpen = (next: Updater<boolean>) => updateAtom($modelPickerOpen, next)
 export const setSessionPickerOpen = (next: Updater<boolean>) => updateAtom($sessionPickerOpen, next)
+
+export function setForkOriginNotice(
+  childSessionId: string | null | undefined,
+  parentSessionId: string | null | undefined,
+  branchMessageOrdinal: number | null | undefined
+) {
+  const child = childSessionId?.trim()
+  const parent = parentSessionId?.trim()
+
+  if (
+    !child ||
+    !parent ||
+    typeof branchMessageOrdinal !== 'number' ||
+    !Number.isInteger(branchMessageOrdinal) ||
+    branchMessageOrdinal < 0
+  ) {
+    return
+  }
+
+  setForkOriginNotices(current => ({
+    ...current,
+    [child]: {
+      branchMessageOrdinal,
+      createdAt: Date.now(),
+      parentSessionId: parent
+    }
+  }))
+}
+
+export function clearForkOriginNotice(childSessionId: string | null | undefined) {
+  const child = childSessionId?.trim()
+
+  if (!child) {
+    return
+  }
+
+  setForkOriginNotices(current => {
+    if (!(child in current)) {
+      return current
+    }
+
+    const next = { ...current }
+    delete next[child]
+
+    return next
+  })
+}

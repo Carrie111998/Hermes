@@ -2155,6 +2155,14 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     assert ov["provider_override"] == "anthropic"
     assert ov["model_override"]["provider"] == "anthropic"
 
+    # A named custom provider is a routable identity, unlike the bare custom
+    # billing bucket, and must survive a fork/resume round trip.
+    ov = server._stored_session_runtime_overrides(
+        {"model": "test-model", "billing_provider": "custom:team-relay"}
+    )
+    assert ov["provider_override"] == "custom:team-relay"
+    assert ov["model_override"]["provider"] == "custom:team-relay"
+
     # An explicit routable provider in model_config wins over the bare billing bucket.
     ov = server._stored_session_runtime_overrides(
         {"model": "m", "billing_provider": "custom", "model_config": {"provider": "custom:myendpoint"}}

@@ -1113,6 +1113,139 @@ class TestSessionLifecycle:
             db.close()
 
 
+class TestSessionFork:
+    def test_fork_session_copies_transcript_and_sets_lineage(self, db):
+        db.create_session(
+            session_id="parent",
+            source="cli",
+            model="sonnet",
+            model_config={"temperature": 0.2},
+        )
+        db.update_token_counts(
+            "parent",
+            input_tokens=1,
+            billing_provider="kimi-coding",
+            billing_base_url="https://api.kimi.com/coding",
+            billing_mode="api_key",
+        )
+        db.set_session_title("parent", "Investigate issue")
+        db.append_message("parent", "user", "first prompt")
+        db.append_message("parent", "assistant", "first answer")
+
+        forked = db.fork_session("parent", "child")
+
+        child = db.get_session("child")
+        assert child is not None
+        assert child["parent_session_id"] == "parent"
+        assert child["model"] == "sonnet"
+        assert child["billing_provider"] == "kimi-coding"
+        assert child["billing_base_url"] == "https://api.kimi.com/coding"
+        assert child["billing_mode"] == "api_key"
+        assert forked["id"] == "child"
+        assert forked["title"] == "Investigate issue #2"
+        assert db.get_session("parent")["ended_at"] is None
+
+        cfg = db._decode_model_config_blob(child["model_config"])
+        assert cfg["temperature"] == 0.2
+        assert cfg["_branched_from"] == "parent"
+
+        parent_messages = db.get_messages("parent")
+        child_messages = db.get_messages("child")
+        assert [m["content"] for m in child_messages] == [m["content"] for m in parent_messages]
+        assert child["message_count"] == len(child_messages)
+
+    def test_fork_session_can_copy_prefix_until_message_id(self, db):
+        db.create_session(session_id="parent", source="cli")
+        db.append_message("parent", "user", "one")
+        second_id = db.append_message("parent", "assistant", "two")
+        db.append_message("parent", "user", "three")
+
+        db.fork_session("parent", "child", until_message_id=second_id)
+
+        child_messages = db.get_messages("child")
+        assert [m["content"] for m in child_messages] == ["one", "two"]
+
+    def test_fork_session_copies_named_custom_provider_route(self, db):
+        db.create_session(session_id="parent", source="tui", model="gpt-5.5")
+        db.update_token_counts(
+            "parent",
+            input_tokens=1,
+            billing_provider="custom:team-relay",
+            billing_base_url="https://relay.example.test/v1",
+            billing_mode="chat_completions",
+        )
+
+        db.fork_session("parent", "child")
+
+        child = db.get_session("child")
+        assert child["billing_provider"] == "custom:team-relay"
+        assert child["billing_base_url"] == "https://relay.example.test/v1"
+        assert child["billing_mode"] == "chat_completions"
+
+    def test_fork_session_preserves_every_stored_message_field(self, db):
+        db.create_session(session_id="parent", source="cli")
+        db.append_message(
+            "parent",
+            "tool",
+            "safety-sensitive result",
+            tool_name="terminal",
+            tool_call_id="call-1",
+            token_count=17,
+            finish_reason="stop",
+            platform_message_id="platform-1",
+            observed=True,
+            effect_disposition="unknown",
+            timestamp=1234.5,
+            api_content="wire result",
+            display_kind="tool_result",
+            display_metadata={"source": "test"},
+        )
+        db.append_message(
+            "parent",
+            "tool",
+            "known no-effect result",
+            tool_name="read_file",
+            tool_call_id="call-2",
+            effect_disposition="none",
+            timestamp=1235.5,
+        )
+
+        db.fork_session("parent", "child")
+
+        source_rows = db._conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+            ("parent",),
+        ).fetchall()
+        child_rows = db._conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+            ("child",),
+        ).fetchall()
+        copied_columns = [
+            column
+            for column in source_rows[0].keys()
+            if column not in {"id", "session_id"}
+        ]
+
+        assert [row["effect_disposition"] for row in child_rows] == [
+            "unknown",
+            "none",
+        ]
+        assert [
+            {column: row[column] for column in copied_columns}
+            for row in child_rows
+        ] == [
+            {column: row[column] for column in copied_columns}
+            for row in source_rows
+        ]
+
+    def test_fork_session_rejects_unknown_until_message_id(self, db):
+        db.create_session(session_id="parent", source="cli")
+        db.append_message("parent", "user", "hello")
+
+        with pytest.raises(ValueError, match="until_message_id"):
+            db.fork_session("parent", "child", until_message_id=999999)
+
+
 # =========================================================================
 # Message storage
 # =========================================================================
@@ -3431,8 +3564,8 @@ class TestBulkDeleteSessions:
         bulk-delete CLI / web flows don't leak files."""
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="cli")
-        (tmp_path / "s1.jsonl").write_text("")
-        (tmp_path / "s2.json").write_text("{}")
+        (tmp_path / "s1.jsonl").write_text("", encoding="utf-8")
+        (tmp_path / "s2.json").write_text("{}", encoding="utf-8")
 
         deleted = db.delete_sessions(["s1", "s2"], sessions_dir=tmp_path)
         assert deleted == 2
@@ -3546,9 +3679,9 @@ class TestDeleteEmptySessions:
         db.end_session("empty_with_dump", end_reason="done")
 
         dump = tmp_path / "request_dump_empty_with_dump_0.json"
-        dump.write_text("{}")
+        dump.write_text("{}", encoding="utf-8")
         transcript = tmp_path / "empty_with_dump.jsonl"
-        transcript.write_text("")
+        transcript.write_text("", encoding="utf-8")
 
         deleted = db.delete_empty_sessions(sessions_dir=tmp_path)
         assert deleted == 1
@@ -5529,11 +5662,15 @@ class TestAutoMaintenance:
         db.create_session(session_id="new", source="cli")  # active
 
         # Transcript files mimicking real gateway/CLI layout
-        (sessions_dir / "old1.json").write_text("{}")
-        (sessions_dir / "old1.jsonl").write_text("{}\n")
-        (sessions_dir / "old2.jsonl").write_text("{}\n")
-        (sessions_dir / "request_dump_old1_001.json").write_text("{}")
-        (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
+        (sessions_dir / "old1.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "old1.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "old2.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "request_dump_old1_001.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (sessions_dir / "new.jsonl").write_text(
+            "{}\n", encoding="utf-8"
+        )  # active, must survive
 
         result = db.maybe_auto_prune_and_vacuum(
             retention_days=90, sessions_dir=sessions_dir
@@ -5553,7 +5690,7 @@ class TestAutoMaintenance:
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
         self._make_old_ended(db, "old", days_old=100)
-        (sessions_dir / "old.jsonl").write_text("{}\n")
+        (sessions_dir / "old.jsonl").write_text("{}\n", encoding="utf-8")
 
         result = db.maybe_auto_prune_and_vacuum(retention_days=90)
         assert result["pruned"] == 1
@@ -5566,8 +5703,8 @@ class TestAutoMaintenance:
         sessions_dir.mkdir()
         self._make_old_ended(db, "old", days_old=100)
         db.create_session(session_id="active", source="cli")  # not ended
-        (sessions_dir / "old.jsonl").write_text("{}\n")
-        (sessions_dir / "active.jsonl").write_text("{}\n")
+        (sessions_dir / "old.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "active.jsonl").write_text("{}\n", encoding="utf-8")
 
         count = db.prune_sessions(older_than_days=90, sessions_dir=sessions_dir)
         assert count == 1
@@ -7703,4 +7840,3 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-
