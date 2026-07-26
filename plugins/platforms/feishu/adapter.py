@@ -2694,6 +2694,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 source=source,
                 raw_message=data,
                 message_id=event_id,
+                metadata={"_hermes_no_reply_anchor": True},
                 channel_prompt=self._resolve_channel_prompt(open_id),
                 timestamp=datetime.now(),
             )

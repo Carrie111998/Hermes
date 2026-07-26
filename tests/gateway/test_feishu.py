@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import AsyncMock, Mock, patch
 
-from gateway.platforms.base import ProcessingOutcome
+from gateway.platforms.base import MessageEvent, ProcessingOutcome, _reply_anchor_for_event
 
 try:
     import lark_oapi
@@ -232,9 +232,11 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(event.text, "/status")
         self.assertEqual(event.message_type, MessageType.TEXT)
         self.assertEqual(event.message_id, "evt_menu_1")
+        self.assertTrue(event.metadata["_hermes_no_reply_anchor"])
         self.assertEqual(event.source.chat_id, "ou_user")
         self.assertEqual(event.source.chat_type, "dm")
         self.assertEqual(event.source.user_id, "ou_user")
+        self.assertIsNone(_reply_anchor_for_event(event))
         adapter._admit.assert_called_once()
 
     def test_bot_menu_event_rejected_by_dm_admission_is_dropped(self):
