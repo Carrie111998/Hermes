@@ -132,7 +132,7 @@ export const ResponseLoadingIndicator: FC = () => {
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
       <span aria-hidden="true" className="dither inline-block size-3 rounded-[2px] text-midground/80 animate-pulse" />
       {hint && <HintText>{hint}</HintText>}
-      <ActivityTimerText seconds={elapsed} />
+      <ActivityTimerText aria-hidden={true} seconds={elapsed} />
     </StatusRow>
   )
 }
@@ -238,7 +238,7 @@ export const StreamStallIndicator: FC = () => {
     <StatusRow data-slot="aui_stream-stall" label={hint || 'Hermes is thinking'}>
       <span aria-hidden="true" className="dither inline-block size-3 rounded-[2px] text-midground/80 animate-pulse" />
       {hint && <HintText>{hint}</HintText>}
-      <ActivityTimerText seconds={elapsed} />
+      <ActivityTimerText aria-hidden={true} seconds={elapsed} />
     </StatusRow>
   )
 }
