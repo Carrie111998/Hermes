@@ -651,29 +651,48 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
 
 
 def test_readonly_resolver_env_var_no_writes(monkeypatch):
-    """Verify env var path returns token without any write side effects."""
+    """Verify env var path returns token without any write side effects.
+
+    Spies on exact module-bound forms of the three writer functions.
+    """
     import hermes_cli.auth as auth_mod
+    from agent import credential_pool, anthropic_adapter
 
     monkeypatch.setenv("ANTHROPIC_TOKEN", "oauth-env-token")
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
-    # Spy on ALL write functions — assert zero calls.
-    write_calls = []
+    # Explicit zero-call spies on exact module-bound writer forms.
+    write_pool_calls = []
+    persist_calls = []
+    write_creds_calls = []
 
     def spy_write_pool(*args, **kwargs):
-        write_calls.append(("write_credential_pool", args, kwargs))
+        write_pool_calls.append((args, kwargs))
+
+    def spy_persist(self, *args, **kwargs):
+        persist_calls.append((self, args, kwargs))
+
+    def spy_write_creds(*args, **kwargs):
+        write_creds_calls.append((args, kwargs))
 
     monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)
+    monkeypatch.setattr(credential_pool.CredentialPool, "_persist", spy_persist)
+    monkeypatch.setattr(anthropic_adapter, "_write_claude_code_credentials", spy_write_creds)
 
     token = account_usage._resolve_anthropic_token_readonly()
 
     assert token == "oauth-env-token"
-    assert write_calls == [], "No writes must occur on env var path"
+    assert write_pool_calls == [], "write_credential_pool must not be called"
+    assert persist_calls == [], "CredentialPool._persist must not be called"
+    assert write_creds_calls == [], "_write_claude_code_credentials must not be called"
 
 
 def test_readonly_resolver_no_refresh_on_claude_code_creds(monkeypatch):
-    """Verify Claude Code credentials path never calls refresh or writes."""
-    from agent import anthropic_adapter
+    """Verify Claude Code credentials path never calls refresh or writes.
+
+    Spies on exact module-bound forms of all writer functions.
+    """
+    from agent import anthropic_adapter, credential_pool
     import hermes_cli.auth as auth_mod
 
     creds = {"accessToken": "token", "refreshToken": "refresh"}
@@ -692,32 +711,45 @@ def test_readonly_resolver_no_refresh_on_claude_code_creds(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    # Spy on refresh and writers.
+    # Spies on refresh and exact module-bound writer forms.
     refresh_calls = []
-    write_calls = []
+    write_pool_calls = []
+    persist_calls = []
+    write_creds_calls = []
 
     def spy_refresh(c):
         refresh_calls.append(c)
 
     def spy_write_pool(*args, **kwargs):
-        write_calls.append(("write_credential_pool", args, kwargs))
+        write_pool_calls.append((args, kwargs))
+
+    def spy_persist(self, *args, **kwargs):
+        persist_calls.append((self, args, kwargs))
+
+    def spy_write_creds(*args, **kwargs):
+        write_creds_calls.append((args, kwargs))
 
     monkeypatch.setattr(anthropic_adapter, "_refresh_oauth_token", spy_refresh)
     monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)
+    monkeypatch.setattr(credential_pool.CredentialPool, "_persist", spy_persist)
+    monkeypatch.setattr(anthropic_adapter, "_write_claude_code_credentials", spy_write_creds)
 
     token = account_usage._resolve_anthropic_token_readonly()
 
     assert token == "token"
     assert refresh_calls == [], "Refresh must not be called"
-    assert write_calls == [], "Pool writes must not occur"
+    assert write_pool_calls == [], "write_credential_pool must not be called"
+    assert persist_calls == [], "CredentialPool._persist must not be called"
+    assert write_creds_calls == [], "_write_claude_code_credentials must not be called"
 
 
 def test_readonly_resolver_expired_token_mutation_sensitive(monkeypatch):
     """Verify expired token returns None without refresh (mutation-sensitive test).
 
-    FAILS if someone reintroduces _refresh_oauth_token into resolver.
+    FAILS if someone reintroduces _refresh_oauth_token or any writer into resolver.
+    Spies on exact module-bound forms of all writer functions.
     """
-    from agent import anthropic_adapter
+    from agent import anthropic_adapter, credential_pool
     import hermes_cli.auth as auth_mod
 
     creds = {"accessToken": "expired", "refreshToken": "refresh"}
@@ -736,25 +768,40 @@ def test_readonly_resolver_expired_token_mutation_sensitive(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    # MUTATION-SENSITIVE: spy on refresh and writers.
+    # MUTATION-SENSITIVE: spy on all write paths (exact module-bound forms).
     refresh_calls = []
-    write_calls = []
+    write_pool_calls = []
+    persist_calls = []
+    write_creds_calls = []
 
     def spy_refresh(c):
         refresh_calls.append(c)
         raise AssertionError("_refresh_oauth_token must not be called")
 
     def spy_write_pool(*args, **kwargs):
-        write_calls.append(("write_credential_pool", args, kwargs))
+        write_pool_calls.append((args, kwargs))
+        raise AssertionError("write_credential_pool must not be called")
+
+    def spy_persist(self, *args, **kwargs):
+        persist_calls.append((self, args, kwargs))
+        raise AssertionError("CredentialPool._persist must not be called")
+
+    def spy_write_creds(*args, **kwargs):
+        write_creds_calls.append((args, kwargs))
+        raise AssertionError("_write_claude_code_credentials must not be called")
 
     monkeypatch.setattr(anthropic_adapter, "_refresh_oauth_token", spy_refresh)
     monkeypatch.setattr(auth_mod, "write_credential_pool", spy_write_pool)
+    monkeypatch.setattr(credential_pool.CredentialPool, "_persist", spy_persist)
+    monkeypatch.setattr(anthropic_adapter, "_write_claude_code_credentials", spy_write_creds)
 
     token = account_usage._resolve_anthropic_token_readonly()
 
     assert token is None, "Expired token must return None"
     assert refresh_calls == [], "Refresh must not be called (MUTATION-SENSITIVE)"
-    assert write_calls == [], "Pool writes must not occur"
+    assert write_pool_calls == [], "write_credential_pool must not be called (MUTATION-SENSITIVE)"
+    assert persist_calls == [], "CredentialPool._persist must not be called (MUTATION-SENSITIVE)"
+    assert write_creds_calls == [], "_write_claude_code_credentials must not be called (MUTATION-SENSITIVE)"
 
 
 def test_readonly_resolver_pool_direct_read_no_load_pool(monkeypatch):
