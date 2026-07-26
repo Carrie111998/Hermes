@@ -562,7 +562,33 @@ def _notify_workflow_complete(task_id: str, state=None):
                     "node": nid,
                     "agent": ns.get("agent", ""),
                     "status": ns.get("status", "unknown"),
+                    "summary": ns.get("summary", ""),
                 })
+
+        # Enrich with task_runs summaries from kanban DB
+        try:
+            import sqlite3
+            from hermes_cli.kanban_db import kanban_home
+            board = state.get("kanban_board", "")
+            if board:
+                db_path = kanban_home() / "boards" / board / "kanban.db"
+                if db_path.exists():
+                    with sqlite3.connect(str(db_path)) as db_conn:
+                        rows = db_conn.execute(
+                            "SELECT task_id, summary FROM task_runs WHERE outcome='completed' "
+                            "ORDER BY ended_at DESC"
+                        ).fetchall()
+                        summary_map = {}
+                        for tid, s in rows:
+                            if s and tid not in summary_map:
+                                summary_map[tid] = s
+                        # Match summaries to nodes by card_id
+                        for node in all_nodes:
+                            card_id = state.get("states", {}).get(node["node"], {}).get("kanban_card_id", "")
+                            if card_id and card_id in summary_map:
+                                node["summary"] = summary_map[card_id]
+        except Exception:
+            pass  # non-fatal: fall back to status-only output
 
         # Count stats
         done_count = sum(1 for n in all_nodes if n["status"] == "done")
@@ -604,12 +630,16 @@ def _notify_workflow_complete(task_id: str, state=None):
         except Exception as _analyst_exc:
             logger.debug("workflow analyst unavailable for completion report: %s", _analyst_exc)
 
-        # Fallback to basic message if analyst didn't produce one
+        # Build message with summaries
         if not message:
             lines = []
             for n in all_nodes:
-                icon = "✅" if n["status"] == "done" else "❌"
+                icon = {"done": "✅", "failed": "❌", "blocked": "🚫", "skipped": "⏭"}.get(n["status"], "❓")
                 lines.append(f"  {icon} {n['node']} ({n['agent']})")
+                if n.get("summary"):
+                    # Indent and wrap summary
+                    for sline in n["summary"].split("\n")[:5]:  # Max 5 lines
+                        lines.append(f"      {sline}")
             message = "\n".join(lines)
 
         # Build the full notification
@@ -629,6 +659,8 @@ def _notify_workflow_complete(task_id: str, state=None):
             "board": board,
             "status": "completed",
             "message": full_message,
+            "nodes": all_nodes,
+            "run_id": state.get("run_id", ""),
         }
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
         wf_marker_dir = _COMPLETIONS_DIR / workflow_name
