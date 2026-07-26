@@ -15,7 +15,6 @@ import js from '@eslint/js'
 import typescriptEslint from '@typescript-eslint/eslint-plugin'
 import typescriptParser from '@typescript-eslint/parser'
 import perfectionist from 'eslint-plugin-perfectionist'
-import reactPlugin from 'eslint-plugin-react'
 import hooksPlugin from 'eslint-plugin-react-hooks'
 import unusedImports from 'eslint-plugin-unused-imports'
 import globals from 'globals'
@@ -41,7 +40,6 @@ export default [
     plugins: {
       '@typescript-eslint': typescriptEslint,
       perfectionist,
-      react: reactPlugin,
       'react-hooks': hooksPlugin,
       'unused-imports': unusedImports
     },
@@ -51,7 +49,9 @@ export default [
       curly: ['error', 'all'],
       'no-fallthrough': ['error', { allowEmptyCase: true }],
       'no-undef': 'off',
+      'no-useless-assignment': 'off',
       'no-unused-vars': 'off',
+      'preserve-caught-error': 'off',
       'padding-line-between-statements': [
         1,
         {
@@ -95,9 +95,6 @@ export default [
       'react-hooks/exhaustive-deps': 'warn',
       'react-hooks/rules-of-hooks': 'error',
       'unused-imports/no-unused-imports': 'error'
-    },
-    settings: {
-      react: { version: 'detect' }
     }
   },
   {

@@ -27,6 +27,7 @@ export default defineConfig([
       // TODO: upgrade these react-hooks v7 rules from 'warn' to 'error' after
       // refactoring set-state-in-effect, ref-as-instance-var, and manual
       // memoization patterns in the web codebase.
+      'no-useless-assignment': 'off',
       'react-hooks/set-state-in-effect': 'warn',
       'react-hooks/refs': 'warn',
       'react-hooks/preserve-manual-memoization': 'warn',
