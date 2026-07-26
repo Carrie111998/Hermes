@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -25,6 +27,21 @@ def _node_project(root: Path) -> None:
 def _make_project(root: Path) -> None:
     root.mkdir()
     _node_project(root)
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    """Create a directory link without requiring Windows symlink privilege."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 @pytest.fixture
@@ -268,7 +285,7 @@ def test_no_suite_nudge_uses_canonical_temp_dir(tmp_path, monkeypatch):
     real_temp = tmp_path / "real-temp"
     real_temp.mkdir()
     linked_temp = tmp_path / "linked-temp"
-    linked_temp.symlink_to(real_temp, target_is_directory=True)
+    _make_directory_link(linked_temp, real_temp)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(linked_temp))
 
     nudge = build_verify_on_stop_nudge(
