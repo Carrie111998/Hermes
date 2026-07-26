@@ -298,6 +298,72 @@ def register(ctx):
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
 
+### Require authenticated gateway dispatch for consequential surfaces
+
+Plugins that expose consequential actions can ask the host to admit them only
+from an independently authenticated gateway message. Check the exact capability
+version before registering the surface, then set
+`requires_authenticated_gateway=True`:
+
+```python
+SUPPORTED_AUTH_DISPATCH = 1
+
+
+def register(ctx):
+    tool_capability = ctx.authenticated_gateway_tool_dispatch_version
+    if type(tool_capability) is not int or tool_capability != SUPPORTED_AUTH_DISPATCH:
+        raise RuntimeError("Unsupported authenticated tool dispatch contract")
+    command_capability = ctx.authenticated_gateway_dispatch_version
+    if type(command_capability) is not int or command_capability != SUPPORTED_AUTH_DISPATCH:
+        raise RuntimeError("Unsupported authenticated command dispatch contract")
+
+    def protected_tool(args, *, tool_context):
+        # Frozen, host-issued fields; never accept these values from args.
+        actor = tool_context.user_id
+        message_id = tool_context.message_id
+        return json.dumps({"actor": actor, "message_id": message_id})
+
+    def protected_command(raw_args, *, command_context):
+        actor = command_context.user_id
+        return f"Accepted authenticated request from {actor}"
+
+    ctx.register_tool(
+        name="protected_action",
+        toolset="my-plugin",
+        schema=PROTECTED_ACTION_SCHEMA,
+        handler=protected_tool,
+        requires_authenticated_gateway=True,
+    )
+    ctx.register_command(
+        "protected-action",
+        protected_command,
+        requires_authenticated_gateway=True,
+    )
+```
+
+The host enforces these rules before handler entry:
+
+- Only the exact built-in integer capability version is supported. Treat an
+  absent, boolean, or different value as unsupported.
+- `tool_context` and `authenticated_gateway_context` are reserved host
+  provenance names and must not appear anywhere in a protected tool's model
+  schema or model-supplied arguments.
+- Protected tool handlers receive the live lease as keyword-only
+  `tool_context`; protected slash-command handlers receive `command_context`.
+- Tool and command contexts are not interchangeable. They are valid only for
+  the admitted request and are revoked when that dispatch completes.
+- CLI, TUI, internal/synthetic, direct registry, and plugin-initiated
+  `ctx.dispatch_tool()` calls do not gain authenticated gateway authority and
+  are denied for protected surfaces.
+- The host authentication decision is only the admission boundary. The plugin
+  must still apply its own domain policy, actor allowlist, approval,
+  idempotency, and audit rules before a consequential write.
+
+Ordinary tools remain backward compatible: `ctx.dispatch_tool(...,
+tool_context=value)` forwards that legacy keyword unchanged. For a protected
+tool, the registry discards any caller-supplied legacy value and uses only its
+live host-issued context.
+
 ## Step 6: Test it
 
 Start Hermes:
