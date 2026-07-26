@@ -472,6 +472,58 @@ def test_compute_host_interrupt_failure_leaves_running_after_teardown(monkeypatc
         server._sessions.pop("iso-int-post", None)
 
 
+def test_compute_host_interrupt_failure_does_not_clobber_replaced_inflight(monkeypatch):
+    """Successor submit may replace inflight before pending is registered."""
+
+    class _DeadHostNoPending:
+        def interrupt(self, sid, *, request_id=None):
+            raise RuntimeError("compute host is not running")
+
+        def has_pending_turn(self, sid: str) -> bool:
+            return False
+
+    old_inflight = {"user": "old", "assistant": "", "streaming": True}
+    new_inflight = {"user": "new", "assistant": "", "streaming": True}
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        running=True,
+        _compute_host_active=True,
+        inflight_turn=old_inflight,
+    )
+    server._sessions["iso-int-race"] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+
+    host = _DeadHostNoPending()
+    real_interrupt = host.interrupt
+
+    def _interrupt_and_swap(sid, *, request_id=None):
+        # Simulate prompt.submit replacing inflight after lock release,
+        # before submit_turn registers pending.
+        with session["history_lock"]:
+            session["inflight_turn"] = new_inflight
+            session["_turn_cancel_requested"] = False
+        return real_interrupt(sid, request_id=request_id)
+
+    host.interrupt = _interrupt_and_swap
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: host)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "int-race",
+                "method": "session.interrupt",
+                "params": {"session_id": "iso-int-race"},
+            }
+        )
+        assert resp.get("result") == {"status": "interrupted", "turn_isolation": True}
+        assert session["running"] is True
+        assert session.get("inflight_turn") is new_inflight
+        assert session.get("_turn_cancel_requested") is True
+    finally:
+        server._sessions.pop("iso-int-race", None)
+
+
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
     session = _session(
         agent=None,
