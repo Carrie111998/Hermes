@@ -1186,10 +1186,10 @@ def _execute_remote(
     }
     result.update(stdout_metadata)
     if _scrub_note:
+        # Surface as a dedicated field only. Never mutate ``output``: it must
+        # stay byte-for-byte equal to the child's stdout so callers can parse
+        # it (e.g. JSON dumps) without the DX note corrupting the payload.
         result["credential_scrub_note"] = _scrub_note
-        out = result.get("output") or ""
-        if _scrub_note not in out:
-            result["output"] = (out + ("\n\n" if out else "") + _scrub_note)
 
     if status == "timeout":
         timeout_msg = f"Script timed out after {timeout}s and was killed."
@@ -1629,10 +1629,9 @@ def execute_code(
         }
         result.update(stdout_metadata)
         if _scrub_note:
+            # Dedicated field only — do not append to ``output`` (see remote
+            # path above): callers parse ``output`` as the child's raw stdout.
             result["credential_scrub_note"] = _scrub_note
-            _out = result.get("output") or ""
-            if _scrub_note not in _out:
-                result["output"] = (_out + ("\n\n" if _out else "") + _scrub_note)
 
         if status == "timeout":
             timeout_msg = f"Script timed out after {timeout}s and was killed."
