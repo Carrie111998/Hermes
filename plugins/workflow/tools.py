@@ -226,6 +226,18 @@ def _handle_workflow_start_predefined(
     except Exception as exc:
         return _err(f"engine import failed: {exc}")
 
+    # Validate before executing (skip for dry-run and resume)
+    if not dry_run and not resume:
+        try:
+            result = engine.validate(workflow)
+            if not result["valid"]:
+                issues = "\n".join(f"  - {i}" for i in result["issues"])
+                return _err(f"Workflow validation failed:\n{issues}")
+        except FileNotFoundError:
+            pass  # Will be caught by execute()
+        except Exception as exc:
+            logger.debug("validation warning for %s: %s", workflow, exc)
+
     # Single-flight opt-in check: if the workflow declares
     # ``single_flight: true`` in YAML, refuse to start when another
     # run is already in progress. Prevents duplicate parallel runs
