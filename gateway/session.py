@@ -498,11 +498,14 @@ def build_session_context_prompt(
     # shared multi-user session this prompt is cache-shared and sender-agnostic, so
     # owner status rides the additive "[SYSTEM: sender NAME is the owner]" message
     # marker (added in run.py) instead. Gated to the platforms that wire owner
-    # detection (their adapter sets source.is_owner); OTHER PLATFORMS CAN OPT IN by
-    # adding themselves to this set once their adapter implements owner detection.
+    # detection (WhatsApp's adapter sets source.is_owner directly; Signal DMs
+    # resolve it via the generic _is_owner() fallback against
+    # SIGNAL_ALLOWED_USERS). OTHER PLATFORMS CAN OPT IN by adding themselves to
+    # this set once their adapter implements owner detection.
     if not context.shared_multi_user_session and context.source.platform in {
         Platform.WHATSAPP,
         Platform.WHATSAPP_CLOUD,
+        Platform.SIGNAL,
     }:
         lines.append(
             "**Owner:** "

@@ -10522,12 +10522,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # status can't ride there — it has to ride on the message. System-set
             # (a guest can't spoof it via display name/body) and added ONLY for
             # the owner, so guest lines stay byte-identical to upstream. Gated to
-            # the platforms that wire owner detection (their adapter sets
-            # source.is_owner); OTHER PLATFORMS CAN OPT IN by adding themselves to
-            # this set once their adapter implements owner detection.
+            # the platforms that wire owner detection (WhatsApp's adapter sets
+            # source.is_owner directly; Signal DMs resolve it via the generic
+            # _is_owner() fallback against SIGNAL_ALLOWED_USERS). OTHER PLATFORMS
+            # CAN OPT IN by adding themselves to this set once their adapter
+            # implements owner detection.
             if getattr(source, "is_owner", False) and source.platform in {
                 Platform.WHATSAPP,
                 Platform.WHATSAPP_CLOUD,
+                Platform.SIGNAL,
             }:
                 message_text = f"[SYSTEM: sender {source.user_name} is the owner] {message_text}"
 
