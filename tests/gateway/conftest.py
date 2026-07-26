@@ -120,6 +120,7 @@ def _ensure_discord_mock() -> None:
     discord_mod.Intents.default.return_value = MagicMock()
     discord_mod.Client = MagicMock
     discord_mod.File = MagicMock
+    discord_mod.AudioSource = type("AudioSource", (), {})
     discord_mod.DMChannel = type("DMChannel", (), {})
     discord_mod.Thread = type("Thread", (), {})
     discord_mod.ForumChannel = type("ForumChannel", (), {})

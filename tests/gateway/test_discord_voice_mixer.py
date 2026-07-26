@@ -47,6 +47,13 @@ class TestVoiceMixerCore:
             assert len(frame) == vm.FRAME_SIZE
             assert frame == vm.SILENCE_FRAME
 
+    def test_is_discord_audio_source(self):
+        import discord
+
+        # VoiceClient.play() enforces this at runtime; merely implementing
+        # read()/is_opus() is not enough.
+        assert issubclass(vm.VoiceMixer, discord.AudioSource)
+
     def test_is_opus_false(self):
         # discord.py sends raw PCM when is_opus() is False.
         assert vm.VoiceMixer().is_opus() is False

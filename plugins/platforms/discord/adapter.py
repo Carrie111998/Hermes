@@ -480,7 +480,11 @@ class VoiceReceiver:
         self._install_speaking_hook(conn)
         conn.add_socket_listener(self._on_packet)
         self._running = True
-        logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
+        logger.info(
+            "VoiceReceiver started (bot_ssrc=%s transport_mode=%s)",
+            self._bot_ssrc,
+            getattr(conn, "mode", "unknown"),
+        )
 
     def stop(self):
         """Stop listening and clean up."""
