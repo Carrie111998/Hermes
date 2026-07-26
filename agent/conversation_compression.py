@@ -34,6 +34,7 @@ import json
 import logging
 import math
 import os
+import subprocess
 import tempfile
 import time
 import uuid
@@ -702,6 +703,95 @@ class _CompressionLockLeaseRefresher:
                     consecutive_failures, self._session_id,
                 )
                 break
+
+
+def _run_compression_hook(
+    agent: Any,
+    phase: str,
+    *,
+    reason: str = "unknown",
+    old_session_id: Optional[str] = None,
+    message_count_before: Optional[int] = None,
+    message_count_after: Optional[int] = None,
+    tokens_before: Optional[int] = None,
+    tokens_after: Optional[int] = None,
+    focus_topic: Optional[str] = None,
+) -> None:
+    """Run an optional, local pre/post-compaction continuity hook.
+
+    The hook is deliberately config-driven and best-effort. It is used by
+    operator-owned deployments to preserve rich continuity artifacts before a
+    transcript is summarized or rotated; failure must never block compaction.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        hooks = ((load_config().get("compression") or {}).get("hooks") or {})
+        hook = hooks.get(phase) or {}
+        command = str(hook.get("command") or "").strip()
+        if not command:
+            return
+        timeout = int(hook.get("timeout_seconds") or 30)
+    except Exception as exc:
+        logger.debug("compression %s hook config unavailable: %s", phase, exc)
+        return
+
+    env = os.environ.copy()
+
+    def _set(name: str, value: Any) -> None:
+        if value is not None:
+            env[name] = str(value)
+
+    _set("HERMES_COMPRESSION_PHASE", phase)
+    _set("HERMES_COMPRESSION_REASON", reason)
+    _set("HERMES_SESSION_ID", getattr(agent, "session_id", None))
+    _set("HERMES_OLD_SESSION_ID", old_session_id)
+    _set("HERMES_NEW_SESSION_ID", getattr(agent, "session_id", None))
+    _set(
+        "HERMES_PLATFORM",
+        getattr(agent, "platform", None) or os.environ.get("HERMES_SESSION_SOURCE"),
+    )
+    _set("HERMES_MODEL", getattr(agent, "model", None))
+    _set("HERMES_PROVIDER", getattr(agent, "provider", None))
+    _set("HERMES_MESSAGE_COUNT_BEFORE", message_count_before)
+    _set("HERMES_MESSAGE_COUNT_AFTER", message_count_after)
+    _set("HERMES_TOKENS_BEFORE", tokens_before)
+    _set("HERMES_TOKENS_AFTER", tokens_after)
+    _set("HERMES_FOCUS_TOPIC", focus_topic)
+    _set(
+        "HERMES_CONTEXT_LENGTH",
+        getattr(getattr(agent, "context_compressor", None), "context_length", None),
+    )
+    try:
+        subprocess.run(
+            command,
+            shell=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning("compression %s hook failed: %s", phase, exc)
+
+
+def _latest_handoff_marker() -> Optional[str]:
+    """Return a compact pointer to the latest rich continuity artifact."""
+    path = Path.home() / ".cc-observer" / "handoffs" / "latest.html"
+    try:
+        if not path.exists():
+            return None
+        return (
+            "CONTEXT COMPRESSION CONTINUITY ARTIFACT:\n"
+            f"A deterministic rich HTML handoff was generated at {path}.\n"
+            "On resume after compression/compaction, inspect this file first; it may contain "
+            "live session transcript excerpts, Agent Mail IDs/outcomes, observer state, gateway "
+            "state, and Hermes source/compression-hook state not preserved by the LLM summary."
+        )
+    except Exception:
+        return None
 
 
 def check_compression_model_feasibility(agent: Any) -> None:
@@ -1439,6 +1529,15 @@ def compress_context(
         if _compaction_status_emitted:
             _emit_compaction_done(agent)
 
+    _run_compression_hook(
+        agent,
+        "pre",
+        reason=os.environ.get("HERMES_COMPRESSION_REASON", "unknown"),
+        message_count_before=_pre_msg_count,
+        tokens_before=approx_tokens,
+        focus_topic=focus_topic,
+    )
+
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
     # AIAgent instances that share the same session_id (most commonly the
@@ -1999,6 +2098,13 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
+        handoff_marker = _latest_handoff_marker()
+        if handoff_marker:
+            compressed.append({
+                "role": "user",
+                "content": handoff_marker,
+                "_handoff_marker_synthetic": True,
+            })
         _ensure_compressed_has_user_turn(messages, compressed)
 
         cached_system_prompt = agent._cached_system_prompt
@@ -2354,6 +2460,17 @@ def compress_context(
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
+        _run_compression_hook(
+            agent,
+            "post",
+            reason=os.environ.get("HERMES_COMPRESSION_REASON", "unknown"),
+            old_session_id=_old_sid,
+            message_count_before=_pre_msg_count,
+            message_count_after=len(compressed),
+            tokens_before=approx_tokens,
+            tokens_after=_compressed_est,
+            focus_topic=focus_topic,
+        )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(
             agent,
@@ -2449,6 +2566,14 @@ def _compress_context_via_codex_app_server(
         _compaction_done_emitted = True
         _emit_compaction_done(agent)
 
+    _run_compression_hook(
+        agent,
+        "pre",
+        reason=os.environ.get("HERMES_COMPRESSION_REASON", "unknown"),
+        message_count_before=len(messages),
+        tokens_before=approx_tokens,
+    )
+
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
@@ -2517,6 +2642,15 @@ def _compress_context_via_codex_app_server(
         getattr(agent, "session_id", None) or "none",
         getattr(result, "thread_id", None) or "",
         getattr(result, "turn_id", None) or "",
+    )
+    _run_compression_hook(
+        agent,
+        "post",
+        reason=os.environ.get("HERMES_COMPRESSION_REASON", "unknown"),
+        message_count_before=len(messages),
+        message_count_after=len(messages),
+        tokens_before=approx_tokens,
+        tokens_after=approx_tokens,
     )
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
