@@ -1,6 +1,7 @@
 import { useAuiState } from '@assistant-ui/react'
 import { type FC, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 
@@ -124,6 +125,8 @@ function scrollToPrompt(root: HTMLElement | null, id: string) {
 
 /** Right-edge prompt rail — hover previews, click to jump. ≥4 user turns only. */
 export const ThreadTimeline: FC = () => {
+  const copy = useI18n().t.assistant.thread
+
   const sourceSignature = useAuiState(s => {
     const rows: TimelineSourceMessage[] = []
 
@@ -239,7 +242,7 @@ export const ThreadTimeline: FC = () => {
 
   return (
     <div
-      aria-label="Conversation timeline"
+      aria-label={copy.conversationTimeline}
       className="group/timeline pointer-events-auto absolute right-0 top-1/2 z-40 flex -translate-y-1/2 flex-col items-end"
       data-slot="thread-timeline"
       data-suppress-pane-reveal=""
