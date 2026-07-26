@@ -639,7 +639,18 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
         processed = run_one_job(job)
-        refreshed = get_job(job_id) or {}
+        refreshed = get_job(job_id)
+        # For finite one-shot jobs, mark_job_run removes the job from the
+        # store when completed >= times.  get_job returns None in that case,
+        # so we cannot read last_status — but processed=True means the job
+        # ran end-to-end successfully.  Treat removal as implicit success
+        # rather than reporting a false "failed" to the operator (#71760).
+        if refreshed is None:
+            return {
+                "claimed": True,
+                "success": bool(processed),
+                "error": None,
+            }
         ok = refreshed.get("last_status") == "ok"
         return {
             "claimed": True,
