@@ -2012,6 +2012,9 @@ def _fetch_codex_oauth_context_lengths_with_source(
         if not isinstance(item, dict):
             continue
         slug = item.get("slug")
+        # Deliberately ignore max_context_window here. It is the raw model
+        # ceiling, while context_window is the request/session limit enforced
+        # by chatgpt.com/backend-api/codex (GPT-5.4 can report 1M vs 272K).
         ctx = item.get("context_window")
         if isinstance(slug, str) and isinstance(ctx, int) and ctx > 0:
             result[slug.strip()] = ctx
