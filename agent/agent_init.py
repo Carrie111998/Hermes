@@ -472,6 +472,7 @@ def init_agent(
     provider_sort: str = None,
     provider_require_parameters: bool = False,
     provider_data_collection: str = None,
+    provider_max_price: dict = None,
     openrouter_min_coding_score: Optional[float] = None,
     session_id: str = None,
     tool_progress_callback: callable = None,
@@ -543,6 +544,31 @@ def init_agent(
         providers_ignored (List[str]): OpenRouter providers to ignore (optional)
         providers_order (List[str]): OpenRouter providers to try in order (optional)
         provider_sort (str): Sort providers by price/throughput/latency (optional)
+        provider_max_price (dict): OpenRouter max price caps per million tokens (optional).
+            Set top-level caps that apply to all models, or use a ``per_model``
+            sub-key to target specific models. See
+            https://openrouter.ai/docs/guides/routing/provider-selection#max-price
+
+            .. code-block:: yaml
+
+                # Global cap — all models
+                provider_routing:
+                  max_price:
+                    prompt: 1.0
+                    completion: 2.0
+
+                # Per-model overrides via ``per_model`` sub-key
+                provider_routing:
+                  max_price:
+                    prompt: 3.0
+                    completion: 10.0
+                    per_model:
+                      "deepseek/deepseek-v4-pro":
+                        prompt: 0.15
+                        completion: 0.50
+                      "anthropic/claude-sonnet-4.6":
+                        prompt: 5.0
+                        completion: 25.0
         openrouter_min_coding_score (float): Coding-score floor (0.0-1.0) for the
             openrouter/pareto-code router. Only applied when model == "openrouter/pareto-code".
             None or empty = let OpenRouter pick the strongest available coder.
@@ -806,6 +832,7 @@ def init_agent(
     agent.provider_sort = provider_sort
     agent.provider_require_parameters = provider_require_parameters
     agent.provider_data_collection = provider_data_collection
+    agent.provider_max_price = provider_max_price
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
     # Store toolset filtering options

@@ -5785,6 +5785,7 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
+        provider_max_price=_pr.get("max_price"),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),

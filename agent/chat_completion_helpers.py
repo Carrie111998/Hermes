@@ -169,6 +169,32 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
+def _resolve_per_model_max_price(agent) -> dict | None:
+    """Resolve provider_max_price against the current model.
+
+    If agent.provider_max_price has a ``per_model`` sub-key, checks the
+    current model against patterns in that map. Returns the matched
+    override, or the top-level caps (minus ``per_model``) as fallback.
+    Returns None if provider_max_price is unset or empty after resolution.
+
+    Matching is case-insensitive and supports prefix matching, so
+    ``"deepseek/deepseek-v4"`` matches ``"deepseek/deepseek-v4-pro"``.
+    """
+    max_price = getattr(agent, "provider_max_price", None)
+    if not max_price:
+        return None
+    resolved = dict(max_price)
+    per_model = resolved.pop("per_model", None)
+    if per_model:
+        current_model = (getattr(agent, "model", "") or "").lower()
+        for pattern, override in per_model.items():
+            if current_model == pattern.lower() or current_model.startswith(pattern.lower()):
+                return override
+    if resolved:
+        return resolved
+    return None
+
+
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     """Build the validated provider-routing object shared by request paths."""
     preferences: Dict[str, Any] = {}
@@ -185,6 +211,9 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
         preferences["require_parameters"] = True
     if agent.provider_data_collection:
         preferences["data_collection"] = agent.provider_data_collection
+    effective_max_price = _resolve_per_model_max_price(agent)
+    if effective_max_price:
+        preferences["max_price"] = effective_max_price
     return preferences
 
 
