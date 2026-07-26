@@ -9844,8 +9844,9 @@ class SessionDB:
     ) -> int:
         """Archive every session untouched for at least ``idle_days`` days.
 
-        "Touched" is the latest message timestamp (falling back to
-        ``started_at``) — i.e. real recency, not creation time — so a session
+        "Touched" is the freshest of ``last_activity_at`` and the latest
+        message timestamp (else ``started_at``) — i.e. real recency, not
+        creation time — so a session
         created long ago but active yesterday is spared, while an old
         abandoned one (even a still-open one) is swept. This differs from
         :meth:`archive_sessions`, which ages on ``started_at`` and only ended
