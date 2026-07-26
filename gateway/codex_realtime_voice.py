@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from agent.transports.codex_realtime_voice import (
+    DEFAULT_CODEX_REALTIME_PROTOCOL,
+    SUPPORTED_CODEX_REALTIME_WEBRTC_PROTOCOLS,
     CodexRealtimeCapabilities,
     CodexRealtimeSession,
     safe_realtime_error,
@@ -45,6 +47,7 @@ class CodexRealtimeVoiceConfig:
     enabled: bool = False
     user_id: Optional[int] = None
     voice: Optional[str] = None
+    protocol_version: str = DEFAULT_CODEX_REALTIME_PROTOCOL
     fallback_to_classic: bool = True
     codex_bin: str = "codex"
     codex_home: Optional[str] = None
@@ -58,6 +61,9 @@ class CodexRealtimeVoiceConfig:
             return cls()
         voice = raw.get("voice")
         voice = str(voice).strip() if voice is not None else None
+        protocol_version = str(
+            raw.get("protocol_version") or DEFAULT_CODEX_REALTIME_PROTOCOL
+        ).strip().lower()
         codex_bin = str(raw.get("codex_bin") or "codex").strip() or "codex"
         codex_home = raw.get("codex_home")
         codex_home = str(codex_home).strip() if codex_home else None
@@ -65,6 +71,7 @@ class CodexRealtimeVoiceConfig:
             enabled=_config_bool(raw.get("enabled"), False),
             user_id=_positive_id(raw.get("user_id")),
             voice=voice or None,
+            protocol_version=protocol_version,
             fallback_to_classic=_config_bool(raw.get("fallback_to_classic"), True),
             codex_bin=codex_bin,
             codex_home=codex_home,
@@ -172,6 +179,13 @@ class CodexRealtimeVoiceManager:
             )
         if not config.enabled:
             return CodexRealtimeStartResult(False, False, True)
+        if config.protocol_version not in SUPPORTED_CODEX_REALTIME_WEBRTC_PROTOCOLS:
+            return CodexRealtimeStartResult(
+                True,
+                False,
+                config.fallback_to_classic,
+                "codex_realtime_voice.protocol_version must be v1 or v3 for WebRTC",
+            )
         if config.user_id is None:
             return CodexRealtimeStartResult(
                 True,
@@ -231,6 +245,7 @@ class CodexRealtimeVoiceManager:
                     cwd=os.getcwd(),
                     codex_bin=config.codex_bin,
                     codex_home=config.codex_home,
+                    protocol_version=config.protocol_version,
                     on_user_transcript=_on_transcript,
                     on_output_pcm=_on_output_pcm,
                     on_error=_on_error,

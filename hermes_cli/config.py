@@ -2725,7 +2725,8 @@ DEFAULT_CONFIG = {
         "codex_realtime_voice": {
             "enabled": False,
             "user_id": "",            # one Discord user ID; quote snowflakes in YAML
-            "voice": "",              # empty = Codex v1 default; queried at runtime
+            "voice": "",              # empty = protocol default; queried at runtime
+            "protocol_version": "v3", # WebRTC supports v1 or v3; v3 is current
             "fallback_to_classic": True,
             "codex_bin": "codex",
             "codex_home": "",         # optional isolated CODEX_HOME

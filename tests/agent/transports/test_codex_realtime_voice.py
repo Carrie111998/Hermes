@@ -70,11 +70,11 @@ class FakePeer:
 
 
 @pytest.mark.asyncio
-async def test_start_uses_experimental_v1_webrtc_contract_and_lists_capabilities():
+async def test_start_uses_experimental_v3_webrtc_contract_and_lists_capabilities():
     client = FakeClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",
@@ -92,7 +92,7 @@ async def test_start_uses_experimental_v1_webrtc_contract_and_lists_capabilities
     capabilities = await session.start(voice="cedar")
 
     assert capabilities == CodexRealtimeCapabilities(
-        protocol_version="v1",
+        protocol_version="v3",
         voices=("cedar", "marin"),
         language_selection=False,
         reasoning_effort=False,
@@ -122,7 +122,7 @@ async def test_start_uses_experimental_v1_webrtc_contract_and_lists_capabilities
                 "the client supplies text to speak."
             ),
             "transport": {"type": "webrtc", "sdp": "v=offer\r\n"},
-            "version": "v1",
+            "version": "v3",
             "voice": "cedar",
         },
     )
@@ -142,7 +142,7 @@ async def test_transcript_and_remote_pcm_notifications_are_forwarded(monkeypatch
     client = FakeClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",
@@ -216,7 +216,7 @@ async def test_new_user_generation_suppresses_stale_hermes_speech_and_late_compl
     client = FakeClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",
@@ -286,7 +286,7 @@ async def test_error_closes_session_and_reports_sanitized_reason():
     client = FakeClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",
@@ -326,7 +326,7 @@ async def test_remote_close_reports_failure_and_closes_resources():
     client = FakeClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",
@@ -366,7 +366,7 @@ async def test_append_speech_failure_reports_provider_failure_and_closes():
     client = BrokenSpeechClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",
@@ -399,7 +399,7 @@ async def test_webrtc_runtime_failure_closes_session_and_reports_safe_reason():
     client = FakeClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",
@@ -433,7 +433,7 @@ async def test_sideband_audio_is_ignored_for_webrtc_output():
     client = FakeClient([
         {
             "method": "thread/realtime/started",
-            "params": {"threadId": "thread-1", "version": "v1"},
+            "params": {"threadId": "thread-1", "version": "v3"},
         },
         {
             "method": "thread/realtime/sdp",

@@ -25,6 +25,8 @@ from agent.transports.codex_app_server import (
 logger = logging.getLogger(__name__)
 
 MIN_CODEX_REALTIME_VERSION = (0, 145, 0)
+DEFAULT_CODEX_REALTIME_PROTOCOL = "v3"
+SUPPORTED_CODEX_REALTIME_WEBRTC_PROTOCOLS = frozenset({"v1", "v3"})
 REALTIME_SAMPLE_RATE = 24_000
 REALTIME_CHANNELS = 1
 REALTIME_FRAME_SAMPLES = 480  # 20 ms at 24 kHz
@@ -319,6 +321,7 @@ class CodexRealtimeSession:
         cwd: str | Path,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        protocol_version: str = DEFAULT_CODEX_REALTIME_PROTOCOL,
         client_factory: Callable[..., Any] = CodexAppServerClient,
         peer_factory: Callable[[], Any] = AiortcRealtimePeer,
         binary_checker: Callable[..., tuple[bool, str]] = check_codex_binary,
@@ -329,6 +332,11 @@ class CodexRealtimeSession:
         self._cwd = str(cwd)
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._protocol_version = str(protocol_version).strip().lower()
+        if self._protocol_version not in SUPPORTED_CODEX_REALTIME_WEBRTC_PROTOCOLS:
+            raise CodexRealtimeUnavailable(
+                "Codex realtime WebRTC protocol_version must be v1 or v3"
+            )
         self._client_factory = client_factory
         self._peer_factory = peer_factory
         self._binary_checker = binary_checker
@@ -445,10 +453,14 @@ class CodexRealtimeSession:
             voices = ()
         if requested_voice and voices and requested_voice not in voices:
             raise CodexRealtimeUnavailable(
-                f"Codex realtime voice {requested_voice!r} is not supported for v1; "
+                f"Codex realtime voice {requested_voice!r} is not supported for "
+                f"{self._protocol_version}; "
                 f"choose one of: {', '.join(voices)}"
             )
-        return CodexRealtimeCapabilities(protocol_version="v1", voices=voices)
+        return CodexRealtimeCapabilities(
+            protocol_version=self._protocol_version,
+            voices=voices,
+        )
 
     def _request_start(self, offer_sdp: str, voice: Optional[str]) -> None:
         assert self._client is not None and self._thread_id is not None
@@ -459,7 +471,7 @@ class CodexRealtimeSession:
             "outputModality": "audio",
             "prompt": _SPEECH_INTERFACE_PROMPT,
             "transport": {"type": "webrtc", "sdp": offer_sdp},
-            "version": "v1",
+            "version": self._protocol_version,
         }
         if voice:
             params["voice"] = voice
@@ -483,7 +495,7 @@ class CodexRealtimeSession:
                 continue
             if method == "thread/realtime/started":
                 version = str(params.get("version") or "")
-                if version and version != "v1":
+                if version and version != self._protocol_version:
                     raise CodexRealtimeUnavailable(
                         f"Codex realtime started unsupported protocol {version!r}"
                     )

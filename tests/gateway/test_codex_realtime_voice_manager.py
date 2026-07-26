@@ -35,7 +35,7 @@ class FakeSession:
     async def start(self, *, voice=None):
         self.active = True
         self.voice = voice
-        return SimpleNamespace(protocol_version="v1", voices=("cedar",))
+        return SimpleNamespace(protocol_version="v3", voices=("cedar",))
 
     def push_discord_pcm(self, pcm: bytes) -> bool:
         if not self.active:
@@ -101,6 +101,34 @@ async def test_disabled_config_preserves_classic_voice_without_session():
 
 
 @pytest.mark.asyncio
+async def test_webrtc_rejects_v2_protocol_without_starting_session():
+    created: list[FakeSession] = []
+    manager = CodexRealtimeVoiceManager(
+        session_factory=lambda **kwargs: (
+            created.append(FakeSession(**kwargs)) or created[-1]
+        ),
+        dependency_ensurer=lambda: None,
+    )
+    adapter = FakeAdapter({
+        "enabled": True,
+        "user_id": "42",
+        "protocol_version": "v2",
+    })
+
+    result = await manager.start_for_voice_channel(
+        adapter=adapter,
+        guild_id=7,
+        user_id=42,
+        on_transcript=lambda *_: None,
+    )
+
+    assert result.enabled is True
+    assert result.active is False
+    assert "protocol_version must be v1 or v3" in str(result.reason)
+    assert created == []
+
+
+@pytest.mark.asyncio
 async def test_enabled_route_requires_the_configured_single_user():
     manager = CodexRealtimeVoiceManager(
         session_factory=FakeSession,
@@ -125,7 +153,10 @@ async def test_enabled_route_requires_the_configured_single_user():
         on_transcript=lambda *_: None,
     )
     assert accepted.active is True
-    assert accepted.capabilities.protocol_version == "v1"
+    assert accepted.capabilities.protocol_version == "v3"
+    active_session = manager.session_for(adapter, 7)
+    assert active_session is not None
+    assert active_session.kwargs["protocol_version"] == "v3"
     assert adapter.mixer_started == [7]
 
     # While realtime is active, non-bound speakers are consumed/dropped rather

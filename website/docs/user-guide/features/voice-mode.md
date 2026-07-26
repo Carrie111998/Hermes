@@ -397,7 +397,8 @@ discord:
   codex_realtime_voice:
     enabled: true
     user_id: "284102345871466496"  # exactly one bound Discord user
-    voice: ""                      # empty uses Codex's v1 default
+    voice: ""                      # empty uses the selected protocol's default
+    protocol_version: "v3"         # WebRTC supports v1 or v3
     fallback_to_classic: true
     codex_bin: "codex"
     codex_home: ""                 # optional isolated Codex config/auth home
@@ -407,7 +408,8 @@ The route requires Codex CLI `0.145.0` or newer plus its own Codex login. The st
 
 Capability boundaries are explicit:
 
-- WebRTC realtime protocol `v1`
+- WebRTC realtime protocol `v3` by default; `v1` is an explicit compatibility option and `v2` is rejected for WebRTC
+- V3 preserves the V1 Codex Voice behavior and voice family
 - supported voice names are discovered at startup
 - Codex app-server thread state is ephemeral for each voice session
 - decoded Discord audio and Hermes' synthesized reply text are sent to Codex/OpenAI for the session, so only enable the route where that external processing is appropriate
