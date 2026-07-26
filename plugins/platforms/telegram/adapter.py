@@ -7909,7 +7909,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not text or not self._bot or not getattr(self._bot, "username", None):
             return text
         username = re.escape(self._bot.username)
-        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
+        # Do not consume the whitespace after a command mention.  Telegram
+        # sends ``/title@bot_name My title`` as one command message; consuming
+        # that separator turns it into ``/titleMy title`` and makes the
+        # gateway report an unknown command.  ``strip()`` below still removes
+        # leading whitespace for ordinary ``@bot_name hello`` messages.
+        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*", "", text).strip()
         return cleaned or text
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
