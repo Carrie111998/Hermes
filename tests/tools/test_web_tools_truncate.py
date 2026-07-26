@@ -129,6 +129,41 @@ class TestEndToEnd:
         assert "para 0 " in content
         assert "para 2999 " in content
 
+    def test_web_extract_rechecks_provider_final_url_before_content(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        class RedirectedProvider:
+            name = "fake"
+            display_name = "Fake"
+
+            def supports_extract(self):
+                return True
+
+            async def extract(self, urls, **kwargs):
+                return [{
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                    "title": "metadata",
+                    "content": "INSTANCE_SECRET=should-not-reach-model",
+                    "raw_content": "INSTANCE_SECRET=should-not-reach-model",
+                    "metadata": {"sourceURL": "http://169.254.169.254/latest/meta-data/"},
+                }]
+
+        safety = _AsyncSequence([True, False])
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools.async_is_safe_url", new=safety), \
+             patch("agent.web_search_registry.get_provider", return_value=RedirectedProvider()):
+            result = json.loads(asyncio.new_event_loop().run_until_complete(
+                wt.web_extract_tool(["https://public.example/redirect"])
+            ))
+
+        item = result["results"][0]
+        assert item["url"] == "http://169.254.169.254/latest/meta-data/"
+        assert "private or internal network" in item["error"]
+        assert item["content"] == ""
+        assert "INSTANCE_SECRET" not in json.dumps(result)
+        assert not list((tmp_path / ".hermes" / "cache" / "web").glob("*.md"))
+
 
 def _make_awaitable(value):
     async def _coro(*a, **k):
@@ -140,3 +175,14 @@ class _AsyncTrue:
     """Async callable that always returns True (re-awaitable per call)."""
     async def __call__(self, *a, **k):
         return True
+
+
+class _AsyncSequence:
+    """Async callable that returns the next configured value per call."""
+    def __init__(self, values):
+        self._values = list(values)
+
+    async def __call__(self, *a, **k):
+        if not self._values:
+            raise AssertionError("async sequence exhausted")
+        return self._values.pop(0)

@@ -963,6 +963,29 @@ async def web_extract_tool(
             by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
             results = [by_index[index] for index in range(len(urls))]
 
+        for result in results:
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+            final_url = (result.get("url") or "").strip()
+            if final_url and not await async_is_safe_url(final_url):
+                logger.info(
+                    "Blocked web_extract provider result for unsafe final URL: %s",
+                    final_url,
+                )
+                result.clear()
+                result.update(
+                    {
+                        "url": final_url,
+                        "title": "",
+                        "content": "",
+                        "raw_content": "",
+                        "error": (
+                            "Blocked: URL targets a private or internal "
+                            "network address"
+                        ),
+                    }
+                )
+
         response = {"results": results}
         
         pages_extracted = len(response.get('results', []))
