@@ -40,7 +40,7 @@ const CONFIGURED_HOME_CWD = 'C:\\Users\\example'
 type DraftHandle = Pick<ReturnType<typeof useSessionActions>, 'startFreshSessionDraft'>
 
 /**
- * Composes the real fresh-draft action with background-sync config refresh ??
+ * Composes the real fresh-draft action with background-sync config refresh —
  * the seam #65274 regressed: startFreshSessionDraft clears the session ref and
  * seeds project cwd, then useBackgroundSync reloads config.yaml terminal.cwd.
  */
