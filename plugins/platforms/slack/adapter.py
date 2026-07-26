@@ -77,6 +77,7 @@ except Exception:
 _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+_SLACK_EMOJI_NAME_RE = re.compile(r"[A-Za-z0-9_+\-]{1,100}")
 
 
 async def _read_error_text_limited(
@@ -3743,6 +3744,15 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    @staticmethod
+    def _validated_slack_emoji_name(value: Any) -> str:
+        """Return a safe Slack emoji name with a stable success fallback."""
+        if isinstance(value, str):
+            candidate = value.strip()
+            if _SLACK_EMOJI_NAME_RE.fullmatch(candidate):
+                return candidate
+        return "white_check_mark"
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
@@ -3773,7 +3783,10 @@ class SlackAdapter(BasePlatformAdapter):
             return
         await self._remove_reaction(channel_id, ts, "eyes", team_id)
         if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
+            success_reaction = self._validated_slack_emoji_name(
+                self.config.extra.get("success_reaction", "white_check_mark")
+            )
+            await self._add_reaction(channel_id, ts, success_reaction, team_id)
         elif outcome == ProcessingOutcome.FAILURE:
             await self._add_reaction(channel_id, ts, "x", team_id)
 
@@ -5528,6 +5541,7 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_type="dm" if is_dm else "group",
                 user_id=user_id,
                 user_name="",
+                is_bot=sender_is_bot,
             )
             if not _auth_fn(_source):
                 logger.warning(
@@ -5645,6 +5659,19 @@ class SlackAdapter(BasePlatformAdapter):
             if allowed_channels and channel_id not in allowed_channels:
                 logger.debug(
                     "[Slack] Ignoring message in non-allowed channel: %s", channel_id
+                )
+                return
+
+            if (
+                not force_process
+                and not is_mentioned
+                and self._slack_message_matches_other_agent_patterns(routing_text)
+            ):
+                logger.debug(
+                    "[Slack] Ignoring message addressed to another configured agent: "
+                    "channel=%s thread_ts=%s",
+                    channel_id,
+                    event_thread_ts,
                 )
                 return
 
@@ -6212,7 +6239,7 @@ class SlackAdapter(BasePlatformAdapter):
             # subtype=bot_message with user=None; flag them so the
             # gateway SLACK_ALLOW_BOTS bypass can authorize them
             # (they carry no user_id to match against the allowlist).
-            is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
+            is_bot=sender_is_bot,
         )
 
         # Per-channel ephemeral prompt
@@ -8466,6 +8493,35 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         return any(pattern.search(text) for pattern in self._slack_mention_patterns())
 
+    def _slack_other_agent_patterns(self) -> List["re.Pattern"]:
+        """Compile optional leading-address patterns for peer agents."""
+        cached = getattr(self, "_compiled_other_agent_patterns", None)
+        if cached is not None:
+            return cached
+        raw = (self.config.extra or {}).get("other_agent_patterns")
+        if isinstance(raw, str):
+            raw = [raw]
+        compiled: List["re.Pattern"] = []
+        for pattern in raw if isinstance(raw, list) else []:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            try:
+                compiled.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as exc:
+                logger.warning(
+                    "[Slack] Invalid other_agent_patterns entry %r: %s",
+                    pattern,
+                    exc,
+                )
+        self._compiled_other_agent_patterns = compiled
+        return compiled
+
+    def _slack_message_matches_other_agent_patterns(self, text: str) -> bool:
+        """Return whether a configured peer-agent pattern matches at the start."""
+        return bool(text) and any(
+            pattern.match(text) for pattern in self._slack_other_agent_patterns()
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Plugin migration glue (#41112 / #3823)
@@ -8975,8 +9031,8 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     existing env-driven model and owns the YAML→env translation here, next to
     the adapter that consumes it. Env vars take precedence over YAML — every
     assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    survive a config.yaml update. Plugin settings without legacy env consumers
+    are returned for ``PlatformConfig.extra``.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -9028,7 +9084,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
-    return None  # all settings flow through env; nothing to merge into extras
+    return {
+        key: slack_cfg[key]
+        for key in ("success_reaction", "other_agent_patterns")
+        if key in slack_cfg
+    }
 
 
 def _is_connected(config) -> bool:

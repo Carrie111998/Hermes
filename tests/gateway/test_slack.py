@@ -3432,6 +3432,51 @@ class TestMessageRouting:
         assert msg_event.source.user_name == "AIDx Engineer"
 
     @pytest.mark.asyncio
+    async def test_resolved_bot_identity_reaches_early_auth_and_final_source(
+        self, adapter
+    ):
+        adapter.config.extra["allow_bots"] = "mentions"
+        adapter._app.client.users_info = AsyncMock(
+            return_value={
+                "user": {
+                    "is_bot": True,
+                    "profile": {"display_name": "Router Bot"},
+                }
+            }
+        )
+
+        class Runner:
+            def __init__(self):
+                self.sources = []
+
+            def _is_user_authorized(self, source):
+                self.sources.append(source)
+                return source.is_bot
+
+            async def handle(self, _event):
+                return None
+
+        runner = Runner()
+        adapter._message_handler = runner.handle
+        event = {
+            "text": "<@U_BOT> route this",
+            "user": "U_ROUTER_BOT",
+            "channel": "C123",
+            "channel_type": "channel",
+            "team": "T123",
+            "ts": "123.999",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        assert len(runner.sources) == 1
+        assert runner.sources[0].is_bot is True
+        routed = adapter.handle_message.await_args.args[0]
+        assert routed.source.is_bot is True
+        assert routed.source.user_name == "Router Bot"
+        adapter._app.client.users_info.assert_awaited_once_with(user="U_ROUTER_BOT")
+
+    @pytest.mark.asyncio
     async def test_app_authored_messages_without_client_msg_id_are_ignored(self, adapter):
         """Slack app-authored events can arrive without bot_id/subtype markers."""
         adapter._app.client.users_info = AsyncMock(
@@ -3558,6 +3603,122 @@ class TestMessageRouting:
         await adapter._handle_slack_message(edited_event)
 
         adapter.handle_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestOtherAgentPatternRouting
+# ---------------------------------------------------------------------------
+
+
+class TestOtherAgentPatternRouting:
+    @staticmethod
+    def _event(text, *, channel_type="channel", thread_ts=None, force_process=False):
+        event = {
+            "text": text,
+            "user": "U_USER",
+            "channel": "D123" if channel_type == "im" else "C123",
+            "channel_type": channel_type,
+            "team": "T_TEAM",
+            "ts": "123.456",
+            "client_msg_id": "client-message-id",
+        }
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
+        if force_process:
+            event["_hermes_force_process"] = True
+        return event
+
+    @staticmethod
+    def _configure(adapter):
+        adapter.config.extra.update(
+            {
+                "other_agent_patterns": [r"Friday\b"],
+                "mention_patterns": [],
+                "require_mention": True,
+            }
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("active", [False, True], ids=["cold", "active"])
+    async def test_thread_is_ignored_before_wake_logic(self, adapter, active):
+        self._configure(adapter)
+        adapter._has_active_session_for_thread = MagicMock(return_value=active)
+        adapter._should_wake_on_unmentioned_message = AsyncMock(return_value=True)
+
+        await adapter._handle_slack_message(
+            self._event("Friday, take this", thread_ts="123.000")
+        )
+
+        adapter.handle_message.assert_not_called()
+        adapter._should_wake_on_unmentioned_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("text", "mention_patterns"),
+        [
+            ("Friday, <@U_BOT> take this", []),
+            ("Friday, take this", [r"Friday\b"]),
+        ],
+        ids=["literal-bot-mention", "configured-mention-pattern"],
+    )
+    async def test_explicit_wake_precedence_over_peer_pattern(
+        self, adapter, text, mention_patterns
+    ):
+        self._configure(adapter)
+        adapter.config.extra["mention_patterns"] = mention_patterns
+
+        await adapter._handle_slack_message(self._event(text))
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_force_process_precedence_over_peer_pattern(self, adapter):
+        self._configure(adapter)
+
+        await adapter._handle_slack_message(
+            self._event("Friday, take this", force_process=True)
+        )
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_leading_peer_pattern_does_not_suppress(self, adapter):
+        self._configure(adapter)
+        adapter.config.extra["free_response_channels"] = ["C123"]
+
+        await adapter._handle_slack_message(
+            self._event("Could Friday take this instead?")
+        )
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dm_is_not_suppressed(self, adapter):
+        self._configure(adapter)
+
+        await adapter._handle_slack_message(
+            self._event("Friday, take this", channel_type="im")
+        )
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_invalid_pattern_logs_skips_and_is_cached(self, adapter, caplog):
+        self._configure(adapter)
+        adapter.config.extra.update(
+            {
+                "other_agent_patterns": ["("],
+                "free_response_channels": ["C123"],
+            }
+        )
+
+        await adapter._handle_slack_message(self._event("Friday, take this"))
+
+        adapter.handle_message.assert_called_once()
+        assert "Invalid other_agent_patterns entry" in caplog.text
+        cached = adapter._slack_other_agent_patterns()
+        assert cached == []
+        assert adapter._slack_other_agent_patterns() is cached
 
 
 # ---------------------------------------------------------------------------
@@ -4841,6 +5002,71 @@ class TestReactions:
 
         # Message ID should be cleaned up
         assert "1234567890.000001" not in adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ("thumbsup", "thumbsup"),
+            (" +1 ", "+1"),
+            ("", "white_check_mark"),
+            (" :thumbsup: ", "white_check_mark"),
+            ("two words", "white_check_mark"),
+            ("a" * 101, "white_check_mark"),
+            (["thumbsup"], "white_check_mark"),
+            (None, "white_check_mark"),
+        ],
+    )
+    async def test_success_reaction_accepts_only_safe_bounded_emoji_names(
+        self, adapter, configured, expected
+    ):
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            ProcessingOutcome,
+            SessionSource,
+        )
+        from gateway.config import Platform
+
+        adapter.config.extra["success_reaction"] = configured
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        message_id = "1234567890.000009"
+        adapter._reacting_message_ids.add(message_id)
+        msg_event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=message_id,
+        )
+
+        await adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS)
+
+        assert adapter._app.client.reactions_add.call_args.kwargs["name"] == expected
+
+    def test_yaml_bridge_seeds_only_residual_slack_extras(self):
+        from plugins.platforms.slack.adapter import _apply_yaml_config
+
+        seeded = _apply_yaml_config(
+            {},
+            {
+                "success_reaction": "thumbsup",
+                "other_agent_patterns": [r"Friday\b"],
+                "mention_patterns": [r"Sunday\b"],
+                "unrelated": True,
+            },
+        )
+
+        assert seeded == {
+            "success_reaction": "thumbsup",
+            "other_agent_patterns": [r"Friday\b"],
+        }
 
     @pytest.mark.asyncio
     async def test_reactions_failure_outcome(self, adapter):
