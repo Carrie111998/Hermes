@@ -114,3 +114,12 @@ export function staggerOffset(index: number, windowMs: number = PET_BG_POLL_MS):
 
   return Math.round((windowMs / Math.max(1, count)) * index) % windowMs
 }
+
+/**
+ * The single shared background-poll lane. Every PetSlot's background meta poll
+ * funnels through here so at most PET_BG_POLL_CONCURRENCY (1) background request
+ * is in flight at a time, regardless of how many profiles are pinned. Foreground
+ * polls bypass it (runForeground). Module-level singleton, like the gallery's
+ * thumbCache — survives slot unmount/remount.
+ */
+export const backgroundPollLane = createPollLane(PET_BG_POLL_CONCURRENCY)

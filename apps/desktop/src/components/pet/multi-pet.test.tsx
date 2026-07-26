@@ -63,7 +63,15 @@ describe('PetSlot (test 13, 14)', () => {
     const { unmount } = render(<PetSlot profile="apollo" />)
 
     expect(leaseProfileGateway).toHaveBeenCalledWith('apollo')
-    expect(requestGatewayForProfile).toHaveBeenCalledWith('apollo', 'pet.info', { profile: 'apollo' })
+    // apollo is a background profile (active = default), so the slot polls the
+    // cheap pet.info.meta first (meta-first budget) through the profile gateway.
+    expect(requestGatewayForProfile).toHaveBeenCalledWith(
+      'apollo',
+      'pet.info.meta',
+      { profile: 'apollo' },
+      undefined,
+      undefined
+    )
     expect(releaseProfileGateway).not.toHaveBeenCalled()
 
     unmount()

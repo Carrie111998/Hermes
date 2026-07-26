@@ -37,8 +37,8 @@ export function MultiPetContainer() {
         zIndex: 60
       }}
     >
-      {profiles.map(profile => (
-        <PetSlot key={profile} profile={profile} />
+      {profiles.map((profile, index) => (
+        <PetSlot index={index} key={profile} profile={profile} />
       ))}
     </div>
   )
