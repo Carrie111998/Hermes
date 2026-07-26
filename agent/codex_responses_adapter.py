@@ -912,7 +912,8 @@ def _preflight_codex_api_kwargs(
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
-        "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
+        "tool_choice", "parallel_tool_calls", "prompt_cache_key",
+        "prompt_cache_retention", "service_tier",
         "extra_headers", "extra_body", "timeout",
     }
     normalized: Dict[str, Any] = {
@@ -950,8 +951,13 @@ def _preflight_codex_api_kwargs(
     if isinstance(temperature, (int, float)):
         normalized["temperature"] = float(temperature)
 
-    # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
-    for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
+    # Pass through cache routing/retention and tool-dispatch hints.
+    for passthrough_key in (
+        "tool_choice",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+    ):
         val = api_kwargs.get(passthrough_key)
         if val is not None:
             normalized[passthrough_key] = val
@@ -1118,6 +1124,22 @@ def _normalize_codex_response(
     differs from the one that minted the encrypted_content blob and drop
     the item instead of triggering HTTP 400 invalid_encrypted_content.
     """
+    response_status = getattr(response, "status", None)
+    if isinstance(response_status, str):
+        response_status = response_status.strip().lower()
+    else:
+        response_status = None
+
+    incomplete_details = getattr(response, "incomplete_details", None)
+    incomplete_reason = ""
+    if isinstance(incomplete_details, dict):
+        incomplete_reason = str(incomplete_details.get("reason") or "").strip().lower()
+    elif incomplete_details is not None:
+        incomplete_reason = str(getattr(incomplete_details, "reason", "") or "").strip().lower()
+    response_incomplete_content_filter = (
+        response_status == "incomplete" and incomplete_reason == "content_filter"
+    )
+
     output = getattr(response, "output", None)
     if not isinstance(output, list) or not output:
         # The Codex backend can return empty output when the answer was
@@ -1134,14 +1156,17 @@ def _normalize_codex_response(
                 content=[SimpleNamespace(type="output_text", text=out_text.strip())],
             )]
             response.output = output
+        elif response_incomplete_content_filter:
+            # This is a deterministic provider safety block, not a partial
+            # answer. Synthesize an empty message so finish_reason below becomes
+            # content_filter and the conversation loop can fallback/surface it
+            # instead of burning three continuation attempts.
+            output = [SimpleNamespace(
+                type="message", role="assistant", status="completed", content=[]
+            )]
+            response.output = output
         else:
             raise RuntimeError("Responses API returned no output items")
-
-    response_status = getattr(response, "status", None)
-    if isinstance(response_status, str):
-        response_status = response_status.strip().lower()
-    else:
-        response_status = None
 
     if response_status in {"failed", "cancelled"}:
         error_obj = getattr(response, "error", None)
@@ -1411,6 +1436,8 @@ def _normalize_codex_response(
 
     if tool_calls:
         finish_reason = "tool_calls"
+    elif response_incomplete_content_filter:
+        finish_reason = "content_filter"
     elif leaked_tool_call_text:
         finish_reason = "incomplete"
     elif saw_streaming_or_item_incomplete:
