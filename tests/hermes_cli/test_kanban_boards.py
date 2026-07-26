@@ -126,12 +126,27 @@ class TestPathResolution:
             fresh_home / "kanban" / "boards" / "other" / "logs"
         )
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+    def test_env_var_db_override_used_when_no_board_is_explicit(self, fresh_home, tmp_path, monkeypatch):
+        """``HERMES_KANBAN_DB`` pins the file for legacy/no-board callers."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+
+    def test_explicit_board_arg_beats_db_override(self, fresh_home, tmp_path, monkeypatch):
+        """Per-call board selection must override a worker's pinned DB path."""
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        expected = fresh_home / "kanban" / "boards" / "target" / "kanban.db"
+        assert kb.kanban_db_path(board="target") == expected
+
+    def test_scoped_current_board_beats_db_override(self, fresh_home, tmp_path, monkeypatch):
+        """CLI ``--board`` scopes legacy call sites that do not pass board=."""
+        forced = tmp_path / "custom.db"
+        kb.create_board("target")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        expected = fresh_home / "kanban" / "boards" / "target" / "kanban.db"
+        with kb.scoped_current_board("target"):
+            assert kb.kanban_db_path() == expected
 
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"
@@ -531,6 +546,21 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
+
+    def test_board_flag_beats_env_pinned_db_via_cli(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
+        assert _cli(["create", "Default Task", "--assignee", "dev"], env_extra=env).returncode == 0
+        assert _cli(["--board", "projB", "create", "Task B", "--assignee", "dev"], env_extra=env).returncode == 0
+
+        pinned_to_default = {
+            **env,
+            "HERMES_KANBAN_DB": str(tmp_path / "kanban.db"),
+            "HERMES_KANBAN_BOARD": "default",
+        }
+        listB = _cli(["--board", "projB", "list", "--json"], env_extra=pinned_to_default)
+        assert listB.returncode == 0, listB.stderr
+        assert [t["title"] for t in json.loads(listB.stdout)] == ["Task B"]
 
     def test_board_flag_rejects_unknown(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

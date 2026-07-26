@@ -2152,6 +2152,29 @@ def test_board_param_routes_show_to_alt_board(multi_board_env):
     assert good["task"]["title"] == "seed-alt"
 
 
+def test_board_param_routes_show_despite_env_pinned_db(monkeypatch, multi_board_env):
+    """Explicit ``board=`` must beat a worker/orchestrator env-pinned DB path.
+
+    Regression for workers spawned with ``HERMES_KANBAN_DB`` set to their own
+    board: a deliberate cross-board ``kanban_show(board=...)`` should connect
+    to the requested board instead of silently reading the env-pinned DB.
+    """
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(multi_board_env["default_db"]))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    alt_seed = multi_board_env["alt_seed"]
+
+    # No explicit board keeps legacy env-pinned behavior.
+    pinned = json.loads(kt._handle_show({"task_id": alt_seed}))
+    assert "not found" in pinned.get("error", "")
+
+    # Explicit board deliberately overrides the pinned DB path.
+    routed = json.loads(kt._handle_show({"task_id": alt_seed, "board": "alt"}))
+    assert routed["task"]["id"] == alt_seed
+    assert routed["task"]["title"] == "seed-alt"
+
+
 def test_board_param_routes_assign_via_create_to_alt(multi_board_env):
     """Workflow test for the 'assign' UX — create with assignee on a
     specific board. (The CLI has a separate ``kanban assign`` verb; the

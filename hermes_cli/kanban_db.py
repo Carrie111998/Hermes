@@ -22,16 +22,19 @@ For back-compat its on-disk DB is ``<root>/kanban.db`` (not
 ``boards/default/kanban.db``), so installs that predate the boards
 feature keep working with zero migration. See :func:`kanban_db_path`.
 
-Board resolution order (highest precedence first, all optional):
+Board path resolution order (highest precedence first, all optional):
 
 * ``board=`` argument passed directly to :func:`connect` / :func:`init_db`
   (explicit — used by the CLI ``--board`` flag and the dashboard
   ``?board=...`` query param).
+* ``scoped_current_board(...)`` context override (used by the CLI
+  ``--board`` flag to scope legacy call sites that do not pass ``board=``).
+* ``HERMES_KANBAN_DB`` env var, but only when no explicit/scoped board was
+  supplied. The dispatcher injects this into workers as a defensive exact-path
+  pin for their own board; a per-call board override must still be able to
+  route to another board deliberately.
 * ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
-  to the board their task lives on — workers cannot see other boards).
-* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
-  override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
+  to the board their task lives on when no DB path is pinned).
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
@@ -543,20 +546,32 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
     Resolution (highest precedence first):
 
-    1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
-       :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    1. Explicit ``board`` argument, or a ``scoped_current_board(...)`` override
+       — routes to that board's DB even when a worker/orchestrator process has
+       env-pinned kanban variables.
+    2. When no board is explicit/scoped, ``HERMES_KANBAN_DB`` pins the path directly.
+       Honoured for back-compat and for the dispatcher→worker handoff (defense
+       in depth: dispatcher injects this into worker env so workers are immune
+       to any path-resolution disagreement for their own board).
+    3. When no board/path is pinned, the active board from :func:`get_current_board`
+       is used.
+    4. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
-    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
+        scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+        if scoped:
+            try:
+                normed = _normalize_board_slug(scoped)
+                if normed and board_exists(normed):
+                    slug = normed
+            except ValueError:
+                pass
+    if slug is None:
+        override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if override:
+            return Path(override).expanduser()
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
@@ -3890,7 +3905,8 @@ def _synthesize_ended_run(
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    worker/operator ``kanban_block`` call (#28712) or by being created
+    directly in ``blocked`` state.
 
     A ``blocked`` status can come from two very different sources:
 
@@ -3906,13 +3922,20 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       automatically once the underlying conditions change (e.g. parents
       finish, transient infra error clears).
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
+    The cheapest signal that distinguishes the first path is the most
+    recent ``"blocked"`` / ``"unblocked"`` event for the task.  If the
+    most recent one is ``"blocked"`` (or there is a ``"blocked"`` event
+    and no ``"unblocked"`` event has fired since), the task is sticky and
     ``recompute_ready`` must *not* auto-promote it.
 
-    Returns ``False`` when there is no such event at all (e.g. the task
+    ``initial_status='blocked'`` is also an explicit human-ops parking
+    request, but it is recorded on the ``"created"`` event payload rather
+    than as a separate ``"blocked"`` event.  Treat that initial state as
+    sticky until a later explicit unblock/block event says otherwise; this
+    keeps passive smoke/inbox items from being promoted on the next
+    dispatcher tick.
+
+    Returns ``False`` when neither sticky signal exists (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
@@ -3923,7 +3946,22 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if row:
+        return row["kind"] == "blocked"
+
+    created = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'created' "
+        "ORDER BY id ASC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not created or not created["payload"]:
+        return False
+    try:
+        payload = json.loads(created["payload"])
+    except Exception:
+        return False
+    return isinstance(payload, dict) and payload.get("status") == "blocked"
 
 
 def recompute_ready(
@@ -8841,6 +8879,17 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Kanban workers are not cron jobs even when the gateway-embedded
+    # dispatcher runs in the same long-lived process as the cron scheduler.
+    # cron.scheduler marks cron agent runs with process-global
+    # HERMES_CRON_SESSION so approval guards can apply approvals.cron_mode;
+    # if a previous/parallel cron tick leaves that flag in the gateway env, a
+    # worker subprocess would inherit it and execute_code would be blocked with
+    # a misleading "Cron jobs run without a user present" error. Scrub the
+    # cron-context marker at the worker boundary; explicit kanban env above is
+    # the worker's authority.
+    env.pop("HERMES_CRON_SESSION", None)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

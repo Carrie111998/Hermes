@@ -125,6 +125,44 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     assert "HERMES_TUI" not in captured["env"]
 
 
+def test_default_spawn_scrubs_inherited_cron_session(monkeypatch, tmp_path):
+    """Kanban workers must not inherit the gateway cron-context marker.
+
+    The gateway hosts both cron and the embedded kanban dispatcher. If a cron
+    run has set HERMES_CRON_SESSION in the long-lived gateway process, a worker
+    spawned from that process is still a kanban worker, not a cron job; leaving
+    the flag in the child env makes execute_code obey approvals.cron_mode and
+    fail with a misleading cron-only block message.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert "HERMES_CRON_SESSION" not in captured["env"]
+
+
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
 
