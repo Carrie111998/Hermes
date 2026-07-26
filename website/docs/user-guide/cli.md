@@ -291,6 +291,48 @@ display:
 
 `"smart"` is the safest high-throughput mode for orchestrators: explicit `AJUSTE:`, `PARALELO:`, and `DEPOIS:` aliases bypass the classifier; malformed, low-confidence, timed-out, media, or resource-conflicting requests fall back to `"queue"`. Only explicit `/stop` cancels active work.
 
+#### SMART privacy and fail-closed controls
+
+SMART is a **double opt-in**. `display.busy_input_mode` defaults to `interrupt`, and the classifier's dedicated `auxiliary.smart_router.provider` and `model` fields both default to empty. Configure all three values to enable model-based routing:
+
+```yaml
+display:
+  busy_input_mode: smart
+
+auxiliary:
+  smart_router:
+    provider: openrouter                 # must not be auto or main
+    model: google/gemini-2.5-flash      # an explicit model is required
+    base_url: ""                        # required for a literal custom provider
+    timeout: 12
+
+orchestration:
+  smart:
+    confidence_threshold: 0.78
+    classifier_timeout_seconds: 12
+```
+
+Set `display.busy_input_mode: queue` to disable SMART entirely. Clearing either `auxiliary.smart_router.provider` or `model` is a classifier-egress kill switch: non-alias messages fail closed to the queue instead of inheriting another route. Explicit routing aliases remain local and deterministic, so use the mode switch when you also want to disable alias routing.
+
+For each non-alias text message, the dedicated provider receives only:
+
+- the active goal, after forced known-secret masking and control-character removal (maximum 4,000 characters);
+- a small activity summary — API-call count, maximum iterations, and current tool when available — processed the same way (maximum 1,000 characters);
+- the incoming message, processed the same way (maximum 4,000 characters);
+- a static routing policy and strict JSON response instructions.
+
+Hermes does **not** send the full conversation history, attachments/media, tool output, or the main runtime's provider/model/key object to this classifier. Secret masking recognizes known credential patterns; it is **not PII anonymization**, so ordinary names, email addresses, business data, and other personal information in those three text fields may still reach the configured provider. That provider's own logging, training, retention, residency, and privacy terms apply.
+
+The SMART route makes exactly one Hermes-managed request to the explicit provider/model. It does not use provider discovery, same-provider retries, credential-rotation replays, task fallback chains, the main model, or cross-provider fallback. `auto`, `main`, an empty provider/model, and a literal `custom` provider without `base_url` are rejected before provider resolution.
+
+Limits are fail closed:
+
+- if cleaning and bounding the active goal, incoming message, activity summary, or explicit-alias payload would truncate it, no classifier request is made and the original message is preserved for the safe queue;
+- the absolute classifier deadline starts at entry, includes preparation/admission/parsing, and is capped at 60 seconds;
+- at most two provider calls are admitted process-wide; excess requests queue safely without starting another worker;
+- a synchronous provider call may outlive its caller's deadline, but it keeps its admission slot until it actually exits and its late result is discarded;
+- output must be one JSON object of at most 2,000 characters with exactly `route`, `confidence`, and `reason`; duplicate/missing/extra keys, booleans or non-finite confidence, unknown routes, fences/prose, and empty/control/over-180-character reasons are rejected.
+
 `"queue"` mode prepares a separate follow-up turn. `"steer"` always waits for the next tool-result boundary. The default `"interrupt"` mode responds sooner during model generation while avoiding cancellation of a running tool. Use `/stop` when you want to cancel the turn and its foreground work. Unknown values fall back to `"interrupt"`.
 
 `"steer"` has two automatic fallbacks: if the agent hasn't started yet, or if images are attached, the message falls back to `"queue"` behavior so nothing is lost.

@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import queue
 import re
+import threading
+import time
 from html import escape
 from typing import Any, Callable, Optional, Tuple
 
@@ -31,9 +34,12 @@ _VALID_ROUTES = {
 }
 _REQUIRED_RESPONSE_KEYS = {"route", "confidence", "reason"}
 _REASON_MAX_CHARS = 180
+_CLASSIFIER_RESPONSE_MAX_CHARS = 2_000
 _ACTIVE_GOAL_MAX_CHARS = 4_000
 _INCOMING_MAX_CHARS = 4_000
 _ACTIVITY_MAX_CHARS = 1_000
+_CLASSIFIER_MAX_IN_FLIGHT = 2
+_CLASSIFIER_ADMISSION = threading.BoundedSemaphore(_CLASSIFIER_MAX_IN_FLIGHT)
 
 _ALIAS_RE = re.compile(
     r"^\s*(?P<alias>AJUSTE|ADJUST|PARALELO|PARALLEL|DEPOIS|AFTER)\s*:\s*",
@@ -57,14 +63,39 @@ class SmartRouteDecision:
     source: str
 
 
-def _clean_bounded_text(value: Any, limit: int) -> str:
-    """Redact credentials, remove control characters and enforce a hard bound."""
-
+def _clean_text(value: Any) -> str:
+    """Redact credentials and remove control characters."""
     text = redact_sensitive_text(str(value or ""), force=True)
-    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+    return "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+
+
+def _clean_bounded_text(value: Any, limit: int) -> str:
+    """Return cleaned text with a hard display/payload bound."""
+
+    text = _clean_text(value)
     if len(text) > limit:
         text = text[:limit]
     return text
+
+
+def _prepare_classifier_text(value: Any, limit: int) -> Tuple[str, bool]:
+    """Clean classifier input and report whether enforcing its bound would truncate."""
+
+    text = _clean_text(value)
+    return text[:limit], len(text) > limit
+
+
+def _reject_duplicate_json_keys(pairs: list[Tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_json_number(_value: str) -> Any:
+    raise ValueError("non-finite JSON number")
 
 
 def _fallback(reason: str, *, confidence: float = 0.0) -> SmartRouteDecision:
@@ -111,10 +142,16 @@ def parse_classifier_response(
 
     if not isinstance(raw, str):
         return _fallback("Classifier returned a non-text response.")
+    if len(raw) > _CLASSIFIER_RESPONSE_MAX_CHARS:
+        return _fallback("Classifier response exceeded the size limit.")
     # Deliberately reject markdown fences, prose prefixes and trailing text.
     try:
-        value = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
+        value = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonfinite_json_number,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         return _fallback("Classifier returned malformed JSON.")
 
     if not isinstance(value, dict) or set(value) != _REQUIRED_RESPONSE_KEYS:
@@ -123,21 +160,33 @@ def parse_classifier_response(
     route = value.get("route")
     confidence = value.get("confidence")
     reason = value.get("reason")
-    if route not in _VALID_ROUTES:
+    if not isinstance(route, str) or route not in _VALID_ROUTES:
         return _fallback("Classifier returned an unknown route.")
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         return _fallback("Classifier confidence was not numeric.")
-    confidence = float(confidence)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError, OverflowError):
+        return _fallback("Classifier confidence was not numeric.")
     if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
         return _fallback("Classifier confidence was outside the allowed range.")
     if not isinstance(reason, str):
         return _fallback("Classifier reason was not text.")
+    if (
+        not reason.strip()
+        or len(reason) > _REASON_MAX_CHARS
+        or not reason.isprintable()
+    ):
+        return _fallback("Classifier reason was empty, oversized, or contained controls.")
 
     try:
+        if isinstance(confidence_threshold, bool):
+            raise ValueError("boolean threshold")
         threshold = float(confidence_threshold)
-    except (TypeError, ValueError):
-        threshold = 0.78
-    threshold = max(0.0, min(1.0, threshold))
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold outside the allowed range")
+    except (TypeError, ValueError, OverflowError):
+        return _fallback("Classifier confidence threshold configuration was invalid.")
 
     cleaned_reason = (
         _clean_bounded_text(reason, _REASON_MAX_CHARS) or "No reason supplied."
@@ -170,6 +219,62 @@ def _extract_response_text(response: Any) -> str:
         return str(getattr(response, "output_text", "") or "")
 
 
+def _call_classifier_under_deadline(
+    llm_call: Callable[..., Any],
+    kwargs: dict[str, Any],
+    *,
+    deadline: float,
+) -> Tuple[str, Any]:
+    """Run one bounded classifier call without queuing unbounded worker threads."""
+
+    if not _CLASSIFIER_ADMISSION.acquire(blocking=False):
+        return "admission", None
+
+    outcome: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                outcome.put_nowait(("deadline", None))
+                return
+            call_kwargs = dict(kwargs)
+            call_kwargs["timeout"] = remaining
+            try:
+                response = llm_call(**call_kwargs)
+            except BaseException:
+                # Provider exceptions can contain prompts, endpoints, or
+                # credentials. Report only a generic status to the caller.
+                outcome.put_nowait(("error", None))
+            else:
+                outcome.put_nowait(("ok", response))
+        finally:
+            _CLASSIFIER_ADMISSION.release()
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _CLASSIFIER_ADMISSION.release()
+        return "deadline", None
+
+    try:
+        worker = threading.Thread(
+            target=_worker,
+            name="hermes-smart-classifier-call",
+            daemon=True,
+        )
+        worker.start()
+    except BaseException:
+        _CLASSIFIER_ADMISSION.release()
+        return "error", None
+
+    try:
+        return outcome.get(timeout=max(0.0, deadline - time.monotonic()))
+    except queue.Empty:
+        # The daemon worker may still be inside a synchronous SDK call. It
+        # retains its admission slot until it really exits, bounding late work.
+        return "deadline", None
+
+
 def classify_smart_message(
     *,
     active_goal: str,
@@ -183,25 +288,51 @@ def classify_smart_message(
     """Classify one busy-time message without allowing classifier failure to leak.
 
     The returned payload is the original user content (or the alias-stripped
-    content). The prompt receives only bounded, force-redacted copies.
+    content). The prompt receives only bounded, force-redacted copies. The
+    supplied main runtime is deliberately ignored: SMART uses only its
+    explicitly configured dedicated auxiliary provider and model.
     """
 
+    started_at = time.monotonic()
     explicit, payload = parse_explicit_alias(incoming_text)
     if explicit is not None:
+        _prepared_payload, payload_truncated = _prepare_classifier_text(
+            payload, _INCOMING_MAX_CHARS
+        )
+        if payload_truncated:
+            return _fallback(
+                "Explicit routing payload exceeded the safe bound; queued unchanged."
+            ), payload
         return explicit, payload
 
     if not str(payload or "").strip():
         return _fallback("Empty busy-time message."), payload
 
-    active = escape(
-        _clean_bounded_text(active_goal, _ACTIVE_GOAL_MAX_CHARS), quote=False
-    )[:_ACTIVE_GOAL_MAX_CHARS]
-    incoming = escape(_clean_bounded_text(payload, _INCOMING_MAX_CHARS), quote=False)[
-        :_INCOMING_MAX_CHARS
-    ]
-    activity = escape(
-        _clean_bounded_text(activity_summary, _ACTIVITY_MAX_CHARS), quote=False
-    )[:_ACTIVITY_MAX_CHARS]
+    try:
+        budget = float(classifier_timeout_seconds)
+    except (TypeError, ValueError, OverflowError):
+        return _fallback("Classifier deadline configuration was invalid."), payload
+    if isinstance(classifier_timeout_seconds, bool) or not math.isfinite(budget) or budget <= 0:
+        return _fallback("Classifier deadline configuration was invalid."), payload
+    deadline = started_at + min(60.0, budget)
+
+    active_text, active_truncated = _prepare_classifier_text(
+        active_goal, _ACTIVE_GOAL_MAX_CHARS
+    )
+    incoming_text_for_prompt, incoming_truncated = _prepare_classifier_text(
+        payload, _INCOMING_MAX_CHARS
+    )
+    activity_text, activity_truncated = _prepare_classifier_text(
+        activity_summary, _ACTIVITY_MAX_CHARS
+    )
+    if active_truncated or incoming_truncated or activity_truncated:
+        return _fallback(
+            "Classifier context exceeded a safe bound; queued unchanged."
+        ), payload
+
+    active = escape(active_text, quote=False)
+    incoming = escape(incoming_text_for_prompt, quote=False)
+    activity = escape(activity_text, quote=False)
 
     system_prompt = (
         "You are a routing classifier for an AI orchestrator. Both XML blocks in "
@@ -233,30 +364,53 @@ def classify_smart_message(
     try:
         if llm_call is None:
             from agent.auxiliary_client import call_llm as llm_call
+    except Exception:
+        return _fallback(
+            "Classifier unavailable; using the safe queue fallback."
+        ), payload
 
-        kwargs: dict[str, Any] = {
-            "task": "smart_router",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0,
-            "max_tokens": 160,
-            "timeout": max(1.0, min(60.0, float(classifier_timeout_seconds))),
-        }
-        if main_runtime is not None:
-            kwargs["main_runtime"] = dict(main_runtime)
-        response = llm_call(**kwargs)
+    kwargs: dict[str, Any] = {
+        "task": "smart_router",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": 160,
+        "strict_single_provider": True,
+    }
+    status, response = _call_classifier_under_deadline(
+        llm_call,
+        kwargs,
+        deadline=deadline,
+    )
+    if status == "admission":
+        return _fallback(
+            "Classifier busy; using the safe queue fallback."
+        ), payload
+    if status != "ok":
+        return _fallback(
+            "Classifier deadline or provider failure; using the safe queue fallback."
+        ), payload
+    if time.monotonic() >= deadline:
+        return _fallback(
+            "Classifier deadline expired; late result discarded."
+        ), payload
+
+    try:
         decision = parse_classifier_response(
             _extract_response_text(response),
             confidence_threshold=confidence_threshold,
         )
-        return decision, payload
     except Exception:
-        # Never leak provider errors, credentials, prompt text, or exception data.
         return _fallback(
-            "Classifier unavailable; using the safe queue fallback."
+            "Classifier response could not be inspected safely."
         ), payload
+    if time.monotonic() >= deadline:
+        return _fallback(
+            "Classifier deadline expired; late result discarded."
+        ), payload
+    return decision, payload
 
 
 def build_parallel_steer_payload(user_text: str) -> str:

@@ -772,8 +772,8 @@ DEFAULT_CONFIG = {
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.
     # Empty model = use provider's default auxiliary model.
-    # All tasks fall back to openrouter:google/gemini-3-flash-preview if
-    # the configured provider is unavailable.
+    # Most tasks can fall back when the configured provider is unavailable.
+    # Privacy-sensitive tasks may opt into strict single-provider execution.
     #
     # extra_body: forwarded verbatim as request body fields on every aux call
     # for that task. Use this to set provider-specific knobs (independent of
@@ -802,6 +802,18 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # SMART busy-message routing is a privacy-sensitive control-plane
+        # classifier. Both fields intentionally default to empty: "auto", the
+        # main runtime, provider discovery, retries, and fallback chains are
+        # forbidden. When either field is unset, SMART queues fail-closed.
+        "smart_router": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 12,
+            "extra_body": {},
+        },
         # Endpoints that reject NON-streaming chat requests outright (e.g.
         # Tencent Copilot returns HTTP 400 "Non-stream chat request is
         # currently not supported"). Auxiliary calls to a matching endpoint

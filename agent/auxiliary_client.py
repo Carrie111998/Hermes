@@ -6967,9 +6967,9 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 
 
 def _resolve_task_provider_model(
-    task: str = None,
-    provider: str = None,
-    model: str = None,
+    task: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -7118,7 +7118,11 @@ def _resolve_task_provider_model(
         if not api_key:
             api_key = cfg_api_key
 
-    if base_url and _preserve_provider_with_base_url(provider):
+    if (
+        base_url
+        and provider is not None
+        and _preserve_provider_with_base_url(provider)
+    ):
         return provider, resolved_model, base_url, api_key, resolved_api_mode
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
@@ -8112,6 +8116,63 @@ async def _acreate_with_stream(
     )
 
 
+def _strict_single_provider_inputs(
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> Tuple[str, str, Optional[str], Optional[str], Optional[str]]:
+    """Capture and validate one dedicated route before generic resolution.
+
+    Strict callers may specify the route directly or through their dedicated
+    ``auxiliary.<task>`` slot.  Validate those raw values before aliases,
+    defaults, or the main runtime can turn an ambiguous route into a concrete
+    one.  Returning a snapshot also prevents a concurrent config rewrite from
+    changing provider/model between validation and resolution.
+    """
+
+    task_config = _get_auxiliary_task_config(task) if task else {}
+    raw_provider = provider if provider is not None else task_config.get("provider")
+    raw_model = model if model is not None else task_config.get("model")
+    raw_base_url = base_url if base_url is not None else task_config.get("base_url")
+    raw_api_key = api_key if api_key is not None else task_config.get("api_key")
+    raw_api_mode = task_config.get("api_mode")
+
+    if not isinstance(raw_provider, str) or not isinstance(raw_model, str):
+        raise RuntimeError(
+            "Strict single-provider auxiliary calls require an explicit provider and model."
+        )
+    strict_provider = raw_provider.strip()
+    strict_model = raw_model.strip()
+    ambiguous = {"", "auto", "main"}
+    if strict_provider.lower() in ambiguous or strict_model.lower() in ambiguous:
+        raise RuntimeError(
+            "Strict single-provider auxiliary calls require an explicit provider and model."
+        )
+
+    strict_base_url = (
+        raw_base_url.strip() if isinstance(raw_base_url, str) and raw_base_url.strip() else None
+    )
+    if strict_provider.lower() == "custom" and strict_base_url is None:
+        raise RuntimeError(
+            "Strict single-provider custom calls require an explicit base_url."
+        )
+    strict_api_key = (
+        raw_api_key.strip() if isinstance(raw_api_key, str) and raw_api_key.strip() else None
+    )
+    strict_api_mode = (
+        raw_api_mode.strip() if isinstance(raw_api_mode, str) and raw_api_mode.strip() else None
+    )
+    return (
+        strict_provider,
+        strict_model,
+        strict_base_url,
+        strict_api_key,
+        strict_api_mode,
+    )
+
+
 @_relay_auxiliary_call
 def call_llm(
     task: str = None,
@@ -8132,6 +8193,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    strict_single_provider: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -8163,6 +8225,10 @@ def call_llm(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        strict_single_provider: Require an explicit provider and model, issue
+            exactly one request, and disable discovery, retries, credential
+            rotation, and every provider/model fallback. Intended for
+            privacy-sensitive control-plane calls that must fail closed.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -8171,13 +8237,52 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
-    # Capture one immutable runtime snapshot for keying, resolution, retries,
-    # and fallbacks. Reading ambient state independently in each phase lets a
-    # concurrent /model switch produce a key for one runtime and a client for
-    # another.
-    main_runtime = _normalize_main_runtime(main_runtime)
-    resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
+    if strict_single_provider:
+        (
+            strict_provider,
+            strict_model,
+            strict_base_url,
+            strict_api_key,
+            strict_api_mode,
+        ) = _strict_single_provider_inputs(task, provider, model, base_url, api_key)
+        # Resolve only the frozen, already-validated route. Passing task=None
+        # prevents generic task defaults or a second config read from changing
+        # the destination. A live main-runtime snapshot is never inspected.
+        (
+            resolved_provider,
+            resolved_model,
+            resolved_base_url,
+            resolved_api_key,
+            resolved_api_mode,
+        ) = _resolve_task_provider_model(
+            None,
+            strict_provider,
+            strict_model,
+            strict_base_url,
+            strict_api_key,
+        )
+        resolved_api_mode = strict_api_mode or resolved_api_mode
+        main_runtime = {}
+        if (
+            str(resolved_provider or "").strip().lower() in {"", "auto", "main"}
+            or str(resolved_model or "").strip().lower() in {"", "auto", "main"}
+        ):
+            raise RuntimeError(
+                "Strict single-provider auxiliary calls require an explicit provider and model."
+            )
+    else:
+        # Capture one immutable runtime snapshot for keying, resolution,
+        # retries, and fallbacks. Reading ambient state independently in each
+        # phase lets a concurrent /model switch produce a key for one runtime
+        # and a client for another.
+        main_runtime = _normalize_main_runtime(main_runtime)
+        (
+            resolved_provider,
+            resolved_model,
+            resolved_base_url,
+            resolved_api_key,
+            resolved_api_mode,
+        ) = _resolve_task_provider_model(task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -8192,7 +8297,12 @@ def call_llm(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not strict_single_provider
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -8219,6 +8329,11 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if strict_single_provider:
+                raise RuntimeError(
+                    f"No dedicated LLM provider configured for task={task} "
+                    f"provider={resolved_provider}."
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -8310,6 +8425,17 @@ def call_llm(
             kwargs,
             provider=resolved_provider,
             api_mode=resolved_api_mode,
+        )
+
+    if strict_single_provider:
+        # Security-sensitive control-plane calls get one wire attempt only.
+        # In particular, do not enter the generic auxiliary retry, credential
+        # rotation, model self-heal, or cross-provider fallback machinery.
+        return _validate_llm_response(
+            client.chat.completions.create(**kwargs),
+            task,
+            provider=resolved_provider,
+            base_url=_base_info,
         )
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
