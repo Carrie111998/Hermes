@@ -62,7 +62,7 @@ import tempfile
 import threading
 import time
 import requests
-from typing import Dict, Any, Optional, List, Tuple, Union
+from typing import Dict, Any, Callable, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from agent.redact import (
@@ -2624,6 +2624,255 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
 # Browser Tool Functions
 # ============================================================================
 
+def _kanban_worker_run_id() -> Optional[int]:
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def _browser_page_identity(
+    browser_task_id: str,
+) -> tuple[str, str, Optional[str]]:
+    """Return (url, page-load identity, error) from the live page itself."""
+    probe = _browser_eval(
+        "JSON.stringify({href: location.href, timeOrigin: performance.timeOrigin})",
+        browser_task_id,
+    )
+    try:
+        payload = json.loads(probe)
+        result = payload.get("result")
+        if isinstance(result, str):
+            result = json.loads(result)
+        if not payload.get("success") or not isinstance(result, dict):
+            return "", "", str(payload.get("error") or "page identity unavailable")
+        url = str(result.get("href") or "")
+        time_origin = result.get("timeOrigin")
+        if not url or not isinstance(time_origin, (int, float)):
+            return "", "", "page identity probe returned incomplete data"
+        return url, f"{url}|{time_origin}", None
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return "", "", f"page identity probe was invalid: {exc}"
+
+
+def _bind_external_create_page(
+    browser_task_id: str,
+    guard_conn: Any = None,
+    *,
+    require_protected: bool = False,
+) -> Optional[str]:
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not kanban_task_id:
+        return None
+    current_url, page_identity, identity_error = _browser_page_identity(
+        browser_task_id,
+    )
+    if identity_error:
+        return f"External create page binding failed closed: {identity_error}"
+    try:
+        from hermes_cli import kanban_db as _kanban_db
+
+        if not _kanban_db.external_platform_for_url(current_url):
+            if require_protected:
+                return (
+                    "External create page binding failed closed: live page "
+                    "is no longer a protected create route."
+                )
+            return None
+        if guard_conn is not None:
+            return _kanban_db.bind_external_create_page(
+                guard_conn,
+                kanban_task_id,
+                current_url,
+                page_identity=page_identity,
+                expected_run_id=_kanban_worker_run_id(),
+            )
+        with _kanban_db.connect_closing() as opened_conn:
+            return _kanban_db.bind_external_create_page(
+                opened_conn,
+                kanban_task_id,
+                current_url,
+                page_identity=page_identity,
+                expected_run_id=_kanban_worker_run_id(),
+            )
+    except Exception as exc:
+        return (
+            "External create page binding failed closed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _run_guarded_external_browser_action(
+    browser_task_id: str,
+    action: Callable[[Optional[str]], str],
+    *,
+    atomic_page_check: bool = False,
+) -> str:
+    """Serialize a protected page mutation with the active Kanban run."""
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not kanban_task_id:
+        return action(None)
+    try:
+        from hermes_cli import kanban_db as _kanban_db
+
+        with _kanban_db.connect_closing() as scope_conn:
+            if not _kanban_db.is_grace_execution_task(
+                scope_conn,
+                kanban_task_id,
+            ):
+                return action(None)
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Task browser safety scope check failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }, ensure_ascii=False)
+    current_url, page_identity, identity_error = _browser_page_identity(
+        browser_task_id,
+    )
+    if identity_error:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Browser mutation safety check failed closed: "
+                f"{identity_error}"
+            ),
+        }, ensure_ascii=False)
+    try:
+        with _kanban_db.connect_closing() as guard_conn:
+            with _kanban_db.write_txn(guard_conn):
+                guard_error = _kanban_db.external_create_mutation_guard(
+                    guard_conn,
+                    kanban_task_id,
+                    current_url,
+                    expected_run_id=_kanban_worker_run_id(),
+                    page_identity=page_identity,
+                )
+                if guard_error:
+                    return json.dumps(
+                        {"success": False, "error": guard_error},
+                        ensure_ascii=False,
+                    )
+                if not atomic_page_check:
+                    return json.dumps({
+                        "success": False,
+                        "error": (
+                            "Task-bound browser mutation blocked: this action "
+                            "cannot validate the exact page load atomically. "
+                            "Use a contract-approved guarded tool; do not "
+                            "retry with a fallback."
+                        ),
+                    }, ensure_ascii=False)
+                result = action(page_identity)
+                if (
+                    atomic_page_check
+                    and _kanban_db.external_platform_for_url(current_url)
+                ):
+                    bind_error = _bind_external_create_page(
+                        browser_task_id,
+                        guard_conn,
+                        require_protected=True,
+                    )
+                    if bind_error:
+                        return json.dumps(
+                            {"success": False, "error": bind_error},
+                            ensure_ascii=False,
+                        )
+                return result
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "External create safety check failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }, ensure_ascii=False)
+
+
+def _run_guarded_browser_navigation(
+    requested_url: str,
+    browser_task_id: str,
+    action: Callable[[], Any],
+    result_details: Callable[[Any], tuple[bool, str, str]],
+) -> Any:
+    """Serialize active-run validation, create reservation, nav, and binding."""
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not kanban_task_id:
+        return action()
+    from hermes_cli import kanban_db as _kanban_db
+
+    with _kanban_db.connect_closing() as scope_conn:
+        if not _kanban_db.is_grace_execution_task(
+            scope_conn,
+            kanban_task_id,
+        ):
+            return action()
+    expected_run_id = _kanban_worker_run_id()
+    protected = bool(_kanban_db.external_platform_for_url(requested_url))
+    with _kanban_db.connect_closing() as guard_conn:
+        with _kanban_db.write_txn(guard_conn):
+            active_error = _kanban_db.external_create_mutation_guard(
+                guard_conn,
+                kanban_task_id,
+                "about:blank",
+                expected_run_id=expected_run_id,
+                page_identity=None,
+            )
+            if active_error:
+                return {
+                    "_hermes_guard_error": active_error,
+                }
+            if protected:
+                reserve_error = _kanban_db.reserve_external_create(
+                    guard_conn,
+                    kanban_task_id,
+                    requested_url,
+                    expected_run_id=expected_run_id,
+                )
+                if reserve_error:
+                    return {"_hermes_guard_error": reserve_error}
+            result = action()
+            success, final_url, failure = result_details(result)
+            if protected:
+                if (
+                    success
+                    and _kanban_db.external_platform_for_url(final_url)
+                ):
+                    bind_error = _bind_external_create_page(
+                        browser_task_id,
+                        guard_conn,
+                        require_protected=True,
+                    )
+                    if bind_error:
+                        _kanban_db.release_external_create_reservation(
+                            guard_conn,
+                            kanban_task_id,
+                            requested_url,
+                            expected_run_id=expected_run_id,
+                            reason=bind_error,
+                        )
+                        return {"_hermes_guard_error": bind_error}
+                else:
+                    redirect_error = (
+                        "External create navigation failed closed: browser "
+                        f"did not remain on the protected create route "
+                        f"(final_url={final_url or 'unknown'})."
+                    )
+                    _kanban_db.release_external_create_reservation(
+                        guard_conn,
+                        kanban_task_id,
+                        requested_url,
+                        expected_run_id=expected_run_id,
+                        reason=failure or redirect_error,
+                    )
+                    if success:
+                        return {"_hermes_guard_error": redirect_error}
+            return result
+
+
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -2656,6 +2905,17 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "error": "Blocked: URL contains what appears to be an API key or token. "
                      "Secrets must not be sent in URLs.",
         })
+
+    # Grace Loop external-create idempotency. Reservation is performed
+    # immediately around the actual browser navigation below so stale workers
+    # cannot act between reservation and page binding.
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    protected_create_requested = False
+    if kanban_task_id:
+        from hermes_cli import kanban_db as _kanban_db
+        protected_create_requested = bool(
+            _kanban_db.external_platform_for_url(url)
+        )
 
     # SSRF protection — block private/internal addresses before navigating.
     # Skipped for local backends (Camofox, headless Chromium without a cloud
@@ -2704,7 +2964,37 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # Camofox backend — delegate after safety checks pass
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_navigate
-        return camofox_navigate(url, task_id)
+        try:
+            navigation_result = _run_guarded_browser_navigation(
+                url,
+                task_id or "default",
+                lambda: camofox_navigate(url, task_id),
+                lambda raw: (
+                    bool((json.loads(raw) if isinstance(raw, str) else raw).get("success")),
+                    str((json.loads(raw) if isinstance(raw, str) else raw).get("url") or url),
+                    str((json.loads(raw) if isinstance(raw, str) else raw).get("error") or ""),
+                ),
+            )
+        except Exception as exc:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "External create navigation failed closed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }, ensure_ascii=False)
+        if isinstance(navigation_result, dict) and navigation_result.get(
+            "_hermes_guard_error"
+        ):
+            return json.dumps({
+                "success": False,
+                "error": navigation_result["_hermes_guard_error"],
+            }, ensure_ascii=False)
+        try:
+            navigation_payload = json.loads(navigation_result)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return navigation_result
+        return navigation_result
 
     if auto_local_this_nav:
         logger.info(
@@ -2725,12 +3015,35 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
 
-    result = _run_browser_command(
-        nav_session_key,
-        "open",
-        [url],
-        timeout=_get_open_command_timeout(first_open=is_first_nav),
-    )
+    try:
+        result = _run_guarded_browser_navigation(
+            url,
+            nav_session_key,
+            lambda: _run_browser_command(
+                nav_session_key,
+                "open",
+                [url],
+                timeout=_get_open_command_timeout(first_open=is_first_nav),
+            ),
+            lambda raw: (
+                bool(raw.get("success")),
+                str(raw.get("data", {}).get("url") or url),
+                str(raw.get("error") or ""),
+            ),
+        )
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "External create navigation failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }, ensure_ascii=False)
+    if result.get("_hermes_guard_error"):
+        return json.dumps({
+            "success": False,
+            "error": result["_hermes_guard_error"],
+        }, ensure_ascii=False)
 
     # Remember which session served this nav so snapshot/click/fill/...
     # on the same task_id hit it (critical when hybrid routing has both a
@@ -2948,17 +3261,33 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with click result
     """
+    effective_task_id = (
+        task_id or "default"
+        if _is_camofox_mode()
+        else _last_session_key(task_id or "default")
+    )
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_click
-        return camofox_click(ref, task_id)
-
-    effective_task_id = _last_session_key(task_id or "default")
+        return _run_guarded_external_browser_action(
+            effective_task_id,
+            lambda _identity: camofox_click(ref, task_id),
+        )
 
     # Ensure ref starts with @
     if not ref.startswith("@"):
         ref = f"@{ref}"
 
-    result = _run_browser_command(effective_task_id, "click", [ref])
+    guarded_result = _run_guarded_external_browser_action(
+        effective_task_id,
+        lambda _identity: json.dumps(
+            _run_browser_command(effective_task_id, "click", [ref]),
+            ensure_ascii=False,
+        ),
+    )
+    try:
+        result = json.loads(guarded_result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return guarded_result
 
     if result.get("success"):
         response = {
@@ -2986,18 +3315,34 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with type result
     """
+    effective_task_id = (
+        task_id or "default"
+        if _is_camofox_mode()
+        else _last_session_key(task_id or "default")
+    )
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
-        return camofox_type(ref, text, task_id)
-
-    effective_task_id = _last_session_key(task_id or "default")
+        return _run_guarded_external_browser_action(
+            effective_task_id,
+            lambda _identity: camofox_type(ref, text, task_id),
+        )
 
     # Ensure ref starts with @
     if not ref.startswith("@"):
         ref = f"@{ref}"
 
     # Use fill command (clears then types)
-    result = _run_browser_command(effective_task_id, "fill", [ref, text])
+    guarded_result = _run_guarded_external_browser_action(
+        effective_task_id,
+        lambda _identity: json.dumps(
+            _run_browser_command(effective_task_id, "fill", [ref, text]),
+            ensure_ascii=False,
+        ),
+    )
+    try:
+        result = json.loads(guarded_result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return guarded_result
 
     from agent.display import (
         redact_browser_typed_text_for_display,
@@ -3121,12 +3466,28 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with key press result
     """
+    effective_task_id = (
+        task_id or "default"
+        if _is_camofox_mode()
+        else _last_session_key(task_id or "default")
+    )
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
-        return camofox_press(key, task_id)
-
-    effective_task_id = _last_session_key(task_id or "default")
-    result = _run_browser_command(effective_task_id, "press", [key])
+        return _run_guarded_external_browser_action(
+            effective_task_id,
+            lambda _identity: camofox_press(key, task_id),
+        )
+    guarded_result = _run_guarded_external_browser_action(
+        effective_task_id,
+        lambda _identity: json.dumps(
+            _run_browser_command(effective_task_id, "press", [key]),
+            ensure_ascii=False,
+        ),
+    )
+    try:
+        result = json.loads(guarded_result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return guarded_result
 
     if result.get("success"):
         response = {
@@ -3162,7 +3523,27 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     """
     # --- JS evaluation mode ---
     if expression is not None:
-        return _browser_eval(expression, task_id)
+        effective_task_id = _last_session_key(task_id or "default")
+
+        def guarded_eval(page_identity: Optional[str]) -> str:
+            if not page_identity:
+                return _browser_eval(expression, task_id)
+            wrapped = (
+                "(() => {"
+                f"const expected={json.dumps(page_identity)};"
+                "const actual=`${location.href}|${performance.timeOrigin}`;"
+                "if(actual!==expected){throw new Error("
+                "'Protected page load changed before atomic evaluation');}"
+                f"return (0,eval)({json.dumps(expression)});"
+                "})()"
+            )
+            return _browser_eval(wrapped, task_id)
+
+        return _run_guarded_external_browser_action(
+            effective_task_id,
+            guarded_eval,
+            atomic_page_check=True,
+        )
 
     # --- Console output mode (original behaviour) ---
     if _is_camofox_mode():

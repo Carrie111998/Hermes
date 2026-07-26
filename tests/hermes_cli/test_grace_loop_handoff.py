@@ -198,14 +198,17 @@ def test_rejected_grace_review_reopens_execution_for_correction(tmp_path):
 
         assert execution.status == "ready"
         assert execution.completed_at is None
-        assert execution.result is None
+        assert execution.result == "stale result"
         assert review.status == "todo"
         assert review.block_kind == "dependency"
         assert correction_comment["author"] == "Grace review"
         assert "Scheduled distribution job is still enabled" in correction_comment["body"]
+        assert "CORRECTION_MODE: reconciliation_first" in correction_comment["body"]
+        assert "kanban_external_effect" in correction_comment["body"]
         assert "4a6d50ce6d18" not in correction_comment["body"]
         assert correction_event is not None
         assert review_id in correction_event["payload"]
+        assert "reconciliation_first" in correction_event["payload"]
         assert kb.check_respawn_guard(conn, execution_id) is None
 
         # A dispatcher promotion pass must not immediately re-run the review:
@@ -220,3 +223,226 @@ def test_rejected_grace_review_reopens_execution_for_correction(tmp_path):
         )
         assert kb.get_task(conn, review_id).status == "ready"
         assert kb.check_respawn_guard(conn, execution_id) == "recent_success"
+
+
+def test_grace_review_context_includes_cumulative_parent_evidence(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _grace_loop_pair(conn)
+        first = kb.claim_task(conn, execution_id)
+        assert first is not None
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="Shopee still pending",
+            kind="needs_input",
+            expected_run_id=first.current_run_id,
+        )
+        kb.add_comment(
+            conn,
+            execution_id,
+            author="clawops-browser",
+            body=(
+                "Facebook draft verified: title, AI disclosure, three images, "
+                "and unpublished state were read back."
+            ),
+        )
+        # The durable Facebook evidence must survive beyond the ordinary
+        # worker-context comment tail.
+        for index in range(kb._CTX_MAX_COMMENTS + 5):
+            kb.add_comment(
+                conn,
+                execution_id,
+                author="worker",
+                body=f"later diagnostic note {index}",
+            )
+        assert kb.unblock_task(conn, execution_id)
+        second = kb.claim_task(conn, execution_id)
+        assert second is not None
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="Shopee product 50614873414 verified as unlisted.",
+            metadata={
+                "external_effects": [{
+                    "platform": "shopee",
+                    "state": "verified",
+                    "external_id": "50614873414",
+                    "details": {"published": False},
+                }],
+            },
+            expected_run_id=second.current_run_id,
+        )
+
+        context = kb.build_worker_context(conn, review_id)
+
+    assert "Cumulative evidence" in context
+    assert "Facebook draft verified" in context
+    assert "Shopee product 50614873414 verified as unlisted" in context
+    assert "external effect ledger" in context
+    assert '"external_id": "50614873414"' in context
+
+
+def test_external_create_guard_requires_reconciliation_on_correction(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, review_id = _grace_loop_pair(conn)
+        initial = kb.claim_task(conn, execution_id)
+        assert initial is not None
+        assert kb.complete_task(
+            conn,
+            execution_id,
+            summary="partial result",
+            expected_run_id=initial.current_run_id,
+        )
+        review = kb.claim_task(conn, review_id)
+        assert review is not None
+        assert kb.block_task(
+            conn,
+            review_id,
+            reason="Reconcile Facebook evidence",
+            kind="dependency",
+            expected_run_id=review.current_run_id,
+        )
+        correction = kb.claim_task(conn, execution_id)
+        assert correction is not None
+
+        create_url = "https://www.facebook.com/marketplace/create/item"
+        denied = kb.reserve_external_create(
+            conn,
+            execution_id,
+            create_url,
+            expected_run_id=correction.current_run_id,
+        )
+        assert denied is not None
+        assert "read-only lookup first" in denied
+
+        effect = kb.record_external_effect(
+            conn,
+            execution_id,
+            platform="facebook",
+            state="absent_verified",
+            details={"query": "Kolin KD-291M06", "matches": 0},
+            expected_run_id=correction.current_run_id,
+        )
+        assert effect["state"] == "absent_verified"
+        assert kb.reserve_external_create(
+            conn,
+            execution_id,
+            create_url,
+            expected_run_id=correction.current_run_id,
+        ) is None
+        with pytest.raises(ValueError, match="after durable create_started"):
+            kb.record_external_effect(
+                conn,
+                execution_id,
+                platform="facebook",
+                state="absent_verified",
+                expected_run_id=correction.current_run_id,
+            )
+        repeated = kb.reserve_external_create(
+            conn,
+            execution_id,
+            create_url,
+            expected_run_id=correction.current_run_id,
+        )
+        assert repeated is not None
+        assert "already create_started" in repeated
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="worker ended before creating an object",
+            kind="needs_input",
+            expected_run_id=correction.current_run_id,
+        )
+        assert kb.unblock_task(conn, execution_id)
+        later_correction = kb.claim_task(conn, execution_id)
+        assert later_correction is not None
+        recovered = kb.record_external_effect(
+            conn,
+            execution_id,
+            platform="facebook",
+            state="absent_verified",
+            expected_run_id=later_correction.current_run_id,
+        )
+        assert recovered["state"] == "absent_verified"
+        assert recovered["run_id"] == later_correction.current_run_id
+
+
+def test_terminal_external_effect_blocks_duplicate_create(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, _ = _grace_loop_pair(conn)
+        run = kb.claim_task(conn, execution_id)
+        assert run is not None
+        kb.record_external_effect(
+            conn,
+            execution_id,
+            platform="shopee",
+            state="verified",
+            external_id="50614873414",
+            expected_run_id=run.current_run_id,
+        )
+
+        denied = kb.reserve_external_create(
+            conn,
+            execution_id,
+            "https://seller.shopee.tw/portal/product/new",
+            expected_run_id=run.current_run_id,
+        )
+
+    assert denied is not None
+    assert "external_id=50614873414" in denied
+
+
+def test_external_create_guard_rejects_stale_worker_run(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        execution_id, _ = _grace_loop_pair(conn)
+        stale_run = kb.claim_task(conn, execution_id)
+        assert stale_run is not None
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="retry",
+            kind="needs_input",
+            expected_run_id=stale_run.current_run_id,
+        )
+        assert kb.unblock_task(conn, execution_id)
+        active_run = kb.claim_task(conn, execution_id)
+        assert active_run is not None
+
+        denied = kb.reserve_external_create(
+            conn,
+            execution_id,
+            "https://www.facebook.com/marketplace/create/item",
+            expected_run_id=stale_run.current_run_id,
+        )
+
+    assert denied is not None
+    assert "not the active worker run" in denied
+
+
+def test_external_create_url_requires_canonical_host():
+    assert (
+        kb.external_platform_for_url(
+            "https://m.facebook.com/marketplace/create/item"
+        )
+        == "facebook"
+    )
+    assert (
+        kb.external_platform_for_url(
+            "https://seller.shopee.tw/portal/product/new"
+        )
+        == "shopee"
+    )
+    assert (
+        kb.external_platform_for_url(
+            "https://seller.shopee.tw.evil.example/portal/product/new"
+        )
+        is None
+    )

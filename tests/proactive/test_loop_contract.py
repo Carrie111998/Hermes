@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from proactive.loop_contract import LoopContractError, validate_loop_contract
-from proactive.grace_task_compiler import render_execution_body
+from proactive.grace_task_compiler import render_execution_body, render_review_body
 
 
 def _contract():
@@ -102,3 +102,15 @@ def test_execution_body_makes_scoped_effective_limit_authoritative():
     assert "Scoped authorization decision (authoritative)" in body
     assert "effective_risk_level_limit=high" in body
     assert "does not override the scoped effective limit" in body
+
+
+def test_grace_bodies_require_durable_external_effect_handoff():
+    contract = _contract()
+
+    execution = render_execution_body(contract)
+    review = render_review_body(contract, "t_execution")
+
+    assert "kanban_external_effect" in execution
+    assert "metadata.external_effects" in execution
+    assert "all cumulative evidence" in review
+    assert "external-effect ledger" in review

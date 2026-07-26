@@ -34,6 +34,10 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "Do not search unrelated chats, topics, projects, or global history for intent.",
             "Use working memory only inside the declared namespace.",
             "Before completion, provide every required verification item and evidence.",
+            "For each external draft/object you find or create, call kanban_external_effect "
+            "immediately after readback. Also include the same records in "
+            "kanban_complete metadata.external_effects using platform, state, external_id "
+            "(when available), and details. This durable ledger is the create-idempotency gate.",
             "When every deliverable and verification item is complete, call kanban_complete "
             "even if Grace or KJ must still review or approve a later public/external action. "
             "Record those downstream gates in metadata.approval_needed; they are not execution blockers.",
@@ -58,7 +62,10 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "GRACE_LOOP_CONTRACT_STAGE: grace_review",
             f"Review parent execution task: {execution_task_id}",
             "You are Grace's final acceptance gate, running on Grace's primary model.",
-            "Compare the parent result and evidence against every contract criterion.",
+            "Compare the parent result and all cumulative evidence against every contract "
+            "criterion. Evidence from earlier runs, parent comments, and the external-effect "
+            "ledger remains valid until contradicted by a newer readback; never infer absence "
+            "from a correction run merely saying it did not touch that platform.",
             "If accepted, complete with metadata review_outcome=accepted and list verified evidence.",
             "If rejected but safely correctable, do not call kanban_complete. Call kanban_block with "
             "kind=dependency and a precise correction contract that preserves the same project, scope, "
