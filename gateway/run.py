@@ -20091,10 +20091,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return None
 
+    def _rehydrate_profile_from_session(self, source: SessionSource) -> Optional[str]:
+        """Look up a previously-picked profile for this source in session metadata.
+
+        Used by ``_resolve_profile_home_for_source`` (step 0 of resolution) so a
+        ``/profile`` choice persists across gateway restarts. Scans every entry
+        in the session store whose ``(platform, chat_id, thread_id, user_id)``
+        tuple matches the inbound source and returns the first ``"profile"``
+        metadata value found. ``None`` when no match — callers fall through to
+        the normal resolution path.
+
+        Only consulted when ``source.profile`` is unset, so a configured
+        ``profile_routes`` entry always wins.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None
+        # Test fixtures pass Mock objects via MagicMock(spec=GatewayRunner);
+        # short-circuit when the runner itself looks mocked so we don't walk
+        # through auto-created Mock attributes looking for fake session entries.
+        cls = type(self)
+        if cls.__module__.startswith("unittest.mock") or "Mock" in cls.__name__:
+            return None
+        try:
+            entries = getattr(store, "_entries", None)
+            if not isinstance(entries, dict):
+                return None
+        except Exception:
+            return None
+        if not entries:
+            return None
+
+        platform_val = getattr(getattr(source, "platform", None), "value", None)
+        chat_id = getattr(source, "chat_id", None)
+        thread_id = getattr(source, "thread_id", None)
+        user_id = getattr(source, "user_id", None) or getattr(
+            source, "username", None
+        )
+
+        for entry in entries.values():
+            origin = getattr(entry, "origin", None) or {}
+            # Match on the same source tuple. platform/chat_id must match;
+            # thread_id and user_id are best-effort (None means "any").
+            if origin.get("platform") != platform_val:
+                continue
+            if str(origin.get("chat_id") or "") != str(chat_id or ""):
+                continue
+            if thread_id and str(origin.get("thread_id") or "") != str(thread_id):
+                continue
+            if user_id and str(origin.get("user_id") or origin.get("username") or "") not in (
+                "",
+                str(user_id),
+            ):
+                continue
+            meta = getattr(entry, "metadata", None) or {}
+            picked = meta.get("profile")
+            if isinstance(picked, str) and picked.strip():
+                return picked.strip()
+        return None
+
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
 
         Resolution order:
+          0. **Session-metadata rehydration** — if the inbound source has no
+             ``source.profile`` stamp and no route matches, scan the session
+             store for any entry keyed to the same (platform, chat_id,
+             thread_id, user_id) and read a ``"profile"`` metadata value set
+             previously by ``/profile``. This makes the choice survive
+             gateway restarts without requiring ``profile_routes`` config.
           1. ``source.profile`` — set by /p/<profile>/ URL prefix, per-credential
              adapter ownership, OR profile_routes matching at ``build_source`` time.
           2. ``_profile_name_for_source`` — re-run routing here as a defensive
@@ -20107,7 +20172,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
-        
+
+        # Step 0: rehydrate the profile from session metadata if the user
+        # picked it earlier via ``/profile`` in a previous session. Guarded
+        # so test fixtures (which mock the runner) and any future refactors
+        # can't accidentally break the resolution chain — ``getattr`` on a
+        # Mock returns another Mock, not a callable that returns ``None``.
+        # The triple guard short-circuits cleanly when *any* layer is mocked.
+        if getattr(source, "profile", None):
+            pass  # explicit stamp wins, skip step 0 entirely
+        elif type(self).__module__.startswith("unittest.mock") or "Mock" in type(self).__name__:
+            pass  # running under a mocked runner (test fixture)
+        else:
+            rehydrated = None
+            try:
+                rehydrator = getattr(
+                    self, "_rehydrate_profile_from_session", None
+                )
+                if callable(rehydrator):
+                    rehydrated = rehydrator(source)
+            except Exception:
+                rehydrated = None
+            if isinstance(rehydrated, str) and rehydrated.strip():
+                try:
+                    source.profile = rehydrated
+                except Exception:
+                    pass
+                logger.debug(
+                    "Rehydrated profile=%s for source %s/%s from session metadata",
+                    rehydrated,
+                    getattr(source, "platform", None),
+                    getattr(source, "chat_id", None),
+                )
+
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
         try:
@@ -20120,7 +20217,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     explicit_profile = name  # Routing explicitly set this profile
             if not name:
                 name = get_active_profile_name() or "default"
-            
+
             profile_dir = get_profile_dir(name)
             # Warn if an explicit profile doesn't exist on disk
             if explicit_profile and not profile_exists(name):

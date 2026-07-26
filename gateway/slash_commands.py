@@ -314,34 +314,40 @@ class GatewaySlashCommandsMixin:
         return EphemeralReply(f"{header}{_tip_line}")
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show the profile serving this source and its home.
+        """Handle /profile — list profiles and (when multiplexed) offer switching.
 
-        On a multiplexed gateway the process-level active profile is always
-        the multiplexer's own (usually ``default``), so reporting it would
-        answer "default" in every chat regardless of which profile actually
-        serves the room/channel (``source.profile`` — stamped by the
-        ``/p/<profile>/`` URL prefix, a per-credential adapter, or a room→
-        profile map). When ``multiplex_profiles`` is on, report the stamped
-        profile and, like the scoped /reset banner (#59003), resolve the
-        displayed home under that profile's runtime scope. When multiplexing
-        is off (the default) the stamp is ignored — mirroring the gating in
-        ``_run_agent`` and ``_reset_notice_session_info`` — and the command
-        reports the active profile and default home, byte-identical to before.
+        Three modes:
+
+        * **Multiplex ON + interactive adapter** (Telegram/Discord/etc.):
+          render an inline-keyboard picker via ``send_profile_picker`` and
+          retarget ``event.source.profile`` on tap. Persists for the lifetime
+          of the current session (the multiplex re-resolves the source profile
+          on each inbound event). For cross-session persistence, users should
+          edit ``gateway.profile_routes`` in ``config.yaml`` — out of scope for
+          this command.
+        * **Multiplex ON, non-interactive platform** (CLI, etc.): fall back to
+          a plain text list of available profiles with the current one marked.
+        * **Multiplex OFF**: report the active profile + home — same as the
+          pre-multiplex behavior. Switching requires a gateway restart with a
+          different ``HERMES_HOME`` / wrapper script.
         """
         from hermes_constants import display_hermes_home
-        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.profiles import get_active_profile_name, list_profiles
 
         multiplexed = getattr(
             getattr(self, "config", None), "multiplex_profiles", False
         )
         source = getattr(event, "source", None)
 
+        # Resolve the profile that's actually serving this source.
         profile_name = ""
-        if multiplexed:
+        if multiplexed and source is not None:
             profile_name = (getattr(source, "profile", "") or "").strip()
-        profile_name = profile_name or get_active_profile_name()
+        profile_name = profile_name or get_active_profile_name() or "default"
 
-        if multiplexed:
+        # Resolve the home under the right runtime scope so the display
+        # reflects where this chat is actually being served from.
+        if multiplexed and source is not None:
             try:
                 from gateway.run import _profile_runtime_scope
 
@@ -353,12 +359,136 @@ class GatewaySlashCommandsMixin:
         else:
             display = display_hermes_home()
 
-        lines = [
-            t("gateway.profile.header", profile=profile_name),
-            t("gateway.profile.home", home=display),
-        ]
+        # Try the interactive picker first — Telegram, Discord, etc.
+        if multiplexed:
+            adapter = None
+            try:
+                from gateway.platform_registry import platform_registry
+                if source is not None:
+                    entry = platform_registry.get(getattr(source.platform, "value", ""))
+                    adapter = getattr(entry, "adapter", None) if entry else None
+            except Exception:
+                adapter = None
 
-        return "\n".join(lines)
+            send_picker = getattr(adapter, "send_profile_picker", None) if adapter else None
+            if send_picker is not None and source is not None:
+                try:
+                    all_profiles = list_profiles()
+                except Exception as exc:
+                    logger.warning("list_profiles() failed in /profile: %s", exc)
+                    all_profiles = []
+
+                picker_choices = [
+                    {
+                        "value": p.name,
+                        "label": p.name,
+                        "is_current": (p.name == profile_name),
+                    }
+                    for p in all_profiles
+                ]
+
+                if picker_choices:
+                    session_key = getattr(event, "session_key", None) or (
+                        getattr(source, "platform", None).value
+                        + ":"
+                        + str(getattr(source, "chat_id", ""))
+                        if source is not None
+                        else ""
+                    )
+
+                    async def _on_profile_selected(
+                        _chat_id: str, picked: str
+                    ) -> str:
+                        # Retarget the source profile for the current session.
+                        # The multiplex re-resolves on every inbound event, so
+                        # this sticks for as long as the user keeps chatting
+                        # in this room. Persist via session metadata so the
+                        # choice survives gateway restarts and is rehydrated
+                        # by ``_profile_name_for_source`` on the next event.
+                        if source is not None:
+                            try:
+                                setattr(source, "profile", picked)
+                            except Exception:
+                                pass
+                        # Persist on the session store so the next inbound
+                        # event (after a restart or after the source object is
+                        # rebuilt) rehydrates the same profile.
+                        persist_key = (
+                            session_key
+                            or (
+                                getattr(source, "platform", None).value
+                                + ":"
+                                + str(getattr(source, "chat_id", ""))
+                                if source is not None
+                                else ""
+                            )
+                        )
+                        persisted = False
+                        if persist_key:
+                            try:
+                                store = getattr(self, "session_store", None)
+                                if store is not None:
+                                    persisted = store.set_session_metadata(
+                                        persist_key, "profile", picked
+                                    )
+                            except Exception as exc:
+                                logger.warning(
+                                    "set_session_metadata(profile) failed: %s",
+                                    exc,
+                                )
+                        persistence_note = (
+                            "Persisted across restarts via session metadata."
+                            if persisted
+                            else "Persistence skipped (no session key); "
+                            "switch retargets this chat only."
+                        )
+                        return (
+                            f"✅ Switched to profile `{picked}`.\n\n"
+                            f"{persistence_note}"
+                        )
+
+                    try:
+                        metadata = self._thread_metadata_for_source(
+                            source, self._reply_anchor_for_event(event)
+                        )
+                        result = await send_picker(
+                            chat_id=str(source.chat_id),
+                            profiles=picker_choices,
+                            current_profile=profile_name,
+                            session_key=session_key,
+                            on_profile_selected=_on_profile_selected,
+                            metadata=metadata,
+                        )
+                        if getattr(result, "success", False):
+                            return None  # Picker handles the reply
+                    except Exception as exc:
+                        logger.warning(
+                            "send_profile_picker failed in /profile: %s", exc
+                        )
+                        # Fall through to the text list below.
+
+        # Fallback: text report (single-profile, non-interactive, or picker
+        # failure). Multiplex users see their current profile + a hint that
+        # switching requires editing ``gateway.profile_routes``.
+        if multiplexed:
+            try:
+                all_profiles = list_profiles()
+            except Exception:
+                all_profiles = []
+            names = ", ".join(p.name for p in all_profiles) or "(none)"
+            return (
+                f"{t('gateway.profile.header', profile=profile_name)}\n"
+                f"{t('gateway.profile.home', home=display)}\n\n"
+                f"Available profiles: {names}\n"
+                f"_Switch by editing `gateway.profile_routes` in config.yaml._"
+            )
+
+        return "\n".join(
+            [
+                t("gateway.profile.header", profile=profile_name),
+                t("gateway.profile.home", home=display),
+            ]
+        )
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.

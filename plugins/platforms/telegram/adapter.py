@@ -813,6 +813,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
+        # Interactive profile picker state per chat (multiplex gateways)
+        self._profile_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -5519,6 +5521,83 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_model_picker failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_profile_picker(
+        self,
+        chat_id: str,
+        profiles: list,
+        current_profile: str,
+        session_key: str,
+        on_profile_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an inline-keyboard profile picker.
+
+        One tap = one profile. ``profiles`` is a list of dicts shaped like
+        ``send_choice_picker`` (``{"value", "label", "is_current"}``). Used by
+        the ``/profile`` slash command in multiplexed gateways so the user can
+        retarget their chat at a different ``HERMES_HOME`` without restarting
+        the bot. Profile switches propagate via ``source.profile`` and resolve
+        through the multiplexer's ``_profile_runtime_scope``.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            if not profiles:
+                return SendResult(success=False, error="No profiles available")
+
+            buttons = []
+            for i, prof in enumerate(profiles):
+                label = str(prof.get("label") or prof.get("value") or "")
+                if prof.get("is_current"):
+                    label = f"✓ {label}"
+                buttons.append(
+                    InlineKeyboardButton(label, callback_data=f"pp:{i}")
+                )
+            # One button per row — profile names should be easy to read on mobile.
+            keyboard = InlineKeyboardMarkup([[b] for b in buttons])
+
+            text = self.format_message(
+                (
+                    f"👤 *Profile*\n\n"
+                    f"Current profile: `{current_profile or 'unknown'}`\n\n"
+                    f"Select a profile to switch this chat to. "
+                    f"Skills, memory, and SOUL change to match."
+                )
+            )
+
+            thread_id = metadata.get("thread_id") if metadata else None
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode
+                ),
+                **self._link_preview_kwargs(),
+            )
+
+            # Store state so the callback can resolve the picked index back to a profile name.
+            self._profile_picker_state[str(chat_id)] = {
+                "profiles": profiles,
+                "current_profile": current_profile,
+                "session_key": session_key,
+                "on_profile_selected": on_profile_selected,
+                "msg_id": msg.message_id,
+            }
+
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_profile_picker failed: %s", self.name, _redact_telegram_error_text(e))
+            return SendResult(success=False, error=_redact_telegram_error_text(e))
+
     _PROVIDER_PAGE_SIZE = 10
 
     async def send_choice_picker(
@@ -5641,6 +5720,75 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
         await query.answer()
         self._choice_picker_state.pop(chat_id, None)
+
+    async def _handle_profile_picker_callback(
+        self, query, data: str, chat_id: str
+    ) -> None:
+        """Handle profile picker button taps (pp:<index>).
+
+        Resolves the chosen index back to the profile name from the picker
+        state, invokes ``on_profile_selected`` (the slash command will retarget
+        ``source.profile`` on the session), and edits the picker message to
+        show the result.
+        """
+        state = self._profile_picker_state.get(chat_id)
+        if not state:
+            await query.answer(text="Picker expired — run /profile again.")
+            return
+
+        # Authorization gate — same as the choice picker. Profile switches
+        # change session context, so an unauthorized tap on a stale picker
+        # message must NOT be allowed to flip state in shared chats.
+        query_message = getattr(query, "message", None)
+        query_chat = getattr(query_message, "chat", None)
+        if not self._is_callback_user_authorized(
+            str(getattr(query.from_user, "id", "")),
+            chat_id=getattr(query_message, "chat_id", None),
+            chat_type=str(getattr(query_chat, "type", None)) if getattr(query_chat, "type", None) is not None else None,
+            thread_id=str(getattr(query_message, "message_thread_id", None)) if getattr(query_message, "message_thread_id", None) is not None else None,
+            user_name=getattr(query.from_user, "first_name", None),
+        ):
+            await query.answer(text="⛔ You are not authorized to switch profiles.")
+            return
+
+        try:
+            idx = int(data[3:])
+            profile = state["profiles"][idx]
+        except (ValueError, IndexError):
+            await query.answer(text="Invalid selection.")
+            return
+
+        profile_name = str(profile.get("value") or "")
+        if not profile_name:
+            await query.answer(text="Empty profile name.")
+            return
+
+        callback = state.get("on_profile_selected")
+        if not callback:
+            await query.answer(text="Picker expired.")
+            return
+
+        try:
+            result_text = await callback(chat_id, profile_name)
+        except Exception as exc:
+            logger.error("Profile picker selection failed: %s", exc)
+            result_text = f"Error switching profile: {exc}"
+
+        try:
+            await query.edit_message_text(
+                text=self.format_message(result_text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    text=result_text, parse_mode=None, reply_markup=None,
+                )
+            except Exception:
+                pass
+        await query.answer()
+        self._profile_picker_state.pop(chat_id, None)
 
     _MODEL_PAGE_SIZE = 8
 
@@ -6143,6 +6291,13 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_choice_picker_callback(query, data, chat_id)
+            return
+
+        # --- Profile picker callbacks (/profile, multiplexed gateways) ---
+        if data.startswith("pp:"):
+            chat_id = str(query.message.chat_id) if query.message else None
+            if chat_id:
+                await self._handle_profile_picker_callback(query, data, chat_id)
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---
