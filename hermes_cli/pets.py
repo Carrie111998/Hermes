@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import contextmanager
 
 
 def _print(msg: str = "") -> None:
@@ -25,6 +26,9 @@ def _err(msg: str) -> None:
 def _cmd_list(args) -> int:
     """List gallery pets (or only installed ones with ``--installed``)."""
     from agent.pet import store
+
+    if getattr(args, "profiles", False):
+        return _cmd_list_profiles()
 
     if getattr(args, "installed", False):
         pets = store.installed_pets()
@@ -122,8 +126,55 @@ def _cmd_select(args) -> int:
 
 
 def _cmd_off(args) -> int:
+    if getattr(args, "all", False):
+        return _cmd_off_all()
+
     _set_enabled(False)
     _print("✓ pet disabled (display.pet.enabled=false)")
+    return 0
+
+
+def _cmd_off_all() -> int:
+    """Disable the pet for EVERY profile (``pets off --all``).
+
+    Iterates the profiles catalog and binds each profile's HERMES_HOME the same
+    way the gateway's ``@_profile_scoped`` decorator does, then sets
+    ``display.pet.enabled=false``. Idempotent. An unreadable profile is skipped
+    with a warning rather than aborting the whole run; a per-profile result line
+    is printed either way.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    for info in profiles_mod.list_profiles():
+        try:
+            with _bound_profile_home(info.path):
+                _set_enabled(False)
+            _print(f"  ✓ {info.name}: pet disabled (display.pet.enabled=false)")
+        except Exception as exc:  # noqa: BLE001 - best-effort per profile
+            _err(f"  ⚠ {info.name}: skipped ({exc})")
+
+    _print("Note: a running desktop picks this up on its next pet poll, not instantly.")
+    return 0
+
+
+def _cmd_list_profiles() -> int:
+    """Per-profile pet status (``pets list --profiles``)."""
+    from hermes_cli import profiles as profiles_mod
+
+    _print("Per-profile pet status:")
+
+    for info in profiles_mod.list_profiles():
+        try:
+            with _bound_profile_home(info.path):
+                cfg = _pet_config()
+            enabled = bool(cfg.get("enabled"))
+            slug = str(cfg.get("slug", "") or "")
+            mark = "✓" if enabled else " "
+            _print(f"  {mark} {info.name:<24} enabled={str(enabled):<5} slug={slug or '(unset)'}")
+        except Exception as exc:  # noqa: BLE001 - best-effort per profile
+            _err(f"  ⚠ {info.name:<24} unreadable ({exc})")
+
+    _print("Note: a running desktop picks up CLI changes on its next pet poll, not instantly.")
     return 0
 
 
@@ -282,13 +333,59 @@ def _cmd_doctor(args) -> int:
         _print("  ✗ Pillow not importable — sprite decoding will be unavailable")
         ok = False
 
+    _print("  profiles:")
+    for line in _profile_pet_summary_lines():
+        _print(f"    {line}")
+
     _print("  ✓ ready" if ok and enabled else "  (run the suggestions above to finish setup)")
     return 0
+
+
+def _profile_pet_summary_lines() -> list[str]:
+    """One status line per profile (``pets doctor`` multi-profile section).
+
+    Best-effort: an unreadable profile yields a warning line rather than raising,
+    so a single broken profile never aborts the doctor report.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    lines: list[str] = []
+
+    for info in profiles_mod.list_profiles():
+        try:
+            with _bound_profile_home(info.path):
+                cfg = _pet_config()
+            enabled = bool(cfg.get("enabled"))
+            slug = str(cfg.get("slug", "") or "")
+            lines.append(f"{info.name:<24} enabled={str(enabled):<5} slug={slug or '(unset)'}")
+        except Exception as exc:  # noqa: BLE001 - best-effort per profile
+            lines.append(f"{info.name:<24} unreadable ({exc})")
+
+    return lines or ["(no profiles found)"]
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # config helpers
 # ─────────────────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def _bound_profile_home(home):
+    """Bind a profile's HERMES_HOME (context-locally) around a config read/write.
+
+    Mirrors the gateway's ``@_profile_scoped`` decorator: ``load_config`` /
+    ``save_config`` resolve through ``get_hermes_home()``, which honors this
+    override, so the pet helpers below operate on the named profile's
+    ``config.yaml`` rather than the launch profile's.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(home)
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
 
 def _pet_config() -> dict:
     from hermes_cli.config import load_config
@@ -465,6 +562,7 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     p_list = subs.add_parser("list", help="Browse the petdex gallery")
     p_list.add_argument("query", nargs="?", default="", help="Filter by slug/name substring")
     p_list.add_argument("--installed", action="store_true", help="Only show installed pets")
+    p_list.add_argument("--profiles", action="store_true", help="Per-profile pet status")
     p_list.add_argument("--limit", type=int, default=40, help="Max rows (0 = all)")
     p_list.set_defaults(func=_cmd_list)
 
@@ -487,7 +585,9 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     p_show.add_argument("--scale", type=float, default=0, help="Override scale (0 = config)")
     p_show.set_defaults(func=_cmd_show)
 
-    subs.add_parser("off", help="Disable the pet display").set_defaults(func=_cmd_off)
+    p_off = subs.add_parser("off", help="Disable the pet display")
+    p_off.add_argument("--all", action="store_true", help="Disable the pet for every profile")
+    p_off.set_defaults(func=_cmd_off)
 
     p_scale = subs.add_parser("scale", help="Resize the pet everywhere (display.pet.scale)")
     p_scale.add_argument("factor", help="Scale factor, e.g. 0.5 (clamped 0.1–3.0)")
