@@ -115,8 +115,9 @@ def format_duration_compact(*args, **kwargs):
     if hours < 24:
         remaining_min = int(minutes % 60)
         return f"{int(hours)}h {remaining_min}m" if remaining_min else f"{int(hours)}h"
-    days = hours / 24
-    return f"{days:.1f}d"
+    days = int(hours // 24)
+    remaining_hours = int(hours % 24)
+    return f"{days}d {remaining_hours}h" if remaining_hours else f"{days}d"
 
 
 # Cached reverse map of config.yaml ``model_aliases:`` so the TUI can show

@@ -98,10 +98,14 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
 export const fmtDuration = (ms: number) => {
   const t = Math.max(0, Math.floor(ms / 1000))
-  const h = Math.floor(t / 3600)
+  const d = Math.floor(t / 86400)
+  const h = Math.floor((t % 86400) / 3600)
   const m = Math.floor((t % 3600) / 60)
   const s = t % 60
 
+  if (d > 0) {
+    return h > 0 ? `${d}d ${h}h` : `${d}d`
+  }
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`
 }
 

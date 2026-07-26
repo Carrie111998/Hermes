@@ -5,7 +5,7 @@ import React from 'react'
 import { describe, expect, it } from 'vitest'
 
 import { MessageLine } from '../components/messageLine.js'
-import { toTranscriptMessages } from '../domain/messages.js'
+import { fmtDuration, toTranscriptMessages } from '../domain/messages.js'
 import { upsert } from '../lib/messages.js'
 import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
@@ -146,5 +146,43 @@ describe('upsert', () => {
     const prev = [{ role: 'user' as const, text: 'hi' }]
     upsert(prev, 'assistant', 'yo')
     expect(prev).toHaveLength(1)
+  })
+})
+
+describe('fmtDuration', () => {
+  it('formats under a minute as plain seconds', () => {
+    expect(fmtDuration(0)).toBe('0s')
+    expect(fmtDuration(42_000)).toBe('42s')
+    expect(fmtDuration(59_400)).toBe('59s')
+  })
+
+  it('formats whole minutes with trailing seconds', () => {
+    expect(fmtDuration(60_000)).toBe('1m 0s')
+    expect(fmtDuration(180_000)).toBe('3m 0s')
+  })
+
+  it('mixes minutes and seconds', () => {
+    expect(fmtDuration(134_000)).toBe('2m 14s')
+    expect(fmtDuration(605_000)).toBe('10m 5s')
+  })
+
+  it('formats whole hours with trailing minutes', () => {
+    expect(fmtDuration(3_600_000)).toBe('1h 0m')
+    expect(fmtDuration(7_200_000)).toBe('2h 0m')
+  })
+
+  it('mixes hours and minutes', () => {
+    expect(fmtDuration(5_400_000)).toBe('1h 30m')
+    expect(fmtDuration(3_960_000)).toBe('1h 6m')
+  })
+
+  it('formats whole days without trailing hours', () => {
+    expect(fmtDuration(86_400_000)).toBe('1d')
+    expect(fmtDuration(172_800_000)).toBe('2d')
+  })
+
+  it('mixes days and hours', () => {
+    expect(fmtDuration(129_600_000)).toBe('1d 12h') // 1.5 days
+    expect(fmtDuration(97_200_000)).toBe('1d 3h') // 1d 3h
   })
 })
