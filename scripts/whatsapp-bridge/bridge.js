@@ -31,6 +31,7 @@ import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { createInboundWebhook, resolveSenderPhone } from './inbound_webhook.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
@@ -107,6 +108,14 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
+// Deterministic routing for campaign replies: senders on the server-provided
+// numbers list are forwarded to an operator webhook instead of being dropped,
+// and are NEVER enqueued for the agent. See inbound_webhook.js.
+const inboundWebhook = createInboundWebhook({
+  url: process.env.WHATSAPP_INBOUND_WEBHOOK_URL,
+  numbersUrl: process.env.WHATSAPP_INBOUND_WEBHOOK_NUMBERS_URL,
+  secret: process.env.WHATSAPP_INBOUND_WEBHOOK_SECRET,
+});
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
 // when uploading media to WhatsApp servers (and, less often, on text sends),
@@ -360,6 +369,58 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
+function extractEventFrom(msg, { chatId, senderId, senderNumber, botIds, isGroup }) {
+  return extractBridgeEvent({
+    msg,
+    chatId,
+    senderId,
+    senderNumber,
+    botIds,
+    isGroup,
+    downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+    cacheDirs: {
+      image: IMAGE_CACHE_DIR,
+      document: DOCUMENT_CACHE_DIR,
+      audio: AUDIO_CACHE_DIR,
+    },
+  });
+}
+
+/**
+ * Forwards a non-agent sender's message to the inbound webhook when the sender
+ * is on the server's numbers list. Returns true when the message was consumed
+ * (forwarded, empty, or failed-and-logged) — a matched sender must never fall
+ * through to any other handling, so every outcome past the match is terminal.
+ */
+async function routeToInboundWebhook(msg, { chatId, senderId, senderNumber, botIds, isGroup }) {
+  if (!inboundWebhook.enabled || isGroup || chatId.includes('@broadcast') || chatId.includes('status')) {
+    return false;
+  }
+  const phone = resolveSenderPhone(msg, senderId, lidToPhone);
+  if (!(await inboundWebhook.shouldForward(phone))) {
+    return false;
+  }
+  try {
+    const event = await extractEventFrom(msg, { chatId, senderId, senderNumber, botIds, isGroup });
+    if (!event.body && !event.hasMedia) {
+      return true;
+    }
+    await inboundWebhook.forward({
+      from: phone,
+      text: event.body,
+      mediaUrls: event.mediaUrls,
+      mime: event.mime,
+      fileName: event.fileName,
+    });
+    try {
+      console.log(JSON.stringify({ event: 'forwarded', reason: 'inbound_webhook', chatId }));
+    } catch {}
+  } catch (err) {
+    console.warn('[bridge] inbound webhook forward failed:', err?.message || err);
+  }
+  return true;
+}
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -557,6 +618,7 @@ async function startSocket() {
       // to arbitrary incoming messages (#8389).
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
+          if (await routeToInboundWebhook(msg, { chatId, senderId, senderNumber, botIds, isGroup })) continue;
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -568,6 +630,7 @@ async function startSocket() {
           continue;
         }
         if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+          if (await routeToInboundWebhook(msg, { chatId, senderId, senderNumber, botIds, isGroup })) continue;
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -640,20 +703,7 @@ async function startSocket() {
         continue;
       }
 
-      const event = await extractBridgeEvent({
-        msg,
-        chatId,
-        senderId,
-        senderNumber,
-        botIds,
-        isGroup,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
-        cacheDirs: {
-          image: IMAGE_CACHE_DIR,
-          document: DOCUMENT_CACHE_DIR,
-          audio: AUDIO_CACHE_DIR,
-        },
-      });
+      const event = await extractEventFrom(msg, { chatId, senderId, senderNumber, botIds, isGroup });
       event.fromOwner = fromOwner;
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
@@ -993,6 +1043,7 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    inboundWebhook: inboundWebhook.enabled,
   });
 });
 
@@ -1018,6 +1069,10 @@ if (PAIR_ONLY) {
     }
     if (WHATSAPP_MODE === 'bot' && FORWARD_OWNER_MESSAGES) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
+    }
+    if (inboundWebhook.enabled) {
+      inboundWebhook.start();
+      console.log(`📮 Inbound webhook routing enabled — listed campaign senders are forwarded, never agent-processed.`);
     }
     console.log();
     startSocket();
