@@ -8194,8 +8194,17 @@ class TelegramAdapter(BasePlatformAdapter):
         return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
+        # The display name is platform-supplied and user-settable, and this
+        # prefix is followed by a newline inside content the model reads every
+        # turn — an unescaped name can close the bracket and forge a second
+        # "[Name|id]" line (impersonating another member) or open a markdown
+        # section. Neutralize it the way the runner's shared-session prefix and
+        # build_session_context_prompt already do; an ordinary name is left
+        # byte-identical.
+        from gateway.session import neutralize_untrusted_inline_text
+
         user_id = event.source.user_id or "unknown"
-        sender = event.source.user_name or user_id
+        sender = neutralize_untrusted_inline_text(event.source.user_name or user_id)
         return f"[{sender}|{user_id}]\n{event.text or ''}"
 
     def _telegram_group_observe_channel_prompt(self) -> str:

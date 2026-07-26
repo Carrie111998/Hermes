@@ -95,7 +95,7 @@ from gateway.platforms.yuanbao_proto import (
     encode_get_group_member_list,
     next_seq_no,
 )
-from gateway.session import build_session_key
+from gateway.session import build_session_key, neutralize_untrusted_inline_text
 
 logger = logging.getLogger(__name__)
 
@@ -2228,7 +2228,14 @@ class GroupAtGuardMiddleware(InboundMiddleware):
                 )
                 if summary:
                     body_text = f"{text}\n{summary}" if text else summary
-            attributed = f"[{sender_display}|{user_id}]\n{body_text}"
+            # Nickname is user-settable; collapse it to one inert line so it
+            # can't forge a second "[Name|id]" attribution line or a markdown
+            # section in observed history the model reads (same guard as the
+            # runner's shared-session prefix).
+            attributed = (
+                f"[{neutralize_untrusted_inline_text(sender_display)}|{user_id}]"
+                f"\n{body_text}"
+            )
             entry: dict = {
                 "role": "user",
                 "content": attributed,
@@ -2283,7 +2290,12 @@ class GroupAttributionMiddleware(InboundMiddleware):
                 ctx.msg_body, adapter._bot_id,
             )
             user_id_label = ctx.from_account or "unknown"
-            nickname_label = ctx.sender_nickname or ctx.from_account or "unknown"
+            # This prefix replaces the runner's own (neutralized) one below, so
+            # it must apply the same guard: an unescaped nickname could forge a
+            # second attribution line or a markdown section.
+            nickname_label = neutralize_untrusted_inline_text(
+                ctx.sender_nickname or ctx.from_account or "unknown"
+            )
             ctx.raw_text = f"[{nickname_label}|{user_id_label}]\n{ctx.raw_text}"
             # Suppress runner's default ``[user_name]`` shared-thread prefix so
             # the text the model sees matches the observed-history format.
