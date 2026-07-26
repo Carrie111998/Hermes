@@ -466,11 +466,17 @@ class WorkflowEngine:
             print(f"   ⚠  Completion notification failed: {_notify_exc}")
 
     def _find_loop_zones(self, workflow: Workflow, layers: list[list[str]]) -> list[int]:
-        """Return sorted layer indices that contain verify nodes (nodes with revision dependents)."""
+        """Return sorted layer indices that contain verify nodes (nodes with revision dependents)
+        or nodes with reviews (which need a supervisor to dispatch reviewers)."""
         loop_layers: list[int] = []
         for i, layer in enumerate(layers):
             for nid in layer:
+                node = workflow.nodes.get(nid)
                 if self._find_revision_node(workflow, nid) is not None:
+                    loop_layers.append(i)
+                    break
+                # Also detect nodes with reviews attribute
+                if node and node.reviews:
                     loop_layers.append(i)
                     break
         return loop_layers
