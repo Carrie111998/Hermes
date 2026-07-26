@@ -331,6 +331,30 @@ def _get_search_backend() -> str:
     return _get_capability_backend("search")
 
 
+def _get_search_fallback_backends() -> List[str]:
+    """Return the configured, ordered runtime search fallback chain.
+
+    A scalar is accepted as a convenience, while the documented form is a
+    YAML list. Invalid and duplicate entries are ignored. Provider capability
+    and credential checks remain the dispatcher's responsibility because the
+    plugin registry may not be populated when config is read.
+    """
+    configured = _load_web_config().get("search_fallback_backends", [])
+    if isinstance(configured, str):
+        configured = [configured]
+    if not isinstance(configured, list):
+        return []
+
+    result: List[str] = []
+    for item in configured:
+        if not isinstance(item, str):
+            continue
+        name = item.strip().lower()
+        if name and name not in result:
+            result.append(name)
+    return result
+
+
 def _get_extract_backend() -> str:
     """Determine which backend to use for web_extract specifically.
 
@@ -835,6 +859,32 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
+_RETRYABLE_SEARCH_HTTP_RE = re.compile(r"\bHTTP\s+(402|429|5\d\d)\b", re.IGNORECASE)
+_RETRYABLE_SEARCH_TRANSPORT_RE = re.compile(
+    r"\b(timeout|timed out|connection (?:error|failed|refused|reset)|"
+    r"could not reach|temporarily unavailable|network error)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_retryable_web_search_error(response: Dict[str, Any]) -> bool:
+    """Whether a provider failure is safe to retry on another backend."""
+    if response.get("success") is not False:
+        return False
+    if response.get("retryable") is True:
+        return True
+    status = response.get("status_code")
+    if status in (402, 429) or (
+        isinstance(status, int) and 500 <= status <= 599
+    ):
+        return True
+    error = str(response.get("error") or "")
+    return bool(
+        _RETRYABLE_SEARCH_HTTP_RE.search(error)
+        or _RETRYABLE_SEARCH_TRANSPORT_RE.search(error)
+    )
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -979,32 +1029,123 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 slice_search_response as _slice_search_response,
             )
 
+            def _configured_fallback_search(
+                initial_response: dict,
+                fetch_limit: int,
+            ) -> tuple[dict, bool]:
+                """Try explicit providers before the anonymous rescue tier."""
+                response = initial_response
+                primary_name = provider.name
+                current_name = primary_name
+                attempted = [primary_name]
+                considered = {primary_name}
+                while (
+                    not response.get("success")
+                    and _is_retryable_web_search_error(response)
+                ):
+                    fallback = None
+                    for fallback_name in _get_search_fallback_backends():
+                        if fallback_name in considered:
+                            continue
+                        considered.add(fallback_name)
+                        candidate = _wsp_get_provider(fallback_name)
+                        if candidate is None or not candidate.supports_search():
+                            logger.warning(
+                                "Skipping web search fallback %s: provider is not "
+                                "registered or does not support search",
+                                fallback_name,
+                            )
+                            continue
+                        try:
+                            available = bool(candidate.is_available())
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "Skipping web search fallback %s: availability "
+                                "check failed: %s",
+                                fallback_name,
+                                exc,
+                            )
+                            continue
+                        if not available:
+                            logger.warning(
+                                "Skipping web search fallback %s: provider is unavailable",
+                                fallback_name,
+                            )
+                            continue
+                        fallback = candidate
+                        break
+
+                    if fallback is None:
+                        break
+
+                    previous_error = str(response.get("error") or "search failed")
+                    logger.warning(
+                        "Web search via %s failed with a retryable error (%s); "
+                        "falling back to %s",
+                        current_name,
+                        previous_error,
+                        fallback.name,
+                    )
+                    current_name = fallback.name
+                    attempted.append(fallback.name)
+                    try:
+                        response = fallback.search(query, fetch_limit)
+                    except Exception as exc:  # noqa: BLE001
+                        response = {
+                            "success": False,
+                            "error": str(exc),
+                            "retryable": True,
+                        }
+                    if response.get("success"):
+                        response.setdefault("meta", {}).update({
+                            "provider": fallback.name,
+                            "fallback_from": primary_name,
+                        })
+
+                if not response.get("success") and len(attempted) > 1:
+                    response.setdefault("meta", {}).update({
+                        "providers_attempted": attempted,
+                        "fallback_from": primary_name,
+                    })
+                return response, len(attempted) > 1
+
             def _paid_search() -> tuple[dict, bool]:
                 _fetch_limit = _bucket_limit(limit)
                 _rescued = False
+                _used_configured_fallback = False
                 try:
                     _resp = provider.search(query, _fetch_limit)
                 except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                    if _rescue_eligible(provider):
+                    if _get_search_fallback_backends():
+                        _resp = {
+                            "success": False,
+                            "error": str(exc),
+                            "retryable": True,
+                        }
+                    elif _rescue_eligible(provider):
                         _rescued = True
                         _resp = _rescue_search(
                             provider.name, str(exc), query, _fetch_limit
                         )
                     else:
                         raise
-                else:
-                    if not _resp.get("success") and _rescue_eligible(provider):
-                        # One-shot keyless rescue: THIS call rides the
-                        # free-tier ring; the next call attempts the chosen
-                        # backend again.
-                        _rescued = True
-                        _resp = _rescue_search(
-                            provider.name,
-                            str(_resp.get("error", "")),
-                            query,
-                            _fetch_limit,
-                        )
-                return _resp, _rescued
+
+                if not _resp.get("success"):
+                    _resp, _used_configured_fallback = _configured_fallback_search(
+                        _resp,
+                        _fetch_limit,
+                    )
+                if not _resp.get("success") and _rescue_eligible(provider):
+                    # Explicit configured providers have been exhausted. This
+                    # call alone may now use the anonymous free-tier ring.
+                    _rescued = True
+                    _resp = _rescue_search(
+                        provider.name,
+                        str(_resp.get("error", "")),
+                        query,
+                        _fetch_limit,
+                    )
+                return _resp, _rescued or _used_configured_fallback
 
             response_data = _search_memo.lookup(provider.name, query, limit)
             if response_data is None:
