@@ -6940,6 +6940,10 @@ class TestNewEndpoints:
         ``model`` populated and another row with token/API accounting plus
         ``billing_provider``. The Models dashboard should show one provider
         card, not a real card plus a misleading duplicate empty card.
+
+        After the switch to session_model_usage (fix for #71778), sessions
+        with zero API calls don't appear in session_model_usage at all —
+        only the session that actually made API calls is counted.
         """
         from hermes_state import SessionDB
 
@@ -6977,11 +6981,13 @@ class TestNewEndpoints:
         assert len(deepseek_rows) == 1
         row = deepseek_rows[0]
         assert row["provider"] == "openrouter"
-        assert row["sessions"] == 2
+        # session_model_usage only counts sessions with actual API calls;
+        # "deepseek-session-only" has 0 API calls so it doesn't appear.
+        assert row["sessions"] == 1
         assert row["input_tokens"] == 20_000
         assert row["output_tokens"] == 7_100
         assert row["api_calls"] == 9
-        assert row["avg_tokens_per_session"] == 13_550
+        assert row["avg_tokens_per_session"] == 27_100
 
     def test_analytics_usage_includes_skill_breakdown(self):
         from hermes_state import SessionDB
