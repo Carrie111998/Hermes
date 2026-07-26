@@ -183,6 +183,9 @@ _SIDEBAR_DEFAULTS = {
     "lease_seconds": 300,
     "max_attempts": 5,
     "heartbeat_grace_seconds": 120,
+    "readable_preview_enabled": False,
+    "legacy_hydration_enabled": False,
+    "preview_budget_chars": 24_000,
 }
 
 
@@ -229,6 +232,9 @@ def test_sidebar_config_loads_only_from_config_yaml(
         "lease_seconds": 300,
         "max_attempts": 5,
         "heartbeat_grace_seconds": 45,
+        "readable_preview_enabled": True,
+        "legacy_hydration_enabled": True,
+        "preview_budget_chars": 12_000,
     }
 
     config = _load_with_sidebar(monkeypatch, configured)
@@ -265,6 +271,22 @@ def test_unknown_sidebar_config_key_is_rejected(
             "heartbeat_grace_seconds",
             -1,
             "heartbeat_grace_seconds must be at least 0",
+        ),
+        (
+            "readable_preview_enabled",
+            1,
+            "readable_preview_enabled must be a boolean",
+        ),
+        (
+            "legacy_hydration_enabled",
+            "false",
+            "legacy_hydration_enabled must be a boolean",
+        ),
+        ("preview_budget_chars", 0, "preview_budget_chars must be at least 1"),
+        (
+            "preview_budget_chars",
+            100_001,
+            "preview_budget_chars must be at most 100000",
         ),
     ),
 )

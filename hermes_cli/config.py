@@ -3324,6 +3324,9 @@ DEFAULT_CONFIG = {
             "lease_seconds": 300,
             "max_attempts": 5,
             "heartbeat_grace_seconds": 120,
+            "readable_preview_enabled": False,
+            "legacy_hydration_enabled": False,
+            "preview_budget_chars": 24_000,
         },
     },
 

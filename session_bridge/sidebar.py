@@ -13,7 +13,13 @@ from collections.abc import Mapping
 from typing import cast
 
 from .context_pack import _redact
-from .models import OriginKind, Provider, SessionProjection, canonical_session_id
+from .models import (
+    OriginKind,
+    Provider,
+    SessionPreview,
+    SessionProjection,
+    canonical_session_id,
+)
 
 
 ACK_OR_CONTROL_ONLY = frozenset({
@@ -58,6 +64,8 @@ _CHARACTERIZATION_TITLE_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+_PREVIEW_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_READABLE_REGISTRATION_DELIMITER = "\n\n## Bridge Registration\n"
 
 
 @dataclass(frozen=True)
@@ -132,7 +140,7 @@ def is_sidebar_session_eligible(
     for message in projection.messages:
         if message.role != "user" or not isinstance(message.content, str):
             continue
-        if _is_exact_registration_block(message.content):
+        if is_registration_prompt(message.content):
             continue
         if is_meaningful_user_text(message.content):
             return True
@@ -241,7 +249,12 @@ def sidebar_title(provider: Provider, title: str | None, first_request: str) -> 
     return prefix + compact[: _MAX_TITLE_CHARS - len(prefix)].rstrip()
 
 
-def build_registration_prompt(candidate: SidebarCandidate, marker: str) -> str:
+def build_registration_prompt(
+    candidate: SidebarCandidate,
+    marker: str,
+    *,
+    preview: SessionPreview | None = None,
+) -> str:
     _validate_candidate(candidate)
     _validate_registration_marker(candidate, marker)
 
@@ -259,7 +272,7 @@ def build_registration_prompt(candidate: SidebarCandidate, marker: str) -> str:
     git_head = _serialized_metadata(candidate.git_head)
     worktree_id = _serialized_metadata(candidate.worktree_id)
 
-    return "\n".join((
+    legacy_prompt = "\n".join((
         "This is a Hermes Session Bridge placeholder registration.",
         "Do not perform project work during registration.",
         f"Signed marker: {marker}",
@@ -275,6 +288,115 @@ def build_registration_prompt(candidate: SidebarCandidate, marker: str) -> str:
         f'session_continue(session_id={source}, target_provider="codex").',
         "Until that later user message, reply with only: REGISTERED",
     ))
+    if preview is None:
+        return legacy_prompt
+
+    _validate_preview(candidate, preview)
+    preview_cursor = _serialized_preview_identity(
+        preview.source_cursor,
+        "preview source cursor",
+    )
+    preview_hash = _serialized_preview_identity(
+        preview.source_hash,
+        "preview source hash",
+    )
+    bridge_block = "\n".join((
+        f"Preview version: {preview.version}",
+        f"Preview source cursor: {preview_cursor}",
+        f"Preview source hash: {preview_hash}",
+        f"Preview digest: {preview.digest}",
+        legacy_prompt,
+    ))
+    return (
+        preview.rendered.rstrip("\n")
+        + "\n\n## Bridge Registration\n"
+        + bridge_block
+    )
+
+
+def is_registration_prompt(value: object) -> bool:
+    """Recognize exact legacy or digest-bound readable registration prompts."""
+    if _is_exact_registration_block(value):
+        return True
+    if not isinstance(value, str) or value.count(_READABLE_REGISTRATION_DELIMITER) != 1:
+        return False
+    rendered_without_newline, bridge_block = value.split(
+        _READABLE_REGISTRATION_DELIMITER,
+        1,
+    )
+    bridge_lines = bridge_block.split("\n")
+    if len(bridge_lines) != 17:
+        return False
+    try:
+        version = _prompt_line_value(bridge_lines[0], "Preview version: ")
+        if version != "1":
+            return False
+        cursor = _decode_canonical_prompt_field(
+            bridge_lines[1],
+            "Preview source cursor: ",
+        )
+        source_hash = _decode_canonical_prompt_field(
+            bridge_lines[2],
+            "Preview source hash: ",
+        )
+        digest = _prompt_line_value(bridge_lines[3], "Preview digest: ")
+        if (
+            not isinstance(cursor, str)
+            or not cursor
+            or not isinstance(source_hash, str)
+            or not source_hash
+            or _PREVIEW_DIGEST_RE.fullmatch(digest) is None
+        ):
+            return False
+        rendered = rendered_without_newline + "\n"
+        if not rendered.startswith("# Imported "):
+            return False
+        if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != digest:
+            return False
+        return _is_exact_registration_block("\n".join(bridge_lines[4:]))
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_preview(candidate: SidebarCandidate, preview: SessionPreview) -> None:
+    if not isinstance(preview, SessionPreview):
+        raise ValueError("session preview is malformed")
+    if (
+        preview.version != 1
+        or preview.source_session_id != candidate.source_session_id
+        or not isinstance(preview.source_cursor, str)
+        or not preview.source_cursor.strip()
+        or not isinstance(preview.source_hash, str)
+        or not preview.source_hash.strip()
+        or preview.source_cursor != preview.source_cursor.strip()
+        or preview.source_hash != preview.source_hash.strip()
+        or _redact(preview.source_cursor) != preview.source_cursor
+        or _redact(preview.source_hash) != preview.source_hash
+        or not isinstance(preview.rendered, str)
+        or not preview.rendered.endswith("\n")
+        or _READABLE_REGISTRATION_DELIMITER in preview.rendered
+        or len(preview.rendered) > preview.budget_chars
+        or len(preview.recent_messages) > 5
+        or _PREVIEW_DIGEST_RE.fullmatch(preview.digest) is None
+        or hashlib.sha256(preview.rendered.encode("utf-8")).hexdigest()
+        != preview.digest
+    ):
+        raise ValueError("session preview is malformed or mismatched")
+    expected_header = (
+        "# Imported Claude Code Session"
+        if candidate.provider is Provider.CLAUDE
+        else "# Imported Hermes Session"
+    )
+    if not preview.rendered.startswith(expected_header):
+        raise ValueError("session preview is malformed or mismatched")
+
+
+def _serialized_preview_identity(value: str, label: str) -> str:
+    if not value or value != value.strip() or _has_line_break(value):
+        raise ValueError(f"{label} must be canonical")
+    if _redact(value) != value:
+        raise ValueError(f"{label} cannot be represented safely")
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _validated_source_session_id(value: object) -> str:

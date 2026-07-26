@@ -402,12 +402,14 @@ def _create_test_app(
     db: SessionDB,
     store: SessionBridgeStore,
     coordinator: _FakeCoordinator,
+    *,
+    config: BridgeConfig | None = None,
 ):
     return create_app(
         catalog=UnifiedCatalog(db, store),
         coordinator=coordinator,
         store=store,
-        config=BridgeConfig(),
+        config=BridgeConfig() if config is None else config,
         token=TOKEN,
         marker_key=MARKER_KEY,
     )
@@ -1098,31 +1100,38 @@ def test_session_sidebar_pending_exposes_durable_create_boundary(
     assert response["jobs"][0]["create_reserved"] is True
 
 
-def test_session_sidebar_pending_never_reads_transcript_after_enqueue(
+def test_session_sidebar_pending_returns_only_bounded_redacted_readable_preview(
     db: SessionDB,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, candidate = _seed_sidebar_source(db)
     db._execute_write(
         lambda conn: conn.executemany(
             "INSERT INTO messages (session_id, role, content, timestamp, active) "
-            "VALUES (?, 'user', ?, ?, 1)",
+            "VALUES (?, ?, ?, ?, 1)",
             [
                 (
                     candidate.source_session_id,
-                    f"private transcript {index}",
+                    "assistant",
+                    f"assistant message {index}",
                     901.0 + index,
                 )
-                for index in range(600)
+                for index in range(6)
+            ]
+            + [
+                (
+                    candidate.source_session_id,
+                    "tool",
+                    "provider tool output must stay private",
+                    907.0,
+                ),
+                (
+                    candidate.source_session_id,
+                    "user",
+                    "Use sk-abcdefghijklmnopqrstuvwxyz123456 for the pending work",
+                    908.0,
+                ),
             ],
         )
-    )
-    monkeypatch.setattr(
-        db,
-        "_decode_content",
-        lambda _value: (_ for _ in ()).throw(
-            AssertionError("sidebar pending decoded transcript content")
-        ),
     )
     coordinator = _FakeCoordinator(
         bridge_id=candidate.bridge_id,
@@ -1140,12 +1149,30 @@ def test_session_sidebar_pending_never_reads_transcript_after_enqueue(
         ),
     )
 
-    with _test_client(_create_test_app(db, store, coordinator)) as client:
+    with _test_client(
+        _create_test_app(
+            db,
+            store,
+            coordinator,
+            config=BridgeConfig(
+                sidebar=SidebarConfig(readable_preview_enabled=True)
+            ),
+        )
+    ) as client:
         response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
 
     assert [job["lease_token"] for job in response["jobs"]] == [
         "bounded-candidate-lease"
     ]
+    prompt = response["jobs"][0]["registration_prompt"]
+    assert "# Imported Claude Code Session" in prompt
+    assert "assistant message 1" not in prompt
+    for index in range(2, 6):
+        assert f"assistant message {index}" in prompt
+    assert "provider tool output must stay private" not in prompt
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in prompt
+    assert "[REDACTED]" in prompt
+    assert "C:/claude/sidebar-source.jsonl" not in prompt
 
 
 def test_session_sidebar_pending_settles_legacy_job_missing_delivery_candidate(

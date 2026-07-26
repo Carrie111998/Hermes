@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import pytest
 
-from session_bridge.models import PreviewMessage, SessionPreview
+from hermes_state import SessionDB
+from session_bridge.models import (
+    PreviewMessage,
+    ProjectedMessage,
+    Provider,
+    SessionPreview,
+    SessionProjection,
+)
 from session_bridge.preview import build_session_preview
+from session_bridge.store import SessionBridgeStore
 
 
 def _preview(
@@ -158,6 +167,49 @@ def test_preview_digest_is_deterministic_and_covers_rendered_text() -> None:
 
     assert first == second
     assert first.digest == hashlib.sha256(first.rendered.encode("utf-8")).hexdigest()
+
+
+def test_store_reads_authoritative_indexed_sidebar_preview_snapshot(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        store = SessionBridgeStore(db)
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id="source",
+                title="Indexed source",
+                cwd=r"C:\repo",
+                started_at=1.0,
+                last_active=3.0,
+                messages=(
+                    ProjectedMessage("u1", 0, "user", "first", 2.0),
+                    ProjectedMessage("a1", 0, "assistant", "latest", 3.0),
+                ),
+                native_path=r"C:\private\source.jsonl",
+                native_cursor="cursor-1",
+                native_hash="hash-1",
+                git_branch="main",
+            )
+        )
+
+        snapshot = store.get_sidebar_preview_source("claude:source")
+
+        assert snapshot["source_session_id"] == "claude:source"
+        assert snapshot["provider"] == "claude"
+        assert snapshot["source_cursor"] == "cursor-1"
+        assert snapshot["source_hash"] == "hash-1"
+        assert snapshot["title"] == "Indexed source"
+        assert snapshot["cwd"] == r"C:\repo"
+        assert snapshot["captured_at"] == 3.0
+        assert [message["content"] for message in snapshot["messages"]] == [
+            "first",
+            "latest",
+        ]
+        assert "native_path" not in snapshot
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize(

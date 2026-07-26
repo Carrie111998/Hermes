@@ -14,10 +14,12 @@ from session_bridge.models import (
     SessionProjection,
     encode_bridge_marker,
 )
+from session_bridge.preview import build_session_preview
 from session_bridge.sidebar import (
     ACK_OR_CONTROL_ONLY,
     SidebarCandidate,
     build_registration_prompt,
+    is_registration_prompt,
     is_meaningful_user_text,
     is_sidebar_session_eligible,
     normalize_meaningful_user_text,
@@ -632,6 +634,81 @@ def test_registration_prompt_has_exact_minimal_field_order_and_instructions() ->
     assert "raw title must stay out" not in prompt
     assert "first request" not in prompt
     assert "transcript" not in prompt.casefold()
+
+
+def test_readable_registration_prompt_puts_preview_before_bridge_metadata() -> None:
+    candidate = _candidate()
+    preview = build_session_preview(
+        source_session_id=candidate.source_session_id,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        title="Readable source",
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=NOW,
+        messages=[
+            {
+                "role": "user",
+                "content": "Please fix the remaining sidebar issue.",
+                "timestamp": NOW - 1,
+            },
+            {
+                "role": "assistant",
+                "content": "Decision: preserve the exact native task.",
+                "timestamp": NOW,
+            },
+        ],
+        git_root=candidate.git_root,
+        git_branch=candidate.git_branch,
+        git_head=candidate.git_head,
+        worktree_id=candidate.worktree_id,
+    )
+
+    prompt = build_registration_prompt(
+        candidate,
+        _marker_for(candidate),
+        preview=preview,
+    )
+
+    assert prompt.index("# Imported Claude Code Session") < prompt.index(
+        "## Bridge Registration"
+    )
+    assert "## Continuation Brief" in prompt
+    assert "## Last 5 Messages" in prompt
+    assert f"Signed marker: {_marker_for(candidate)}" in prompt
+    assert "Preview version: 1" in prompt
+    assert 'Preview source cursor: "cursor-1"' in prompt
+    assert 'Preview source hash: "hash-1"' in prompt
+    assert f"Preview digest: {preview.digest}" in prompt
+    assert prompt.endswith(
+        "Until that later user message, reply with only: REGISTERED"
+    )
+    assert is_registration_prompt(prompt)
+
+
+def test_readable_registration_prompt_digest_mismatch_fails_classification() -> None:
+    candidate = _candidate()
+    preview = build_session_preview(
+        source_session_id=candidate.source_session_id,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        title=None,
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=NOW,
+        messages=[],
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+    )
+    prompt = build_registration_prompt(
+        candidate,
+        _marker_for(candidate),
+        preview=preview,
+    )
+
+    assert is_registration_prompt(prompt.replace(preview.digest, "0" * 64)) is False
 
 
 def test_registration_prompt_represents_missing_git_metadata_stably() -> None:

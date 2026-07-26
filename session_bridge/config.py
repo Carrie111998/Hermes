@@ -76,6 +76,9 @@ class SidebarConfig:
     lease_seconds: int = 300
     max_attempts: int = 5
     heartbeat_grace_seconds: int = 120
+    readable_preview_enabled: bool = False
+    legacy_hydration_enabled: bool = False
+    preview_budget_chars: int = 24_000
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,9 @@ class BridgeConfig:
                 "lease_seconds",
                 "max_attempts",
                 "heartbeat_grace_seconds",
+                "readable_preview_enabled",
+                "legacy_hydration_enabled",
+                "preview_budget_chars",
             }),
             scope="session_bridge.sidebar",
         )
@@ -402,6 +408,29 @@ class BridgeConfig:
                 ),
                 "session_bridge.sidebar.heartbeat_grace_seconds",
                 minimum=0,
+            ),
+            readable_preview_enabled=_toml_bool(
+                sidebar.get(
+                    "readable_preview_enabled",
+                    sidebar_defaults.readable_preview_enabled,
+                ),
+                "session_bridge.sidebar.readable_preview_enabled",
+            ),
+            legacy_hydration_enabled=_toml_bool(
+                sidebar.get(
+                    "legacy_hydration_enabled",
+                    sidebar_defaults.legacy_hydration_enabled,
+                ),
+                "session_bridge.sidebar.legacy_hydration_enabled",
+            ),
+            preview_budget_chars=_toml_int(
+                sidebar.get(
+                    "preview_budget_chars",
+                    sidebar_defaults.preview_budget_chars,
+                ),
+                "session_bridge.sidebar.preview_budget_chars",
+                minimum=1,
+                maximum=100_000,
             ),
         )
         claude_visibility_defaults = cls().claude_visibility

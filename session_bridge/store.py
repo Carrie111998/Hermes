@@ -7267,6 +7267,143 @@ class SessionBridgeStore:
             raise ValueError("invalid sidebar delivery candidate identity")
         return candidate
 
+    def get_sidebar_preview_source(
+        self,
+        source_session_id: str,
+    ) -> dict[str, Any]:
+        """Read indexed source metadata, active messages, and identity atomically."""
+        source_id = _exact_nonempty_text(
+            source_session_id,
+            "sidebar source session ID",
+        )
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            conn.execute("BEGIN")
+            try:
+                session_row = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                message_rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                    (source_id,),
+                ).fetchall()
+                external_row = conn.execute(
+                    "SELECT * FROM external_sessions WHERE session_id = ?",
+                    (source_id,),
+                ).fetchone()
+            finally:
+                conn.rollback()
+        if session_row is None:
+            raise KeyError(source_id)
+
+        session = dict(session_row)
+        message_records = [dict(row) for row in message_rows]
+        decode_content = self.db._decode_content
+        if session.get("source") == _PROFILE_SHADOW_SOURCE:
+            profile_matches: list[
+                tuple[dict[str, Any], list[dict[str, Any]], Callable[[Any], Any]]
+            ] = []
+            with self._native_hermes_databases() as databases:
+                for _profile, database, owned in databases:
+                    if not owned or not self._profile_catalog_compatible(database):
+                        continue
+                    with database._lock:
+                        profile_conn = database._conn
+                        assert profile_conn is not None
+                        profile_session = profile_conn.execute(
+                            "SELECT * FROM sessions WHERE id = ?",
+                            (source_id,),
+                        ).fetchone()
+                        if profile_session is None:
+                            continue
+                        profile_messages = profile_conn.execute(
+                            "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                            (source_id,),
+                        ).fetchall()
+                    profile_matches.append((
+                        dict(profile_session),
+                        [dict(row) for row in profile_messages],
+                        database._decode_content,
+                    ))
+            if len(profile_matches) != 1:
+                raise ValueError("sidebar source identity is ambiguous")
+            session, message_records, decode_content = profile_matches[0]
+            external_row = None
+
+        if external_row is not None:
+            external = dict(external_row)
+            if external.get("provider") != Provider.CLAUDE.value:
+                raise ValueError("sidebar source provider mismatch")
+            provider = Provider.CLAUDE
+            cursor = external.get("last_native_cursor")
+            source_hash = external.get("last_native_hash")
+        else:
+            provider = Provider.HERMES
+            identity = _native_session_snapshot_identity(
+                session,
+                message_records,
+                decode_content=decode_content,
+            )
+            cursor = identity["cursor"]
+            source_hash = identity["source_hash"]
+        if (
+            not isinstance(cursor, str)
+            or not cursor
+            or not isinstance(source_hash, str)
+            or not source_hash
+        ):
+            raise ValueError("sidebar source snapshot identity is unavailable")
+        if (
+            provider is Provider.CLAUDE
+            and not source_id.startswith(f"{Provider.CLAUDE.value}:")
+        ) or (
+            provider is Provider.HERMES
+            and source_id.startswith(("claude:", "codex:"))
+        ):
+            raise ValueError("sidebar source provider mismatch")
+
+        messages: list[dict[str, Any]] = []
+        timestamps: list[float] = []
+        for raw_timestamp in (session.get("started_at"), session.get("ended_at")):
+            if (
+                isinstance(raw_timestamp, (int, float))
+                and not isinstance(raw_timestamp, bool)
+                and math.isfinite(float(raw_timestamp))
+            ):
+                timestamps.append(float(raw_timestamp))
+        for message in message_records:
+            message["content"] = decode_content(message.get("content"))
+            if message.get("tool_calls"):
+                try:
+                    message["tool_calls"] = json.loads(message["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    message["tool_calls"] = []
+            if message.get("active") != 1:
+                continue
+            timestamp = message.get("timestamp")
+            if (
+                isinstance(timestamp, (int, float))
+                and not isinstance(timestamp, bool)
+                and math.isfinite(float(timestamp))
+            ):
+                timestamps.append(float(timestamp))
+            messages.append(message)
+
+        return {
+            "source_session_id": source_id,
+            "provider": provider.value,
+            "source_cursor": cursor,
+            "source_hash": source_hash,
+            "title": session.get("title"),
+            "cwd": session.get("cwd"),
+            "captured_at": max(timestamps, default=0.0),
+            "messages": messages,
+            "git_root": session.get("git_repo_root"),
+            "git_branch": session.get("git_branch"),
+        }
+
     def ensure_sidebar_lineage(
         self,
         *,
