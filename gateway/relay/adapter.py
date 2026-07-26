@@ -27,7 +27,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -1352,6 +1352,38 @@ class RelayAdapter(BasePlatformAdapter):
             chat_id, question, choices, clarify_id, session_key, metadata=metadata
         )
 
+    def _caller_owns_prompt_session(self, event, session_key: str) -> bool:
+        """True when the prompt answer's author owns ``session_key``.
+
+        ``_consume_prompt_response`` resolves a click *before* ``handle_message``
+        (see ``_on_passthrough``), so the normal ``_is_user_authorized`` gate
+        never runs for a consumed prompt. Re-derive the caller's session key the
+        same way ``handle_message`` does and require an exact match: a shared
+        (non-per-user) session collapses every member's source to one key so all
+        stay allowed, while a per-user key carries the participant id so only its
+        owner matches. DMs are 1:1 (their key has no participant id) and fail
+        open; an empty ``session_key`` fails open, a derivation error fails
+        closed.
+        """
+        if not session_key:
+            return True
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "chat_type", None) == "dm":
+            return True
+        try:
+            caller_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a derivation failure must fail closed
+            return False
+        return caller_key == session_key
+
     async def _consume_prompt_response(self, event) -> bool:
         """Route an inbound prompt_response to its waiting primitive.
 
@@ -1369,6 +1401,25 @@ class RelayAdapter(BasePlatformAdapter):
         option_id = str(pr.get("option_id") or "")
         if not prompt_id or not option_id:
             return False
+        # Authorization (CWE-639): a prompt answer must come from the
+        # participant who owns the session. Resolution here precedes
+        # handle_message (see _on_passthrough), so the usual _is_user_authorized
+        # gate never runs for a consumed prompt — without this, any channel
+        # co-member who can see the buttons could resolve, and via "always"
+        # permanently allowlist, another user's dangerous-command approval. Peek
+        # (do not consume) so a stray click can't evict a still-pending prompt
+        # from under its real owner.
+        pending = self._pending_prompts.get(prompt_id)
+        if pending is not None and not self._caller_owns_prompt_session(
+            event, str(pending.get("session_key") or "")
+        ):
+            logger.warning(
+                "relay prompt_response for session %s rejected: caller %s is not "
+                "the session owner",
+                pending.get("session_key"),
+                getattr(getattr(event, "source", None), "user_id", None),
+            )
+            return True
         state = self._pop_prompt(prompt_id)
         if state is None:
             logger.info(

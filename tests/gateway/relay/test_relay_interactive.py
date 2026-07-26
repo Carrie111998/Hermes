@@ -27,7 +27,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 from tests.gateway.relay.stub_connector import StubConnector
 
@@ -414,3 +414,100 @@ async def test_cancelled_outcome_removes_eyes_without_verdict():
     await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
     reacts = [(a["emoji"], a.get("remove", False)) for a in stub.sent if a["op"] == "react"]
     assert reacts == [("👀", True)]  # eyes removed, no ✅/❌
+
+
+# ── owner-scoped prompt authorization (CWE-639) ──────────────────────────
+
+
+def _channel_event(prompt_id, option_id, user_id, chat_id="chan42", scope_id="guild9"):
+    return MessageEvent(
+        text=f"/{option_id}",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform="relay",
+            chat_id=chat_id,
+            chat_type="channel",
+            scope_id=scope_id,
+            user_id=user_id,
+        ),
+        prompt_response={"prompt_id": prompt_id, "option_id": option_id},
+    )
+
+
+def _owner_source():
+    return SessionSource(
+        platform="relay", chat_id="chan42", chat_type="channel",
+        scope_id="guild9", user_id="owner",
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_response_rejects_non_owner_in_per_user_channel(monkeypatch):
+    """A co-member must not resolve another user's approval in a per-user
+    channel session — the relay analog of the native adapters' interaction
+    owner check. Resolution runs before handle_message, so without this the
+    normal auth gate never fires for the click."""
+    adapter, _stub = _adapter()
+    adapter.config.extra["group_sessions_per_user"] = True
+    owner_key = build_session_key(_owner_source(), group_sessions_per_user=True)
+    pid = adapter._mint_prompt(
+        "exec_approval", {"session_key": owner_key, "chat_id": "chan42"}
+    )
+
+    calls: list = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda sk, choice, **kw: calls.append((sk, choice)) or 1,
+    )
+    consumed = await adapter._consume_prompt_response(
+        _channel_event(pid, "always", user_id="attacker")
+    )
+    assert consumed is True  # dropped, not re-dispatched as the attacker's chat
+    assert calls == []  # the victim's approval was NOT resolved
+    assert pid in adapter._pending_prompts  # left intact for its real owner
+
+
+@pytest.mark.asyncio
+async def test_prompt_response_allows_owner_in_per_user_channel(monkeypatch):
+    adapter, _stub = _adapter()
+    adapter.config.extra["group_sessions_per_user"] = True
+    owner_key = build_session_key(_owner_source(), group_sessions_per_user=True)
+    pid = adapter._mint_prompt(
+        "exec_approval", {"session_key": owner_key, "chat_id": "chan42"}
+    )
+
+    calls: list = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda sk, choice, **kw: calls.append((sk, choice)) or 1,
+    )
+    consumed = await adapter._consume_prompt_response(
+        _channel_event(pid, "always", user_id="owner")
+    )
+    assert consumed is True
+    assert calls == [(owner_key, "always")]
+    assert pid not in adapter._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_prompt_response_shared_channel_allows_any_member(monkeypatch):
+    """A shared session (group_sessions_per_user=False) has no participant id in
+    its key, so every co-member is a legitimate responder — the fix must not
+    regress that."""
+    adapter, _stub = _adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+    shared_key = build_session_key(_owner_source(), group_sessions_per_user=False)
+    pid = adapter._mint_prompt(
+        "exec_approval", {"session_key": shared_key, "chat_id": "chan42"}
+    )
+
+    calls: list = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda sk, choice, **kw: calls.append((sk, choice)) or 1,
+    )
+    consumed = await adapter._consume_prompt_response(
+        _channel_event(pid, "always", user_id="someone_else")
+    )
+    assert consumed is True
+    assert calls == [(shared_key, "always")]
