@@ -571,6 +571,7 @@ def handle_workflow_show(args: Dict[str, Any], **kwargs: Any) -> str:
         "layers": len(layers),
         "nodes": len(wf.nodes),
         "inputs": getattr(wf, "inputs", []),
+        "attachments": getattr(wf, "attachments", []),
         "structure": nodes,
     })
 
@@ -697,12 +698,12 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
                 "default": "",
             },
             "attachments": {
-                "type": "array",
-                "items": {"type": "string"},
+                "type": "object",
                 "description": (
-                    "Optional list of local file paths to attach to every kanban card "
-                    "created by this workflow run. Files are stored in the kanban "
-                    "attachment store and visible to agents that pick up the cards."
+                    "Optional dict of named file paths to attach to kanban cards. "
+                    "Keys are attachment names (must match declarations in the workflow YAML). "
+                    "Values are local file paths. E.g. "
+                    '{"grill_artifact": "/path/to/file.md", "source_video": "/path/to/video.mp4"}'
                 ),
             },
         },

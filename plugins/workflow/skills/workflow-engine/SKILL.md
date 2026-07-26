@@ -121,20 +121,33 @@ inputs:
 
 ### Attachment Selection
 
-Nodes can select which workflow attachment they receive:
+Workflows declare expected attachments with names. Nodes reference them by name:
 
 ```yaml
-inputs:
+attachments:
   - name: grill_artifact
-  - name: acceptance_criteria
+    required: true
+    description: "The enriched README"
+  - name: source_video
+    required: true
+    description: "Base video for splicing"
+
 nodes:
   enrich-artifact:
-    attachment: attachments[0]   # gets grill_artifact
-  spec-author:
-    attachment: attachments[1]   # gets acceptance_criteria
+    attachment: grill_artifact
+  splice-video:
+    attachment: source_video
 ```
 
-If `attachment` is set, only that specific file is attached to the card. If omitted, all attachments are attached (first layer) or none (other layers).
+The caller passes named file paths:
+```
+workflow_start(
+    workflow="my-workflow",
+    attachments={"grill_artifact": "/path/to/file.md", "source_video": "/path/to/video.mp4"}
+)
+```
+
+If `attachment` is set, only that named file is attached. If omitted, all attachments are attached (first layer) or none (other layers).
 
 ### Node Fields
 

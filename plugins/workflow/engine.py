@@ -165,9 +165,9 @@ class WorkflowNode:
     max_retries: int | None = None
     """Max times each reviewer can review this node. None = use workflow default."""
     attachment: Optional[str] = None
-    """Attachment selector. E.g. "attachments[0]" picks the first
-    workflow attachment for this node. If None, all attachments
-    are attached (first layer) or none (other layers)."""
+    """Attachment name. References a declared attachment by name.
+    E.g. "grill_artifact" picks the attachment with that key.
+    If None, all attachments are attached (first layer) or none."""
     reviews: list[str] = field(default_factory=list)
     """Sequential review pipeline. Each entry is a node ID that reviews
     this node's output. When the card moves to 'review' status, the
@@ -188,6 +188,9 @@ class Workflow:
     kanban_board: str = ""         # Per-pipeline board override (empty = engine default)
     inputs: list = field(default_factory=list)
                                     # Declared inputs for this workflow.
+                                    # Each entry: {"name": str, "required": bool, "description": str}
+    attachments: list = field(default_factory=list)
+                                    # Declared attachments for this workflow.
                                     # Each entry: {"name": str, "required": bool, "description": str}
     scope: str = "project"         # "project" (default) — creates kanban cards per node.
                                     # "global" — in-process only, no cards created.
@@ -311,6 +314,7 @@ class WorkflowEngine:
             trigger_events=raw.get("trigger_events", []),
             kanban_board=raw.get("kanban_board", ""),
             inputs=raw.get("inputs", []),
+            attachments=raw.get("attachments", []),
             scope=raw.get("scope", "project"),
             single_flight=bool(raw.get("single_flight", False)),
 
@@ -1810,14 +1814,14 @@ class WorkflowEngine:
                         f"Node '{nid}' has invalid max_retries={node.max_retries}"
                     )
 
-        # Check attachment syntax
-        import re as _re
+        # Check attachment references against declared attachments
+        declared_attachments = {a.get("name", "") for a in raw.get("attachments", [])}
         for nid, node in workflow.nodes.items():
             if node.attachment is not None:
-                if not _re.match(r"attachments\[\d+\]", node.attachment):
+                if declared_attachments and node.attachment not in declared_attachments:
                     result["issues"].append(
-                        f"Node '{nid}' has invalid attachment='{node.attachment}' — "
-                        f"expected format: attachments[N]"
+                        f"Node '{nid}' references attachment '{node.attachment}' "
+                        f"which is not declared in attachments section"
                     )
 
         # Check all references against declarations
