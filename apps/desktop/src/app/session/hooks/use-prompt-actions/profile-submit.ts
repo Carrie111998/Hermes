@@ -1,4 +1,5 @@
 import { listAllProfileSessions } from '@/hermes'
+import { translateNow } from '@/i18n'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
 import { requestGatewayForProfile, withProfileGatewayLease } from '@/store/gateway'
 import { notify } from '@/store/notifications'
@@ -124,16 +125,20 @@ export async function submitTextForProfile(
   }
 
   if (!target.sessionId && !target.storedSessionId) {
-    // TODO(PR4 i18n): copy.petNoActiveSession(key)
-    notify({ kind: 'warning', message: `No active session to reply to on "${key}".` })
+    notify({
+      kind: 'warning',
+      message: translateNow('settings.appearance.pet.multiPet.noActiveSession', key)
+    })
 
     return false
   }
 
   if (isProfileSessionBusy(key, target.sessionId, target.storedSessionId)) {
     if (!target.storedSessionId) {
-      // TODO(PR4 i18n): copy.petCannotQueueNoDurableSession(key)
-      notify({ kind: 'warning', message: `"${key}" is busy and can't be queued without a durable session.` })
+      notify({
+        kind: 'warning',
+        message: translateNow('settings.appearance.pet.multiPet.cannotQueueNoDurable', key)
+      })
 
       return false
     }

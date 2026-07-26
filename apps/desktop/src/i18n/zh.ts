@@ -481,7 +481,28 @@ export const zh: Translations = {
         exportFailed: slug => `无法导出 ${slug}`,
         noneAvailable: '当前没有可开启的宠物。',
         turnOnFailed: '无法开启宠物。',
-        turnOffFailed: '无法关闭宠物。'
+        turnOffFailed: '无法关闭宠物。',
+        multiPet: {
+          modeTitle: '桌面宠物',
+          modeDesc: '选择浮动吉祥物如何跟随你的配置。',
+          followActive: '跟随当前',
+          pinned: '固定',
+          rosterTitle: '固定的配置',
+          rosterDesc: '同时为每个固定的配置显示一只宠物。',
+          profilePet: profile => `${profile} 宠物`,
+          connectionOnline: '在线',
+          connectionOffline: '离线',
+          connectionReauth: '需要登录',
+          connectionConnecting: '连接中',
+          unavailable: '未找到',
+          unavailableDesc: '未找到该配置——它可能已被重命名或删除。',
+          removeAction: '移除',
+          enableAction: '启用',
+          softCapWarning: n => `你已固定 ${n} 只宠物，每只都会保持与其配置的实时连接。`,
+          hardCapNotice: n => `最多可固定 ${n} 个配置。请先禁用一个再添加。`,
+          noActiveSession: profile => `"${profile}" 没有可回复的活动会话。`,
+          cannotQueueNoDurable: profile => `"${profile}" 正忙，且没有持久会话，无法加入队列。`
+        }
       }
     },
     fieldLabels: defineFieldCopy({

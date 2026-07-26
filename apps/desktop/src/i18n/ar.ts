@@ -453,7 +453,28 @@ export const ar = defineLocale({
         exportFailed: slug => `تعذّر تصدير ${slug}`,
         noneAvailable: 'لا توجد حيوانات أليفة متاحة للتشغيل الآن.',
         turnOnFailed: 'تعذّر تشغيل الحيوان الأليف.',
-        turnOffFailed: 'تعذّر إيقاف الحيوان الأليف.'
+        turnOffFailed: 'تعذّر إيقاف الحيوان الأليف.',
+        multiPet: {
+          modeTitle: 'حيوانات سطح المكتب',
+          modeDesc: 'اختر كيف يتابع التميمة العائمة ملفاتك الشخصية.',
+          followActive: 'متابعة النشط',
+          pinned: 'مثبّت',
+          rosterTitle: 'الملفات المثبّتة',
+          rosterDesc: 'اعرض حيوانًا أليفًا لكل ملف مثبّت في الوقت نفسه.',
+          profilePet: profile => `حيوان ${profile}`,
+          connectionOnline: 'متصل',
+          connectionOffline: 'غير متصل',
+          connectionReauth: 'يتطلب تسجيل الدخول',
+          connectionConnecting: 'جارٍ الاتصال',
+          unavailable: 'غير موجود',
+          unavailableDesc: 'لم يتم العثور على الملف — ربما أعيدت تسميته أو حُذف.',
+          removeAction: 'إزالة',
+          enableAction: 'تفعيل',
+          softCapWarning: n => `لديك ${n} حيوانات مثبّتة. يحتفظ كل منها باتصال مباشر مع ملفه.`,
+          hardCapNotice: n => `يمكنك تثبيت ما يصل إلى ${n} ملفات. عطّل واحدًا لإضافة آخر.`,
+          noActiveSession: profile => `لا توجد جلسة نشطة للرد عليها في "${profile}".`,
+          cannotQueueNoDurable: profile => `"${profile}" مشغول ولا يمكن وضعه في القائمة دون جلسة دائمة.`
+        }
       }
     },
     fieldLabels: {

@@ -380,7 +380,28 @@ export const ja = defineLocale({
         exportFailed: slug => `${slug} をエクスポートできませんでした`,
         noneAvailable: 'オンにできるペットがありません。',
         turnOnFailed: 'ペットをオンにできませんでした。',
-        turnOffFailed: 'ペットをオフにできませんでした。'
+        turnOffFailed: 'ペットをオフにできませんでした。',
+        multiPet: {
+          modeTitle: 'デスクトップペット',
+          modeDesc: 'フローティングマスコットがプロファイルに追随する方法を選択します。',
+          followActive: 'アクティブに追随',
+          pinned: 'ピン留め',
+          rosterTitle: 'ピン留めしたプロファイル',
+          rosterDesc: 'ピン留めした各プロファイルのペットを同時に表示します。',
+          profilePet: profile => `${profile} のペット`,
+          connectionOnline: 'オンライン',
+          connectionOffline: 'オフライン',
+          connectionReauth: 'サインインが必要',
+          connectionConnecting: '接続中',
+          unavailable: '見つかりません',
+          unavailableDesc: 'プロファイルが見つかりません。名前変更または削除された可能性があります。',
+          removeAction: '削除',
+          enableAction: '有効化',
+          softCapWarning: n => `${n} 匹のペットをピン留めしています。各ペットはプロファイルへの接続を維持します。`,
+          hardCapNotice: n => `最大 ${n} 個のプロファイルをピン留めできます。追加するには1つ無効にしてください。`,
+          noActiveSession: profile => `"${profile}" には返信先のアクティブなセッションがありません。`,
+          cannotQueueNoDurable: profile => `"${profile}" はビジーで、永続セッションがないためキューに追加できません。`
+        }
       }
     },
     fieldLabels: defineFieldCopy({

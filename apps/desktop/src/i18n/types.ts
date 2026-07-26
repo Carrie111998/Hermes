@@ -402,6 +402,27 @@ export interface Translations {
         noneAvailable: string
         turnOnFailed: string
         turnOffFailed: string
+        multiPet: {
+          modeTitle: string
+          modeDesc: string
+          followActive: string
+          pinned: string
+          rosterTitle: string
+          rosterDesc: string
+          profilePet: (profile: string) => string
+          connectionOnline: string
+          connectionOffline: string
+          connectionReauth: string
+          connectionConnecting: string
+          unavailable: string
+          unavailableDesc: string
+          removeAction: string
+          enableAction: string
+          softCapWarning: (n: number) => string
+          hardCapNotice: (n: number) => string
+          noActiveSession: (profile: string) => string
+          cannotQueueNoDurable: (profile: string) => string
+        }
       }
     }
     fieldLabels: Record<string, string>

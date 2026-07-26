@@ -369,7 +369,28 @@ export const zhHant = defineLocale({
         exportFailed: slug => `無法匯出 ${slug}`,
         noneAvailable: '目前沒有可開啟的寵物。',
         turnOnFailed: '無法開啟寵物。',
-        turnOffFailed: '無法關閉寵物。'
+        turnOffFailed: '無法關閉寵物。',
+        multiPet: {
+          modeTitle: '桌面寵物',
+          modeDesc: '選擇浮動吉祥物如何跟隨你的設定檔。',
+          followActive: '跟隨當前',
+          pinned: '固定',
+          rosterTitle: '固定的設定檔',
+          rosterDesc: '同時為每個固定的設定檔顯示一隻寵物。',
+          profilePet: profile => `${profile} 寵物`,
+          connectionOnline: '線上',
+          connectionOffline: '離線',
+          connectionReauth: '需要登入',
+          connectionConnecting: '連線中',
+          unavailable: '未找到',
+          unavailableDesc: '未找到該設定檔——它可能已被重新命名或刪除。',
+          removeAction: '移除',
+          enableAction: '啟用',
+          softCapWarning: n => `你已固定 ${n} 隻寵物，每隻都會保持與其設定檔的即時連線。`,
+          hardCapNotice: n => `最多可固定 ${n} 個設定檔。請先停用一個再新增。`,
+          noActiveSession: profile => `"${profile}" 沒有可回覆的使用中工作階段。`,
+          cannotQueueNoDurable: profile => `"${profile}" 正忙，且沒有持久工作階段，無法加入佇列。`
+        }
       }
     },
     fieldLabels: defineFieldCopy({

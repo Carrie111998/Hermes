@@ -494,7 +494,28 @@ export const en: Translations = {
         exportFailed: slug => `Could not export ${slug}`,
         noneAvailable: 'No pets available to turn on right now.',
         turnOnFailed: 'Could not turn the pet on.',
-        turnOffFailed: 'Could not turn the pet off.'
+        turnOffFailed: 'Could not turn the pet off.',
+        multiPet: {
+          modeTitle: 'Desktop pets',
+          modeDesc: 'Choose how the floating mascot follows your profiles.',
+          followActive: 'Follow Active',
+          pinned: 'Pinned',
+          rosterTitle: 'Pinned profiles',
+          rosterDesc: 'Show a pet for each pinned profile at the same time.',
+          profilePet: profile => `${profile} pet`,
+          connectionOnline: 'Online',
+          connectionOffline: 'Offline',
+          connectionReauth: 'Needs sign-in',
+          connectionConnecting: 'Connecting',
+          unavailable: 'Not found',
+          unavailableDesc: 'Profile not found — it may have been renamed or deleted.',
+          removeAction: 'Remove',
+          enableAction: 'Enable',
+          softCapWarning: n => `You have ${n} pets pinned. Each one keeps a live connection to its profile.`,
+          hardCapNotice: n => `You can pin up to ${n} profiles. Disable one to add another.`,
+          noActiveSession: profile => `No active session to reply to on "${profile}".`,
+          cannotQueueNoDurable: profile => `"${profile}" is busy and can't be queued without a durable session.`
+        }
       }
     },
     fieldLabels: FIELD_LABELS,
