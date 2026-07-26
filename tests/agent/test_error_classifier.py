@@ -743,6 +743,214 @@ class TestClassifyApiError:
         result = classify_api_error(e, approx_tokens=100000, context_length=200000)
         assert result.reason == FailoverReason.context_overflow
 
+    def test_400_codex_chatgpt_unsupported_model_detail_is_not_context_overflow(self):
+        """A descriptive Codex ``detail`` 400 stays a model error on large sessions.
+
+        ChatGPT-plan Codex rejects retired/ineligible models with a top-level
+        ``detail`` body.  Treating that unrecognized body shape as an empty,
+        generic 400 makes the large-session heuristic fabricate a context
+        overflow and enter the compression-exhaustion path.
+        """
+        detail = (
+            "The 'gpt-5-codex' model is not supported when using Codex "
+            "with a ChatGPT account."
+        )
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={"detail": detail},
+        )
+
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5-codex",
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.model_not_found
+        assert result.message == detail
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_billing_signal_with_unsupported_phrase_stays_billing(self):
+        """The Codex compatibility phrase must not swallow billing guidance."""
+        detail = "Insufficient credits: model is not supported on free tier."
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={"detail": detail},
+        )
+
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5-codex",
+        )
+
+        assert result.reason == FailoverReason.billing
+        assert result.message == detail
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_specific_detail_overrides_nested_generic_error_message(self):
+        """A generic envelope must not hide a specific top-level rejection."""
+        detail = (
+            "The 'gpt-5-codex' model is not supported when using Codex "
+            "with a ChatGPT account."
+        )
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={
+                "error": {"message": "Error"},
+                "detail": detail,
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5-codex",
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.model_not_found
+        assert result.message == detail
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_specific_flat_message_overrides_nested_generic_message(self):
+        """A generic nested envelope must not hide a specific flat message."""
+        detail = (
+            "The 'gpt-5-codex' model is not supported when using Codex "
+            "with a ChatGPT account."
+        )
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={
+                "error": {"message": "Error"},
+                "message": detail,
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5-codex",
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.model_not_found
+        assert result.message == detail
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_non_string_message_containers_cannot_inject_patterns(self):
+        """Malformed nested and flat message containers are not classifier text."""
+        injected = {"message": "model is not supported"}
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={
+                "error": {"message": injected},
+                "message": injected,
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5-codex",
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.format_error
+        assert result.message == "Error"
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_descriptive_detail_body_bypasses_generic_large_session_heuristic(self):
+        """Top-level ``detail`` text is evidence, not an empty 400 body."""
+        detail = "Invalid request shape: the selected capability is unavailable."
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={"detail": detail},
+        )
+
+        result = classify_api_error(
+            e,
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_short_descriptive_detail_is_not_generic(self):
+        """Short detail text is evidence unless it is a known placeholder."""
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={"detail": "invalid capability"},
+        )
+
+        result = classify_api_error(
+            e,
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_non_string_detail_is_ignored_for_pattern_matching(self):
+        """Malformed detail containers cannot inject classifier phrases."""
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={
+                "error": {"message": "Error"},
+                "detail": {"message": "model is not supported"},
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5-codex",
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
     def test_400_generic_small_session_is_format_error(self):
         """Generic 400 with small session → format error, not context overflow."""
         e = MockAPIError(

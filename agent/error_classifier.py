@@ -310,6 +310,7 @@ _MODEL_NOT_FOUND_PATTERNS = [
     "no such model",
     "unknown model",
     "unsupported model",
+    "model is not supported when using codex",
     # OpenRouter returns 404 with this message when none of the candidate
     # endpoints for the selected model support tool/function calling.
     # Classifying this as model_not_found triggers fallback to a different
@@ -604,12 +605,16 @@ def classify_api_error(
     # {"raw": "<actual error JSON>"}}} and the real error message (e.g.
     # "context length exceeded") is only in the inner JSON.
     _raw_msg = str(error).lower()
-    _body_msg = ""
+    _nested_msg = ""
+    _flat_msg = ""
+    _detail_msg = ""
     _metadata_msg = ""
     if isinstance(body, dict):
         _err_obj = body.get("error", {})
         if isinstance(_err_obj, dict):
-            _body_msg = str(_err_obj.get("message") or "").lower()
+            _nested_value = _err_obj.get("message")
+            if isinstance(_nested_value, str):
+                _nested_msg = _nested_value.lower()
             # Parse metadata.raw for wrapped provider errors
             _metadata = _err_obj.get("metadata", {})
             if isinstance(_metadata, dict):
@@ -621,17 +626,28 @@ def classify_api_error(
                         if isinstance(_inner, dict):
                             _inner_err = _inner.get("error", {})
                             if isinstance(_inner_err, dict):
-                                _metadata_msg = str(_inner_err.get("message") or "").lower()
+                                _metadata_value = _inner_err.get("message")
+                                if isinstance(_metadata_value, str):
+                                    _metadata_msg = _metadata_value.lower()
                     except (json.JSONDecodeError, TypeError):
                         pass
-        if not _body_msg:
-            _body_msg = str(body.get("message") or "").lower()
-    # Combine all message sources for pattern matching
+        _flat_value = body.get("message")
+        if isinstance(_flat_value, str):
+            _flat_msg = _flat_value.lower()
+        # FastAPI-style endpoints place their only useful rejection reason in
+        # top-level ``detail``. Keep string details independent from a generic
+        # envelope message (for example ``error.message == "Error"``), so the
+        # specific reason remains available to both pattern and generic-400
+        # checks. Structured validation details are not classifier text.
+        _detail_value = body.get("detail")
+        if isinstance(_detail_value, str):
+            _detail_msg = _detail_value.lower()
+    # Combine every textual message source for pattern matching. Do not let a
+    # generic nested envelope hide a specific flat message or sibling detail.
     parts = [_raw_msg]
-    if _body_msg and _body_msg not in _raw_msg:
-        parts.append(_body_msg)
-    if _metadata_msg and _metadata_msg not in _raw_msg and _metadata_msg not in _body_msg:
-        parts.append(_metadata_msg)
+    for candidate in (_nested_msg, _flat_msg, _detail_msg, _metadata_msg):
+        if candidate and not any(candidate in part for part in parts):
+            parts.append(candidate)
     error_msg = " ".join(parts)
     provider_lower = (provider or "").strip().lower()
     model_lower = (model or "").strip().lower()
@@ -1322,16 +1338,51 @@ def _classify_400(
         )
 
     # Generic 400 + large session → probable context overflow
-    # Anthropic sometimes returns a bare "Error" message when context is too large
-    err_body_msg = ""
+    # Anthropic sometimes returns a bare "Error" message when context is too large.
+    # A response is generic only when *all* populated message fields are generic;
+    # a descriptive sibling ``detail`` must not be hidden by an envelope "Error".
+    err_body_messages = []
+    has_structured_body_message = False
     if isinstance(body, dict):
         err_obj = body.get("error", {})
         if isinstance(err_obj, dict):
-            err_body_msg = str(err_obj.get("message") or "").strip().lower()
-        # Responses API (and some providers) use flat body: {"message": "..."}
-        if not err_body_msg:
-            err_body_msg = str(body.get("message") or "").strip().lower()
-    is_generic = len(err_body_msg) < 30 or err_body_msg in {"error", ""}
+            nested_value = err_obj.get("message")
+            if isinstance(nested_value, str):
+                nested_message = nested_value.strip().lower()
+                if nested_message:
+                    err_body_messages.append(("message", nested_message))
+            elif nested_value is not None:
+                has_structured_body_message = True
+        flat_value = body.get("message")
+        if isinstance(flat_value, str):
+            flat_message = flat_value.strip().lower()
+            if flat_message and ("message", flat_message) not in err_body_messages:
+                err_body_messages.append(("message", flat_message))
+        elif flat_value is not None:
+            has_structured_body_message = True
+        detail_value = body.get("detail")
+        if isinstance(detail_value, str):
+            detail_message = detail_value.strip().lower()
+            if detail_message:
+                err_body_messages.append(("detail", detail_message))
+        elif detail_value is not None:
+            has_structured_body_message = True
+
+    generic_detail_placeholders = {
+        "error",
+        "bad request",
+        "invalid request",
+        "request failed",
+    }
+    is_generic = not has_structured_body_message and (
+        not err_body_messages
+        or all(
+            message in generic_detail_placeholders
+            if source == "detail"
+            else len(message) < 30 or message == "error"
+            for source, message in err_body_messages
+        )
+    )
     # Absolute token/message-count thresholds are only a proxy for smaller
     # context windows.  Large-context sessions can have many messages while
     # still being far below their actual token budget.
@@ -1639,16 +1690,32 @@ def _extract_error_code(body: dict) -> str:
 
 def _extract_message(error: Exception, body: dict) -> str:
     """Extract the most informative error message."""
-    # Try structured body first
+    # Try structured body first. Prefer a specific sibling message over a
+    # generic envelope placeholder, while preserving the established nested →
+    # flat → detail precedence when more than one specific message exists.
+    candidates = []
     if body:
         error_obj = body.get("error", {})
         if isinstance(error_obj, dict):
             msg = error_obj.get("message", "")
             if isinstance(msg, str) and msg.strip():
-                return msg.strip()[:500]
-        msg = body.get("message", "")
-        if isinstance(msg, str) and msg.strip():
-            return msg.strip()[:500]
+                candidates.append(msg.strip())
+        for key in ("message", "detail"):
+            msg = body.get(key, "")
+            if isinstance(msg, str) and msg.strip() and msg.strip() not in candidates:
+                candidates.append(msg.strip())
+
+    generic_placeholders = {
+        "error",
+        "bad request",
+        "invalid request",
+        "request failed",
+    }
+    for candidate in candidates:
+        if candidate.lower() not in generic_placeholders:
+            return candidate[:500]
+    if candidates:
+        return candidates[0][:500]
     # Fallback to str(error)
     return str(error)[:500]
 
