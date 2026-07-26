@@ -635,6 +635,26 @@ class TestPluginHooks:
     def test_valid_hooks_include_pre_gateway_dispatch(self):
         assert "pre_gateway_dispatch" in VALID_HOOKS
 
+    def test_valid_hooks_include_post_auth_gateway_dispatch(self):
+        assert "post_auth_gateway_dispatch" in VALID_HOOKS
+
+    @pytest.mark.asyncio
+    async def test_async_hook_awaits_callbacks_and_isolates_failures(self, tmp_path, monkeypatch):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir, "async_dispatch_plugin",
+            register_body=(
+                "async def callback(**kw):\n"
+                "        return {'action': 'reply', 'text': 'fast'}\n"
+                "    ctx.register_hook('post_auth_gateway_dispatch', callback)"
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        results = await mgr.invoke_hook_async("post_auth_gateway_dispatch", event=object())
+        assert results == [{"action": "reply", "text": "fast"}]
+
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
         """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"

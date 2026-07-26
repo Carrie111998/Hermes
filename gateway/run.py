@@ -12474,6 +12474,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        # Authenticated fast-path plugins run only after authorization,
+        # slash-command/control handling, lobby routing, and drain checks.
+        # This is deliberately awaitable so a bounded network lookup can
+        # return directly without creating or inflating an agent session.
+        if not is_internal:
+            try:
+                from hermes_cli.plugins import invoke_hook_async as _invoke_hook_async
+
+                _post_auth_results = await _invoke_hook_async(
+                    "post_auth_gateway_dispatch",
+                    event=event,
+                    gateway=self,
+                    session_store=self.session_store,
+                    session_key=_quick_key,
+                    adapter=self._adapter_for_source(source),
+                )
+            except Exception as _hook_exc:
+                logger.warning("post_auth_gateway_dispatch invocation failed: %s", _hook_exc)
+                _post_auth_results = []
+
+            for _result in _post_auth_results:
+                if not isinstance(_result, dict):
+                    continue
+                _action = str(_result.get("action", "")).strip().lower()
+                if _action == "reply":
+                    _reply = _result.get("text")
+                    if isinstance(_reply, str):
+                        return _reply
+                if _action == "skip":
+                    logger.info(
+                        "post_auth_gateway_dispatch skip: reason=%s session=%s",
+                        _result.get("reason"),
+                        _quick_key,
+                    )
+                    return None
+                if _action == "rewrite":
+                    _new_text = _result.get("text")
+                    if isinstance(_new_text, str):
+                        event = dataclasses.replace(event, text=_new_text)
+                        source = event.source
+                    break
+                if _action == "allow":
+                    break
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,

@@ -177,3 +177,38 @@ async def test_internal_events_bypass_hook(monkeypatch):
     # Even though the hook would say skip, internal events bypass it.
     await runner._handle_message(event)
     assert called["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_post_auth_hook_replies_without_starting_agent(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_async_hook(name, **kwargs):
+        assert name == "post_auth_gateway_dispatch"
+        assert kwargs["session_key"]
+        return [{"action": "reply", "text": "fast answer"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(side_effect=AssertionError("agent must not start"))
+
+    assert await runner._handle_message(_make_event("quick search")) == "fast answer"
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_auth_hook_is_not_called_for_unauthorized_sender(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    called = {"count": 0}
+
+    async def _fake_async_hook(name, **kwargs):
+        called["count"] += 1
+        return [{"action": "reply", "text": "unsafe"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.pairing_store.generate_code.return_value = None
+
+    assert await runner._handle_message(_make_event("quick search")) is None
+    assert called["count"] == 0

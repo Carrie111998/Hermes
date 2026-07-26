@@ -3369,6 +3369,22 @@ class TestTransientTransportRetry:
         assert primary.chat.completions.create.call_count == 2
         assert fb_client.chat.completions.create.call_count == 1
 
+    def test_transient_retry_policy_receives_auxiliary_task_name(self):
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create.side_effect = Exception("connection reset by peer")
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=0) as retry_count,
+            patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")),
+            patch("agent.auxiliary_client._try_main_agent_model_fallback", return_value=(None, None, None)),
+            pytest.raises(Exception, match="connection reset"),
+        ):
+            call_llm(task="kyss_fast_lane", messages=[{"role": "user", "content": "hi"}])
+        retry_count.assert_called_once_with("kyss_fast_lane")
+        assert primary.chat.completions.create.call_count == 1
+
     def test_compression_skips_same_provider_retry_on_timeout(self):
         """A timeout on the critical compression path must NOT retry the same
         provider (that doubles the user-visible stall, issue #54465) — it

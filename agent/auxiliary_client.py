@@ -3371,11 +3371,12 @@ _DEFAULT_TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0
 
 
-def _transient_retry_count() -> int:
+def _transient_retry_count(task: Optional[str] = None) -> int:
     """Number of same-provider retries for a transient transport blip.
 
-    Read from ``auxiliary.transient_retries`` in config.yaml (default 2 →
-    3 total attempts). Clamped to [0, 6] to bound worst-case wall time. A
+    Read first from ``auxiliary.<task>.transient_retries``, then from the
+    global ``auxiliary.transient_retries`` in config.yaml (default 2 → 3 total
+    attempts). Clamped to [0, 6] to bound worst-case wall time. A
     connection blip to a pinned auxiliary target (e.g. a MoA reference
     advisor) has no meaningful provider fallback, so a couple of retries with
     backoff is the difference between recovering and silently losing the call.
@@ -3384,7 +3385,10 @@ def _transient_retry_count() -> int:
     try:
         from hermes_cli.config import cfg_get, load_config
 
-        val = cfg_get(load_config(), "auxiliary", "transient_retries")
+        config = load_config()
+        val = cfg_get(config, "auxiliary", task, "transient_retries") if task else None
+        if val is None:
+            val = cfg_get(config, "auxiliary", "transient_retries")
         if val is None:
             return _DEFAULT_TRANSIENT_RETRIES
         n = int(val)
@@ -7906,7 +7910,7 @@ def call_llm(
                     transient_err,
                 )
                 raise
-            _max_transient_retries = _transient_retry_count()
+            _max_transient_retries = _transient_retry_count(task)
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
                 _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
