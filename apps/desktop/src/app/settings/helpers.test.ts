@@ -84,9 +84,6 @@ describe('settings helpers', () => {
       expect(schemaKeyToFieldCopyKey('model_context_length')).toBe('modelContextLength')
       expect(schemaKeyToFieldCopyKey('display.show_reasoning')).toBe('display.showReasoning')
       expect(schemaKeyToFieldCopyKey('tool_output.max_line_length')).toBe('toolOutput.maxLineLength')
-      expect(schemaKeyToFieldCopyKey('updates.non_interactive_local_changes')).toBe(
-        'updates.nonInteractiveLocalChanges'
-      )
     })
 
     it('looks up camelCase field copy by schema key with legacy fallback', () => {

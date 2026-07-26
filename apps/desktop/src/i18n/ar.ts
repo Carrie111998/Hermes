@@ -541,8 +541,7 @@ export const ar = defineLocale({
       'delegation.maxIterations': 'حد دورات الوكيل الفرعي',
       'delegation.maxConcurrentChildren': 'الوكلاء الفرعيون المتوازيون',
       'delegation.childTimeoutSeconds': 'مهلة الوكيل الفرعي',
-      'delegation.reasoningEffort': 'جهد تفكير الوكيل الفرعي',
-      'updates.nonInteractiveLocalChanges': 'تغييرات التحديث داخل التطبيق'
+      'delegation.reasoningEffort': 'جهد تفكير الوكيل الفرعي'
     },
     fieldDescriptions: {
       model: 'يستخدم في المحادثات الجديدة ما لم تختر نموذجاً مختلفاً من محرر الرسائل.',
@@ -575,9 +574,7 @@ export const ar = defineLocale({
       'tts.xai.language': 'رمز لغة النطق، مثل en.',
       'tts.neutts.device': 'جهاز الاستدلال المحلي لـ NeuTTS.',
       'stt.enabled': 'يفعل التفريغ الصوتي المحلي أو عبر مزود.',
-      'stt.elevenlabs.languageCode': 'رمز لغة ISO-639-3 اختياري. اتركه فارغاً للاكتشاف التلقائي.',
-      'updates.nonInteractiveLocalChanges':
-        'عندما يحدّث Hermes نفسه من التطبيق دون موجه طرفية، احتفظ بتعديلات المصدر المحلية أو تجاهلها.'
+      'stt.elevenlabs.languageCode': 'رمز لغة ISO-639-3 اختياري. اتركه فارغاً للاكتشاف التلقائي.'
     },
     about: {
       heading: 'حول Hermes',

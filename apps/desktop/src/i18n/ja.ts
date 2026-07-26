@@ -540,9 +540,6 @@ export const ja = defineLocale({
         maxConcurrentChildren: '並列サブエージェント',
         childTimeoutSeconds: 'サブエージェントタイムアウト',
         reasoningEffort: 'サブエージェント推論強度'
-      },
-      updates: {
-        nonInteractiveLocalChanges: 'アプリ内更新時のローカル変更'
       }
     }),
     fieldDescriptions: defineFieldCopy({
@@ -601,10 +598,6 @@ export const ja = defineLocale({
         elevenlabs: {
           languageCode: '任意の ISO-639-3 言語コードです。空欄なら ElevenLabs が自動検出します。'
         }
-      },
-      updates: {
-        nonInteractiveLocalChanges:
-          'アプリから Hermes 自身を更新するとき、ローカルのソース変更を保持するか破棄するかを選びます。ターミナル更新では常に確認されます。'
       }
     }),
     about: {

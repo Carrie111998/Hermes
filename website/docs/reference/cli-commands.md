@@ -1622,7 +1622,7 @@ hermes update [--gateway] [--check] [--no-backup] [--backup] [--yes]
 
 Pulls the latest `hermes-agent` code and reinstalls dependencies in the managed venv, then re-runs the post-install hooks (MCP servers, skills sync, completion install). Safe to run on a live install. Use `--check` to see whether your checkout is behind `origin/main` without installing.
 
-`hermes update` pulls the configured update branch (default: `main`). If your checkout is on another branch, Hermes may check out the update branch before pulling. Commit branch work before updating when you want to keep it outside the update autostash flow.
+`hermes update` pulls the configured update branch (default: `main`). If your checkout is on another branch, Hermes may check out the update branch before pulling. The checkout must be clean, and neither the current branch nor the requested target branch may contain commits absent from its matching `origin/` branch.
 
 | Option | Description |
 |--------|-------------|
@@ -1630,16 +1630,16 @@ Pulls the latest `hermes-agent` code and reinstalls dependencies in the managed 
 | `--check` | Check whether an update is available without pulling, installing dependencies, or restarting anything. |
 | `--no-backup` | Skip all pre-update backups for this run (both the quick state snapshot and the full zip), regardless of `updates.pre_update_backup`. |
 | `--backup` | Force a **full** pre-update backup for this run: the quick state snapshot plus a complete zip of `HERMES_HOME` (config, auth, sessions, skills, pairing data). The default mode is `quick` — a lightweight state snapshot only. Set the permanent mode via `updates.pre_update_backup: quick | full | off` in `config.yaml`. |
-| `--yes`, `-y` | Assume yes for interactive prompts such as config migration and stash restore. API-key entry is skipped; run `hermes config migrate` separately for those. |
+| `--yes`, `-y` | Assume yes for interactive prompts such as config migration. API-key entry is skipped; run `hermes config migrate` separately for those. |
 
 Additional behavior:
 
 - **Gateway restart.** After a successful update, Hermes attempts to restart all running gateway profiles automatically so they pick up the new code. Use `hermes gateway restart` when you want to restart a gateway without applying an update.
-- **Local source changes.** For git installs, dirty tracked files and untracked files are auto-stashed before branch checkout or pull (`git stash push --include-untracked`). Interactive terminal updates ask before restoring the stash. Non-interactive updates restore it by default; set `updates.non_interactive_local_changes: discard` only on managed installs where local source edits should be thrown away after a successful pull. If stash restore conflicts or the pull fails, the stash is left in place for manual recovery.
-- **npm lockfile churn.** Before stashing or switching branches, Hermes makes a best-effort cleanup of tracked `package-lock.json` diffs produced by npm install/build steps. Commit or manually stash intentional lockfile edits before running `hermes update`.
+- **Local source work (Git installs).** After refreshing the target and current branch refs, Hermes refuses the update when the checkout has dirty tracked files, untracked files, or commits on either the current branch or requested target branch that are absent from its matching `origin/` branch. Detached HEAD compares against the update target. It exits before branch checkout, pull, or reset; Hermes does not clean or auto-stash source changes. Terminal, `--yes`, desktop, and gateway `/update` use the same Git guard. Windows ZIP installs use a separate ZIP replacement path and are not covered by this Git preflight.
+- **npm lockfile churn.** A modified `package-lock.json` is treated as local work and is not discarded automatically. Review or restore it yourself, then rerun the update from a clean checkout.
 - **Pairing data snapshot.** Even when `--backup` is off, `hermes update` takes a lightweight snapshot of `~/.hermes/pairing/` and the Feishu comment rules before `git pull`. You can roll it back with `hermes backup restore --state pre-update` if a pull rewrites a file you were editing.
 - **Legacy `hermes.service` warning.** If Hermes detects a pre-rename `hermes.service` systemd unit (instead of the current `hermes-gateway.service`), it prints a one-time migration hint so you can avoid flap-loop issues.
-- **Exit codes.** `0` on success, `1` on pull/install/post-install errors, `2` on unexpected working-tree changes that block `git pull`.
+- **Exit codes.** `0` on success, `1` on pull/install/post-install errors, `2` when local work or an unverifiable Git state blocks the update.
 
 ## Maintenance commands
 

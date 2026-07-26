@@ -4,8 +4,6 @@ Covers:
   1. argparse parses the flag
   2. Config-migration prompt is auto-answered (no input() call) and migrate_config
      runs with interactive=False so API-key prompts are skipped
-  3. Autostash restore prompt is auto-answered (prompt_for_restore == False, no
-     input() call) and the stash is applied automatically
 """
 
 import subprocess
@@ -15,9 +13,7 @@ from unittest.mock import patch
 from hermes_cli.main import cmd_update
 
 
-def _make_run_side_effect(
-    branch="main", verify_ok=True, commit_count="1", dirty=False
-):
+def _make_run_side_effect(branch="main", verify_ok=True, commit_count="1"):
     """Minimal subprocess.run side_effect for the update flow."""
 
     def side_effect(cmd, **kwargs):
@@ -33,14 +29,8 @@ def _make_run_side_effect(
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=f"{commit_count}\n", stderr=""
             )
-        # `git status --porcelain` for dirty-tree detection during autostash.
+        # Clean local-work guard result.
         if "status" in joined and "--porcelain" in joined:
-            out = " M hermes_cli/main.py\n" if dirty else ""
-            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
-        # `git stash list` — return a stash ref when dirty (so _stash_local_changes
-        # gets something to return). _stash_local_changes_if_needed is what we
-        # actually patch in tests that exercise restore, so this is a catch-all.
-        if "stash" in joined and "list" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -130,8 +120,3 @@ class TestUpdateYesConfigMigration:
             assert mock_input.called
             prompts = [c.args[0] if c.args else "" for c in mock_input.call_args_list]
             assert any("configure them now" in p for p in prompts)
-
-
-class TestUpdateYesStashRestore:
-    """--yes auto-restores the pre-update autostash without prompting."""
-

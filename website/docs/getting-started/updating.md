@@ -25,11 +25,12 @@ This pulls the latest code from `main`, updates dependencies, and prompts you to
 When you run `hermes update`, the following steps occur:
 
 1. **Pre-update snapshot** — a lightweight state snapshot is saved by default (covers pairing data, cron jobs, `config.yaml`, `.env`, `auth.json`, and other state files that get modified at runtime; individual files over 1 GiB are skipped so a large sessions DB never slows the update down). Controlled by `updates.pre_update_backup` (`quick` by default, `full` for a zip of all of `HERMES_HOME`, `off` to disable). Recoverable via the snapshot restore flow described under [Snapshots and rollback](../user-guide/checkpoints-and-rollback.md).
-2. **Git pull** — pulls the latest code from the `main` branch and updates submodules
-3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the eight critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
-4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
-5. **Config migration** — detects new config options added since your version and prompts you to set them
-6. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
+2. **Local-work preflight (Git installs)** — refreshes the target and current branch refs, then stops if the checkout has uncommitted files or if either the current branch or requested target branch has commits absent from its matching `origin/` branch. This happens before branch checkout, pull, or reset; Hermes does not clean or auto-stash source changes.
+3. **Git pull** — pulls the latest code from the `main` branch and updates submodules
+4. **Post-pull syntax validation + safe rollback** — after the pull, Hermes compiles the eight critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes rechecks for local work and uses `git reset --keep <pre-pull-sha>` so Git refuses to overwrite a late edit. Re-run `hermes update` once the upstream fix lands.
+5. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
+6. **Config migration** — detects new config options added since your version and prompts you to set them
+7. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
 
 ### Updating against a non-default branch: `--branch`
 
@@ -40,25 +41,19 @@ hermes update --branch release-candidate
 hermes update --check --branch experimental   # preview behindness only
 ```
 
-If your local checkout is on a different branch, Hermes auto-stashes any uncommitted work, switches HEAD to the target branch, and then pulls. Branches that don't exist locally are auto-tracked from `origin/<name>` (`git checkout -B <name> origin/<name>`). Branches that don't exist anywhere fail cleanly — your stashed changes are restored before exit so you're never stranded in a weird state. The `main`-only fork-upstream sync logic is automatically skipped on non-`main` branches.
+If your local checkout is on a different branch, Hermes first verifies that it has no uncommitted files and that neither the current branch nor the requested target branch has commits absent from its matching `origin/` branch. Local work stops the update with exit code 2. A clean checkout can switch to the target branch and pull. Branches that don't exist locally are created as tracking branches from `origin/<name>` (`git checkout --track -b <name> origin/<name>`). The `main`-only fork-upstream sync logic is automatically skipped on non-`main` branches.
 
-### Local changes on non-interactive updates
+### Local source work
 
-When you run `hermes update` in a terminal, Hermes stashes any uncommitted source-tree changes, pulls, then **asks** whether to restore them — exactly as it always has. Nothing changes for interactive updates.
+For Git installs, terminal, `--yes`, desktop, and gateway-triggered updates use the same guard. After refreshing the target and current remote branch refs, Hermes checks for both forms of local work:
 
-When the update runs **without a terminal** — from the desktop/chat app's "Update" button or a gateway-triggered update — there's no prompt to answer. The `updates.non_interactive_local_changes` setting decides what happens to your stashed changes:
+- dirty tracked files or untracked files;
+- commits in `HEAD` that are absent from the current branch's matching `origin/` branch (or the update target when HEAD is detached);
+- commits on the requested local target branch that are absent from `origin/<target>`.
 
-```yaml
-# ~/.hermes/config.yaml
-updates:
-  non_interactive_local_changes: stash   # default: keep + auto-restore
-  # non_interactive_local_changes: discard  # throw local source edits away
-```
+Either condition stops the update before branch checkout, pull, or reset. Hermes does not clean or auto-stash source changes. Review the paths with `git status --short` and use the exact `git log` command Hermes prints for local commits. Preserve or move that work, then update from a clean checkout.
 
-- `stash` (default) — auto-stash, pull, then auto-restore your changes on top of the updated code. Nothing is lost; if a restore hits conflicts they're preserved in a git stash for manual recovery.
-- `discard` — auto-stash and drop the stash after the pull, so the update always lands on a clean tree. Use this only on machines where you never intend to keep local edits to the Hermes source. It stash-drops (not `git reset --hard` + `git clean -fd`), so ignored paths like `node_modules`, `venv`, and build outputs are never touched.
-
-In the desktop app this is **Settings → Advanced → In-App Update Local Changes**.
+Windows ZIP installs do not have Git history and use the separate ZIP replacement updater, so this Git preflight does not apply to them.
 
 ### Preview-only: `hermes update --check`
 

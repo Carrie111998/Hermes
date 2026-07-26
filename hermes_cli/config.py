@@ -3363,22 +3363,6 @@ DEFAULT_CONFIG = {
         # Values below 1 are floored to 1 — the backup just created is
         # always preserved. The quick snapshot always keeps exactly 1.
         "backup_keep": 5,
-        # What `hermes update` does with uncommitted local changes to the
-        # source tree when it runs NON-interactively — i.e. triggered from
-        # the desktop/chat app or the gateway, where there's no TTY to answer
-        # a restore prompt. Interactive (terminal) updates are unaffected:
-        # they always stash the changes and ask whether to restore, exactly
-        # as they always have.
-        #   "stash"   — auto-stash the changes, pull, then auto-restore them
-        #               on top of the updated code (the safe default; nothing
-        #               is ever lost — conflicts are preserved in a git stash).
-        #   "discard" — auto-stash the changes and throw the stash away after
-        #               the pull. Use this only if you never intend to keep
-        #               local edits to the source tree on this machine.
-        #               Stash-and-drop (not `reset --hard` + `clean -fd`) so
-        #               ignored paths — node_modules, venv, build outputs —
-        #               are never touched.
-        "non_interactive_local_changes": "stash",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example

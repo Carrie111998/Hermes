@@ -4795,8 +4795,8 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
     Writes a prompt marker file so the gateway can forward the question to the
     user, then polls for a response file.  Falls back to *default* on timeout.
 
-    Used by ``hermes update --gateway`` so interactive prompts (stash restore,
-    config migration) are forwarded to the messenger instead of being silently
+    Used by ``hermes update --gateway`` so remaining interactive prompts such as
+    config migration are forwarded to the messenger instead of being silently
     skipped.
     """
     import json as _json
@@ -7488,336 +7488,6 @@ def _update_via_zip(args):
         _kill_stale_dashboard_processes(restart_managed=True)
 
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
-    status = subprocess.run(
-        git_cmd + ["status", "--porcelain"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-        check=True,
-    )
-    if not status.stdout.strip():
-        return None
-
-    # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
-    # git stash will fail with "needs merge / could not write index".  Clear the
-    # conflict state with `git reset` so the stash can proceed.  Working-tree
-    # changes are preserved; only the index conflict markers are dropped.
-    unmerged = subprocess.run(
-        git_cmd + ["ls-files", "--unmerged"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if unmerged.stdout.strip():
-        print("→ Clearing unmerged index entries from a previous conflict...")
-        subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
-
-    from datetime import datetime, timezone
-
-    stash_name = datetime.now(timezone.utc).strftime(
-        "hermes-update-autostash-%Y%m%d-%H%M%S"
-    )
-    print("→ Local changes detected — stashing before update...")
-    prev_stash = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
-    push = subprocess.run(
-        git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if push.stdout.strip():
-        print(push.stdout.strip())
-    stash_probe = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    stash_ref = stash_probe.stdout.strip()
-    stash_created = (
-        stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
-    )
-
-    if push.returncode != 0:
-        if stash_created:
-            # git stash push exits non-zero when it saved everything but could
-            # not delete some swept untracked files from the working tree
-            # (e.g. a root-owned directory: "warning: failed to remove ...:
-            # Permission denied").  The stash entry is complete — the changes
-            # are safe — so this is not a failure.  Leave the undeletable
-            # files in place and continue the update.
-            if push.stderr.strip():
-                print(push.stderr.strip())
-            print(
-                "  ⚠ Some untracked files could not be removed from the "
-                "working tree (permission denied)."
-            )
-            print(
-                "    They were still saved to the stash and were left in "
-                "place — the update will continue."
-            )
-            # A partially-failed stash push also aborts its working-tree
-            # cleanup for TRACKED modifications — they are saved in the stash
-            # but still dirty the tree, which would break the checkout/pull
-            # that follows. Safe to reset: everything is in the stash entry.
-            subprocess.run(
-                git_cmd + ["reset", "--hard", "HEAD"],
-                cwd=cwd,
-                capture_output=True,
-            )
-        else:
-            # No stash entry was created: the changes were NOT saved.  This
-            # is a real failure — bail out before the update touches HEAD.
-            print("✗ Could not stash local changes — update aborted.")
-            if push.stderr.strip():
-                print(f"  {push.stderr.strip().splitlines()[0]}")
-            print(
-                "  Commit, stash, or clean up your local changes manually, "
-                "then re-run `hermes update`."
-            )
-            raise subprocess.CalledProcessError(
-                push.returncode, push.args, output=push.stdout, stderr=push.stderr
-            )
-
-    return stash_ref
-
-
-def _resolve_stash_selector(
-    git_cmd: list[str], cwd: Path, stash_ref: str
-) -> Optional[str]:
-    stash_list = subprocess.run(
-        git_cmd + ["stash", "list", "--format=%gd %H"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-        check=True,
-    )
-    for line in stash_list.stdout.splitlines():
-        selector, _, commit = line.partition(" ")
-        if commit.strip() == stash_ref:
-            return selector.strip()
-    return None
-
-
-def _print_stash_cleanup_guidance(
-    stash_ref: str, stash_selector: Optional[str] = None
-) -> None:
-    print(
-        "  Check `git status` first so you don't accidentally reapply the same change twice."
-    )
-    print("  Find the saved entry with: git stash list --format='%gd %H %s'")
-    if stash_selector:
-        print(f"  Remove it with: git stash drop {stash_selector}")
-    else:
-        print(
-            f"  Look for commit {stash_ref}, then drop its selector with: git stash drop stash@{{N}}"
-        )
-
-
-def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
-    """True when a ``git stash apply`` failure is ONLY about untracked files
-    that already exist in the working tree.
-
-    This is the tail end of the permission-denied autostash class: ``git stash
-    push --include-untracked`` swept undeletable files (e.g. a root-owned
-    ``packaging/`` directory) into the stash but could not remove them from
-    disk.  On restore, git applies all tracked changes, then refuses to
-    overwrite those still-present files (``already exists, no checkout`` /
-    ``could not restore untracked files from stash``) and exits non-zero even
-    though nothing was lost.  Any other error line (e.g. ``would be
-    overwritten by merge`` / ``Aborting``) means the tracked apply itself
-    failed and this returns False.
-    """
-    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
-    if not lines:
-        return False
-    saw_untracked_error = False
-    for ln in lines:
-        if "already exists, no checkout" in ln:
-            saw_untracked_error = True
-        elif "could not restore untracked files from stash" in ln:
-            saw_untracked_error = True
-        elif ln.startswith(("warning:", "hint:")):
-            continue
-        else:
-            return False
-    return saw_untracked_error
-
-
-def _restore_stashed_changes(
-    git_cmd: list[str],
-    cwd: Path,
-    stash_ref: str,
-    prompt_user: bool = False,
-    input_fn=None,
-) -> bool:
-    if prompt_user:
-        print()
-        print("⚠ Local changes were stashed before updating.")
-        print(
-            "  Restoring them may reapply local customizations onto the updated codebase."
-        )
-        print("  Review the result afterward if Hermes behaves unexpectedly.")
-        print("Restore local changes now? [Y/n]")
-        if input_fn is not None:
-            response = input_fn("Restore local changes now? [Y/n]", "y")
-        else:
-            response = input().strip().lower()
-        if response not in {"", "y", "yes"}:
-            print("Skipped restoring local changes.")
-            print("Your changes are still preserved in git stash.")
-            print(f"Restore manually with: git stash apply {stash_ref}")
-            return False
-
-    print("→ Restoring local changes...")
-    restore = subprocess.run(
-        git_cmd + ["stash", "apply", stash_ref],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-
-    # Check for unmerged (conflicted) files — can happen even when returncode is 0
-    unmerged = subprocess.run(
-        git_cmd + ["diff", "--name-only", "--diff-filter=U"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    has_conflicts = bool(unmerged.stdout.strip())
-
-    if restore.returncode != 0 and not has_conflicts and (
-        _stash_apply_failed_only_on_existing_untracked(restore.stderr)
-    ):
-        # Permission-denied autostash tail end: the tracked changes applied
-        # cleanly; the only "failure" is untracked files that never left the
-        # working tree (git could not delete them at stash time, so it now
-        # refuses to overwrite them). Their content was never touched —
-        # nothing is lost. Treat as restored.
-        print(
-            "  ⚠ Some stashed untracked files already exist in the working "
-            "tree and were kept as-is."
-        )
-    elif restore.returncode != 0 or has_conflicts:
-        print("✗ Update pulled new code, but restoring local changes hit conflicts.")
-        if restore.stdout.strip():
-            print(restore.stdout.strip())
-        if restore.stderr.strip():
-            print(restore.stderr.strip())
-
-        # Show which files conflicted
-        conflicted_files = unmerged.stdout.strip()
-        if conflicted_files:
-            print("\nConflicted files:")
-            for f in conflicted_files.splitlines():
-                print(f"  • {f}")
-
-        print("\nYour stashed changes are preserved — nothing is lost.")
-        print(f"  Stash ref: {stash_ref}")
-
-        # Always reset to clean state — leaving conflict markers in source
-        # files makes hermes completely unrunnable (SyntaxError on import).
-        # The user's changes are safe in the stash for manual recovery.
-        subprocess.run(
-            git_cmd + ["reset", "--hard", "HEAD"],
-            cwd=cwd,
-            capture_output=True,
-        )
-        print("Working tree reset to clean state.")
-        print(f"Restore your changes later with: git stash apply {stash_ref}")
-        # Don't sys.exit — the code update itself succeeded, only the stash
-        # restore had conflicts.  Let cmd_update continue with pip install,
-        # skill sync, and gateway restart.
-        return False
-
-    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
-    if stash_selector is None:
-        print(
-            "⚠ Local changes were restored, but Hermes couldn't find the stash entry to drop."
-        )
-        print(
-            "  The stash was left in place. You can remove it manually after checking the result."
-        )
-        _print_stash_cleanup_guidance(stash_ref)
-    else:
-        drop = subprocess.run(
-            git_cmd + ["stash", "drop", stash_selector],
-            cwd=cwd,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if drop.returncode != 0:
-            print(
-                "⚠ Local changes were restored, but Hermes couldn't drop the saved stash entry."
-            )
-            if drop.stdout.strip():
-                print(drop.stdout.strip())
-            if drop.stderr.strip():
-                print(drop.stderr.strip())
-            print(
-                "  The stash was left in place. You can remove it manually after checking the result."
-            )
-            _print_stash_cleanup_guidance(stash_ref, stash_selector)
-
-    print("⚠ Local changes were restored on top of the updated codebase.")
-    print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
-    return True
-
-
-def _discard_stashed_changes(
-    git_cmd: list[str],
-    cwd: Path,
-    stash_ref: str,
-) -> bool:
-    """Throw away a stash created before an update, without applying it.
-
-    Used only on a NON-interactive update when the user has set
-    ``updates.non_interactive_local_changes: discard`` — i.e. they've opted out
-    of keeping local source edits on this machine. Drops the stash entry
-    instead of re-applying it, so the working tree stays clean at the freshly
-    pulled HEAD. Unlike ``git reset --hard`` + ``git clean -fd``, this only
-    affects what was stashed (tracked changes + the untracked files we
-    explicitly captured) — ignored paths like node_modules/venv/build outputs
-    are never touched, since they were never stashed.
-
-    Returns True if the stash was dropped, False on a git failure (in which
-    case the stash is left in place for safety).
-    """
-    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
-    if stash_selector is None:
-        print(
-            "⚠ Configured to discard local changes on non-interactive update, "
-            "but Hermes couldn't find the stash entry to drop."
-        )
-        _print_stash_cleanup_guidance(stash_ref)
-        return False
-
-    drop = subprocess.run(
-        git_cmd + ["stash", "drop", stash_selector],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if drop.returncode != 0:
-        print(
-            "⚠ Configured to discard local changes, but Hermes couldn't drop "
-            "the saved stash entry."
-        )
-        if drop.stderr.strip():
-            print(f"  {drop.stderr.strip().splitlines()[0]}")
-        _print_stash_cleanup_guidance(stash_ref, stash_selector)
-        return False
-
-    print("→ Discarded local source changes (updates.non_interactive_local_changes=discard).")
-    return True
-
-
 # =========================================================================
 # Fork detection and upstream management for `hermes update`
 # =========================================================================
@@ -8035,6 +7705,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     print("→ Pulling from upstream...")
 
     try:
+        _guard_update_local_work(git_cmd, cwd, "main")
         subprocess.run(
             git_cmd + ["pull", "--ff-only", "upstream", "main"],
             cwd=cwd,
@@ -11140,47 +10811,159 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         )
 
 
-def _discard_lockfile_churn(git_cmd, repo_root):
-    """Restore tracked ``package-lock.json`` files that npm dirtied locally.
+def _guard_update_local_work(
+    git_cmd, repo_root, branch, *, update_already_pulled=False
+):
+    """Stop an update before it can mutate a checkout with local work."""
 
-    npm rewrites lockfiles non-deterministically at install/build time. On a
-    managed install those diffs are never intentional, so we discard them so
-    ``hermes update`` sees a clean tree instead of autostashing every run.
-    Best-effort; only ever touches files named ``package-lock.json``.
-    """
-    try:
-        diff = subprocess.run(
-            git_cmd + ["diff", "--name-only"],
+    def explain_preservation():
+        if update_already_pulled:
+            print("  Hermes did not reset the checkout; late local work was preserved.")
+        else:
+            print("  No source files were cleaned, stashed, switched, pulled, or reset.")
+
+    status = subprocess.run(
+        git_cmd
+        + [
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":(exclude).update-incomplete",
+            ":(exclude).lazy-refresh-incomplete",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if status.returncode != 0:
+        print("✗ Update stopped: Hermes could not verify local work.")
+        explain_preservation()
+        sys.exit(2)
+
+    current = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if current.returncode != 0:
+        print("✗ Update stopped: Hermes could not identify the current branch.")
+        explain_preservation()
+        sys.exit(2)
+    current_branch = current.stdout.strip()
+    comparison_branch = branch if current_branch == "HEAD" else current_branch
+    comparison_ref = f"origin/{comparison_branch}"
+
+    if comparison_branch != branch:
+        comparison_refspec = (
+            f"+refs/heads/{comparison_branch}:"
+            f"refs/remotes/origin/{comparison_branch}"
+        )
+        refresh = subprocess.run(
+            git_cmd + ["fetch", "origin", comparison_refspec],
             cwd=repo_root,
             capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-        if diff.returncode != 0:
-            return
-        dirty_package_dirs = {
-            Path(line.strip()).parent
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package.json")
-        }
-        dirty = [
-            line.strip()
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package-lock.json")
-            and Path(line.strip()).parent not in dirty_package_dirs
-        ]
-        if not dirty:
-            return
-        subprocess.run(
-            git_cmd + ["checkout", "--", *dirty],
+        if refresh.returncode != 0:
+            print(
+                "✗ Update stopped: Hermes could not refresh the current branch safely."
+            )
+            explain_preservation()
+            sys.exit(2)
+
+    def count_local_commits(local_ref, remote_ref):
+        ancestry = subprocess.run(
+            git_cmd + ["merge-base", "--is-ancestor", local_ref, remote_ref],
             cwd=repo_root,
             capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-        print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
-    except Exception:
-        # Never let lockfile cleanup block an update.
-        pass
+        if ancestry.returncode == 0:
+            return 0
+        if ancestry.returncode != 1:
+            print("✗ Update stopped: Hermes could not verify local commit safety.")
+            explain_preservation()
+            sys.exit(2)
+
+        local_commits = subprocess.run(
+            git_cmd + ["rev-list", "--count", f"{remote_ref}..{local_ref}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            count = int(local_commits.stdout.strip())
+        except (TypeError, ValueError):
+            count = -1
+        if local_commits.returncode != 0 or count < 0:
+            print("✗ Update stopped: Hermes could not count local commits safely.")
+            explain_preservation()
+            sys.exit(2)
+        return count
+
+    local_commit_count = count_local_commits("HEAD", comparison_ref)
+    target_commit_count = 0
+    target_local_ref = f"refs/heads/{branch}"
+    if current_branch != branch:
+        target_exists = subprocess.run(
+            git_cmd + ["show-ref", "--verify", "--quiet", target_local_ref],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if target_exists.returncode == 0:
+            target_commit_count = count_local_commits(
+                target_local_ref, f"origin/{branch}"
+            )
+        elif target_exists.returncode != 1:
+            print("✗ Update stopped: Hermes could not inspect the target branch safely.")
+            explain_preservation()
+            sys.exit(2)
+
+    has_uncommitted_work = bool(status.stdout.strip())
+    if (
+        not has_uncommitted_work
+        and local_commit_count == 0
+        and target_commit_count == 0
+    ):
+        return current_branch
+
+    print("✗ Update stopped: this checkout contains local work.")
+    if local_commit_count:
+        suffix = "" if local_commit_count == 1 else "s"
+        print(f"  Committed work: {local_commit_count} local commit{suffix}")
+    if target_commit_count:
+        suffix = "" if target_commit_count == 1 else "s"
+        print(
+            f"  Committed work on target '{branch}': "
+            f"{target_commit_count} local commit{suffix}"
+        )
+    if has_uncommitted_work:
+        print("  Uncommitted work: tracked or untracked files are present")
+    explain_preservation()
+    print("  Review it with: git status --short")
+    print(f"  Review commits with: git log --oneline {comparison_ref}..HEAD")
+    if target_commit_count:
+        print(
+            "  Review target commits with: "
+            f"git log --oneline origin/{branch}..{target_local_ref}"
+        )
+    print(f"  Then update from a clean checkout of origin/{branch}.")
+    sys.exit(2)
 
 
 def cmd_update(args):
@@ -11249,30 +11032,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else None
     )
     assume_yes = bool(getattr(args, "yes", False))
-
-    # Whether this update is running without a human at the keyboard.
-    # Interactive terminal updates always stash-and-ask (unchanged behavior);
-    # only non-interactive updates (desktop/chat app, gateway, `--yes`) consult
-    # the `updates.non_interactive_local_changes` config setting to decide
-    # whether to auto-restore stashed local source changes or throw them away.
-    _non_interactive_update = (
-        gateway_mode
-        or assume_yes
-        or not (sys.stdin.isatty() and sys.stdout.isatty())
-    )
-    discard_local_changes = False
-    if _non_interactive_update:
-        try:
-            from hermes_cli.config import load_config
-
-            _update_cfg = (load_config() or {}).get("updates", {})
-            if isinstance(_update_cfg, dict):
-                _mode = str(_update_cfg.get("non_interactive_local_changes", "stash")).lower()
-                discard_local_changes = _mode == "discard"
-        except Exception as exc:
-            # Never let a config read failure change the safe default.
-            logger.debug("Could not read updates.non_interactive_local_changes: %s", exc)
-            discard_local_changes = False
 
     print("⚕ Updating Hermes Agent...")
     print()
@@ -11358,15 +11117,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Discard npm lockfile churn before any stash/branch logic. npm rewrites
-    # tracked package-lock.json files non-deterministically at install/build
-    # time (platform-specific optional deps, ideallyInert annotations, etc.),
-    # which is never an intentional edit on a managed install but leaves the
-    # tree dirty — forcing an autostash on every update and making branch
-    # switches fragile. Restoring them first lets the common case (only
-    # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, PROJECT_ROOT)
-
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
@@ -11393,10 +11143,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _resolve_update_branch(args)
+        branch_check = subprocess.run(
+            git_cmd + ["check-ref-format", "--branch", branch],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if branch_check.returncode != 0:
+            print(f"✗ Invalid update branch: {branch}")
+            sys.exit(2)
 
         print("→ Fetching updates...")
+        target_refspec = f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch", "origin", target_refspec],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -11418,15 +11180,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
-        # Get current branch (returns literal "HEAD" when detached)
-        result = subprocess.run(
-            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=True,
+        # Fetching only refreshes remote refs. Before the updater switches
+        # branches, pulls, or resets, refuse local source work so the user's
+        # checkout remains byte-for-byte intact.
+        current_branch = _guard_update_local_work(git_cmd, PROJECT_ROOT, branch)
+        original_detached_sha = (
+            _capture_head_sha(git_cmd, PROJECT_ROOT)
+            if current_branch == "HEAD"
+            else None
         )
-        current_branch = result.stdout.strip()
+        if current_branch == "HEAD" and not original_detached_sha:
+            print("✗ Update stopped: Hermes could not preserve the detached HEAD.")
+            sys.exit(2)
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -11440,8 +11205,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else f"branch '{current_branch}'"
             )
             print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            # Recheck immediately before checkout. Git itself also refuses to
+            # overwrite a late uncommitted edit; Hermes never auto-stashes it.
+            _guard_update_local_work(git_cmd, PROJECT_ROOT, branch)
             checkout_result = subprocess.run(
                 git_cmd + ["checkout", branch],
                 cwd=PROJECT_ROOT,
@@ -11449,39 +11215,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if checkout_result.returncode != 0:
-                # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
+                # Recheck before creating a missing local tracking branch. If
+                # the first checkout failed because work appeared after the
+                # previous guard, this stops instead of trying another checkout.
+                _guard_update_local_work(git_cmd, PROJECT_ROOT, branch)
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd
+                    + ["checkout", "--track", "-b", branch, f"origin/{branch}"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
                 if track_result.returncode != 0:
-                    # Restore the user's prior branch + stash before bailing
-                    # so we don't leave them stranded in a weird state.
-                    if auto_stash_ref is not None:
-                        _restore_stashed_changes(
-                            git_cmd,
-                            PROJECT_ROOT,
-                            auto_stash_ref,
-                            prompt_user=False,
-                            input_fn=gw_input_fn,
-                        )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                    print(f"✗ Could not check out branch '{branch}' safely.")
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
-        else:
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-
-        prompt_for_restore = (
-            auto_stash_ref is not None
-            and not assume_yes
-            and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
-        )
 
         # Check if there are updates
         result = subprocess.run(
@@ -11500,23 +11249,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if is_fork and branch == "main":
                 _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
+            # Switch back to the user's original clean branch or detached
+            # commit if we moved only to discover there was nothing to update.
+            if current_branch != branch:
+                restore_target = (
+                    original_detached_sha
+                    if current_branch == "HEAD"
+                    else current_branch
+                )
+                _guard_update_local_work(
                     git_cmd,
                     PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
+                    branch if current_branch == "HEAD" else current_branch,
                 )
-            if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
+                restore_cmd = ["checkout"]
+                if current_branch == "HEAD":
+                    restore_cmd.append("--detach")
+                restore_cmd.append(restore_target)
+                restore_result = subprocess.run(
+                    git_cmd + restore_cmd,
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     check=False,
                 )
+                if restore_result.returncode != 0:
+                    print("✗ Update check finished, but Hermes could not restore")
+                    print(f"  the original checkout: {restore_target}")
+                    sys.exit(1)
 
             # "No new commits" does not mean the managed interpreter is safe.
             # uv can retain the same CPython patch while python-build-standalone
@@ -11605,110 +11365,78 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print(f"→ Found {commit_count} new commit(s)")
 
         print("→ Pulling updates...")
-        update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
         # orphan merge-conflict markers in hermes_cli/config.py bricked
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
-        try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+        # This is the final operation before pull: work created after the
+        # earlier preflight stops here, while Git itself refuses conflicts
+        # that race the check.
+        _guard_update_local_work(git_cmd, PROJECT_ROOT, branch)
+        pull_result = subprocess.run(
+            git_cmd + ["pull", "--ff-only", "origin", branch],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if pull_result.returncode != 0:
+            print("✗ Fast-forward update failed; Hermes did not reset the checkout.")
+            if pull_result.stderr.strip():
+                print(f"  {pull_result.stderr.strip().splitlines()[0]}")
+            print("  Review the branch with git status and git log, then retry.")
+            sys.exit(1)
+
+        # Post-pull syntax guard: validate critical-path files actually
+        # parse before declaring the update successful. If a bad commit
+        # made it through CI (e.g. admin-merge bypass of a failing
+        # ruff check), this catches it on the user side and rolls back
+        # so the CLI stays bootable. The user can then retry ``hermes
+        # update`` later once a fix lands upstream.
+        syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
+            PROJECT_ROOT
+        )
+        if not syntax_ok:
+            print()
+            print("✗ Pulled code has a syntax error in a critical file:")
+            print(f"  {failing_path}")
+            if syntax_error:
+                # py_compile errors can be multi-line; show the first
+                # ~6 lines so the user sees the actual SyntaxError text.
+                for line in str(syntax_error).splitlines()[:6]:
+                    print(f"    {line}")
+            if pre_pull_sha:
+                # Refuse rollback if work appeared after the pull. --keep is
+                # a second safeguard: Git aborts rather than overwriting a
+                # late uncommitted edit.
+                _guard_update_local_work(
+                    git_cmd,
+                    PROJECT_ROOT,
+                    branch,
+                    update_already_pulled=True,
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                print()
+                print(f"→ Rolling back to {pre_pull_sha[:10]}...")
+                rollback_result = subprocess.run(
+                    git_cmd + ["reset", "--keep", pre_pull_sha],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
-                    sys.exit(1)
-
-            # Post-pull syntax guard: validate critical-path files actually
-            # parse before declaring the update successful. If a bad commit
-            # made it through CI (e.g. admin-merge bypass of a failing
-            # ruff check), this catches it on the user side and rolls back
-            # so the CLI stays bootable. The user can then retry ``hermes
-            # update`` later once a fix lands upstream.
-            syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
-                PROJECT_ROOT
-            )
-            if not syntax_ok:
+                if rollback_result.returncode == 0:
+                    print("  ✓ Rollback complete — your install is unchanged.")
+                    print("  Try ``hermes update`` again later once a fix lands.")
+                else:
+                    print("  ✗ Rollback failed. Recover manually with:")
+                    print(f"    cd {PROJECT_ROOT} && git reset --keep {pre_pull_sha}")
+                    if rollback_result.stderr.strip():
+                        print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
+            else:
                 print()
-                print("✗ Pulled code has a syntax error in a critical file:")
-                print(f"  {failing_path}")
-                if syntax_error:
-                    # py_compile errors can be multi-line; show the first
-                    # ~6 lines so the user sees the actual SyntaxError text.
-                    for line in str(syntax_error).splitlines()[:6]:
-                        print(f"    {line}")
-                if pre_pull_sha:
-                    print()
-                    print(f"→ Rolling back to {pre_pull_sha[:10]}...")
-                    rollback_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", pre_pull_sha],
-                        cwd=PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if rollback_result.returncode == 0:
-                        print("  ✓ Rollback complete — your install is unchanged.")
-                        print("  Try ``hermes update`` again later once a fix lands.")
-                    else:
-                        print("  ✗ Rollback failed. Recover manually with:")
-                        print(f"    cd {PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
-                        if rollback_result.stderr.strip():
-                            print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
-                else:
-                    print()
-                    print("  Could not capture pre-pull SHA — recover manually with:")
-                    print(f"    cd {PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
-                sys.exit(1)
-
-            update_succeeded = True
-        finally:
-            if auto_stash_ref is not None:
-                # Don't attempt stash restore if the code update itself failed —
-                # working tree is in an unknown state.
-                if not update_succeeded:
-                    print(
-                        f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
-                    )
-                    print("  Restore manually with: git stash apply")
-                elif discard_local_changes:
-                    # Non-interactive update + user opted into discarding local
-                    # source edits (updates.non_interactive_local_changes:
-                    # discard). Throw the stash away instead of re-applying it.
-                    _discard_stashed_changes(
-                        git_cmd,
-                        PROJECT_ROOT,
-                        auto_stash_ref,
-                    )
-                else:
-                    _restore_stashed_changes(
-                        git_cmd,
-                        PROJECT_ROOT,
-                        auto_stash_ref,
-                        prompt_user=prompt_for_restore,
-                        input_fn=gw_input_fn,
-                    )
+                print("  Could not capture pre-pull SHA — recover manually with:")
+                print(f"    cd {PROJECT_ROOT} && git reflog && git reset --keep <prev-sha>")
+            sys.exit(1)
 
         _invalidate_update_cache()
 

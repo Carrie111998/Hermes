@@ -910,16 +910,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Reasoning effort for delegated subagents",
         "options": ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     },
-    "updates.non_interactive_local_changes": {
-        "type": "select",
-        "description": (
-            "When the chat app / gateway updates Hermes (no terminal prompt), "
-            "what to do with uncommitted local source edits. 'stash' keeps them "
-            "and re-applies them after the update; 'discard' throws them away. "
-            "Terminal updates always ask, regardless of this setting."
-        ),
-        "options": ["stash", "discard"],
-    },
+
     "updates.refresh_cua_driver": {
         "type": "bool",
         "description": (

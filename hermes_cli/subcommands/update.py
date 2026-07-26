@@ -48,7 +48,7 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "-y",
         action="store_true",
         default=False,
-        help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
+        help="Assume yes for interactive prompts such as config migration. Local source work still stops the update. API-key entry is skipped; run 'hermes config migrate' separately for those.",
     )
     update_parser.add_argument(
         "--branch",
@@ -57,8 +57,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help=(
             "Update against this branch instead of the default (main). "
             "If the local checkout is on a different branch, hermes will "
-            "switch to the requested branch first (auto-stashing any "
-            "uncommitted changes)."
+            "switch to the requested branch only after confirming that no "
+            "local source work would be left behind."
         ),
     )
     update_parser.add_argument(

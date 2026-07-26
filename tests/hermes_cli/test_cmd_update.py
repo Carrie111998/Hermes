@@ -742,8 +742,8 @@ class TestCmdUpdateBranchFlag:
         - ``current_branch``  what ``git rev-parse --abbrev-ref HEAD`` returns
         - ``target_branch``   passed via --branch; what we expect the code to switch to
         - ``checkout_fails``  if True, ``git checkout <target>`` returns non-zero
-                              (simulates branch absent locally; code should retry with -B)
-        - ``track_fails``     if True, ``git checkout -B <target> origin/<target>`` ALSO fails
+                              (simulates branch absent locally; code should create a tracking branch)
+        - ``track_fails``     if True, ``git checkout --track -b <target> origin/<target>`` also fails
                               (simulates branch absent on origin too)
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
@@ -754,12 +754,12 @@ class TestCmdUpdateBranchFlag:
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
 
-            if "checkout" in joined and "-B" in joined:
+            if "checkout" in joined and "--track" in joined:
                 rc = 128 if track_fails else 0
                 err = f"fatal: '{target_branch}' did not match any file(s) known to git\n" if track_fails else ""
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
-            if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
+            if "checkout" in joined and "--track" not in joined and "rev-parse" not in joined:
                 rc = 128 if checkout_fails else 0
                 err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
@@ -831,12 +831,12 @@ class TestCmdUpdateBranchFlag:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_branch_flag_tracks_remote_when_branch_absent_locally(self, mock_run, _mock_which, capsys):
-        """If local lacks the branch but origin has it, fall back to ``checkout -B``."""
+        """If local lacks the branch but origin has it, create a tracking branch."""
         mock_run.side_effect = self._branch_side_effect(
             current_branch="main",
             target_branch="bb/gui",
             checkout_fails=True,  # plain checkout fails
-            track_fails=False,    # -B from origin/bb/gui succeeds
+            track_fails=False,    # tracking origin/bb/gui succeeds
             commit_count="2",
         )
         args = SimpleNamespace(branch="bb/gui")
@@ -844,8 +844,8 @@ class TestCmdUpdateBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have BOTH a failed `checkout bb/gui` AND a successful `checkout -B bb/gui origin/bb/gui`
-        track_cmds = [c for c in commands if "checkout" in c and "-B" in c]
+        # Should have both a failed checkout and a new tracking-branch checkout.
+        track_cmds = [c for c in commands if "checkout" in c and "--track" in c]
         assert len(track_cmds) == 1
         assert "bb/gui" in track_cmds[0]
         assert "origin/bb/gui" in track_cmds[0]
@@ -868,7 +868,7 @@ class TestCmdUpdateBranchFlag:
         assert exc_info.value.code == 1
 
         out = capsys.readouterr().out
-        assert "does not exist locally or on origin" in out
+        assert "Could not check out branch" in out
         assert "nonexistent" in out
 
 

@@ -529,9 +529,6 @@ export const zhHant = defineLocale({
         maxConcurrentChildren: '平行子代理',
         childTimeoutSeconds: '子代理逾時',
         reasoningEffort: '子代理推理強度'
-      },
-      updates: {
-        nonInteractiveLocalChanges: '應用程式內更新的本機變更'
       }
     }),
     fieldDescriptions: defineFieldCopy({
@@ -589,10 +586,6 @@ export const zhHant = defineLocale({
         elevenlabs: {
           languageCode: '可選的 ISO-639-3 語言代碼。留空讓 ElevenLabs 自動偵測。'
         }
-      },
-      updates: {
-        nonInteractiveLocalChanges:
-          'Hermes 從應用程式內更新自身時，保留本機原始碼變更（stash）或丟棄（discard）。終端機更新一律會詢問。'
       }
     }),
     about: {

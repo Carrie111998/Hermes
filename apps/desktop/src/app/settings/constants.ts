@@ -354,8 +354,7 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
   'tts.openai.model': ['gpt-4o-mini-tts', 'tts-1', 'tts-1-hd'],
   'tts.elevenlabs.model_id': ['eleven_multilingual_v2', 'eleven_turbo_v2_5', 'eleven_flash_v2_5'],
   // NeuTTS local inference device.
-  'tts.neutts.device': ['cpu', 'cuda', 'mps'],
-  'updates.non_interactive_local_changes': ['stash', 'discard']
+  'tts.neutts.device': ['cpu', 'cuda', 'mps']
 }
 
 // Voice/model name fields render as a free-input combobox (Input + datalist)
@@ -545,9 +544,6 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     maxConcurrentChildren: 'Parallel Subagents',
     childTimeoutSeconds: 'Subagent Timeout',
     reasoningEffort: 'Subagent Reasoning Effort'
-  },
-  updates: {
-    nonInteractiveLocalChanges: 'In-App Update Local Changes'
   }
 })
 
@@ -625,10 +621,6 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     elevenlabs: {
       languageCode: 'Optional ISO-639-3 language code. Blank lets ElevenLabs auto-detect.'
     }
-  },
-  updates: {
-    nonInteractiveLocalChanges:
-      'When Hermes updates itself from the app (no terminal prompt), keep local source edits (stash) or throw them away (discard). Terminal updates always ask.'
   }
 })
 
@@ -773,8 +765,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'delegation.max_iterations',
       'delegation.max_concurrent_children',
       'delegation.child_timeout_seconds',
-      'delegation.reasoning_effort',
-      'updates.non_interactive_local_changes'
+      'delegation.reasoning_effort'
     ]
   }
 ]

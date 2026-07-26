@@ -4,7 +4,6 @@ Tests the new --gateway mode for hermes update, including:
 - _gateway_prompt() file-based IPC
 - _watch_update_progress() output streaming and prompt detection
 - Message interception for update prompt responses
-- _restore_stashed_changes() with input_fn parameter
 """
 
 import json
@@ -142,63 +141,6 @@ class TestGatewayPrompt:
             result = _gateway_prompt("test?", "default_val", timeout=2.0)
 
         assert result == "default_val"
-
-
-# ---------------------------------------------------------------------------
-# _restore_stashed_changes with input_fn
-# ---------------------------------------------------------------------------
-
-
-class TestRestoreStashWithInputFn:
-    """Tests for _restore_stashed_changes with the input_fn parameter."""
-
-    def test_uses_input_fn_when_provided(self, tmp_path):
-        """When input_fn is provided, it's called instead of input()."""
-        from hermes_cli.main import _restore_stashed_changes
-
-        captured_args = []
-
-        def fake_input_fn(prompt, default=""):
-            captured_args.append((prompt, default))
-            return "n"
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout="", stderr=""
-            )
-            result = _restore_stashed_changes(
-                ["git"], tmp_path, "abc123",
-                prompt_user=True,
-                input_fn=fake_input_fn,
-            )
-
-        assert len(captured_args) == 1
-        assert "Restore" in captured_args[0][0]
-        assert result is False  # user declined
-
-    def test_input_fn_yes_proceeds_with_restore(self, tmp_path):
-        """When input_fn returns 'y', stash apply is attempted."""
-        from hermes_cli.main import _restore_stashed_changes
-
-        call_count = [0]
-
-        def fake_run(*args, **kwargs):
-            call_count[0] += 1
-            mock = MagicMock()
-            mock.returncode = 0
-            mock.stdout = ""
-            mock.stderr = ""
-            return mock
-
-        with patch("subprocess.run", side_effect=fake_run):
-            _restore_stashed_changes(
-                ["git"], tmp_path, "abc123",
-                prompt_user=True,
-                input_fn=lambda p, d="": "y",
-            )
-
-        # Should have called git stash apply + git diff --name-only
-        assert call_count[0] >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -727,28 +669,6 @@ class TestUpdatePromptInterception:
 
 class TestCmdUpdateGatewayMode:
     """Tests for cmd_update with --gateway flag."""
-
-    def test_gateway_flag_enables_gateway_prompt_for_stash(self, tmp_path):
-        """With --gateway, stash restore uses _gateway_prompt instead of input()."""
-        from hermes_cli.main import _restore_stashed_changes
-
-        # Use input_fn to verify the gateway path is taken
-        calls = []
-
-        def fake_input(prompt, default=""):
-            calls.append(prompt)
-            return "n"
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            _restore_stashed_changes(
-                ["git"], tmp_path, "abc123",
-                prompt_user=True,
-                input_fn=fake_input,
-            )
-
-        assert len(calls) == 1
-        assert "Restore" in calls[0]
 
     def test_gateway_flag_parsed(self):
         """The --gateway flag is accepted by the update subparser."""
