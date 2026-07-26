@@ -1424,16 +1424,13 @@ CREATE TABLE IF NOT EXISTS dispatcher_ticks (
     reclaimed   INTEGER NOT NULL DEFAULT 0,
     promoted    INTEGER NOT NULL DEFAULT 0,
     spawned     INTEGER NOT NULL DEFAULT 0,
-    skipped_nonspawnable INTEGER NOT NULL DEFAULT 0,
-    skipped_capacity     INTEGER NOT NULL DEFAULT 0,
+    skipped_nonspawnable_ids TEXT NOT NULL DEFAULT '[]',
+    skipped_capacity_ids     TEXT NOT NULL DEFAULT '[]',
     stale_claims_reclaimed INTEGER NOT NULL DEFAULT 0,
-    auto_blocked INTEGER NOT NULL DEFAULT 0,
-    error        TEXT,
-    -- Exact task IDs per skip reason (JSON arrays).  Enables precise
-    -- per-task matching in diagnostics rather than applying aggregate
-    -- counts to every ready task (FD-013).
-    skipped_nonspawnable_ids TEXT,
-    skipped_capacity_ids     TEXT
+    spawned_ids            TEXT NOT NULL DEFAULT '[]',
+    reclaimed_ids          TEXT NOT NULL DEFAULT '[]',
+    auto_blocked_ids       TEXT NOT NULL DEFAULT '[]',
+    error        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_dispatcher_ticks_board
@@ -4047,29 +4044,39 @@ def _record_dispatcher_tick(
 ) -> int:
     """Record a dispatcher tick in the dispatcher_ticks table.
 
-    Stores both aggregate counts and exact per-reason task ID lists.
-    Returns the new row id.  Called from _dispatch_once_locked after a
-    successful tick pass so diagnostics can surface dispatcher health
-    signals with per-task precision (FD-013).
+    Stores exact per-reason task ID lists as JSON arrays so diagnostics
+    can match per-task rather than applying aggregate counts to every
+    ready task (FD-013). Returns the new row id.
     """
+    import json as _json
+
     now = int(time.time())
-    # Build JSON arrays of per-reason task IDs.
-    skipped_nonspawnable_json = json.dumps(
+    skipped_nonspawnable_json = _json.dumps(
         list(result.skipped_nonspawnable) if result.skipped_nonspawnable else [],
     )
-    skipped_capacity_json = json.dumps(
+    skipped_capacity_json = _json.dumps(
         [
             [tid, assignee, count]
             for tid, assignee, count in (result.skipped_per_profile_capped or [])
         ],
     )
+    spawned_json = _json.dumps(
+        [tid for tid, _, _ in (result.spawned or [])],
+    )
+    reclaimed_json = _json.dumps(
+        result.crashed + result.stale + result.timed_out,
+    )
+    auto_blocked_json = _json.dumps(
+        list(result.auto_blocked) if result.auto_blocked else [],
+    )
     cur = conn.execute(
         """INSERT INTO dispatcher_ticks (
             board, started_at, finished_at,
             reclaimed, promoted, spawned,
-            skipped_nonspawnable, skipped_capacity,
-            stale_claims_reclaimed, auto_blocked,
-            error, skipped_nonspawnable_ids, skipped_capacity_ids
+            skipped_nonspawnable_ids, skipped_capacity_ids,
+            stale_claims_reclaimed,
+            spawned_ids, reclaimed_ids, auto_blocked_ids,
+            error
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             board,
@@ -4078,13 +4085,13 @@ def _record_dispatcher_tick(
             result.reclaimed,
             result.promoted,
             len(result.spawned),
-            len(result.skipped_nonspawnable),
-            len(result.skipped_per_profile_capped),
-            len(result.stale),
-            len(result.auto_blocked),
-            error,
             skipped_nonspawnable_json,
             skipped_capacity_json,
+            len(result.stale),
+            spawned_json,
+            reclaimed_json,
+            auto_blocked_json,
+            error,
         ),
     )
     return cur.lastrowid or 0

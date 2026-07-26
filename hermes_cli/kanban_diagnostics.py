@@ -1192,7 +1192,7 @@ def _rule_dispatcher_capacity_wait(
     if not task_matched:
         return []
 
-    skipped_cap = _task_field(last_tick, "skipped_capacity", 0) or 0
+    total_skipped = len(skipped_cap_ids)
 
     return [Diagnostic(
         kind="dispatcher_capacity_wait",
@@ -1222,7 +1222,7 @@ def _rule_dispatcher_capacity_wait(
         data={
             "assignee": assignee,
             "task_id": task_id,
-            "total_skipped_this_tick": skipped_cap,
+            "total_skipped_this_tick": total_skipped,
         },
     )]
 
@@ -1266,7 +1266,7 @@ def _rule_dispatcher_nonspawnable_assignee(
     if created_at and (now - created_at) < ready_threshold:
         return []
 
-    skipped_nonspawnable = _task_field(last_tick, "skipped_nonspawnable", 0) or 0
+    total_skipped = len(nonspawn_ids)
 
     return [Diagnostic(
         kind="dispatcher_nonspawnable_assignee",
@@ -1297,7 +1297,7 @@ def _rule_dispatcher_nonspawnable_assignee(
         data={
             "assignee": assignee,
             "task_id": task_id,
-            "total_skipped_this_tick": skipped_nonspawnable,
+            "total_skipped_this_tick": total_skipped,
         },
     )]
 

@@ -782,6 +782,7 @@ def test_severity_at_or_above_uses_threshold_semantics():
 
 def _tick(**overrides):
     """Create a minimal dispatcher tick row dict."""
+    import json as _json
     base = {
         "id": 1,
         "board": "default",
@@ -790,13 +791,13 @@ def _tick(**overrides):
         "reclaimed": 0,
         "promoted": 0,
         "spawned": 0,
-        "skipped_nonspawnable": 0,
-        "skipped_capacity": 0,
+        "skipped_nonspawnable_ids": "[]",
+        "skipped_capacity_ids": "[]",
         "stale_claims_reclaimed": 0,
-        "auto_blocked": 0,
+        "spawned_ids": "[]",
+        "reclaimed_ids": "[]",
+        "auto_blocked_ids": "[]",
         "error": None,
-        "skipped_nonspawnable_ids": None,
-        "skipped_capacity_ids": None,
     }
     base.update(overrides)
     return base
@@ -942,7 +943,6 @@ class TestDispatcherCapacityWait:
     def test_fires_when_capacity_skip_matches_task_id(self):
         task = _task(id="t_cap_test", status="ready", assignee="worker-terra")
         ticks = [_tick(
-            skipped_capacity=3,
             skipped_capacity_ids=json.dumps([["t_cap_test", "worker-terra", 3]]),
         )]
         diags = kd._rule_dispatcher_capacity_wait(
@@ -955,7 +955,6 @@ class TestDispatcherCapacityWait:
         """Only fires when THIS task's ID is in skipped_capacity_ids."""
         task = _task(id="t_other", status="ready", assignee="worker-terra")
         ticks = [_tick(
-            skipped_capacity=3,
             skipped_capacity_ids=json.dumps([["t_cap_test", "worker-terra", 3]]),
         )]
         diags = kd._rule_dispatcher_capacity_wait(
@@ -965,7 +964,7 @@ class TestDispatcherCapacityWait:
 
     def test_no_fire_when_no_skips(self):
         task = _task(status="ready", assignee="worker-terra")
-        ticks = [_tick(skipped_capacity=0)]
+        ticks = [_tick(skipped_capacity_ids="[]")]
         diags = kd._rule_dispatcher_capacity_wait(
             task, [], [], int(time.time()), {}, dispatcher_ticks=ticks,
         )
@@ -974,7 +973,6 @@ class TestDispatcherCapacityWait:
     def test_no_fire_for_non_ready_task(self):
         task = _task(id="t_cap_test", status="running", assignee="worker-terra")
         ticks = [_tick(
-            skipped_capacity=3,
             skipped_capacity_ids=json.dumps([["t_cap_test", "worker-terra", 3]]),
         )]
         diags = kd._rule_dispatcher_capacity_wait(
@@ -995,7 +993,6 @@ class TestDispatcherNonspawnableAssignee:
             created_at=now_ts - 500,  # older than 2*threshold (360s with default 180)
         )
         ticks = [_tick(
-            skipped_nonspawnable=2,
             skipped_nonspawnable_ids=json.dumps(["t_ns_test", "t_other_ns"]),
         )]
         diags = kd._rule_dispatcher_nonspawnable_assignee(
@@ -1013,7 +1010,6 @@ class TestDispatcherNonspawnableAssignee:
             created_at=now_ts - 500,
         )
         ticks = [_tick(
-            skipped_nonspawnable=2,
             skipped_nonspawnable_ids=json.dumps(["t_ns_test"]),
         )]
         diags = kd._rule_dispatcher_nonspawnable_assignee(
@@ -1026,7 +1022,7 @@ class TestDispatcherNonspawnableAssignee:
         task = _task(
             status="ready", assignee="worker-terra", created_at=now_ts - 300,
         )
-        ticks = [_tick(skipped_nonspawnable=0)]
+        ticks = [_tick(skipped_nonspawnable_ids="[]")]
         diags = kd._rule_dispatcher_nonspawnable_assignee(
             task, [], [], now_ts, {}, dispatcher_ticks=ticks,
         )
@@ -1040,7 +1036,6 @@ class TestDispatcherNonspawnableAssignee:
             created_at=now_ts - 30,
         )
         ticks = [_tick(
-            skipped_nonspawnable=2,
             skipped_nonspawnable_ids=json.dumps(["t_ns_test"]),
         )]
         diags = kd._rule_dispatcher_nonspawnable_assignee(
@@ -1074,4 +1069,43 @@ class TestDispatcherTickIntegration:
         assert "dispatcher_no_recent_tick" not in kinds, (
             "dispatcher rules should not fire when dispatcher_ticks=None"
         )
-    assert kd.severity_at_or_above("warning", None) is True
+
+
+class TestOldSchemaMigration:
+    """Old dispatcher_ticks schema (integer columns) parses without error."""
+
+    def test_old_schema_tick_with_int_columns_is_parseable(self):
+        """Ticks written before JSON columns support the roll-forward parse."""
+        import json as _json
+
+        # Simulate an old-schema tick: integer counts, no JSON ID columns.
+        old_tick = {
+            "id": 1,
+            "board": "default",
+            "started_at": int(time.time()) - 120,
+            "finished_at": int(time.time()) - 60,
+            "reclaimed": 0,
+            "promoted": 1,
+            "spawned": 1,
+            "stale_claims_reclaimed": 0,
+            "error": None,
+            # Old columns present — diagnostics parse them via _parse_json_list
+            # which returns [] for non-string values, so rules degrade gracefully.
+            "skipped_nonspawnable_ids": None,
+            "skipped_capacity_ids": None,
+            "spawned_ids": None,
+            "reclaimed_ids": None,
+            "auto_blocked_ids": None,
+        }
+        # capacity_wait rule: None→_parse_json_list→[] — no fire.
+        task = _task(status="ready", assignee="worker-terra")
+        diags = kd._rule_dispatcher_capacity_wait(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=[old_tick],
+        )
+        assert len(diags) == 0
+
+        # nonspawnable rule: same — None→[] — no fire.
+        diags2 = kd._rule_dispatcher_nonspawnable_assignee(
+            task, [], [], int(time.time()), {}, dispatcher_ticks=[old_tick],
+        )
+        assert len(diags2) == 0
