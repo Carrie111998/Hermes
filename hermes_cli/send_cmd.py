@@ -94,6 +94,25 @@ def _resolve_target(arg_to: Optional[str]) -> Optional[str]:
     return None
 
 
+def _cli_send_allowed() -> tuple[bool, str]:
+    """Return whether the active profile permits side-effecting CLI sends.
+
+    ``hermes send --list`` remains read-only and bypasses this check.  The
+    setting is opt-out for backwards compatibility; worker profiles that must
+    never contact users set ``security.cli_send_enabled: false``.
+    """
+    try:
+        from .config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return True, "security policy unavailable; legacy default enabled"
+    security = config.get("security") if isinstance(config, dict) else None
+    if isinstance(security, dict) and security.get("cli_send_enabled") is False:
+        return False, "security.cli_send_enabled=false"
+    return True, "security.cli_send_enabled not disabled"
+
+
 def _emit_result(
     result_json: str,
     *,
@@ -310,6 +329,15 @@ def cmd_send(args: argparse.Namespace) -> None:
         platform_filter = getattr(args, "message", None)
         exit_code = _list_targets(platform_filter, json_mode=getattr(args, "json", False))
         sys.exit(exit_code)
+
+    allowed, policy_reason = _cli_send_allowed()
+    if not allowed:
+        print(
+            "hermes send: disabled by profile security policy "
+            f"({policy_reason}); no delivery attempted.",
+            file=sys.stderr,
+        )
+        sys.exit(_FAILURE_EXIT)
 
     target = _resolve_target(getattr(args, "to", None))
     if not target:

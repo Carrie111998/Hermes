@@ -141,6 +141,21 @@ def test_quiet_suppresses_stdout(fake_tool, capsys):
 # ---------------------------------------------------------------------------
 
 
+def test_profile_security_can_disable_cli_send(fake_tool, capsys, monkeypatch):
+    monkeypatch.setattr(
+        send_cmd,
+        "_cli_send_allowed",
+        lambda: (False, "security.cli_send_enabled=false"),
+    )
+    args = _parse(["--to", "telegram:8300219302", "must not send"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 1
+    assert fake_tool.calls == []
+    err = capsys.readouterr().err
+    assert "disabled by profile security policy" in err
+
+
 def test_missing_target(fake_tool, capsys, monkeypatch):
     # Ensure stdin is a tty so the CLI does not try to consume it as a body.
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
