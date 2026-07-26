@@ -104,7 +104,8 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   communication,creative,devops,dogfood,email,finance,gaming,health,mcp,migration} = 41.
   Preservados `HermesTokenStorage` (clase), `NousResearch/pokemon-agent` (repo distinto),
   `Nous catalog`. Autores → Digital Services LLC (incl. "Anthropic (adapted by DS LLC)").
-- Sub-lotes skills/ restantes: 11=optional/mlops (30); 12=optional/ resto {payments,
-  productivity,research,security,software-development,web-development} (30).
+- Lote 11 (este commit): `skills/optional/mlops` = 30. Residual limpio.
+- Sub-lote skills/ restante: 12=optional/ resto {payments,productivity,research,security,
+  software-development,web-development} (30) → cierra `skills/` y `user-guide/`.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
