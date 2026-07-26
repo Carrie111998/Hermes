@@ -12003,6 +12003,8 @@ def _try_termux_fast_cli_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=getattr(args, "ignore_rules", False)
+            or getattr(args, "safe_mode", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -13936,7 +13938,8 @@ def main():
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
-            ignore_rules=getattr(args, "ignore_rules", False),
+            ignore_rules=getattr(args, "ignore_rules", False)
+            or getattr(args, "safe_mode", False),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat
