@@ -104,7 +104,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Google Vertex AI provider — OAuth2 token minting for the Gemini
     # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
     # google-auth is NOT in [all] so plain installs don't carry it.
-    "provider.vertex": ("google-auth==2.55.1",),
+    "provider.vertex": (
+        "google-auth==2.55.1",
+        "pyasn1==0.6.4",  # PYSEC-2026-3455/3456/3457
+    ),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
     # service principal, az login, VS Code, azd, PowerShell). Only loaded
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
@@ -161,7 +164,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # uploaded to the Discord gateway fails to decode at att.read() with
     # "Can not decode content-encoding: br" — see #12511 / #15744.
     "platform.discord": (
-        "discord.py[voice]==2.7.1",
+        "discord.py==2.7.1",
+        "davey==0.1.5",
+        "PyNaCl==1.6.2",  # CVE-2025-69277; avoid discord.py[voice]'s <1.6 cap
         "brotlicffi==1.2.0.1",
         # discord.py pulls aiohttp transitively (>=3.7.4,<4) as its HTTP
         # backbone. Pin the patched floor here too so the lazy Discord path
@@ -212,6 +217,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "google-api-python-client==2.194.0",
         "google-auth-oauthlib==1.3.1",
         "google-auth-httplib2==0.3.1",
+        "httplib2==0.32.0",
+        "pyasn1==0.6.4",
     ),
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
 
@@ -223,21 +230,21 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "fastapi==0.133.1",
         "uvicorn[standard]==0.41.0",
         "starlette==1.3.1",  # CVE-2026-48710 (BadHost) — keep lazy-install in sync with pyproject [web]
-        "python-multipart==0.0.32",  # FastAPI UploadFile/Form for streaming uploads (NS-501)
+        "python-multipart==0.0.32",  # CVE-2026-53538/53539/53540; streaming uploads (NS-501)
     ),
     # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency
     # (pyproject `dependencies`), so this entry is a belt-and-suspenders fallback
     # for stripped/source-build installs that somehow dropped it. The vision
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
-    "tool.vision": ("Pillow==12.2.0",),
+    "tool.vision": ("Pillow==12.3.0",),
     # Computer Use (cua-driver) — the MCP client SDK used to spawn and talk
     # to the cua-driver process over stdio. Matches the `mcp` / `computer-use`
     # extras in pyproject.toml. The one-liner installer pulls this in via
     # `[all]`; lazy-installing here covers lean / partial / broken-extra
     # installs so computer_use never dead-ends on `No module named 'mcp'`.
     "tool.computer_use": (
-        "mcp==1.26.0",
+        "mcp==1.28.1",
         "starlette==1.3.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
