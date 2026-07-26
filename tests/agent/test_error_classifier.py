@@ -776,6 +776,22 @@ class TestClassifyApiError:
         assert result.should_fallback is True
         assert result.should_compress is False
 
+    def test_400_codex_model_rejection_wins_over_context_overflow_text(self):
+        """The exact Codex rejection phrase beats overlapping overflow text."""
+        message = (
+            "The requested model is not supported when using Codex; "
+            "the context length exceeds the maximum context window."
+        )
+        e = MockAPIError(message, status_code=400)
+
+        result = classify_api_error(e)
+
+        assert result.reason == FailoverReason.model_not_found
+        assert result.message == message
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
     def test_400_billing_signal_with_unsupported_phrase_stays_billing(self):
         """The Codex compatibility phrase must not swallow billing guidance."""
         detail = "Insufficient credits: model is not supported on free tier."
@@ -922,6 +938,35 @@ class TestClassifyApiError:
         )
 
         assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_short_descriptive_metadata_raw_message_is_not_generic(self):
+        """Wrapped provider text is evidence, not a generic outer 400."""
+        message = "invalid capability"
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={
+                "error": {
+                    "message": "Error",
+                    "metadata": {
+                        "raw": '{"error":{"message":"invalid capability"}}',
+                    },
+                },
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            approx_tokens=132738,
+            context_length=272000,
+            num_messages=201,
+        )
+
+        assert result.reason == FailoverReason.format_error
+        assert result.message == message
         assert result.retryable is False
         assert result.should_fallback is True
         assert result.should_compress is False

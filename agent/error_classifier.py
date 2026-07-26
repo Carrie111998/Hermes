@@ -12,6 +12,7 @@ that the main retry loop in run_agent.py consults for every API failure.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -301,6 +302,8 @@ _CONTEXT_OVERFLOW_PATTERNS = [
 ]
 
 # Model not found patterns
+_CODEX_MODEL_COMPATIBILITY_PHRASE = "model is not supported when using codex"
+
 _MODEL_NOT_FOUND_PATTERNS = [
     "is not a valid model",
     "invalid model",
@@ -310,7 +313,7 @@ _MODEL_NOT_FOUND_PATTERNS = [
     "no such model",
     "unknown model",
     "unsupported model",
-    "model is not supported when using codex",
+    _CODEX_MODEL_COMPATIBILITY_PHRASE,
     # OpenRouter returns 404 with this message when none of the candidate
     # endpoints for the selected model support tool/function calling.
     # Classifying this as model_not_found triggers fallback to a different
@@ -608,29 +611,14 @@ def classify_api_error(
     _nested_msg = ""
     _flat_msg = ""
     _detail_msg = ""
-    _metadata_msg = ""
+    metadata_message = _extract_metadata_raw_message(body)
+    _metadata_msg = metadata_message.lower()
     if isinstance(body, dict):
         _err_obj = body.get("error", {})
         if isinstance(_err_obj, dict):
             _nested_value = _err_obj.get("message")
             if isinstance(_nested_value, str):
                 _nested_msg = _nested_value.lower()
-            # Parse metadata.raw for wrapped provider errors
-            _metadata = _err_obj.get("metadata", {})
-            if isinstance(_metadata, dict):
-                _raw_json = _metadata.get("raw") or ""
-                if isinstance(_raw_json, str) and _raw_json.strip():
-                    try:
-                        import json
-                        _inner = json.loads(_raw_json)
-                        if isinstance(_inner, dict):
-                            _inner_err = _inner.get("error", {})
-                            if isinstance(_inner_err, dict):
-                                _metadata_value = _inner_err.get("message")
-                                if isinstance(_metadata_value, str):
-                                    _metadata_msg = _metadata_value.lower()
-                    except (json.JSONDecodeError, TypeError):
-                        pass
         _flat_value = body.get("message")
         if isinstance(_flat_value, str):
             _flat_msg = _flat_value.lower()
@@ -658,7 +646,11 @@ def classify_api_error(
             "status_code": status_code,
             "provider": provider,
             "model": model,
-            "message": _extract_message(error, body),
+            "message": _extract_message(
+                error,
+                body,
+                metadata_message=metadata_message,
+            ),
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
@@ -805,6 +797,7 @@ def classify_api_error(
             provider=provider_lower, model=model_lower,
             approx_tokens=approx_tokens, context_length=context_length,
             num_messages=num_messages,
+            metadata_message=metadata_message,
             result_fn=_result,
         )
         if classified is not None:
@@ -949,6 +942,7 @@ def _classify_by_status(
     approx_tokens: int,
     context_length: int,
     num_messages: int = 0,
+    metadata_message: str,
     result_fn,
 ) -> Optional[ClassifiedError]:
     """Classify based on HTTP status code with message-aware refinement."""
@@ -1085,6 +1079,7 @@ def _classify_by_status(
             approx_tokens=approx_tokens,
             context_length=context_length,
             num_messages=num_messages,
+            metadata_message=metadata_message,
             result_fn=result_fn,
         )
 
@@ -1212,6 +1207,7 @@ def _classify_400(
     approx_tokens: int,
     context_length: int,
     num_messages: int = 0,
+    metadata_message: str,
     result_fn,
 ) -> ClassifiedError:
     """Classify 400 Bad Request — context overflow, format error, or generic."""
@@ -1298,6 +1294,32 @@ def _classify_400(
             should_compress=False,
         )
 
+    # Codex can include context-overflow wording while rejecting the selected
+    # model/account combination. Only its exact compatibility phrase outranks
+    # overflow; broad model patterns retain the established ordering below.
+    # Preserve 400 limit precedence when the same diagnostic also carries an
+    # explicit rate-limit or billing signal.
+    if _CODEX_MODEL_COMPATIBILITY_PHRASE in error_msg:
+        if any(p in error_msg for p in _RATE_LIMIT_PATTERNS):
+            return result_fn(
+                FailoverReason.rate_limit,
+                retryable=True,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
+        if any(p in error_msg for p in _BILLING_PATTERNS):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
+        return result_fn(
+            FailoverReason.model_not_found,
+            retryable=False,
+            should_fallback=True,
+        )
+
     # Context overflow from 400
     if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
         return result_fn(
@@ -1368,6 +1390,10 @@ def _classify_400(
         elif detail_value is not None:
             has_structured_body_message = True
 
+    metadata_message_lower = metadata_message.strip().lower()
+    if metadata_message_lower:
+        err_body_messages.append(("metadata", metadata_message_lower))
+
     generic_detail_placeholders = {
         "error",
         "bad request",
@@ -1378,7 +1404,7 @@ def _classify_400(
         not err_body_messages
         or all(
             message in generic_detail_placeholders
-            if source == "detail"
+            if source in {"detail", "metadata"}
             else len(message) < 30 or message == "error"
             for source, message in err_body_messages
         )
@@ -1688,7 +1714,40 @@ def _extract_error_code(body: dict) -> str:
     return ""
 
 
-def _extract_message(error: Exception, body: dict) -> str:
+def _extract_metadata_raw_message(body: Any) -> str:
+    """Extract a string error.message from valid metadata.raw JSON."""
+    if not isinstance(body, dict):
+        return ""
+    error_obj = body.get("error")
+    if not isinstance(error_obj, dict):
+        return ""
+    metadata = error_obj.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("raw")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        inner = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(inner, dict):
+        return ""
+    inner_error = inner.get("error")
+    if not isinstance(inner_error, dict):
+        return ""
+    message = inner_error.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return ""
+
+
+def _extract_message(
+    error: Exception,
+    body: dict,
+    *,
+    metadata_message: str = "",
+) -> str:
     """Extract the most informative error message."""
     # Try structured body first. Prefer a specific sibling message over a
     # generic envelope placeholder, while preserving the established nested →
@@ -1704,6 +1763,8 @@ def _extract_message(error: Exception, body: dict) -> str:
             msg = body.get(key, "")
             if isinstance(msg, str) and msg.strip() and msg.strip() not in candidates:
                 candidates.append(msg.strip())
+    if metadata_message and metadata_message not in candidates:
+        candidates.append(metadata_message)
 
     generic_placeholders = {
         "error",
