@@ -95,7 +95,11 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
 - Micro-lote READMEs idiomas (este commit): `git rm README.zh-CN.md README.ur-pk.md`
   (huérfanos con marca vieja); `README.es.md` reemplazado por versión IYARI (verbatim del
   usuario + "Inicio rápido" en ```bash). `README.md` y `README.es.md` únicos READMEs vivos.
-- Sub-lotes user-guide/ restantes: 8=`skills/bundled/`+google-workspace (74, dividir en 2),
-  9-10=`skills/optional/` (101, dividir).
+- Lote 8 (este commit): `skills/bundled/{apple,autonomous-ai-agents,creative,data-science,
+  dogfood,email,github,media}` + `skills/google-workspace.md` = 40. Sin anclas. Preservados
+  `HermesCLI` (clase), `Nous Portal`. Prosa core del skill "hermes-agent" rebrandeada a IYARI.
+- Sub-lotes skills/ restantes: 9=bundled/{mlops,note-taking,productivity,research,smart-home,
+  social-media,software-development,yuanbao} (34); 10=optional/ parte A (41);
+  11=optional/mlops (30); 12=optional/ resto (30). Regla NousResearch/pokemon-agent = preservar.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
