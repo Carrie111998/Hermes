@@ -10226,6 +10226,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and platform is Platform.RELAY
             ):
                 continue
+            # Mirror of the primary-path skip (#64674), for the opposite
+            # direction: a secondary profile can have a token platform enabled
+            # — the plugin registry auto-enables discord/telegram on any
+            # profile that lists their plugins — while the bot credential lives
+            # only in the DEFAULT profile's .env. That is the normal shape for a
+            # profile used purely as a gateway.profile_routes target: it supplies
+            # the model/tools/memory/persona, and inbound arrives on the default
+            # profile's single connection. Building an adapter here logs a bare
+            # "No bot token configured" plus "✗ <platform> failed to connect
+            # (profile: <name>)" on every start, and cannot ever succeed.
+            #
+            # This asks about THIS profile's config snapshot only. A credential
+            # visible in the process env is not this profile's — the default
+            # profile's tokens live there, and _profile_runtime_scope
+            # deliberately does not mutate os.environ. So if
+            # _platform_has_bot_credential ever gains a raw-os.environ fallback
+            # (see PR #68746, which adds one for the reconnect path), this call
+            # must keep resolving through the profile's secret scope instead, or
+            # every routes-only profile starts connecting the default profile's
+            # bot again.
+            if not _platform_has_bot_credential(platform, platform_config):
+                logger.info(
+                    "Skipping %s on profile '%s': no bot credential in this "
+                    "profile's secrets. Inbound for this profile arrives on the "
+                    "default profile's connection via gateway.profile_routes.",
+                    platform.value,
+                    profile_name,
+                )
+                continue
             try:
                 with _profile_runtime_scope(profile_home):
                     adapter = self._create_adapter(platform, platform_config)
