@@ -7820,7 +7820,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Enable faulthandler at gateway start so that SIGUSR2 (or an
         # internal watchdog) can dump all thread and task stacks to stderr
         # for post-mortem diagnosis of event-loop freezes (#70344).
-        faulthandler.enable()
+        #
+        # DETACHED-SAFE (2026-07-26): under pythonw.exe — the Windows
+        # detached launcher, gateway-service\Hermes_Gateway.vbs — there is
+        # no console, so sys.stderr is None and a bare faulthandler.enable()
+        # raises RuntimeError("sys.stderr is None"), which crashed EVERY
+        # detached gateway start. Fall back to a log file, and never let a
+        # diagnostics helper abort gateway startup.
+        try:
+            if sys.stderr is not None:
+                faulthandler.enable()
+            else:
+                _fh_dir = os.path.join(
+                    os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")),
+                    "logs",
+                )
+                os.makedirs(_fh_dir, exist_ok=True)
+                # Held open for the process lifetime on purpose: faulthandler
+                # writes to this handle during fatal errors.
+                self._faulthandler_stream = open(
+                    os.path.join(_fh_dir, "gateway_faulthandler.log"),
+                    "a",
+                    encoding="utf-8",
+                )
+                faulthandler.enable(file=self._faulthandler_stream)
+        except Exception as exc:  # diagnostics must never block startup
+            logger.warning("faulthandler.enable() skipped: %s", exc)
         # Also dump stacks to a rotating file for off-line analysis when
         # the gateway is running under a service manager that doesn't
         # capture stderr.
