@@ -409,22 +409,38 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
 
     ``export -p`` emits one ``declare -x NAME="value"`` line per exported var.
     We drop the HERMES_SESSION_* / UI / CRON_AUTO_DELIVER lines so they never
-    persist across sessions in the shared snapshot. ``grep -vE`` returns exit 1
-    when it filters everything, so ``|| true`` keeps the pipeline's success
-    contract intact for the callers that chain on it.
+    persist across sessions in the shared snapshot.
+
+    Some bash versions (notably 3.x on macOS) emit multi-line values as raw
+    continuation lines without a ``declare -x`` prefix.  A ``grep -vE`` only
+    removes the first line of such entries, allowing the continuation lines
+    to persist into the snapshot and execute on ``source`` (GH-71296).  An
+    awk state-machine is used instead: when a ``declare -x`` line matches an
+    excluded prefix, ``skip`` is set and the line is dropped; ``skip`` stays
+    true through continuation lines and resets on the next ``declare -x``
+    line of any variable.  awk returns exit 0 even when filtering everything
+    (unlike grep which returns 1), so the ``|| true`` is retained only as a
+    safety net for environments where awk is unavailable.
 
     The pipeline MUST be wrapped in a brace group with the redirection applied
     to the group, not to the last pipeline segment. *tmp_path* typically embeds
     ``$BASHPID`` for concurrency-safe temp names; a redirection attached
-    directly to ``grep`` is expanded inside grep's own pipeline subshell, where
-    ``$BASHPID`` resolves to the grep subshell's PID — while the caller's
+    directly to ``awk`` is expanded inside awk's own pipeline subshell, where
+    ``$BASHPID`` resolves to the awk subshell's PID — while the caller's
     follow-up ``mv $tmp`` expands in the parent shell to a DIFFERENT PID. The
     dump then lands in an orphaned temp file and the snapshot silently never
     updates (all exported-env persistence breaks). The brace-group redirect is
     expanded in the current shell, keeping both expansions consistent.
     """
+    # NOTE: the awk script is intentionally kept on one line to avoid
+    # backslash-newline complications inside the f-string.
+    awk_prog = (
+        "'/^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|"
+        "HERMES_CRON_AUTO_DELIVER_)/{skip=1;next} "
+        "/^declare -x /{skip=0} !skip{print}'"
+    )
     return (
-        f"{{ export -p | grep -vE '{_SNAPSHOT_EXCLUDED_ENV_REGEX}' || true; }} "
+        f"{{ export -p | awk {awk_prog} || true; }} "
         f"> {tmp_path}"
     )
 
