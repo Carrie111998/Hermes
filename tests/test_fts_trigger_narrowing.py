@@ -1114,6 +1114,131 @@ DROP TABLE IF EXISTS messages_fts;
         db.close()
 
 
+def test_real_optimizer_demotion_keeps_writer_out_until_current_schema(
+    db_path, monkeypatch
+):
+    """Real legacy demotion cannot expose a committed triggerless interval."""
+    from hermes_state import LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL, SessionDB
+
+    seeded = SessionDB(db_path=db_path)
+    seeded.create_session("optimizer-race", "test")
+    message_id = seeded.append_message(
+        "optimizer-race", "user", content="old content", tool_name="oldmetadata"
+    )
+    seeded.close()
+
+    drop_current = """
+DROP TRIGGER IF EXISTS messages_fts_insert;
+DROP TRIGGER IF EXISTS messages_fts_delete;
+DROP TRIGGER IF EXISTS messages_fts_update;
+DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+DROP TABLE IF EXISTS messages_fts_trigram;
+DROP VIEW IF EXISTS messages_fts_trigram_src;
+DROP TABLE IF EXISTS messages_fts;
+"""
+    with sqlite3.connect(str(db_path), isolation_level=None) as conn:
+        conn.executescript(drop_current + LEGACY_FTS_SQL + "\n" + LEGACY_FTS_TRIGRAM_SQL)
+        for table in ("messages_fts", "messages_fts_trigram"):
+            conn.execute(
+                f"INSERT INTO {table}(rowid, content) "
+                "SELECT id, COALESCE(content, '') || ' ' || "
+                "COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') "
+                "FROM messages"
+            )
+
+    optimizer = SessionDB(db_path=db_path)
+    reached_current_create = threading.Event()
+    release_optimizer = threading.Event()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+    result: dict[str, object] = {}
+    original_execute_ddl = SessionDB._execute_ddl_statements
+
+    def pause_current_creation(cursor, ddl):
+        if (
+            threading.current_thread().name == "real-fts-optimizer"
+            and not reached_current_create.is_set()
+        ):
+            count = cursor.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='trigger' AND name LIKE 'messages_fts%_update'"
+            ).fetchone()[0]
+            assert count == 0
+            assert cursor.in_transaction
+            reached_current_create.set()
+            assert release_optimizer.wait(5), "test did not release optimizer"
+        return original_execute_ddl(cursor, ddl)
+
+    monkeypatch.setattr(
+        SessionDB,
+        "_execute_ddl_statements",
+        staticmethod(pause_current_creation),
+    )
+
+    def optimize() -> None:
+        try:
+            result["high_water"] = optimizer._demote_legacy_fts_to_trash()
+        except BaseException as exc:
+            result["optimizer_error"] = exc
+
+    def write() -> None:
+        try:
+            with sqlite3.connect(str(db_path), timeout=5.0) as writer:
+                writer_started.set()
+                writer.execute(
+                    "UPDATE messages SET content=?, tool_name=? WHERE id=?",
+                    ("new content", "newmetadata", message_id),
+                )
+                writer.commit()
+        except BaseException as exc:
+            result["writer_error"] = exc
+        finally:
+            writer_done.set()
+
+    optimizer_thread = threading.Thread(
+        target=optimize, name="real-fts-optimizer", daemon=True
+    )
+    optimizer_thread.start()
+    assert reached_current_create.wait(5), (
+        "optimizer never reached current DDL: "
+        f"{result.get('optimizer_error')!r}"
+    )
+
+    writer_thread = threading.Thread(target=write, daemon=True)
+    writer_thread.start()
+    assert writer_started.wait(2)
+    assert not writer_done.wait(0.25), "writer committed during triggerless demotion"
+
+    release_optimizer.set()
+    optimizer_thread.join(10)
+    writer_thread.join(10)
+    assert not optimizer_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert "optimizer_error" not in result, result.get("optimizer_error")
+    assert "writer_error" not in result, result.get("writer_error")
+
+    try:
+        while optimizer.fts_rebuild_step():
+            pass
+        with optimizer._lock:
+            layout = optimizer._legacy_fts_layout(optimizer._conn)
+            old_hits = optimizer._conn.execute(
+                "SELECT rowid FROM messages_fts "
+                "WHERE messages_fts MATCH 'oldmetadata'"
+            ).fetchall()
+            new_hits = optimizer._conn.execute(
+                "SELECT rowid FROM messages_fts "
+                "WHERE messages_fts MATCH 'newmetadata'"
+            ).fetchall()
+        assert layout is None
+        assert old_hits == []
+        assert [row[0] for row in new_hits] == [message_id]
+    finally:
+        optimizer.close()
+
+
 def test_writer_blocks_inside_drop_recreate_transaction(db_path, monkeypatch):
     """A writer cannot commit while UPDATE triggers are absent in migration."""
     from hermes_state import SessionDB

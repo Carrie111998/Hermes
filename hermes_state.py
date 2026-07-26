@@ -2806,6 +2806,27 @@ class SessionDB:
                 return False
             raise
 
+    @staticmethod
+    def _execute_ddl_statements(
+        cursor: sqlite3.Cursor,
+        ddl: str,
+    ) -> None:
+        """Execute complete DDL statements without ``executescript`` commits.
+
+        ``Connection.executescript`` commits an active transaction before it
+        runs. Storage migrations that already hold ``BEGIN IMMEDIATE`` must use
+        this helper so table/view/trigger replacement remains atomic.
+        """
+        statement = ""
+        for line in ddl.splitlines(keepends=True):
+            statement += line
+            if not sqlite3.complete_statement(statement):
+                continue
+            cursor.execute(statement)
+            statement = ""
+        if statement.strip():
+            raise sqlite3.OperationalError("incomplete FTS DDL statement")
+
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
@@ -3451,9 +3472,11 @@ class SessionDB:
                 ]
                 for sh in shadows:
                     conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
-            # Create the new v23 empty schema + set the backfill markers.
-            self._ensure_fts_schema(conn, "messages_fts", FTS_SQL)
-            self._ensure_fts_schema(conn, "messages_fts_trigram", FTS_TRIGRAM_SQL)
+            # Create the new v23 empty schema in the SAME BEGIN IMMEDIATE
+            # transaction as trigger/table demotion. ``executescript`` would
+            # commit first and expose a triggerless writer window.
+            self._execute_ddl_statements(conn, FTS_SQL)
+            self._execute_ddl_statements(conn, FTS_TRIGRAM_SQL)
             hw = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
             for k, v in (
                 ("fts_rebuild_high_water", str(hw)),
