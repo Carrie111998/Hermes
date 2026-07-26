@@ -12191,7 +12191,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 from hermes_cli.tools_config import install_cua_driver
 
                 print()
-                print("→ Refreshing cua-driver (Computer Use)...")
                 install_cua_driver(upgrade=True)
         except Exception as e:
             logger.debug("cua-driver refresh failed: %s", e)

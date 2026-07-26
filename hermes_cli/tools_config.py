@@ -1100,7 +1100,7 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
     if verbose:
         _print_info(f"    {label} cua-driver (background computer-use)...")
     else:
-        _print_info(f"    {label} cua-driver...")
+        _print_info(f"→ {label} cua-driver (Computer Use)...")
     driver_cmd = _cua_driver_cmd()
 
     # A previous timed-out install can leave the upstream installer's
