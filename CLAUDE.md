@@ -126,6 +126,17 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   intacta (heading "A note on Hermes 4" = modelo, no cambia). NOTA CLAVE: revisar SIEMPRE
   bare "Hermes" en contexto de familia de modelos LLM (tablas, listas de parsers/tool-calling)
   porque el lookahead solo protege "Hermes-3/4" y "Hermes 3/4" directos.
-- Pendiente GRUPO 5: `docs/` sueltos (raíz website/docs), `userStories.json`.
+- Lote 15 (este commit): sueltos raíz `website/docs/` = `index.mdx` (home) + `user-stories.mdx`.
+  `userStories.json` (website/src/data/) **INTACTO** por decisión del usuario (testimonios/citas
+  verbatim de terceros; opción 2). index.mdx: autoría del producto → Digital Services LLC +
+  link iyari.io; repo GitHub → fork; producto Hermes/Hermes Agent → IYARI; lab de Nous como
+  **atribución honesta de fork** ("Originally built by Nous Research, the lab behind Hermes,
+  Nomos, and Psyche. Now maintained by Digital Services LLC as IYARI"); `Hermes` en esa frase =
+  modelo/proyecto preservado. user-stories.mdx: envoltorio → IYARI, citas intactas.
+  ⚠️ FLAG: home aún enlaza instalación/descarga a `hermes-agent.nousresearch.com` (install.sh/
+  ps1, Download Desktop) — preservado por regla de URL; actualizar si el fork tiene su instalador.
+- **GRUPO 5 (docs de website/docs/) COMPLETO.** Pendiente futuro: GRUPO 6 = i18n zh-Hans/;
+  código `.py` heredado (identity strings ya se tocan en docs, no en código). Revisar si
+  procede `userStories.json`/instaladores del home en una pasada de marketing aparte.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
