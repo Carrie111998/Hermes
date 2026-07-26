@@ -15678,6 +15678,8 @@ def _(rid, params: dict) -> dict:
                 text = "~/" + os.path.relpath(full, os.path.expanduser("~")) + suffix
             elif word.startswith("./"):
                 text = "./" + rel + suffix
+            elif os.path.isabs(word):
+                text = full + suffix
             else:
                 text = rel + suffix
 
