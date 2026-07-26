@@ -4039,18 +4039,45 @@ class SlackAdapter(BasePlatformAdapter):
                 exc,
             )
             return None
-        if not isinstance(response, dict) or not response.get("ok"):
+        response_get = getattr(response, "get", None)
+        if not callable(response_get):
             logger.warning(
                 "[Slack] Could not classify interactive callback channel %s",
                 channel_id,
             )
             return None
-        channel = response.get("channel") or {}
-        if not isinstance(channel, dict):
+        try:
+            ok = response_get("ok")
+            channel = response_get("channel")
+        except Exception:
+            logger.warning(
+                "[Slack] Could not read interactive callback channel %s",
+                channel_id,
+                exc_info=True,
+            )
             return None
-        if channel.get("is_im"):
+        if ok is not True:
+            logger.warning(
+                "[Slack] Could not classify interactive callback channel %s",
+                channel_id,
+            )
+            return None
+        channel_get = getattr(channel, "get", None)
+        if not callable(channel_get):
+            return None
+        missing = object()
+        try:
+            is_im = channel_get("is_im", missing)
+            is_mpim = channel_get("is_mpim", missing)
+        except Exception:
+            return None
+        if not isinstance(is_im, bool) or not isinstance(is_mpim, bool):
+            return None
+        if is_im and is_mpim:
+            return None
+        if is_im:
             return "im"
-        if channel.get("is_mpim"):
+        if is_mpim:
             return "mpim"
         return "channel"
 

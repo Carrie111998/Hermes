@@ -31,7 +31,15 @@ def _make_adapter():
         }
     )
     client.conversations_info = AsyncMock(
-        return_value={"ok": True, "channel": {"id": "C1", "name": "leads"}}
+        return_value={
+            "ok": True,
+            "channel": {
+                "id": "C1",
+                "name": "leads",
+                "is_im": False,
+                "is_mpim": False,
+            },
+        }
     )
     adapter._get_client = MagicMock(return_value=client)
     adapter.stop_typing = AsyncMock()
@@ -78,6 +86,16 @@ class _StringifiesTo:
 
     def __str__(self) -> str:
         return self._value
+
+
+class _MappingLikeResponse:
+    """Minimal SlackResponse-shaped object: mapping access without dict identity."""
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
 
 
 def test_parse_valid_directive_strips_it_and_preserves_visible_reply():
@@ -434,8 +452,19 @@ async def test_ignored_channel_click_does_not_consume_card(tmp_path, monkeypatch
 @pytest.mark.parametrize(
     ("channel_id", "channel_record"),
     [
-        ("D1", {"id": "D1", "is_im": True, "user": "U1"}),
-        ("G1", {"id": "G1", "name": "mpdm-team", "is_mpim": True}),
+        (
+            "D1",
+            {"id": "D1", "is_im": True, "is_mpim": False, "user": "U1"},
+        ),
+        (
+            "G1",
+            {
+                "id": "G1",
+                "name": "mpdm-team",
+                "is_im": False,
+                "is_mpim": True,
+            },
+        ),
     ],
 )
 async def test_disabled_dm_click_does_not_consume_card(
@@ -481,7 +510,12 @@ async def test_non_allowed_channel_click_does_not_consume_card(tmp_path, monkeyp
     client.conversations_info = AsyncMock(
         return_value={
             "ok": True,
-            "channel": {"id": "C2", "name": "other-channel"},
+            "channel": {
+                "id": "C2",
+                "name": "other-channel",
+                "is_im": False,
+                "is_mpim": False,
+            },
         }
     )
     adapter.handle_message = AsyncMock()
@@ -518,7 +552,12 @@ async def test_non_string_required_callback_field_does_not_consume_card(
     client.conversations_info = AsyncMock(
         return_value={
             "ok": True,
-            "channel": {"id": "123", "name": "numbers"},
+            "channel": {
+                "id": "123",
+                "name": "numbers",
+                "is_im": False,
+                "is_mpim": False,
+            },
         }
     )
     adapter.handle_message = AsyncMock()
@@ -622,12 +661,17 @@ async def test_card_cleanup_preserves_unrelated_control_in_shared_actions_block(
     [
         (
             "D1",
-            {"id": "D1", "is_im": True, "user": "U1"},
+            {"id": "D1", "is_im": True, "is_mpim": False, "user": "U1"},
             ["C_OTHER"],
         ),
         (
             "G1",
-            {"id": "G1", "is_mpim": True, "name": "mpdm-team"},
+            {
+                "id": "G1",
+                "is_im": False,
+                "is_mpim": True,
+                "name": "mpdm-team",
+            },
             ["G1"],
         ),
     ],
@@ -658,3 +702,104 @@ async def test_im_and_mpim_clicks_use_dm_source_classification(
 
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "dm"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_id", "channel_record", "expected_chat_type"),
+    [
+        (
+            "G_MPIM",
+            {
+                "id": "G_MPIM",
+                "name": "mpdm-team",
+                "is_im": False,
+                "is_mpim": True,
+            },
+            "dm",
+        ),
+        (
+            "C_CHANNEL",
+            {
+                "id": "C_CHANNEL",
+                "name": "leads",
+                "is_im": False,
+                "is_mpim": False,
+            },
+            "group",
+        ),
+    ],
+)
+async def test_mapping_like_slack_response_classifies_non_d_callback(
+    tmp_path, monkeypatch, channel_id, channel_record, expected_chat_type
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    adapter.config.extra["allowed_channels"] = [channel_id]
+    client.conversations_info = AsyncMock(
+        return_value=_MappingLikeResponse(
+            {"ok": True, "channel": channel_record}
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        channel_id, "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        _click_body(channel=channel_id),
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == expected_chat_type
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "channel_record",
+    [
+        {"id": "C1", "name": "leads", "is_im": False},
+        {
+            "id": "C1",
+            "name": "leads",
+            "is_im": "false",
+            "is_mpim": False,
+        },
+    ],
+)
+async def test_missing_or_malformed_channel_type_flags_do_not_consume_card(
+    tmp_path, monkeypatch, channel_record
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    adapter, client = _make_adapter()
+    client.conversations_info = AsyncMock(
+        return_value={"ok": True, "channel": channel_record}
+    )
+    adapter.handle_message = AsyncMock()
+    prepared = adapter._interactive_reply_store.create_card(
+        "C1", "T1", (InteractiveButton("Go", "go"),)
+    )
+    assert adapter._interactive_reply_store.bind_message(prepared.card_id, "M1")
+
+    await adapter._handle_interactive_reply_action(
+        AsyncMock(),
+        _click_body(),
+        {
+            "action_id": "hermes_interactive_reply",
+            "value": prepared.buttons[0].token,
+        },
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert (
+        adapter._interactive_reply_store.consume(
+            prepared.buttons[0].token, "C1", "M1"
+        )
+        is not None
+    )
