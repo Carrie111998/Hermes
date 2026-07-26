@@ -35,6 +35,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -5005,6 +5006,46 @@ def get_profiles_sessions(
                 )
                 s["archived"] = bool(s.get("archived"))
                 merged.append(s)
+        except sqlite3.OperationalError as exc:
+            exc_msg = str(exc)
+            if "no such column" not in exc_msg.lower():
+                errors.append({"profile": name, "error": exc_msg})
+            else:
+                db.close()
+                if _migrate_db_if_schema_lags(db_path):
+                    db = SessionDB(db_path=db_path, read_only=True)
+                    rows = db.list_sessions_rich(
+                        source=source_filter,
+                        exclude_sources=exclude_list or None,
+                        limit=per_profile,
+                        offset=0,
+                        min_message_count=min_message_count,
+                        include_archived=include_archived,
+                        archived_only=archived_only,
+                        order_by_last_active=order == "recent",
+                        compact_rows=not full,
+                    )
+                    profile_total = db.session_count(
+                        source=source_filter,
+                        exclude_sources=exclude_list or None,
+                        min_message_count=min_message_count,
+                        include_archived=include_archived,
+                        archived_only=archived_only,
+                        exclude_children=True,
+                    )
+                    total += profile_total
+                    profile_totals[name] = profile_total
+                    for s in rows:
+                        s["profile"] = name
+                        s["is_default_profile"] = name == "default"
+                        s["is_active"] = (
+                            s.get("ended_at") is None
+                            and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                        )
+                        s["archived"] = bool(s.get("archived"))
+                        merged.append(s)
+                else:
+                    errors.append({"profile": name, "error": exc_msg})
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
         finally:
@@ -5115,27 +5156,45 @@ def get_profiles_sessions_sidebar(
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
-            if recents_scope == "all" or name == recents_scope:
-                recents_rows.extend(
-                    _tag(_slice(db, exclude=recents_exclude_list, cap=recents_cap), name)
-                )
-                rtotal = db.session_count(
-                    exclude_sources=recents_exclude_list or None,
-                    min_message_count=1,
-                    include_archived=False,
-                    archived_only=False,
-                    exclude_children=True,
-                )
-                recents_total += rtotal
-                recents_profile_totals[name] = rtotal
-            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
-            messaging_rows.extend(
-                _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
-            )
+            query_ok = False
+            for attempt in range(2):
+                if attempt > 0:
+                    db.close()
+                    if not _migrate_db_if_schema_lags(db_path):
+                        break
+                    db = SessionDB(db_path=db_path, read_only=True)
+                try:
+                    if recents_scope == "all" or name == recents_scope:
+                        recents_rows.extend(
+                            _tag(_slice(db, exclude=recents_exclude_list, cap=recents_cap), name)
+                        )
+                        rtotal = db.session_count(
+                            exclude_sources=recents_exclude_list or None,
+                            min_message_count=1,
+                            include_archived=False,
+                            archived_only=False,
+                            exclude_children=True,
+                        )
+                        recents_total += rtotal
+                        recents_profile_totals[name] = rtotal
+                    cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
+                    messaging_rows.extend(
+                        _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
+                    )
+                    query_ok = True
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "no such column" not in str(exc).lower():
+                        raise
+                    if attempt > 0:
+                        raise
+            if not query_ok:
+                errors.append({"profile": name, "error": "failed to query profile DB"})
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
         finally:
-            db.close()
+            if 'db' in locals() and db is not None:
+                db.close()
 
     def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
         rows.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)
@@ -9774,6 +9833,25 @@ async def update_messaging_platform(
     except Exception:
         _log.exception("PUT /api/messaging/platforms/%s failed", platform_id)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+def _migrate_db_if_schema_lags(db_path: Path) -> bool:
+    """Open a profile DB read-write to trigger schema migration, then close.
+
+    When a profile's state.db lags schema, read-only list_sessions_rich fails
+    with sqlite3.OperationalError about a missing column.  Opening the same DB
+    read-write once runs _init_schema -> column reconciliation, after which
+    the read-only path succeeds.
+    """
+    from hermes_state import SessionDB
+    if not db_path.exists():
+        return False
+    try:
+        migrate_db = SessionDB(db_path=db_path, read_only=False)
+        migrate_db.close()
+        return True
+    except Exception:
+        return False
 
 
 @app.post("/api/messaging/platforms/{platform_id}/test")
