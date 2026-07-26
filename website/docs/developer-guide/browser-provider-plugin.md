@@ -1,7 +1,7 @@
 ---
 sidebar_position: 13
 title: "Browser Provider Plugins"
-description: "How to build a cloud browser backend plugin for Hermes Agent"
+description: "How to build a cloud browser backend plugin for IYARI"
 ---
 
 # Building a Browser Provider Plugin
@@ -9,18 +9,18 @@ description: "How to build a cloud browser backend plugin for Hermes Agent"
 Browser provider plugins register a **cloud browser backend** that services cloud-mode `browser_*` tool calls (navigate, click, screenshot, …). Built-in providers — Browserbase, Browser Use, and Firecrawl — all ship as plugins under `plugins/browser/<name>/`. You can add a new one, or override a bundled one, by dropping a directory next to them.
 
 :::tip
-Browser backends are one of several **backend plugins** Hermes supports. The others (with their own ABCs) are [Web Search Provider Plugins](/developer-guide/web-search-provider-plugin) (which this ABC deliberately mirrors), [Image Generation](/developer-guide/image-gen-provider-plugin), [Video Generation](/developer-guide/video-gen-provider-plugin), [Memory Providers](/developer-guide/memory-provider-plugin), [Context Engines](/developer-guide/context-engine-plugin), [Secret Sources](/developer-guide/secret-source-plugin), and [Model Providers](/developer-guide/model-provider-plugin). General tool/hook/CLI plugins live in [Build a Hermes Plugin](/developer-guide/plugins).
+Browser backends are one of several **backend plugins** IYARI supports. The others (with their own ABCs) are [Web Search Provider Plugins](/developer-guide/web-search-provider-plugin) (which this ABC deliberately mirrors), [Image Generation](/developer-guide/image-gen-provider-plugin), [Video Generation](/developer-guide/video-gen-provider-plugin), [Memory Providers](/developer-guide/memory-provider-plugin), [Context Engines](/developer-guide/context-engine-plugin), [Secret Sources](/developer-guide/secret-source-plugin), and [Model Providers](/developer-guide/model-provider-plugin). General tool/hook/CLI plugins live in [Build a IYARI Plugin](/developer-guide/plugins).
 :::
 
 ## How it fits together
 
-A browser provider does **not** implement browsing. It implements **session lifecycle**: create a remote browser session, hand back a CDP websocket URL, and tear the session down. Hermes' own browser stack (`agent-browser` + `tools/browser_tool.py`) connects to whatever CDP URL you return and drives the page from there — every provider gets the full `browser_*` toolset for free.
+A browser provider does **not** implement browsing. It implements **session lifecycle**: create a remote browser session, hand back a CDP websocket URL, and tear the session down. IYARI's own browser stack (`agent-browser` + `tools/browser_tool.py`) connects to whatever CDP URL you return and drives the page from there — every provider gets the full `browser_*` toolset for free.
 
 The active provider is selected by `browser.cloud_provider` in `config.yaml`; the dispatcher in `tools/browser_tool.py` is a pure registry lookup with no per-provider conditionals.
 
 ## Discovery
 
-Hermes scans for browser backends in three places:
+IYARI scans for browser backends in three places:
 
 1. **Bundled** — `<repo>/plugins/browser/<name>/` (auto-loaded with `kind: backend`)
 2. **User** — `~/.hermes/plugins/browser/<name>/` (opt-in via `plugins.enabled` or `hermes plugins enable <name>`)

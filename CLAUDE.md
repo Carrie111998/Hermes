@@ -110,6 +110,13 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
   Verificación global skills/: residual solo `Nous` (servicio), `HermesTokenStorage`/`HermesCLI`
   (clases), `NousResearch/pokemon-agent` (repo distinto) — todo preservado a propósito.
 - **`features/`, `getting-started/`, `guides/`, `reference/`, `user-guide/` (todo) COMPLETOS.**
-- Pendiente GRUPO 5: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
+- Lote 13 (este commit): `developer-guide/` (31 .md/.mdx). Sin anclas que reapuntar
+  (headings Hermes no referenciados; `HermesACPAgent` camelCase y `Surfacing Env Vars in
+  \`hermes config\`` minúscula intactos). Preservados: headers `X-Hermes-Session-Id/Key`,
+  clases `HermesPlugin`/`HermesCLI`/`HermesACPAgent`, servicio `Nous`, repo upstream distinto
+  `NousResearch/hermes-example-plugins` (⚠️ FLAG: preservado; repointar solo si existe fork).
+  Identity strings de prompt-assembly → "You are IYARI ... created by Digital Services LLC".
+  2 refs a Discord de Nous → repo propio (precedente faq:844).
+- Pendiente GRUPO 5: `integrations/`, `docs/` sueltos, `userStories.json`.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
