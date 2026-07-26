@@ -97,6 +97,84 @@ class TestTextBatching:
         assert "split by Telegram" in dispatched.text
 
     @pytest.mark.asyncio
+    async def test_split_batch_retains_each_native_identity_and_mentions(self):
+        adapter = _make_adapter()
+        first = _make_event("ordinary")
+        first.message_id = "m1"
+        first.metadata["mentioned_user_ids"] = ()
+        second = _make_event("@bot")
+        second.message_id = "m2"
+        second.source.user_id = "user-2"
+        second.metadata["mentioned_user_ids"] = ("9",)
+
+        adapter._enqueue_text_event(first)
+        adapter._enqueue_text_event(second)
+        pending = next(iter(adapter._pending_text_batches.values()))
+        native = pending.metadata["_gateway_native_events"]
+
+        assert [(item.message_id, item.text) for item in native] == [
+            ("m1", "ordinary"),
+            ("m2", "@bot"),
+        ]
+        assert native[0].metadata["mentioned_user_ids"] == ()
+        assert native[1].metadata["mentioned_user_ids"] == ("9",)
+        assert native[1].source.user_id == "user-2"
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_unattested_username_mention_remains_unknown_in_snapshot(self):
+        adapter = _make_adapter()
+        event = _make_event("@someone")
+        event.message_id = "m-unknown"
+        event.metadata["mentioned_user_ids"] = None
+
+        adapter._enqueue_text_event(event)
+        pending = next(iter(adapter._pending_text_batches.values()))
+        native = pending.metadata["_gateway_native_events"]
+
+        assert native[0].metadata["mentioned_user_ids"] is None
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_photo_and_media_group_batches_retain_native_ids(self):
+        adapter = _make_adapter()
+
+        first_photo = _make_event("caption one")
+        first_photo.message_type = MessageType.PHOTO
+        first_photo.message_id = "p1"
+        first_photo.media_urls = ["file:///p1.jpg"]
+        first_photo.media_types = ["image/jpeg"]
+        second_photo = _make_event("caption two")
+        second_photo.message_type = MessageType.PHOTO
+        second_photo.message_id = "p2"
+        second_photo.media_urls = ["file:///p2.jpg"]
+        second_photo.media_types = ["image/jpeg"]
+        adapter._enqueue_photo_event("photos", first_photo)
+        adapter._enqueue_photo_event("photos", second_photo)
+        photo_native = adapter._pending_photo_batches["photos"].metadata[
+            "_gateway_native_events"
+        ]
+        assert [item.message_id for item in photo_native] == ["p1", "p2"]
+
+        first_album = _make_event("")
+        first_album.message_type = MessageType.PHOTO
+        first_album.message_id = "a1"
+        first_album.media_urls = ["file:///a1.jpg"]
+        first_album.media_types = ["image/jpeg"]
+        second_album = _make_event("")
+        second_album.message_type = MessageType.PHOTO
+        second_album.message_id = "a2"
+        second_album.media_urls = ["file:///a2.jpg"]
+        second_album.media_types = ["image/jpeg"]
+        await adapter._queue_media_group_event("album", first_album)
+        await adapter._queue_media_group_event("album", second_album)
+        album_native = adapter._media_group_events["album"].metadata[
+            "_gateway_native_events"
+        ]
+        assert [item.message_id for item in album_native] == ["a1", "a2"]
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
     async def test_three_way_split_aggregated(self):
         """Three rapid messages should all merge."""
         adapter = _make_adapter()

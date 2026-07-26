@@ -547,6 +547,8 @@ async def test_discord_text_batch_invokes_hook_once_per_native_event(monkeypatch
     second = _event()
     second.message_id = "m2"
     second.text = "@bot"
+    second.source.user_id = "8"
+    second.source.user_name = "second-user"
     second.metadata["mentioned_user_ids"] = ("9",)
     merged = _event()
     merged.message_id = "m1"
@@ -565,6 +567,7 @@ async def test_discord_text_batch_invokes_hook_once_per_native_event(monkeypatch
                 kwargs["event"].message_id,
                 kwargs["event"].text,
                 kwargs["event"].mentioned_user_ids,
+                kwargs["route"].user_id,
             )
         )
         return [{"decision": "handled"}]
@@ -575,10 +578,53 @@ async def test_discord_text_batch_invokes_hook_once_per_native_event(monkeypatch
     await runner._handle_message(merged)
 
     assert observed == [
-        ("m1", "ordinary", ()),
-        ("m2", "@bot", ("9",)),
+        ("m1", "ordinary", (), "user-1"),
+        ("m2", "@bot", ("9",), "8"),
     ]
     runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_busy_pre_dispatch_skip_runs_before_gateway_message(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    event = _event()
+    session_key = build_session_key(event.source)
+    participant_hook = AsyncMock()
+
+    def pre_hook(name, **_kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "skip", "reason": "fixture"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", pre_hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", participant_hook)
+
+    handled = await runner._handle_active_session_busy_message(event, session_key)
+
+    assert handled is True
+    participant_hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker",
+    ["_hermes_startup_restore_replay", "_hermes_historical_replay"],
+)
+async def test_replayed_ingress_never_reaches_gateway_message(monkeypatch, marker):
+    runner, _adapter = _runner_for_dispatch()
+    event = _event()
+    setattr(event, marker, True)
+    participant_hook = AsyncMock()
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", participant_hook)
+
+    suppressed = await runner._run_gateway_message_hook(
+        event,
+        event.source,
+        build_session_key(event.source),
+    )
+
+    assert suppressed is False
+    participant_hook.assert_not_awaited()
 
 
 @pytest.mark.asyncio

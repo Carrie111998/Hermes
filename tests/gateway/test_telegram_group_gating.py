@@ -228,6 +228,27 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
     asyncio.run(_run())
 
 
+def test_caption_mentions_are_transport_attested_in_gateway_metadata():
+    adapter = _make_adapter(require_mention=True)
+    caption = "photo for Bob"
+    entity = SimpleNamespace(
+        type="text_mention",
+        offset=10,
+        length=3,
+        user=SimpleNamespace(id=222),
+    )
+    message = _group_message(
+        text=None,
+        caption=caption,
+        caption_entities=[entity],
+    )
+
+    event = adapter._build_message_event(message, MessageType.PHOTO, update_id=1004)
+
+    assert event.text == caption
+    assert event.metadata["mentioned_user_ids"] == ("222",)
+
+
 def test_observed_group_context_replays_as_current_message_context_not_user_turns():
     from gateway.run import (
         _build_gateway_agent_history,

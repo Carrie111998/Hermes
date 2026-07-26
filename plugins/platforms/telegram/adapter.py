@@ -8513,6 +8513,34 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
+    def _native_gateway_event_snapshot(self, event: MessageEvent) -> MessageEvent:
+        """Retain one native identity before host-agent batching mutates it."""
+        mentioned_user_ids = event.metadata.get("mentioned_user_ids")
+        return MessageEvent(
+            text=str(event.text or ""),
+            message_type=event.message_type,
+            source=event.source,
+            raw_message=None,
+            message_id=event.message_id,
+            platform_update_id=event.platform_update_id,
+            media_urls=list(event.media_urls),
+            media_types=list(event.media_types),
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_text=event.reply_to_text,
+            reply_to_author_id=event.reply_to_author_id,
+            reply_to_author_name=event.reply_to_author_name,
+            reply_to_is_own_message=event.reply_to_is_own_message,
+            metadata={
+                "mentioned_user_ids": (
+                    None
+                    if mentioned_user_ids is None
+                    else tuple(mentioned_user_ids)
+                ),
+                "mentions_room": event.metadata.get("mentions_room"),
+            },
+            timestamp=event.timestamp,
+        )
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -8528,10 +8556,16 @@ class TelegramAdapter(BasePlatformAdapter):
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._pending_text_batches[key] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
@@ -8637,9 +8671,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         existing = self._pending_photo_batches.get(batch_key)
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._pending_photo_batches[batch_key] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -8945,9 +8985,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         existing = self._media_group_events.get(media_group_id)
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._media_group_events[media_group_id] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -9368,12 +9414,14 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        mentioned_user_ids = _attested_mention_user_ids(
-            getattr(message, "entities", None) or ()
+        mention_entities = (
+            *(getattr(message, "entities", None) or ()),
+            *(getattr(message, "caption_entities", None) or ()),
         )
+        mentioned_user_ids = _attested_mention_user_ids(mention_entities)
 
         return MessageEvent(
-            text=message.text or "",
+            text=message.text or getattr(message, "caption", None) or "",
             message_type=msg_type,
             source=source,
             raw_message=message,

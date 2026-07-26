@@ -7629,6 +7629,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
+        if recovered:
+            setattr(event, "_hermes_historical_replay", True)
+
         # Only live plain text messages use split-message batching. Recovery
         # candidates are already complete historical messages; coalescing them
         # would lose constituent IDs and make later restarts replay them.
@@ -7665,6 +7668,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _native_gateway_event_snapshot(self, event: MessageEvent) -> MessageEvent:
         """Retain one bounded-to-hook native identity before agent-text batching."""
+        mentioned_user_ids = event.metadata.get("mentioned_user_ids")
         return MessageEvent(
             text=str(event.text or ""),
             message_type=event.message_type,
@@ -7679,8 +7683,10 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_author_name=event.reply_to_author_name,
             reply_to_is_own_message=event.reply_to_is_own_message,
             metadata={
-                "mentioned_user_ids": tuple(
-                    event.metadata.get("mentioned_user_ids", ())
+                "mentioned_user_ids": (
+                    None
+                    if mentioned_user_ids is None
+                    else tuple(mentioned_user_ids)
                 ),
                 "mentions_room": event.metadata.get("mentions_room"),
             },

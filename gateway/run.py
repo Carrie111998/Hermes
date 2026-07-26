@@ -6246,6 +6246,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True
 
+        # Busy ingress bypasses the cold _handle_message entry. Apply the
+        # existing pre-dispatch policy here first and mark it one-shot so a
+        # later queue fallback cannot invoke it twice.
+        if self._run_pre_gateway_dispatch(event):
+            return True
+
         # Real busy-session ingress returns from BasePlatformAdapter after this
         # handler. Invoke the post-authorization participant seam before any
         # host queue, steer, redirect, or interrupt effect so ordinary live
@@ -9617,7 +9623,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Shutdown acceptance closes before any observer or adapter await.
             # Every retained participant delivery is invalid at this point,
             # including sessions with no currently running host agent.
-            self._revoke_all_gateway_deliveries()
+            _revoke_deliveries = getattr(
+                self,
+                "_revoke_all_gateway_deliveries",
+                None,
+            )
+            if callable(_revoke_deliveries):
+                _revoke_deliveries()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -10778,6 +10790,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return switched
 
+    def _run_pre_gateway_dispatch(self, event: MessageEvent) -> bool:
+        """Apply the legacy pre-dispatch policy once; return True when skipped."""
+        marker = "_hermes_pre_gateway_dispatch_done"
+        if getattr(event, marker, False):
+            return False
+        setattr(event, marker, True)
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+            hook_results = _invoke_hook(
+                "pre_gateway_dispatch",
+                event=event,
+                gateway=self,
+                session_store=self.session_store,
+            )
+        except Exception as hook_exc:
+            logger.warning("pre_gateway_dispatch invocation failed: %s", hook_exc)
+            hook_results = []
+
+        for result in hook_results:
+            if not isinstance(result, dict):
+                continue
+            action = result.get("action")
+            if action == "skip":
+                source = event.source
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    result.get("reason"),
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                )
+                return True
+            if action == "rewrite":
+                new_text = result.get("text")
+                if isinstance(new_text, str):
+                    event.text = new_text
+                break
+            if action == "allow":
+                break
+        return False
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -10849,46 +10902,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not is_internal:
             self._scale_to_zero_note_real_inbound()
 
-        # Fire pre_gateway_dispatch plugin hook for user-originated messages.
-        # Plugins receive the MessageEvent and may return a dict influencing flow:
-        #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
-        #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
-        # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
-                    "pre_gateway_dispatch",
-                    event=event,
-                    gateway=self,
-                    session_store=self.session_store,
-                )
-            except Exception as _hook_exc:
-                logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
-
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
-                    )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+        # Apply the legacy user-ingress policy exactly once. Busy ingress may
+        # already have passed through this seam in BasePlatformAdapter.
+        if not is_internal and self._run_pre_gateway_dispatch(event):
+            return None
 
         if is_internal:
             pass
@@ -12949,7 +12966,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_key: str,
     ) -> bool:
-        """Run ordinary-message hooks in the already-resolved profile scope."""
+        """Run ordinary-message hooks in the route's profile scope.
+
+        Platform adapters may batch adjacent native messages for the host agent.
+        The participant seam expands retained native snapshots so event IDs,
+        route actors, and mention facts remain attributable to each native event.
+        """
+        if getattr(event, "_hermes_startup_restore_replay", False) or getattr(
+            event,
+            "_hermes_historical_replay",
+            False,
+        ):
+            return False
 
         async def _run_scoped() -> bool:
             native_events = event.metadata.get("_gateway_native_events", ())
@@ -12963,13 +12991,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return True
                 suppressed = False
                 for native_event in native_events:
-                    # Every authorized native Discord ingress crosses the hook
-                    # independently. Continue through the batch even after one
-                    # terminal result so no constituent identity disappears.
+                    # Continue through the entire batch even after one terminal
+                    # result so no authorized native identity disappears.
                     suppressed = (
                         await self._run_gateway_message_hook_scoped(
                             native_event,
-                            source,
+                            native_event.source,
                             session_key,
                         )
                         or suppressed
