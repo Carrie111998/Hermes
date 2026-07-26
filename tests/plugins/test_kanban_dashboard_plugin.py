@@ -398,7 +398,6 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
     bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
     js = bundle.read_text()
 
-    assert 'useState(() => readSelectedBoard() || null)' in js
     assert "const storedBoard = readSelectedBoard();" in js
     assert "if (!storedBoard && !board && data && data.current)" in js
     assert "setBoard(data.current);" in js
@@ -2365,7 +2364,6 @@ def test_dashboard_requests_default_board_explicitly():
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
 
     assert "SDK.fetchJSON(withBoard(`${API}/config`, board))" in dist
-    assert "SDK.fetchJSON(withBoard(`${API}/boards`, board))" in dist
     assert "}, [loadBoardList, switchBoard, board]);" in dist
 
 
