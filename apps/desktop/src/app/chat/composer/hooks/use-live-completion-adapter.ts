@@ -19,6 +19,10 @@ export interface CompletionPayload {
   query: string
 }
 
+export type LiveCompletionAdapter = Unstable_TriggerAdapter & {
+  reset: () => void
+}
+
 const EMPTY_QUERY = '\u0000'
 
 export function useLiveCompletionAdapter(options: {
@@ -26,7 +30,7 @@ export function useLiveCompletionAdapter(options: {
   debounceMs?: number
   fetcher: (query: string) => Promise<CompletionPayload>
   toItem: (entry: CompletionEntry, index: number) => Unstable_TriggerItem
-}): { adapter: Unstable_TriggerAdapter; loading: boolean } {
+}): { adapter: LiveCompletionAdapter; loading: boolean } {
   const { enabled, debounceMs = 60, fetcher, toItem } = options
 
   const [state, setState] = useState<{ query: string; items: Unstable_TriggerItem[] }>({
@@ -108,7 +112,15 @@ export function useLiveCompletionAdapter(options: {
     [cancelTimer, debounceMs, enabled, fetcher, toItem]
   )
 
-  const adapter = useMemo<Unstable_TriggerAdapter>(
+  const reset = useCallback(() => {
+    cancelTimer()
+    pendingQueryRef.current = null
+    tokenRef.current += 1
+    setLoading(false)
+    setState({ query: EMPTY_QUERY, items: [] })
+  }, [cancelTimer])
+
+  const adapter = useMemo<LiveCompletionAdapter>(
     () => ({
       categories: () => [],
       categoryItems: () => [],
@@ -118,9 +130,10 @@ export function useLiveCompletionAdapter(options: {
         }
 
         return state.items
-      }
+      },
+      reset
     }),
-    [scheduleFetch, state]
+    [reset, scheduleFetch, state]
   )
 
   return { adapter, loading }

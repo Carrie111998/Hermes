@@ -1,10 +1,19 @@
-import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from '@assistant-ui/core'
+import type { Unstable_TriggerItem } from '@assistant-ui/core'
 import { act, fireEvent, render } from '@testing-library/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
-import { useLiveCompletionAdapter } from './hooks/use-live-completion-adapter'
+import {
+  type CompletionPayload,
+  type LiveCompletionAdapter,
+  useLiveCompletionAdapter
+} from './hooks/use-live-completion-adapter'
 import { detectTrigger, type TriggerState } from './text-utils'
+
+const DEFAULT_FETCHER = async (query: string): Promise<CompletionPayload> => ({
+  query,
+  items: Array.from({ length: 5 }, (_, i) => ({ text: `/cmd${i}`, display: `/cmd${i}`, meta: '' }))
+})
 
 // Faithful mirror of index.tsx's trigger wiring, driven through REAL DOM
 // keydown+keyup events on a contentEditable. Exercises the parts a direct
@@ -12,8 +21,10 @@ import { detectTrigger, type TriggerState } from './text-utils'
 // keydown-set "consumed" ref that guards it, and per-press keydown+keyup
 // ordering (critical for Escape, whose keydown nulls `trigger` before keyup).
 function Harness({
+  fetcher = DEFAULT_FETCHER,
   onState
 }: {
+  fetcher?: (query: string) => Promise<CompletionPayload>
   onState: (s: { active: number; items: readonly Unstable_TriggerItem[]; open: boolean }) => void
 }) {
   const editorRef = useRef<HTMLDivElement>(null)
@@ -25,14 +36,11 @@ function Harness({
   const { adapter } = useLiveCompletionAdapter({
     enabled: true,
     debounceMs: 0,
-    fetcher: async (query: string) => ({
-      query,
-      items: Array.from({ length: 5 }, (_, i) => ({ text: `/cmd${i}`, display: `/cmd${i}`, meta: '' }))
-    }),
+    fetcher,
     toItem: (entry, index) => ({ id: `${entry.text}|${index}`, type: 'slash', label: entry.text.slice(1) })
   })
 
-  const triggerAdapter: Unstable_TriggerAdapter | null = trigger?.kind === '/' ? adapter : null
+  const triggerAdapter: LiveCompletionAdapter | null = trigger?.kind === '/' ? adapter : null
 
   const refreshTrigger = useCallback(() => {
     const editor = editorRef.current
@@ -77,6 +85,7 @@ function Harness({
   onState({ active: triggerActive, items: triggerItems, open: trigger !== null })
 
   const closeTrigger = () => {
+    adapter.reset()
     setTrigger(null)
     setTriggerItems([])
     setTriggerActive(0)
@@ -182,5 +191,49 @@ describe('slash menu navigation — real DOM keydown+keyup', () => {
     })
     await flush()
     expect(latest.open).toBe(false)
+  })
+
+  it('refreshes the empty-query catalog after the palette closes and reopens', async () => {
+    vi.useRealTimers()
+    let catalogFetches = 0
+    let latest = { active: 0, items: [] as readonly Unstable_TriggerItem[], open: false }
+
+    const fetcher = async (query: string): Promise<CompletionPayload> => {
+      catalogFetches += 1
+
+      const command = catalogFetches === 1 ? '/old-skill' : '/fresh-skill'
+
+      return { query, items: [{ text: command, display: command, meta: '' }] }
+    }
+
+    const { getByTestId } = render(<Harness fetcher={fetcher} onState={s => (latest = s)} />)
+    const editor = getByTestId('editor')
+
+    await act(async () => {
+      editor.textContent = '/'
+      fireEvent.input(editor)
+    })
+    await flush()
+
+    expect(catalogFetches).toBe(1)
+    expect(latest.items[0]?.label).toBe('old-skill')
+
+    await act(async () => {
+      fireEvent.keyDown(editor, { key: 'Escape' })
+      fireEvent.keyUp(editor, { key: 'Escape' })
+    })
+    await flush()
+    expect(latest.open).toBe(false)
+
+    await act(async () => {
+      editor.textContent = ''
+      fireEvent.input(editor)
+      editor.textContent = '/'
+      fireEvent.input(editor)
+    })
+    await flush()
+
+    expect(catalogFetches).toBe(2)
+    expect(latest.items[0]?.label).toBe('fresh-skill')
   })
 })

@@ -21,7 +21,7 @@ import {
 import { detectTrigger, textBeforeCaret, type TriggerState } from '../text-utils'
 
 interface CompletionSource {
-  adapter: Unstable_TriggerAdapter | null
+  adapter: (Unstable_TriggerAdapter & { reset?: () => void }) | null
   loading: boolean
 }
 
@@ -63,6 +63,15 @@ export function useComposerTrigger({
   // re-rendered and the handler closure sees the post-keydown state.
   const triggerKeyConsumedRef = useRef(false)
 
+  const resetCompletionSource = useCallback(
+    (kind: TriggerState['kind']) => {
+      const source = kind === '@' ? at : slash
+
+      source.adapter?.reset?.()
+    },
+    [at, slash]
+  )
+
   const refreshTrigger = useCallback(() => {
     const editor = editorRef.current
 
@@ -79,6 +88,7 @@ export function useComposerTrigger({
 
     if (!rawText.includes('@') && !rawText.includes('/')) {
       if (trigger) {
+        resetCompletionSource(trigger.kind)
         setTrigger(null)
         setTriggerActive(0)
       }
@@ -97,6 +107,10 @@ export function useComposerTrigger({
         ? null
         : found
 
+    if (trigger?.kind && trigger.kind !== detected?.kind) {
+      resetCompletionSource(trigger.kind)
+    }
+
     setTrigger(detected)
 
     // Only reset the highlight when the trigger actually changed (opened, or
@@ -106,7 +120,7 @@ export function useComposerTrigger({
     if (detected?.kind !== trigger?.kind || detected?.query !== trigger?.query) {
       setTriggerActive(0)
     }
-  }, [editorRef, trigger])
+  }, [editorRef, resetCompletionSource, trigger])
 
   const triggerAdapter: Unstable_TriggerAdapter | null =
     trigger?.kind === '@' ? at.adapter : trigger?.kind === '/' ? slash.adapter : null
@@ -135,6 +149,10 @@ export function useComposerTrigger({
   const argStageEmpty = trigger?.kind === '/' && slashArgStage(trigger.query) && !triggerLoading && !triggerItems.length
 
   const closeTrigger = () => {
+    if (trigger) {
+      resetCompletionSource(trigger.kind)
+    }
+
     setTrigger(null)
     setTriggerItems([])
     setTriggerActive(0)
