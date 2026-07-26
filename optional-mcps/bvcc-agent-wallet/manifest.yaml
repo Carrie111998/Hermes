@@ -1,8 +1,7 @@
 manifest_version: 1
 
 name: bvcc-agent-wallet
-description: Operate a non-custodial BVCC Agent Wallet on-chain — check balances, simulate, send native/tokens, approve, swap (Uniswap v3/v4), provide liquidity (Uniswap v3/v4), and lend on Aave v3, all
-within the agent's authorized on-chain limits.
+description: Operate a non-custodial BVCC Agent Wallet on-chain — check balances, simulate, send native/tokens, approve, swap (Uniswap v3/v4), provide liquidity (Uniswap v3/v4), and lend on Aave v3, all within the agent's authorized on-chain limits.
 source: https://github.com/blockventurechaincapital-crypto/bvcc-agent-mcp
 
 transport:
