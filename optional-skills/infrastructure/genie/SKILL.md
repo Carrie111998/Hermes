@@ -156,7 +156,7 @@ When disk is critically high, flag these in the report even if `--clean` cannot 
 - If disk usage is below 50%, report "no action needed"
 - If any operation fails, report the error and continue
 - If a snapshot deletion fails, leave the snapshot in place and report at the end
-- The most recent snapshot is always preserved (never auto-deleted) — **NOTE: this is currently undermined by `backup_retention` (see Known Issues); verify the snapshot dir survived after every `--clean`, do not assume it from the summary line.**
+- The most recent snapshot is always preserved (never auto-deleted) — `backup_retention_plan()` now excludes `state-snapshot` candidates so the cross-class "keep 1" rule can never reclaim it (FIXED 2026-07-16; see Known Issues). Still verify the snapshot dir survived after every `--clean`; do not read `clean_snapshots`'s `freed 0.0 B` as proof it survived.
 - **Do not preserve multiple backups**: The VPS policy is one historical backup plus current live data. Count all historical backup classes together (`/root/backup`, `/root/backups`, snapshots, migration backups, `.bak-*`) and report/remove older valid copies.
 
 ## Known Issues / Pitfalls
