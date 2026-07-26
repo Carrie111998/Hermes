@@ -1813,6 +1813,24 @@ class WorkflowEngine:
                         f"expected format: attachments[N]"
                     )
 
+        # Check template variables reference declared inputs
+        declared_inputs = {i.get("name", "") for i in raw.get("inputs", [])}
+        if declared_inputs:
+            for nid, node in workflow.nodes.items():
+                # Extract template references from task text
+                refs = re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z0-9_\-]+\}", node.task)
+                for ref_ns in set(refs):
+                    if ref_ns == "inputs":
+                        continue  # {inputs.X} is always valid
+                    if ref_ns in ("context", "run_id", "date"):
+                        continue  # Built-in namespaces
+                    # Check if it's a declared input
+                    if ref_ns not in declared_inputs and ref_ns not in workflow.nodes:
+                        result["issues"].append(
+                            f"Node '{nid}' has template ref {{{ref_ns}.}} "
+                            f"but '{ref_ns}' is not a declared input or node"
+                        )
+
         # Check reviews/depends_on conflicts
         for nid, node in workflow.nodes.items():
             for review_entry in (node.reviews or []):
