@@ -256,7 +256,7 @@ def test_sidebar_skill_renames_only_after_applicable_read_checks_pass() -> None:
     )
     assert (
         "Rename a bound task only after every applicable exact-ID read, identity, "
-        "marker, and idle-status check has passed"
+        "marker, and authenticated-quiescence check has passed"
     ) in rename_step
     assert "Rename every bound task" not in rename_step
     assert "whenever" not in rename_step
@@ -470,7 +470,7 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
         "Desktop explicitly offline before native-create dispatch -> `desktop_offline`",
         "A native-create rejection proven before invoking `create_thread` -> "
         "`native_task_not_indexed`",
-        "Unavailable or not-yet-indexed reconciliation read -> "
+        "Unavailable, not-yet-indexed, or not-quiescent reconciliation read -> "
         "`native_task_not_indexed`",
         "Successfully returned thread-ID or marker mismatch, or multiple exact "
         "marker matches -> `marker_conflict`",
@@ -539,7 +539,10 @@ def test_sidebar_skill_verification_is_conditional_on_the_taken_delivery_path() 
     assert "If commit did not succeed" in verification
     assert "If a newly created task reached native-read polling" in verification
     assert "If a reconciled candidate was read before binding" in verification
-    assert "If exact-ID polling reached readable and idle" in verification
+    assert (
+        "If exact-ID polling reached an authenticated quiescent registration"
+        in verification
+    )
     assert "If exact-ID polling failed or timed out" in verification
     assert "If rename succeeded" in verification
     assert "If bind or rename failed" in verification
