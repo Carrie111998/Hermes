@@ -93,6 +93,99 @@ def test_tui_loader_does_not_persist_managed_back(homes, monkeypatch):
     assert (ts._cfg_cache.get("display") or {}).get("skin") == "user"
 
 
+def test_tui_write_config_key_does_not_bake_managed_overlay(homes, monkeypatch):
+    """Mutate-then-save via _write_config_key must not persist managed leaves."""
+    import yaml
+
+    home, managed = homes
+    _seed(
+        home,
+        managed,
+        user="display:\n  skin: user\n  busy_input_mode: queue\n",
+        mgd="display:\n  skin: charizard\n",
+    )
+    import tui_gateway.server as ts
+
+    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
+    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
+    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+
+    loaded = ts._load_cfg()
+    assert (loaded.get("display") or {}).get("skin") == "charizard"
+
+    ts._write_config_key("display.busy_input_mode", "steer")
+    disk = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert (disk.get("display") or {}).get("skin") == "user"
+    assert (disk.get("display") or {}).get("busy_input_mode") == "steer"
+
+
+def test_tui_write_config_key_refuses_managed_key(homes, monkeypatch):
+    """Direct writes to a managed leaf must fail closed (CLI set_config_value parity)."""
+    home, managed = homes
+    _seed(home, managed, user="display:\n  skin: user\n", mgd="display:\n  skin: charizard\n")
+    import tui_gateway.server as ts
+
+    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
+    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
+    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+
+    with pytest.raises(ts._ManagedConfigWriteError, match="managed"):
+        ts._write_config_key("display.skin", "blastoise")
+    disk = (home / "config.yaml").read_text(encoding="utf-8")
+    assert "charizard" not in disk
+    assert "blastoise" not in disk
+    assert "skin: user" in disk
+
+
+def test_tui_config_set_sibling_does_not_bake_managed(homes, monkeypatch):
+    """config.set paths that mutate then _save_cfg must also use raw config."""
+    import yaml
+
+    home, managed = homes
+    _seed(
+        home,
+        managed,
+        user="display:\n  skin: user\n  show_reasoning: false\n",
+        mgd="display:\n  skin: charizard\n",
+    )
+    import tui_gateway.server as ts
+
+    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
+    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
+    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+
+    resp = ts._methods["config.set"](1, {"key": "reasoning", "value": "show"})
+    assert "error" not in resp
+    disk = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert (disk.get("display") or {}).get("skin") == "user"
+    assert (disk.get("display") or {}).get("show_reasoning") is True
+
+
+def test_tui_config_set_refuses_managed_skin(homes, monkeypatch):
+    home, managed = homes
+    _seed(home, managed, user="display:\n  skin: user\n", mgd="display:\n  skin: charizard\n")
+    import tui_gateway.server as ts
+
+    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
+    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
+    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+
+    resp = ts._methods["config.set"](1, {"key": "skin", "value": "blastoise"})
+    assert resp.get("error", {}).get("code") == 4030
+    assert "managed" in resp["error"]["message"].lower()
+    disk = (home / "config.yaml").read_text(encoding="utf-8")
+    assert "blastoise" not in disk
+    assert "skin: user" in disk
+
+
 def test_logging_config_honors_managed(homes, monkeypatch):
     home, managed = homes
     _seed(home, managed, user="logging:\n  level: INFO\n", mgd="logging:\n  level: DEBUG\n")
