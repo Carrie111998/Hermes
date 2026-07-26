@@ -78,21 +78,18 @@ def check_workflow_requirements() -> bool:
 
 
 
-def _capture_session_for_engine() -> None:
-    """Capture current gateway session info into a temp file for the engine.
+def _capture_session_for_engine() -> dict:
+    """Capture current gateway session info for the engine.
 
     Called from the tool handler where ContextVars are live.
-    The engine reads this file because ContextVars are lost across
-    the tool-handler → engine call boundary.
+    Returns session info dict directly — no temp file needed.
     """
     try:
         from gateway.session_context import get_session_env
-        import json as _json
-        from pathlib import Path
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if platform and chat_id:
-            data = {
+            return {
                 "platform": platform,
                 "chat_id": chat_id,
                 "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
@@ -100,41 +97,9 @@ def _capture_session_for_engine() -> None:
                 "profile": get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE"),
                 "session_key": get_session_env("HERMES_SESSION_KEY", ""),
             }
-            # Write to both /tmp and the engine state dir for reliability
-            for path in ["/tmp/wfe-session.json",
-                         Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session.json"]:
-                try:
-                    path = Path(path)
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(path, "w") as f:
-                        _json.dump(data, f)
-                except Exception:
-                    pass
     except Exception:
         pass
-
-
-def _get_captured_session() -> dict:
-    """Read the session info captured by the tool handler from temp file.
-
-    Called from the engine where ContextVars are NOT available.
-    """
-    try:
-        import json as _json
-        from pathlib import Path
-        # Try /tmp first, then engine state dir
-        for path in ["/tmp/wfe-session.json",
-                     Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session.json"]:
-            try:
-                with open(path) as f:
-                    data = _json.load(f)
-                if data and data.get("platform"):
-                    return data
-            except Exception:
-                continue
-        return {}
-    except Exception:
-        return {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +245,7 @@ def _handle_workflow_start_predefined(
                 inputs=inputs,
                 board=board,
                 attachments=attachments,
+                session_info=_sess or None,
             )
         except FileNotFoundError as exc:
             return _err(f"workflow not found: {workflow}", hint=str(exc))
@@ -289,8 +255,7 @@ def _handle_workflow_start_predefined(
         return _ok(result)
 
     # Capture session info and inject into context (which persists in state file)
-    _capture_session_for_engine()
-    _sess = _get_captured_session()
+    _sess = _capture_session_for_engine()
     _ctx = context or {}
     if _sess:
         _ctx["_session_info"] = _sess
@@ -311,7 +276,7 @@ def _handle_workflow_start_predefined(
             board=board,
             fire_and_forget=True,
             attachments=attachments,
-            session_info=_get_captured_session() or None,
+            session_info=_sess or None,
         )
     except FileNotFoundError as exc:
         return _err(f"workflow not found: {workflow}", hint=str(exc))

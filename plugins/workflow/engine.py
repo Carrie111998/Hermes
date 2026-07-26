@@ -2277,14 +2277,7 @@ class WorkflowEngine:
             or (context or {}).get("_session_info")
             or self._get_session_info()
         )
-        # DEBUG: trace session_info
-        try:
-            Path("/tmp/wfe-debug.log").write_text(
-                f"session_info={bool(session_info)} context_si={bool((context or {}).get('_session_info'))} "
-                f"get_session_info={bool(self._get_session_info())} result={bool(_session_info)}\n"
-            )
-        except Exception:
-            pass
+
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
             has_loops = len(loop_layers) > 0
