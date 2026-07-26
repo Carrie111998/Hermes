@@ -1,0 +1,27 @@
+name: akari-video
+version: 0.1.0
+description: "AKARI Video — AI video editing tool (Theia-based monorepo) as a Git submodule plugin"
+author: "Hermes Agent"
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
+provides_tools:
+  - akari_video_status
+  - akari_video_skills
+  - akari_video_launch
+provides_cli:
+  - akari-video
+slash_commands:
+  - name: akari-video
+    description: "AKARI Video submodule: status, skills catalog, launch akari.mjs"
+    category: "Tools & Skills"
+    aliases: ["akari", "av"]
+    args_hint: "[status|skills|launch <args...>]"
+    cli_only: false
+    gateway_config_gate: "plugins.akari_video.enabled"
+submodule:
+  url: "https://github.com/zapabob/akari-video"
+  path: "vendor/akari-video"
+  recursive: true

@@ -26,3 +26,6 @@
 [submodule "vendor/officecli"]
 	path = vendor/officecli
 	url = https://github.com/iOfficeAI/OfficeCLI.git
+[submodule "vendor/akari-video"]
+	path = vendor/akari-video
+	url = https://github.com/zapabob/akari-video

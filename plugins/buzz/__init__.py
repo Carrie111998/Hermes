@@ -120,17 +120,7 @@ def _buzz_schema(name: str) -> dict:
         },
         "buzz_keypair": {
             "name": "buzz_keypair",
-            "description": "Generate or inspect a Nostr keypair for Buzz.",
-            "parameters": {
-                **base,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["generate", "inspect", "export"],
-                        "description": "Key lifecycle action.",
-                    }
-                },
-                "required": ["action"],
-            },
+            "description": "Inspect the configured Nostr identity (BUZZ_PRIVATE_KEY).",
+            "parameters": {**base},
         },
     }.get(name, {"name": name, "description": name, "parameters": base})
