@@ -445,6 +445,7 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
@@ -1303,13 +1304,49 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             return None
 
 
+def _resolve_workspace_key() -> Optional[str]:
+    """The current workspace identity for cwd-scoped resume.
+
+    Git repo root when CWD is inside a repo (so all sessions across its
+    subdirs/worktrees group together), else the CWD itself. Returns None when
+    neither can be determined — callers fall back to the global MRU then.
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.abspath(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        return os.getcwd()
+    except Exception:
+        return None
+
+
 def _resolve_last_session(source: str = "cli") -> Optional[str]:
-    """Look up the most recently-used session ID for a source."""
+    """Look up the most recently-used session ID for a source.
+
+    Scoped to the current workspace first (git repo root, else cwd) so
+    ``hermes -c`` from repo A continues repo A's last session rather than the
+    global MRU. Falls back to the unscoped MRU when no session matches the
+    current workspace, preserving the old behaviour for fresh directories.
+    """
     db = None
     try:
         from hermes_state import SessionDB
 
         db = SessionDB()
+        ws_key = _resolve_workspace_key()
+        if ws_key:
+            sessions = db.search_sessions(source=source, limit=1, workspace_key=ws_key)
+            if sessions:
+                return sessions[0]["id"]
+        # Fallback: global MRU for this source.
         sessions = db.search_sessions(source=source, limit=1)
         return sessions[0]["id"] if sessions else None
     except Exception:
@@ -4558,6 +4595,16 @@ def cmd_security(args):
     sys.exit(2)
 
 
+def cmd_approvals(args):
+    """Dispatch `hermes approvals <subcmd>`."""
+    from hermes_cli.approvals_suggest import approvals_command
+
+    status = approvals_command(args)
+    if status:
+        sys.exit(status)
+    return status
+
+
 def cmd_dump(args):
     """Dump setup summary for support/debugging."""
     from hermes_cli.dump import run_dump
@@ -7708,6 +7755,11 @@ def _update_via_zip(args):
             )
         _install_python_dependencies_with_optional_fallback(pip_cmd)
 
+    # ZIP path parity: heal the active memory provider's bridge packages
+    # after the dependency reinstall, same as the git-pull path (#53272,
+    # #70636).
+    _refresh_active_memory_provider_dependencies()
+
     node_failures = _update_node_dependencies()
     _build_web_ui(PROJECT_ROOT / "web")
 
@@ -9534,6 +9586,55 @@ def _refresh_active_lazy_features(
             "  ⚠ Leaving `.lazy-refresh-incomplete` until import probes can confirm health."
         )
     return False
+
+
+def _refresh_active_memory_provider_dependencies() -> None:
+    """Refresh pip dependencies for the configured external memory provider.
+
+    Memory-provider bridge packages are declared in each provider's
+    ``plugin.yaml`` (plus mode-dependent extras like Hindsight's
+    ``hindsight-all``), NOT in Hermes' editable-install extras or
+    ``LAZY_DEPS`` alone — so the core dependency reinstall above can strip
+    or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run the
+    provider's declared install for the ACTIVE provider only, after the
+    core install and lazy refresh, so the last write to any shared package
+    is the one the active provider needs.
+
+    Never raises. A failure here must not block the rest of the update.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (config load failed): %s", exc)
+        return
+
+    provider = ""
+    if isinstance(cfg, dict):
+        memory_cfg = cfg.get("memory")
+        if isinstance(memory_cfg, dict):
+            if memory_cfg.get("enabled") is False:
+                return
+            provider = str(memory_cfg.get("provider") or "").strip()
+
+    # "default" / empty is the built-in file-backed store — no pip deps.
+    if not provider or provider in {"default", "builtin", "none"}:
+        return
+
+    try:
+        from hermes_cli.memory_setup import _install_dependencies
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (import failed): %s", exc)
+        return
+
+    print()
+    print(f"→ Refreshing active memory provider dependencies ({provider})...")
+
+    try:
+        _install_dependencies(provider, force=True)
+    except Exception as exc:
+        print(f"  ⚠ {provider} dependencies failed to refresh: {exc}")
 
 
 def _install_python_dependencies_with_optional_fallback(
@@ -11420,6 +11521,36 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     print("    sudo systemctl restart <unit>     # system-scope")
 
 
+def _refresh_windows_gateway_launchers() -> None:
+    """Regenerate installed Windows gateway launcher scripts after update.
+
+    The Scheduled Task / Startup-folder launchers (``gateway.cmd`` +
+    ``gateway.vbs``) are persistence artifacts written once at install time —
+    ``hermes update`` never touched them, so installs created before the
+    hidden-console rework (aa2ae36c3f) kept launching the gateway through
+    ``pythonw.exe`` forever: every descendant spawn flashed a conhost
+    (#54220/#56747) and, since #70344, the console-less gateway died at
+    startup with ``RuntimeError: sys.stderr is None`` (#71671).
+
+    The task's /TR points at a stable script path, so rewriting the files in
+    place retargets the task without any schtasks call (no UAC needed).
+    ``_write_task_script`` is idempotent and renders from current code, so
+    this is a no-op for modern installs. Best-effort: a failed refresh must
+    never fail the update.
+    """
+    if not _is_windows():
+        return
+    try:
+        from hermes_cli import gateway_windows
+
+        if not gateway_windows.is_installed():
+            return
+        gateway_windows._write_task_script()
+        print("  ✓ Refreshed Windows gateway launcher scripts")
+    except Exception as exc:
+        logger.debug("Could not refresh Windows gateway launchers after update: %s", exc)
+
+
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
     if not token or not token.get("resume_needed"):
@@ -11427,6 +11558,11 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     token["resume_needed"] = False
     if not _is_windows():
         return
+
+    # Regenerate the persisted launcher scripts before respawning anything,
+    # so a legacy pythonw-era Scheduled Task / Startup entry comes back on
+    # the current hidden-console design at the next login too.
+    _refresh_windows_gateway_launchers()
 
     profiles = token.get("profiles") or {}
     unmapped = token.get("unmapped") or []
@@ -12158,6 +12294,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 "  ⚠ Lazy-refresh recovery incomplete — run `hermes` again "
                 "to finish import-based venv repair."
             )
+
+        # Heal the active memory provider's bridge packages last — the core
+        # reinstall + lazy refresh above may have stripped or downgraded
+        # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
+        _refresh_active_memory_provider_dependencies()
 
         node_failures = _update_node_dependencies()
         _build_web_ui(PROJECT_ROOT / "web")
@@ -14822,7 +14963,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
@@ -15664,6 +15805,11 @@ def main():
     build_security_parser(subparsers, cmd_security=cmd_security)
 
     # =========================================================================
+    # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
+    # =========================================================================
+    build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
+
+    # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)
     # =========================================================================
     build_dump_parser(subparsers, cmd_dump=cmd_dump)
@@ -16097,7 +16243,7 @@ def main():
         p.add_argument(
             "--newer-than",
             metavar="AGE",
-            help="Only match sessions started within the last AGE "
+            help="Only match sessions active within the last AGE "
             "(e.g. '5h', '2d') or after an ISO timestamp",
         )
         p.add_argument(
@@ -17254,12 +17400,14 @@ def main():
                 print(f"No sessions match ({describe_filters(filters)}).")
                 return
 
-            # Candidates are ordered oldest-first — surface the age span so
-            # the confirmation makes the blast radius obvious.
-            _oldest = candidates[0].get("started_at")
-            _newest = candidates[-1].get("started_at")
+            # Candidates are ordered by activity oldest-first. Surface that
+            # span so a long-lived but recently used conversation cannot look
+            # old merely because of its creation date.
+            _oldest = candidates[0].get("last_active")
+            _newest = candidates[-1].get("last_active")
             _span = (
-                f"oldest {format_epoch(_oldest)}, newest {format_epoch(_newest)}"
+                f"oldest activity {format_epoch(_oldest)}, "
+                f"newest activity {format_epoch(_newest)}"
             )
 
             if args.dry_run or not args.yes:
@@ -17272,7 +17420,7 @@ def main():
                     title = (s.get("title") or "")[:36]
                     model = (s.get("model") or "-").split("/")[-1][:24]
                     print(
-                        f"  {s['id']}  {format_epoch(s['started_at']):<17} "
+                        f"  {s['id']}  {format_epoch(s.get('last_active')):<17} "
                         f"{s['source']:<10} {model:<24} "
                         f"{s['message_count']:>4} msgs  {title}"
                     )
