@@ -1611,9 +1611,9 @@ def register_payment_adapters(
                     facts={"intent_id": intent_id, "readback_recorded": False},
                 ),
             )
+        allocation_facts = None
         if action.action_type in {"payments.create_invoice", "payments.create_metered_invoice"}:
             passed = bool(row["provider_reference"] and intent["payment_url"])
-            allocation_facts = None
             if action.action_type == "payments.create_metered_invoice":
                 from hermes_cli import usage_billing
 
