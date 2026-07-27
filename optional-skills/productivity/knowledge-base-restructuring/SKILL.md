@@ -1,6 +1,6 @@
 ---
 name: knowledge-base-restructuring
-description: "Restructure a messy knowledge library into an expert system organized by business lifecycle. Covers deduplication, merging, reorganization, and maintenance governance."
+description: "Restructure messy knowledge bases by project lifecycle."
 tags: [knowledge-management, restructuring, deduplication, note-taking, content-strategy]
 triggers:
   - user says knowledge base is messy, needs cleanup, needs restructuring
@@ -37,8 +37,8 @@ Readers should follow a project story, not browse a dictionary.
 
 ### Step 1: 做减法 (Deduplication)
 
-1. Scan all files: `find /path/ -name "*.md" -type f`
-2. Group by topic (grep for keywords: standard numbers, product names)
+1. Scan all files: `search_files(pattern="*.md", target="files", path="/path/")`
+2. Group by topic (search_files for keywords: standard numbers, product names)
 3. Identify overlapping content (same standard covered in 4-5 files)
 4. Create dedup checklist: `/path/去重合并清单.md`
    - List each topic group with file count before/after
@@ -85,6 +85,12 @@ terminal("mkdir -p /path/备份_原文件/TOPIC_原文件")
 # 2. Backup originals
 terminal("cp /path/ORIGINAL_DIR/*.md /path/备份_原文件/TOPIC_原文件/")
 
+# 2.5. Verify backup integrity before proceeding
+backup_result = terminal("ls /path/备份_原文件/TOPIC_原文件/")
+backup_files = backup_result.get('output', '').strip().splitlines()
+assert len(backup_files) > 0, f"Backup failed: no files in /path/备份_原文件/TOPIC_原文件/"
+print(f"Backup verified: {len(backup_files)} files in /path/备份_原文件/TOPIC_原文件/")
+
 # 3. Group files by target merged file
 groups = {
     "合并文件1": ["src1.md", "src2.md", "src3.md"],
@@ -97,7 +103,15 @@ for target, sources in groups.items():
     merged = f"# Title\n\n**版本：** v2.0\n---\n\n{''.join(contents)}"
     write_file(f"/path/TOPIC_终极指南/{target}.md", merged)
 
-# 5. Clear original directory (backups preserved)
+# 5. User confirmation before destructive removal
+print(f"Backup: {len(backup_files)} files preserved at /path/备份_原文件/TOPIC_原文件/")
+print(f"Merge: {len(groups)} target files created at /path/TOPIC_终极指南/")
+confirmation = input("Delete originals? Type 'yes' to confirm: ")
+if confirmation.strip().lower() != 'yes':
+    print("Aborted. Originals preserved in source directory.")
+    exit(0)
+
+# 6. Clear original directory (backups preserved)
 terminal("rm /path/ORIGINAL_DIR/*.md")
 ```
 
@@ -170,7 +184,7 @@ Create `00_反馈机制.md` with:
 
 6. **Don't use the model's knowledge as excuse to skip structure** — User said "你是大模型了，本身就有海量知识" — meaning use the model's built-in knowledge to ADD DEPTH (decision logic, cost analysis, real cases), not to skip the restructuring work. The value is in the structure + depth, not raw information.
 
-7. **Detect root-vs-subdirectory duplication first** — Before restructuring, scan for folders that exist BOTH at root level AND inside numbered subdirectories (e.g., `/note/平安校园/` AND `/note/01_规划阶段/平安校园/`). These duplicates are the #1 source of confusion. Use `find /path -type d | sort` to detect, then deduplicate BEFORE merging. The subdirectory copy is usually the canonical one; the root copy is the stale leftover from a previous partial restructure.
+7. **Detect root-vs-subdirectory duplication first** — Before restructuring, scan for folders that exist BOTH at root level AND inside numbered subdirectories (e.g., `/note/平安校园/` AND `/note/01_规划阶段/平安校园/`). These duplicates are the #1 source of confusion. Use `search_files(pattern="*", target="files", path="/path/")` to list all files, then extract unique directories to detect, then deduplicate BEFORE merging. The subdirectory copy is usually the canonical one; the root copy is the stale leftover from a previous partial restructure.
 
 8. **Always propose the plan before executing** — When user says "整理一下文件", do NOT immediately start moving files. First: (1) scan and analyze the full structure, (2) present a clear reorganization plan with proposed directory tree, (3) wait for user confirmation. This prevents mistakes and builds trust. User expects a planning-first workflow for structural changes.
 
