@@ -46,6 +46,17 @@ describe('desktop i18n runtime translator', () => {
     expect(translateNow('settings.nav.providerApiKeys')).toBe('API 金鑰')
   })
 
+  it('translates Russian strings and pluralized counters', () => {
+    setRuntimeI18nLocale('ru')
+
+    expect(translateNow('common.save')).toBe('Сохранить')
+    expect(translateNow('settings.appearance.title')).toBe('Внешний вид')
+    expect(translateNow('profiles.count', 1)).toBe('1 профиль')
+    expect(translateNow('profiles.count', 2)).toBe('2 профиля')
+    expect(translateNow('profiles.count', 11)).toBe('11 профилей')
+    expect(translateNow('profiles.count', 21)).toBe('21 профиль')
+  })
+
   it('keeps translated settings field copy addressable from schema keys', () => {
     const field = ['display', 'show_reasoning'].join('.')
 

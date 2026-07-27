@@ -18,12 +18,18 @@ describe('desktop i18n languages', () => {
     expect(normalizeLocale('ar')).toBe('ar')
     expect(normalizeLocale('AR-SA')).toBe('ar')
     expect(normalizeLocale(' ar_eg ')).toBe('ar')
+    expect(normalizeLocale('ru')).toBe('ru')
+    expect(normalizeLocale('RU-RU')).toBe('ru')
+    expect(normalizeLocale(' ru_RU ')).toBe('ru')
   })
 
   it('falls back to English for empty or unsupported values', () => {
     expect(normalizeLocale(null)).toBe(DEFAULT_LOCALE)
     expect(normalizeLocale('')).toBe(DEFAULT_LOCALE)
     expect(normalizeLocale('de')).toBe(DEFAULT_LOCALE)
+    expect(normalizeLocale('be')).toBe(DEFAULT_LOCALE)
+    expect(normalizeLocale('uk')).toBe(DEFAULT_LOCALE)
+    expect(normalizeLocale('kk')).toBe(DEFAULT_LOCALE)
   })
 
   it('distinguishes exact locale ids from supported config aliases', () => {
@@ -36,6 +42,11 @@ describe('desktop i18n languages', () => {
     expect(isLocale('zh-hant')).toBe(true)
     expect(isLocale('ja')).toBe(true)
     expect(isLocale('ar')).toBe(true)
+    expect(isSupportedLocaleValue('ru-RU')).toBe(true)
+    expect(isLocale('ru')).toBe(true)
+    expect(isSupportedLocaleValue('be')).toBe(false)
+    expect(isSupportedLocaleValue('uk')).toBe(false)
+    expect(isSupportedLocaleValue('kk')).toBe(false)
   })
 
   it('returns the persisted config value for supported locales', () => {
@@ -44,5 +55,6 @@ describe('desktop i18n languages', () => {
     expect(localeConfigValue('zh-hant')).toBe('zh-hant')
     expect(localeConfigValue('ja')).toBe('ja')
     expect(localeConfigValue('ar')).toBe('ar')
+    expect(localeConfigValue('ru')).toBe('ru')
   })
 })
