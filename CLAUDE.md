@@ -286,6 +286,18 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   eran casos nuevos. Aplicado transformador normal a los 38. 7 headings cambiaron, sin
   anchors internos que los referenciaran. Preservados `HermesCLI` (clase), `Nous Portal`.
   Build limpio: 98/98 warnings idénticos a la baseline.
+- Lote 8 (este commit): `skills/bundled/{mlops,note-taking,productivity,research,
+  smart-home,social-media,software-development,yuanbao}` = 32 (segunda mitad de
+  `bundled/`). **`skills/bundled/` COMPLETO (70/70).** 2 casos verificados contra la
+  doc en inglés (ambos ya resueltos allí igual, transformación normal): autor
+  `Nous Research`→`Digital Services LLC` en `productivity-google-workspace.md`, mención
+  normal del producto en `productivity-nano-pdf.md` ("already available in Hermes"→IYARI).
+  Curiosidad replicada a propósito: heading `# 编写 Hermes-Agent Skills（仓库内）` →
+  `# 编写 IYARI-Agent Skills（仓库内）` (guión, no espacio — el regex no limpia el
+  "-Agent" residual); el inglés ya commiteado tiene el mismo artefacto
+  ("Authoring IYARI-Agent Skills (in-repo)"), se replica por consistencia, no es un
+  bug nuevo. 10 headings cambiaron, sin anchors internos que los referenciaran. Build
+  limpio: 98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 
