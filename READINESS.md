@@ -456,6 +456,12 @@ Image manifest: `sha256:b081b0a9de63aadbcbb4392d6453616dfa8870c3cdc1402b20e06dff
 This is still deterministic local-provider evidence, not production deployment
 or live payment-provider evidence.
 
+After cumulative delegator-budget enforcement, the same command was rerun from
+commit `8144594bf130dad4f25f18a4e194b8fa4f82072a` on 2026-07-27. It returned
+`current-tree agentic acceptance: PASS`, with interrupted-provider read-back
+succeeding, `duplicate_provider_calls: 0`, and `duplicate_effects: 0`.
+Image manifest: `sha256:43ba8bfdacd7b6313e92c72da1e23c0cbe7fb80cd5982bb4dfb1587ab680b051`.
+
 Compliance lineage was separately validated with:
 
 ```sh

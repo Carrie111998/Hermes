@@ -275,3 +275,7 @@ scripts/run_agentic_acceptance.sh
 It passed the process-separated delegation, interrupted-provider read-back,
 durable restart recovery, and stop phases with zero duplicate provider calls.
 Image manifest: `sha256:b081b0a9de63aadbcbb4392d6453616dfa8870c3cdc1402b20e06dffa9d40d3f`.
+After cumulative delegator-budget enforcement, the same command was rerun from
+commit `8144594bf130dad4f25f18a4e194b8fa4f82072a` on 2026-07-27 and returned
+`current-tree agentic acceptance: PASS`. Image manifest:
+`sha256:43ba8bfdacd7b6313e92c72da1e23c0cbe7fb80cd5982bb4dfb1587ab680b051`.
