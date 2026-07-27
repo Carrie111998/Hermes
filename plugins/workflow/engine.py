@@ -2366,6 +2366,36 @@ class WorkflowEngine:
             states = {nid: NodeState(node_id=nid) for nid in workflow.nodes}
             results = {}
 
+        # On resume, check for blocked reviewer cards that need enrichment
+        if resume:
+            for nid, state in list(states.items()):
+                if state.status == "blocked" and state.kanban_card_id:
+                    # Check if this node is a reviewer for an upstream node
+                    for upstream_nid, upstream_state in states.items():
+                        upstream_node = workflow.nodes.get(upstream_nid)
+                        if upstream_node and nid in upstream_node.reviews:
+                            # Reviewer blocked — enrich upstream with failure
+                            body = self.get_card_body(state.kanban_card_id)
+                            print(f"   ↩ {nid} BLOCKED (reviewer) — enriching {upstream_nid} on resume")
+                            if upstream_state.kanban_card_id:
+                                try:
+                                    with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                        existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
+                                        feedback = f"\n\n--- Review Failed ({nid}) ---\n{body}"
+                                        new_body = existing_body + feedback
+                                        conn.execute(
+                                            "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL WHERE id = ?",
+                                            (new_body, upstream_state.kanban_card_id)
+                                        )
+                                        conn.commit()
+                                    upstream_state.status = "ready"
+                                    upstream_state.completed_at = None
+                                    upstream_state.result = None
+                                    print(f"   ✓ {upstream_nid} enriched with failure feedback, reset to ready")
+                                except Exception as e:
+                                    print(f"   ⚠  Failed to enrich upstream card on resume: {e}")
+                            break
+
         # Handle partial start
         if start_node and start_node in workflow.nodes:
             layer_idx = self._find_layer_for_node(layers, start_node)
