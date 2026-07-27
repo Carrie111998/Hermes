@@ -37,7 +37,7 @@ import sys
 import threading
 import types
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -216,6 +216,55 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
     )
     # And the cached agent instance must be untouched (never rebuilt).
     assert cached[0] is agent_obj
+
+
+@pytest.mark.asyncio
+async def test_streamed_response_media_cleanup_uses_defined_history_paths(
+    monkeypatch, tmp_path
+):
+    """A successfully streamed reply must not crash after delivery.
+
+    Regression: the post-stream branch passed ``_history_media_paths`` to
+    ``_deliver_media_from_response`` even though that local was defined only
+    inside ``_run_agent_inner``, producing a NameError after every Telegram
+    response.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner._adapter_for_source = lambda source: adapter
+    runner._deliver_media_from_response = AsyncMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Streamed successfully",
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "Streamed successfully"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "already_sent": True,
+            "failed": False,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response is None
+    runner._deliver_media_from_response.assert_awaited_once_with(
+        "Streamed successfully",
+        ANY,
+        adapter,
+        history_media_paths=set(),
+    )
 
 
 @pytest.mark.asyncio

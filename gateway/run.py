@@ -13974,6 +13974,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            # Snapshot paths already present before this turn so post-stream
+            # media delivery can deduplicate safely.  This handler owns the
+            # streaming-return branch below, so the value must be defined in
+            # this scope rather than only inside _run_agent_inner.
+            _history_media_paths: set = _collect_history_media_paths(history)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
