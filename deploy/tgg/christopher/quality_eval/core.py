@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -10,8 +11,9 @@ import sys
 import tempfile
 import urllib.parse
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Sequence
 
 import yaml
@@ -36,6 +38,10 @@ MEDIA_ROOTS = (
 
 
 class EvalError(RuntimeError):
+    pass
+
+
+class RunAlreadyActive(EvalError):
     pass
 
 
@@ -149,6 +155,8 @@ class StateStore:
                 "loop_caught": 0,
                 "human_caught": 0,
                 "occurred_batch_keys": [],
+                "last_completed_rows": 0,
+                "last_unmapped_count": 0,
             }
         return json.loads(self.state_path.read_text())
 
@@ -160,6 +168,26 @@ class StateStore:
 
     def save_defects(self, value: dict[str, str]) -> None:
         atomic_json(self.defects_path, value)
+
+    @contextmanager
+    def exclusive_run(self) -> Iterable[None]:
+        """Hold one kernel-released writer lock for the full evaluator run."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.root / "run.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RunAlreadyActive("another evaluator run holds the state lock") from exc
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()} {iso(utc_now())}\n".encode())
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 REMOTE_SNAPSHOT_SCRIPT = r"""
@@ -254,7 +282,11 @@ def _walk_media(value: Any) -> Iterable[str]:
             } and isinstance(child, str) and candidate(child):
                 yield child
             elif key in {"media_paths", "mediaPaths", "media_urls", "mediaUrls"} and isinstance(child, list):
-                yield from (str(item) for item in child if isinstance(item, str) and candidate(item))
+                for item in child:
+                    if isinstance(item, str) and candidate(item):
+                        yield item
+                    elif isinstance(item, (dict, list)):
+                        yield from _walk_media(item)
             elif key == "url" and isinstance(child, str) and candidate(child):
                 yield child
             else:
@@ -355,10 +387,16 @@ def pull_retained_media(
         for path in message.get("retained_media_paths", [])
     }
     for remote_path in sorted(paths):
+        if "\0" in remote_path or not remote_path.startswith("/"):
+            raise EvalError(f"retained media path is not absolute: {remote_path!r}")
+        if ".." in PurePosixPath(remote_path).parts:
+            raise EvalError(f"retained media path contains traversal: {remote_path}")
         if remote_path.startswith("/media/tgg/hermes/"):
             remote_path = f"/home/pclaw/.systems-pcl/data{remote_path}"
-        if not remote_path.startswith(MEDIA_ROOTS):
+        normalized = str(PurePosixPath(remote_path))
+        if not any(normalized.startswith(root) for root in MEDIA_ROOTS):
             raise EvalError(f"retained media path is outside read-only roots: {remote_path}")
+        remote_path = normalized
         suffix = Path(remote_path).suffix[:16]
         local = destination / f"{hashlib.sha256(remote_path.encode()).hexdigest()[:20]}{suffix}"
         result = command(
@@ -388,7 +426,25 @@ class Browser:
         )
         if result.returncode:
             raise EvalError(f"agent-browser {' '.join(args[:2])} failed: {result.stderr.strip()}")
-        return result.stdout
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise EvalError(f"agent-browser {' '.join(args[:2])} returned invalid JSON") from exc
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            raise EvalError(
+                f"agent-browser {' '.join(args[:2])} did not succeed: "
+                f"{json_dump(payload) if isinstance(payload, dict) else payload!r}"
+            )
+        data = payload.get("data")
+        if args and args[0] == "snapshot":
+            if not isinstance(data, dict) or not isinstance(data.get("snapshot"), str):
+                raise EvalError("agent-browser snapshot response has no data.snapshot")
+            return data["snapshot"]
+        if len(args) >= 2 and args[:2] == ["get", "url"]:
+            if not isinstance(data, dict) or not isinstance(data.get("url"), str):
+                raise EvalError("agent-browser get url response has no data.url")
+            return data["url"]
+        return json_dump(data)
 
     def _wait_for_content(self, session: str, *, required: str, attempts: int = 30) -> str:
         last = ""
@@ -437,6 +493,8 @@ class Browser:
 
 
 def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> dict[str, Any]:
+    if not isinstance(maker_session_id, str) or not maker_session_id.strip():
+        raise EvalError("maker_session_id is required")
     if not isinstance(value, dict):
         raise EvalError("judge response must be a JSON object")
     required = {
@@ -452,7 +510,7 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
     checker = value["checker_session_id"]
     if not isinstance(checker, str) or not checker:
         raise EvalError("judge checker_session_id is missing")
-    if maker_session_id and checker == maker_session_id:
+    if checker == maker_session_id:
         raise EvalError("checker session equals maker session")
     for axis in ("source_to_page", "page_to_source", "manager_readability"):
         if value[axis] not in RESULTS:
@@ -497,7 +555,7 @@ class Judge:
             "Read the source bundle and accessibility "
             "snapshots named below and inspect both attached screenshots. Check both directions: every "
             "page claim must trace to source, every source fact must be represented, and the page must "
-            "read sensibly to a TGG manager. Run all seven registry checks exactly once, using each "
+            "read sensibly to a TGG manager. Run every registry check exactly once, using each "
             "registry check id verbatim. A check whose triggering source fact is absent is unsure, not "
             "pass. Use unsure whenever "
             "evidence is insufficient; never silently pass uncertainty.\n"
@@ -523,6 +581,25 @@ class Judge:
 
         with tempfile.TemporaryDirectory(prefix="tgg-output-judge-") as tmp:
             output = Path(tmp) / "result.json"
+            try:
+                source_bundle = json.loads(bundle_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise EvalError("judge source bundle is unreadable JSON") from exc
+            source_images = [
+                str(item["local_path"])
+                for item in source_bundle.get("retained_media", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("local_path"), str)
+                and Path(item["local_path"]).is_file()
+            ][:20]
+            if source_images:
+                prompt += (
+                    "\nAttachment order: image 1 is the rendered case page; image 2 is the portal "
+                    "case list; subsequent images are retained source media in this exact order:\n"
+                    + "\n".join(f"- {path}" for path in source_images)
+                    + "\nUse the bundle's retained_media mapping to correlate each source image. "
+                    "If more source media is referenced than attached, mark affected checks unsure.\n"
+                )
             argv = [
                 "codex",
                 "exec",
@@ -537,8 +614,10 @@ class Judge:
                 captures["screenshot"],
                 "-i",
                 captures["portal_screenshot"],
-                "-",
             ]
+            for source_image in source_images:
+                argv.extend(["-i", source_image])
+            argv.append("-")
             # `codex exec` inherits CODEX_THREAD_ID in managed sessions and
             # otherwise resumes the maker's thread. Remove only session
             # bindings so the checker is a genuinely fresh vision seat while
@@ -575,8 +654,11 @@ class Judge:
             return validate_judgment(value, registry, maker_session_id)
 
 
-def defect_key(job_no: str, check_id: str, message_ids: Sequence[str]) -> str:
-    raw = "\0".join([job_no, check_id, *sorted(message_ids)])
+def defect_key(job_no: str, check_id: str, message_ids: Sequence[str] = ()) -> str:
+    # Identity is the case/check defect class, not the individual batch. An
+    # open repair row absorbs later evidence; after it terminals, the same key
+    # can create a new repair generation.
+    raw = "\0".join([job_no, check_id])
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -597,21 +679,54 @@ class DefectFiler:
         key = defect_key(job_no, check["id"], message_ids)
         index = self.store.defects()
         if key in index:
-            return index[key], False
+            indexed_id = index[key]
+            existing = self.command(
+                ["pcl", "whiteboard", "get", "--id", indexed_id],
+                capture_output=True,
+            )
+            if existing.returncode != 0:
+                # Dedupe is safety-bearing. A broken read never licenses a
+                # duplicate repair row every interval.
+                return indexed_id, False
+            try:
+                row = json.loads(existing.stdout).get("data", {})
+            except (json.JSONDecodeError, AttributeError):
+                return indexed_id, False
+            lane = row.get("lane")
+            if not isinstance(lane, str):
+                return indexed_id, False
+            if lane.lower() not in {"done", "cancelled", "archived"}:
+                return indexed_id, False
+            index.pop(key, None)
+            self.store.save_defects(index)
         search = self.command(
             ["pcl", "whiteboard", "search", "--query", f"tgg-output-defect:{key}", "--owner", "edna"],
             capture_output=True,
         )
-        if search.returncode == 0:
-            try:
-                rows = json.loads(search.stdout).get("data", [])
-            except (json.JSONDecodeError, AttributeError):
-                rows = []
-            if rows:
-                wb_id = str(rows[0].get("id") or rows[0].get("task_id"))
-                index[key] = wb_id
-                self.store.save_defects(index)
-                return wb_id, False
+        if search.returncode != 0:
+            raise EvalError(f"defect dedupe search failed: {search.stderr.strip()}")
+        try:
+            rows = json.loads(search.stdout).get("data", [])
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise EvalError("defect dedupe search returned invalid JSON") from exc
+        if not isinstance(rows, list):
+            raise EvalError("defect dedupe search returned non-list data")
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("lane"), str):
+                raise EvalError("defect dedupe search row has no lane")
+        if rows:
+            open_rows = [
+                row
+                for row in rows
+                if str(row.get("lane", "")).lower() not in {"done", "cancelled", "archived"}
+            ]
+        else:
+            open_rows = []
+        if open_rows:
+            wb_id = str(open_rows[0].get("id") or open_rows[0].get("task_id"))
+            index[key] = wb_id
+            self.store.save_defects(index)
+            return wb_id, False
         description = {
             "defect_key": f"tgg-output-defect:{key}",
             "job_no": job_no,
@@ -733,6 +848,12 @@ class Evaluator:
             raise EvalError(f"golden registry regression mismatch: {json_dump(mismatches)}")
 
     def run(self, *, trigger: str, maker_session_id: str, force: bool = False) -> dict[str, Any]:
+        with self.store.exclusive_run():
+            return self._run_locked(trigger=trigger, maker_session_id=maker_session_id, force=force)
+
+    def _run_locked(self, *, trigger: str, maker_session_id: str, force: bool = False) -> dict[str, Any]:
+        if not isinstance(maker_session_id, str) or not maker_session_id.strip():
+            raise EvalError("maker_session_id is required")
         registry = load_registry()
         state = self.store.load()
         snapshot = self.collect(int(state["cursor"]))
@@ -756,7 +877,7 @@ class Evaluator:
             self._golden(registry, maker_session_id)
         bundles, unmapped = make_bundles(snapshot)
         start_cursor = int(state["cursor"])
-        run_id = f"{self.clock().strftime('%Y%m%dT%H%M%SZ')}-{events[0]['seq']}-{events[-1]['seq']}"
+        run_id = f"cursor-{start_cursor + 1}-{events[-1]['seq']}"
         run_dir = self.store.root / "runs" / run_id
         # A failed attempt deliberately keeps its evidence. Retrying the same
         # cursor window resumes that stable run directory rather than inventing
@@ -798,8 +919,13 @@ class Evaluator:
         state["cursor"] = max(int(item["seq"]) for item in events)
         state["last_success_at"] = iso(completed_at)
         state["registry_hash"] = registry.digest
-        state["batches_evaluated"] = int(state.get("batches_evaluated", 0)) + 1
+        # The committed cursor covers every overlapping occurrence window
+        # recorded since the previous cursor, including failed attempts whose
+        # end sequence is now included.
+        state["batches_evaluated"] = int(state.get("batches_occurred", 0))
         state["loop_caught"] = int(state.get("loop_caught", 0)) + new_defects
+        state["last_completed_rows"] = len(events)
+        state["last_unmapped_count"] = len(unmapped)
         trend = list(state.get("defect_trend", []))
         trend.append({"run_id": run_id, "at": iso(completed_at), "defects": len(defects), "new_defects": new_defects})
         state["defect_trend"] = trend[-30:]
@@ -861,6 +987,8 @@ def finalize_external(
     vision clone can finish without holding the cursor transaction open. The
     cursor advances only after every non-pass result has a durable WB id.
     """
+    if not isinstance(maker_session_id, str) or not maker_session_id.strip():
+        raise EvalError("maker_session_id is required")
     now = now or utc_now()
     registry = load_registry()
     batch = json.loads(batch_path.read_text())
@@ -870,7 +998,7 @@ def finalize_external(
     checker = raw_judgment.get("evaluator_session") or raw_judgment.get("checker_session_id")
     if not isinstance(checker, str) or not checker:
         raise EvalError("external judge result has no evaluator_session")
-    if maker_session_id and checker == maker_session_id:
+    if checker == maker_session_id:
         raise EvalError("checker session equals maker session")
     case_results = raw_judgment.get("cases")
     portal_results = raw_judgment.get("portal_checks", [])
@@ -908,9 +1036,11 @@ def finalize_external(
     state = store.load()
     cursor_start = int(batch.get("cursor_start", 0))
     cursor_end = int(batch.get("cursor_end") or max(int(item["seq"]) for item in batch["events"]))
-    if int(state.get("cursor", 0)) >= cursor_end:
+    if int(state.get("cursor", 0)) > cursor_end:
+        raise EvalError("local cursor is ahead of the external batch")
+    if int(state.get("cursor", 0)) == cursor_end:
         return {"ok": True, "ran": False, "reason": "already-finalized", "cursor": state["cursor"]}
-    if int(state.get("cursor", 0)) not in {0, cursor_start}:
+    if int(state.get("cursor", 0)) != cursor_start:
         raise EvalError("local cursor does not match the external batch start")
     if state.get("registry_hash") != registry.digest:
         Evaluator(store, judge=golden_judge or Judge())._golden(registry, maker_session_id)
@@ -1015,9 +1145,11 @@ def finalize_external(
     state["cursor"] = cursor_end
     state["last_success_at"] = iso(now)
     state["registry_hash"] = registry.digest
-    state["batches_evaluated"] = int(state.get("batches_evaluated", 0)) + 1
+    state["batches_evaluated"] = int(state.get("batches_occurred", 0))
     created_count = sum(int(item["created"]) for item in defects)
     state["loop_caught"] = int(state.get("loop_caught", 0)) + created_count
+    state["last_completed_rows"] = len(batch["events"])
+    state["last_unmapped_count"] = len(unmapped)
     trend = list(state.get("defect_trend", []))
     run_id = f"external-{cursor_start + 1}-{cursor_end}"
     trend.append({"run_id": run_id, "at": iso(now), "defects": len(defects), "new_defects": created_count})
@@ -1064,7 +1196,21 @@ def health(store: StateStore, now: datetime | None = None) -> dict[str, Any]:
         "defect_trend": state.get("defect_trend", []),
         "human_caught": int(state.get("human_caught", 0)),
         "loop_caught": int(state.get("loop_caught", 0)),
+        "last_completed_rows": int(state.get("last_completed_rows", 0)),
+        "last_unmapped_count": int(state.get("last_unmapped_count", 0)),
     }
+
+
+def initialize_cursor(store: StateStore, cursor: int, now: datetime | None = None) -> dict[str, Any]:
+    if cursor < 0:
+        raise EvalError("initial cursor must be non-negative")
+    if store.root.exists() and any(store.root.iterdir()):
+        raise EvalError("cursor initialization is allowed only on pristine evaluator state")
+    state = store.load()
+    state["cursor"] = cursor
+    state["initialized_at"] = iso(now or utc_now())
+    store.save(state)
+    return {"ok": True, "initialized": True, "cursor": cursor}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1086,6 +1232,8 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--judge-result", type=Path, required=True)
     finalize.add_argument("--artifacts-dir", type=Path, required=True)
     finalize.add_argument("--maker-session-id", default=os.environ.get("MARSHAL_SESSION_ID", ""))
+    initialize = sub.add_parser("initialize-cursor", help="Set the first cursor on pristine local evaluator state.")
+    initialize.add_argument("--cursor", type=int, required=True)
     return parser
 
 
@@ -1109,21 +1257,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             append_jsonl(store.human_path, {"at": iso(utc_now()), "check_id": args.check_id, "evidence": args.evidence})
             result = {"ok": True, "check_id": args.check_id}
         elif args.command_name == "finalize":
-            result = finalize_external(
-                store,
-                batch_path=args.batch,
-                judgment_path=args.judge_result,
-                artifacts_dir=args.artifacts_dir,
-                maker_session_id=args.maker_session_id,
-            )
+            with store.exclusive_run():
+                result = finalize_external(
+                    store,
+                    batch_path=args.batch,
+                    judgment_path=args.judge_result,
+                    artifacts_dir=args.artifacts_dir,
+                    maker_session_id=args.maker_session_id,
+                )
+        elif args.command_name == "initialize-cursor":
+            result = initialize_cursor(store, args.cursor)
         else:
             result = Evaluator(store).run(
                 trigger=args.trigger,
                 maker_session_id=args.maker_session_id,
                 force=args.force,
             )
+            current_health = health(store)
+            result.update(
+                {
+                    key: current_health[key]
+                    for key in (
+                        "batches_evaluated",
+                        "batches_occurred",
+                        "coverage_ratio",
+                        "defect_trend",
+                        "human_caught",
+                        "loop_caught",
+                        "last_completed_rows",
+                        "last_unmapped_count",
+                    )
+                }
+            )
+            result["ok"] = current_health["ok"]
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("ok") else 1
+    except RunAlreadyActive:
+        print(json.dumps({"ok": True, "ran": False, "reason": "already-running"}, sort_keys=True))
+        return 0
     except EvalError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
         return 1

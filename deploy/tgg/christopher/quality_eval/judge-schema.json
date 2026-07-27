@@ -11,8 +11,6 @@
     "summary": {"type": "string", "minLength": 1},
     "checks": {
       "type": "array",
-      "minItems": 7,
-      "maxItems": 7,
       "items": {
         "type": "object",
         "additionalProperties": false,

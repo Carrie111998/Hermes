@@ -159,6 +159,12 @@ def test_media_pull_is_source_only_allowlisted(tmp_path):
             tmp_path,
             command=command,
         )
+    with pytest.raises(core.EvalError, match="traversal"):
+        core.pull_retained_media(
+            {"messages": [{"retained_media_paths": ["/media/tgg/hermes/../../etc/passwd"]}]},
+            tmp_path,
+            command=command,
+        )
 
 
 def test_walk_media_matches_canonical_media_object_shapes():
@@ -180,28 +186,30 @@ def test_walk_media_matches_canonical_media_object_shapes():
 
 
 def test_browser_retries_loading_skeleton_until_case_detail(tmp_path):
-    responses = iter(
+    values = iter(
         [
-            "ok",  # auth
-            "ok",  # portal open
-            "Loading... skeleton",
-            "ok",  # wait
-            "TGG Cases",
-            "ok",  # portal screenshot
-            "ok",  # case open
-            "AM/JOB/2607/0001",  # get url
-            "Loading... skeleton",
-            "ok",  # wait
-            "Case AM/JOB/2607/0001 details",
-            "ok",  # case screenshot
-            "ok",  # close
+            {},  # auth
+            {},  # portal open
+            {"snapshot": "Loading... skeleton"},
+            {},  # wait
+            {"snapshot": "TGG Cases"},
+            {},  # portal screenshot
+            {},  # case open
+            {"url": core.case_url("AM/JOB/2607/0001")},
+            {"snapshot": "Loading... skeleton"},
+            {},  # wait
+            {"snapshot": "Case AM/JOB/2607/0001 details"},
+            {},  # case screenshot
+            {},  # close
         ]
     )
     calls = []
 
     def command(argv, **_kwargs):
         calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, next(responses), "")
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"success": True, "data": next(values)}), ""
+        )
 
     captures = core.Browser(command).capture(
         "fixture",
@@ -212,6 +220,16 @@ def test_browser_retries_loading_skeleton_until_case_detail(tmp_path):
     assert sum(argv[-2:] == ["wait", "1000"] for argv in calls) == 2
 
 
+def test_browser_rejects_false_success_envelope():
+    def command(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"success": False, "error": "not authenticated"}), ""
+        )
+
+    with pytest.raises(core.EvalError, match="did not succeed"):
+        core.Browser(command)._run("fixture", ["open", "https://example.invalid"])
+
+
 def test_strict_judgment_preserves_unsure_and_rejects_maker():
     registry = core.load_registry()
     value = core.validate_judgment(judgment(), registry, "maker-1")
@@ -219,6 +237,8 @@ def test_strict_judgment_preserves_unsure_and_rejects_maker():
     assert any(item["result"] == "unsure" for item in value["checks"])
     with pytest.raises(core.EvalError, match="equals maker"):
         core.validate_judgment(judgment("maker-1"), registry, "maker-1")
+    with pytest.raises(core.EvalError, match="maker_session_id is required"):
+        core.validate_judgment(judgment(), registry, "")
     broken = judgment()
     broken["checks"].pop()
     with pytest.raises(core.EvalError, match="exactly match"):
@@ -254,7 +274,9 @@ def test_injected_judge_command_receives_paths_and_is_strict(tmp_path):
 
 def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle.json"
-    bundle.write_text("{}")
+    source_image = tmp_path / "source.jpg"
+    source_image.write_bytes(b"jpg")
+    bundle.write_text(json.dumps({"retained_media": [{"local_path": str(source_image)}]}))
     screen = tmp_path / "screen.png"
     screen.write_bytes(b"png")
     monkeypatch.setenv("CODEX_THREAD_ID", "maker-thread")
@@ -262,6 +284,7 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     seen = {}
 
     def command(argv, **kwargs):
+        seen["argv"] = argv
         seen["env"] = kwargs["env"]
         output = Path(argv[argv.index("--output-last-message") + 1])
         output.write_text(json.dumps(judgment("ignored-model-value")))
@@ -287,6 +310,12 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     assert result["checker_session_id"] == "fresh-checker"
     assert "CODEX_THREAD_ID" not in seen["env"]
     assert "MARSHAL_SESSION_ID" not in seen["env"]
+    image_args = [
+        seen["argv"][index + 1]
+        for index, value in enumerate(seen["argv"])
+        if value == "-i"
+    ]
+    assert str(source_image) in image_args
 
 
 def test_defect_filing_dedupes_locally(tmp_path):
@@ -297,6 +326,10 @@ def test_defect_filing_dedupes_locally(tmp_path):
         calls.append(argv)
         if argv[2] == "search":
             return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "data": []}), "")
+        if argv[2] == "get":
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"ok": True, "data": {"lane": "ongoing"}}), ""
+            )
         return subprocess.CompletedProcess(argv, 0, "wb-123\n", "")
 
     filer = core.DefectFiler(store, command=command)
@@ -310,6 +343,41 @@ def test_defect_filing_dedupes_locally(tmp_path):
     assert filer.file(**kwargs) == ("wb-123", True)
     assert filer.file(**kwargs) == ("wb-123", False)
     assert sum(argv[2] == "create" for argv in calls) == 1
+
+
+def test_defect_dedupe_read_failure_keeps_existing_row(tmp_path):
+    store = core.StateStore(tmp_path)
+    key = core.defect_key(
+        "AM/JOB/2607/0001",
+        "sender-shows-real-name-not-site-worker",
+        ["wa-10"],
+    )
+    store.save_defects({key: "wb-existing"})
+
+    def command(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "read failed")
+
+    filer = core.DefectFiler(store, command=command)
+    result = filer.file(
+        job_no="AM/JOB/2607/0001",
+        check={
+            "id": "sender-shows-real-name-not-site-worker",
+            "result": "fail",
+            "evidence": "wrong label",
+        },
+        screenshot="/tmp/case.png",
+        message_ids=["wa-10"],
+        judgment_path="/tmp/judgment.json",
+    )
+    assert result == ("wb-existing", False)
+
+
+def test_state_lock_refuses_overlapping_runner(tmp_path):
+    store = core.StateStore(tmp_path)
+    with store.exclusive_run():
+        with pytest.raises(core.RunAlreadyActive):
+            with store.exclusive_run():
+                pass
 
 
 class FakeBrowser:
@@ -393,17 +461,48 @@ def test_successful_run_commits_cursor_after_artifacts_and_defects(tmp_path, mon
     )
     result = evaluator.run(trigger="deploy", maker_session_id="maker-1")
     assert result["ran"] is True
+    assert result["run_id"] == "cursor-1-11"
     assert result["committed_cursor"] == 11
     assert result["unmapped_message_ids"] == []
     assert store.load()["cursor"] == 11
     assert store.load()["registry_hash"] == core.load_registry().digest
     assert store.load()["batches_evaluated"] == 1
+    assert store.load()["last_completed_rows"] == 2
+    assert store.load()["last_unmapped_count"] == 0
     assert judge.calls == 2  # golden regression, then the live case
     assert any(call["check"]["result"] == "unsure" for call in filer.calls)
     receipt = next((tmp_path / "runs").glob("*/receipt.json"))
     assert json.loads(receipt.read_text())["completed_rows"] == 2
     second = evaluator.run(trigger="interval", maker_session_id="maker-1")
     assert second["ran"] is False
+
+
+def test_successful_run_reconciles_prior_failed_occurrences(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
+    store = core.StateStore(tmp_path)
+    state = store.load()
+    state.update(
+        {
+            "batches_occurred": 2,
+            "batches_evaluated": 0,
+            "occurred_batch_keys": ["1:9", "1:10"],
+            "registry_hash": core.load_registry().digest,
+        }
+    )
+    store.save(state)
+    evaluator = core.Evaluator(
+        store,
+        collect=lambda _cursor: snapshot(),
+        browser=FakeBrowser(),
+        judge=FakeJudge(),
+        filer=FakeFiler(),
+        clock=lambda: NOW,
+    )
+    evaluator.run(trigger="deploy", maker_session_id="maker-1")
+    final_state = store.load()
+    assert final_state["batches_occurred"] == 3
+    assert final_state["batches_evaluated"] == 3
+    assert core.health(store, NOW)["coverage_ratio"] == 1.0
 
 
 def test_health_reports_required_population_metrics(tmp_path):
@@ -418,6 +517,8 @@ def test_health_reports_required_population_metrics(tmp_path):
             "human_caught": 1,
             "loop_caught": 4,
             "cursor": 99,
+            "last_completed_rows": 25,
+            "last_unmapped_count": 2,
         }
     )
     store.save(state)
@@ -426,6 +527,48 @@ def test_health_reports_required_population_metrics(tmp_path):
     assert result["coverage_ratio"] == 1.0
     assert result["defect_trend"] == [{"defects": 2}]
     assert (result["human_caught"], result["loop_caught"]) == (1, 4)
+    assert (result["last_completed_rows"], result["last_unmapped_count"]) == (25, 2)
+
+
+def test_run_cli_emits_top_level_health_metrics(tmp_path, monkeypatch, capsys):
+    class StubEvaluator:
+        def __init__(self, _store):
+            pass
+
+        def run(self, **_kwargs):
+            return {"ok": True, "ran": False, "reason": "no-new-completions"}
+
+    monkeypatch.setattr(core, "Evaluator", StubEvaluator)
+    monkeypatch.setattr(
+        core,
+        "health",
+        lambda _store: {
+            "ok": True,
+            "batches_evaluated": 4,
+            "batches_occurred": 4,
+            "coverage_ratio": 1.0,
+            "defect_trend": [{"defects": 1}],
+            "human_caught": 2,
+            "loop_caught": 3,
+            "last_completed_rows": 25,
+            "last_unmapped_count": 0,
+        },
+    )
+    assert core.main(
+        [
+            "--state-dir",
+            str(tmp_path),
+            "run",
+            "--trigger",
+            "interval",
+            "--maker-session-id",
+            "check-runner",
+        ]
+    ) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["coverage_ratio"] == 1.0
+    assert output["defect_trend"] == [{"defects": 1}]
+    assert (output["human_caught"], output["loop_caught"]) == (2, 3)
 
 
 def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
@@ -477,6 +620,7 @@ def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
     (tmp_path / "portal-cases.png").write_bytes(b"portal")
     filer = FakeFiler()
     store = core.StateStore(tmp_path / "state")
+    core.initialize_cursor(store, 9, NOW)
     result = core.finalize_external(
         store,
         batch_path=batch_path,
@@ -505,6 +649,7 @@ def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
     external["evaluator_session"] = "maker-1"
     judge_path.write_text(json.dumps(external))
     fresh_store = core.StateStore(tmp_path / "fresh-state")
+    core.initialize_cursor(fresh_store, 9, NOW)
     with pytest.raises(core.EvalError, match="equals maker"):
         core.finalize_external(
             fresh_store,
@@ -516,6 +661,13 @@ def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
             golden_judge=FakeJudge(),
             now=NOW,
         )
+
+
+def test_initialize_cursor_requires_pristine_state(tmp_path):
+    store = core.StateStore(tmp_path / "state")
+    assert core.initialize_cursor(store, 23, NOW)["cursor"] == 23
+    with pytest.raises(core.EvalError, match="pristine"):
+        core.initialize_cursor(store, 24, NOW)
 
 
 def test_golden_fixture_covers_all_result_classes():
