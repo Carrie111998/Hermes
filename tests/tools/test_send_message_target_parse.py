@@ -55,6 +55,41 @@ def test_whatsapp_friendly_name_still_uses_directory_resolution() -> None:
     assert _parse_target_ref("whatsapp", "general")[2] is False
 
 
+def test_wecom_external_userid_is_explicit() -> None:
+    chat_id, thread_id, is_explicit = _parse_target_ref(
+        "wecom", "woGyl0EAAAF904oOQcB4CAMZr5piFDxQ"
+    )
+
+    assert chat_id == "woGyl0EAAAF904oOQcB4CAMZr5piFDxQ"
+    assert thread_id is None
+    assert is_explicit is True
+
+
+def test_wecom_corp_scoped_userid_is_explicit() -> None:
+    # The callback adapter emits ``corp_id:user_id`` chat IDs and splits on the
+    # first ``:`` to recover ``touser`` — a scoped reply target must round-trip.
+    chat_id, thread_id, is_explicit = _parse_target_ref(
+        "wecom", "wwabc123:woGyl0EAAAF904oOQcB4CAMZr5piFDxQ"
+    )
+
+    assert chat_id == "wwabc123:woGyl0EAAAF904oOQcB4CAMZr5piFDxQ"
+    assert thread_id is None
+    assert is_explicit is True
+
+
+def test_wecom_userid_prefix_only_matches_wecom() -> None:
+    # The ``wo``-prefixed token must not be treated as explicit on other
+    # platforms, which have their own target grammars.
+    assert _parse_target_ref("telegram", "woGyl0EAAAF904oOQcB4CAMZr5piFDxQ")[2] is False
+    assert _parse_target_ref("weixin", "woGyl0EAAAF904oOQcB4CAMZr5piFDxQ")[2] is False
+
+
+def test_wecom_friendly_name_still_uses_directory_resolution() -> None:
+    # A human-friendly channel name lacks the ``wo`` prefix, so it falls through
+    # to channel-directory resolution rather than being sent verbatim.
+    assert _parse_target_ref("wecom", "sales-team")[2] is False
+
+
 def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
     whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
     config = SimpleNamespace(
