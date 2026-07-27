@@ -440,3 +440,7 @@ gateway:
     session_db_unavailable_prefix: "قاعدة بيانات الجلسات غير متاحة"
     session_not_found:           "لم يُعثر على الجلسة في قاعدة البيانات."
     warn_passthrough:            "⚠️ {error}"
+
+cron:
+  delivery:
+    wrapper: "Cronjob Response: {task_name}\n(job_id: {job_id})\n-------------\n\n{content}\n\nTo stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
