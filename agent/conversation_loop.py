@@ -93,6 +93,37 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# Output-cap retry safety margin, in tokens.
+#
+# When a provider rejects a call because input_tokens + max_tokens exceeds the
+# context window, the retry recomputes max_tokens from the budget the provider
+# reported. That number describes the request that ALREADY FAILED: by the time
+# the retry is sent the payload has grown slightly (retry bookkeeping, status
+# lines), so the true budget is smaller than the parsed one. The margin absorbs
+# that drift.
+#
+# It must ESCALATE. A fixed margin smaller than the per-retry growth can never
+# converge -- each retry lands the same distance over the limit:
+#
+#     safe_out   = (ctx - input_n) - margin
+#     next_total = (input_n + growth) + safe_out = ctx + (growth - margin)
+#
+# so with growth > margin every attempt overshoots by the same amount until the
+# attempt budget runs out. Doubling outgrows any bounded growth in
+# O(log growth) attempts; the shift is capped so a high attempt count cannot
+# collapse the output budget to nothing.
+#
+# The BASE is deliberately generous rather than minimal. `compression.
+# max_attempts` defaults to 3, so a base that only just exceeds the growth
+# burns most of that budget before converging -- starting at 64 against an
+# observed growth of 65 converges only on the third and final attempt, with no
+# headroom left for a provider that drifts slightly more. 1024 tokens is 0.4%
+# of a 262k window and converges on the FIRST retry for any realistic growth,
+# which is the right trade: the cost is a little unused output headroom on one
+# call, and the alternative is a dead turn.
+_OUTPUT_CAP_BASE_MARGIN_TOKENS = 1024
+_OUTPUT_CAP_MAX_MARGIN_SHIFT = 4  # 1024 << 4 = 16384 tokens
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -4347,21 +4378,47 @@ def run_conversation(
                         request_input_estimate = estimate_request_tokens_rough(
                             api_messages, tools=agent.tools or None,
                         )
+                        # The margin DOUBLES per attempt instead of staying at a
+                        # flat 64 (#TBD).  `available_out` describes the request
+                        # that already failed; by the time the retry goes out the
+                        # payload has grown (retry bookkeeping, status lines), so
+                        # the real budget is smaller than the number we just
+                        # parsed.  A fixed margin that is smaller than that growth
+                        # never converges -- every retry lands the same distance
+                        # over the limit:
+                        #
+                        #   safe_out   = (ctx - input_n) - 64
+                        #   next_total = (input_n + growth) + safe_out
+                        #              = ctx + (growth - 64)
+                        #
+                        # With growth=65 that is ctx+1 forever.  Observed live
+                        # against a 262,144-token vLLM model: three attempts at
+                        # totals of exactly 262,145, then "max compression
+                        # attempts (3) reached" -- the retries could not have
+                        # succeeded at any attempt count.
+                        #
+                        # Doubling makes the margin outgrow any bounded per-retry
+                        # growth in O(log growth) attempts, and costs only unused
+                        # output headroom on the retry that succeeds.
+                        safety_margin = _OUTPUT_CAP_BASE_MARGIN_TOKENS * (
+                            2 ** min(compression_attempts, _OUTPUT_CAP_MAX_MARGIN_SHIFT)
+                        )
                         local_available_out = old_ctx - request_input_estimate
                         if local_available_out > 0:
-                            safe_out = max(1, min(available_out, local_available_out) - 64)
+                            safe_out = max(1, min(available_out, local_available_out) - safety_margin)
                         else:
                             # The rough local estimate can overshoot the real
                             # request size.  Fall back to the provider-reported
                             # budget, which is authoritative for the failed
                             # request.
-                            safe_out = max(1, available_out - 64)
+                            safe_out = max(1, available_out - safety_margin)
                         agent._ephemeral_max_output_tokens = safe_out
                         agent._buffer_vprint(
                             f"⚠️  Output cap too large for current prompt — "
                             f"retrying with max_tokens={safe_out:,} "
                             f"(provider_available={available_out:,}, "
-                            f"estimated_request_tokens={request_input_estimate:,}; "
+                            f"estimated_request_tokens={request_input_estimate:,}, "
+                            f"safety_margin={safety_margin:,}; "
                             f"context_length unchanged at {old_ctx:,})"
                         )
                         # Still count against compression_attempts so we don't
