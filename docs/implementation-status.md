@@ -39,6 +39,8 @@ acceptance evidence.
 - Result handoff also revalidates the exact Kanban task contract (board,
   tenant, assignee, title, body, and grant binding) before a completion event
   can wake CEO planning; board selection is explicit across process boundaries.
+- Completed execution-contract-bound Kanban tasks are append-only; the CLI
+  cannot rewrite their result after governed evidence has been recorded.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

@@ -750,6 +750,11 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
         kanban_db.complete_task(
             board, task_id, summary="Evidence synthesis ready for review"
         )
+        assert kanban_db.edit_completed_task_result(
+            board,
+            task_id,
+            result="Attempted post-handoff rewrite",
+        ) is False
     action_id = ids[-1]
     conn.execute(
         """INSERT INTO permits (

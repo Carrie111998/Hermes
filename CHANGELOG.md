@@ -48,6 +48,8 @@
 - Result handoff now revalidates the exact Kanban task contract and accepts an
   explicit board identity, preventing a tampered or cross-board task from
   waking CEO planning.
+- Governed completed Kanban task results are now append-only; post-handoff CLI
+  edits are rejected instead of mutating evidence used by CEO verification.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

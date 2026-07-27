@@ -5371,9 +5371,14 @@ def edit_completed_task_result(
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status,execution_contract_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if not row or row["status"] != "done":
+            return False
+        if row["execution_contract_id"]:
+            # A governed worker result is part of the immutable grant/evidence
+            # contract. Corrections must be represented by a new task/grant or
+            # an explicit reconciliation event, never by rewriting the result.
             return False
         conn.execute(
             "UPDATE tasks SET result = ? WHERE id = ?",
