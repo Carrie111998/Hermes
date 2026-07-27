@@ -1299,6 +1299,9 @@ class TestProfileRestoration:
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.check_alias_collision", lambda _name: None
+        )
 
         # Mock the wrapper dir to be inside tmp_path
         wrapper_dir = tmp_path / ".local" / "bin"

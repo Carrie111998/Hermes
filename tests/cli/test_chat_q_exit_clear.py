@@ -94,6 +94,7 @@ def test_single_query_main_skips_clear_on_exit_summary(monkeypatch):
                 clear_calls.append("CLEARED")  # should NOT happen
 
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setitem(cli_mod.CLI_CONFIG, "worktree", False)
     monkeypatch.setattr(cli_mod.atexit, "register", lambda *_a, **_kw: None)
     monkeypatch.setattr(
         cli_mod,

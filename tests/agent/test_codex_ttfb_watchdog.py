@@ -282,20 +282,24 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "1")
 
     closes: list = []
+    stop = {"flag": False}
     dummy_client = SimpleNamespace()
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+
+    def _abort_request(_client, reason=None):
+        closes.append(reason)
+        stop["flag"] = True
+
     monkeypatch.setattr(
         agent,
         "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        _abort_request,
     )
     monkeypatch.setattr(
         agent,
         "_close_request_openai_client",
         lambda c, reason=None: closes.append(reason),
     )
-
-    stop = {"flag": False}
 
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
         agent._codex_stream_last_event_ts = time.time()

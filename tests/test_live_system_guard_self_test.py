@@ -18,6 +18,7 @@ the guard? Add a test here too.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import types
@@ -277,7 +278,12 @@ def test_subprocess_killall_hermes_blocked():
 
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
+requires_systemctl = pytest.mark.skipif(
+    shutil.which("systemctl") is None,
+    reason="systemctl is unavailable",
+)
 
+@requires_systemctl
 def test_systemctl_status_passes_through():
     """Read-only systemctl probes (status/show/list-units) are fine."""
     # Run with check=False so we don't fail on the gateway's exit code.
@@ -290,6 +296,7 @@ def test_systemctl_status_passes_through():
     assert r is not None  # Did not raise — the guard let it through.
 
 
+@requires_systemctl
 def test_systemctl_show_passes_through():
     r = subprocess.run(
         ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
@@ -300,6 +307,7 @@ def test_systemctl_show_passes_through():
     assert r is not None
 
 
+@requires_systemctl
 def test_systemctl_list_units_passes_through():
     r = subprocess.run(
         ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
@@ -310,6 +318,7 @@ def test_systemctl_list_units_passes_through():
     assert r is not None
 
 
+@requires_systemctl
 def test_systemctl_unrelated_unit_passes_through():
     """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
     # Use --dry-run so we don't actually try to restart anything; just
@@ -334,6 +343,26 @@ def test_kill_own_subtree_passes_through():
         p.wait(timeout=2)
     # SIGTERM = 15; subprocess returncode is -15 on POSIX.
     assert p.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
+
+
+def test_kill_child_without_proven_identity_is_blocked(monkeypatch):
+    """A failed create-time lookup must not turn a recorded PID into trust."""
+    psutil = pytest.importorskip("psutil")
+    real_process = psutil.Process
+
+    def _deny_process_lookup(pid):
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(psutil, "Process", _deny_process_lookup)
+    p = subprocess.Popen(["sleep", "30"])
+    try:
+        with pytest.raises(RuntimeError, match="outside the test process subtree"):
+            os.kill(p.pid, signal.SIGTERM)
+    finally:
+        monkeypatch.setattr(psutil, "Process", real_process)
+        if p.poll() is None:
+            os.kill(p.pid, signal.SIGTERM)
+        p.wait(timeout=2)
 
 
 def test_subprocess_pkill_with_unrelated_pattern_passes_through():

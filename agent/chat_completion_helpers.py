@@ -896,7 +896,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
+            if result["response"] is None:
+                # The abort can make the worker publish its transport error
+                # before this thread synthesizes the watchdog timeout. The
+                # watchdog owns the outcome once its deadline has fired.
                 if _silent_hint:
                     result["error"] = TimeoutError(
                         f"Codex stream produced no bytes within {int(_elapsed)}s "
@@ -941,7 +944,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
+            if result["response"] is None:
                 result["error"] = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
                     f"after first byte (threshold: {int(_codex_idle_timeout)}s)"

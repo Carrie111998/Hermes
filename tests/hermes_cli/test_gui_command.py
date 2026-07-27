@@ -312,7 +312,7 @@ def test_gui_source_mode_uses_renderer_build_and_electron(tmp_path, monkeypatch)
     build_ok = subprocess.CompletedProcess(["npm", "run", "build"], 0)
     launch_ok = subprocess.CompletedProcess(["npm", "exec", "--", "electron", "."], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
@@ -325,6 +325,37 @@ def test_gui_source_mode_uses_renderer_build_and_electron(tmp_path, monkeypatch)
     assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
     assert mock_run.call_args_list[1].args[0] == ["/usr/bin/npm", "exec", "--", "electron", "."]
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
+
+
+@pytest.mark.parametrize("skip_build", [False, True])
+def test_gui_source_mode_resolves_npm_when_build_is_skipped(
+    tmp_path, monkeypatch, skip_build
+):
+    root = _make_desktop_tree(tmp_path)
+    desktop_dir = root / "apps" / "desktop"
+    (desktop_dir / "dist").mkdir()
+    (desktop_dir / "dist" / "index.html").write_text("", encoding="utf-8")
+    electron_dir = root / "node_modules" / "electron"
+    electron_dir.mkdir(parents=True)
+    (electron_dir / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+
+    launch_ok = subprocess.CompletedProcess([], 0)
+
+    with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm") as mock_npm, \
+         patch("hermes_cli.main._run_npm_install_deterministic") as mock_install, \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(source=True, skip_build=skip_build))
+
+    assert exc.value.code == 0
+    mock_npm.assert_called_once_with()
+    mock_install.assert_not_called()
+    assert mock_run.call_args.args[0] == [
+        "/usr/bin/npm", "exec", "--", "electron", "."
+    ]
+    assert mock_run.call_args.kwargs["cwd"] == desktop_dir
 
 
 @pytest.mark.parametrize(
@@ -352,6 +383,7 @@ def test_desktop_build_stamp_skips_build_when_up_to_date(tmp_path, monkeypatch):
     launch_ok = subprocess.CompletedProcess([], 0)
 
     with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._resolve_node_runtime_npm") as mock_npm, \
          patch("hermes_cli.main._run_npm_install_deterministic") as mock_install, \
          patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
@@ -359,6 +391,7 @@ def test_desktop_build_stamp_skips_build_when_up_to_date(tmp_path, monkeypatch):
         cli_main.cmd_gui(_ns())
 
     assert exc.value.code == 0
+    mock_npm.assert_not_called()
     mock_install.assert_not_called()
     mock_run.assert_called_once()  # only the launch call, no build
 

@@ -181,6 +181,7 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
             calls.append("summary")
 
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setitem(cli_mod.CLI_CONFIG, "worktree", False)
     monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         cli_mod,
@@ -254,6 +255,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setitem(cli_mod.CLI_CONFIG, "worktree", False)
     monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         cli_mod,

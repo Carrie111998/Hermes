@@ -670,6 +670,40 @@ def _live_system_guard(request, monkeypatch):
         _psutil = None
         _initial_children = set()
 
+    # ``parents()`` is insufficient once a child daemonizes or the direct
+    # parent exits: the process is reparented and no longer appears below the
+    # pytest worker. Record exact process identities at spawn time so tests can
+    # still terminate children they created without weakening the foreign-PID
+    # guard. ``create_time`` prevents a reused PID from inheriting trust.
+    _spawned_children = {}
+
+    def _record_spawned_child(proc):
+        try:
+            pid = int(proc.pid)
+        except Exception:
+            return proc
+        if _psutil is None:
+            return proc
+        try:
+            created = _psutil.Process(pid).create_time()
+        except Exception:
+            return proc
+        _spawned_children[pid] = created
+        return proc
+
+    def _is_recorded_child(pid: int) -> bool:
+        if _psutil is None:
+            return False
+        expected_created = _spawned_children.get(pid)
+        if expected_created is None:
+            return False
+        try:
+            return _psutil.Process(pid).create_time() == expected_created
+        except _psutil.NoSuchProcess:
+            return True
+        except Exception:
+            return False
+
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
         # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
@@ -679,15 +713,16 @@ def _live_system_guard(request, monkeypatch):
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid or pid in _initial_children or _is_recorded_child(pid):
             return True
         if _psutil is None:
             return False
         try:
             walker = _psutil.Process(pid)
-        except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
+        except _psutil.NoSuchProcess:
             return True
+        except Exception:
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
@@ -730,11 +765,35 @@ def _live_system_guard(request, monkeypatch):
         real_killpg = _os.killpg
         own_pgid = _os.getpgrp()
 
+        def _is_own_session_group(pgid: int) -> bool:
+            """Return True for an exact, recorded child leading its own session."""
+            if pgid <= 0 or _psutil is None:
+                return False
+            expected_created = _spawned_children.get(pgid)
+            if expected_created is None:
+                return False
+            try:
+                proc = _psutil.Process(pgid)
+                return (
+                    proc.create_time() == expected_created
+                    and _os.getpgid(pgid) == pgid
+                    and _os.getsid(pgid) == pgid
+                )
+            except Exception:
+                return False
+
         def _guarded_killpg(pgid, sig, *args, **kwargs):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
+            # A PGID is not a process identity: it can equal the PID of a
+            # recorded child while containing unrelated processes. Besides the
+            # pytest worker's group, only trust a recorded child whose exact
+            # identity is still present and which leads a new session. POSIX
+            # prevents unrelated processes outside that session from joining
+            # the group, so product cleanup paths can safely kill their own
+            # start_new_session=True subprocess trees.
+            if int(pgid) == own_pgid or _is_own_session_group(int(pgid)):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -891,6 +950,7 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                _record_spawned_child(self)
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -963,11 +1023,13 @@ def _live_system_guard(request, monkeypatch):
             _check_subprocess_cmd(
                 "asyncio.create_subprocess_exec", [program, *args]
             )
-            return await real_async_exec(program, *args, **kwargs)
+            proc = await real_async_exec(program, *args, **kwargs)
+            return _record_spawned_child(proc)
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
             _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
-            return await real_async_shell(cmd, *args, **kwargs)
+            proc = await real_async_shell(cmd, *args, **kwargs)
+            return _record_spawned_child(proc)
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
         monkeypatch.setattr(
