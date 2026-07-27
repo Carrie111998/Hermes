@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -291,6 +292,52 @@ def test_grant_binding_is_one_to_one_and_profile_snapshot_must_be_current(
         workforce_delegation.DelegationError, match="snapshot is stale"
     ):
         _grant(conn, stale_ids)
+
+
+def test_concurrent_grant_admission_serializes_mandate_budget(tmp_path, monkeypatch):
+    company = _company(tmp_path, monkeypatch)
+    conn = company[0]
+    ids = company[1:]
+    organization_id, ceo_id, _, _, objective_id, action_id = ids
+    plan_id = conn.execute(
+        "SELECT plan_id FROM candidate_actions WHERE id=?", (action_id,)
+    ).fetchone()[0]
+    second_action_id = objectives_db.propose_action(
+        conn,
+        objective_id=objective_id,
+        plan_id=plan_id,
+        action_type="kanban.create_task",
+        payload={"system": "kanban", "target_resource": "secondary"},
+        expected_outcome="bounded employee task exists",
+        required_capability="work.delegate",
+        verification_method="kanban.task.created",
+        risk_class="low",
+        reversible=True,
+        proposed_by=f"employee:{ceo_id}",
+    )
+
+    def create(action):
+        worker_conn = objectives_db.connect(tmp_path / "hermes" / "objectives.db")
+        try:
+            try:
+                return _grant(
+                    worker_conn,
+                    (*ids[:-1], action),
+                    budget_minor=300,
+                )
+            except workforce_delegation.DelegationError:
+                return None
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, (action_id, second_action_id)))
+    assert sum(result is not None and result[1] for result in results) == 1
+    assert conn.execute(
+        "SELECT COALESCE(SUM(budget_minor),0) FROM employee_task_grants "
+        "WHERE mandate_id=?",
+        (ids[3],),
+    ).fetchone()[0] == 300
 
 
 def test_charter_revision_revocation_blocks_handoff_and_releases_allocation(

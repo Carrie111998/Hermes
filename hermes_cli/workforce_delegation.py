@@ -8,6 +8,7 @@ import os
 import sqlite3
 import time
 import uuid
+from functools import wraps
 from typing import Any, Mapping
 
 from hermes_cli import organization_db
@@ -80,6 +81,29 @@ class DelegationError(ValueError):
     pass
 
 
+def _serialized_grant_mutation(function):
+    """Make mandate and budget admission one serialized authority decision."""
+
+    @wraps(function)
+    def wrapped(conn, *args, **kwargs):
+        ensure_schema(conn)
+        owns_transaction = not conn.in_transaction
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = function(conn, *args, **kwargs)
+        except Exception:
+            if owns_transaction:
+                conn.rollback()
+            raise
+        else:
+            if owns_transaction:
+                conn.commit()
+            return result
+
+    return wrapped
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -93,6 +117,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
 
 
+@_serialized_grant_mutation
 def create_grant(
     conn: sqlite3.Connection,
     *,
@@ -111,7 +136,6 @@ def create_grant(
     expires_at: int,
 ) -> tuple[str, bool]:
     """Authorize one bounded task inside a live employee mandate."""
-    ensure_schema(conn)
     now = int(time.time())
     employee = organization_db.employee_for_profile(
         conn, organization_id, assignee_profile
