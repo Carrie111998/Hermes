@@ -102,6 +102,38 @@ def _safe_which(cmd: str) -> str | None:
         return None
 
 
+def _resolve_openrouter_doctor_key() -> str:
+    """Resolve OpenRouter auth from dotenv/environment or its credential pool.
+
+    ``hermes auth add openrouter`` stores manual keys in the credential pool,
+    while Doctor historically checked only the environment. Use ``peek``
+    rather than ``select`` so diagnosis cannot advance pool rotation or mutate
+    inference state.
+    """
+    try:
+        from hermes_cli.auth import has_usable_secret
+        from hermes_cli.config import get_env_value_prefer_dotenv
+
+        key = (get_env_value_prefer_dotenv("OPENROUTER_API_KEY") or "").strip()
+        if has_usable_secret(key):
+            return key
+
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("openrouter")
+        entry = pool.peek() if pool and pool.has_credentials() else None
+        key = str(
+            getattr(entry, "runtime_api_key", "")
+            or getattr(entry, "access_token", "")
+            or ""
+        ).strip()
+        return key if has_usable_secret(key) else ""
+    except Exception:
+        # Doctor should report an unavailable probe, not crash because an auth
+        # store is unreadable or temporarily locked.
+        return ""
+
+
 def _termux_browser_setup_steps(node_installed: bool) -> list[str]:
     steps: list[str] = []
     step = 1
@@ -2017,7 +2049,7 @@ def run_doctor(args):
     _probes: list = []  # list of (label, callable) submitted in display order
 
     def _probe_openrouter() -> _ConnectivityResult:
-        key = os.getenv("OPENROUTER_API_KEY")
+        key = _resolve_openrouter_doctor_key()
         if not key:
             return _ConnectivityResult(
                 "OpenRouter API",
