@@ -42,6 +42,24 @@ _CDP_PRIVATE_PAGE_ALLOWED_METHODS = {
 }
 
 
+def _authorize_cdp_action(
+    *, task_id: str, method: str, target_id: Optional[str], frame_id: Optional[str]
+) -> None:
+    """Require an exact CDP method and browser session for governed workers."""
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    scope = f"browser-cdp:{task_id}:{method}"
+    if target_id:
+        scope += f":target:{target_id}"
+    if frame_id:
+        scope += f":frame:{frame_id}"
+    authorize_worker_action(
+        capability="browser.cdp",
+        system="browser",
+        target_resource=scope,
+    )
+
+
 def _redact_cdp_output(value: Any) -> Any:
     """Redact browser-originated CDP result data before returning it."""
     from agent.redact import redact_sensitive_text
@@ -426,6 +444,22 @@ def browser_cdp(
     """
     effective_task_id = task_id or "default"
 
+    if not method or not isinstance(method, str):
+        return tool_error(
+            "'method' is required (e.g. 'Target.getTargets')",
+            cdp_docs=CDP_DOCS_URL,
+        )
+
+    # Raw CDP is an intentionally broad escape hatch. Governed workers must
+    # receive a permit for the exact method, session, and optional target/frame
+    # rather than inheriting authority from the ordinary browser toolset.
+    _authorize_cdp_action(
+        task_id=effective_task_id,
+        method=method,
+        target_id=target_id,
+        frame_id=frame_id,
+    )
+
     # --- Route iframe-scoped calls through the supervisor ---------------
     if frame_id:
         # Same private-page/SSRF boundary as the stateless path below —
@@ -443,12 +477,6 @@ def browser_cdp(
             method=method,
             params=params,
             timeout=timeout,
-        )
-
-    if not method or not isinstance(method, str):
-        return tool_error(
-            "'method' is required (e.g. 'Target.getTargets')",
-            cdp_docs=CDP_DOCS_URL,
         )
 
     if not _WS_AVAILABLE:

@@ -20,6 +20,32 @@ from websockets.asyncio.server import serve
 from tools import browser_cdp_tool
 
 
+def test_cdp_authorization_is_method_target_and_frame_scoped(monkeypatch):
+    calls = []
+
+    def record(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", record
+    )
+
+    browser_cdp_tool._authorize_cdp_action(
+        task_id="worker-1",
+        method="Runtime.evaluate",
+        target_id="tab-7",
+        frame_id="frame-3",
+    )
+
+    assert calls == [
+        (
+            "browser.cdp",
+            "browser",
+            "browser-cdp:worker-1:Runtime.evaluate:target:tab-7:frame:frame-3",
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # In-process CDP mock server
 # ---------------------------------------------------------------------------
