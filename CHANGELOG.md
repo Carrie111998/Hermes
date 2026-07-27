@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The current-tree acceptance now includes a durable scheduled wake event,
+  proving the CEO worker can initiate the next governed cycle without a human
+  dispatch.
 - The unified current-tree acceptance now includes an interrupted provider
   effect, a real container restart, read-back reconciliation, and a zero
   duplicate-provider-call assertion after the normal CEO restart path.

@@ -32,6 +32,9 @@ acceptance evidence.
 - The unified current-tree acceptance covers both ordinary verified-state
   restart recovery and ambiguous provider-effect recovery through read-back;
   the latter never replays the provider call.
+- The same acceptance also dispatches a due durable schedule and verifies that
+  the CEO worker advances the objective from that event without turn-by-turn
+  operator input.
 - Planner/provider rate-limit failures are classified explicitly, persisted in
   the durable event retry state with bounded backoff, honor SDK attributes,
   `Retry-After`, and rate-limit reset headers, and recover on a later tick

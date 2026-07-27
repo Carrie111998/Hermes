@@ -235,6 +235,24 @@ This is the current-main acceptance boundary; it remains deterministic
 provider-adapter evidence, not live payment-provider or production deployment
 proof.
 
+At current-main commit `d2fc0e1e40`, the acceptance also dispatched a due
+durable schedule inside the same worker run. The exact output was:
+
+```text
+{"phase": "prepare", "initial_readiness": "blocked"}
+{"phase": "prepare", "ready": true, "runtime_active": false}
+{"phase": "run", "objective": "verified", "effects": 1, "scheduled_events": 1}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1}
+current-tree agentic acceptance: PASS
+```
+
+The resulting image manifest was
+`sha256:fda78f344ed7ca45cfce1860402607006c467f02d25c93825b5f925f302803c6`.
+`scheduled_events: 1` is evidence of a durable autonomous wake-up, not proof
+of an always-on production scheduler or external event-provider availability.
+
 ## Interrupted provider-action evidence
 
 The current tree also proves the ambiguous mid-flight payment case. At commit
