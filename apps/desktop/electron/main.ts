@@ -39,7 +39,7 @@ import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
+import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure, shouldLatchSshAuthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -1033,6 +1033,14 @@ let backendStartFailure = null
 // the boot-failure overlay, so the "Sign in" button flickers away before it
 // can be clicked. Cleared on every recovery path and on a confirmed sign-in.
 let remoteReauthFailure = null
+// Latched SSH auth-failed errors. SSH `auth-failed` (wrong key/user, key not
+// loaded in agent) is a confirmed credential rejection that cannot self-heal.
+// Without latching, every subsequent getConnection re-runs startHermes,
+// re-emits running:true, and the boot-failure overlay (visible = Boolean(boot.error)
+// && !boot.running) hides itself — so the Settings button flickers away before
+// it can be clicked. This is the root cause of #72698. Cleared on reset,
+// repair, or apply-connection-config.
+let sshAuthFailure = null
 // Active first-launch install, so the renderer's Cancel button (and app quit)
 // can abort the in-flight install.sh/ps1 instead of leaving it running.
 let bootstrapAbortController = null
@@ -7642,6 +7650,7 @@ function stopBackendChild(child) {
 function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
   remoteReauthFailure = null
+  sshAuthFailure = null
   remoteLiveness.clear()
   const hermesProcess = backendConnectionState.invalidate()
   stopBackendChild(hermesProcess)
@@ -8041,6 +8050,14 @@ async function startHermes() {
     throw remoteReauthFailure
   }
 
+  // A confirmed SSH auth-failed error is terminal until the user edits the
+  // connection config. Without this latch, the renderer's getConnection retry
+  // loop re-runs startHermes on every call, toggling boot.running and hiding
+  // the boot-failure overlay — making Settings unreachable (#72698).
+  if (sshAuthFailure) {
+    throw sshAuthFailure
+  }
+
   // E2E: simulate a boot failure without breaking the real backend. The boot
   // progresses a few steps, then fails with the given error message.
   if (BOOT_FAKE_ERROR) {
@@ -8308,6 +8325,14 @@ async function startHermes() {
     // leaving it unlatched hides the overlay's "Sign in" button on every retry.
     if (shouldLatchRemoteReauthFailure({ attemptedRemote, isReauth: isReauthRequiredError(error) })) {
       remoteReauthFailure = error instanceof Error ? error : new Error(message)
+    }
+
+    // SSH auth-failed (wrong key, wrong user, key not in agent) latches for the
+    // same reason as remote reauth — it's a confirmed credential rejection that
+    // can't self-heal. Without this the retry loop toggles boot.running and hides
+    // the boot-failure overlay, locking the user out of Settings (#72698).
+    if (shouldLatchSshAuthFailure({ attemptedRemote, isSshAuthFailed: error?.sshError === 'auth-failed' })) {
+      sshAuthFailure = error instanceof Error ? error : new Error(message)
     }
 
     updateBootProgress(
@@ -9323,6 +9348,7 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   bootstrapFailure = null
   backendStartFailure = null
   remoteReauthFailure = null
+  sshAuthFailure = null
   getFirstRunSetupGate().resetForRetry()
   resetBootstrapSnapshot()
 
@@ -9343,6 +9369,7 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   bootstrapFailure = null
   backendStartFailure = null
   remoteReauthFailure = null
+  sshAuthFailure = null
   getFirstRunSetupGate().resetForRepair()
   resetHermesConnection()
 
