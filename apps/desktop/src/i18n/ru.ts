@@ -2531,7 +2531,7 @@ export const ru: Translations = {
       '/resume': 'возобновить прошлую сессию',
       '/details': 'управлять детализацией транскрипта',
       '/copy': 'копировать выделение или последнее сообщение ассистента',
-      '/quit': 'выйти из hermes'
+      '/quit': 'выйти из Hermes'
     },
     hotkeyDescs: {
       'composer.mention': 'ссылаться на файлы, папки, URL, git',
@@ -2575,7 +2575,7 @@ export const ru: Translations = {
     queueSend: 'Отправить',
     queueDelete: 'Удалить',
     queueResume: 'Продолжить',
-    queueResumeTip: 'Остановлено через Stop — возобновить отправку очереди',
+    queueResumeTip: 'Остановлено через Стоп — возобновить отправку очереди',
     queueStuckTitle: 'Сообщение из очереди не отправлено',
     queueStuckBody: 'Ход из очереди не удалось отправить. Он всё ещё в очереди — попробуйте снова.',
     previewUnavailable: 'Предпросмотр недоступен',
@@ -2933,7 +2933,7 @@ export const ru: Translations = {
     freeTier: 'Бесплатный уровень',
     pro: 'Pro',
     free: 'Бесплатно',
-    price: (input, output) => `${input} вх / ${output} вых за Mток`,
+    price: (input, output) => `${input} вх / ${output} вых за 1 млн токенов`,
     change: 'Изменить',
     startChatting: 'Начать',
     docs: provider => `Документация ${provider}`
