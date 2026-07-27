@@ -26,6 +26,26 @@ class CircuitOpenError(RuntimeError):
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    # ``executescript`` commits an active SQLite transaction. Circuit-breaker
+    # admission runs beside permit and ledger transitions, so never let a
+    # schema check release those atomic state changes.
+    if conn.in_transaction:
+        existing = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='operation_circuit_breakers'"
+        ).fetchone()
+        if existing is not None:
+            return
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS operation_circuit_breakers (
+                operation_key TEXT PRIMARY KEY,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'closed', opened_at INTEGER,
+                retry_after INTEGER, last_error TEXT,
+                updated_at INTEGER NOT NULL
+            )"""
+        )
+        return
     conn.executescript(SCHEMA_SQL)
 
 

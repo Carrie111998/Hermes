@@ -72,3 +72,14 @@ def test_expired_recovery_probe_can_be_reclaimed():
         ("stripe:charge",),
     ).fetchone()
     assert state["retry_after"] == now + breaker.HALF_OPEN_PROBE_LEASE_SECONDS
+
+
+def test_schema_check_does_not_commit_active_authority_transaction():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE authority_sentinel (value TEXT NOT NULL)")
+    breaker.ensure_schema(conn)
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO authority_sentinel(value) VALUES ('uncommitted')")
+    breaker.ensure_schema(conn)
+    conn.rollback()
+    assert conn.execute("SELECT * FROM authority_sentinel").fetchall() == []
