@@ -1810,3 +1810,33 @@ production multi-tenant orchestration or external authorization.
 See [implementation status](docs/implementation-status.md) for the complete
 capability and limitation inventory, and the release boundary in
 [CHANGELOG.md](CHANGELOG.md).
+
+## Exact delegated-authority and finance audit (2026-07-27)
+
+The current tree keeps delegation authority monotone: a child grant must be a
+subset of the delegator's active capabilities, systems, toolsets, skills,
+resource scope, budget, objective, and expiry. Worker calls are checked again
+at execution time against the live grant, revocation chain, mandate version,
+and exact `system` plus `target_resource`. Consequently, a grant such as
+`file.read` for `localhost:/home/mike/ceofile.txt` cannot be retargeted to
+`/home/mike/notceofile.txt` or inferred as `file.write`.
+
+The business-finance path separately requires organization/objective lineage,
+exact idempotency payloads, budget reservations, spend controls, provider
+assessments, and provider read-back before settlement. These controls are
+projection-independent from readiness; readiness consumes their persisted
+results rather than reimplementing their policy.
+
+Exact validation command:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_finance_and_payments.py \
+  tests/hermes_cli/test_procurement_policy.py
+```
+
+Result on commit `2e17387bc4e8a9914edad237ec7b0ec6bd30465e`: **47 passed**.
+This is deterministic authority-store and test-provider evidence; it does
+not establish production banking, payment-provider credentials, or external
+legal compliance.
