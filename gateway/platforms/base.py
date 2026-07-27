@@ -2899,7 +2899,20 @@ class BasePlatformAdapter(ABC):
         if mode == "verbose":
             if event.args:
                 import json
-                args_str = json.dumps(event.args, ensure_ascii=False, default=str)
+                from agent.display import redact_tool_args_for_display
+                # Verbose mode renders the full args dict, unlike the
+                # capped preview path below (build_tool_preview()) which
+                # already redacts. Without this, a browser_type call
+                # carrying a credential typed into a form (e.g. pulled from
+                # a password manager) reached chat history verbatim in
+                # verbose mode, even though the SAME tool's own result
+                # payload was already redacted via
+                # redact_browser_typed_text_for_display() in
+                # tools/browser_tool.py -- this call's arguments (rendered
+                # here BEFORE the tool even runs) were a separate,
+                # unguarded surface (issue #72298, #10520).
+                safe_args = redact_tool_args_for_display(event.tool_name, event.args) or event.args
+                args_str = json.dumps(safe_args, ensure_ascii=False, default=str)
                 if preview_max_len > 0 and len(args_str) > preview_max_len:
                     args_str = args_str[:preview_max_len - 3] + "..."
                 return f"{emoji} {event.tool_name}({list(event.args.keys())})\n{args_str}"

@@ -180,3 +180,61 @@ def test_dispatch_swallows_render_errors():
     adapter.render_message_event = _boom
     d = GatewayEventDispatcher(adapter, _FakeSink())
     d.dispatch(MessageChunk("x"))  # must not raise
+
+
+# ── Verbose-mode tool arg redaction (issue #72298, #10520) ──────────────────
+
+class TestVerboseModeToolArgRedaction:
+    """A browser_type call carrying a recognizable-secret value (e.g. an API
+    key pulled from a password manager) must be redacted in the verbose
+    tool-progress display, not just in the tool's own RESULT payload
+    (tools/browser_tool.py already redacts that separately via
+    redact_browser_typed_text_for_display()). This is the display-side gap
+    the automated review on the stalled #10661 flagged: verbose mode
+    serialized event.args directly with no redaction pass at all, so a
+    credential-shaped value reached chat history before the tool even ran.
+    """
+
+    def test_recognizable_secret_in_browser_type_args_is_redacted(self):
+        adapter = _base_adapter()
+        event = ToolCallChunk(
+            tool_name="browser_type",
+            args={"ref": "@e3", "text": "sk-ant-api03-FAKEsecretvalue1234567890abcdefgh"},
+        )
+        rendered = adapter.format_tool_event(event, mode="verbose", preview_max_len=0)
+        assert "sk-ant-api03-FAKEsecretvalue1234567890abcdefgh" not in rendered, (
+            f"Recognizable secret leaked into verbose tool-progress display: {rendered!r}"
+        )
+
+    def test_normal_typed_text_stays_readable(self):
+        """The existing contract (commit 6c58878e7, test_display.py) keeps
+        normal typed text visible for debuggability -- this fix must not
+        regress that by over-redacting."""
+        adapter = _base_adapter()
+        event = ToolCallChunk(
+            tool_name="browser_type",
+            args={"ref": "@e3", "text": "123 Main Street, Springfield"},
+        )
+        rendered = adapter.format_tool_event(event, mode="verbose", preview_max_len=0)
+        assert "123 Main Street, Springfield" in rendered
+
+    def test_non_browser_type_tool_args_unaffected(self):
+        """redact_tool_args_for_display() is browser_type-specific; other
+        tools' verbose args must render exactly as before."""
+        adapter = _base_adapter()
+        event = ToolCallChunk(
+            tool_name="terminal",
+            args={"command": "ls -la /home/user"},
+        )
+        rendered = adapter.format_tool_event(event, mode="verbose", preview_max_len=0)
+        assert "ls -la /home/user" in rendered
+
+    def test_compact_and_new_modes_unaffected(self):
+        """This fix only touches the verbose branch; compact preview modes
+        already went through build_tool_preview()'s own redaction path and
+        must render unchanged."""
+        adapter = _base_adapter()
+        event = ToolCallChunk(tool_name="terminal", preview="ls -la")
+        for mode in ("all", "new"):
+            rendered = adapter.format_tool_event(event, mode=mode)
+            assert rendered is not None
