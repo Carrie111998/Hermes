@@ -234,6 +234,18 @@ The native task operation is `send_message_to_thread` (or its supported equivale
 against the exact authenticated task ID. Direct Codex database or transcript
 mutation remains forbidden.
 
+The implemented broker surface is
+`session_sidebar_hydration_pending`,
+`session_sidebar_hydration_reserve`,
+`session_sidebar_hydration_commit`, and
+`session_sidebar_hydration_fail`. Rollout is controlled by
+`sidebar-readable-preview --enable|--disable` and
+`sidebar-hydration --enable|--disable`; one exact canary is seeded only through
+`sidebar-hydration-seed --source-session-id ... --codex-thread-id ... --confirm
+HYDRATE_EXACT_EXISTING_TASK`. `sidebar-hydration-status` and
+`session_status.sidebar.hydration` expose sanitized counts, age, and fixed error
+codes only.
+
 ### 5. Continuation remains authoritative
 
 The preview improves presentation; it does not replace `session_continue`.

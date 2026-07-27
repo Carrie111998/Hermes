@@ -41,16 +41,22 @@ from session_bridge.mcp_server import create_app
 from session_bridge.mirror import MirrorPolicy, enqueue_mirror_job
 from session_bridge.models import (
     BridgeMarkerPayload,
+    HydrationMarkerPayload,
     OriginKind,
     ProjectedMessage,
     Provider,
     Relation,
     SessionProjection,
+    SidebarHydrationState,
     SidebarJobState,
     canonical_session_id,
     decode_bridge_marker,
 )
-from session_bridge.sidebar import VerifiedSidebarThread
+from session_bridge.preview import build_session_preview
+from session_bridge.sidebar import (
+    VerifiedSidebarThread,
+    encode_hydration_marker,
+)
 from session_bridge.store import SessionBridgeStore
 
 
@@ -88,7 +94,10 @@ class _SidebarSkillContract:
     def load(cls, path: Path) -> "_SidebarSkillContract":
         try:
             text = path.read_text(encoding="utf-8")
-            procedure = text.split("\n## Procedure\n", 1)[1].split(
+            queue_selection = text.split("\n## Queue Selection\n", 1)[1].split(
+                "\n## In-place Hydration Procedure\n", 1
+            )[0]
+            procedure = text.split("\n## Registration Procedure\n", 1)[1].split(
                 "\n## Fixed Failure Mapping\n", 1
             )[0]
             steps = {
@@ -101,7 +110,10 @@ class _SidebarSkillContract:
             if set(steps) != set(range(1, 10)):
                 raise ValueError("procedure steps")
 
-            status = re.search(r"Call `(session_status)` exactly once", steps[1])
+            status = re.search(
+                r"Call `(session_status)` exactly once",
+                queue_selection,
+            )
             pending = re.search(
                 r"call `(session_sidebar_[a-z_]+)\(limit=(\d+)\)` exactly once",
                 steps[2],
@@ -109,7 +121,7 @@ class _SidebarSkillContract:
             )
             projects = re.search(
                 r"native tool `(list_[a-z_]+)\(\{\}\)` exactly once",
-                steps[2],
+                queue_selection,
             )
             list_threads = re.search(
                 r"call `(list_threads)\(\{.*?\"limit\":(\d+)\}\)`",
@@ -1329,6 +1341,9 @@ class _SidebarMcpCoordinator:
     async def claim_sidebar_jobs_for_delivery(self, *, limit: int):
         return await self.delegate.claim_sidebar_jobs_for_delivery(limit=limit)
 
+    async def claim_sidebar_hydration_for_delivery(self, *, limit: int):
+        return await self.delegate.claim_sidebar_hydration_for_delivery(limit=limit)
+
     async def commit_sidebar_job(
         self,
         *,
@@ -1371,6 +1386,8 @@ class _FakeNativeCodexTasks:
         self.app_server_create_calls: list[dict[str, Any]] = []
         self.available = True
         self.rename_failures_remaining = 0
+        self.next_thread_id: str | None = None
+        self.send_calls: list[tuple[str, str]] = []
 
     def add_project(self, project_id: str, path: Path) -> None:
         self.projects.append({
@@ -1406,7 +1423,8 @@ class _FakeNativeCodexTasks:
     ) -> str:
         if not self.available:
             raise RuntimeError("synthetic Desktop offline")
-        thread_id = f"native-sidebar-{len(self.threads) + 1}"
+        thread_id = self.next_thread_id or f"native-sidebar-{len(self.threads) + 1}"
+        self.next_thread_id = None
         marker = _registration_marker(prompt)
         payload = decode_bridge_marker(marker, self.marker_secret)
         call = {
@@ -1421,10 +1439,41 @@ class _FakeNativeCodexTasks:
             "title": None,
             "marker": marker,
             "payload": payload,
+            "assistant_reply": "REGISTERED",
+            "session_continue_calls": [],
+            "turns": [
+                {"role": "user", "content": prompt, "status": "completed"},
+                {"role": "assistant", "content": "REGISTERED", "status": "completed"},
+            ],
         }
         if self.on_create is not None:
             self.on_create(self.threads[thread_id])
         return thread_id
+
+    def send_message_to_thread(
+        self,
+        *,
+        thread_id: str,
+        message: str,
+        drop_after_append: bool = False,
+    ) -> dict[str, Any]:
+        thread = self.threads[thread_id]
+        self.send_calls.append((thread_id, message))
+        thread["turns"].append({
+            "role": "user",
+            "content": message,
+            "status": "completed",
+        })
+        source_id = thread["payload"].source_session_id
+        thread["session_continue_calls"].append(source_id)
+        thread["turns"].append({
+            "role": "assistant",
+            "content": "HYDRATED",
+            "status": "completed",
+        })
+        if drop_after_append:
+            raise RuntimeError("synthetic hydration response drop")
+        return {"threadId": thread_id, "status": "completed"}
 
     def set_thread_title(self, thread_id: str, title: str) -> None:
         self.rename_calls.append((thread_id, title))
@@ -2101,6 +2150,145 @@ class _SidebarEndToEndHarness:
         self.worker_traces.append(trace)
         return outcomes
 
+    def run_hydration_worker_once(
+        self,
+        client: Any,
+        *,
+        drop_after_append: bool = False,
+    ) -> dict[str, Any] | None:
+        trace: list[dict[str, Any]] = [
+            {"tool": self.contract.status_tool, "arguments": {}}
+        ]
+        status = _sidebar_call_tool(client, self.contract.status_tool, {})
+        hydration_counts = status["sidebar"]["hydration"]["counts"]
+        if not (
+            hydration_counts[SidebarHydrationState.PENDING.value]
+            or hydration_counts[SidebarHydrationState.RETRY.value]
+        ):
+            self.worker_traces.append(trace)
+            return None
+        trace.append({"tool": self.contract.projects_tool, "arguments": {}})
+        self.native.list_projects()
+        pending_tool = "session_sidebar_hydration_pending"
+        trace.append({"tool": pending_tool, "arguments": {"limit": 1}})
+        jobs = _sidebar_call_tool(client, pending_tool, {"limit": 1})["jobs"]
+        if not jobs:
+            self.worker_traces.append(trace)
+            return None
+        job = jobs[0]
+        thread_id = job["codex_thread_id"]
+        trace.append({"tool": "read_thread", "arguments": {"threadId": thread_id}})
+        thread = self.native.read_thread(thread_id=thread_id)
+        if (
+            thread["thread_id"] != thread_id
+            or thread["payload"].source_session_id
+            != job["hydration_message"].split(
+                "session_continue(session_id=",
+                1,
+            )[1].split(",", 1)[0].strip('"')
+        ):
+            raise AssertionError("hydration exact-task identity mismatch")
+        marker_present = any(
+            job["hydration_marker"] in turn["content"]
+            and turn["status"] == "completed"
+            for turn in thread["turns"]
+        )
+        if marker_present:
+            arguments = {
+                "lease_token": job["lease_token"],
+                "codex_thread_id": thread_id,
+                "hydration_marker": job["hydration_marker"],
+            }
+            trace.append({
+                "tool": "session_sidebar_hydration_commit",
+                "arguments": arguments,
+            })
+            result = _sidebar_call_tool(
+                client,
+                "session_sidebar_hydration_commit",
+                arguments,
+            )
+            self.worker_traces.append(trace)
+            return result
+        if job["send_reserved"]:
+            arguments = {
+                "lease_token": job["lease_token"],
+                "error_code": "hydration_send_ambiguous",
+                "codex_thread_id": thread_id,
+            }
+            trace.append({
+                "tool": "session_sidebar_hydration_fail",
+                "arguments": arguments,
+            })
+            result = _sidebar_call_tool(
+                client,
+                "session_sidebar_hydration_fail",
+                arguments,
+            )
+            self.worker_traces.append(trace)
+            return result
+        reserve_arguments = {"lease_token": job["lease_token"]}
+        trace.append({
+            "tool": "session_sidebar_hydration_reserve",
+            "arguments": reserve_arguments,
+        })
+        _sidebar_call_tool(
+            client,
+            "session_sidebar_hydration_reserve",
+            reserve_arguments,
+        )
+        trace.append({
+            "tool": "send_message_to_thread",
+            "arguments": {"threadId": thread_id},
+        })
+        try:
+            self.native.send_message_to_thread(
+                thread_id=thread_id,
+                message=job["hydration_message"],
+                drop_after_append=drop_after_append,
+            )
+        except RuntimeError:
+            arguments = {
+                "lease_token": job["lease_token"],
+                "error_code": "hydration_send_ambiguous",
+                "codex_thread_id": thread_id,
+            }
+            trace.append({
+                "tool": "session_sidebar_hydration_fail",
+                "arguments": arguments,
+            })
+            result = _sidebar_call_tool(
+                client,
+                "session_sidebar_hydration_fail",
+                arguments,
+            )
+            self.worker_traces.append(trace)
+            return result
+        trace.append({"tool": "read_thread", "arguments": {"threadId": thread_id}})
+        verified = self.native.read_thread(thread_id=thread_id)
+        if not any(
+            job["hydration_marker"] in turn["content"]
+            and turn["status"] == "completed"
+            for turn in verified["turns"]
+        ):
+            raise AssertionError("hydration marker was not indexed")
+        arguments = {
+            "lease_token": job["lease_token"],
+            "codex_thread_id": thread_id,
+            "hydration_marker": job["hydration_marker"],
+        }
+        trace.append({
+            "tool": "session_sidebar_hydration_commit",
+            "arguments": arguments,
+        })
+        result = _sidebar_call_tool(
+            client,
+            "session_sidebar_hydration_commit",
+            arguments,
+        )
+        self.worker_traces.append(trace)
+        return result
+
 
 def _canonical_sidebar_path(value: str | Path) -> str:
     return os.path.normcase(os.path.realpath(os.fspath(value)))
@@ -2300,6 +2488,255 @@ def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
             harness.contract.rename_tool,
             harness.contract.commit_tool,
         ]
+    finally:
+        harness.close()
+
+
+def test_sidebar_new_import_delivers_bounded_readable_registration(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "readable-registration"
+        source_cwd.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(source_cwd)],
+            check=True,
+            capture_output=True,
+        )
+        harness.add_project("readable-registration-project", source_cwd)
+        harness.config = replace(
+            harness.config,
+            sidebar=replace(
+                harness.config.sidebar,
+                readable_preview_enabled=True,
+            ),
+        )
+        harness.coordinator._config = harness.config
+        harness._rebuild_app()
+        conversational = [
+            ("user", "conversation-message-1 sk-" + ("q" * 24)),
+            ("assistant", "conversation-message-2"),
+            ("user", "conversation-message-3"),
+            ("assistant", "conversation-message-4"),
+            ("user", "conversation-message-5"),
+            ("assistant", "conversation-message-6"),
+            ("user", "conversation-message-7"),
+        ]
+        messages = [
+            ProjectedMessage(
+                native_event_id=f"conversation-{index}",
+                ordinal=index,
+                role=role,
+                content=content,
+                timestamp=harness.now - 10 + index,
+            )
+            for index, (role, content) in enumerate(conversational)
+        ]
+        messages.extend((
+            ProjectedMessage(
+                native_event_id="tool-output",
+                ordinal=7,
+                role="tool",
+                content="tool-output-must-not-render",
+                timestamp=harness.now - 3,
+            ),
+            ProjectedMessage(
+                native_event_id="system-output",
+                ordinal=8,
+                role="system",
+                content="system-output-must-not-render",
+                timestamp=harness.now - 2,
+            ),
+        ))
+        source_id = harness.store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id="readable-registration",
+                title="Readable registration",
+                cwd=str(source_cwd),
+                started_at=harness.now - 10,
+                last_active=harness.now,
+                messages=tuple(messages),
+                native_path=str(source_cwd / "readable-registration.jsonl"),
+                native_cursor="cursor-readable-registration",
+                native_hash="hash-readable-registration",
+                git_branch="main",
+            )
+        ).session_id
+
+        summary = harness.register()
+        with harness.client() as client:
+            outcomes = harness.run_worker_once(client)
+
+        assert summary.queued == 1
+        assert outcomes == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+        thread = harness.native.threads["native-sidebar-1"]
+        prompt = thread["prompt"]
+        assert prompt.startswith("# Imported Claude Code Session")
+        last_five = prompt.split("## Last 5 Messages", 1)[1].split(
+            "## Bridge Registration",
+            1,
+        )[0]
+        for index in range(3, 8):
+            assert f"conversation-message-{index}" in last_five
+        assert "conversation-message-1" not in last_five
+        assert "conversation-message-2" not in last_five
+        assert "tool-output-must-not-render" not in prompt
+        assert "system-output-must-not-render" not in prompt
+        assert "sk-" + ("q" * 24) not in prompt
+        assert prompt.count("Signed marker: HERMES_SESSION_BRIDGE_V1:") == 1
+        assert thread["assistant_reply"] == "REGISTERED"
+        assert thread["session_continue_calls"] == []
+        assert harness.store.get_sidebar_job_for_source(source_id)["state"] == (
+            SidebarJobState.VISIBLE.value
+        )
+    finally:
+        harness.close()
+
+
+def test_reported_legacy_task_hydrates_once_and_reconciles_ambiguous_send(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_native_id = "2a786924-8093-4a9f-a371-6e27ca66be32"
+        source_id = f"claude:{source_native_id}"
+        thread_id = "019f8927-8012-77d0-beb0-4cd5f8cc21f9"
+        source_cwd = tmp_path / "reported-legacy-source"
+        source_cwd.mkdir()
+        harness.add_project("reported-legacy-project", source_cwd)
+        messages = tuple(
+            ProjectedMessage(
+                native_event_id=f"reported-message-{index}",
+                ordinal=index,
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"reported-conversation-message-{index}",
+                timestamp=harness.now - 578 + index,
+            )
+            for index in range(578)
+        )
+        persisted_source = harness.store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id=source_native_id,
+                title="Reported legacy Claude task",
+                cwd=str(source_cwd),
+                started_at=harness.now - 600,
+                last_active=harness.now,
+                messages=messages,
+                native_path=str(source_cwd / f"{source_native_id}.jsonl"),
+                native_cursor="cursor-reported-578",
+                native_hash="hash-reported-578",
+            )
+        ).session_id
+        assert persisted_source == source_id
+        harness.native.next_thread_id = thread_id
+        assert harness.register().queued == 1
+        with harness.client() as client:
+            assert harness.run_worker_once(client) == [
+                {"state": "sidebar_visible", "codex_thread_id": thread_id}
+            ]
+
+        snapshot = harness.store.get_sidebar_preview_source(source_id)
+        assert len(snapshot["messages"]) == 578
+        candidate = harness.store.get_sidebar_candidate_for_delivery(source_id)
+        preview = build_session_preview(
+            source_session_id=source_id,
+            source_cursor=snapshot["source_cursor"],
+            source_hash=snapshot["source_hash"],
+            title=snapshot["title"],
+            provider=candidate.provider.value,
+            cwd=candidate.cwd,
+            captured_at=snapshot["captured_at"],
+            messages=snapshot["messages"],
+            git_root=candidate.git_root,
+            git_branch=candidate.git_branch,
+            git_head=candidate.git_head,
+            worktree_id=candidate.worktree_id,
+            budget_chars=24_000,
+        )
+        hydration_marker = encode_hydration_marker(
+            HydrationMarkerPayload(
+                bridge_id=candidate.bridge_id,
+                codex_thread_id=thread_id,
+                preview_digest=preview.digest,
+                preview_version=preview.version,
+                source_cursor=preview.source_cursor,
+                source_hash=preview.source_hash,
+                source_session_id=source_id,
+            ),
+            _MARKER_SECRET,
+        )
+        seeded = harness.store.seed_sidebar_hydration_job(
+            source_session_id=source_id,
+            bridge_id=candidate.bridge_id,
+            codex_thread_id=thread_id,
+            source_cursor=preview.source_cursor,
+            source_hash=preview.source_hash,
+            preview_version=preview.version,
+            preview_digest=preview.digest,
+            hydration_marker=hydration_marker,
+            now=harness.now,
+        )
+        assert seeded["state"] == SidebarHydrationState.PENDING.value
+        harness.config = replace(
+            harness.config,
+            sidebar=replace(
+                harness.config.sidebar,
+                legacy_hydration_enabled=True,
+            ),
+        )
+        harness.coordinator._config = harness.config
+        harness._rebuild_app()
+        create_count = len(harness.native.create_calls)
+        rename_count = len(harness.native.rename_calls)
+
+        with harness.client() as client:
+            first = harness.run_hydration_worker_once(
+                client,
+                drop_after_append=True,
+            )
+            harness.advance_retry()
+            second = harness.run_hydration_worker_once(client)
+
+        assert first == {
+            "state": SidebarHydrationState.RETRY.value,
+            "error_code": "hydration_send_ambiguous",
+            "send_reserved": True,
+        }
+        assert second == {
+            "state": SidebarHydrationState.VISIBLE.value,
+            "codex_thread_id": thread_id,
+        }
+        assert len(harness.native.send_calls) == 1
+        sent_thread_id, sent_message = harness.native.send_calls[0]
+        assert sent_thread_id == thread_id
+        assert sent_message.startswith("# Imported Claude Code Session")
+        last_five = sent_message.split("## Last 5 Messages", 1)[1].split(
+            "## In-place Session Bridge Hydration",
+            1,
+        )[0]
+        for index in range(573, 578):
+            assert f"reported-conversation-message-{index}" in last_five
+        assert "reported-conversation-message-572" not in last_five
+        assert sent_message.count(hydration_marker) == 1
+        thread = harness.native.threads[thread_id]
+        assert thread["session_continue_calls"] == [source_id]
+        assert len(harness.native.create_calls) == create_count
+        assert len(harness.native.rename_calls) == rename_count
+        assert harness.store.sidebar_hydration_status(harness.now)["counts"][
+            SidebarHydrationState.VISIBLE.value
+        ] == 1
+        hydration_traces = harness.worker_traces[-2:]
+        assert all(
+            "create_thread" not in {event["tool"] for event in trace}
+            and "set_thread_title" not in {event["tool"] for event in trace}
+            and "set_thread_archived" not in {event["tool"] for event in trace}
+            for trace in hydration_traces
+        )
     finally:
         harness.close()
 
