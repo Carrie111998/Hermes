@@ -2051,8 +2051,19 @@ class APIServerAdapter(BasePlatformAdapter):
         model = split_model or raw_model
         alias_route = self._resolve_route(raw_model) or self._resolve_route(model)
         route = dict(alias_route) if isinstance(alias_route, dict) else None
+        # The virtual model alias (self._model_name, e.g. "hermes-agent") is
+        # not a real provider model id — it's the id /v1/models advertises
+        # for "use the gateway default". A client that echoes it back
+        # (explicitly or via a generic model picker) means "no real request",
+        # same as omitting model entirely. Null it out here, upstream of
+        # both the route-building below and every caller's "requested"
+        # dict, so it never gets persisted as a session's model or
+        # misread later as a raw session_model override (#session-model-
+        # alias-leak — see _handle_create_session).
+        if model == self._model_name:
+            model = None
         route_source = "model_routes" if route else "global"
-        if not route and model and model != self._model_name:
+        if not route and model:
             route = {"model": model}
             if provider:
                 route["provider"] = provider
@@ -3076,7 +3087,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
-        model = body.get("model") or self._model_name
+        # Never persist the virtual model alias (self._model_name, e.g.
+        # "hermes-agent") as if it were a real provider model id — a bare
+        # "hermes-agent" is not a model_routes alias, so a later chat on
+        # this session would fall into the raw session_model precedence
+        # branch in _handle_session_chat and get sent to the provider
+        # literally, failing with "invalid model identifier" (#session-
+        # model-alias-leak). Treat "no model" / "the virtual alias" the
+        # same: leave the session's model unset so it falls through to the
+        # global default on every turn, exactly as an omitted model would.
+        model = _clean_request_string(body.get("model"))
+        if model == self._model_name:
+            model = None
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
@@ -3086,7 +3108,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if lock_error is not None:
             return lock_error
         requested = runtime_request.get("requested") or {}
-        model_name = self._clean_runtime_id(requested.get("model")) or (str(model) if model else None)
+        model_name = self._clean_runtime_id(requested.get("model")) or model
         model_config = None
         if requested.get("model") or requested.get("provider"):
             model_config = {
