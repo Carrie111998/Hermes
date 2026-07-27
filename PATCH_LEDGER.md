@@ -96,6 +96,7 @@ None submitted yet — pushing requires authorization.
 | `2484ec0a0`, `6cd47d16e` | worker auto-dispatch guards for this deployment |
 | `0e32d21f1`, `f66dfbdee` | stop test artifacts leaking into the repo root |
 | `7f9e41aaf` | this ledger, its drift check, and `scripts/safe_update.py` |
+| `a54349771`, `cbaff4773` | `scripts/rehearse_rollback.py` + `ROLLBACK.md` — restore rehearsal (20/20) and the tested procedure |
 | `d9f3996d8` | behavioral evaluation harness + `.github/workflows/hermes-audit-guards.yml` |
 | `6fab15b17` | FakeRunner composes the ultra mixin; XFAIL disposition recorded |
 | `7efb1104e` | drift check exempts ledger-only commits (it could not converge) |
