@@ -561,6 +561,19 @@ contract returns non-zero for unavailable discovered rails while remaining
 read-only; payment intent idempotency, provider read-back, and accounting
 settlement remain covered by the same regression.
 
+Event-driven CEO wakeups were validated on current `main` (`7fc5cae501718262b9c95eac67845e4bc3b6abd1`) with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_objective_triggers.py \
+  tests/hermes_cli/test_objective_service.py \
+  tests/hermes_cli/test_objective_runtime.py
+```
+
+Result: **55 passed, 0 failed**. This covers scheduled catch-up without event
+storms, authenticated external-event routing, durable event claims, worker
+recovery, and objective execution after a persistent wake.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
