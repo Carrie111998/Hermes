@@ -66,7 +66,7 @@ Optional settings live in `$HERMES_HOME/timem.json`:
 | `score_threshold` | `0.5` | Minimum semantic similarity for recall (0–1) |
 | `auto_recall` | `true` | Inject recalled context each turn |
 | `auto_capture` | `true` | Submit turns for memory generation |
-| `api_timeout` | `10.0` | Request timeout in seconds (1–60) |
+| `api_timeout` | `60.0` | Request timeout in seconds (1–60) |
 
 Environment overrides: `TIMEM_API_KEY` (required), `TIMEM_BASE_URL`.
 
@@ -78,3 +78,14 @@ Environment overrides: `TIMEM_API_KEY` (required), `TIMEM_BASE_URL`.
 - A circuit breaker opens after 5 consecutive API failures and retries after
   a 120s cooldown; the agent keeps working without memory in the meantime.
 - Trivial turns (short acknowledgements) are not captured.
+- **Reads and writes are serialized server-side.** While a turn is being
+  ingested (`sync_turn` / `timem_add` / built-in mirror), the engine may
+  briefly queue concurrent `timem_search` / prefetch calls — those can take
+  longer or, in the worst case, time out and return no context for that one
+  turn. The agent should treat prefetch as best-effort and fall back to the
+  explicit `timem_search` tool when it genuinely needs a recall. Empirically,
+  searches return in ~1–2s when no generation is in flight.
+- The TiMEM sync SDK wraps a single asyncio event loop that is not
+  thread-safe, so this plugin uses **two separate client instances** (one for
+  reads, one for writes), each internally locked, so a slow background write
+  never blocks a recall.

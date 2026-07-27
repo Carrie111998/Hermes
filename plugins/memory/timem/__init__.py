@@ -20,6 +20,7 @@ The SDK (timem-ai) is lazy-installed on first use via tools/lazy_deps.py.
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import os
 import re
@@ -39,8 +40,8 @@ _DEFAULT_CHARACTER_ID = "hermes"
 _DEFAULT_USER_ID = "hermes-user"
 _DEFAULT_MAX_RECALL_RESULTS = 8
 _DEFAULT_SCORE_THRESHOLD = 0.5
-_DEFAULT_API_TIMEOUT = 10.0
-_PREFETCH_WAIT_SECS = 3.0
+_DEFAULT_API_TIMEOUT = 60.0
+_PREFETCH_WAIT_SECS = 10.0
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120.0
 _MIN_CAPTURE_LENGTH = 10
@@ -251,7 +252,16 @@ def _is_trivial_message(text: str) -> bool:
 # ─── SDK wrapper ─────────────────────────────────────────────────────────────
 
 class _TimemClient:
-    """Thin wrapper around the timem-ai SDK, lazy-installed on first use."""
+    """Thin, thread-safe wrapper around ONE timem-ai sync client.
+
+    The timem-ai synchronous client wraps an internal asyncio event loop
+    that is NOT thread-safe: concurrent calls from different threads race on
+    the same loop and time out.  We therefore (a) give every ``_TimemClient``
+    its own ``TiMEMClient`` instance (own loop) and (b) serialize calls on
+    this client with a lock.  The provider uses two ``_TimemClient``
+    instances -- one for reads, one for writes -- so a slow write never
+    blocks a recall.
+    """
 
     def __init__(self, api_key: str, base_url: str, timeout: float,
                  user_id: str, character_id: str, domain: str):
@@ -262,66 +272,80 @@ class _TimemClient:
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
             _lazy_ensure("memory.timem", prompt=False)
-        except ImportError:
-            pass
         except Exception:
             pass
         from timem import TiMEMClient
+        # The timem-ai SDK logs verbose Chinese retry/timeout noise to the
+        # console ("请求最终失败 ...") at ERROR level. We own the circuit
+        # breaking and best-effort semantics and log failures ourselves, so
+        # silence the SDK entirely (CRITICAL suppresses even its .error()).
+        logging.getLogger("timem").setLevel(logging.CRITICAL)
 
         self._user_id = user_id
         self._character_id = character_id
         self._domain = domain
+        self._lock = threading.Lock()
         self._client = TiMEMClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
             max_retries=0,
             verify_ssl=True,
+            enable_monitoring=False,
+            enable_circuit_breaker=False,
         )
 
     def search(self, query: str, *, limit: int, score_threshold: float) -> List[dict]:
-        response = self._client.search_memories(
-            user_id=self._user_id,
-            query_text=query,
-            character_id=self._character_id,
-            score_threshold=score_threshold,
-            limit=limit,
-        )
+        with self._lock:
+            response = self._client.search_memories(
+                user_id=self._user_id,
+                query_text=query,
+                character_id=self._character_id,
+                score_threshold=score_threshold,
+                limit=limit,
+            )
         return _extract_memories(response)
 
     def ingest_turn(self, session_id: str, messages: List[dict],
                     metadata: Optional[dict] = None) -> dict:
         # Async on the server: returns an acceptance with task_id. We do NOT
-        # poll — memory generation completes in the background server-side.
-        return self._client.generate_memory(
-            character_id=self._character_id,
-            session_id=session_id,
-            messages=messages,
-            user_id=self._user_id,
-            domain=self._domain,
-            metadata=metadata,
-        )
+        # poll -- memory generation completes in the background server-side.
+        with self._lock:
+            return self._client.generate_memory(
+                character_id=self._character_id,
+                session_id=session_id,
+                messages=messages,
+                user_id=self._user_id,
+                domain=self._domain,
+                metadata=metadata,
+            )
 
     def add_fact(self, content: dict, *, tags: Optional[List[str]] = None,
                  session_id: Optional[str] = None) -> dict:
-        return self._client.add_memory(
-            user_id=self._user_id,
-            domain=self._domain,
-            content=content,
-            layer_type="L1",
-            tags=tags,
-            session_id=session_id,
-        )
+        with self._lock:
+            return self._client.add_memory(
+                user_id=self._user_id,
+                domain=self._domain,
+                content=content,
+                layer_type="L1",
+                tags=tags,
+                session_id=session_id,
+            )
 
     def get_profile(self) -> dict:
-        result = self._client.get_profile(
-            user_id=self._user_id, expert_id=self._character_id,
-        )
+        with self._lock:
+            result = self._client.get_profile(
+                user_id=self._user_id, expert_id=self._character_id,
+            )
         return result if isinstance(result, dict) else {}
 
     def close(self) -> None:
         try:
-            self._client.close()
+            cl = getattr(self._client, "close", None)
+            # The timem-ai sync client exposes an async close(); calling it
+            # without awaiting emits a RuntimeWarning and leaks the coroutine.
+            if cl is not None and not inspect.iscoroutinefunction(cl):
+                cl()
         except Exception:
             pass
 
@@ -381,7 +405,8 @@ class TimemMemoryProvider(MemoryProvider):
     """TiMEM temporal-hierarchical memory provider."""
 
     def __init__(self):
-        self._client: Optional[_TimemClient] = None
+        self._read_client: Optional[_TimemClient] = None
+        self._write_client: Optional[_TimemClient] = None
         self._config: dict = _default_config()
         self._session_id = ""
         self._read_only = False
@@ -428,7 +453,17 @@ class TimemMemoryProvider(MemoryProvider):
 
         api_key = os.environ.get("TIMEM_API_KEY", "").strip()
         try:
-            self._client = _TimemClient(
+            self._read_client = _TimemClient(
+                api_key=api_key,
+                base_url=_resolve_base_url(self._config["base_url"]),
+                timeout=self._config["api_timeout"],
+                user_id=user_id,
+                character_id=character_id,
+                domain=self._config["domain"],
+            )
+            # Writes use a SEPARATE client/event loop so a slow server-side
+            # generation never blocks recalls on the read client.
+            self._write_client = _TimemClient(
                 api_key=api_key,
                 base_url=_resolve_base_url(self._config["base_url"]),
                 timeout=self._config["api_timeout"],
@@ -438,12 +473,13 @@ class TimemMemoryProvider(MemoryProvider):
             )
             self._init_error = ""
         except Exception as exc:
-            self._client = None
+            self._read_client = None
+            self._write_client = None
             self._init_error = str(exc).strip()[:200] or "client construction failed"
             logger.warning("TiMEM client init failed: %s", self._init_error)
 
     def system_prompt_block(self) -> str:
-        if self._client is None:
+        if self._read_client is None:
             return ""
         return (
             "## TiMEM Long-Term Memory\n"
@@ -478,7 +514,7 @@ class TimemMemoryProvider(MemoryProvider):
     # -- Recall (prefetch) -----------------------------------------------------
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        if self._client is None or not self._config["auto_recall"]:
+        if self._read_client is None or not self._config["auto_recall"]:
             return
         if self._is_breaker_open() or not (query or "").strip():
             return
@@ -488,7 +524,7 @@ class TimemMemoryProvider(MemoryProvider):
 
         def _recall():
             try:
-                memories = self._client.search(
+                memories = self._read_client.search(
                     cleaned,
                     limit=self._config["max_recall_results"],
                     score_threshold=self._config["score_threshold"],
@@ -513,7 +549,7 @@ class TimemMemoryProvider(MemoryProvider):
             self._prefetch_thread.start()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._client is None or not self._config["auto_recall"]:
+        if self._read_client is None or not self._config["auto_recall"]:
             return ""
         thread = self._prefetch_thread
         if thread is None:
@@ -538,7 +574,7 @@ class TimemMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        if self._client is None or self._read_only or not self._config["auto_capture"]:
+        if self._write_client is None or self._read_only or not self._config["auto_capture"]:
             return
         if self._is_breaker_open():
             return
@@ -554,7 +590,7 @@ class TimemMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
-                self._client.ingest_turn(sid, payload, metadata={"source": "hermes"})
+                self._write_client.ingest_turn(sid, payload, metadata={"source": "hermes"})
                 self._record_success()
             except Exception:
                 logger.debug("TiMEM sync_turn failed", exc_info=True)
@@ -576,7 +612,7 @@ class TimemMemoryProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if self._client is None or self._read_only or not self._config["auto_capture"]:
+        if self._write_client is None or self._read_only or not self._config["auto_capture"]:
             return
         if action == "remove" or self._is_breaker_open():
             return
@@ -586,7 +622,7 @@ class TimemMemoryProvider(MemoryProvider):
 
         def _mirror():
             try:
-                self._client.add_fact(
+                self._write_client.add_fact(
                     {
                         "type": "hermes_builtin_memory",
                         "action": action,
@@ -609,7 +645,7 @@ class TimemMemoryProvider(MemoryProvider):
         return [SEARCH_SCHEMA, ADD_SCHEMA, PROFILE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        if self._client is None:
+        if self._read_client is None and self._write_client is None:
             err = self._init_error or "not initialized"
             return json.dumps({"error": f"TiMEM client not initialized: {err}"})
         if self._is_breaker_open():
@@ -622,12 +658,14 @@ class TimemMemoryProvider(MemoryProvider):
             query = (args.get("query") or "").strip()
             if not query:
                 return tool_error("Missing required parameter: query")
+            if self._read_client is None:
+                return tool_error("TiMEM read client not initialized")
             try:
                 limit = max(1, min(int(args.get("limit", self._config["max_recall_results"])), 20))
             except Exception:
                 limit = self._config["max_recall_results"]
             try:
-                memories = self._client.search(
+                memories = self._read_client.search(
                     query, limit=limit,
                     score_threshold=self._config["score_threshold"],
                 )
@@ -646,29 +684,40 @@ class TimemMemoryProvider(MemoryProvider):
             content = (args.get("content") or "").strip()
             if not content:
                 return tool_error("Missing required parameter: content")
+            if self._write_client is None:
+                return tool_error("TiMEM write client not initialized")
             tags = args.get("tags")
             if not isinstance(tags, list):
                 tags = None
             else:
                 tags = [str(t) for t in tags if t][:10]
-            try:
-                result = self._client.add_fact(
-                    {"type": "explicit_fact", "text": content},
-                    tags=(tags or []) + ["hermes"],
-                    session_id=self._session_id or None,
-                )
-                self._record_success()
-                memory_id = ""
-                if isinstance(result, dict):
-                    memory_id = str(result.get("id") or result.get("memory_id") or "")
-                return json.dumps({"result": "Fact stored.", "id": memory_id})
-            except Exception as e:
-                self._record_failure()
-                return tool_error(f"TiMEM store failed: {str(e)[:200]}")
+            # Fired into the background: TiMEM generates memory server-side
+            # (async, can be slow), so we never block the turn on it.
+            sid = self._session_id or None
+
+            def _add():
+                try:
+                    self._write_client.add_fact(
+                        {"type": "explicit_fact", "text": content},
+                        tags=(tags or []) + ["hermes"],
+                        session_id=sid,
+                    )
+                    self._record_success()
+                except Exception:
+                    logger.debug("TiMEM add_fact failed", exc_info=True)
+                    self._record_failure()
+
+            threading.Thread(target=_add, daemon=True, name="timem-add").start()
+            return json.dumps({
+                "result": "Fact submitted to TiMEM for async generation.",
+                "queued": True,
+            })
 
         elif tool_name == "timem_profile":
+            if self._read_client is None:
+                return tool_error("TiMEM read client not initialized")
             try:
-                profile = self._client.get_profile()
+                profile = self._read_client.get_profile()
                 self._record_success()
                 if not profile:
                     return json.dumps({"result": "No profile computed yet."})
@@ -725,9 +774,11 @@ class TimemMemoryProvider(MemoryProvider):
         for t in (self._prefetch_thread, self._sync_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
-        if self._client:
-            self._client.close()
-            self._client = None
+        for client in (self._read_client, self._write_client):
+            if client:
+                client.close()
+        self._read_client = None
+        self._write_client = None
 
 
 def register(ctx) -> None:

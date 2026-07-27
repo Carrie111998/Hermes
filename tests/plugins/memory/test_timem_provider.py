@@ -64,9 +64,9 @@ def _join_worker_threads(p):
     for t in (p._prefetch_thread, p._sync_thread):
         if t and t.is_alive():
             t.join(timeout=5.0)
-    # mirror threads are fire-and-forget; give them a beat
+    # fire-and-forget mirror / add threads are daemon; give them a beat
     for t in threading.enumerate():
-        if t.name == "timem-mirror":
+        if t.name and t.name.startswith("timem-"):
             t.join(timeout=5.0)
 
 
@@ -164,27 +164,27 @@ def test_clean_text_strips_injected_context():
 # ─── Recall / capture ────────────────────────────────────────────────────────
 
 def test_prefetch_returns_formatted_context(provider):
-    provider._client.search_results = [{"text": "user prefers dark mode",
-                                        "layer": "L4", "score": 0.75}]
+    provider._read_client.search_results = [{"text": "user prefers dark mode",
+                                             "layer": "L4", "score": 0.75}]
     provider.queue_prefetch("what theme should I use for the app?")
     result = provider.prefetch("what theme should I use for the app?")
     assert "user prefers dark mode" in result
-    assert provider._client.search_calls  # search actually ran
+    assert provider._read_client.search_calls  # search actually ran
 
 
 def test_prefetch_strips_previous_injection_from_query(provider):
     provider.queue_prefetch("<timem-context>old</timem-context>real question here")
     provider.prefetch("real question here")
-    assert provider._client.search_calls
-    assert "old" not in provider._client.search_calls[0]["query"]
+    assert provider._read_client.search_calls
+    assert "old" not in provider._read_client.search_calls[0]["query"]
 
 
 def test_sync_turn_submits_cleaned_exchange(provider):
     provider.sync_turn("I moved to Berlin last month", "Noted — congrats!",
                        session_id="session-1")
     _join_worker_threads(provider)
-    assert len(provider._client.ingest_calls) == 1
-    call = provider._client.ingest_calls[0]
+    assert len(provider._write_client.ingest_calls) == 1
+    call = provider._write_client.ingest_calls[0]
     assert call["session_id"] == "session-1"
     assert call["messages"][0]["role"] == "user"
     assert call["messages"][1]["role"] == "assistant"
@@ -194,7 +194,7 @@ def test_sync_turn_skips_trivial_messages(provider):
     provider.sync_turn("ok", "Anything else?")
     provider.sync_turn("short", "too short to capture")
     _join_worker_threads(provider)
-    assert provider._client.ingest_calls == []
+    assert provider._write_client.ingest_calls == []
 
 
 def test_sync_turn_skipped_for_non_primary_context(monkeypatch, tmp_path):
@@ -205,14 +205,14 @@ def test_sync_turn_skipped_for_non_primary_context(monkeypatch, tmp_path):
                  agent_context="cron")
     p.sync_turn("scheduled system prompt content here", "done")
     _join_worker_threads(p)
-    assert p._client.ingest_calls == []
+    assert p._write_client.ingest_calls == []
 
 
 def test_on_memory_write_mirrors_add(provider):
     provider.on_memory_write("add", "user", "User's birthday is March 3rd")
     _join_worker_threads(provider)
-    assert len(provider._client.add_calls) == 1
-    call = provider._client.add_calls[0]
+    assert len(provider._write_client.add_calls) == 1
+    call = provider._write_client.add_calls[0]
     assert call["content"]["text"] == "User's birthday is March 3rd"
     assert "builtin-memory" in call["tags"]
 
@@ -220,7 +220,7 @@ def test_on_memory_write_mirrors_add(provider):
 def test_on_memory_write_ignores_remove(provider):
     provider.on_memory_write("remove", "user", "some removed entry content")
     _join_worker_threads(provider)
-    assert provider._client.add_calls == []
+    assert provider._write_client.add_calls == []
 
 
 # ─── Tools ───────────────────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ def test_tool_schemas_exposed(provider):
 
 
 def test_timem_search_tool(provider):
-    provider._client.search_results = [{"text": "fact", "score": 0.9}]
+    provider._read_client.search_results = [{"text": "fact", "score": 0.9}]
     result = json.loads(provider.handle_tool_call("timem_search", {"query": "fact"}))
     assert result["count"] == 1
     assert result["results"][0]["text"] == "fact"
@@ -242,17 +242,18 @@ def test_timem_search_tool_requires_query(provider):
     assert "query" in result
 
 
-def test_timem_add_tool(provider):
+def test_timem_add_tool_queues_write(provider):
     result = json.loads(provider.handle_tool_call(
         "timem_add", {"content": "likes espresso", "tags": ["prefs"]}))
-    assert result["result"] == "Fact stored."
-    call = provider._client.add_calls[0]
+    assert result["queued"] is True
+    _join_worker_threads(provider)
+    call = provider._write_client.add_calls[0]
     assert call["content"]["text"] == "likes espresso"
     assert "prefs" in call["tags"] and "hermes" in call["tags"]
 
 
 def test_timem_profile_tool(provider):
-    provider._client.profile_response = {"persona": "engineer"}
+    provider._read_client.profile_response = {"persona": "engineer"}
     result = json.loads(provider.handle_tool_call("timem_profile", {}))
     assert result["profile"] == {"persona": "engineer"}
 
@@ -268,7 +269,7 @@ def test_circuit_breaker_opens_after_failures(provider):
     def boom(*args, **kwargs):
         raise RuntimeError("api down")
 
-    provider._client.search = boom
+    provider._read_client.search = boom
     for _ in range(5):
         provider.handle_tool_call("timem_search", {"query": "x"})
     result = provider.handle_tool_call("timem_search", {"query": "x"})
@@ -292,8 +293,11 @@ def test_config_schema_has_secret_api_key(provider):
     assert by_key["base_url"]["default"] == "https://api.timem.cloud"
 
 
-def test_shutdown_closes_client(provider):
-    client = provider._client
+def test_shutdown_closes_clients(provider):
+    read_client = provider._read_client
+    write_client = provider._write_client
     provider.shutdown()
-    assert client.closed is True
-    assert provider._client is None
+    assert read_client.closed is True
+    assert write_client.closed is True
+    assert provider._read_client is None
+    assert provider._write_client is None
