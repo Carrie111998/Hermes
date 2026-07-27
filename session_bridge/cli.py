@@ -1298,7 +1298,17 @@ class ProductionBackend:
                     status=hydration.status,
                 )
                 return {"lane": "hydration", **asdict(hydration)}
-            registration = self._require_sidebar_executor().run_once()
+            executor = self._require_sidebar_executor()
+            registration = executor.run_once()
+            if registration.status == "idle":
+                discovery = self._register_sidebar_catalog_once()
+                if discovery.failed:
+                    _LOG.warning(
+                        "continuous sidebar registration skipped %s candidates",
+                        discovery.failed,
+                    )
+                if discovery.queued:
+                    registration = executor.run_once()
             self._record_sidebar_recovery_progress(
                 lane="registration",
                 status=registration.status,
@@ -1313,6 +1323,20 @@ class ProductionBackend:
             raise
         except Exception as exc:
             raise ProviderDegraded("sidebar_recovery_failed") from exc
+
+    def _register_sidebar_catalog_once(self):
+        coordinator = SessionBridgeCoordinator(
+            config=self.config,
+            store=self._require_store(),
+            adapters={},
+            target_adapters={},
+            clock=time.time,
+        )
+        return asyncio.run(
+            coordinator.register_sidebar_jobs_once(
+                limit=self.config.sidebar.continuous_batch_limit,
+            )
+        )
 
     def _record_sidebar_recovery_progress(self, *, lane: str, status: str) -> None:
         try:

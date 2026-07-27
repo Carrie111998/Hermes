@@ -5211,6 +5211,10 @@ def test_production_sidebar_recovery_once_prioritizes_hydration_then_registratio
             calls.append("registration")
             return SidebarExecutionResult(status="idle")
 
+    class RegistrationSummary:
+        queued = 0
+        failed = 0
+
     monkeypatch.setattr(
         backend,
         "_require_sidebar_hydration_executor",
@@ -5221,6 +5225,11 @@ def test_production_sidebar_recovery_once_prioritizes_hydration_then_registratio
         backend,
         "_require_sidebar_executor",
         lambda: RegistrationExecutor(),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_register_sidebar_catalog_once",
+        lambda: calls.append("discovery") or RegistrationSummary(),
     )
     monkeypatch.setattr(backend, "_require_store", lambda: Store())
     monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
@@ -5241,10 +5250,82 @@ def test_production_sidebar_recovery_once_prioritizes_hydration_then_registratio
         "thread_id": None,
         "error_code": None,
     }
-    assert calls == ["hydration", "hydration", "registration"]
+    assert calls == ["hydration", "hydration", "registration", "discovery"]
     assert progress == [
         {"lane": "hydration", "status": "visible", "now": 1_000.0},
         {"lane": "registration", "status": "idle", "now": 1_000.0},
+    ]
+
+
+def test_production_sidebar_recovery_discovers_catalog_only_work_before_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    )
+    calls: list[str] = []
+    progress: list[dict[str, object]] = []
+    registration_results = iter((
+        SidebarExecutionResult(status="idle"),
+        SidebarExecutionResult(
+            status="visible",
+            job_id="sidebar-job:" + ("b" * 64),
+            thread_id="019f-readable",
+        ),
+    ))
+
+    class Store:
+        def record_sidebar_recovery_progress(self, **value: object) -> None:
+            progress.append(value)
+
+    class HydrationExecutor:
+        def run_once(self) -> SidebarHydrationExecutionResult:
+            calls.append("hydration")
+            return SidebarHydrationExecutionResult(status="idle")
+
+    class RegistrationExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            calls.append("registration")
+            return next(registration_results)
+
+    class RegistrationSummary:
+        queued = 1
+        failed = 0
+
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_hydration_executor",
+        lambda: HydrationExecutor(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_executor",
+        lambda: RegistrationExecutor(),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_register_sidebar_catalog_once",
+        lambda: calls.append("discovery") or RegistrationSummary(),
+    )
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 2_000.0)
+
+    assert backend.run_sidebar_recovery_once() == {
+        "lane": "registration",
+        "status": "visible",
+        "job_id": "sidebar-job:" + ("b" * 64),
+        "thread_id": "019f-readable",
+        "error_code": None,
+    }
+    assert calls == [
+        "hydration",
+        "registration",
+        "discovery",
+        "registration",
+    ]
+    assert progress == [
+        {"lane": "registration", "status": "visible", "now": 2_000.0}
     ]
 
 
