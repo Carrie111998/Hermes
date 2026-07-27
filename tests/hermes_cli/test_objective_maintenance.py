@@ -12,6 +12,15 @@ from hermes_cli import (
 )
 
 
+def test_maintenance_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    objective_maintenance.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    objective_maintenance.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_housekeeping_expires_dormant_authority_and_releases_capital(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")
     now = int(time.time())
