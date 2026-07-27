@@ -276,3 +276,5 @@ recorded.
   recording to the organization executing the governed action.
 - `e860e36534bf323f61a4ee4f0ab4c940020fd97a` — bound durable verification
   recording to the organization executing the governed action.
+- `1799f65aebbc28e195e631a4f1dd9200cfd73ecb` — completed organization
+  propagation across all governed verification paths.

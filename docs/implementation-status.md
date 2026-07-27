@@ -193,7 +193,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`e860e36534bf323f61a4ee4f0ab4c940020fd97a` passed 6 Founder/CEO E2E tests, 48
+`1799f65aebbc28e195e631a4f1dd9200cfd73ecb` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -224,6 +224,7 @@ Execution-result recording is organization-bound and passed the outcome
 attribution regression.
 Durable verification recording is organization-bound in governed runtime and
 CLI paths and passed the runtime and attribution regressions.
+The verification API now requires organization scope for all direct callers.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,
