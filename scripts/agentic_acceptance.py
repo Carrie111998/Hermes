@@ -19,6 +19,7 @@ from hermes_cli import (
     objective_triggers,
     objective_worker,
     objectives_db,
+    operational_control,
 )
 from hermes_cli.objective_runtime import (
     ActionProposal,
@@ -338,8 +339,45 @@ def recover() -> None:
         conn.close()
 
 
+def stop() -> None:
+    """Revoke autonomy and prove the worker stops before another effect."""
+    conn = objectives_db.connect(_db())
+    try:
+        before = json.loads(_provider_file().read_text(encoding="utf-8"))
+        generation = operational_control.set_autonomy_mode(
+            conn,
+            mode="paused",
+            actor="advisor:acceptance",
+            reason="master stop acceptance",
+        )
+        result = objective_worker.run_forever(
+            db_path=_db(), tick=_runtime(conn).tick, max_cycles=1, interval_seconds=1
+        )
+        assert result == 0, result
+        assert operational_control.autonomy_state(conn)["mode"] == "paused"
+        after = json.loads(_provider_file().read_text(encoding="utf-8"))
+        assert after == before, {"before": before, "after": after}
+        print(
+            json.dumps(
+                {
+                    "phase": "stop",
+                    "autonomy": "paused",
+                    "generation": generation,
+                    "duplicate_effects": 0,
+                }
+            )
+        )
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    phases = {"prepare": prepare, "run": run_worker, "recover": recover}
+    phases = {
+        "prepare": prepare,
+        "run": run_worker,
+        "recover": recover,
+        "stop": stop,
+    }
     try:
         phases[sys.argv[1]]()
     except (AssertionError, KeyError, IndexError) as exc:
