@@ -66,6 +66,21 @@ class ProviderPayment:
     evidence: Any = None
 
 
+class UncertainProviderAction(RuntimeError):
+    """A provider may have acted, but the caller did not receive a final reply.
+
+    The reference is intentionally optional: providers that return a request
+    or idempotency reference in a timeout can be reconciled immediately;
+    providers that do not must remain stopped until an operator supplies
+    authoritative evidence.
+    """
+
+    def __init__(self, message: str, *, provider_reference: str = "", evidence: Any = None):
+        super().__init__(message)
+        self.provider_reference = provider_reference
+        self.evidence = evidence
+
+
 class InboundPaymentRail(ABC):
     name: str
 
@@ -478,17 +493,17 @@ class PaymentService:
             direction="outbound",
             jurisdiction=payee_jurisdiction,
         )
-        remote = self._outbound_rail(provider).send_payment(
-            amount_minor=amount_minor,
-            currency=currency,
-            payee=payee,
-            instrument_reference=spend_authority["provider_instrument_id"],
-            purpose=purpose,
-            idempotency_key=idempotency_key,
-        )
-        self._validate_remote(remote, amount_minor, currency)
         intent_id = f"payment_{uuid.uuid4().hex}"
         now = int(time.time())
+        metadata = {
+            "instrument_id": instrument_id,
+            "merchant_category": merchant_category,
+            "payee_id": payee_id,
+            "spend_control_id": spend_authority["control_id"],
+            "policy_version": spend_authority["policy_version"],
+            "provider_assessment_id": assessment_id,
+            "payee_jurisdiction": payee_jurisdiction,
+        }
         with self.conn:
             self.conn.execute(
                 """
@@ -497,8 +512,8 @@ class PaymentService:
                     direction, provider, party_json, amount_minor, currency,
                     purpose, status, provider_reference, payment_url,
                     idempotency_key, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'outgoing', ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'outgoing', ?, ?, ?, ?, ?, 'processing',
+                          NULL, NULL, ?, ?, ?, ?)
                 """,
                 (
                     intent_id,
@@ -511,25 +526,53 @@ class PaymentService:
                     amount_minor,
                     currency.upper(),
                     purpose,
-                    remote.status,
-                    remote.reference,
-                    remote.payment_url,
                     idempotency_key,
-                    json.dumps(
-                        {
-                            "instrument_id": instrument_id,
-                            "merchant_category": merchant_category,
-                            "payee_id": payee_id,
-                            "spend_control_id": spend_authority["control_id"],
-                            "policy_version": spend_authority["policy_version"],
-                            "provider_assessment_id": assessment_id,
-                            "payee_jurisdiction": payee_jurisdiction,
-                        },
-                        sort_keys=True,
-                    ),
+                    json.dumps(metadata, sort_keys=True),
                     now,
                     now,
                 ),
+            )
+        try:
+            remote = self._outbound_rail(provider).send_payment(
+                amount_minor=amount_minor,
+                currency=currency,
+                payee=payee,
+                instrument_reference=spend_authority["provider_instrument_id"],
+                purpose=purpose,
+                idempotency_key=idempotency_key,
+            )
+            self._validate_remote(remote, amount_minor, currency)
+        except UncertainProviderAction as exc:
+            metadata["uncertainty_evidence"] = exc.evidence
+            with self.conn:
+                self.conn.execute(
+                    """UPDATE payment_intents
+                       SET status='uncertain', provider_reference=?, metadata_json=?,
+                           updated_at=? WHERE id=?""",
+                    (
+                        exc.provider_reference or None,
+                        json.dumps(metadata, sort_keys=True),
+                        int(time.time()),
+                        intent_id,
+                    ),
+                )
+            return self._get(intent_id)
+        except Exception as exc:
+            metadata["uncertainty_error"] = f"{type(exc).__name__}: {exc}"
+            with self.conn:
+                self.conn.execute(
+                    """UPDATE payment_intents
+                       SET status='uncertain', metadata_json=?, updated_at=?
+                       WHERE id=?""",
+                    (json.dumps(metadata, sort_keys=True), int(time.time()), intent_id),
+                )
+            raise
+        with self.conn:
+            self.conn.execute(
+                """UPDATE payment_intents
+                   SET status=?, provider_reference=?, payment_url=?, updated_at=?
+                   WHERE id=?""",
+                (remote.status, remote.reference, remote.payment_url, int(time.time()), intent_id),
             )
         return self.reconcile(intent_id)
 

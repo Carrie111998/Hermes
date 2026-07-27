@@ -14,7 +14,12 @@ from hermes_cli import (
     usage_billing,
 )
 from hermes_cli import objectives_db
-from hermes_cli.payments import PaymentRail, PaymentService, ProviderPayment
+from hermes_cli.payments import (
+    PaymentRail,
+    PaymentService,
+    ProviderPayment,
+    UncertainProviderAction,
+)
 
 
 def test_finance_schema_read_preserves_active_transaction(tmp_path):
@@ -96,6 +101,21 @@ class FakeRail(PaymentRail):
 
     def get_payment(self, reference):
         return self.payments[reference]
+
+
+class InterruptedRail(FakeRail):
+    def __init__(self):
+        super().__init__()
+        self.send_attempts = 0
+
+    def send_payment(self, **kwargs):
+        self.send_attempts += 1
+        payment = super().send_payment(**kwargs)
+        raise UncertainProviderAction(
+            "provider response lost after acceptance",
+            provider_reference=payment.reference,
+            evidence={"phase": "after_provider_acceptance"},
+        )
 
 
 @pytest.fixture
@@ -723,3 +743,108 @@ def test_raw_financial_credentials_are_rejected(treasury):
             label="unsafe",
             metadata={"card_number": "4242424242424242"},
         )
+
+
+def test_interrupted_outbound_payment_converges_from_readback_without_replay(
+    treasury,
+):
+    conn, account = treasury
+    finance_db.seed_initial_capital(
+        conn, account_id=account, amount_minor=5_000, currency="USD", actor="human"
+    )
+    rail = InterruptedRail()
+    service = PaymentService(conn, {"fake": rail})
+    instrument = payment_controls.register_tokenized_instrument(
+        conn,
+        organization_id="org_1",
+        provider="fake",
+        provider_instrument_id="provider-card-token-uncertain",
+        rail_type="virtual_card",
+        currency="USD",
+        label="Interrupted provider card",
+    )
+    payment_controls.set_spend_controls(
+        conn,
+        instrument_id=instrument,
+        max_transaction_minor=2_000,
+        max_daily_minor=3_000,
+        allowed_merchant_categories=["software"],
+        allowed_payees=["vendor-uncertain"],
+        policy_version="finance-v1",
+    )
+    finance_db.reserve_budget(
+        conn,
+        account_id=account,
+        objective_id="obj-uncertain",
+        action_id="act-uncertain",
+        amount_minor=1_000,
+        currency="USD",
+        expires_at=9_999_999_999,
+    )
+
+    uncertain = service.send_payable(
+        organization_id="org_1",
+        account_id=account,
+        objective_id="obj-uncertain",
+        action_id="act-uncertain",
+        provider="fake",
+        amount_minor=1_000,
+        currency="USD",
+        payee={"account": "vendor-uncertain"},
+        payee_jurisdiction="US",
+        instrument_id=instrument,
+        merchant_category="software",
+        payee_id="vendor-uncertain",
+        purpose="Interrupted provider action",
+        idempotency_key="pay-uncertain-0001",
+    )
+    assert uncertain["status"] == "uncertain"
+    assert uncertain["provider_reference"] == "outgoing-1"
+    assert rail.send_attempts == 1
+    assert finance_db.account_balance(conn, account) == 5_000
+
+    # Restart the local service and reconcile only through provider read-back.
+    database_path = conn.execute("PRAGMA database_list").fetchone()["file"]
+    restarted = objectives_db.connect(database_path)
+    try:
+        resumed = PaymentService(restarted, {"fake": rail})
+        settled = resumed.reconcile(uncertain["id"])
+        assert settled["status"] == "succeeded"
+        assert finance_db.account_balance(restarted, account) == 4_000
+        assert restarted.execute(
+            "SELECT status FROM budget_reservations WHERE action_id=?",
+            ("act-uncertain",),
+        ).fetchone()["status"] == "settled"
+        assert restarted.execute(
+            "SELECT status FROM payment_spend_holds WHERE action_id=?",
+            ("act-uncertain",),
+        ).fetchone()["status"] == "settled"
+
+        # A retry with the same idempotency key returns the durable intent and
+        # never calls the provider a second time.
+        retry = resumed.send_payable(
+            organization_id="org_1",
+            account_id=account,
+            objective_id="obj-uncertain",
+            action_id="act-uncertain",
+            provider="fake",
+            amount_minor=1_000,
+            currency="USD",
+            payee={"account": "vendor-uncertain"},
+            payee_jurisdiction="US",
+            instrument_id=instrument,
+            merchant_category="software",
+            payee_id="vendor-uncertain",
+            purpose="Interrupted provider action",
+            idempotency_key="pay-uncertain-0001",
+        )
+        assert retry["id"] == uncertain["id"]
+        assert retry["status"] == "succeeded"
+        assert rail.send_attempts == 1
+        assert finance_db.account_balance(restarted, account) == 4_000
+        assert restarted.execute(
+            "SELECT COUNT(*) AS n FROM payment_provider_readbacks WHERE payment_intent_id=?",
+            (uncertain["id"],),
+        ).fetchone()["n"] == 1
+    finally:
+        restarted.close()
