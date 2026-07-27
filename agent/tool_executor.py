@@ -1110,6 +1110,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             agent._apply_pending_steer_to_tool_results(messages, 1)
             continue
 
+        # Tool request middleware was applied upstream (concurrent path) or is
+        # skipped (sequential path keeps middleware_trace empty for post-call
+        # emissions that expect the variable to exist in scope).
+        middleware_trace: list[dict[str, Any]] = []
+
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
