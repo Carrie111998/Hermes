@@ -3518,8 +3518,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _aux_model = _resolved_model or _aux_model or self.model or ""
                 if _aux_model == self.model:
                     _aux_context = self.context_length
-            except Exception:
-                pass
+            except Exception as exc:
+                # Provider resolution failed — log for telemetry but continue with defaults.
+                # The summary call will still work using the model's default wire format.
+                logger.warning(
+                    "Failed to resolve aux provider/model for compression summary: %s",
+                    exc,
+                )
             # Compression is atomic: protect the in-flight summary call from a
             # mid-turn gateway interrupt. Without this, an incoming user message
             # aborts the summary and compression falls back to a degraded static
@@ -3845,10 +3850,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             return "merged" if cls._starts_with_summary_prefix(after) else None
         return "standalone" if cls._starts_with_summary_prefix(text) else None
 
-    @classmethod
-    def _is_context_summary_content(cls, content: Any) -> bool:
-        return cls.classify_summary_content(content) is not None
-
     @staticmethod
     def _has_compressed_summary_metadata(message: Any) -> bool:
         """Return True if *message* carries the compressed-summary flag.
@@ -3890,7 +3891,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         if cls._has_compressed_summary_metadata(message):
             return True
         content = message.get("content")
-        if cls._is_context_summary_content(content):
+        if cls.classify_summary_content(content) is not None:
             return True
         text = _content_text_for_contains(content).strip()
         return text in {
@@ -3932,7 +3933,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             return False
         return cls._has_compressed_summary_metadata(
             message
-        ) or cls._is_context_summary_content(message.get("content"))
+        ) or cls.classify_summary_content(message.get("content")) is not None
 
     @classmethod
     def _is_blank_user_turn(cls, message: Any) -> bool:
@@ -3942,7 +3943,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         if cls._has_compressed_summary_metadata(message):
             return False
         content = message.get("content")
-        if cls._is_context_summary_content(content):
+        if cls.classify_summary_content(content) is not None:
             return False
         if content is None or (isinstance(content, str) and not content.strip()):
             return True
@@ -3971,7 +3972,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         if cls._has_compressed_summary_metadata(message):
             return False
         content = message.get("content")
-        if cls._is_context_summary_content(content):
+        if cls.classify_summary_content(content) is not None:
             return False
         return not cls._is_blank_user_turn(message)
 
@@ -4134,7 +4135,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         content = message.get("content")
         is_summary = (
-            cls._is_context_summary_content(content)
+            cls.classify_summary_content(content) is not None
             or cls._has_compressed_summary_metadata(message)
         )
         if not is_summary:
@@ -4492,9 +4493,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         last_any = -1
         for i in range(len(messages) - 1, head_end - 1, -1):
             msg = messages[i]
-            if msg.get("role") != "assistant" or self._is_context_summary_content(
-                msg.get("content")
-            ):
+            if msg.get("role") != "assistant" or ContextCompressor.classify_summary_content(
+                                msg.get("content")
+                            ) is not None:
                 continue
             if self._is_context_summary_message(msg):
                 continue
@@ -5548,4 +5549,4 @@ def is_compaction_summary_message(message: Any) -> bool:
         content = message.get("content")
     else:
         content = message
-    return ContextCompressor._is_context_summary_content(content)
+    return ContextCompressor.classify_summary_content(content) is not None
