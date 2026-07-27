@@ -419,6 +419,16 @@ immutable, supersession must target the current leaf with an explicit reason,
 and ambiguous branching records fail closed rather than being silently
 selected as authoritative.
 
+Payment-provider authority was additionally validated with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_compliance_db.py tests/hermes_cli/test_business_bootstrap_command.py -q
+```
+
+Result: **13 passed, 0 failed**. Provider assessments now support immutable
+supersession, reject branch-from-old-record attempts, and stop authorization
+when the current replacement no longer satisfies screening controls.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

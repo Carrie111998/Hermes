@@ -129,7 +129,11 @@ def payment_findings(
             """SELECT provider FROM payment_provider_assessments
                WHERE organization_id=? AND direction=? AND status='verified'
                  AND expires_at>? AND aml_screening_delegated=1
-                 AND sanctions_screening_delegated=1""",
+                 AND sanctions_screening_delegated=1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM payment_provider_assessments newer
+                      WHERE newer.supersedes_id = payment_provider_assessments.id
+                 )""",
             (organization_id, direction, int(time.time())),
         ).fetchall()
         assessed_providers = {

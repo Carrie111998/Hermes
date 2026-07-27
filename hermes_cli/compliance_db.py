@@ -23,9 +23,15 @@ CREATE TABLE IF NOT EXISTS payment_provider_assessments (
     aml_screening_delegated INTEGER NOT NULL,
     sanctions_screening_delegated INTEGER NOT NULL,
     status TEXT NOT NULL, verified_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-    evidence_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL, supersedes_id TEXT, supersession_reason TEXT NOT NULL DEFAULT '',
     UNIQUE(organization_id, provider, direction, jurisdiction, verified_at)
 );
+CREATE TRIGGER IF NOT EXISTS payment_provider_assessments_immutable_update
+BEFORE UPDATE ON payment_provider_assessments
+BEGIN SELECT RAISE(ABORT, 'payment provider assessments are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS payment_provider_assessments_immutable_delete
+BEFORE DELETE ON payment_provider_assessments
+BEGIN SELECT RAISE(ABORT, 'payment provider assessments are immutable'); END;
 CREATE TABLE IF NOT EXISTS kya_events (
     id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, agent_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,
@@ -50,9 +56,60 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "SELECT 1 FROM sqlite_master WHERE type='index' "
             "AND name='idx_kya_sequence'"
         ).fetchone()
+        assessment_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(payment_provider_assessments)"
+            )
+        }
         if "sequence" in columns and index is not None:
+            if "supersedes_id" not in assessment_columns:
+                conn.execute(
+                    "ALTER TABLE payment_provider_assessments "
+                    "ADD COLUMN supersedes_id TEXT"
+                )
+            if "supersession_reason" not in assessment_columns:
+                conn.execute(
+                    "ALTER TABLE payment_provider_assessments ADD COLUMN "
+                    "supersession_reason TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS payment_provider_assessments_immutable_update
+                   BEFORE UPDATE ON payment_provider_assessments
+                   BEGIN SELECT RAISE(ABORT, 'payment provider assessments are immutable'); END;"""
+            )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS payment_provider_assessments_immutable_delete
+                   BEFORE DELETE ON payment_provider_assessments
+                   BEGIN SELECT RAISE(ABORT, 'payment provider assessments are immutable'); END;"""
+            )
             return
     conn.executescript(SCHEMA_SQL)
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(payment_provider_assessments)"
+        )
+    }
+    if "supersedes_id" not in columns:
+        conn.execute(
+            "ALTER TABLE payment_provider_assessments ADD COLUMN supersedes_id TEXT"
+        )
+    if "supersession_reason" not in columns:
+        conn.execute(
+            "ALTER TABLE payment_provider_assessments ADD COLUMN "
+            "supersession_reason TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS payment_provider_assessments_immutable_update
+           BEFORE UPDATE ON payment_provider_assessments
+           BEGIN SELECT RAISE(ABORT, 'payment provider assessments are immutable'); END;"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS payment_provider_assessments_immutable_delete
+           BEFORE DELETE ON payment_provider_assessments
+           BEGIN SELECT RAISE(ABORT, 'payment provider assessments are immutable'); END;"""
+    )
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(kya_events)")}
     if "sequence" not in columns:
         conn.execute("ALTER TABLE kya_events ADD COLUMN sequence INTEGER")
@@ -124,6 +181,8 @@ def verify_payment_provider(
     verified_at: int,
     expires_at: int,
     evidence: Any,
+    supersedes_id: Optional[str] = None,
+    supersession_reason: Optional[str] = None,
 ) -> str:
     if direction not in {"inbound", "outbound"}:
         raise ValueError("payment direction must be inbound or outbound")
@@ -145,19 +204,45 @@ def verify_payment_provider(
         raise ComplianceError("provider assessment requires current external evidence")
     assessment_id = f"assessment_{uuid.uuid4().hex}"
     ensure_schema(conn)
+    if supersedes_id:
+        prior = conn.execute(
+            """SELECT organization_id,provider,direction,jurisdiction
+               FROM payment_provider_assessments WHERE id=?""",
+            (supersedes_id,),
+        ).fetchone()
+        if (
+            prior is None
+            or str(prior["organization_id"]) != organization_id
+            or str(prior["provider"]) != provider
+            or str(prior["direction"]) != direction
+            or str(prior["jurisdiction"]) != jurisdiction
+        ):
+            raise ComplianceError(
+                "provider assessment supersession must reference the same scope"
+            )
+        if conn.execute(
+            "SELECT 1 FROM payment_provider_assessments WHERE supersedes_id=? LIMIT 1",
+            (supersedes_id,),
+        ).fetchone() is not None:
+            raise ComplianceError(
+                "provider assessment supersession must reference the current record"
+            )
+        if not str(supersession_reason or "").strip():
+            raise ComplianceError("provider assessment supersession requires a reason")
     with conn:
         conn.execute(
             """INSERT INTO payment_provider_assessments
                (id, organization_id, provider, direction, jurisdiction,
                 registry_authority, registry_reference, aml_screening_delegated,
                 sanctions_screening_delegated, status, verified_at, expires_at,
-                evidence_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?)""",
+                evidence_json, supersedes_id, supersession_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?, ?, ?)""",
             (
                 assessment_id, organization_id, provider, direction, jurisdiction,
                 registry_authority, registry_reference,
                 int(aml_screening_delegated), int(sanctions_screening_delegated),
                 verified_at, expires_at, json.dumps(evidence, sort_keys=True),
+                supersedes_id, str(supersession_reason or ""),
             ),
         )
     return assessment_id
@@ -183,6 +268,10 @@ def authorize_payment_provider(
            WHERE organization_id = ? AND provider = ? AND direction = ?
              AND jurisdiction IN (?, 'GLOBAL') AND status = 'verified'
              AND expires_at > ?
+             AND NOT EXISTS (
+                 SELECT 1 FROM payment_provider_assessments newer
+                  WHERE newer.supersedes_id = payment_provider_assessments.id
+             )
            ORDER BY CASE WHEN jurisdiction = ? THEN 0 ELSE 1 END, verified_at DESC
            LIMIT 1""",
         (

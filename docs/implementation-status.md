@@ -70,6 +70,9 @@ acceptance evidence.
 - Compliance applicability, obligations, and control evidence use explicit
   supersession lineage; attempts to branch from an old record are rejected,
   and ambiguous current leaves fail closed during action authorization.
+- Payment-provider assessments use the same append-only supersession model;
+  readiness excludes superseded records and provider authorization evaluates
+  only the current screened assessment.
 - Security-readiness blocks now create deduplicated, organization-scoped
   advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.
