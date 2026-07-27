@@ -9,6 +9,8 @@
 - Evidence-based contractor/FTE decision and hierarchical profiles.
 - Treasury, budgets, reservations, double-entry accounting, fiscal periods,
   tax records, payment intents, and verification.
+- Immutable usage-event metering and exact-event metered invoicing with
+  idempotent allocation guards against duplicate billing.
 - Compliance inventory, obligations, deadlines, evidence, and audit export.
 - Authenticated external-event receipts with idempotent provenance and
   credential-redacted ingress envelopes.
@@ -42,6 +44,8 @@
   legal personhood for the agent.
 - Autonomous signing of contracts where law requires a human/legal principal.
 - Universal tax filing in every jurisdiction.
+- Automatic tax determination for metered usage without verified jurisdictional
+  rules (tax-bearing metered invoices remain blocked until configured).
 - PCI DSS, SOC 2, SOX, GDPR, EU AI Act, CASL, CAN-SPAM, or other certification.
 - A published Charterforge installer, package release, container registry
   image, production deployment, or repository rename.

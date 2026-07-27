@@ -29,6 +29,9 @@ Hermes Agent history remains available in Git.
 
 ### Added
 
+- Immutable usage metering and governed metered-invoice actions. Prices are
+  captured when usage occurs; invoice actions reference exact event IDs and
+  immutable allocations prevent duplicate billing.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.

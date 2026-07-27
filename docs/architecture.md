@@ -49,3 +49,14 @@ worker restarts without reviving blocked or terminal objectives.
 
 The inherited `hermes_cli` package is a compatibility implementation detail.
 The public distribution, command, and new namespace are `charterforge`.
+# Metered revenue boundary
+
+Charterforge records billable usage as immutable, idempotent events. Each event
+stores the customer, metric, quantity, unit price, currency, and occurrence
+time; pricing is therefore fixed at capture rather than supplied later by a
+planner. A governed metered-invoice action may reference only an explicit set
+of unallocated event IDs. The runtime aggregates those events, creates a
+normal inbound payment intent, and atomically records immutable allocations so
+retries cannot bill an event twice. Provider read-back remains the independent
+completion check. Tax-bearing metered invoices are blocked unless a verified
+tax rule is supplied through the existing accounting controls.

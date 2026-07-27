@@ -1352,7 +1352,7 @@ def register_payment_adapters(
     authority_conn,
 ) -> None:
     """Expose governed inbound/outbound payment operations to the runtime."""
-    from hermes_cli import accounting_db, finance_db, organization_db, payments
+    from hermes_cli import accounting_db, finance_db, organization_db, payments, usage_billing
 
     ceo = organization_db.active_ceo(authority_conn)
     if ceo is None:
@@ -1457,6 +1457,52 @@ def register_payment_adapters(
             external_reference=intent["id"],
         )
 
+    def create_metered_invoice(payload: Mapping[str, Any]) -> ExecutionOutcome:
+        try:
+            customer = dict(payload["customer"])
+            customer_ref = str(payload["customer_ref"])
+            embedded_customer_ref = customer.get("customer_ref") or customer.get("id")
+            if embedded_customer_ref is not None and str(embedded_customer_ref) != customer_ref:
+                raise ValueError("customer_ref does not match the customer payload")
+            context = usage_billing.invoice_context(
+                authority_conn,
+                organization_id=organization_id,
+                customer_ref=customer_ref,
+                currency=currency,
+                event_ids=payload["usage_event_ids"],
+            )
+            intent = service.create_receivable(
+                organization_id=organization_id,
+                account_id=account_id,
+                provider=str(payload["provider"]),
+                amount_minor=int(context["amount_minor"]),
+                currency=str(context["currency"]),
+                customer=customer,
+                customer_jurisdiction=str(payload["customer_jurisdiction"]),
+                purpose=str(payload["purpose"]),
+                idempotency_key=str(payload["idempotency_key"]),
+                objective_id=str(payload["_governance_objective_id"]),
+            )
+            usage_billing.allocate_events(
+                authority_conn,
+                event_ids=context["event_ids"],
+                payment_intent_id=intent["id"],
+            )
+        except Exception as exc:
+            return ExecutionOutcome("failed", {"error": str(exc)})
+        return ExecutionOutcome(
+            "succeeded",
+            {
+                "payment_intent_id": intent["id"],
+                "status": intent["status"],
+                "payment_url": intent["payment_url"],
+                "amount_minor": context["amount_minor"],
+                "currency": context["currency"],
+                "usage_event_ids": context["event_ids"],
+            },
+            external_reference=intent["id"],
+        )
+
     def send_payment(payload: Mapping[str, Any]) -> ExecutionOutcome:
         try:
             merchant_category = str(payload["merchant_category"]).lower()
@@ -1556,7 +1602,7 @@ def register_payment_adapters(
                     facts={"intent_id": intent_id, "readback_recorded": False},
                 ),
             )
-        if action.action_type == "payments.create_invoice":
+        if action.action_type in {"payments.create_invoice", "payments.create_metered_invoice"}:
             passed = bool(row["provider_reference"] and intent["payment_url"])
         else:
             passed = row["status"] == "succeeded" and bool(row["provider_reference"])
@@ -1599,6 +1645,27 @@ def register_payment_adapters(
                 "tax_minor": int,
                 "tax_rule_id": str,
             },
+        ),
+        required_capability="payments.receive",
+        target_system="payments",
+        verification_method="payments.provider_readback",
+    )
+    executor.register(
+        "payments.create_metered_invoice",
+        create_metered_invoice,
+        contract=PayloadContract(
+            required={
+                "system": str,
+                "target_resource": str,
+                "idempotency_key": str,
+                "provider": str,
+                "customer": dict,
+                "customer_ref": str,
+                "customer_jurisdiction": str,
+                "usage_event_ids": list,
+                "purpose": str,
+            },
+            optional=COMMON_ACTION_FIELDS,
         ),
         required_capability="payments.receive",
         target_system="payments",
