@@ -193,7 +193,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`9836000c9a21a4f2c87f007e2c1547e66ea128c1` passed 6 Founder/CEO E2E tests, 48
+`bf5202b9bca5c2cb098bb9bc38d27342a91b2e4a` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -210,6 +210,9 @@ It also passed the approval-artifact regression: 9 tests.
 It also passed the company-email regression: 4 tests.
 It also passed the compute-reconciliation regression: 9 tests.
 The finance suite also passed the payment readback convergence regression: 21 tests.
+The broader current-main regression command across resource budgets, company
+email, approvals, operational control, hiring, portfolio, accounting,
+procurement, metered billing, and usage billing passed **76 tests, 0 failed**.
 Business-commitment fulfillment is organization-bound and passed its focused
 regression, including cross-tenant rejection.
 Tax filing and payment mutations are organization-bound and passed the

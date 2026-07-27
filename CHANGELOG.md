@@ -286,3 +286,5 @@ recorded.
   checks to plan creation and action proposals.
 - `9836000c9a21a4f2c87f007e2c1547e66ea128c1` — scoped employee identities at
   permit issuance before execution authority is minted.
+- `bf5202b9bca5c2cb098bb9bc38d27342a91b2e4a` — refreshed current-main release
+  evidence and semantic-release documentation posture.
