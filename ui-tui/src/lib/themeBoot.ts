@@ -36,8 +36,9 @@ interface BootThemeFile {
 
 // Profile-aware: the Python launcher exports CHARTERFORGE_HOME (set by
 // _apply_profile_override) before spawning the TUI. Falling back to
-// ~/.hermes matches get_hermes_home()'s default.
-const bootFilePath = () => join(process.env.CHARTERFORGE_HOME ?? join(homedir(), '.hermes'), 'tui-theme-boot.json')
+// ~/.charterforge is the canonical state root; legacy homes are migrated by the
+// Python launcher before the TUI starts.
+const bootFilePath = () => join(process.env.CHARTERFORGE_HOME ?? join(homedir(), '.charterforge'), 'tui-theme-boot.json')
 
 // Never touch the user's real ~/.hermes from test runs (the TS suite has no
 // CHARTERFORGE_HOME isolation fixture).

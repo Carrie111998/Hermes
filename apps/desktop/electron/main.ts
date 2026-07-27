@@ -463,12 +463,12 @@ if (INSTALL_STAMP) {
 // scripts/install.ps1's $CharterforgeHome and scripts/install.sh's $CHARTERFORGE_HOME.
 //
 // Defaults:
-//   Windows: %LOCALAPPDATA%\hermes (matches install.ps1)
-//   macOS / Linux: ~/.hermes (matches install.sh)
+//   Windows: %LOCALAPPDATA%\charterforge
+//   macOS / Linux: ~/.charterforge
 //
 // Special case for Windows: if the user has a legacy ~/.hermes directory
 // (e.g., from a prior pip install or a manual setup) AND no
-// %LOCALAPPDATA%\hermes yet, prefer the legacy path so we don't orphan their
+// %LOCALAPPDATA%\charterforge yet, prefer the legacy path so we don't orphan their
 // existing config / sessions / .env. New installs go to %LOCALAPPDATA%.
 //
 // CHARTERFORGE_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
@@ -498,7 +498,7 @@ function resolveCharterforgeHome() {
   }
 
   if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
+    const localappdata = path.join(process.env.LOCALAPPDATA, 'charterforge')
     const legacy = path.join(app.getPath('home'), '.hermes')
 
     // Migrate transparently to LOCALAPPDATA, but honour an existing legacy
@@ -510,7 +510,7 @@ function resolveCharterforgeHome() {
     return localappdata
   }
 
-  return path.join(app.getPath('home'), '.hermes')
+  return path.join(app.getPath('home'), '.charterforge')
 }
 
 const CHARTERFORGE_HOME = resolveCharterforgeHome()
@@ -899,12 +899,12 @@ app.setName(APP_NAME)
 // Windows toast notifications silently no-op unless an AppUserModelID is set:
 // `new Notification().show()` returns without error and nothing appears. The
 // AUMID must match the installed Start Menu shortcut's AUMID, which
-// electron-builder derives from the build `appId` (com.nousresearch.hermes) —
+// electron-builder derives from the build `appId` (com.charterforge.desktop) —
 // keep this string in sync with package.json `build.appId`. macOS/Linux don't
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId('com.charterforge.desktop')
 }
 
 // Seed the native About panel with the live Charterforge version. This is refreshed

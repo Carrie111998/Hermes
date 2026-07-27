@@ -482,10 +482,10 @@ def format_banner_version_label() -> str:
     ahead = int(state.get("ahead") or 0)
 
     if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
+        return f"{base} · base {upstream}"
 
     carried_word = "commit" if ahead == 1 else "commits"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
+    return f"{base} · base {upstream} · local {local} (+{ahead} carried {carried_word})"
 
 
 # =========================================================================

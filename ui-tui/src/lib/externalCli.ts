@@ -5,7 +5,7 @@ export interface LaunchResult {
   error?: string
 }
 
-const resolveCharterforgeBin = () => process.env.CHARTERFORGE_BIN?.trim() || 'hermes'
+const resolveCharterforgeBin = () => process.env.CHARTERFORGE_BIN?.trim() || 'charterforge'
 
 export const launchCharterforgeCommand = (args: string[]): Promise<LaunchResult> =>
   new Promise(resolve => {

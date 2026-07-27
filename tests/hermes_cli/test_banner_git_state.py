@@ -20,7 +20,7 @@ def test_format_banner_version_label_on_upstream_main():
     ):
         value = banner.format_banner_version_label()
 
-    assert value.endswith("· upstream b2f477a3")
+    assert value.endswith("· base b2f477a3")
     assert "local" not in value
 
 
@@ -34,7 +34,7 @@ def test_format_banner_version_label_with_carried_commits():
     ):
         value = banner.format_banner_version_label()
 
-    assert "upstream b2f477a3" in value
+    assert "base b2f477a3" in value
     assert "local af8aad31" in value
     assert "+3 carried commits" in value
 
