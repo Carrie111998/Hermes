@@ -2005,6 +2005,7 @@ def build_context_files_prompt(
     skip_soul: bool = False,
     context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False,
+    skip_project_context: bool = False,
 ) -> str:
     """Discover and load context files for the system prompt.
 
@@ -2015,6 +2016,11 @@ def build_context_files_prompt(
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
     SOUL.md from HERMES_HOME is independent and always included when present.
+
+    When *skip_project_context* is True, project-context files (HERMES.md,
+    AGENTS.md, CLAUDE.md, .cursorrules) are not loaded — only SOUL.md is
+    included. This is used to gate project context behind the coding_context
+    setting (#72268).
 
     Each context source is capped before injection. The cap defaults to the
     model's context window (scaled — see ``_dynamic_context_file_max_chars``)
@@ -2043,7 +2049,9 @@ def build_context_files_prompt(
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
     from agent.runtime_cwd import _is_install_tree
 
-    if (
+    if skip_project_context:
+        project_context = ""
+    elif (
         cwd_is_fallback
         and not allow_install_tree_fallback
         and _is_install_tree(cwd_path)
