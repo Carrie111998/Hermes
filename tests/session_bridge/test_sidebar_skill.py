@@ -471,6 +471,22 @@ def test_sidebar_skill_matches_the_native_read_thread_response_schema() -> None:
     assert "explicitly contradicts local native execution" in reconcile_step
 
 
+def test_sidebar_skill_reconciles_bound_task_after_saved_project_map_drift() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+    recovered_branch = reconcile_step.split("When `recovered_thread_id` is present", 1)[
+        1
+    ].split("Only when `recovered_thread_id` is absent", 1)[0]
+
+    assert "current saved-project membership is not identity authority" in (
+        recovered_branch
+    )
+    assert "job's exact source cwd" in recovered_branch
+    assert "chosen project's canonical path" in recovered_branch
+    assert "either" in recovered_branch
+    assert "never authorizes replacement creation" in recovered_branch
+
+
 def test_sidebar_skill_never_creates_after_an_unverifiable_search_candidate() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]

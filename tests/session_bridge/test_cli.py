@@ -878,6 +878,61 @@ def test_sidebar_retry_bound_requires_exact_authority_and_preserves_ids(
     assert "private/provider-detail" not in rendered
 
 
+def test_sidebar_retry_bound_accepts_exact_project_drift_conflict(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "b" * 64
+    source_session_id = "claude:1b04a5be-69ff-4c08-afa4-0a0e534cede6"
+    thread_id = "019fa02c-8d73-7a73-a04b-e838e26b88c2"
+    backend = FakeBackend(
+        sidebar_bound_retry_payload={
+            "status": "requeued",
+            "job_id": job_id,
+            "codex_thread_id": thread_id,
+            "error_code": "codex_thread_conflict",
+            "state": "sidebar_retry",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-retry-bound",
+                "--job-id",
+                job_id,
+                "--source-session-id",
+                source_session_id,
+                "--codex-thread-id",
+                thread_id,
+                "--expected-error-code",
+                "codex_thread_conflict",
+                "--confirm",
+                "PRESERVE_EXACT_BOUND_TASK",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    assert backend.calls == [
+        (
+            "sidebar_retry_bound",
+            job_id,
+            source_session_id,
+            thread_id,
+            "codex_thread_conflict",
+            "PRESERVE_EXACT_BOUND_TASK",
+        ),
+        ("close",),
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "requeued",
+        "job_id": job_id,
+        "codex_thread_id": thread_id,
+        "state": "sidebar_retry",
+    }
+
+
 @pytest.mark.parametrize(
     "argv",
     (
@@ -1389,6 +1444,39 @@ def test_production_sidebar_retry_bound_preserves_exact_task_and_is_single_use(
                 expected_error_code="native_task_not_indexed",
                 confirmation="PRESERVE_EXACT_BOUND_TASK",
             )
+    finally:
+        backend.close()
+
+
+def test_production_sidebar_retry_bound_accepts_exact_project_drift_conflict(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation = _production_bound_retry_backend(tmp_path)
+    source_session_id = failed["source_session_id"]
+    thread_id = failed["codex_thread_id"]
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("codex_thread_conflict", failed["id"]),
+        )
+    )
+    try:
+        result = backend.sidebar_retry_bound(
+            job_id=failed["id"],
+            source_session_id=source_session_id,
+            codex_thread_id=thread_id,
+            expected_error_code="codex_thread_conflict",
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+        )
+
+        assert result == {
+            "status": "requeued",
+            "job_id": failed["id"],
+            "codex_thread_id": thread_id,
+            "error_code": "codex_thread_conflict",
+            "state": SidebarJobState.RETRY.value,
+        }
+        assert store.get_sidebar_create_reservation(source_session_id) == reservation
     finally:
         backend.close()
 

@@ -1128,7 +1128,8 @@ class ProductionBackend:
             re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", codex_thread_id)
             is None
-            or expected_error_code != "native_task_not_indexed"
+            or expected_error_code
+            not in {"native_task_not_indexed", "codex_thread_conflict"}
             or confirmation != "PRESERVE_EXACT_BOUND_TASK"
         ):
             raise RolloutGateBlocked("sidebar_bound_retry_snapshot_mismatch")
@@ -1149,7 +1150,7 @@ class ProductionBackend:
             "status": "requeued",
             "job_id": result["id"],
             "codex_thread_id": result["codex_thread_id"],
-            "error_code": "native_task_not_indexed",
+            "error_code": expected_error_code,
             "state": result["state"],
         }
 
@@ -2898,7 +2899,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sidebar_retry_bound.add_argument(
         "--expected-error-code",
-        choices=("native_task_not_indexed",),
+        choices=("native_task_not_indexed", "codex_thread_conflict"),
         required=True,
     )
     sidebar_retry_bound.add_argument(
@@ -3969,7 +3970,8 @@ def _public_sidebar_bound_retry_result(raw: Mapping[str, Any]) -> dict[str, Any]
     if (
         status != "requeued"
         or state != SidebarJobState.RETRY.value
-        or raw.get("error_code") != "native_task_not_indexed"
+        or raw.get("error_code")
+        not in {"native_task_not_indexed", "codex_thread_conflict"}
         or not isinstance(job_id, str)
         or re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
         or not isinstance(thread_id, str)

@@ -9823,6 +9823,57 @@ def test_bound_sidebar_operator_retry_preserves_exact_task_and_reservation(db) -
     assert claimed["lease_token"] == "bound-retry-token-recovered"
 
 
+def test_bound_sidebar_operator_retry_accepts_exact_project_drift_conflict(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "bound-conflict-token",
+            "bound-conflict-recovered",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="bound-project-drift")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key="hermes-session-bridge-create-v1:bound-project-drift",
+        now=110.0,
+    )
+    thread_id = "019f-bound-project-drift"
+    store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=120.0,
+    )
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="codex_thread_conflict",
+        codex_thread_id=thread_id,
+        now=130.0,
+    )
+
+    retried = store.retry_failed_bound_sidebar_job(
+        job_id=failed["id"],
+        source_session_id=candidate.source_session_id,
+        codex_thread_id=thread_id,
+        expected_error_code="codex_thread_conflict",
+        confirmation="PRESERVE_EXACT_BOUND_TASK",
+        now=140.0,
+    )
+
+    assert retried["state"] == SidebarJobState.RETRY.value
+    assert retried["attempts"] == 0
+    assert retried["error_code"] is None
+    assert retried["codex_thread_id"] == thread_id
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) == (
+        reservation
+    )
+    claimed = store.claim_sidebar_jobs(now=140.0, limit=1)[0]
+    assert claimed["codex_thread_id"] == thread_id
+    assert claimed["lease_token"] == "bound-conflict-recovered"
+
+
 @pytest.mark.parametrize(
     ("argument", "replacement"),
     (

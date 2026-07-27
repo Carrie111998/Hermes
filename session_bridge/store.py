@@ -6839,7 +6839,8 @@ class SessionBridgeStore:
             "bound sidebar retry confirmation",
         )
         if (
-            error_code != "native_task_not_indexed"
+            error_code
+            not in {"native_task_not_indexed", "codex_thread_conflict"}
             or authority != "PRESERVE_EXACT_BOUND_TASK"
         ):
             raise ValueError("expected bound sidebar failure does not match")
