@@ -14,6 +14,15 @@ from hermes_cli import (
 from hermes_cli import objectives_db as db
 
 
+def test_commitment_schema_read_preserves_active_transaction(tmp_path):
+    conn = db.connect(tmp_path / "authority.db")
+    business_commitments.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    business_commitments.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def _context(tmp_path):
     conn = db.connect(tmp_path / "authority.db")
     organization_id, _ = organization_db.bootstrap_solo_founder(
