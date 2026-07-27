@@ -5,6 +5,7 @@ import socket
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -121,6 +122,12 @@ def test_unmanaged_dispatch_keeps_ff_only_git_behavior(tmp_path, monkeypatch):
     root.mkdir()
     (root / "plugin.yaml").write_text("name: legacy\n", encoding="utf-8")
     pull = Mock(return_value=(True, "Already up to date."))
+
+    @contextmanager
+    def stage(_name, _root):
+        yield None, "a" * 40
+
+    monkeypatch.setattr(managed, "stage_managed_update_candidate", stage)
     monkeypatch.setattr(plugins_cmd, "_git_pull_plugin_dir", pull)
     monkeypatch.setattr(plugins_cmd, "_copy_example_files", Mock())
 
@@ -133,7 +140,7 @@ def test_unmanaged_dispatch_keeps_ff_only_git_behavior(tmp_path, monkeypatch):
         "unchanged": True,
         "update_mode": "git",
     }
-    pull.assert_called_once_with(root)
+    pull.assert_called_once_with(root, "a" * 40)
 
 
 def test_dashboard_and_cli_share_managed_dispatch(tmp_path, monkeypatch, capsys):
@@ -394,22 +401,175 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _write_backend(root: Path, implementation: str, delay: float = 0) -> None:
+def _write_bootstrap_worker(root: Path, *, fail_after_cutover: bool = False) -> None:
+    (root / "update_process.py").write_text(
+        """
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+actual = Path(sys.argv[1]).resolve()
+if sys.argv[2] != "migrate":
+    raise SystemExit("legacy bootstrap did not use migrate")
+home = Path(os.environ["HERMES_HOME"])
+state_path = home / "t3code" / "service-state.json"
+prior = git(actual, "rev-parse", "HEAD")
+candidate = git(actual, "rev-parse", "@{upstream}^{commit}")
+# Model a real pre-managed install: the native runtime is present, but the
+# old integration never wrote service-state.json.  A migration must discover
+# and snapshot that runtime identity without mutating anything before
+# preflight, then establish canonical state as part of cutover/rollback.
+old_version = "1.0"
+if os.environ.get("TEST_HERMES_SOURCE_ROOT"):
+    sys.path.insert(0, os.environ["TEST_HERMES_SOURCE_ROOT"])
+from hermes_cli.managed_plugin_update import get_managed_update_contract
+
+contract = get_managed_update_contract("t3code")
+if contract is None:
+    raise SystemExit("missing bootstrap contract")
+contract.preflight(plugin_name="t3code", plugin_root=actual)
+try:
+    git(actual, "checkout", "--detach", candidate)
+    if FAIL_AFTER_CUTOVER:
+        raise RuntimeError("simulated activation failure")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "desired_state": "installed",
+                "product_source_commit": candidate,
+                "product_version": "2.0",
+            }
+        )
+    )
+    attestation = contract.complete(
+        plugin_name="t3code",
+        plugin_root=actual,
+        source_commit=candidate,
+        product_version="2.0",
+    )
+except Exception as error:
+    git(actual, "checkout", "--detach", prior)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "desired_state": "installed",
+                "product_source_commit": prior,
+                "product_version": old_version,
+            }
+        )
+    )
+    contract.rollback(
+        plugin_name="t3code",
+        plugin_root=actual,
+        source_commit=prior,
+        product_version=old_version,
+    )
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
+print(
+    json.dumps(
+        {
+            "ok": True,
+            "version": "2.0",
+            "source_commit": candidate,
+            "attestation": attestation,
+        }
+    )
+)
+""".replace("FAIL_AFTER_CUTOVER", repr(fail_after_cutover)),
+        encoding="utf-8",
+    )
+
+
+def _legacy_remote(
+    tmp_path: Path,
+    *,
+    fail_after_cutover: bool = False,
+    update_dependency: bool = False,
+) -> tuple[Path, Path, str, str]:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _write_backend(
+        seed, "old", delay=0.2, update_dependency=update_dependency
+    )
+    (seed / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
+    (seed / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": "t3code", "version": "1.0"}),
+        encoding="utf-8",
+    )
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "legacy")
+    prior = _git(seed, "rev-parse", "HEAD")
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(seed), str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    home = tmp_path / "home"
+    root = home / "plugins" / "t3code"
+    root.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "clone", str(remote), str(root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    _write_backend(seed, "new", update_dependency=update_dependency)
+    _write_managed_manifest(seed)
+    _write_bootstrap_worker(seed, fail_after_cutover=fail_after_cutover)
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "managed")
+    candidate = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "push", "-q", str(remote), "main")
+    return home, root, prior, candidate
+
+
+def _write_backend(
+    root: Path,
+    implementation: str,
+    delay: float = 0,
+    *,
+    name: str = "t3code",
+    update_dependency: bool = False,
+) -> None:
     dashboard = root / "dashboard"
     dashboard.mkdir(parents=True, exist_ok=True)
     (dashboard / "manifest.json").write_text(
         json.dumps(
             {
-                "name": "t3code",
+                "name": name,
                 "entry": "dist/index.js",
                 "api": "plugin_api.py",
             }
         ),
         encoding="utf-8",
     )
+    update_decorator = (
+        "@router.post('/update', dependencies=[Depends(require_update_auth)])\n"
+        if update_dependency
+        else "@router.post('/update')\n"
+    )
     (dashboard / "plugin_api.py").write_text(
         "import time\n"
-        "from fastapi import APIRouter\n"
+        "from fastapi import APIRouter, Depends, Header, HTTPException\n"
         "router = APIRouter()\n"
         f"IMPLEMENTATION = {implementation!r}\n"
         f"DELAY = {delay!r}\n"
@@ -417,7 +577,14 @@ def _write_backend(root: Path, implementation: str, delay: float = 0) -> None:
         "def identity():\n"
         "    value = IMPLEMENTATION\n"
         "    time.sleep(DELAY)\n"
-        "    return {'implementation': value}\n",
+        "    return {'implementation': value}\n"
+        "def require_update_auth(x_plugin_auth: str = Header(...)):\n"
+        "    if x_plugin_auth != 'allowed':\n"
+        "        raise HTTPException(status_code=403)\n"
+        + update_decorator
+        +
+        "def runtime_only_update():\n"
+        "    return {'runtime_only': IMPLEMENTATION}\n",
         encoding="utf-8",
     )
 
@@ -435,6 +602,411 @@ def _write_state(home: Path, source_commit: str, version: str) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def test_fetched_unmanaged_target_keeps_exact_ff_only_update(
+    tmp_path, monkeypatch
+):
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    from hermes_cli import web_server
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _write_backend(seed, "old", name="legacy")
+    (seed / ".gitignore").write_text("__pycache__/\n*.pyc\n")
+    (seed / "plugin.yaml").write_text("name: legacy\nversion: '1'\n")
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "one")
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(seed), str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    home = tmp_path / "home"
+    root = home / "plugins" / "legacy"
+    root.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "clone", str(remote), str(root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write_backend(seed, "new", name="legacy")
+    (seed / "plugin.yaml").write_text("name: legacy\nversion: '2'\n")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "two")
+    candidate = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "push", "-q", str(remote), "main")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["legacy"], "disabled": []}})
+    )
+    web_server._dashboard_plugins_cache = None
+    web_server._plugin_api_routes.clear()
+    web_server._plugin_api_modules.clear()
+    test_app = fastapi.FastAPI()
+    test_app.middleware("http")(web_server._managed_plugin_bootstrap_gate)
+    monkeypatch.setattr(web_server, "app", test_app)
+    web_server._mount_plugin_api_routes()
+    client = testclient.TestClient(test_app)
+
+    plugin_update = client.post("/api/plugins/legacy/update")
+    assert plugin_update.status_code == 200
+    assert plugin_update.json() == {"runtime_only": "old"}
+    assert _git(root, "rev-parse", "HEAD") != candidate
+
+    result = plugins_cmd._update_user_plugin("legacy", root)
+
+    assert result["update_mode"] == "git"
+    assert _git(root, "rev-parse", "HEAD") == candidate
+    assert managed.get_managed_update_spec(root, strict=True) is None
+
+
+def test_legacy_update_route_with_plugin_auth_is_not_intercepted(
+    tmp_path, monkeypatch
+):
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    from hermes_cli import web_server
+
+    home, root, prior_commit, _candidate_commit = _legacy_remote(
+        tmp_path, update_dependency=True
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["t3code"], "disabled": []}})
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    web_server._dashboard_plugins_cache = None
+    web_server._plugin_api_routes.clear()
+    web_server._plugin_api_modules.clear()
+    test_app = fastapi.FastAPI()
+    test_app.middleware("http")(web_server._managed_plugin_bootstrap_gate)
+    monkeypatch.setattr(web_server, "app", test_app)
+    web_server._mount_plugin_api_routes()
+    client = testclient.TestClient(test_app)
+
+    assert client.post("/api/plugins/t3code/update").status_code == 422
+    response = client.post(
+        "/api/plugins/t3code/update",
+        headers={"x-plugin-auth": "allowed"},
+    )
+    assert response.json() == {"runtime_only": "old"}
+    assert _git(root, "rev-parse", "HEAD") == prior_commit
+
+
+def test_legacy_managed_candidate_needs_host_before_source_cutover(
+    tmp_path, monkeypatch
+):
+    home, root, prior_commit, candidate_commit = _legacy_remote(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(
+        plugins_cmd.PluginOperationError,
+        match="coordinator is unavailable",
+    ):
+        plugins_cmd._update_user_plugin("t3code", root)
+
+    assert _git(root, "rev-parse", "HEAD") == prior_commit
+    assert _git(root, "rev-parse", "origin/main") == candidate_commit
+    assert managed.get_managed_update_spec(root, strict=True) is None
+
+
+def test_partial_multi_host_bootstrap_is_ungated_on_preflight_failure(
+    tmp_path, monkeypatch
+):
+    home, root, prior_commit, _candidate_commit = _legacy_remote(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    begun = Mock()
+    released = Mock()
+
+    with (
+        managed.ManagedUpdateCoordinator(
+            preflight=lambda _name, _root: None,
+            reload_backend=Mock(),
+            begin_bootstrap=begun,
+            release_bootstrap=released,
+        ),
+        managed.ManagedUpdateCoordinator(
+            preflight=Mock(side_effect=RuntimeError("host cannot remount")),
+            reload_backend=Mock(),
+        ),
+    ):
+        with pytest.raises(
+            plugins_cmd.PluginOperationError,
+            match="host cannot remount",
+        ):
+            plugins_cmd._update_user_plugin("t3code", root)
+
+    assert begun.call_count == released.call_count
+    assert _git(root, "rev-parse", "HEAD") == prior_commit
+
+
+@pytest.mark.live_system_guard_bypass
+def test_partial_multi_host_complete_rolls_every_host_back(
+    tmp_path, monkeypatch
+):
+    home, root, prior_commit, candidate_commit = _legacy_remote(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv(
+        "TEST_HERMES_SOURCE_ROOT",
+        str(Path(__file__).resolve().parents[2]),
+    )
+    instances = iter(("a" * 32, "b" * 32))
+    monkeypatch.setattr(
+        managed.secrets,
+        "token_hex",
+        lambda size: next(instances) if size == 16 else "c" * (size * 2),
+    )
+    calls_a: list[str] = []
+    calls_b: list[str] = []
+    released_a = Mock()
+    released_b = Mock()
+
+    def reload_a(_name, _root, source_commit, product_version):
+        calls_a.append(source_commit)
+        return {
+            "reloaded": True,
+            "loaded_source_commit": source_commit,
+            "loaded_product_version": product_version,
+        }
+
+    def reload_b(_name, _root, source_commit, product_version):
+        calls_b.append(source_commit)
+        if source_commit == candidate_commit:
+            raise RuntimeError("second host could not activate")
+        return {
+            "reloaded": True,
+            "loaded_source_commit": source_commit,
+            "loaded_product_version": product_version,
+        }
+
+    with (
+        managed.ManagedUpdateCoordinator(
+            preflight=lambda _name, _root: None,
+            reload_backend=reload_a,
+            release_bootstrap=released_a,
+        ),
+        managed.ManagedUpdateCoordinator(
+            preflight=lambda _name, _root: None,
+            reload_backend=reload_b,
+            release_bootstrap=released_b,
+        ),
+    ):
+        with pytest.raises(
+            plugins_cmd.PluginOperationError,
+            match="second host could not activate",
+        ):
+            plugins_cmd._update_user_plugin("t3code", root)
+
+    assert calls_a == [candidate_commit, prior_commit]
+    assert calls_b == [candidate_commit, prior_commit]
+    assert released_a.call_count == 1
+    assert released_b.call_count == 1
+    assert _git(root, "rev-parse", "HEAD") == prior_commit
+
+
+@pytest.mark.live_system_guard_bypass
+def test_partial_multi_host_finalize_is_retriable_without_product_rollback(
+    tmp_path, monkeypatch
+):
+    home, root, prior_commit, candidate_commit = _legacy_remote(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv(
+        "TEST_HERMES_SOURCE_ROOT",
+        str(Path(__file__).resolve().parents[2]),
+    )
+    instances = iter(("a" * 32, "b" * 32))
+    monkeypatch.setattr(
+        managed.secrets,
+        "token_hex",
+        lambda size: next(instances) if size == 16 else "c" * (size * 2),
+    )
+    released_a = Mock()
+    release_attempts = 0
+
+    def release_b(_name, _root):
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise RuntimeError("second host release failed")
+
+    def reload(_name, _root, source_commit, product_version):
+        return {
+            "reloaded": True,
+            "loaded_source_commit": source_commit,
+            "loaded_product_version": product_version,
+        }
+
+    with (
+        managed.ManagedUpdateCoordinator(
+            preflight=lambda _name, _root: None,
+            reload_backend=reload,
+            release_bootstrap=released_a,
+        ),
+        managed.ManagedUpdateCoordinator(
+            preflight=lambda _name, _root: None,
+            reload_backend=reload,
+            release_bootstrap=release_b,
+        ),
+    ):
+        with pytest.raises(
+            plugins_cmd.PluginOperationError,
+            match="second host release failed",
+        ):
+            plugins_cmd._update_user_plugin("t3code", root)
+
+        assert _git(root, "rev-parse", "HEAD") == candidate_commit
+        spec = managed.get_managed_update_spec(root, strict=True)
+        assert spec is not None
+        managed.finalize_managed_update_bootstrap(
+            "t3code",
+            root,
+            managed.ManagedUpdateCandidate(
+                source_commit=candidate_commit,
+                prior_commit=prior_commit,
+                staged_root=root,
+                spec=spec,
+            ),
+        )
+
+    assert released_a.call_count == 1
+    assert release_attempts == 2
+    assert _git(root, "rev-parse", "HEAD") == candidate_commit
+
+
+def test_bootstrap_allows_managed_release_behind_staged_tip(
+    tmp_path, monkeypatch
+):
+    home, root, prior_commit, release_commit = _legacy_remote(tmp_path)
+    seed = tmp_path / "seed"
+    (seed / "tip.txt").write_text("after release\n", encoding="utf-8")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "post-release tip")
+    tip_commit = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "push", "-q", str(tmp_path / "remote.git"), "main")
+    _git(root, "fetch", "-q")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def reload(_name, _root, source_commit, product_version):
+        return {
+            "reloaded": True,
+            "loaded_source_commit": source_commit,
+            "loaded_product_version": product_version,
+        }
+
+    payload = {
+        "plugin_name": "t3code",
+        "requested_plugin_name": "t3code",
+        "plugin_root": str(root),
+        "bootstrap_prior_commit": prior_commit,
+        "bootstrap_candidate_commit": tip_commit,
+        "bootstrap_contract": "t3code-hermes-v1",
+    }
+    with managed.ManagedUpdateCoordinator(
+        preflight=lambda _name, _root: None,
+        reload_backend=reload,
+    ) as coordinator:
+        coordinator._handle({**payload, "operation": "bootstrap_begin"})
+        _git(root, "checkout", "--detach", release_commit)
+        result = coordinator._handle(
+            {
+                **payload,
+                "operation": "complete",
+                "source_commit": release_commit,
+                "product_version": "2.0",
+            }
+        )
+
+    assert result["result"]["loaded_source_commit"] == release_commit
+
+
+@pytest.mark.parametrize("fail_after_cutover", [False, True])
+@pytest.mark.live_system_guard_bypass
+def test_legacy_checkout_bootstraps_or_rolls_back_as_one_product(
+    tmp_path, monkeypatch, request, fail_after_cutover
+):
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    from hermes_cli import web_server
+
+    home, root, prior_commit, candidate_commit = _legacy_remote(
+        tmp_path, fail_after_cutover=fail_after_cutover
+    )
+    state_path = home / "t3code" / "service-state.json"
+    assert not state_path.exists()
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["t3code"], "disabled": []}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv(
+        "TEST_HERMES_SOURCE_ROOT",
+        str(Path(__file__).resolve().parents[2]),
+    )
+    web_server._dashboard_plugins_cache = None
+    web_server._plugin_api_routes.clear()
+    web_server._plugin_api_modules.clear()
+    web_server._plugin_api_gated.clear()
+    web_server._plugin_api_active.clear()
+
+    test_app = fastapi.FastAPI()
+    test_app.middleware("http")(web_server._managed_plugin_bootstrap_gate)
+    monkeypatch.setattr(web_server, "app", test_app)
+    web_server._mount_plugin_api_routes()
+    assert web_server._has_mounted_plugin_backend() is True
+    client = testclient.TestClient(test_app)
+    assert client.get("/api/plugins/t3code/identity").json() == {
+        "implementation": "old"
+    }
+
+    coordinator = managed.ManagedUpdateCoordinator(
+        preflight=web_server._preflight_managed_plugin_reload,
+        reload_backend=web_server._reload_managed_plugin_backend,
+        begin_bootstrap=web_server._begin_managed_plugin_bootstrap,
+        release_bootstrap=web_server._release_managed_plugin_bootstrap,
+    )
+    request.addfinalizer(coordinator.close)
+
+    stale_response: dict[str, object] = {}
+    stale = threading.Thread(
+        target=lambda: stale_response.update(
+            client.get("/api/plugins/t3code/identity").json()
+        )
+    )
+    stale.start()
+    time.sleep(0.05)
+
+    if fail_after_cutover:
+        with pytest.raises(
+            plugins_cmd.PluginOperationError,
+            match="simulated activation failure",
+        ):
+            plugins_cmd._update_user_plugin("t3code", root)
+    else:
+        response = client.post("/api/plugins/t3code/update")
+        assert response.status_code == 200
+        result = response.json()
+        assert result["update_mode"] == "managed"
+        assert result["source_commit"] == candidate_commit
+
+    stale.join(timeout=2)
+    assert stale_response == {"implementation": "old"}
+    expected_commit = prior_commit if fail_after_cutover else candidate_commit
+    expected_version = "1.0" if fail_after_cutover else "2.0"
+    expected_implementation = "old" if fail_after_cutover else "new"
+    assert _git(root, "rev-parse", "HEAD") == expected_commit
+    assert web_server._managed_product_identity("t3code", root) == (
+        expected_commit,
+        expected_version,
+    )
+    assert client.get("/api/plugins/t3code/identity").json() == {
+        "implementation": expected_implementation
+    }
+    assert "t3code" not in web_server._plugin_api_gated
 
 
 def test_complete_and_rollback_swap_live_routes_with_exact_attestation(

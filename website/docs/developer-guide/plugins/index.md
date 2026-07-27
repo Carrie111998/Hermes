@@ -112,6 +112,19 @@ the plugin is unmanaged. The entrypoint owns the complete
 source/runtime/service transaction and must print one JSON object with
 `{"ok": true, ...}` only after coherent success.
 
+Hermes also handles the first migration from a legacy manifest. It fetches the
+configured upstream without changing the live worktree, requires the exact
+upstream commit to be a clean fast-forward with the same plugin identity,
+validates a supported managed declaration and regular-file entrypoint directly
+from that Git commit, and extracts regular files into a private staging
+directory. Only then does it gate and drain the old plugin API prefix and run
+the staged entrypoint against the actual installed root. A legacy plugin-owned
+`POST /api/plugins/<name>/update` with no plugin-specific FastAPI dependencies
+is routed through this same check, so an old runtime-only Update handler cannot
+bypass a newly available managed transaction. Routes with their own
+dependencies retain them and are not intercepted. If the fetched target is
+still unmanaged, its normal exact `git pull --ff-only` update remains unchanged.
+
 The `t3code-hermes-v1` worker imports
 `hermes_cli.managed_plugin_update.get_managed_update_contract("t3code")`.
 The returned synchronous object has `version == 1` and these methods:
@@ -132,9 +145,23 @@ contract.rollback(
 )
 ```
 
+During an authorized legacy migration, the factory returns the same v1 object
+even though the installed manifest is still unmanaged. The host authorization
+binds it to the prior commit, fetched candidate history, installed root, and
+contract. Rollback is restricted to the recorded prior commit; completion must
+select a managed commit within the validated fast-forward history, and the host
+derives and attests the loaded source and product version. A staged entrypoint must load
+its implementation from its own staged source while treating the supplied
+`plugin_root` argument as the installed checkout to mutate; Hermes invokes this
+case with the `migrate` operation instead of `update`. It must snapshot legacy
+installed runtime intent (including installations without coherent product
+metadata) so rollback restores and attests the prior running version, not an
+uninstalled state.
+
 `preflight` is mutation-free and fails unless a matching profile's dashboard
-or desktop backend host is running, the plugin is enabled, and its backend is mounted. Call it
-before fetch, checkout, runtime replacement, or service changes. `complete`
+or desktop backend host is running, the plugin is enabled, and its backend is
+mounted. Call it before the worker fetches releases, checks out source, replaces
+the runtime, or changes the service. `complete`
 and `rollback` return only after Hermes has imported fresh backend code,
 atomically replaced the plugin's prefixed routes, and independently attested
 the requested Git commit and product version. The product identity is read

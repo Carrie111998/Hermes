@@ -282,10 +282,19 @@ separate source-only Git update for that plugin.
 
 Managed Update requires a matching profile's dashboard or desktop backend host
 to be running with the plugin enabled and mounted. If it is unavailable, the
-CLI and dashboard fail before fetching or changing files and tell you to start
-or restart a backend host. A successful response means requests after the
-update are reaching the newly loaded backend implementation, not merely
+CLI and dashboard fail before source, runtime, or service cutover and tell you
+to start or restart a backend host. A successful response means requests after
+the update are reaching the newly loaded backend implementation, not merely
 rescanned metadata.
+
+This also applies to plugins installed before they adopted managed Update.
+Their next Update safely inspects and stages the fetched target first; if that
+target declares managed Update, Hermes migrates source, runtime, service, and
+mounted backend together without an intermediate source-only checkout. The
+legacy plugin tab's Update endpoint is redirected into the same transaction
+when that route does not declare additional plugin-specific dependencies.
+Local checkout changes or an unavailable backend host stop the migration before
+source cutover.
 
 ### Interactive UI
 

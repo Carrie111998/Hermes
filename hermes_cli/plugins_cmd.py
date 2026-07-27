@@ -66,6 +66,10 @@ class PluginOperationError(Exception):
     """Recoverable plugin install/update failure (CLI exits; HTTP maps to 4xx)."""
 
 
+class NoManagedUpdateCandidate(Exception):
+    """The fetched target remains an ordinary unmanaged plugin."""
+
+
 # Minimum manifest version this installer understands.
 # Plugins may declare ``manifest_version: 1`` in plugin.yaml;
 # future breaking changes to the manifest schema bump this.
@@ -1939,13 +1943,22 @@ def _user_installed_plugin_dir(name: str) -> Optional[Path]:
     return target if target.is_dir() else None
 
 
-def _update_user_plugin(name: str, target: Path) -> dict[str, Any]:
+def _update_user_plugin(
+    name: str,
+    target: Path,
+    *,
+    managed_candidate_only: bool = False,
+) -> dict[str, Any]:
     """Shared CLI/dashboard update dispatch with no managed-to-Git fallback."""
     from hermes_cli.managed_plugin_update import (
         ManagedPluginUpdateError,
+        abort_managed_update_bootstrap,
+        begin_managed_update_bootstrap,
+        finalize_managed_update_bootstrap,
         get_managed_update_spec,
         plugin_update_lock,
         run_managed_update,
+        stage_managed_update_candidate,
     )
 
     try:
@@ -1960,7 +1973,44 @@ def _update_user_plugin(name: str, target: Path) -> dict[str, Any]:
                     "update_mode": "managed",
                 }
 
-            ok, output = _git_pull_plugin_dir(target)
+            with stage_managed_update_candidate(name, target) as staged:
+                candidate, fetched_commit = staged
+                if candidate is not None:
+                    try:
+                        begin_managed_update_bootstrap(name, target, candidate)
+                        result = run_managed_update(
+                            name,
+                            target,
+                            candidate.spec,
+                            implementation_root=candidate.staged_root,
+                            bootstrap=candidate,
+                        )
+                    except ManagedPluginUpdateError as exc:
+                        try:
+                            abort_managed_update_bootstrap(
+                                name, target, candidate
+                            )
+                        except ManagedPluginUpdateError as abort_exc:
+                            raise ManagedPluginUpdateError(
+                                f"{exc}; bootstrap recovery: {abort_exc}"
+                            ) from exc
+                        raise
+                    # The product transaction is coherent now. Finalization
+                    # only releases host route gates; it must not trigger a
+                    # product rollback if one host needs a retry.
+                    finalize_managed_update_bootstrap(name, target, candidate)
+                    return {
+                        **result,
+                        "ok": True,
+                        "name": name,
+                        "update_mode": "managed",
+                    }
+
+            if managed_candidate_only:
+                raise NoManagedUpdateCandidate
+            # Advance only to the source we classified as unmanaged.  The
+            # remote may move to a managed commit after inspection.
+            ok, output = _git_pull_plugin_dir(target, fetched_commit)
             if not ok:
                 raise PluginOperationError(output)
             _clear_plugin_bytecode(target)
@@ -2024,13 +2074,18 @@ def _clear_plugin_bytecode(target: Path) -> int:
     return removed
 
 
-def _git_pull_plugin_dir(target: Path) -> tuple[bool, str]:
+def _git_pull_plugin_dir(
+    target: Path, commit: str | None = None
+) -> tuple[bool, str]:
     git_exe = _resolve_git_executable()
     if not git_exe:
         return False, "git is not installed or not in PATH."
+    command = [git_exe, "pull", "--ff-only"]
+    if commit is not None:
+        command.extend([".", commit])
     try:
         result = subprocess.run(
-            [git_exe, "pull", "--ff-only"],
+            command,
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=60,

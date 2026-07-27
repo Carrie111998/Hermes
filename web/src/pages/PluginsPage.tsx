@@ -1015,20 +1015,18 @@ function PluginRowCard(props: PluginRowCardProps) {
                 size="sm"
                 onClick={() => {
                   void setRuntimeLoading(row.name, async () => {
-                    await api.updateAgentPlugin(row.name);
+                    const result = await api.updateAgentPlugin(row.name);
                     showToast(
-                      row.update_mode === "managed"
+                      result.update_mode === "managed"
                         ? (t.pluginsPage.managedUpdated ?? "Product updated")
-                        : t.pluginsPage.updateGit,
+                        : (t.pluginsPage.pluginUpdated ?? "Plugin updated"),
                       "success",
                     );
                   });
                 }}
               >
                 {busy ? <Spinner /> : null}
-                {row.update_mode === "managed"
-                  ? (t.pluginsPage.updateManaged ?? "Update")
-                  : t.pluginsPage.updateGit}
+                {t.pluginsPage.updateManaged ?? "Update"}
               </Button>
             ) : null}
 

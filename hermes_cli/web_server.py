@@ -282,6 +282,107 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
+_plugin_api_gate_condition = threading.Condition()
+_plugin_api_gated: set[str] = set()
+_plugin_api_active: Dict[str, int] = {}
+
+
+def _legacy_update_route_has_no_dependencies(
+    request: Request, plugin_name: str
+) -> bool:
+    """Only bridge a legacy update route whose mounted route adds no auth.
+
+    Dashboard authentication still runs outside this middleware.  A plugin
+    route with its own FastAPI dependencies must execute normally; bypassing
+    those dependencies to bootstrap an update would weaken plugin auth.
+    """
+    path = f"/api/plugins/{plugin_name}/update"
+    mounted = _plugin_api_routes.get(plugin_name, ())
+    for included in mounted:
+        original_router = getattr(included, "original_router", None)
+        if original_router is not None:
+            include_context = getattr(included, "include_context", None)
+            prefix = getattr(include_context, "prefix", "")
+            include_dependencies = getattr(
+                include_context, "dependencies", ()
+            )
+            routes = getattr(original_router, "routes", ())
+        else:
+            prefix = ""
+            include_dependencies = ()
+            routes = (included,)
+        for route in routes:
+            route_path = f"{prefix}{getattr(route, 'path', '')}"
+            dependant = getattr(route, "dependant", None)
+            if (
+                route_path == path
+                and "POST" in (getattr(route, "methods", None) or ())
+            ):
+                return not bool(
+                    include_dependencies
+                    or getattr(dependant, "dependencies", ())
+                )
+    return False
+
+
+@app.middleware("http")
+async def _managed_plugin_bootstrap_gate(request: Request, call_next):
+    """Drain and block a legacy plugin prefix during managed bootstrap."""
+    parts = request.url.path.split("/")
+    plugin_name = (
+        parts[3]
+        if len(parts) > 3 and parts[1:3] == ["api", "plugins"]
+        else None
+    )
+    if plugin_name is None:
+        return await call_next(request)
+    if (
+        request.method == "POST"
+        and len(parts) == 5
+        and parts[4] == "update"
+        and _legacy_update_route_has_no_dependencies(request, plugin_name)
+    ):
+        from hermes_cli.plugins_cmd import (
+            NoManagedUpdateCandidate,
+            PluginOperationError,
+            _update_user_plugin,
+            _user_installed_plugin_dir,
+        )
+
+        plugin_root = _user_installed_plugin_dir(plugin_name)
+        if plugin_root is not None and (plugin_root / ".git").is_dir():
+            try:
+                result = await run_in_threadpool(
+                    _update_user_plugin,
+                    plugin_name,
+                    plugin_root,
+                    managed_candidate_only=True,
+                )
+            except NoManagedUpdateCandidate:
+                pass
+            except PluginOperationError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=400)
+            else:
+                _get_dashboard_plugins(force_rescan=True)
+                return JSONResponse(result)
+    with _plugin_api_gate_condition:
+        if plugin_name in _plugin_api_gated:
+            return JSONResponse(
+                {"detail": "Plugin Update is in progress."}, status_code=503
+            )
+        _plugin_api_active[plugin_name] = _plugin_api_active.get(plugin_name, 0) + 1
+    try:
+        return await call_next(request)
+    finally:
+        with _plugin_api_gate_condition:
+            remaining = _plugin_api_active.get(plugin_name, 1) - 1
+            if remaining:
+                _plugin_api_active[plugin_name] = remaining
+            else:
+                _plugin_api_active.pop(plugin_name, None)
+            _plugin_api_gate_condition.notify_all()
+
+
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
@@ -19968,17 +20069,29 @@ def _preflight_managed_plugin_reload(name: str, plugin_root: Path) -> None:
         )
 
 
-def _has_mounted_managed_plugin() -> bool:
-    from hermes_cli.managed_plugin_update import get_managed_update_spec
+def _begin_managed_plugin_bootstrap(name: str, _plugin_root: Path) -> None:
+    deadline = time.monotonic() + 55
+    with _plugin_api_gate_condition:
+        _plugin_api_gated.add(name)
+        while _plugin_api_active.get(name, 0):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _plugin_api_gated.discard(name)
+                _plugin_api_gate_condition.notify_all()
+                raise RuntimeError(
+                    f"Timed out draining legacy plugin '{name}' before Update."
+                )
+            _plugin_api_gate_condition.wait(timeout=remaining)
 
-    plugins_root = get_process_hermes_home() / "plugins"
-    for name in _plugin_api_routes:
-        try:
-            if get_managed_update_spec(plugins_root / name) is not None:
-                return True
-        except Exception:
-            continue
-    return False
+
+def _release_managed_plugin_bootstrap(name: str, _plugin_root: Path) -> None:
+    with _plugin_api_gate_condition:
+        _plugin_api_gated.discard(name)
+        _plugin_api_gate_condition.notify_all()
+
+
+def _has_mounted_plugin_backend() -> bool:
+    return bool(_plugin_api_routes)
 
 
 def _managed_product_identity(name: str, plugin_root: Path) -> tuple[str, str | None]:
@@ -20432,13 +20545,15 @@ def start_server(
                 return
 
             managed_update_coordinator = None
-            if _has_mounted_managed_plugin():
+            if _has_mounted_plugin_backend():
                 from hermes_cli.managed_plugin_update import ManagedUpdateCoordinator
 
                 try:
                     managed_update_coordinator = ManagedUpdateCoordinator(
                         preflight=_preflight_managed_plugin_reload,
                         reload_backend=_reload_managed_plugin_backend,
+                        begin_bootstrap=_begin_managed_plugin_bootstrap,
+                        release_bootstrap=_release_managed_plugin_bootstrap,
                     )
                 except Exception:
                     if server.started:

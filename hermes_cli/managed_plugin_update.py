@@ -8,10 +8,13 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -30,6 +33,14 @@ class ManagedPluginUpdateError(RuntimeError):
 class ManagedUpdateSpec:
     contract: str
     entrypoint: str
+
+
+@dataclass(frozen=True)
+class ManagedUpdateCandidate:
+    source_commit: str
+    prior_commit: str
+    staged_root: Path
+    spec: ManagedUpdateSpec
 
 
 def get_managed_update_spec(
@@ -117,9 +128,24 @@ def run_managed_update(
     plugin_name: str,
     plugin_root: Path,
     spec: ManagedUpdateSpec,
+    *,
+    implementation_root: Path | None = None,
+    bootstrap: ManagedUpdateCandidate | None = None,
 ) -> dict[str, Any]:
     """Run the plugin-owned product transaction in its declared isolated worker."""
-    entrypoint = (plugin_root / spec.entrypoint).resolve()
+    worker_root = implementation_root or plugin_root
+    entrypoint = (worker_root / spec.entrypoint).resolve()
+    environment = os.environ.copy()
+    if bootstrap is not None:
+        environment[_BOOTSTRAP_ENV] = json.dumps(
+            {
+                "plugin_name": plugin_name,
+                "prior_commit": bootstrap.prior_commit,
+                "candidate_commit": bootstrap.source_commit,
+                "contract": spec.contract,
+            },
+            sort_keys=True,
+        )
     try:
         result = subprocess.run(
             [
@@ -127,9 +153,10 @@ def run_managed_update(
                 "-I",
                 str(entrypoint),
                 str(plugin_root.resolve()),
-                "update",
+                "migrate" if bootstrap is not None else "update",
             ],
             cwd=str(plugin_root),
+            env=environment,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -160,6 +187,208 @@ def run_managed_update(
     return payload
 
 
+def _git(
+    plugin_root: Path,
+    args: list[str],
+    *,
+    check: bool = True,
+    timeout: float = 60,
+) -> subprocess.CompletedProcess[str]:
+    git = shutil.which("git")
+    if not git:
+        raise ManagedPluginUpdateError("git is not installed or not in PATH.")
+    try:
+        result = subprocess.run(
+            [git, *args],
+            cwd=str(plugin_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ManagedPluginUpdateError(f"Could not run git: {_redact_error(exc)}") from exc
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ManagedPluginUpdateError(
+            _redact_error(detail) or f"git exited with status {result.returncode}."
+        )
+    return result
+
+
+def _candidate_spec_from_git(
+    plugin_name: str,
+    plugin_root: Path,
+    source_commit: str,
+) -> ManagedUpdateSpec | None:
+    manifest = _git(
+        plugin_root,
+        ["show", f"{source_commit}:plugin.yaml"],
+        check=False,
+    )
+    if manifest.returncode != 0:
+        return None
+    try:
+        import yaml
+
+        data = yaml.safe_load(manifest.stdout) or {}
+    except Exception as exc:
+        raise ManagedPluginUpdateError(
+            f"Could not read fetched plugin manifest: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ManagedPluginUpdateError("Fetched plugin manifest must be a mapping.")
+    update = data.get("update")
+    if not isinstance(update, dict) or update.get("mode") != "managed":
+        return None
+    if data.get("name") != plugin_name:
+        raise ManagedPluginUpdateError(
+            "Fetched managed plugin identity does not match the installed plugin."
+        )
+    contract = update.get("contract")
+    entrypoint = update.get("entrypoint")
+    if (
+        not isinstance(contract, str)
+        or contract not in _SUPPORTED_CONTRACTS
+        or not isinstance(entrypoint, str)
+        or not entrypoint.strip()
+    ):
+        raise ManagedPluginUpdateError(
+            "Fetched plugin does not declare a supported managed update contract."
+        )
+    candidate = Path(entrypoint)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ManagedPluginUpdateError(
+            "Fetched managed update entrypoint is not a safe relative path."
+        )
+    tree = _git(
+        plugin_root,
+        ["ls-tree", source_commit, "--", candidate.as_posix()],
+        check=False,
+    )
+    fields = tree.stdout.rstrip("\n").split(maxsplit=3)
+    if (
+        tree.returncode != 0
+        or len(fields) != 4
+        or fields[0] not in {"100644", "100755"}
+        or fields[1] != "blob"
+        or fields[3] != candidate.as_posix()
+    ):
+        raise ManagedPluginUpdateError(
+            "Fetched managed update entrypoint is not a regular Git file."
+        )
+    return ManagedUpdateSpec(contract=contract, entrypoint=entrypoint)
+
+
+def _extract_git_archive(plugin_root: Path, source_commit: str, destination: Path) -> None:
+    archive_path = destination.parent / "candidate.tar"
+    git = shutil.which("git")
+    if not git:
+        raise ManagedPluginUpdateError("git is not installed or not in PATH.")
+    try:
+        with archive_path.open("wb") as archive:
+            result = subprocess.run(
+                [git, "archive", "--format=tar", source_commit],
+                cwd=str(plugin_root),
+                stdout=archive,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                check=False,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ManagedPluginUpdateError(
+            f"Could not stage fetched plugin source: {_redact_error(exc)}"
+        ) from exc
+    if result.returncode != 0:
+        raise ManagedPluginUpdateError(
+            _redact_error(result.stderr.decode("utf-8", errors="replace"))
+            or "Could not archive fetched plugin source."
+        )
+    destination.mkdir(mode=0o700)
+    with tarfile.open(archive_path, "r:") as bundle:
+        for member in bundle:
+            target = (destination / member.name).resolve()
+            try:
+                target.relative_to(destination.resolve())
+            except ValueError as exc:
+                raise ManagedPluginUpdateError(
+                    "Fetched plugin archive contains an unsafe path."
+                ) from exc
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if member.issym() or member.islnk():
+                # Links are not needed to execute a regular declared entrypoint
+                # and omitting them avoids platform-specific escape semantics.
+                continue
+            if not member.isfile():
+                raise ManagedPluginUpdateError(
+                    "Fetched plugin archive contains a non-regular file."
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise ManagedPluginUpdateError(
+                    "Fetched plugin archive contains an unreadable file."
+                )
+            with source, target.open("xb") as output:
+                shutil.copyfileobj(source, output)
+
+
+@contextmanager
+def stage_managed_update_candidate(
+    plugin_name: str, plugin_root: Path
+):
+    """Fetch and privately stage an exact FF target when it becomes managed."""
+    prior_commit = _git(plugin_root, ["rev-parse", "HEAD"]).stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", prior_commit) is None:
+        raise ManagedPluginUpdateError("Could not identify installed plugin source.")
+    # Honor the checkout's configured submodule recursion, as legacy
+    # ``git pull --ff-only`` did, while separating inspection from cutover.
+    _git(plugin_root, ["fetch"])
+    candidate_commit = _git(
+        plugin_root, ["rev-parse", "@{upstream}^{commit}"]
+    ).stdout.strip()
+    spec = _candidate_spec_from_git(plugin_name, plugin_root, candidate_commit)
+    if spec is None:
+        yield None, candidate_commit
+        return
+    if _git(
+        plugin_root,
+        ["merge-base", "--is-ancestor", prior_commit, candidate_commit],
+        check=False,
+    ).returncode != 0:
+        raise ManagedPluginUpdateError(
+            "Fetched managed update is not a fast-forward of the installed plugin."
+        )
+    if _git(
+        plugin_root,
+        ["status", "--porcelain", "--untracked-files=all"],
+    ).stdout.strip():
+        raise ManagedPluginUpdateError(
+            "Plugin checkout has local changes; managed Update made no source cutover."
+        )
+    with tempfile.TemporaryDirectory(prefix="hermes-managed-update-") as temporary:
+        staged_root = Path(temporary) / "plugin"
+        _extract_git_archive(plugin_root, candidate_commit, staged_root)
+        staged_spec = get_managed_update_spec(staged_root, strict=True)
+        if staged_spec != spec:
+            raise ManagedPluginUpdateError(
+                "Staged managed plugin declaration changed during validation."
+            )
+        yield (
+            ManagedUpdateCandidate(
+                source_commit=candidate_commit,
+                prior_commit=prior_commit,
+                staged_root=staged_root,
+                spec=spec,
+            ),
+            candidate_commit,
+        )
+
+
 _RUNTIME_DIR = "runtime"
 _DESCRIPTOR_DIR = "managed-plugin-update-hosts"
 _SUPPORTED_CONTRACTS = {"t3code-hermes-v1"}
@@ -167,6 +396,7 @@ _CONNECT_TIMEOUT_SECONDS = 2.0
 _HANDSHAKE_TIMEOUT_SECONDS = 2.0
 _OPERATION_TIMEOUT_SECONDS = 60.0
 _MAX_MESSAGE_BYTES = 1024 * 1024
+_BOOTSTRAP_ENV = "HERMES_INTERNAL_MANAGED_UPDATE_BOOTSTRAP"
 
 
 def _runtime_dir(*, create: bool = False) -> Path:
@@ -358,15 +588,47 @@ def _ipc_call(payload: dict[str, Any]) -> dict[str, Any]:
     return first
 
 
+def _bootstrap_context(name: str) -> dict[str, str] | None:
+    raw = os.environ.get(_BOOTSTRAP_ENV)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("plugin_name") != name
+        or value.get("contract") not in _SUPPORTED_CONTRACTS
+        or re.fullmatch(r"[0-9a-f]{40}", str(value.get("prior_commit", ""))) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(value.get("candidate_commit", "")))
+        is None
+    ):
+        return None
+    return {
+        "bootstrap_prior_commit": str(value["prior_commit"]),
+        "bootstrap_candidate_commit": str(value["candidate_commit"]),
+        "bootstrap_contract": str(value["contract"]),
+    }
+
+
 class _ManagedUpdateContractV1:
     version = 1
 
-    def __init__(self, plugin_name: str):
+    def __init__(
+        self, plugin_name: str, bootstrap: dict[str, str] | None = None
+    ):
         self._plugin_name = plugin_name
+        self._bootstrap = bootstrap or {}
 
     def _call(self, operation: str, **payload: Any) -> dict[str, Any]:
         return _ipc_call(
-            {"operation": operation, "plugin_name": self._plugin_name, **payload}
+            {
+                "operation": operation,
+                "plugin_name": self._plugin_name,
+                **self._bootstrap,
+                **payload,
+            }
         )
 
     def preflight(self, *, plugin_name: str, plugin_root: Path) -> None:
@@ -413,6 +675,9 @@ def get_managed_update_contract(name: str) -> _ManagedUpdateContractV1 | None:
     """Return the synchronous host contract requested by managed workers."""
     if not isinstance(name, str) or not name or "/" in name or "\\" in name:
         return None
+    bootstrap = _bootstrap_context(name)
+    if bootstrap is not None:
+        return _ManagedUpdateContractV1(name, bootstrap)
     plugin_root = get_process_hermes_home() / "plugins" / name
     try:
         spec = get_managed_update_spec(plugin_root, strict=True)
@@ -421,6 +686,59 @@ def get_managed_update_contract(name: str) -> _ManagedUpdateContractV1 | None:
     if spec is None or spec.contract not in _SUPPORTED_CONTRACTS:
         return None
     return _ManagedUpdateContractV1(name)
+
+
+def begin_managed_update_bootstrap(
+    plugin_name: str,
+    plugin_root: Path,
+    candidate: ManagedUpdateCandidate,
+) -> None:
+    _ipc_call(
+        {
+            "operation": "bootstrap_begin",
+            "plugin_name": plugin_name,
+            "requested_plugin_name": plugin_name,
+            "plugin_root": str(plugin_root.resolve()),
+            "bootstrap_prior_commit": candidate.prior_commit,
+            "bootstrap_candidate_commit": candidate.source_commit,
+            "bootstrap_contract": candidate.spec.contract,
+        }
+    )
+
+
+def abort_managed_update_bootstrap(
+    plugin_name: str,
+    plugin_root: Path,
+    candidate: ManagedUpdateCandidate,
+) -> None:
+    _ipc_call(
+        {
+            "operation": "bootstrap_abort",
+            "plugin_name": plugin_name,
+            "requested_plugin_name": plugin_name,
+            "plugin_root": str(plugin_root.resolve()),
+            "bootstrap_prior_commit": candidate.prior_commit,
+            "bootstrap_candidate_commit": candidate.source_commit,
+            "bootstrap_contract": candidate.spec.contract,
+        }
+    )
+
+
+def finalize_managed_update_bootstrap(
+    plugin_name: str,
+    plugin_root: Path,
+    candidate: ManagedUpdateCandidate,
+) -> None:
+    payload = {
+        "plugin_name": plugin_name,
+        "requested_plugin_name": plugin_name,
+        "plugin_root": str(plugin_root.resolve()),
+        "bootstrap_prior_commit": candidate.prior_commit,
+        "bootstrap_candidate_commit": candidate.source_commit,
+        "bootstrap_contract": candidate.spec.contract,
+    }
+    _ipc_call({**payload, "operation": "bootstrap_prepare_finalize"})
+    _ipc_call({**payload, "operation": "bootstrap_finalize"})
 
 
 def _acquire_owner_lock(path: Path, *, contention_message: str) -> int:
@@ -474,6 +792,14 @@ def plugin_update_lock(plugin_root: Path):
         _release_owner_lock(fd)
 
 
+@dataclass
+class _BootstrapAuthorization:
+    prior_commit: str
+    candidate_commit: str
+    contract: str
+    phase: str = "begun"
+
+
 class ManagedUpdateCoordinator:
     """Authenticated local coordinator owned by the running dashboard host."""
 
@@ -482,9 +808,14 @@ class ManagedUpdateCoordinator:
         *,
         preflight: Callable[[str, Path], None],
         reload_backend: Callable[[str, Path, str, str | None], dict[str, Any]],
+        begin_bootstrap: Callable[[str, Path], None] | None = None,
+        release_bootstrap: Callable[[str, Path], None] | None = None,
     ):
         self._preflight = preflight
         self._reload_backend = reload_backend
+        self._begin_bootstrap = begin_bootstrap or (lambda _name, _root: None)
+        self._release_bootstrap = release_bootstrap or (lambda _name, _root: None)
+        self._bootstraps: dict[str, _BootstrapAuthorization] = {}
         self._operation_lock = threading.Lock()
         self._client_threads: set[threading.Thread] = set()
         self._client_threads_lock = threading.Lock()
@@ -610,23 +941,173 @@ class ManagedUpdateCoordinator:
             raise ManagedPluginUpdateError(
                 "Managed update request does not match the installed plugin root."
             )
-        spec = get_managed_update_spec(expected_root, strict=True)
-        if spec is None or spec.contract not in _SUPPORTED_CONTRACTS:
-            raise ManagedPluginUpdateError(
-                "The installed plugin does not declare a supported managed update."
-            )
         return name, expected_root
+
+    @staticmethod
+    def _requested_bootstrap(
+        request: dict[str, Any],
+    ) -> _BootstrapAuthorization | None:
+        prior = request.get("bootstrap_prior_commit")
+        candidate = request.get("bootstrap_candidate_commit")
+        contract = request.get("bootstrap_contract")
+        if prior is None and candidate is None and contract is None:
+            return None
+        if (
+            not isinstance(prior, str)
+            or re.fullmatch(r"[0-9a-f]{40}", prior) is None
+            or not isinstance(candidate, str)
+            or re.fullmatch(r"[0-9a-f]{40}", candidate) is None
+            or contract not in _SUPPORTED_CONTRACTS
+        ):
+            raise ManagedPluginUpdateError(
+                "Invalid managed update bootstrap identity."
+            )
+        return _BootstrapAuthorization(prior, candidate, str(contract))
+
+    def _validate_bootstrap_candidate(
+        self,
+        name: str,
+        root: Path,
+        authorization: _BootstrapAuthorization,
+    ) -> None:
+        head = _git(root, ["rev-parse", "HEAD"]).stdout.strip()
+        upstream = _git(root, ["rev-parse", "@{upstream}^{commit}"]).stdout.strip()
+        if (
+            head != authorization.prior_commit
+            or upstream != authorization.candidate_commit
+            or _git(
+                root,
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    authorization.prior_commit,
+                    authorization.candidate_commit,
+                ],
+                check=False,
+            ).returncode
+            != 0
+            or _git(
+                root,
+                ["status", "--porcelain", "--untracked-files=all"],
+            ).stdout.strip()
+        ):
+            raise ManagedPluginUpdateError(
+                "Managed update bootstrap no longer matches a clean fast-forward target."
+            )
+        spec = _candidate_spec_from_git(
+            name, root, authorization.candidate_commit
+        )
+        if spec is None or spec.contract != authorization.contract:
+            raise ManagedPluginUpdateError(
+                "Managed update bootstrap target is not authorized by its manifest."
+            )
+
+    def _matching_bootstrap(
+        self,
+        name: str,
+        request: dict[str, Any],
+    ) -> _BootstrapAuthorization | None:
+        requested = self._requested_bootstrap(request)
+        active = self._bootstraps.get(name)
+        if requested is None or active is None:
+            return None
+        if (
+            requested.prior_commit != active.prior_commit
+            or requested.candidate_commit != active.candidate_commit
+            or requested.contract != active.contract
+        ):
+            raise ManagedPluginUpdateError(
+                "Managed update bootstrap authorization does not match."
+            )
+        return active
 
     def _handle(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self._operation_lock.acquire(timeout=5):
             raise ManagedPluginUpdateError(
                 "Another managed plugin handoff is already in progress."
-            )
+        )
         try:
             name, root = self._validate_request(request)
             operation = request.get("operation")
+            requested_bootstrap = self._requested_bootstrap(request)
+            if operation == "bootstrap_begin":
+                if requested_bootstrap is None:
+                    raise ManagedPluginUpdateError(
+                        "Managed update bootstrap identity is required."
+                    )
+                existing = self._bootstraps.get(name)
+                if existing is not None:
+                    if existing != requested_bootstrap:
+                        raise ManagedPluginUpdateError(
+                            "Another managed update bootstrap is already active."
+                        )
+                    return {"ok": True, "result": {}}
+                if get_managed_update_spec(root, strict=True) is not None:
+                    raise ManagedPluginUpdateError(
+                        "Managed update bootstrap is only valid for a legacy plugin."
+                    )
+                self._validate_bootstrap_candidate(
+                    name, root, requested_bootstrap
+                )
+                self._preflight(name, root)
+                self._begin_bootstrap(name, root)
+                self._bootstraps[name] = requested_bootstrap
+                return {"ok": True, "result": {}}
+
+            active_bootstrap = self._matching_bootstrap(name, request)
+            if operation == "bootstrap_prepare_finalize":
+                if active_bootstrap is None:
+                    return {"ok": True, "result": {}}
+                if active_bootstrap.phase != "completed":
+                    raise ManagedPluginUpdateError(
+                        "Managed update bootstrap has not completed on this host."
+                    )
+                return {"ok": True, "result": {}}
+            if operation == "bootstrap_finalize":
+                if active_bootstrap is None:
+                    return {"ok": True, "result": {}}
+                if active_bootstrap.phase != "completed":
+                    raise ManagedPluginUpdateError(
+                        "Managed update bootstrap has not completed on this host."
+                    )
+                self._release_bootstrap(name, root)
+                self._bootstraps.pop(name, None)
+                return {"ok": True, "result": {}}
+            if operation == "bootstrap_abort":
+                if active_bootstrap is None:
+                    return {"ok": True, "result": {}}
+                if active_bootstrap.phase not in {
+                    "begun",
+                    "preflighted",
+                    "rolled_back",
+                }:
+                    raise ManagedPluginUpdateError(
+                        "Managed update recovery is incomplete; plugin routes remain gated."
+                    )
+                head = _git(root, ["rev-parse", "HEAD"]).stdout.strip()
+                dirty = _git(
+                    root, ["status", "--porcelain", "--untracked-files=all"]
+                ).stdout.strip()
+                if head != active_bootstrap.prior_commit or dirty:
+                    raise ManagedPluginUpdateError(
+                        "Managed update bootstrap could not safely restore the prior source."
+                    )
+                self._release_bootstrap(name, root)
+                self._bootstraps.pop(name, None)
+                return {"ok": True, "result": {}}
+
+            spec = get_managed_update_spec(root, strict=True)
+            supported_installed = (
+                spec is not None and spec.contract in _SUPPORTED_CONTRACTS
+            )
+            if not supported_installed and active_bootstrap is None:
+                raise ManagedPluginUpdateError(
+                    "The installed plugin does not declare a supported managed update."
+                )
             if operation == "preflight":
                 self._preflight(name, root)
+                if active_bootstrap is not None:
+                    active_bootstrap.phase = "preflighted"
                 return {"ok": True, "result": {}}
             if operation not in {"complete", "rollback"}:
                 raise ManagedPluginUpdateError("Invalid managed update operation.")
@@ -647,6 +1128,53 @@ class ManagedUpdateCoordinator:
                 raise ManagedPluginUpdateError(
                     "Invalid managed update target identity."
                 )
+            if active_bootstrap is not None:
+                if (
+                    operation == "rollback"
+                    and source_commit != active_bootstrap.prior_commit
+                ):
+                    raise ManagedPluginUpdateError(
+                        "Managed update bootstrap requested an unauthorized "
+                        "rollback source commit."
+                    )
+                if operation == "complete":
+                    within_validated_history = (
+                        _git(
+                            root,
+                            [
+                                "merge-base",
+                                "--is-ancestor",
+                                active_bootstrap.prior_commit,
+                                source_commit,
+                            ],
+                            check=False,
+                        ).returncode
+                        == 0
+                        and _git(
+                            root,
+                            [
+                                "merge-base",
+                                "--is-ancestor",
+                                source_commit,
+                                active_bootstrap.candidate_commit,
+                            ],
+                            check=False,
+                        ).returncode
+                        == 0
+                    )
+                    target_spec = _candidate_spec_from_git(
+                        name, root, source_commit
+                    )
+                    if (
+                        not within_validated_history
+                        or target_spec is None
+                        or target_spec.contract != active_bootstrap.contract
+                    ):
+                        raise ManagedPluginUpdateError(
+                            "Managed update bootstrap target is outside the "
+                            "validated managed fast-forward history."
+                        )
+                active_bootstrap.phase = "reloading"
             result = self._reload_backend(
                 name, root, source_commit, product_version
             )
@@ -657,6 +1185,10 @@ class ManagedUpdateCoordinator:
             ):
                 raise ManagedPluginUpdateError(
                     "The dashboard host could not attest the requested loaded product."
+                )
+            if active_bootstrap is not None:
+                active_bootstrap.phase = (
+                    "completed" if operation == "complete" else "rolled_back"
                 )
             return {"ok": True, "result": result}
         finally:
@@ -673,6 +1205,14 @@ class ManagedUpdateCoordinator:
             client_threads = list(self._client_threads)
         for thread in client_threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        for name in tuple(self._bootstraps):
+            try:
+                self._release_bootstrap(
+                    name, (get_process_hermes_home() / "plugins" / name).resolve()
+                )
+            except Exception:
+                pass
+        self._bootstraps.clear()
         try:
             self._descriptor_path.unlink()
         except OSError:

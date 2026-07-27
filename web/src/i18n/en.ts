@@ -401,6 +401,7 @@ export const en: Translations = {
     updateGit: "Git pull",
     updateManaged: "Update",
     managedUpdated: "Product updated",
+    pluginUpdated: "Plugin updated",
     versionBadge: "Version",
     showInSidebar: "Show in sidebar",
     hideFromSidebar: "Hide from sidebar",
