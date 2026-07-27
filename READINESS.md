@@ -343,6 +343,18 @@ settlement, accounting balance increase, and idempotent retry. It remains local
 non-custodial provider-adapter evidence, not live Stripe, bank, card, or
 stablecoin settlement proof.
 
+At current-main commit `7a8cccc640`, the same run included verified tax
+handling:
+
+```text
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}
+provider recovery acceptance: PASS
+```
+
+The deterministic accounting assertion recorded 500 minor units as revenue and
+30 as tax liability under the configured US-PA rule. This is accounting-path
+evidence, not a jurisdiction-wide tax determination or filing authorization.
+
 Image ID: `sha256:ee59306e2257eb3e2a4267d5146dfa996bba75d36a78d4a51a7b580d4875d278`.
 
 ## Release gates that remain open

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The provider recovery acceptance now includes a verified tax rule, proving a
+  tax-bearing inbound receipt splits revenue and tax liability correctly while
+  preserving idempotent settlement.
 - The unified current-tree acceptance now ends with a master autonomy stop,
   proving the worker exits in paused mode without producing another provider
   effect.
