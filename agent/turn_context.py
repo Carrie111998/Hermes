@@ -537,12 +537,6 @@ def build_turn_context(
     # Add the current user message after the prompt/session setup has made
     # close persistence safe. The handoff above preserves any marker already
     # stamped by an earlier close flush.
-    # Every message carries its own creation time (see turn_finalizer for the
-    # assistant path). setdefault rather than assignment: a CLI-staged dict is
-    # already stamped at staging, and a platform-supplied time is restored
-    # later by _apply_persist_user_message_override, which assigns directly and
-    # therefore still wins. This only fills the gap where nothing else did.
-    user_msg.setdefault("timestamp", time.time())
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
