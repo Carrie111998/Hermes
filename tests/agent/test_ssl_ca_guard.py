@@ -80,3 +80,90 @@ def test_skip_env_var_bypasses_guard(monkeypatch, tmp_path, value):
     monkeypatch.setenv("SSL_CERT_FILE", str(fake))
     verify_ca_bundle()
     verify_ca_bundle_with_fallback()
+
+
+# --- truststore / NotImplementedError handling --------------------------------
+# When the optional `truststore` extra injects the OS trust store, the
+# SSLContext returned by ssl.create_default_context() can raise
+# NotImplementedError from get_ca_certs() because the OS-backed context
+# doesn't expose CA enumeration (see truststore docs).  The guard must
+# NOT treat that as an empty-corrupt-bundle failure.
+
+
+def test_get_ca_certs_not_implemented_does_not_raise(monkeypatch, tmp_path):
+    """An SSLContext whose get_ca_certs() raises NotImplementedError must
+    be treated as a successfully loaded (but uninspectable) bundle, not as
+    an empty / corrupt one.  This is the truststore code path.
+    """
+    import ssl as _ssl
+
+    fake = tmp_path / "corporate-ca.pem"
+    # Minimal but real PEM so the file-size + create_default_context checks
+    # pass before we reach the get_ca_certs probe.
+    fake.write_text(
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBhTCCASugAwIBAgIRAOv5Nqg==\n"
+        "-----END CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SSL_CERT_FILE", str(fake))
+
+    real_create_default_context = _ssl.create_default_context
+
+    class _StubContext:
+        """Mimics truststore's context: load succeeds, enumeration fails."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_ca_certs(self):
+            raise NotImplementedError("truststore does not expose CA enumeration")
+
+    def _patched_create_default_context(*args, **kwargs):
+        # Only redirect when we're loading our fake bundle; let the certifi
+        # path (no cafile kwarg) go through to the real implementation.
+        if kwargs.get("cafile"):
+            return _StubContext()
+        return real_create_default_context(*args, **kwargs)
+
+    monkeypatch.setattr(_ssl, "create_default_context", _patched_create_default_context)
+
+    # Must NOT raise SSLConfigurationError despite get_ca_certs() blowing up.
+    verify_ca_bundle()
+
+
+def test_get_ca_certs_empty_list_still_raises(monkeypatch, tmp_path):
+    """A genuine empty-list return (not NotImplementedError) must still fail
+    so a truly corrupt bundle is caught.  Regression guard: the
+    NotImplementedError path must not silently swallow the real-empty case.
+    """
+    import ssl as _ssl
+
+    fake = tmp_path / "empty-but-valid.pem"
+    fake.write_text(
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBhTCCASugAwIBAgIRAOv5Nqg==\n"
+        "-----END CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SSL_CERT_FILE", str(fake))
+
+    real_create_default_context = _ssl.create_default_context
+
+    class _EmptyStubContext:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_ca_certs(self):
+            return []
+
+    def _patched_create_default_context(*args, **kwargs):
+        if kwargs.get("cafile"):
+            return _EmptyStubContext()
+        return real_create_default_context(*args, **kwargs)
+
+    monkeypatch.setattr(_ssl, "create_default_context", _patched_create_default_context)
+
+    with pytest.raises(SSLConfigurationError) as exc:
+        verify_ca_bundle()
+    assert "did not load any certificates" in str(exc.value)
