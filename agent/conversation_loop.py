@@ -259,6 +259,7 @@ def _nous_entitlement_message(capability: str) -> str:
         )
         return message or ""
     except Exception:
+        logger.debug("_nous_entitlement_message failed", exc_info=True)
         return ""
 
 
@@ -384,6 +385,7 @@ def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
             force=True,
         )
     except Exception:
+        logger.debug("_try_refresh_nous_client_credentials failed", exc_info=True)
         return False
 
 
@@ -1314,7 +1316,7 @@ def run_conversation(
                             blocks.append({"type": "text", "text": marker})
                             _sm["content"] = blocks
                         except Exception:
-                            pass
+                            logger.debug("Failed to inject steer into multimodal content blocks", exc_info=True)
                     _injected = True
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",
@@ -1617,6 +1619,7 @@ def run_conversation(
                             ),
                         }}
                     except Exception:
+                        logger.debug("Tool call argument normalization failed, falling back to repair", exc_info=True)
                         tc["function"]["arguments"] = _repair_tool_call_arguments(
                             tc["function"]["arguments"],
                             tc["function"].get("name", "?"),
@@ -1711,7 +1714,7 @@ def run_conversation(
             try:
                 agent.iteration_budget.refund()
             except Exception:
-                pass
+                logger.debug("iteration_budget.refund() failed", exc_info=True)
             break
 
         # Pre-API pressure check. The turn-prologue preflight only saw the
@@ -1981,7 +1984,7 @@ def run_conversation(
                 except ImportError:
                     pass
                 except Exception:
-                    pass  # Never let rate guard break the agent loop
+                    logger.debug("nous_rate_guard check failed (fail-open)", exc_info=True)  # Never let rate guard break the agent loop
 
             try:
                 agent._reset_stream_delivery_tracking()
@@ -2042,6 +2045,7 @@ def run_conversation(
                     _original_api_kwargs = _llm_request_mw.original_payload
                     _llm_middleware_trace = _llm_request_mw.trace
                 except Exception:
+                    logger.debug("LLM request middleware failed, using fallback", exc_info=True)
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
@@ -2100,7 +2104,7 @@ def run_conversation(
                             request=_request_payload,
                         )
                 except Exception:
-                    pass
+                    logger.debug("API request logging hook failed", exc_info=True)
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -3198,7 +3202,7 @@ def run_conversation(
                         from agent.nous_rate_guard import clear_nous_rate_limit
                         clear_nous_rate_limit()
                     except Exception:
-                        pass
+                        logger.debug("clear_nous_rate_limit failed", exc_info=True)
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
@@ -3430,7 +3434,7 @@ def run_conversation(
                                     getattr(api_error, "message", None) or
                                     str(api_error))
                 except Exception:
-                    pass
+                    logger.debug("Failed to extract API error body", exc_info=True)
                 _err_status = getattr(api_error, "status_code", None)
                 _IMAGE_REJECTION_PHRASES = (
                     "only 'text' content type is supported",
