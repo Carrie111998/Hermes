@@ -198,3 +198,42 @@ def test_auto_detected_route_carries_no_caveat():
         base_url="https://openrouter.ai/api/v1", override=None,
     )
     assert status["reason"] is None
+
+
+# ── Bedrock (H-17) ───────────────────────────────────────────────────────────
+
+def test_bedrock_reports_effort_as_not_sent_rather_than_dropping_it_silently():
+    """H-17: the bedrock_converse request builder has no reasoning parameter.
+
+    chat_completion_helpers passes model/messages/tools/max_tokens/region/
+    guardrail_config to the transport and nothing else, and the transport's
+    build_kwargs accepts no reasoning argument, so a configured effort never
+    reaches AWS. That drop is now REPORTED rather than silent.
+
+    Implementing real Bedrock passthrough (additionalModelRequestFields) is
+    deliberately NOT attempted here: it needs AWS credentials and per-model
+    capability data to verify, and inventing a provider parameter is exactly
+    the failure this module exists to prevent.
+    """
+    status = describe(
+        configured="high", supported=False, provider="bedrock",
+        model="anthropic.claude-3-7-sonnet",
+        base_url="bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    assert status["will_be_sent"] is False
+    assert status["effective_effort"] is None, "must not claim an effort AWS never receives"
+    assert status["reason"]
+
+
+def test_bedrock_builder_still_takes_no_reasoning_argument():
+    """Pin the gap so it is caught if upstream adds support and we can drop the
+    'not sent' reporting for this route."""
+    import inspect
+
+    from agent.transports.bedrock import BedrockConverseTransport
+
+    sig = inspect.signature(BedrockConverseTransport.build_kwargs)
+    assert "reasoning_config" not in sig.parameters, (
+        "bedrock build_kwargs now accepts reasoning_config — wire it through and "
+        "stop reporting this route as unsupported"
+    )

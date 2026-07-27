@@ -27,6 +27,12 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 
+# Turn-exit reasons that mean the turn CRASHED rather than finished.
+# Module-level because delegate_tool needs the same list: a crashed child still
+# produces a non-empty apology as its final_response, so anything deriving
+# success from "there is output" reports the crash as a completion.
+CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
+
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
@@ -206,8 +212,7 @@ def finalize_turn(
     # Guardrail halts are deliberately NOT included. That path is a bounded,
     # test-locked stop with its own reporting, and treating it as failure would
     # change documented behaviour rather than fix a defect.
-    _CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
-    crashed = str(_turn_exit_reason).startswith(_CRASH_EXIT_PREFIXES)
+    crashed = str(_turn_exit_reason).startswith(CRASH_EXIT_PREFIXES)
 
     completed = (
         final_response is not None

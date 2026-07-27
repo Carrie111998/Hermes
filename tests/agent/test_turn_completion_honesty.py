@@ -35,13 +35,12 @@ def _completed_for(exit_reason: str, *, failed: bool = False,
     source to stay bound to the implementation rather than to a copy of it.
     """
     src = inspect.getsource(turn_finalizer.finalize_turn)
-    assert "_CRASH_EXIT_PREFIXES" in src, (
+    assert "CRASH_EXIT_PREFIXES" in src, (
         "finalize_turn no longer excludes crash exits from completion"
     )
 
     normal_text_response = str(exit_reason).startswith("text_response(")
-    crash_prefixes = ("local_processing_error(", "error_near_max_iterations(")
-    crashed = str(exit_reason).startswith(crash_prefixes)
+    crashed = str(exit_reason).startswith(turn_finalizer.CRASH_EXIT_PREFIXES)
     return bool(
         final_response is not None
         and not failed
@@ -120,3 +119,48 @@ def test_completion_rule_lives_in_the_finalizer():
     src = inspect.getsource(turn_finalizer.finalize_turn)
     assert "crashed" in src
     assert "and not crashed" in src, "crash exclusion dropped from the completion rule"
+    assert isinstance(turn_finalizer.CRASH_EXIT_PREFIXES, tuple), (
+        "CRASH_EXIT_PREFIXES must stay module-level — delegate_tool imports it so "
+        "the parent classifies a crashed child the same way the turn does"
+    )
+
+
+# ── the parent must see the crash too ────────────────────────────────────────
+
+def test_delegate_tool_classifies_a_crashed_child_as_failed():
+    """Fixing finalize_turn alone was not enough (found by the peer session).
+
+    delegate_tool derived the child's status from "is there a summary?", and a
+    crashed child produces a non-empty apology as its final_response. So the
+    turn correctly said completed=False while the PARENT was still handed
+    status="completed" and carried on as though the delegated work was done.
+
+    Asserted structurally against the real source: reproducing the whole
+    delegate path needs a live child agent, and the property that matters is
+    that the crash check exists and precedes the summary check.
+    """
+    import inspect
+
+    import tools.delegate_tool as dt
+
+    src = inspect.getsource(dt)
+    assert "CRASH_EXIT_PREFIXES" in src, (
+        "delegate_tool no longer consults the crash exit reasons — a crashed "
+        "child is reported to the parent as completed again"
+    )
+    crash_at = src.index("_crashed = str(result.get(")
+    branch_at = src.index('elif _crashed:')
+    summary_at = src.index('elif summary and not _empty_sentinel:')
+    assert crash_at < branch_at < summary_at, (
+        "the crash branch must precede the summary branch, or an apology "
+        "summary still wins"
+    )
+
+
+def test_max_iterations_child_is_still_completed():
+    """Deliberate non-change: gating on `completed` wholesale would reclassify
+    a child that ran out of iterations but produced usable output as a failure.
+    Only the crash exit reasons are treated as failures."""
+    assert not str("max_iterations_reached(60)").startswith(
+        turn_finalizer.CRASH_EXIT_PREFIXES
+    )

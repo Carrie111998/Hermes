@@ -2146,8 +2146,26 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
+        # A crashed child is not a completed one. conversation_loop writes an
+        # apology into final_response on a crash exit, which is a non-empty
+        # summary and is not the "(empty)" sentinel — so deriving success from
+        # "there is output" reported the crash to the parent as
+        # status="completed", and the parent proceeded as though the delegated
+        # work was done. `completed` was already read above and then ignored.
+        #
+        # Keyed on the crash exit reasons specifically, NOT on `completed`:
+        # a child that hits max_iterations but produces usable output is
+        # deliberately still "completed", with exit_reason telling the parent
+        # how it ended. Gating on `completed` wholesale would silently reclassify
+        # those as failures.
+        from agent.turn_finalizer import CRASH_EXIT_PREFIXES
+
+        _crashed = str(result.get("turn_exit_reason") or "").startswith(CRASH_EXIT_PREFIXES)
+
         if interrupted:
             status = "interrupted"
+        elif _crashed:
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already

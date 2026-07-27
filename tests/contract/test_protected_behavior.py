@@ -345,8 +345,17 @@ def test_crash_exits_are_excluded_from_completion():
     from agent.turn_finalizer import finalize_turn
 
     src = inspect.getsource(finalize_turn)
-    assert "_CRASH_EXIT_PREFIXES" in src, "crash exits are completions again"
+    assert "CRASH_EXIT_PREFIXES" in src, "crash exits are completions again"
     assert "and not crashed" in src, "crash exclusion dropped from the completion rule"
+
+    # The parent must classify a crashed child the same way. Fixing only the
+    # finalizer left delegate_tool reporting status="completed" for a crash,
+    # because it derived success from "is there a summary?" and a crash
+    # produces a non-empty apology.
+    delegate_src = _read(REPO / "tools" / "delegate_tool.py")
+    assert "CRASH_EXIT_PREFIXES" in delegate_src, (
+        "delegate_tool reports a crashed child as completed again"
+    )
 
 
 # ── 14. delegation leases are durable and lifecycle-bound ────────────────────
