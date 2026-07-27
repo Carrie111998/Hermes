@@ -262,3 +262,5 @@ recorded.
   rows for actual provider-state changes.
 - `ac8b60da5ea510c6bcf6a4c68b73787d6c7cf0d9` — bound quarantined external-content release to the intervention
   organization, with cross-tenant release regression coverage.
+- `484634193b508c3fa735eab0dd3d8041e431ac84` — bound business-commitment
+  fulfillment to the organization executing the governed action.
