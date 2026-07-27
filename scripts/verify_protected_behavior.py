@@ -120,7 +120,7 @@ def _reintroduce_phantom_path(src: str) -> str:
 
 def _drop_steer_neutralization(src: str) -> str:
     return _sub(src,
-                "wrapped = _neutralize_steer_markers(_maybe_wrap_untrusted(name, content))",
+                "wrapped = _neutralize_forged_trust_markers(_maybe_wrap_untrusted(name, content))",
                 "wrapped = _maybe_wrap_untrusted(name, content)")
 
 

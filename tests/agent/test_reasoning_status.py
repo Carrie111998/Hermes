@@ -230,9 +230,9 @@ def test_bedrock_builder_still_takes_no_reasoning_argument():
     'not sent' reporting for this route."""
     import inspect
 
-    from agent.transports.bedrock import BedrockConverseTransport
+    from agent.transports.bedrock import BedrockTransport
 
-    sig = inspect.signature(BedrockConverseTransport.build_kwargs)
+    sig = inspect.signature(BedrockTransport.build_kwargs)
     assert "reasoning_config" not in sig.parameters, (
         "bedrock build_kwargs now accepts reasoning_config — wire it through and "
         "stop reporting this route as unsupported"
