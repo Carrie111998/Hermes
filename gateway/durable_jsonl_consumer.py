@@ -113,6 +113,10 @@ class MediaRetentionError(ConsumerError):
     """Retryable failure before a claimed event reaches the model."""
 
 
+class SourceEvidenceProjectionError(ConsumerError):
+    """Retryable failure binding claimed source rows before business writes."""
+
+
 class PermanentMediaRefusal(ConsumerError):
     """Terminal safety refusal that may reach the model as a refused attachment."""
 
@@ -2625,6 +2629,8 @@ async def _process_claimed_chat_batch(
     *,
     config_path: Path,
     state_db: Path,
+    case_db: Path,
+    source_before_image_dir: Path,
     gate_changed_at: str,
     runner: Any,
 ) -> None:
@@ -2646,6 +2652,30 @@ async def _process_claimed_chat_batch(
                 record,
                 config_path=config_path,
             )
+        # Systems validates business-write citations against bridge_message_log.
+        # Project the exact claimed source rows before Hermes can run the model
+        # and emit a business write.  The shared helper preserves the bounded
+        # backplay contract: message-id idempotency, identity verification, and
+        # a durable complete before-image.
+        projection_run_id = (
+            f"live-source-{records[0].seq}-{uuid.uuid4().hex[:12]}"
+        )
+        before_image_path = (
+            source_before_image_dir / f"{projection_run_id}.json"
+        )
+        try:
+            await asyncio.to_thread(
+                _inject_bounded_source_evidence,
+                case_db,
+                records,
+                before_image_path=before_image_path,
+                run_id=projection_run_id,
+                dry_run=False,
+            )
+        except Exception as exc:
+            raise SourceEvidenceProjectionError(
+                f"source-evidence-projection-held: {exc}"
+            ) from exc
         async with _management_typing_presence(
             records,
             config_path=config_path,
@@ -2685,6 +2715,9 @@ async def _process_claimed_chat_batch(
     except MediaRetentionError as exc:
         inbox.requeue(records, reason=f"media-retention-retry: {exc}")
         raise
+    except SourceEvidenceProjectionError as exc:
+        inbox.requeue(records, reason=f"source-evidence-projection-retry: {exc}")
+        raise
     except Exception as exc:
         inbox.finish(records, status="failed", error=str(exc))
         raise
@@ -2717,6 +2750,8 @@ async def run_consumer(args: argparse.Namespace) -> int:
     status_path = Path(args.status_file).resolve()
     gate_path = Path(args.processing_gate).resolve()
     state_db = Path(args.state_db).resolve()
+    case_db = Path(args.case_db).resolve()
+    source_before_image_dir = Path(args.source_before_image_dir).resolve()
     site_concurrency = max(1, int(getattr(args, "site_concurrency", 4)))
     chat_batch_size = max(1, int(getattr(args, "chat_batch_size", 25)))
     retention_batch_size = max(1, int(getattr(args, "retention_batch_size", 25)))
@@ -2727,6 +2762,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
         runner: Any | None = None
         tasks: dict[str, asyncio.Task[None]] = {}
         lanes: dict[str, str] = {}
+        source_projection_holds: dict[str, str] = {}
         try:
             while True:
                 done_chats = [chat_id for chat_id, task in tasks.items() if task.done()]
@@ -2735,12 +2771,20 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     lanes.pop(chat_id, None)
                     try:
                         await task
+                        source_projection_holds.pop(chat_id, None)
                     except MediaRetentionError as exc:
                         # This chat's claimed rows are already pending again.
                         # Keep the other chat lanes and the daemon alive; the
                         # durable status exposes the hold until a retry clears it.
                         print(
                             f"media retention HELD/PENDING: chat={chat_id} error={exc}",
+                            file=sys.stderr,
+                        )
+                    except SourceEvidenceProjectionError as exc:
+                        source_projection_holds[chat_id] = str(exc)
+                        print(
+                            "source evidence projection HELD/PENDING: "
+                            f"chat={chat_id} error={exc}",
                             file=sys.stderr,
                         )
 
@@ -2821,7 +2865,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     {
                         **retention_status,
                         "state": (
-                            "held-pending" if inbox.retention_last_error() else "running"
+                            "held-pending"
+                            if inbox.retention_last_error()
+                            or source_projection_holds
+                            else "running"
                         ),
                         "processing_enabled": True,
                         "config_enabled": True,
@@ -2836,6 +2883,12 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         "site_concurrency": site_concurrency,
                         "chat_batch_size": chat_batch_size,
                         "retention_batch_size": retention_batch_size,
+                        "source_projection_hold": (
+                            next(iter(source_projection_holds.values()), None)
+                        ),
+                        "source_projection_held_chats": sorted(
+                            source_projection_holds
+                        ),
                         "active_management_chats": sorted(
                             chat for chat, lane in lanes.items() if lane == "management"
                         ),
@@ -2889,7 +2942,11 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 management_batches, site_batches = inbox.pending_chat_batches(
                     batch_size=chat_batch_size,
                     priority_chats=priority_chats,
-                    exclude_chats=set(tasks),
+                    # A source-projection failure is an operator-visible hold,
+                    # not a 2-second retry loop against the same broken
+                    # binding.  Restarting the daemon re-arms pending rows
+                    # after the case-db/schema fault has been repaired.
+                    exclude_chats=set(tasks) | set(source_projection_holds),
                 )
                 gate_changed_at = str(gate.get("changed_at") or "")
                 active_site = sum(1 for lane in lanes.values() if lane == "site")
@@ -2911,6 +2968,8 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             state_db=state_db,
                             gate_changed_at=gate_changed_at,
                             runner=runner,
+                            case_db=case_db,
+                            source_before_image_dir=source_before_image_dir,
                         )
                     )
                     lanes[chat_id] = "management"
@@ -2925,23 +2984,35 @@ async def run_consumer(args: argparse.Namespace) -> int:
                                 state_db=state_db,
                                 gate_changed_at=gate_changed_at,
                                 runner=runner,
+                                case_db=case_db,
+                                source_before_image_dir=source_before_image_dir,
                             )
                         )
                         lanes[chat_id] = "site"
 
                 if args.once:
                     if tasks:
+                        task_items = list(tasks.items())
                         outcomes = await asyncio.gather(
-                            *tasks.values(), return_exceptions=True
+                            *(task for _, task in task_items), return_exceptions=True
                         )
-                        for outcome in outcomes:
+                        for (chat_id, _), outcome in zip(task_items, outcomes):
                             if isinstance(outcome, MediaRetentionError):
                                 print(
                                     f"media retention HELD/PENDING: {outcome}",
                                     file=sys.stderr,
                                 )
+                            elif isinstance(outcome, SourceEvidenceProjectionError):
+                                source_projection_holds[chat_id] = str(outcome)
+                                print(
+                                    "source evidence projection HELD/PENDING: "
+                                    f"chat={chat_id} error={outcome}",
+                                    file=sys.stderr,
+                                )
                             elif isinstance(outcome, BaseException):
                                 raise outcome
+                            else:
+                                source_projection_holds.pop(chat_id, None)
                         tasks.clear()
                         lanes.clear()
                     counts = inbox.counts()
@@ -2957,7 +3028,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                                 inbox, config_path, inspect_media=True
                             ),
                             "state": (
-                                "held-pending" if inbox.retention_last_error() else "running"
+                                "held-pending"
+                                if inbox.retention_last_error()
+                                or source_projection_holds
+                                else "running"
                             ),
                             "processing_enabled": True,
                             "config_enabled": True,
@@ -2972,6 +3046,12 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             "chat_batch_size": chat_batch_size,
                             "retention_batch_size": retention_batch_size,
                             "retention_cycle": retention_cycle,
+                            "source_projection_hold": (
+                                next(iter(source_projection_holds.values()), None)
+                            ),
+                            "source_projection_held_chats": sorted(
+                                source_projection_holds
+                            ),
                             "active_management_chats": [],
                             "active_site_chats": [],
                             "oldest_active_claim": inbox.oldest_processing_updated_at(),
@@ -2995,7 +3075,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             inbox, config_path, inspect_media=True
                         ),
                         "state": (
-                            "held-pending" if inbox.retention_last_error() else "running"
+                            "held-pending"
+                            if inbox.retention_last_error()
+                            or source_projection_holds
+                            else "running"
                         ),
                         "processing_enabled": True,
                         "config_enabled": True,
@@ -3010,6 +3093,12 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         "chat_batch_size": chat_batch_size,
                         "retention_batch_size": retention_batch_size,
                         "retention_cycle": retention_cycle,
+                        "source_projection_hold": (
+                            next(iter(source_projection_holds.values()), None)
+                        ),
+                        "source_projection_held_chats": sorted(
+                            source_projection_holds
+                        ),
                         "active_management_chats": sorted(
                             chat for chat, lane in lanes.items() if lane == "management"
                         ),
@@ -3275,7 +3364,9 @@ def _inject_bounded_source_evidence(
     only the selected source documents and records the complete pre-mutation image.
     Existing identical source refs are preserved; divergent identities fail closed.
     """
-    conn = sqlite3.connect(case_db)
+    if not case_db.is_file():
+        raise ConsumerError(f"case database is missing: {case_db}")
+    conn = sqlite3.connect(f"file:{case_db}?mode=rw", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         columns = [
@@ -3902,6 +3993,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--inbox", required=True)
     run.add_argument("--config", required=True)
     run.add_argument("--state-db", required=True)
+    run.add_argument("--case-db", required=True)
+    run.add_argument("--source-before-image-dir", required=True)
     run.add_argument("--processing-gate", required=True)
     run.add_argument("--lock-file", required=True)
     run.add_argument("--status-file", required=True)

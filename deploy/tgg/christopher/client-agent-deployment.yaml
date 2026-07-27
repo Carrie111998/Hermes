@@ -183,6 +183,10 @@ spec:
       consumer:
         implementation: gateway/durable_jsonl_consumer.py
         mode: durable-jsonl-tail
+        caseDbPath: /home/pclaw/.systems-pcl/data/tenants/tgg.db
+        sourceEvidenceBeforeImageDir: /home/pclaw/.hermes-christopher-tgg/runtime/source-evidence-before-images
+        sourceProjectionOrdering: exact-claimed-rows-before-hermes-model-and-business-writes
+        sourceProjectionFailure: business-row-pending-retry-without-daemon-death
         scheduler: per-chat-parallel
         siteConcurrency: 4
         chatBatchSize: 25

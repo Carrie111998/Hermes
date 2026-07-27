@@ -37,6 +37,37 @@ def _write_jsonl(path: Path, values: list[dict]) -> None:
     )
 
 
+def _write_case_db(path: Path) -> Path:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE bridge_message_log (
+          local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source TEXT NOT NULL,
+          source_ref TEXT NOT NULL UNIQUE,
+          chat_jid TEXT NOT NULL,
+          chat_name TEXT,
+          zone TEXT,
+          channel_type TEXT,
+          sender_id TEXT,
+          from_me INTEGER,
+          ts INTEGER,
+          sgt TEXT,
+          text TEXT,
+          message_kind TEXT,
+          has_media INTEGER,
+          media_refs TEXT,
+          quoted_text TEXT,
+          reply_to_source_ref TEXT,
+          raw_json TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
 def _png_bytes(payload: bytes = b"fixture") -> bytes:
     return b"\x89PNG\r\n\x1a\n" + payload
 
@@ -797,6 +828,8 @@ async def test_retention_failure_requeues_before_model(tmp_path, monkeypatch):
     with pytest.raises(consumer.MediaRetentionError, match="systems unavailable"):
         await consumer._process_claimed_chat_batch(
             inbox, records, config_path=config, state_db=tmp_path / "state.db",
+            case_db=_write_case_db(tmp_path / "case.db"),
+            source_before_image_dir=tmp_path / "source-before-images",
             gate_changed_at="2026-07-21T00:00:00+00:00", runner=object(),
         )
     assert model_called is False
@@ -810,6 +843,129 @@ async def test_retention_failure_requeues_before_model(tmp_path, monkeypatch):
         "retention_bypassed": 0,
         "retention_held": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_live_batch_projects_source_before_model_and_repeat_is_idempotent(
+    tmp_path, monkeypatch
+):
+    case_db = _write_case_db(tmp_path / "case.db")
+    before_image_dir = tmp_path / "source-before-images"
+    observed_counts: list[int] = []
+
+    async def model(records, **kwargs):
+        conn = sqlite3.connect(case_db)
+        try:
+            row = conn.execute(
+                "SELECT chat_jid,text FROM bridge_message_log WHERE source_ref=?",
+                (records[0].message_id,),
+            ).fetchone()
+            observed_counts.append(
+                conn.execute(
+                    "SELECT COUNT(*) FROM bridge_message_log WHERE source_ref=?",
+                    (records[0].message_id,),
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        assert row == ("test-group@g.us", "fixture message")
+        return {
+            "submitted_message_ids": [records[0].message_id],
+            "handled": [{
+                "message_ids": [records[0].message_id],
+                "turn_id": f"turn-{len(observed_counts)}",
+            }],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", model)
+    config = tmp_path / "config.yaml"
+    config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
+    for suffix in ("first", "repeat"):
+        inbox = consumer.DurableInbox(tmp_path / f"{suffix}-inbox.db")
+        source = tmp_path / f"{suffix}.jsonl"
+        _write_jsonl(source, [_message("SOURCE-1")])
+        cursor = tmp_path / f"{suffix}-cursor.json"
+        consumer.initialize_cursor(source, cursor, position="start")
+        inbox.stage_from_source(source, cursor)
+        records = inbox.pending(limit=1)
+        await consumer._process_claimed_chat_batch(
+            inbox,
+            records,
+            config_path=config,
+            state_db=tmp_path / f"{suffix}-state.db",
+            case_db=case_db,
+            source_before_image_dir=before_image_dir,
+            gate_changed_at="2026-07-21T00:00:00+00:00",
+            runner=object(),
+        )
+        assert inbox.counts() == {"completed": 1}
+
+    assert observed_counts == [1, 1]
+    before_images = sorted(before_image_dir.glob("*.json"))
+    assert len(before_images) == 2
+    images = [json.loads(path.read_text()) for path in before_images]
+    assert all(image["selected_message_ids"] == ["SOURCE-1"] for image in images)
+    assert sorted(len(image["existing_rows"]) for image in images) == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_live_projection_identity_divergence_holds_without_model(
+    tmp_path, monkeypatch
+):
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [_message("SOURCE-IDENTITY")])
+    cursor = tmp_path / "cursor.json"
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.pending(limit=1)[0]
+    divergent = consumer.InboxRecord(
+        record.seq,
+        record.message_id,
+        record.chat_id,
+        record.start_offset,
+        record.end_offset,
+        {**record.raw, "chatId": "other-chat@g.us"},
+    )
+    model_called = False
+
+    async def model(*args, **kwargs):
+        nonlocal model_called
+        model_called = True
+
+    monkeypatch.setattr(consumer, "process_live_records", model)
+    config = tmp_path / "config.yaml"
+    config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
+    with pytest.raises(
+        consumer.SourceEvidenceProjectionError,
+        match="identity diverges",
+    ):
+        await consumer._process_claimed_chat_batch(
+            inbox,
+            [divergent],
+            config_path=config,
+            state_db=tmp_path / "state.db",
+            case_db=_write_case_db(tmp_path / "case.db"),
+            source_before_image_dir=tmp_path / "source-before-images",
+            gate_changed_at="2026-07-21T00:00:00+00:00",
+            runner=object(),
+        )
+    assert model_called is False
+    assert inbox.counts() == {"pending": 1}
+    management, site = inbox.pending_chat_batches(
+        batch_size=25,
+        priority_chats=set(),
+        exclude_chats={record.chat_id},
+    )
+    assert management == []
+    assert site == []
+    conn = sqlite3.connect(tmp_path / "case.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM bridge_message_log").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert len(list((tmp_path / "source-before-images").glob("*.json"))) == 1
 
 
 def test_stage_is_durable_before_cursor_and_idempotent(tmp_path):
@@ -997,6 +1153,8 @@ def test_disabled_once_does_not_require_or_open_source(tmp_path):
         status_file=str(tmp_path / "status.json"),
         lock_file=str(tmp_path / "consumer.lock"),
         state_db=str(tmp_path / "state.db"),
+        case_db=str(tmp_path / "case.db"),
+        source_before_image_dir=str(tmp_path / "source-before-images"),
         processing_gate=str(gate),
         once=True,
         poll_seconds=0.01,
@@ -1037,7 +1195,9 @@ def test_disabled_retention_does_not_touch_media_root(tmp_path):
         config=str(config), source=str(tmp_path / "missing.jsonl"),
         cursor=str(tmp_path / "missing.cursor"), inbox=str(tmp_path / "inbox.db"),
         status_file=str(tmp_path / "status.json"), lock_file=str(tmp_path / "lock"),
-        state_db=str(tmp_path / "state.db"), processing_gate=str(gate), once=True,
+        state_db=str(tmp_path / "state.db"), case_db=str(tmp_path / "case.db"),
+        source_before_image_dir=str(tmp_path / "source-before-images"),
+        processing_gate=str(gate), once=True,
         poll_seconds=.01, max_records=10,
     )
     assert asyncio.run(consumer.run_consumer(args)) == 0
@@ -1088,6 +1248,8 @@ def test_root_gate_blocks_accidentally_enabled_config_without_opening_source(tmp
         status_file=str(tmp_path / "status.json"),
         lock_file=str(tmp_path / "consumer.lock"),
         state_db=str(tmp_path / "state.db"),
+        case_db=str(tmp_path / "case.db"),
+        source_before_image_dir=str(tmp_path / "source-before-images"),
         processing_gate=str(gate),
         once=True,
         poll_seconds=0.01,
@@ -1215,6 +1377,8 @@ def _enabled_consumer_args(tmp_path: Path, messages: list[dict]) -> argparse.Nam
         config=str(config), source=str(source), cursor=str(cursor),
         inbox=str(tmp_path / "inbox.db"), status_file=str(tmp_path / "status.json"),
         lock_file=str(tmp_path / "consumer.lock"), state_db=str(tmp_path / "state.db"),
+        case_db=str(_write_case_db(tmp_path / "case.db")),
+        source_before_image_dir=str(tmp_path / "source-before-images"),
         processing_gate=str(gate), once=True, poll_seconds=0.001, max_records=100,
         site_concurrency=4, chat_batch_size=25,
     )
@@ -1392,6 +1556,8 @@ async def test_cancelling_active_chat_requeues_without_double_processing(
     config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
     task = asyncio.create_task(consumer._process_claimed_chat_batch(
         inbox, records, config_path=config, state_db=tmp_path / "state.db",
+        case_db=_write_case_db(tmp_path / "case.db"),
+        source_before_image_dir=tmp_path / "source-before-images",
         gate_changed_at="2026-07-21T00:00:00+00:00", runner=object(),
     ))
     await entered.wait()

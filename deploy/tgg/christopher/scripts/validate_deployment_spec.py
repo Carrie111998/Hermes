@@ -372,6 +372,15 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("consumer unit does not declare the durable capture source")
     if spec["processing"]["gatePath"] not in consumer_unit:
         raise RuntimeError("consumer unit does not enforce the root processing gate")
+    consumer_spec = whatsapp["consumer"]
+    if (
+        f"--case-db {consumer_spec['caseDbPath']}" not in consumer_unit
+        or "--source-before-image-dir "
+        f"{consumer_spec['sourceEvidenceBeforeImageDir']}" not in consumer_unit
+    ):
+        raise RuntimeError(
+            "consumer unit does not explicitly bind source projection storage"
+        )
 
     manifest_path = _resolve(app_root, spec["deploy"]["manifestRef"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
