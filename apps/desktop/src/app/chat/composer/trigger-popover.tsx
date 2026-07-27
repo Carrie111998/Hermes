@@ -1,5 +1,5 @@
 import type { Unstable_TriggerItem } from '@assistant-ui/core'
-import { Fragment } from 'react'
+import { Fragment, useEffect, useRef } from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
@@ -69,11 +69,21 @@ export function ComposerTriggerPopover({
   const { t } = useI18n()
   const copy = t.composer
   const isSlash = kind === '/'
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Scroll the active item into view when keyboard navigation moves the highlight.
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    const el = container.querySelector('[data-highlighted]') as HTMLElement | null
+    el?.scrollIntoView({ block: 'nearest' })
+  }, [activeIndex])
 
   let lastGroup: string | undefined
 
   return (
     <div
+      ref={containerRef}
       className={placement === 'bottom' ? COMPLETION_DRAWER_BELOW_CLASS : COMPLETION_DRAWER_CLASS}
       data-slot="composer-completion-drawer"
       data-state="open"
