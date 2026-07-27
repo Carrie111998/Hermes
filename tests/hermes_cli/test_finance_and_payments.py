@@ -412,17 +412,17 @@ def test_business_accepts_payment_only_after_provider_readback(treasury):
            WHERE payment_intent_id=? ORDER BY observed_at,id""",
         (intent["id"],),
     ).fetchall()
-    assert len(readbacks) == 2
-    assert '"event_id": "evt_paid"' in readbacks[-1]["evidence_json"]
+    assert len(readbacks) == 1
+    assert '"event_id": "evt_paid"' in readbacks[0]["evidence_json"]
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         conn.execute(
             "UPDATE payment_provider_readbacks SET status='failed' WHERE id=?",
-            (readbacks[-1]["id"],),
+            (readbacks[0]["id"],),
         )
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         conn.execute(
             "DELETE FROM payment_provider_readbacks WHERE id=?",
-            (readbacks[-1]["id"],),
+            (readbacks[0]["id"],),
         )
 
 

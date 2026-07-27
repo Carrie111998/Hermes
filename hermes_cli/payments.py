@@ -483,20 +483,43 @@ class PaymentService:
         )
         remote = rail.get_payment(intent["provider_reference"])
         self._validate_remote(remote, intent["amount_minor"], intent["currency"])
-        readback_id = f"readback_{uuid.uuid4().hex}"
+        evidence_json = json.dumps(remote.evidence, sort_keys=True)
+        existing_readback = self.conn.execute(
+            """SELECT * FROM payment_provider_readbacks
+                WHERE payment_intent_id=? AND provider=?
+                  AND provider_reference=? AND status=? AND amount_minor=?
+                  AND currency=? AND evidence_json=?
+                ORDER BY observed_at DESC,id DESC LIMIT 1""",
+            (
+                intent_id,
+                intent["provider"],
+                remote.reference,
+                remote.status,
+                remote.amount_minor,
+                remote.currency.upper(),
+                evidence_json,
+            ),
+        ).fetchone()
+        readback_id = (
+            str(existing_readback["id"])
+            if existing_readback is not None
+            else f"readback_{uuid.uuid4().hex}"
+        )
         observed_at = int(time.time())
+        if existing_readback is None:
+            with self.conn:
+                self.conn.execute(
+                    """INSERT INTO payment_provider_readbacks
+                       (id,payment_intent_id,provider,provider_reference,status,
+                        amount_minor,currency,evidence_json,observed_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        readback_id, intent_id, intent["provider"], remote.reference,
+                        remote.status, remote.amount_minor, remote.currency.upper(),
+                        evidence_json, observed_at,
+                    ),
+                )
         with self.conn:
-            self.conn.execute(
-                """INSERT INTO payment_provider_readbacks
-                   (id,payment_intent_id,provider,provider_reference,status,
-                    amount_minor,currency,evidence_json,observed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (
-                    readback_id, intent_id, intent["provider"], remote.reference,
-                    remote.status, remote.amount_minor, remote.currency.upper(),
-                    json.dumps(remote.evidence, sort_keys=True), observed_at,
-                ),
-            )
             self.conn.execute(
                 "UPDATE payment_intents SET status = ?, updated_at = ? WHERE id = ?",
                 (remote.status, observed_at, intent_id),
