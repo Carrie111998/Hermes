@@ -272,3 +272,5 @@ recorded.
   validation to the organization executing the governed action.
 - `5175dfd8294fdeae725a7b800fa42ddd698d45f6` — made organization binding
   mandatory when consuming execution permits.
+- `70261890ea87714194914b3dd04bff8e0a73ef5b` — bound execution-result
+  recording to the organization executing the governed action.
