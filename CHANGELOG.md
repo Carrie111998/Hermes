@@ -264,3 +264,5 @@ recorded.
   organization, with cross-tenant release regression coverage.
 - `484634193b508c3fa735eab0dd3d8041e431ac84` — bound business-commitment
   fulfillment to the organization executing the governed action.
+- `8585dd47dd030f0ad225fc0ceab6093617008828` — bound tax filing and payment
+  mutations to the organization executing the governed accounting action.
