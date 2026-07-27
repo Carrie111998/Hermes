@@ -7327,6 +7327,93 @@ def test_strict_product_run_requires_canonical_runtime_identity(
             kb._stamp_run_executor_identity(conn, claimed)
 
 
+def test_strict_product_run_rejects_identity_that_cannot_be_persisted(
+    kanban_home, monkeypatch
+):
+    """A resolved identity is not enough when its active run has ended."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Governed identity persistence required",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        with kb.authorized_governance_write():
+            conn.execute(
+                "UPDATE board_governance "
+                "SET qualification_required=1 WHERE id=1"
+            )
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE id=?",
+            (int(time.time()), claimed.current_run_id),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worker_runtime_identity",
+            lambda _task: {
+                "profile": "developer",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+                "surface": "hermes-primary",
+                "source": "dispatcher",
+                "version": 1,
+            },
+        )
+
+        with pytest.raises(
+            kb.WorkerRuntimeIdentityError,
+            match="could not be persisted on the active run",
+        ):
+            kb._stamp_run_executor_identity(conn, claimed)
+
+
+@pytest.mark.parametrize("review", [False, True])
+def test_dispatch_records_runtime_identity_failure_and_blocks(
+    kanban_home, monkeypatch, review
+):
+    """Both polling loops turn identity errors into bounded spawn failures."""
+    import hermes_cli.profiles as profiles_module
+
+    monkeypatch.setattr(profiles_module, "profile_exists", lambda _name: True)
+
+    def fail_stamp(_conn, _task):
+        raise kb.WorkerRuntimeIdentityError("canonical identity unavailable")
+
+    monkeypatch.setattr(kb, "_stamp_run_executor_identity", fail_stamp)
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Dispatch identity failure",
+            assignee="reviewer" if review else "developer",
+            workflow_template_id="product",
+            current_step_key="review" if review else "development",
+        )
+        if review:
+            conn.execute(
+                "UPDATE tasks SET status='review' WHERE id=?",
+                (tid,),
+            )
+            conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert result.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.last_failure_error == "canonical identity unavailable"
+
+
 def test_product_human_block_routes_to_hermes_preflight_before_blocked(kanban_home):
     kb.create_board("prod", preset="product")
     with kb.connect(board="prod") as conn:

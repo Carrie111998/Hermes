@@ -16067,17 +16067,18 @@ def _stamp_run_executor_identity(
     """Persist trusted profile/provider/model/effort facts on the active run."""
     if task.current_run_id is None:
         return None
+    governance = conn.execute(
+        "SELECT qualification_required "
+        "FROM board_governance WHERE id=1"
+    ).fetchone()
+    governed_product = (
+        task.workflow_template_id == "product"
+        and governance is not None
+        and int(governance["qualification_required"]) == 1
+    )
     identity = _resolve_worker_runtime_identity(task)
     if identity is None:
-        governance = conn.execute(
-            "SELECT qualification_required "
-            "FROM board_governance WHERE id=1"
-        ).fetchone()
-        if (
-            task.workflow_template_id == "product"
-            and governance is not None
-            and int(governance["qualification_required"]) == 1
-        ):
+        if governed_product:
             raise WorkerRuntimeIdentityError(
                 "Governed product dispatch requires an explicit provider, "
                 "model, and effective effort for the selected worker profile."
@@ -16085,6 +16086,11 @@ def _stamp_run_executor_identity(
         return None
     run = get_run(conn, task.current_run_id)
     if run is None or run.ended_at is not None:
+        if governed_product:
+            raise WorkerRuntimeIdentityError(
+                "Governed product worker identity could not be persisted on "
+                "the active run."
+            )
         return None
     metadata = dict(run.metadata or {})
     metadata["executor"] = identity
@@ -16099,6 +16105,11 @@ def _stamp_run_executor_identity(
             ),
         )
         if updated.rowcount != 1:
+            if governed_product:
+                raise WorkerRuntimeIdentityError(
+                    "Governed product worker identity could not be persisted "
+                    "on the active run."
+                )
             return None
         _append_event(
             conn,
