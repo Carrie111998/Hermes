@@ -252,6 +252,7 @@ def _read_regular(
     expected_uid: int,
     expected_gid: int | None = None,
     allowed_modes: frozenset[int],
+    allow_empty: bool = False,
 ) -> bytes:
     descriptor: int | None = None
     try:
@@ -269,7 +270,7 @@ def _read_regular(
             or expected_gid is not None
             and opened.st_gid != expected_gid
             or stat.S_IMODE(opened.st_mode) not in allowed_modes
-            or opened.st_size < 1
+            or (not allow_empty and opened.st_size < 1)
             or opened.st_size > maximum
         ):
             raise OwnerGateStage0Error("owner_gate_stage0_file_invalid")

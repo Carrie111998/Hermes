@@ -507,6 +507,7 @@ def _seal_release(staging_or_release: Path, *, revision: str) -> Mapping[str, An
                 maximum=MAX_FILE_BYTES,
                 expected_uid=0,
                 allowed_modes=frozenset({mode}),
+                allow_empty=True,
             )
             projection.append({
                 "path": relative,
