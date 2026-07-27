@@ -147,6 +147,44 @@ def test_ordinary_developer_worker_hides_resolver_memory_tools(monkeypatch, tmp_
     assert "kanban_agent_memory_write" not in names
 
 
+@pytest.mark.parametrize(
+    ("profile", "capability_set"),
+    [
+        ("productowner", "product-owner"),
+        ("reviewer", "reviewer"),
+    ],
+)
+def test_task_scoped_claude_roles_expose_both_agent_memory_tools(
+    monkeypatch, tmp_path, profile, capability_set
+):
+    """The MCP schema must expose the same recall/write pair as its capability set."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_claude")
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_MCP_CAPABILITY_SET", capability_set)
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "claude-cli")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    names = {
+        item["function"]["name"]
+        for item in get_tool_definitions(
+            enabled_toolsets=["kanban"],
+            quiet_mode=True,
+        )
+        if item.get("type") == "function"
+    }
+    assert {
+        "kanban_agent_memory_recall",
+        "kanban_agent_memory_write",
+    } <= names
+
+
 def test_review_target_is_visible_only_to_task_scoped_reviewer(
     monkeypatch, tmp_path,
 ):

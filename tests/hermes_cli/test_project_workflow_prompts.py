@@ -13,13 +13,14 @@ def assert_engineering_operating_rules(prompt: str):
     assert "updated main" in prompt
     assert "dedicated branch" in prompt
     assert "separate git worktree" in prompt
-    assert "local coding-agent delegation" in prompt
-    assert "Claude Code and Codex" in prompt
-    assert "parallel agents" in prompt
-    assert "different AI reviewer" in prompt
-    assert "reviewer self-reports remain advisory" in prompt
-    assert "Hermes must inspect the diff" in prompt
-    assert "tests/lints/builds" in prompt
+    assert "selected Developer profile model directly implements" in prompt
+    assert "Native subagents" in prompt
+    assert "writer and reviewer providers separate" in prompt
+    assert "Tester and Reviewer own" in prompt
+    assert "independent evidence/verdicts" in prompt
+    assert "Hermes kernel gates validate" in prompt
+    assert "Test/Review evidence" in prompt
+    assert "green" in prompt
     assert "branch/commit/PR" in prompt
     assert "AGENTS.md" in prompt
     assert "CLAUDE.md" in prompt

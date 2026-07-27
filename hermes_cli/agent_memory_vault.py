@@ -64,6 +64,7 @@ _ALLOWED_EXECUTION_SURFACES = frozenset(
         "hermes-direct",
         "hermes-child",
         "codex-cli",
+        "claude-cli",
         "claude-code-cli",
         "cowork-mcp",
     }

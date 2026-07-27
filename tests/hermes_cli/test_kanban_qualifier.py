@@ -41,11 +41,11 @@ def policy():
     }
 
 
-def _intake(conn, *, attachments=()):
+def _intake(conn, *, attachments=(), request=None):
     intake_id = kb.create_qualification_intake(
         conn,
         raw_request=json.dumps(
-            {
+            request or {
                 "kind": "task_create",
                 "request": {
                     "title": "Ship qualified work",
@@ -57,6 +57,20 @@ def _intake(conn, *, attachments=()):
         attachments=attachments,
     )
     return kb.get_qualification_intake(conn, intake_id)
+
+
+def _epic_intake(conn):
+    return _intake(
+        conn,
+        request={
+            "kind": "task_create",
+            "request": {
+                "title": "Reliable customer notifications",
+                "item_kind": "epic",
+                "stories": _epic_decision()["stories"],
+            },
+        },
+    )
 
 
 def _decision(**overrides):
@@ -186,7 +200,8 @@ def test_qualification_prompt_includes_exact_card_and_epic_output_shapes(conn, p
     assert '"item_kind":"epic"' in prompt
     assert '"stories":[' in prompt
     assert '"depends_on":[]' in prompt
-    assert "determine whether the intake is an idea, plan, epic, or bug" in prompt.lower()
+    assert "admission and routing classifier" in prompt.lower()
+    assert "must not invent product stories" in prompt.lower()
     assert "external analysis is advisory" in prompt.lower()
     assert "earliest unfinished phase" in prompt.lower()
     assert "PO PATH ADDITION" in prompt
@@ -204,7 +219,7 @@ def test_new_epic_requires_valid_story_decomposition(conn, policy):
         qualifier.validate_decision(
             conn,
             board_metadata=policy,
-            intake=_intake(conn),
+            intake=_epic_intake(conn),
             decision=decision,
         )
 
@@ -217,9 +232,30 @@ def test_new_epic_requires_valid_story_decomposition(conn, policy):
         qualifier.validate_decision(
             conn,
             board_metadata=policy,
-            intake=_intake(conn),
+            intake=_epic_intake(conn),
             decision=decision,
         )
+
+
+def test_auxiliary_qualifier_cannot_invent_epic_stories(conn, policy):
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="cannot invent Epic stories",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=_epic_decision(),
+        )
+
+    validated = qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=_epic_intake(conn),
+        decision=_epic_decision(),
+    )
+    assert validated["stories"] == _epic_decision()["stories"]
 
 
 def test_standalone_card_cannot_smuggle_story_decomposition(conn, policy):
@@ -721,7 +757,9 @@ def test_epic_qualification_materializes_signed_member_stories_and_dependencies(
                 "functional_intent": {
                     "title": "Reliable customer notifications",
                     "outcome": "Customers receive and can inspect notifications",
-                }
+                },
+                "item_kind": "epic",
+                "stories": _epic_decision()["stories"],
             },
             source="work-inbox:test",
         )

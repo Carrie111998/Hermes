@@ -104,3 +104,54 @@ def test_checkout_venv_without_pytest_falls_back_to_installed_home_dotvenv(tmp_p
     assert result.returncode == 0, result.stderr
     assert "INSTALLED_DOTVENV" in result.stdout
     assert "INCOMPLETE_CHECKOUT_DOTVENV" not in result.stdout
+
+
+def test_runner_replaces_home_and_hermes_home_before_test_process(tmp_path):
+    """A collection/subprocess path must never inherit the operator's live home."""
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    source = Path(__file__).resolve().parents[1] / "scripts" / "run_tests.sh"
+    shutil.copy2(source, scripts / "run_tests.sh")
+
+    checkout_venv = repo / ".venv"
+    bin_dir = checkout_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "activate").write_text("# test marker\n", encoding="utf-8")
+    python = bin_dir / "python"
+    python.write_text(
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = "-c" ]; then exit 0; fi\n'
+        'printf "TEST_HOME=%s\\n" "$HOME"\n'
+        'printf "TEST_HERMES_HOME=%s\\n" "$HERMES_HOME"\n'
+        'printf "TEST_MEMORY_VAULT=%s\\n" "${HERMES_AGENT_MEMORY_VAULT:-}"\n',
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+
+    operator_home = tmp_path / "operator-home"
+    operator_home.mkdir()
+    env = {
+        "HOME": str(operator_home),
+        "PATH": os.environ["PATH"],
+        "HERMES_AGENT_MEMORY_VAULT": str(operator_home / "live-memory"),
+    }
+    result = subprocess.run(
+        ["bash", str(scripts / "run_tests.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if line.startswith("TEST_")
+    )
+    assert Path(lines["TEST_HOME"]) != operator_home
+    assert Path(lines["TEST_HOME"]).resolve() == Path(lines["TEST_HOME"])
+    assert Path(lines["TEST_HERMES_HOME"]) == Path(lines["TEST_HOME"]) / ".hermes"
+    assert lines["TEST_MEMORY_VAULT"] == ""

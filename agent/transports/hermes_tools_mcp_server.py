@@ -150,9 +150,10 @@ CODEX_APP_TOOLS: tuple[str, ...] = (
 PRODUCT_OWNER_TOOLS: tuple[str, ...] = (
     "kanban_show",
     "kanban_create",
-    "kanban_link",
     "kanban_comment",
     "kanban_heartbeat",
+    "kanban_agent_memory_recall",
+    "kanban_agent_memory_write",
     "kanban_complete",
     "kanban_block",
 )
@@ -161,6 +162,8 @@ REVIEWER_TOOLS: tuple[str, ...] = (
     "kanban_show",
     "kanban_comment",
     "kanban_heartbeat",
+    "kanban_agent_memory_recall",
+    "kanban_agent_memory_write",
     "kanban_complete",
     "kanban_block",
     "review_target",
@@ -172,6 +175,11 @@ CAPABILITY_SETS: dict[str, tuple[str, ...]] = {
     "reviewer": REVIEWER_TOOLS,
 }
 
+CLAUDE_TASK_CAPABILITY_BY_PROFILE = {
+    "productowner": "product-owner",
+    "reviewer": "reviewer",
+}
+
 CAPABILITY_INSTRUCTIONS = {
     "codex-app": (
         "Hermes Agent tools exposed to an external runtime. Use only the "
@@ -179,8 +187,13 @@ CAPABILITY_INSTRUCTIONS = {
     ),
     "product-owner": (
         "You are the task-scoped Product Owner. Your filesystem access is "
-        "read-only. You cannot create or upload attachments, and attachment "
-        "content is unavailable through this bridge. If the assignment "
+        "read-only. Own only the assigned backlog item. You may submit bounded "
+        "child-intake proposals with kanban_create, but qualification owns "
+        "trusted routing and dependencies; you cannot link cards directly. "
+        "This headless run cannot conduct a live interview: post the exact "
+        "decision request and call kanban_block when operator input is needed. "
+        "You cannot create or upload attachments, and attachment content is "
+        "unavailable through this bridge. If the assignment "
         "requires unavailable attachment content or file/attachment creation, "
         "comment on the task and call kanban_block with that missing-capability "
         "reason; do not infer the missing content or broaden access."

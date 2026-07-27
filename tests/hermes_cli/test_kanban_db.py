@@ -6930,7 +6930,10 @@ def test_product_review_completion_rejects_same_ai_as_writer(kanban_home):
             (tid,),
         )
         conn.commit()
-        with pytest.raises(kb.ProductProvenanceError, match="reviewer AI must differ"):
+        with pytest.raises(
+            kb.ProductProvenanceError,
+            match="canonical reviewer provider must differ",
+        ):
             kb.complete_task(
                 conn,
                 tid,
@@ -6988,6 +6991,154 @@ def test_product_review_completion_accepts_different_ai_reviewer(kanban_home):
     assert provenance["writer_agent"] == "claude-code"
     assert provenance["reviewer_agent"] == "codex"
     assert provenance["review_rule"]["different_agent"] is True
+
+
+def _stamp_test_runtime(
+    monkeypatch,
+    conn,
+    task,
+    *,
+    provider: str,
+    model: str,
+    effort: str,
+):
+    identity = {
+        "profile": task.assignee,
+        "provider": provider,
+        "model": model,
+        "effort": effort,
+        "surface": "claude-cli" if provider == "claude-cli" else "hermes-primary",
+        "source": "dispatcher",
+        "version": 1,
+    }
+    monkeypatch.setattr(
+        kb, "_resolve_worker_runtime_identity", lambda _task: identity
+    )
+    assert kb._stamp_run_executor_identity(conn, task) == identity
+    return identity
+
+
+def test_dispatched_run_canonical_executor_overrides_writer_self_report(
+    kanban_home, monkeypatch
+):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Canonical writer identity",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, tid, board="prod")
+        assert claimed is not None
+        identity = _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            claimed,
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            effort="xhigh",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented directly.",
+            metadata={
+                "ai_provenance": {
+                    "writer": {
+                        "agent": "forged-claude",
+                        "branch": "feature/canonical-writer",
+                    }
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+            board="prod",
+            product_role_assignees={"tester": "tester"},
+        )
+        run = kb.get_run(conn, claimed.current_run_id)
+        provenance = kb.latest_ai_provenance_by_task(conn, [tid])[tid]
+
+    assert run is not None
+    assert run.metadata["executor"] == identity
+    assert run.metadata["ai_provenance"]["writer"]["agent"] == "openai-codex"
+    assert run.metadata["ai_provenance"]["writer"]["model"] == "gpt-5.6-sol"
+    assert run.metadata["ai_provenance"]["writer"]["effort"] == "xhigh"
+    assert provenance["writer_agent"] == "openai-codex"
+    assert provenance["branch"] == "feature/canonical-writer"
+
+
+def test_review_independence_uses_canonical_provider_not_worker_alias(
+    kanban_home, monkeypatch
+):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Canonical reviewer independence",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        writer = kb.claim_task(conn, tid, board="prod")
+        assert writer is not None
+        _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            writer,
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            effort="xhigh",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented directly.",
+            metadata={"ai_provenance": {"writer": {"agent": "anything"}}},
+            expected_run_id=writer.current_run_id,
+            board="prod",
+            product_role_assignees={"tester": "tester"},
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='review', status='review', "
+            "assignee='reviewer' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        reviewer = kb.claim_review_task(conn, tid)
+        assert reviewer is not None
+        _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            reviewer,
+            provider="openai-codex",
+            model="different-model",
+            effort="high",
+        )
+
+        with pytest.raises(
+            kb.ProductProvenanceError,
+            match="canonical reviewer provider must differ",
+        ):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Claims an independent review.",
+                metadata={
+                    "ai_provenance": {
+                        "reviewer": {"agent": "claude-cli", "verdict": "approved"}
+                    }
+                },
+                expected_run_id=reviewer.current_run_id,
+                board="prod",
+            )
+
+        rejected = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == kb.PRODUCT_PROVENANCE_BLOCKED_EVENT
+        ][-1]
+    assert rejected.payload["writer_agent"] == "openai-codex"
+    assert rejected.payload["reviewer_agent"] == "openai-codex"
 
 
 def test_product_human_block_routes_to_hermes_preflight_before_blocked(kanban_home):

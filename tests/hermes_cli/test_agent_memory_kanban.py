@@ -852,6 +852,41 @@ def test_worker_context_requires_actual_executor_protocol(tmp_path, monkeypatch)
     assert delegation_id in context
 
 
+def test_direct_claude_worker_context_uses_mcp_memory_protocol(
+    tmp_path, monkeypatch
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(
+            conn, board=board, title="Direct Claude memory context"
+        )
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        run = kb.get_run(conn, claimed.current_run_id)
+        assert run is not None
+        metadata = dict(run.metadata or {})
+        metadata["executor"] = {
+            "profile": "productowner",
+            "provider": "claude-cli",
+            "model": "opus",
+            "effort": "high",
+            "surface": "claude-cli",
+            "source": "dispatcher",
+            "version": 1,
+        }
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata), claimed.current_run_id),
+        )
+        conn.commit()
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "## Required direct-Claude memory protocol" in context
+    assert "kanban_agent_memory_recall" in context
+    assert "kanban_agent_memory_write" in context
+    assert "hermes agent-memory recall --input -" not in context
+
+
 def test_worker_context_omits_protocol_when_memory_is_disabled(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1830,6 +1865,131 @@ def test_resolver_memory_tools_produce_receipts_that_satisfy_resolve(
     ))
     assert resolved["ok"] is True
     assert resolved["decision"] == "resume"
+
+
+@pytest.mark.parametrize(
+    ("profile", "capability_set"),
+    [
+        ("productowner", "product-owner"),
+        ("reviewer", "reviewer"),
+    ],
+)
+def test_direct_claude_memory_tools_use_canonical_executor_identity(
+    tmp_path, monkeypatch, profile, capability_set
+):
+    from tools import kanban_tools as kt
+
+    board, vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(
+            conn,
+            board=board,
+            title=f"Direct Claude {profile} memory handoff",
+        )
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        if profile == "reviewer":
+            with kb.authorized_governance_write(), kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET assignee='reviewer', "
+                    "current_step_key='review' WHERE id=?",
+                    (task_id,),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET profile='reviewer', step_key='review' "
+                    "WHERE id=?",
+                    (run_id,),
+                )
+        active = kb.get_task(conn, task_id)
+        assert active is not None
+        claim_lock = active.claim_lock
+        assert claim_lock
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_MCP_CAPABILITY_SET", capability_set)
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "claude-cli")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "claude-opus-5")
+
+    recall_out = json.loads(kt._handle_agent_memory_recall({}))
+    assert recall_out["ok"] is True
+    write_out = json.loads(kt._handle_agent_memory_write({
+        "summary": "Completed the bounded governed role task.",
+        "result": "Produced the required handoff.",
+        "evidence": "work contract and focused verification",
+    }))
+    assert write_out["ok"] is True
+
+    expected_executor = {
+        "agent_id": "claude-cli",
+        "execution_id": f"claude-cli-{profile}-{run_id}",
+        "hermes_role": profile,
+        "model": "claude-opus-5",
+        "responsibility": "reviewer" if profile == "reviewer" else "writer",
+        "surface": "claude-cli",
+        "version": 1,
+    }
+    assert recall_out["receipt"]["executor"] == expected_executor
+    assert write_out["receipt"]["executor"] == expected_executor
+
+    metadata = {
+        "agent_memory": {
+            "recall": recall_out["receipt"],
+            "write": write_out["receipt"],
+        }
+    }
+    with kb.connect(board=board) as conn:
+        assert kb.complete_task(
+            conn,
+            task_id,
+            board=board,
+            summary="Direct Claude role complete.",
+            metadata=metadata,
+            expected_run_id=run_id,
+            product_workflow_enabled=False,
+        )
+
+    # The valid actual-worker write suppresses the legacy lifecycle fallback.
+    assert _gist_history(vault).count("<!-- gist_id:") == 1
+
+
+def test_direct_claude_memory_tools_reject_untrusted_runtime_identity(
+    tmp_path, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    board, vault = _configured_product_board(tmp_path, monkeypatch)
+    outbox = tmp_path / "outbox"
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(
+            conn, board=board, title="Reject untrusted Claude memory identity"
+        )
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        claim_lock = claimed.claim_lock
+        assert claim_lock
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+    monkeypatch.setenv("HERMES_PROFILE", "productowner")
+    monkeypatch.setenv("HERMES_MCP_CAPABILITY_SET", "reviewer")
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "claude-cli")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "claude-opus-5")
+    before = _agent_memory_file_counts(vault, outbox)
+
+    recall_out = json.loads(kt._handle_agent_memory_recall({}))
+    assert recall_out.get("ok") is not True
+    assert "capability" in recall_out.get("error", "").lower()
+    assert _agent_memory_file_counts(vault, outbox) == before
 
 
 def test_resolver_memory_tools_reject_stale_env_run_id(tmp_path, monkeypatch):

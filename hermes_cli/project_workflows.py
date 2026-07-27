@@ -116,17 +116,16 @@ def build_project_create_prompt(raw_args: str | None) -> str:
         - All coding work must follow Ole's branch -> commit -> review -> merge
           rule: start from updated main, create a dedicated branch, and prefer a
           separate git worktree for dirty repos or parallel work.
-        - Prefer real local coding-agent delegation for implementation, notably
-          Claude Code and Codex when available; split bounded work across
-          parallel agents when useful. If delegation is impossible or unsafe,
-          state why and use the smallest directly verified path.
-        - Keep writer and reviewer separate: one coding agent implements, a
-          different AI reviewer inspects the actual diff against main, and
-          reviewer self-reports remain advisory until Hermes verifies them.
-        - Hermes must inspect the diff, run the relevant tests/lints/builds,
-          merge only after green verification, and record branch/commit/PR,
-          reviewer result, commands, outputs, and blockers in the Kanban
-          Traceability log.
+        - The selected Developer profile model directly implements and verifies
+          its bounded change. Native subagents may support bounded subtasks but
+          do not own the run or lifecycle tools; do not substitute external
+          Claude/Codex/Cowork backends for the role.
+        - Keep writer and reviewer providers separate. Tester and Reviewer own
+          independent evidence/verdicts, while Hermes kernel gates validate
+          canonical runtime identity, evidence shape, and state transitions.
+        - Merge only after required Test/Review evidence is green, and record
+          branch/commit/PR, reviewer result, commands, outputs, and blockers in
+          the Kanban Traceability log.
         - Agents must follow project memory and repo instructions such as
           AGENTS.md, CLAUDE.md, and LLM Wiki context when available, while
           staying within the active Kanban ticket scope.
@@ -267,17 +266,16 @@ def build_project_import_prompt(raw_args: str | None) -> str:
           all coding work must follow Ole's branch -> commit -> review -> merge
           rule: start from updated main, create a dedicated branch, and prefer a
           separate git worktree for dirty repos or parallel work.
-        - Prefer real local coding-agent delegation for implementation, notably
-          Claude Code and Codex when available; split bounded work across
-          parallel agents when useful. If delegation is impossible or unsafe,
-          state why and use the smallest directly verified path.
-        - Keep writer and reviewer separate: one coding agent implements, a
-          different AI reviewer inspects the actual diff against main, and
-          reviewer self-reports remain advisory until Hermes verifies them.
-        - Hermes must inspect the diff, run the relevant tests/lints/builds,
-          merge only after green verification, and record branch/commit/PR,
-          reviewer result, commands, outputs, and blockers in the Kanban
-          Traceability log.
+        - The selected Developer profile model directly implements and verifies
+          its bounded change. Native subagents may support bounded subtasks but
+          do not own the run or lifecycle tools; do not substitute external
+          Claude/Codex/Cowork backends for the role.
+        - Keep writer and reviewer providers separate. Tester and Reviewer own
+          independent evidence/verdicts, while Hermes kernel gates validate
+          canonical runtime identity, evidence shape, and state transitions.
+        - Merge only after required Test/Review evidence is green, and record
+          branch/commit/PR, reviewer result, commands, outputs, and blockers in
+          the Kanban Traceability log.
         - Agents must follow project memory and repo instructions such as
           AGENTS.md, CLAUDE.md, and LLM Wiki context when available, while
           staying within the active Kanban ticket scope.

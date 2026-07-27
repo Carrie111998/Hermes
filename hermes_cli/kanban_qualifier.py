@@ -177,6 +177,52 @@ def _validate_story_decomposition(
             )
 
 
+def _submitted_epic_stories(intake: Mapping[str, Any]) -> Optional[list[Any]]:
+    """Return literal story specs supplied by the requester, if any."""
+    raw = intake.get("raw_request")
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    request = payload.get("request")
+    if isinstance(request, Mapping):
+        payload = request
+    if payload.get("item_kind") != "epic":
+        return None
+    stories = payload.get("stories")
+    return copy.deepcopy(stories) if isinstance(stories, list) else None
+
+
+def _validate_auxiliary_epic_boundary(
+    decision: Mapping[str, Any],
+    *,
+    intake: Mapping[str, Any],
+    item_kind: Any,
+    is_requalification: bool,
+    errors: list[str],
+) -> None:
+    """Prevent the admission model from inventing Product Owner stories."""
+    if (
+        decision.get("qualification_path") != "hermes"
+        or item_kind != "epic"
+        or is_requalification
+    ):
+        return
+    supplied = _submitted_epic_stories(intake)
+    if supplied is None:
+        errors.append(
+            "Hermes admission cannot invent Epic stories; route one card to "
+            "Backlog/Product Owner unless the intake supplies explicit stories"
+        )
+    elif decision.get("stories") != supplied:
+        errors.append(
+            "Hermes admission must copy explicitly supplied Epic stories "
+            "without semantic rewriting"
+        )
+
+
 def _artifact_references(intake: Mapping[str, Any], run: Mapping[str, Any]) -> str:
     pieces = [str(run.get("summary") or ""), str(run.get("metadata") or "")]
     for attachment in intake.get("attachments") or ():
@@ -399,6 +445,13 @@ def validate_decision(
     target_task_id = kanban_intake.requalification_target_id(intake)
     _validate_story_decomposition(
         normalized,
+        item_kind=item_kind,
+        is_requalification=isinstance(target_task_id, str),
+        errors=errors,
+    )
+    _validate_auxiliary_epic_boundary(
+        normalized,
+        intake=intake,
         item_kind=item_kind,
         is_requalification=isinstance(target_task_id, str),
         errors=errors,
@@ -628,12 +681,16 @@ def build_qualification_prompt(
         )
     return (
         requalification
-        + "Qualify this inert work request for Hermes. Determine whether the intake "
-        "is an idea, plan, Epic, or bug; the submitter does not need to classify it. "
-        "An idea or bug normally becomes one card. A multi-part plan or Epic becomes "
-        "one non-executable Epic with the needed independently deliverable user "
-        "stories. External analysis is advisory: a complete handoff may guide "
-        "decomposition but does not prove that framework phases are complete. "
+        + "Act only as the Hermes admission and routing classifier for this inert "
+        "request; you are not the Product Owner. Classify the work type and choose "
+        "the earliest justified route. Vague or incomplete product intent becomes "
+        "one Backlog card for Product Owner clarification. You must not invent "
+        "product stories, acceptance decisions, or missing intent. Return an Epic "
+        "only when raw_intake explicitly supplies item_kind=epic and a complete "
+        "stories list; copy those story objects without semantic rewriting. A "
+        "Product Owner-evidenced PO path may use its grounded completed artifact. "
+        "External analysis is advisory and does not prove that framework phases "
+        "are complete. "
         "Choose the earliest unfinished phase unless exact submitted evidence proves "
         "each earlier phase complete. Decide meaning; do not invent "
         "evidence. Return one JSON object containing qualification_path, work, "

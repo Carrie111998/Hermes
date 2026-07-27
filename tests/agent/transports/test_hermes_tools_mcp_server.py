@@ -234,9 +234,10 @@ class TestCapabilitySets:
         assert selected == (
             "kanban_show",
             "kanban_create",
-            "kanban_link",
             "kanban_comment",
             "kanban_heartbeat",
+            "kanban_agent_memory_recall",
+            "kanban_agent_memory_write",
             "kanban_complete",
             "kanban_block",
         )
@@ -252,6 +253,8 @@ class TestCapabilitySets:
             "kanban_show",
             "kanban_comment",
             "kanban_heartbeat",
+            "kanban_agent_memory_recall",
+            "kanban_agent_memory_write",
             "kanban_complete",
             "kanban_block",
             "review_target",

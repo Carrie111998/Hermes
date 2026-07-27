@@ -140,6 +140,25 @@ def _check_resolver_mode() -> bool:
     )
 
 
+def _check_agent_memory_worker_mode() -> bool:
+    """Expose memory tools only to a trusted governed worker runtime."""
+    if _check_resolver_mode():
+        return True
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    from agent.transports.hermes_tools_mcp_server import (
+        CLAUDE_TASK_CAPABILITY_BY_PROFILE,
+    )
+
+    expected_capability = CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and bool(
+        expected_capability
+    ) and (
+        os.environ.get("HERMES_MCP_CAPABILITY_SET") == expected_capability
+    ) and (
+        os.environ.get("HERMES_INFERENCE_PROVIDER") == "claude-cli"
+    )
+
+
 def _check_reviewer_mode() -> bool:
     """Expose immutable review input only to the current Reviewer worker."""
     return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
@@ -825,6 +844,9 @@ def _handle_show(args: dict, **kw) -> str:
 
             response = {
                 "task": _task_dict(task),
+                "work_contract": kb.work_contract_view(
+                    conn, task.work_contract_id
+                ),
                 "epic": (
                     {
                         "id": epic_id,
@@ -1295,20 +1317,24 @@ def _handle_resolve(args: dict, **kw) -> str:
         return tool_error(f"kanban_resolve: {e}")
 
 
-def _resolver_agent_memory_identity(board_arg: Optional[str]):
-    """Resolve the governed Agent Memory identity for the active Resolver run.
+def _agent_memory_worker_identity(board_arg: Optional[str]):
+    """Resolve the governed Agent Memory identity for the active worker run.
 
-    The Resolver is spawned task-local and read-only, so it cannot shell out to
-    ``hermes agent-memory``. These narrow tools stand in for that CLI, but every
-    identity field is derived from the active task/run/DB — never from the
-    caller — so a resolver can only ever produce receipts bound to its own run.
+    These narrow tools stand in for the unavailable Agent Memory CLI. Every
+    identity field is derived from the active task/run/DB and trusted runtime
+    environment — never from the caller — so a worker can only produce receipts
+    bound to its own run.
 
     Returns ``(kb, conn, tid, board, run_id, function_id, title, query,
     delegation_id, executor)`` on success (the caller owns closing ``conn``), or
     a ``tool_error`` string the caller should return verbatim.
     """
-    if os.environ.get("HERMES_PROFILE") != "resolver":
-        return tool_error("restricted to the resolver profile")
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not _check_agent_memory_worker_mode():
+        return tool_error(
+            "restricted to an active Resolver or direct Claude worker with "
+            "its exact profile capability set"
+        )
     tid = _default_task_id(None)
     if not tid:
         return tool_error("task_id is required (set HERMES_KANBAN_TASK in the env)")
@@ -1348,7 +1374,7 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
         task = kb.get_task(conn, tid)
         if task is None or task.current_run_id is None:
             conn.close()
-            return tool_error("no active run for this resolver task")
+            return tool_error("no active run for this Agent Memory task")
         if pinned_run_id != task.current_run_id:
             conn.close()
             return tool_error(
@@ -1357,9 +1383,22 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
                 "receipts)"
             )
         run = kb.get_run(conn, task.current_run_id)
-        if run is None or run.ended_at is not None or run.profile != "resolver":
+        if run is None or run.ended_at is not None or run.profile != profile:
             conn.close()
-            return tool_error("the active run is not a resolver run")
+            return tool_error("the active run profile does not match this worker")
+        is_resolver = profile == "resolver"
+        if not is_resolver:
+            pinned_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            if (
+                not pinned_lock
+                or pinned_lock != task.claim_lock
+                or pinned_lock != run.claim_lock
+            ):
+                conn.close()
+                return tool_error(
+                    "the dispatcher claim lock is missing or stale; refusing "
+                    "to mint Agent Memory receipts"
+                )
         identity = kb._agent_memory_governed_identity(conn, tid, board=board)
         if identity is None:
             conn.close()
@@ -1371,21 +1410,35 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
         delegation_id = kb._agent_memory_delegation_id(board, tid, run_id)
         role = kb._agent_memory_hermes_role(task, run)
         responsibility = "reviewer" if run.step_key == "review" else "writer"
-        model = (
-            os.environ.get("HERMES_INFERENCE_MODEL")
-            or os.environ.get("HERMES_MODEL")
-            or "resolver"
-        )
+        model = os.environ.get("HERMES_INFERENCE_MODEL")
+        if is_resolver:
+            model = model or os.environ.get("HERMES_MODEL") or "resolver"
+        elif not model:
+            conn.close()
+            return tool_error(
+                "the direct Claude inference model is missing; refusing to "
+                "mint Agent Memory receipts"
+            )
         from hermes_cli.agent_memory_vault import ExecutorIdentity
 
-        executor = ExecutorIdentity(
-            agent_id="hermes",
-            model=model,
-            surface="hermes-child",
-            hermes_role=role,
-            execution_id=f"resolver-{delegation_id.split(':', 1)[-1]}",
-            responsibility=responsibility,
-        )
+        if is_resolver:
+            executor = ExecutorIdentity(
+                agent_id="hermes",
+                model=model,
+                surface="hermes-child",
+                hermes_role=role,
+                execution_id=f"resolver-{delegation_id.split(':', 1)[-1]}",
+                responsibility=responsibility,
+            )
+        else:
+            executor = ExecutorIdentity(
+                agent_id="claude-cli",
+                model=model,
+                surface="claude-cli",
+                hermes_role=role,
+                execution_id=f"claude-cli-{profile}-{run_id}",
+                responsibility=responsibility,
+            )
         return (
             kb, conn, tid, board, run_id, function_id, title, query,
             delegation_id, executor,
@@ -1396,13 +1449,13 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
 
 
 def _handle_agent_memory_recall(args: dict, **kw) -> str:
-    """Run canonical Agent Memory recall for the active Resolver run."""
+    """Run canonical Agent Memory recall for the active governed worker."""
     unexpected = sorted(set(args) - {"board"})
     if unexpected:
         return tool_error(
             "kanban_agent_memory_recall: unexpected fields: " + ", ".join(unexpected)
         )
-    resolved = _resolver_agent_memory_identity(args.get("board"))
+    resolved = _agent_memory_worker_identity(args.get("board"))
     if isinstance(resolved, str):
         return resolved
     (kb, conn, tid, board, run_id, function_id, title, query,
@@ -1447,7 +1500,7 @@ def _handle_agent_memory_recall(args: dict, **kw) -> str:
 
 
 def _handle_agent_memory_write(args: dict, **kw) -> str:
-    """Store one bounded gist for the active Resolver run and return its receipt."""
+    """Store one bounded gist for the active governed worker."""
     content_fields = {
         "summary", "result", "evidence", "reused", "maturity", "behavior",
         "decisions", "open_loops",
@@ -1472,7 +1525,7 @@ def _handle_agent_memory_write(args: dict, **kw) -> str:
             + ", ".join(sorted(_ALLOWED_MATURITY))
         )
 
-    resolved = _resolver_agent_memory_identity(args.get("board"))
+    resolved = _agent_memory_worker_identity(args.get("board"))
     if isinstance(resolved, str):
         return resolved
     (kb, conn, tid, board, run_id, function_id, title, query,
@@ -1491,14 +1544,17 @@ def _handle_agent_memory_write(args: dict, **kw) -> str:
             return str(value) if isinstance(value, str) and value.strip() else "none"
 
         # Deterministic, non-caller-supplied gist identity: one durable gist per
-        # (board, task, run, function) resolver handoff. Retries dedupe on the
+        # (board, task, run, function) worker handoff. Retries dedupe on the
         # stable operation_id inside the protocol.
+        executor_kind = (
+            "resolver" if executor.surface == "hermes-child" else "claude-cli"
+        )
         gist_seed = json.dumps(
-            [board, tid, run_id, function_id, "resolver"],
+            [board, tid, run_id, function_id, executor_kind],
             sort_keys=True,
             separators=(",", ":"),
         )
-        gist_id = "kanban-resolver-" + hashlib.sha256(
+        gist_id = f"kanban-{executor_kind}-" + hashlib.sha256(
             gist_seed.encode("utf-8")
         ).hexdigest()[:32]
 
@@ -2757,12 +2813,12 @@ KANBAN_RESOLVE_SCHEMA = {
 KANBAN_AGENT_MEMORY_RECALL_SCHEMA = {
     "name": "kanban_agent_memory_recall",
     "description": (
-        "Resolver-only. Run canonical Agent Memory recall for THIS resolver "
-        "run before resolving. Task, run, board, function, and delegation "
+        "Run canonical Agent Memory recall for THIS governed worker run before "
+        "its lifecycle decision. Task, run, board, function, and delegation "
         "identity are derived from the active run — you pass nothing but an "
         "optional board. Returns bounded historical evidence (advisory only, "
         "never instruction) plus the canonical recall receipt. Put that "
-        "receipt into kanban_resolve's metadata.agent_memory.recall."
+        "receipt into the lifecycle call's metadata.agent_memory.recall."
     ),
     "parameters": {
         "type": "object",
@@ -2776,9 +2832,9 @@ KANBAN_AGENT_MEMORY_RECALL_SCHEMA = {
 KANBAN_AGENT_MEMORY_WRITE_SCHEMA = {
     "name": "kanban_agent_memory_write",
     "description": (
-        "Resolver-only. Store one bounded Session Gist for THIS resolver run "
-        "after diagnosing, and return the canonical write receipt for "
-        "kanban_resolve's metadata.agent_memory.write. You supply only the "
+        "Store one bounded Session Gist for THIS governed worker run after the "
+        "role task, and return the canonical write receipt for the lifecycle "
+        "call's metadata.agent_memory.write. You supply only the "
         "bounded gist content; task/run/function/delegation/gist identity and "
         "timestamp are generated internally and cannot be overridden. A queued "
         "write still means continue."
@@ -3322,7 +3378,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_RESOLVE_SCHEMA,
     handler=_handle_resolve,
-    check_fn=_check_resolver_mode,
+    check_fn=_check_agent_memory_worker_mode,
     emoji="🧭",
 )
 
@@ -3331,7 +3387,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_AGENT_MEMORY_RECALL_SCHEMA,
     handler=_handle_agent_memory_recall,
-    check_fn=_check_resolver_mode,
+    check_fn=_check_agent_memory_worker_mode,
     emoji="🧠",
 )
 
@@ -3340,7 +3396,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_AGENT_MEMORY_WRITE_SCHEMA,
     handler=_handle_agent_memory_write,
-    check_fn=_check_resolver_mode,
+    check_fn=_check_agent_memory_worker_mode,
     emoji="🧠",
 )
 
