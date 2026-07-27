@@ -411,7 +411,6 @@ def load_cli_config() -> Dict[str, Any]:
             # non-blank default here is bridged as explicit and would mask them.
             "tenki_api_endpoint": "",
             "tenki_workspace_id": "",
-            "tenki_project_id": "",
             "tenki_name_prefix": "hermes",
             "tenki_allow_inbound": False,
             "tenki_allow_outbound": True,
@@ -643,7 +642,6 @@ def load_cli_config() -> Dict[str, Any]:
         "tenki_image": "TERMINAL_TENKI_IMAGE",
         "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
         "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-        "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
         "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
         "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
         "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",

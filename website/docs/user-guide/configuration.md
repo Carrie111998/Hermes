@@ -123,7 +123,6 @@ terminal:
   tenki_image: ""                                                           # Optional Tenki image/template; blank uses Tenki default
   tenki_api_endpoint: "https://api.tenki.cloud"
   tenki_workspace_id: ""                                                    # Blank falls back to Tenki CLI config
-  tenki_project_id: ""                                                      # Blank falls back to Tenki CLI config
   tenki_sync_hermes_home: false                                             # Opt-in sync of selected ~/.hermes files
   tenki_forward_env: []                                                     # Explicit host env vars to forward into Tenki
 ```
@@ -388,7 +387,6 @@ terminal:
   container_persistent: false      # Default for Tenki
   tenki_api_endpoint: "https://api.tenki.cloud"
   tenki_workspace_id: ""           # Falls back to Tenki CLI config
-  tenki_project_id: ""             # Falls back to Tenki CLI config
   tenki_name_prefix: "hermes"
   tenki_allow_inbound: false
   tenki_allow_outbound: true
@@ -399,7 +397,7 @@ terminal:
   tenki_forward_env: []           # Explicit credentials like GITHUB_TOKEN / GH_TOKEN
 ```
 
-**Required:** Tenki CLI login, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`. Hermes also reads the Tenki CLI config for the current workspace and project IDs.
+**Required:** Tenki CLI login, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`. Hermes also reads the Tenki CLI config for the current workspace ID.
 
 **Persistence:** Tenki is terminate-only by default. Set `container_persistent: true` only if you intentionally want Hermes to pause and resume a task-named sandbox.
 
@@ -443,7 +441,7 @@ If terminal commands fail immediately or the terminal tool is reported as disabl
 - **SSH** — Both `TERMINAL_SSH_HOST` and `TERMINAL_SSH_USER` must be set. Hermes logs a clear error if either is missing.
 - **Modal** — Needs `MODAL_TOKEN_ID` env var or `~/.modal.toml`. Run `hermes doctor` to check.
 - **Daytona** — Needs `DAYTONA_API_KEY`. The Daytona SDK handles server URL configuration.
-- **Tenki** — Needs Tenki CLI login or `TENKI_AUTH_TOKEN`/`TENKI_API_KEY`. Workspace/project can come from the Tenki CLI config or `terminal.tenki_workspace_id` / `terminal.tenki_project_id`.
+- **Tenki** — Needs Tenki CLI login or `TENKI_AUTH_TOKEN`/`TENKI_API_KEY`. The workspace can come from the Tenki CLI config or `terminal.tenki_workspace_id`.
 - **Singularity** — Needs `apptainer` or `singularity` in `$PATH`. Common on HPC clusters.
 
 When in doubt, set `terminal.backend` back to `local` and verify that commands run there first.

@@ -165,10 +165,9 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | `SUPERMEMORY_API_KEY` | Semantic long-term memory with profile recall and session ingest ([supermemory.ai](https://supermemory.ai)) |
 | `DAYTONA_API_KEY` | Daytona cloud sandboxes ([daytona.io](https://daytona.io/)) |
 | `TENKI_AUTH_TOKEN` / `TENKI_API_KEY` | Tenki cloud sandboxes ([tenki.cloud](https://tenki.cloud)); alternatively run `tenki login` |
-| `TENKI_CONFIG_PATH` | Override the Tenki CLI config path Hermes reads for auth, workspace, and project defaults |
+| `TENKI_CONFIG_PATH` | Override the Tenki CLI config path Hermes reads for auth and workspace defaults |
 | `TENKI_API_ENDPOINT` / `TENKI_API_URL` | Direct Tenki API endpoint override used when terminal config is blank |
 | `TENKI_WORKSPACE_ID` / `TENKI_WORKSPACE` | Direct Tenki workspace ID override used when terminal config is blank |
-| `TENKI_PROJECT_ID` / `TENKI_PROJECT` | Direct Tenki project ID override used when terminal config is blank |
 
 ### Skill API Keys
 
@@ -224,7 +223,6 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 | `TERMINAL_TENKI_IMAGE` | Optional Tenki sandbox image/template; blank uses Tenki default |
 | `TERMINAL_TENKI_API_ENDPOINT` | Tenki API endpoint (default: `https://api.tenki.cloud`) |
 | `TERMINAL_TENKI_WORKSPACE_ID` | Tenki workspace ID; blank falls back to Tenki CLI config |
-| `TERMINAL_TENKI_PROJECT_ID` | Tenki project ID; blank falls back to Tenki CLI config |
 | `TERMINAL_TENKI_NAME_PREFIX` | Prefix for Hermes-created Tenki sandbox names (default: `hermes`) |
 | `TERMINAL_TENKI_ALLOW_INBOUND` | Allow inbound network access in Tenki sandboxes (`true`/`false`, default: `false`) |
 | `TERMINAL_TENKI_ALLOW_OUTBOUND` | Allow outbound network access in Tenki sandboxes (`true`/`false`, default: `true`) |

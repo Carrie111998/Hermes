@@ -255,7 +255,6 @@ class TestFileOpsCwdSanitizedAtCallSite:
             "tenki_image": "",
             "tenki_api_endpoint": "",
             "tenki_workspace_id": "",
-            "tenki_project_id": "",
             "tenki_name_prefix": "hermes",
             "tenki_allow_inbound": False,
             "tenki_allow_outbound": True,

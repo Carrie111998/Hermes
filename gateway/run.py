@@ -1523,7 +1523,6 @@ if _config_path.exists():
                 "tenki_image": "TERMINAL_TENKI_IMAGE",
                 "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
                 "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-                "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
                 "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
                 "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
                 "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",

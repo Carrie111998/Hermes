@@ -29,7 +29,6 @@ def _make_env_config(**overrides):
         "docker_orphan_reaper": False,
         "tenki_api_endpoint": "https://api.tenki.test",
         "tenki_workspace_id": "ws-123",
-        "tenki_project_id": "prj-456",
         "tenki_name_prefix": "agent",
         "tenki_allow_inbound": True,
         "tenki_allow_outbound": False,
@@ -101,7 +100,6 @@ class TestFileToolsContainerConfig:
         assert cc.get("tenki_name_prefix") == "agent"
         assert cc.get("tenki_api_endpoint") == "https://api.tenki.test"
         assert cc.get("tenki_workspace_id") == "ws-123"
-        assert cc.get("tenki_project_id") == "prj-456"
         assert cc.get("tenki_allow_inbound") is True
         assert cc.get("tenki_allow_outbound") is False
         assert cc.get("tenki_max_duration") == 7200
@@ -157,7 +155,6 @@ class TestExecuteCodeContainerConfig:
         assert cc["container_persistent"] is False
         assert cc["tenki_api_endpoint"] == "https://api.tenki.test"
         assert cc["tenki_workspace_id"] == "ws-123"
-        assert cc["tenki_project_id"] == "prj-456"
         assert cc["tenki_name_prefix"] == "agent"
         assert cc["tenki_allow_inbound"] is True
         assert cc["tenki_allow_outbound"] is False

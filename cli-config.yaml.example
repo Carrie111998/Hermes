@@ -323,7 +323,6 @@ terminal:
 #   tenki_image: ""                  # Optional image/template; blank uses Tenki default
 #   tenki_api_endpoint: "https://api.tenki.cloud"
 #   tenki_workspace_id: ""           # Blank falls back to Tenki CLI config
-#   tenki_project_id: ""             # Blank falls back to Tenki CLI config
 #   tenki_name_prefix: "hermes"
 #   tenki_allow_inbound: false
 #   tenki_allow_outbound: true

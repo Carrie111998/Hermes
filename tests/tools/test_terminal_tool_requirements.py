@@ -77,15 +77,12 @@ class TestTerminalRequirements:
         monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
         monkeypatch.delenv("TENKI_WORKSPACE_ID", raising=False)
         monkeypatch.delenv("TENKI_WORKSPACE", raising=False)
-        monkeypatch.delenv("TENKI_PROJECT_ID", raising=False)
-        monkeypatch.delenv("TENKI_PROJECT", raising=False)
         monkeypatch.setattr(
             terminal_tool_module,
             "_get_env_config",
             lambda: {
                 "env_type": "tenki",
                 "tenki_workspace_id": "",
-                "tenki_project_id": "",
             },
         )
 

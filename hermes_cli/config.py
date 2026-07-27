@@ -1233,7 +1233,6 @@ DEFAULT_CONFIG = {
         # them. Blank resolves to https://api.tenki.cloud downstream.
         "tenki_api_endpoint": "",
         "tenki_workspace_id": "",
-        "tenki_project_id": "",
         "tenki_name_prefix": "hermes",
         "tenki_allow_inbound": False,
         "tenki_allow_outbound": True,
@@ -6957,7 +6956,6 @@ TERMINAL_CONFIG_ENV_MAP = {
     "tenki_image": "TERMINAL_TENKI_IMAGE",
     "tenki_api_endpoint": "TERMINAL_TENKI_API_ENDPOINT",
     "tenki_workspace_id": "TERMINAL_TENKI_WORKSPACE_ID",
-    "tenki_project_id": "TERMINAL_TENKI_PROJECT_ID",
     "tenki_name_prefix": "TERMINAL_TENKI_NAME_PREFIX",
     "tenki_allow_inbound": "TERMINAL_TENKI_ALLOW_INBOUND",
     "tenki_allow_outbound": "TERMINAL_TENKI_ALLOW_OUTBOUND",
@@ -8143,7 +8141,6 @@ def show_config():
         print(f"  Tenki image:  {terminal.get('tenki_image') or '(Tenki default)'}")
         print(f"  Endpoint:     {terminal.get('tenki_api_endpoint') or 'https://api.tenki.cloud'}")
         print(f"  Workspace:    {terminal.get('tenki_workspace_id') or '(from Tenki CLI)'}")
-        print(f"  Project:      {terminal.get('tenki_project_id') or '(from Tenki CLI)'}")
         print(f"  Sync .hermes: {'enabled' if terminal.get('tenki_sync_hermes_home') else 'disabled'}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
