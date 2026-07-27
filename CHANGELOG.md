@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Governed employee worker launches now carry and verify exact capabilities
+  and systems in addition to toolsets and skills; a subprocess with a broader
+  semantic surface fails closed before it can perform task work.
 - Permit records now derive and persist the exact target resource from the
   immutable action payload; callers attempting to retarget a permit are
   rejected, and delegator budget enforcement remains cumulative across active

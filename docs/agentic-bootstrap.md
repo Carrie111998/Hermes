@@ -284,3 +284,8 @@ After exact permit target-resource binding, the acceptance was rerun from
 commit `b587ca533a9a5f0f8d1518d0d963395fbe108e9a` on 2026-07-27 and returned
 `current-tree agentic acceptance: PASS`. Image manifest:
 `sha256:4f6bfd947234c853b0f1bad3a1467318d58529f3ed15b2b1e4e77c4ce1e7260a`.
+
+After exact capability/system launch-surface enforcement, the installed
+acceptance was rerun from commit `a1251763116dd951e6f3ab2303032ce2956ccb90`
+on 2026-07-27 and returned `current-tree agentic acceptance: PASS`. Image
+manifest: `sha256:367f6b56334dc5053cdcb6658dc9c9a68c00e6af6f67082cf5829d8d1a277e6c`.
