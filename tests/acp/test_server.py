@@ -1572,6 +1572,64 @@ class TestPrompt:
         assert os.environ.get("HERMES_SESSION_ID") == "outer-sess"
 
     @pytest.mark.asyncio
+    async def test_prompt_session_id_not_clobbered_by_concurrent_session(
+        self, agent, monkeypatch
+    ):
+        """Concurrent ACP sessions running on the shared ThreadPoolExecutor
+        must not clobber each other's HERMES_SESSION_ID in os.environ.
+
+        Before the fix, session A set os.environ['HERMES_SESSION_ID'] = 'sess-A',
+        then session B set it to 'sess-B'. When session A's finally block ran,
+        it restored 'sess-B' instead of the original None — leaking session B's
+        id into the next tool call on that executor thread.
+        """
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+        new_resp_a = await agent.new_session(cwd=".")
+        new_resp_b = await agent.new_session(cwd=".")
+        state_a = agent.session_manager.get_session(new_resp_a.session_id)
+        state_b = agent.session_manager.get_session(new_resp_b.session_id)
+
+        import threading
+
+        env_during_a: dict[str, str | None] = {}
+        env_during_b: dict[str, str | None] = {}
+        barrier = threading.Barrier(2)
+
+        def mock_run_a(*args, **kwargs):
+            barrier.wait(timeout=5)
+            env_during_a["env"] = os.environ.get("HERMES_SESSION_ID")
+            return {"final_response": "ok-a", "messages": []}
+
+        def mock_run_b(*args, **kwargs):
+            barrier.wait(timeout=5)
+            env_during_b["env"] = os.environ.get("HERMES_SESSION_ID")
+            return {"final_response": "ok-b", "messages": []}
+
+        state_a.agent.run_conversation = mock_run_a
+        state_b.agent.run_conversation = mock_run_b
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        # Run both prompts concurrently via gather
+        prompt_a = [TextContentBlock(type="text", text="hi-a")]
+        prompt_b = [TextContentBlock(type="text", text="hi-b")]
+        await asyncio.gather(
+            agent.prompt(prompt=prompt_a, session_id=new_resp_a.session_id),
+            agent.prompt(prompt=prompt_b, session_id=new_resp_b.session_id),
+        )
+
+        # Each session must have seen its OWN id during its agent call
+        assert env_during_a.get("env") == new_resp_a.session_id, (
+            f"Session A saw {env_during_a.get('env')!r}, expected {new_resp_a.session_id!r}"
+        )
+        assert env_during_b.get("env") == new_resp_b.session_id, (
+            f"Session B saw {env_during_b.get('env')!r}, expected {new_resp_b.session_id!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_prompt_does_not_duplicate_streamed_final_message(self, agent):
         """If ACP already streamed response chunks, final_response should not be sent again."""
         new_resp = await agent.new_session(cwd=".")
