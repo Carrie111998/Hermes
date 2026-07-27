@@ -84,7 +84,7 @@ determination until a newer evidence commit is recorded.
 ## Post-boundary evidence on current main
 
 The exact acceptance command set was rerun against current `main` at baseline
-commit `4a129bcbb3d09606ce83b577e63a6e601303331b`. This is a separate,
+commit `29df862970a7caa3e34e3b4f27c98218ab0efce2`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
@@ -101,6 +101,18 @@ acceptance PASS** for the bounded tested surface, while production autonomous
 business operation remains **NOT READY**. The exact commands are the same as
 the command block above; the baseline SHA and results are the authoritative
 post-boundary record.
+
+Authenticated external-ingress freshness was additionally validated with:
+
+```sh
+scripts/run_tests.sh -q -j 4 \
+  tests/hermes_cli/test_objective_triggers.py \
+  tests/hermes_cli/test_agentmail_events.py \
+  tests/hermes_cli/test_agentic_runtime_ingress_e2e.py
+```
+
+Result: **21 passed, 0 failed**. This focused ingress regression is supporting
+evidence, not an expansion of the release-gate capability inventory.
 
 ## Release gates that remain open
 

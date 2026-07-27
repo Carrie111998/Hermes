@@ -43,7 +43,8 @@ The immutable release tree at tag `v0.19.0-agentic-foundation` is the
 authoritative source for this included capability inventory. The entries below
 describe capabilities present in that tagged tree and are part of
 `0.19.0-agentic-foundation`, not Unreleased. The commit comparison is used
-only to classify changes introduced after the tagged boundary.
+only to classify changes introduced after the tagged boundary; it is not the
+source of the complete inventory.
 
 - Added the optional standalone `charterforge-stripe-rail` package for
   idempotent inbound Checkout Sessions, provider read-back verification, and
@@ -190,7 +191,7 @@ recorded.
 - `4a129bcbb3d09606ce83b577e63a6e601303331b` — revalidated standalone worker
   deployment authority before every cycle to fence dynamic host changes.
 - Current-main focused acceptance rerun at baseline
-  `4a129bcbb3d09606ce83b577e63a6e601303331b`: 6 Founder/CEO E2E tests, 48
+  `29df862970a7caa3e34e3b4f27c98218ab0efce2`: 6 Founder/CEO E2E tests, 48
   objective service/runtime/worker tests, and 21 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
@@ -201,3 +202,6 @@ recorded.
   executor identity, preserving an explicit independent-verification boundary.
 - The supervised worker now checks the durable autonomy kill switch before
   invoking any tick callback, including alternate worker integrations.
+- `29df862970a7caa3e34e3b4f27c98218ab0efce2` — rejected malformed,
+  future-dated, and stale authenticated external-event evidence before
+  objective wake-up; the focused ingress regression passed 21 tests.

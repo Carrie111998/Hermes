@@ -160,11 +160,17 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`4a129bcbb3d09606ce83b577e63a6e601303331b` passed 6 Founder/CEO E2E tests, 48
+`29df862970a7caa3e34e3b4f27c98218ab0efce2` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
 boundary or broaden the inventory coverage claim.
+
+Authenticated external-event ingress has a separate focused regression at the
+same current-main baseline: 21 tests passed, including rejection of malformed,
+future-dated, and stale provider authentication timestamps. Provider adapters
+without a timestamp remain compatible; when a timestamp is supplied, the
+router enforces a five-minute age limit and thirty-second future-skew limit.
 
 The following historical focused regression results are contextual evidence,
 not additional claims that the current release boundary covered every listed

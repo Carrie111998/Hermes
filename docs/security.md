@@ -72,4 +72,9 @@ The routing layer still treats payload and text as untrusted, stores a
 credential-redacted immutable receipt, and applies idempotent source identity.
 Adapters remain responsible for performing the provider-specific cryptographic
 or platform authentication before calling the router; an evidence dictionary
-without a validated marker is rejected.
+without a validated marker is rejected. When an adapter supplies
+`signed_timestamp`, `authenticated_at`, or `timestamp`, the router rejects
+malformed, future-dated, or stale evidence (older than five minutes, with a
+thirty-second future-skew allowance) before waking objectives. This is a
+freshness boundary, not a substitute for provider-specific signature
+verification.
