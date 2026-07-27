@@ -304,3 +304,5 @@ recorded.
   transactions during company-email schema checks.
 - `9b21ea30ce7cd579a71ed46fdef77ca6557e3037` — added explicit append-only
   compliance supersession lineage and current-record selection.
+- `24204f0149eb48036c11ffa2504bae1d99a130c8` — enabled independently
+  installable Charterforge wheel and source-distribution artifacts.
