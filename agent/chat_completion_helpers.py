@@ -52,6 +52,34 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+def _strip_empty_tool_calls(api_kwargs: dict) -> None:
+    """Strip empty ``tool_calls: []`` from assistant messages in-place.
+
+    Strict providers (DeepSeek V4, newer OpenAI) reject an assistant message
+    carrying ``tool_calls: []`` with HTTP 400.  The WebUI's
+    ``_sanitize_messages_for_api`` already drops these before the initial send,
+    but the agent's own tool-execution loop makes *follow-up* API calls that
+    bypass that WebUI sanitizer — so the check must also live here, close to
+    the wire.
+
+    Only mutates the list *in place* — does not replace the list object — so
+    callers that hold a separate reference still see the fix.
+    """
+    messages = api_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            tc = msg.get("tool_calls")
+            # Drop when tool_calls is an empty list, None, or any non-list
+            # type (just like sanitize_api_messages does upstream).  Strict
+            # providers reject all three variants.
+            if "tool_calls" in msg and not (
+                isinstance(tc, list) and tc
+            ):
+                msg.pop("tool_calls", None)
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -376,6 +404,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
+    _strip_empty_tool_calls(api_kwargs)
     if should_use_direct_api_call(agent):
         return direct_api_call(agent, api_kwargs)
 
@@ -1962,6 +1991,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    _strip_empty_tool_calls(api_kwargs)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
