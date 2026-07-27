@@ -24,9 +24,23 @@
 
 ---
 
-## v0.21.0 — Payment Rails (Next)
+## v0.21.0 — Payment Rails (In Progress)
 
 **Goal:** User can receive funding from ≥3 payment rail options
+
+**Status:** 🔶 Payment rail packages built and documented. Integration tests pending.
+
+### Deliverables
+
+- [x] `charterforge-stripe-rail` package (card payments, webhooks)
+- [x] `charterforge-nevermined-rail` package (agent-to-agent USDC)
+- [x] `charterforge-circle-rail` package (native USDC, CCTP cross-chain)
+- [x] Entry points registered in all packages
+- [x] README documentation for each rail
+- [x] Build verification (wheel + sdist)
+- [x] GitHub release assets updated
+- [ ] Integration tests for payment validation flows
+- [ ] CI workflow for all payment rail packages
 
 ### Deliverables
 
