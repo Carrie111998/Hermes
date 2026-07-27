@@ -52,9 +52,9 @@ hermes teams-pipeline maintain-subscriptions --dry-run
 
 你**必须**按计划运行 `maintain-subscriptions`。从以下三种方式中选择一种：
 
-#### 方式一：Hermes cron（若已运行 Hermes gateway，推荐此方式）
+#### 方式一：IYARI cron（若已运行 IYARI gateway，推荐此方式）
 
-Hermes 内置 cron 调度器。`--no-agent` 模式以脚本作为任务执行（而非使用 LLM），`--script` 必须指向 `~/.hermes/scripts/` 下的文件。首先创建脚本：
+IYARI 内置 cron 调度器。`--no-agent` 模式以脚本作为任务执行（而非使用 LLM），`--script` 必须指向 `~/.hermes/scripts/` 下的文件。首先创建脚本：
 
 ```bash
 mkdir -p ~/.hermes/scripts
@@ -88,7 +88,7 @@ hermes cron status        # 调度器状态
 
 ```ini
 [Unit]
-Description=Hermes Teams pipeline subscription maintenance
+Description=IYARI Teams pipeline subscription maintenance
 After=network-online.target
 
 [Service]
@@ -102,7 +102,7 @@ ExecStart=/usr/local/bin/hermes teams-pipeline maintain-subscriptions
 
 ```ini
 [Unit]
-Description=Run Hermes Teams pipeline subscription maintenance every 12 hours
+Description=Run IYARI Teams pipeline subscription maintenance every 12 hours
 
 [Timer]
 OnBootSec=5min
@@ -239,7 +239,7 @@ hermes teams-pipeline show <job-id>
 - [ ] Notion 和 Linear 接收端仅在实际需要时配置
 - [ ] `hermes teams-pipeline validate` 返回 OK 快照
 - [ ] `hermes teams-pipeline token-health --force-refresh` 执行成功
-- [ ] **`maintain-subscriptions` 已配置计划任务**（Hermes cron、systemd timer 或 crontab——参见[自动化订阅续期](#automating-subscription-renewal-required-for-production)）。若未配置，Graph 订阅将在 72 小时内静默过期。
+- [ ] **`maintain-subscriptions` 已配置计划任务**（IYARI cron、systemd timer 或 crontab——参见[自动化订阅续期](#automating-subscription-renewal-required-for-production)）。若未配置，Graph 订阅将在 72 小时内静默过期。
 - [ ] 一个真实的端到端会议事件已生成存储任务
 - [ ] 至少一条摘要已到达预期的投递接收端
 
