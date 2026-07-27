@@ -196,3 +196,24 @@ Email access is stricter by default than chat-style platforms:
 | `EMAIL_ALLOWED_USERS` | No | — | Comma-separated allowed sender addresses |
 | `EMAIL_HOME_ADDRESS` | No | — | Default delivery target for cron jobs |
 | `EMAIL_ALLOW_ALL_USERS` | No | `false` | Allow all senders (not recommended) |
+| `EMAIL_SESSION_ROUTING` | No | `thread` | `thread` = one session per email thread; `sender` = one session per sender (legacy) |
+| `EMAIL_DISPLAY_NAME` | No | — | Display name for the `From:` header (e.g., `Iris Sloane`) |
+
+## Session Routing (Per-Thread Conversations)
+
+By default (`EMAIL_SESSION_ROUTING=thread`), each email thread gets its own agent session: the adapter sets `chat_id` to the sender's address and `thread_id` to the normalized subject (with `Re:`/`Fwd:`/`Fw:` prefixes stripped), so Hermes isolates sessions per (sender, thread) the same way it isolates Telegram topics or Discord threads. Two different threads from the same person no longer share conversation history.
+
+- `chat_id` is always the sender's email address — reply `To:` headers always contain a real address.
+- `thread_id` is derived from the normalized subject. If the subject is empty, the adapter falls back to the `In-Reply-To` header, then the message ID.
+- Replies thread correctly (`Re:` subject, `In-Reply-To`/`References` headers) even when a tool sends without thread metadata, because the adapter indexes inbound messages by Message-ID.
+- Set `EMAIL_SESSION_ROUTING=sender` for the legacy behavior (one session per sender, all threads mixed).
+
+The display name config:
+
+```yaml
+platforms:
+  email:
+    display_name: "Your Agent Name"
+```
+
+With a display name set, outgoing mail uses `From: Your Agent Name <agent@example.com>` instead of the bare address.

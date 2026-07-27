@@ -327,9 +327,10 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(len(captured_events[0].media_urls), 2)
 
     def test_source_built_correctly(self):
-        """Session source should have correct chat_id and user info.
+        """Session source should have correct chat_id, thread_id and user info.
 
-        In thread mode, chat_id is a composite of sender:normalized_subject.
+        chat_id is always the sender's mailbox; thread_id carries the
+        normalized subject in thread mode.
         """
         import asyncio
         adapter = self._make_adapter()
@@ -354,8 +355,8 @@ class TestDispatchMessage(unittest.TestCase):
 
         asyncio.run(adapter._dispatch_message(msg_data))
         event = captured_events[0]
-        # Thread mode: chat_id is "sender:normalized_subject"
-        self.assertEqual(event.source.chat_id, "john@example.com:hi")
+        self.assertEqual(event.source.chat_id, "john@example.com")
+        self.assertEqual(event.source.thread_id, "hi")
         self.assertEqual(event.source.user_id, "john@example.com")
         self.assertEqual(event.source.user_name, "John Doe")
         self.assertEqual(event.source.chat_type, "dm")
@@ -398,12 +399,14 @@ class TestDispatchMessage(unittest.TestCase):
 
         self.assertEqual(len(captured_events), 2)
         chat_ids = {e.source.chat_id for e in captured_events}
+        thread_ids = {e.source.thread_id for e in captured_events}
         self.assertEqual(len(chat_ids), 2, "Two senders with same subject must have different chat_ids")
-        self.assertIn("alice@example.com:Invoice", chat_ids)
-        self.assertIn("bob@example.com:Invoice", chat_ids)
+        self.assertIn("alice@example.com", chat_ids)
+        self.assertIn("bob@example.com", chat_ids)
+        self.assertEqual(thread_ids, {"Invoice"})
 
     def test_thread_mode_same_sender_same_subject_reuses_session(self):
-        """Same sender + same subject should produce the same chat_id (same session)."""
+        """Same sender + same subject should produce the same (chat_id, thread_id)."""
         import asyncio
         adapter = self._make_adapter()
         captured_events = []
@@ -428,9 +431,75 @@ class TestDispatchMessage(unittest.TestCase):
 
         self.assertEqual(len(captured_events), 2)
         self.assertEqual(captured_events[0].source.chat_id, captured_events[1].source.chat_id)
+        self.assertEqual(captured_events[0].source.thread_id, captured_events[1].source.thread_id)
+
+    def test_thread_mode_same_sender_different_subjects_isolated(self):
+        """Same sender on two subjects must get different thread_ids (sessions)."""
+        import asyncio
+        adapter = self._make_adapter()
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+
+        for i, subject in enumerate(["Quarterly report", "Lunch plans"]):
+            asyncio.run(adapter._dispatch_message({
+                "uid": str(i).encode(),
+                "sender_addr": "user@test.com",
+                "sender_name": "User",
+                "subject": subject,
+                "message_id": f"<m{i}@test.com>",
+                "in_reply_to": "",
+                "body": f"Message {i}",
+                "attachments": [],
+                "date": "",
+            }))
+
+        self.assertEqual(len(captured_events), 2)
+        self.assertEqual(captured_events[0].source.chat_id, "user@test.com")
+        self.assertEqual(captured_events[1].source.chat_id, "user@test.com")
+        thread_ids = {e.source.thread_id for e in captured_events}
+        self.assertEqual(thread_ids, {"Quarterly report", "Lunch plans"})
+
+    def test_sender_mode_has_no_thread_id(self):
+        """Legacy sender mode: chat_id is the address, thread_id is None."""
+        import asyncio
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True, extra={"session_routing": "sender"}))
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+
+        asyncio.run(adapter._dispatch_message({
+            "uid": b"1",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Re: Anything",
+            "message_id": "<m1@test.com>",
+            "in_reply_to": "",
+            "body": "Body",
+            "attachments": [],
+            "date": "",
+        }))
+
+        self.assertEqual(len(captured_events), 1)
+        self.assertEqual(captured_events[0].source.chat_id, "user@test.com")
+        self.assertIsNone(captured_events[0].source.thread_id)
 
     def test_thread_mode_reply_subject_normalized(self):
-        """Re: prefix should be stripped from subject in chat_id."""
+        """Re: and Fwd: prefixes should be stripped from thread_id."""
         import asyncio
         adapter = self._make_adapter()
         captured_events = []
@@ -454,7 +523,7 @@ class TestDispatchMessage(unittest.TestCase):
 
         self.assertEqual(len(captured_events), 1)
         # Both Re: and Fwd: should be stripped
-        self.assertEqual(captured_events[0].source.chat_id, "user@test.com:Important Topic")
+        self.assertEqual(captured_events[0].source.thread_id, "Important Topic")
 
     def test_non_allowlisted_sender_dropped(self):
         """Senders not in EMAIL_ALLOWED_USERS should be dropped before dispatch."""
@@ -516,7 +585,8 @@ class TestDispatchMessage(unittest.TestCase):
 
             asyncio.run(adapter._dispatch_message(msg_data))
             self.assertEqual(len(captured_events), 1)
-            self.assertEqual(captured_events[0].source.chat_id, "admin@test.com:Important")
+            self.assertEqual(captured_events[0].source.chat_id, "admin@test.com")
+            self.assertEqual(captured_events[0].source.thread_id, "Important")
 
     def test_empty_allowlist_denies_without_optin(self):
         """No allowlist and no allow-all opt-in → adapter fails closed (2.6)."""
@@ -754,16 +824,20 @@ class TestThreadContext(unittest.TestCase):
         }
 
         asyncio.run(adapter._dispatch_message(msg_data))
-        ctx = adapter._thread_context.get("user@test.com:Project question")
+        ctx = adapter._thread_context.get("user@test.com::Project question")
         self.assertIsNotNone(ctx)
         self.assertEqual(ctx["subject"], "Project question")
         self.assertEqual(ctx["message_id"], "<original@test.com>")
+        # Message-ID index should anchor this inbound for reply resolution
+        self.assertEqual(
+            adapter._msgid_context.get("<original@test.com>"),
+            "user@test.com::Project question",
+        )
 
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
         adapter = self._make_adapter()
-        _chat_id = "user@test.com:Project question"
-        adapter._thread_context[_chat_id] = {
+        ctx = {
             "subject": "Project question",
             "message_id": "<original@test.com>",
             "sender_addr": "user@test.com",
@@ -773,7 +847,7 @@ class TestThreadContext(unittest.TestCase):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
-            adapter._send_email("user@test.com", "Here is the answer.", None, _chat_id)
+            adapter._send_email("user@test.com", "Here is the answer.", None, ctx)
 
             # Check the sent message
             send_call = mock_server.send_message.call_args[0][0]
@@ -785,8 +859,7 @@ class TestThreadContext(unittest.TestCase):
     def test_reply_does_not_double_re(self):
         """If subject already has Re:, don't add another."""
         adapter = self._make_adapter()
-        _chat_id = "user@test.com:Project question"
-        adapter._thread_context[_chat_id] = {
+        ctx = {
             "subject": "Re: Project question",
             "message_id": "<reply@test.com>",
             "sender_addr": "user@test.com",
@@ -796,7 +869,7 @@ class TestThreadContext(unittest.TestCase):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
-            adapter._send_email("user@test.com", "Follow up.", None, _chat_id)
+            adapter._send_email("user@test.com", "Follow up.", None, ctx)
 
             send_call = mock_server.send_message.call_args[0][0]
             self.assertEqual(send_call["Subject"], "Re: Project question")
@@ -816,16 +889,75 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
             self.assertIn("Date", send_call)
 
-    def test_resolve_recipient_from_thread_context(self):
-        """_resolve_recipient should return the sender from thread context."""
+    def test_context_for_send_prefers_metadata_thread_id(self):
+        """metadata.thread_id must select the exact thread context."""
         adapter = self._make_adapter()
-        _chat_id = "alice@example.com:Invoice"
-        adapter._thread_context[_chat_id] = {
+        adapter._thread_context["user@test.com::Invoice"] = {
+            "subject": "Invoice", "message_id": "<m1@test.com>", "sender_addr": "user@test.com",
+        }
+        adapter._thread_context["user@test.com::Report"] = {
+            "subject": "Report", "message_id": "<m2@test.com>", "sender_addr": "user@test.com",
+        }
+        ctx = adapter._context_for_send("user@test.com", metadata={"thread_id": "Report"})
+        self.assertEqual(ctx["subject"], "Report")
+
+    def test_context_for_send_anchors_on_reply_to_message_id(self):
+        """reply_to (inbound Message-ID) resolves the thread without metadata."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com::Invoice"] = {
+            "subject": "Invoice", "message_id": "<m1@test.com>", "sender_addr": "user@test.com",
+        }
+        adapter._msgid_context["<m1@test.com>"] = "user@test.com::Invoice"
+        ctx = adapter._context_for_send("user@test.com", reply_to="<m1@test.com>")
+        self.assertEqual(ctx["subject"], "Invoice")
+
+    def test_context_for_send_falls_back_to_latest_sender_thread(self):
+        """Without metadata/reply_to, use the most recent thread for that sender."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com::Old"] = {
+            "subject": "Old", "message_id": "<m1@test.com>", "sender_addr": "user@test.com",
+        }
+        adapter._thread_context["user@test.com::New"] = {
+            "subject": "New", "message_id": "<m2@test.com>", "sender_addr": "user@test.com",
+        }
+        ctx = adapter._context_for_send("user@test.com")
+        self.assertEqual(ctx["subject"], "New")
+
+    def test_context_for_send_never_leaks_across_senders(self):
+        """A reply to bob must not pick up alice's thread context."""
+        adapter = self._make_adapter()
+        adapter._thread_context["alice@example.com::Invoice"] = {
+            "subject": "Invoice", "message_id": "<m1@test.com>", "sender_addr": "alice@example.com",
+        }
+        ctx = adapter._context_for_send("bob@example.com")
+        self.assertEqual(ctx, {})
+
+    def test_thread_context_is_bounded(self):
+        """_trim_thread_context must cap unbounded growth."""
+        adapter = self._make_adapter()
+        adapter._thread_context_max = 10
+        for i in range(15):
+            adapter._thread_context[f"u{i}@test.com::T{i}"] = {
+                "subject": f"T{i}", "message_id": f"<m{i}@t>", "sender_addr": f"u{i}@test.com",
+            }
+            adapter._msgid_context[f"<m{i}@t>"] = f"u{i}@test.com::T{i}"
+            adapter._trim_thread_context()
+        self.assertLessEqual(len(adapter._thread_context), 10)
+        # msgid index must not reference trimmed contexts
+        for key in adapter._msgid_context.values():
+            self.assertIn(key, adapter._thread_context)
+
+    def test_resolve_recipient_from_thread_context(self):
+        """_resolve_recipient should return the chat_id address + thread context."""
+        adapter = self._make_adapter()
+        adapter._thread_context["alice@example.com::Invoice"] = {
             "subject": "Invoice",
             "message_id": "<m1@test.com>",
             "sender_addr": "alice@example.com",
         }
-        to_addr, ctx = adapter._resolve_recipient(_chat_id)
+        to_addr, ctx = adapter._resolve_recipient(
+            "alice@example.com", metadata={"thread_id": "Invoice"}
+        )
         self.assertEqual(to_addr, "alice@example.com")
         self.assertEqual(ctx["subject"], "Invoice")
 
@@ -841,7 +973,7 @@ class TestThreadContext(unittest.TestCase):
         # Ensure no home address is set
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("EMAIL_HOME_ADDRESS", None)
-            to_addr, ctx = adapter._resolve_recipient("unknown:Unknown Subject")
+            to_addr, ctx = adapter._resolve_recipient("unknown-subject-key")
             self.assertEqual(to_addr, "")
             self.assertEqual(ctx, {})
 
@@ -849,7 +981,7 @@ class TestThreadContext(unittest.TestCase):
         """_resolve_recipient should use EMAIL_HOME_ADDRESS for unknown chat_id."""
         adapter = self._make_adapter()
         with patch.dict(os.environ, {"EMAIL_HOME_ADDRESS": "home@test.com"}):
-            to_addr, ctx = adapter._resolve_recipient("unknown:Unknown Subject")
+            to_addr, ctx = adapter._resolve_recipient("unknown-subject-key")
             self.assertEqual(to_addr, "home@test.com")
             self.assertEqual(ctx, {})
 
@@ -862,12 +994,12 @@ class TestThreadContext(unittest.TestCase):
         """
         adapter = self._make_adapter()
         # Populate thread context with multiple senders
-        adapter._thread_context["alice@example.com:Invoice"] = {
+        adapter._thread_context["alice@example.com::Invoice"] = {
             "subject": "Invoice",
             "message_id": "<m1@test.com>",
             "sender_addr": "alice@example.com",
         }
-        adapter._thread_context["bob@example.com:Report"] = {
+        adapter._thread_context["bob@example.com::Report"] = {
             "subject": "Report",
             "message_id": "<m2@test.com>",
             "sender_addr": "bob@example.com",
@@ -878,6 +1010,43 @@ class TestThreadContext(unittest.TestCase):
             os.environ.pop("EMAIL_HOME_ADDRESS", None)
             to_addr, _ = adapter._resolve_recipient("unknown-subject-key")
             self.assertEqual(to_addr, "")
+
+    def test_send_threads_reply_via_metadata(self):
+        """send() must deliver To the chat_id address and thread via metadata."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com::Invoice"] = {
+            "subject": "Invoice", "message_id": "<m1@test.com>", "sender_addr": "user@test.com",
+        }
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            result = asyncio.run(
+                adapter.send("user@test.com", "Done.", metadata={"thread_id": "Invoice"})
+            )
+            self.assertTrue(result.success)
+            sent = mock_server.send_message.call_args[0][0]
+            self.assertEqual(sent["To"], "user@test.com")
+            self.assertEqual(sent["Subject"], "Re: Invoice")
+            self.assertEqual(sent["In-Reply-To"], "<m1@test.com>")
+
+    def test_send_to_header_is_always_an_address(self):
+        """Even with threads cached, To: must never be a subject string."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com::Weird Subject"] = {
+            "subject": "Weird Subject", "message_id": "<m1@test.com>", "sender_addr": "user@test.com",
+        }
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            result = asyncio.run(
+                adapter.send("user@test.com", "Body", metadata={"thread_id": "Weird Subject"})
+            )
+            self.assertTrue(result.success)
+            sent = mock_server.send_message.call_args[0][0]
+            self.assertIn("@", sent["To"])
+            self.assertNotIn("Subject", sent["To"])
 
 
 class TestSendMethods(unittest.TestCase):
