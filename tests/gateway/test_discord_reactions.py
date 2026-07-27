@@ -41,6 +41,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_adapter_module  # noqa: E402
 
 
 class FakeTree:
@@ -249,57 +250,82 @@ async def test_on_processing_complete_cancelled_removes_eyes_without_terminal_re
 
 
 @pytest.mark.asyncio
-async def test_add_tool_progress_reaction_uses_tool_emoji_on_raw_message(adapter):
+async def test_add_tool_progress_reaction_stages_tool_emoji(adapter):
     raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
 
     assert await adapter.add_tool_progress_reaction(raw_message, "📋") is True
-    raw_message.add_reaction.assert_awaited_once_with("📋")
+    raw_message.add_reaction.assert_not_awaited()
+    assert adapter._tool_progress_reactions["123"] == ["📋"]
 
 
 @pytest.mark.asyncio
-async def test_add_tool_progress_reaction_by_id_fetches_inbound_message(adapter):
-    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
-    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=raw_message))
-    adapter._client.get_channel = lambda _id: channel
-
-    assert await adapter.add_tool_progress_reaction_by_id("123", "456", "📋") is True
-    channel.fetch_message.assert_awaited_once_with(456)
-    raw_message.add_reaction.assert_awaited_once_with("📋")
-
-
-@pytest.mark.asyncio
-async def test_add_tool_progress_reaction_by_id_uses_processing_cache(adapter):
-    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
-    adapter._tool_progress_messages["456"] = raw_message
-
+async def test_add_tool_progress_reaction_by_id_stages_without_fetch(adapter):
     assert await adapter.add_tool_progress_reaction_by_id("123", "456", "📋") is True
     adapter._client.fetch_channel.assert_not_awaited()
-    raw_message.add_reaction.assert_awaited_once_with("📋")
+    assert adapter._tool_progress_reactions["456"] == ["📋"]
 
 
 @pytest.mark.asyncio
-async def test_add_tool_progress_reaction_rotates_repeated_discord_emojis(adapter):
-    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock())
+async def test_final_tool_reactions_are_deduped_primary_emojis(adapter):
+    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock(), remove_reaction=AsyncMock())
+    event = _make_event("123", raw_message)
+    await adapter.on_processing_start(event)
 
     for _ in range(4):
         assert await adapter.add_tool_progress_reaction(raw_message, "💻") is True
+    assert await adapter.add_tool_progress_reaction(raw_message, "📖") is True
+    assert await adapter.add_tool_progress_reaction(raw_message, "💻") is True
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     assert [call.args[0] for call in raw_message.add_reaction.await_args_list] == [
-        "💻", "⌨️", "🖥️", "🖱️"
+        "👀", "💻", "📖", "✅"
     ]
+    raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
 
 
 @pytest.mark.asyncio
-async def test_add_tool_progress_reaction_tracks_counts_per_message(adapter):
-    first = SimpleNamespace(id=123, add_reaction=AsyncMock())
-    second = SimpleNamespace(id=456, add_reaction=AsyncMock())
+async def test_live_tool_count_embed_is_edited_then_deleted_before_final_reactions(adapter, monkeypatch):
+    class FakeEmbed:
+        def __init__(self, *, description, colour, title=None):
+            self.title = title
+            self.description = description
+            self.colour = colour
+            self.footer = None
 
-    assert await adapter.add_tool_progress_reaction(first, "📚") is True
-    assert await adapter.add_tool_progress_reaction(first, "📚") is True
-    assert await adapter.add_tool_progress_reaction(second, "📚") is True
+    monkeypatch.setattr(discord_adapter_module, "_DISCORD_TOOL_STATUS_RENDER_DELAY_SECONDS", 0)
+    monkeypatch.setattr(discord_adapter_module, "discord", SimpleNamespace(Embed=FakeEmbed))
+    monkeypatch.setattr(discord_adapter_module, "DISCORD_AVAILABLE", True)
+    status_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+    channel = SimpleNamespace(send=AsyncMock(return_value=status_message))
+    raw_message = SimpleNamespace(
+        id=123,
+        channel=channel,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("123", raw_message)
+    await adapter.on_processing_start(event)
 
-    assert [call.args[0] for call in first.add_reaction.await_args_list] == ["📚", "📘"]
-    second.add_reaction.assert_awaited_once_with("📚")
+    assert await adapter.add_tool_progress_reaction(raw_message, "💻") is True
+    await adapter._tool_progress_status_tasks["123"]
+    channel.send.assert_awaited_once()
+    first_embed = channel.send.await_args.kwargs["embed"]
+    assert first_embed.description == "💻 ×1"
+    assert first_embed.title is None
+    assert first_embed.footer is None
+
+    assert await adapter.add_tool_progress_reaction(raw_message, "💻") is True
+    assert await adapter.add_tool_progress_reaction(raw_message, "📖") is True
+    await adapter._tool_progress_status_tasks["123"]
+    status_message.edit.assert_awaited_once()
+    assert status_message.edit.await_args.kwargs["embed"].description == "💻 ×2 · 📖 ×1"
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    status_message.delete.assert_awaited_once()
+    assert [call.args[0] for call in raw_message.add_reaction.await_args_list] == [
+        "👀", "💻", "📖", "✅"
+    ]
 
 
 @pytest.mark.asyncio
