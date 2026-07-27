@@ -461,6 +461,100 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
     return found
 
 
+def sanitize_tool_call_pairing(messages: list) -> bool:
+    """Make tool_call ids unique and never emit an empty assistant turn.
+
+    Added 27/07/2026 after Marcus wedged permanently on Telegram.
+
+    Kimi K3 (and other Moonshot models) emit tool_call ids of the form
+    ``<tool_name>_<n>`` which REPEAT across turns - one session had
+    ``terminal_46`` emitted eight times, three of them live in the same
+    context window after compression. When two assistant messages carrying the
+    same id are both present, tool results pair to the wrong assistant and the
+    later assistant loses its tool_calls, leaving a message with neither
+    content nor tool_calls. Moonshot rejects that with::
+
+        HTTP 400 Invalid request: the message at position N with role
+        'assistant' must not be empty
+
+    The failed turn is then persisted, so every retry rebuilds the same
+    illegal request and the agent can never recover on its own - it looks like
+    a hang, not an error.
+
+    This runs on the outbound copy only, so stored history is untouched.
+    Returns True if anything was changed.
+    """
+    changed = False
+    seen: set = set()
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not isinstance(msg, dict):
+            i += 1
+            continue
+
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            remap = {}
+            for call in msg["tool_calls"]:
+                if not isinstance(call, dict):
+                    continue
+                cid = call.get("id")
+                if not cid:
+                    continue
+                if cid in seen:
+                    new_id = f"{cid}__u{i}"
+                    n = 0
+                    while new_id in seen:
+                        n += 1
+                        new_id = f"{cid}__u{i}_{n}"
+                    remap[cid] = new_id
+                    call["id"] = new_id
+                    seen.add(new_id)
+                    changed = True
+                else:
+                    seen.add(cid)
+
+            # rewrite the matching results, which follow before the next assistant
+            if remap:
+                pending = dict(remap)
+                j = i + 1
+                while j < len(messages) and pending:
+                    nxt = messages[j]
+                    if not isinstance(nxt, dict):
+                        j += 1
+                        continue
+                    if nxt.get("role") == "assistant":
+                        break
+                    if nxt.get("role") == "tool":
+                        tcid = nxt.get("tool_call_id")
+                        if tcid in pending:
+                            nxt["tool_call_id"] = pending.pop(tcid)
+                    j += 1
+                logger.warning(
+                    "Uniquified %d duplicate tool_call id(s) at message %d "
+                    "(provider reuses ids across turns)",
+                    len(remap), i,
+                )
+
+        # An assistant turn with no content AND no tool_calls is illegal.
+        if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+            content = msg.get("content")
+            is_empty = (
+                content is None
+                or (isinstance(content, str) and not content.strip())
+                or (isinstance(content, (list, tuple)) and len(content) == 0)
+            )
+            if is_empty:
+                msg["content"] = "(no output)"
+                changed = True
+                logger.warning(
+                    "Replaced empty assistant message at position %d with a "
+                    "placeholder; providers reject empty assistant turns", i,
+                )
+        i += 1
+
+    return changed
+
 __all__ = [
     "_SURROGATE_RE",
     "close_interrupted_tool_sequence",
@@ -474,4 +568,5 @@ __all__ = [
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
     "_sanitize_structure_non_ascii",
+    "sanitize_tool_call_pairing",
 ]

@@ -51,6 +51,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
+    sanitize_tool_call_pairing,
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -1542,6 +1543,14 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Some providers (Kimi K3 via Moonshot/OpenRouter) reuse tool_call
+        # ids across turns, e.g. `terminal_46` emitted eight times in one
+        # session. Duplicates mispair tool results, strip tool_calls off the
+        # later assistant turns and leave a message with neither content nor
+        # tool_calls, which strict providers reject with a non-retryable 400.
+        # Only the outbound copy is touched; stored history is left intact.
+        sanitize_tool_call_pairing(api_messages)
 
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
