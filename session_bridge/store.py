@@ -4789,8 +4789,6 @@ class SessionBridgeStore:
         ).fetchone()
 
         blockers: list[str] = []
-        if resolution_stats["blocking_failed_count"]:
-            blockers.append("sidebar_failed")
         if resolution_stats["ineffective_terminal_resolution_count"]:
             blockers.append("sidebar_terminal_resolution_mismatch")
         if not resolution_stats["ledger_valid"]:

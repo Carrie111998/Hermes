@@ -1292,23 +1292,52 @@ class ProductionBackend:
         try:
             hydration = self._require_sidebar_hydration_executor().run_once()
             if hydration.status != "idle":
-                self._require_store().record_sidebar_recovery_progress(
+                self._record_sidebar_recovery_progress(
                     lane="hydration",
                     status=hydration.status,
-                    now=time.time(),
                 )
                 return {"lane": "hydration", **asdict(hydration)}
             registration = self._require_sidebar_executor().run_once()
-            self._require_store().record_sidebar_recovery_progress(
+            self._record_sidebar_recovery_progress(
                 lane="registration",
                 status=registration.status,
-                now=time.time(),
             )
+            if (
+                registration.status == "unsettled"
+                and registration.error_code == "codex_tool_unavailable"
+            ):
+                self._recycle_sidebar_delivery_runtime()
             return {"lane": "registration", **asdict(registration)}
         except (ConfigurationFailure, RolloutGateBlocked):
             raise
         except Exception as exc:
             raise ProviderDegraded("sidebar_recovery_failed") from exc
+
+    def _record_sidebar_recovery_progress(self, *, lane: str, status: str) -> None:
+        try:
+            self._require_store().record_sidebar_recovery_progress(
+                lane=lane,
+                status=status,
+                now=time.time(),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            _LOG.warning(
+                "sidebar recovery progress write failed",
+                exc_info=True,
+            )
+
+    def _recycle_sidebar_delivery_runtime(self) -> None:
+        client, self._sidebar_codex_client = self._sidebar_codex_client, None
+        self._sidebar_executor = None
+        self._sidebar_hydration_executor = None
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:
+            _LOG.warning("sidebar Codex client recycle failed", exc_info=True)
 
     def sidebar_retry_bound(
         self,
@@ -2898,10 +2927,12 @@ class ProductionBackend:
             return self._sidebar_hydration_executor
         try:
             marker_key = resolve_marker_key()
-            coordinator = self._provider_runtime(
-                targets=True,
-                catalog_only=False,
-                providers=(Provider.CLAUDE, Provider.CODEX),
+            store = self._require_store()
+            coordinator = SessionBridgeCoordinator(
+                config=self.config,
+                store=store,
+                adapters={},
+                target_adapters={},
             )
             native = self._require_sidebar_terminal_delivery()
 
@@ -2912,7 +2943,7 @@ class ProductionBackend:
 
             self._sidebar_hydration_executor = SidebarHydrationExecutor(
                 claim_once=_claim_once,
-                store=self._require_store(),
+                store=store,
                 native=native,
                 marker_secret=marker_key,
             )

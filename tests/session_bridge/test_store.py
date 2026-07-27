@@ -8501,7 +8501,7 @@ def test_expired_sidebar_fail_retains_exact_thread_across_restart(tmp_path) -> N
         reopened_db.close()
 
 
-def test_sidebar_execution_blockers_report_any_failed_row(db) -> None:
+def test_sidebar_execution_blockers_isolate_a_known_failed_row(db) -> None:
     store = SessionBridgeStore(
         db,
         sidebar_token_factory=_token_factory("hard-stop-failed"),
@@ -8514,7 +8514,7 @@ def test_sidebar_execution_blockers_report_any_failed_row(db) -> None:
         now=110.0,
     )
 
-    assert store.sidebar_execution_blockers() == ("sidebar_failed",)
+    assert store.sidebar_execution_blockers() == ()
 
 
 def test_precreate_cutover_resolution_is_append_only_and_unblocks_without_native_id(
@@ -8900,7 +8900,6 @@ def test_sidebar_terminal_resolution_waiver_rejects_forged_legacy_evidence(
     )
 
     assert store.sidebar_execution_blockers() == (
-        "sidebar_failed",
         "sidebar_terminal_resolution_mismatch",
     )
 
@@ -8941,7 +8940,6 @@ def test_sidebar_terminal_resolution_waiver_downgrades_on_evidence_snapshot_drif
     )
 
     assert store.sidebar_execution_blockers() == (
-        "sidebar_failed",
         "sidebar_terminal_resolution_mismatch",
     )
 
@@ -9075,7 +9073,7 @@ def test_sidebar_terminal_resolution_cas_rejects_every_expected_snapshot_mismatc
         store.acknowledge_sidebar_terminal_resolution(**arguments)
 
     assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
-    assert store.sidebar_execution_blockers() == ("sidebar_failed",)
+    assert store.sidebar_execution_blockers() == ()
 
 
 @pytest.mark.parametrize("materialization", ("external", "lineage"))
@@ -9115,7 +9113,6 @@ def test_sidebar_terminal_resolution_becomes_ineffective_after_materialization(
         )
 
     assert store.sidebar_execution_blockers() == (
-        "sidebar_failed",
         "sidebar_terminal_resolution_mismatch",
     )
     status = store.sidebar_delivery_status(now=220.0)
@@ -9164,7 +9161,6 @@ def test_sidebar_terminal_resolution_ledger_failure_is_fail_closed(
     db._execute_write(_break_ledger)
 
     assert store.sidebar_execution_blockers() == (
-        "sidebar_failed",
         "sidebar_terminal_resolution_ledger_invalid",
     )
     assert store.claim_sidebar_jobs(now=300.0, limit=1) == []
@@ -9245,7 +9241,6 @@ def test_sidebar_terminal_resolution_refuses_an_unprotected_ledger(db) -> None:
 
     assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
     assert store.sidebar_execution_blockers() == (
-        "sidebar_failed",
         "sidebar_terminal_resolution_ledger_invalid",
     )
 
@@ -9322,7 +9317,7 @@ def test_sidebar_retry_rejects_any_job_with_terminal_resolution_history(db) -> N
         ),
         (
             "UPDATE session_sidebar_jobs SET updated_at = updated_at + 1 WHERE id = ?",
-            ("sidebar_failed", "sidebar_terminal_resolution_mismatch"),
+            ("sidebar_terminal_resolution_mismatch",),
             1,
         ),
     ),
@@ -9382,10 +9377,13 @@ def test_sidebar_execution_blockers_report_unknown_retry_code(db) -> None:
     assert store.sidebar_execution_blockers() == ("unknown_retry_code",)
 
 
-def test_sidebar_claim_refuses_pending_work_when_failed_row_exists(db) -> None:
+def test_sidebar_claim_isolates_failed_row_and_claims_pending_work(db) -> None:
     store = SessionBridgeStore(
         db,
-        sidebar_token_factory=_token_factory("hard-stop-claim"),
+        sidebar_token_factory=_token_factory(
+            "failed-row-token",
+            "pending-row-token",
+        ),
     )
     failed = _sidebar_candidate(db, native_id="hard-stop-existing-failed")
     pending = _sidebar_candidate(db, native_id="hard-stop-still-pending")
@@ -9398,10 +9396,12 @@ def test_sidebar_claim_refuses_pending_work_when_failed_row_exists(db) -> None:
     )
     store.enqueue_sidebar_job(pending)
 
-    assert store.claim_sidebar_jobs(now=200.0, limit=1) == []
+    claimed = store.claim_sidebar_jobs(now=200.0, limit=1)
+    assert len(claimed) == 1
+    assert claimed[0]["source_session_id"] == pending.source_session_id
     pending_row = store.get_sidebar_job_for_source(pending.source_session_id)
     assert pending_row is not None
-    assert pending_row["state"] == SidebarJobState.PENDING.value
+    assert pending_row["state"] == SidebarJobState.LEASED.value
 
 
 def test_sidebar_active_lease_probe_distinguishes_persisted_worker_ownership(
@@ -10648,6 +10648,8 @@ def test_sidebar_claim_scans_one_bounded_page_then_hard_stops_malformed_rows(
         first = store.claim_sidebar_jobs(now=200.0, limit=1)
         after_first = store.sidebar_job_counts()
         second = store.claim_sidebar_jobs(now=200.0, limit=1)
+        after_second = store.sidebar_job_counts()
+        third = store.claim_sidebar_jobs(now=200.0, limit=1)
     finally:
         with db._lock:
             assert db._conn is not None
@@ -10664,11 +10666,15 @@ def test_sidebar_claim_scans_one_bounded_page_then_hard_stops_malformed_rows(
     assert after_first[SidebarJobState.FAILED.value] == 40
     assert after_first[SidebarJobState.PENDING.value] == 6
     assert second == []
-    assert len(due_queries) == 1
+    assert after_second[SidebarJobState.FAILED.value] == 45
+    assert after_second[SidebarJobState.PENDING.value] == 1
+    assert len(third) == 1
+    assert third[0]["source_session_id"] == valid.source_session_id
+    assert len(due_queries) == 3
     assert all("LIMIT 40" in statement for statement in due_queries)
     valid_row = store.get_sidebar_job_for_source(valid.source_session_id)
     assert valid_row is not None
-    assert valid_row["state"] == SidebarJobState.PENDING.value
+    assert valid_row["state"] == SidebarJobState.LEASED.value
 
 
 def test_sidebar_counts_and_source_lookup_have_stable_public_shapes(db) -> None:

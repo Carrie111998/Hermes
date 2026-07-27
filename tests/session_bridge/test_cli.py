@@ -76,6 +76,7 @@ from session_bridge.sidebar_executor import (
     SidebarExecutor,
 )
 from session_bridge.sidebar_hydration_executor import (
+    SidebarHydrationExecutor,
     SidebarHydrationExecutionResult,
 )
 from session_bridge.store import SessionBridgeStore
@@ -5244,6 +5245,138 @@ def test_production_sidebar_recovery_once_prioritizes_hydration_then_registratio
         {"lane": "hydration", "status": "visible", "now": 1_000.0},
         {"lane": "registration", "status": "idle", "now": 1_000.0},
     ]
+
+
+def test_production_sidebar_recovery_progress_write_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    )
+
+    class Store:
+        def record_sidebar_recovery_progress(self, **value: object) -> None:
+            del value
+            raise RuntimeError("database is locked")
+
+    class HydrationExecutor:
+        def run_once(self) -> SidebarHydrationExecutionResult:
+            return SidebarHydrationExecutionResult(status="idle")
+
+    class RegistrationExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            return SidebarExecutionResult(
+                status="visible",
+                job_id="sidebar-job:" + ("a" * 64),
+                thread_id="019f-test",
+            )
+
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_hydration_executor",
+        lambda: HydrationExecutor(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_executor",
+        lambda: RegistrationExecutor(),
+    )
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+
+    assert backend.run_sidebar_recovery_once() == {
+        "lane": "registration",
+        "status": "visible",
+        "job_id": "sidebar-job:" + ("a" * 64),
+        "thread_id": "019f-test",
+        "error_code": None,
+    }
+
+
+def test_production_sidebar_recovery_recycles_unavailable_codex_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    )
+    closed: list[str] = []
+
+    class Client:
+        def close(self) -> None:
+            closed.append("client")
+
+    class Store:
+        def record_sidebar_recovery_progress(self, **value: object) -> None:
+            del value
+
+    class HydrationExecutor:
+        def run_once(self) -> SidebarHydrationExecutionResult:
+            return SidebarHydrationExecutionResult(status="idle")
+
+    class RegistrationExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            return SidebarExecutionResult(
+                status="unsettled",
+                error_code="codex_tool_unavailable",
+            )
+
+    client = Client()
+    hydration = HydrationExecutor()
+    registration = RegistrationExecutor()
+    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
+    backend._sidebar_executor = registration
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+
+    assert backend.run_sidebar_recovery_once() == {
+        "lane": "registration",
+        "status": "unsettled",
+        "job_id": None,
+        "thread_id": None,
+        "error_code": "codex_tool_unavailable",
+    }
+    assert closed == ["client"]
+    assert backend._sidebar_codex_client is None
+    assert backend._sidebar_hydration_executor is None
+    assert backend._sidebar_executor is None
+
+
+def test_sidebar_hydration_claim_runtime_does_not_start_a_provider_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    )
+    provider_calls: list[str] = []
+    store = object()
+    native = object()
+
+    def reject_provider_runtime(**kwargs: object) -> object:
+        del kwargs
+        provider_calls.append("provider")
+        raise AssertionError("hydration claims are store-backed")
+
+    monkeypatch.setattr(
+        backend,
+        "_provider_runtime",
+        reject_provider_runtime,
+    )
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_delivery",
+        lambda: native,
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_marker_key",
+        lambda: b"h" * 32,
+    )
+
+    executor = backend._require_sidebar_hydration_executor()
+
+    assert isinstance(executor, SidebarHydrationExecutor)
+    assert provider_calls == []
+    assert backend._codex_client is None
 
 
 def test_production_serve_owns_one_internal_sidebar_recovery_thread(
