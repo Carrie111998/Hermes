@@ -655,7 +655,11 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
     finally:
+        if stop := session.get("_notif_stop"):
+            assert isinstance(stop, threading.Event)
+            stop.set()
         server._sessions.pop(sid, None)
 
     assert seen == [str(profile_home)]
@@ -710,7 +714,11 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
     finally:
+        if stop := session.get("_notif_stop"):
+            assert isinstance(stop, threading.Event)
+            stop.set()
         server._sessions.pop(sid, None)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
@@ -3123,6 +3131,9 @@ def test_init_session_fires_reset_hook(monkeypatch):
 
     monkeypatch.setattr(_approval, "register_gateway_notify", lambda key, cb: None)
     monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
 
     sid = "sid"
     try:
@@ -4019,14 +4030,8 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
+        # Queue order is an implementation detail. The contract is that batch_2
+        # and batch_3 both remain queued while batch_1's turn is in flight.
         queued: dict = {}
         deadline = time.time() + 5.0
         while time.time() < deadline and set(queued) != {

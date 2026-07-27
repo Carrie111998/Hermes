@@ -128,6 +128,12 @@ def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, 
             }],
         },
     }))
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None
+    )
 
     from agent.credential_pool import load_pool
 

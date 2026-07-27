@@ -103,6 +103,20 @@ def _is_alive_like_dispatcher(pid: int) -> bool:
                         break
         except (FileNotFoundError, PermissionError, OSError):
             pass
+    elif sys.platform == "darwin":
+        try:
+            status = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if status.returncode != 0 or "Z" in status.stdout:
+                return False
+        except (OSError, subprocess.SubprocessError):
+            pass
     return True
 
 
@@ -200,31 +214,60 @@ def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
         _cleanup(proc)
 
 
-def test_real_handler_uses_os_exit_for_kanban_workers():
-    """Source-level invariant: cli.py's _signal_handler_q must call
-    os._exit(0) when HERMES_KANBAN_TASK is set.
+def test_real_handler_uses_os_exit_for_kanban_workers(monkeypatch):
+    """The registered production handler exits a dispatcher worker directly."""
+    import logging
+    from types import SimpleNamespace
 
-    Catches the case where someone refactors the handler and accidentally
-    drops the env-gated exit, restoring the bug. Reading cli.py directly is
-    cheap and avoids the heavy CLI import.
-    """
-    import pathlib
+    import cli as cli_mod
 
-    cli_path = (
-        pathlib.Path(__file__).resolve().parent.parent.parent / "cli.py"
-    )
-    src = cli_path.read_text()
-    # Locate the handler body.
-    start = src.find("def _signal_handler_q(signum, frame):")
-    assert start != -1, "cli.py is missing _signal_handler_q"
-    # Look ahead for the env-gated os._exit call within ~80 lines.
-    body = src[start : start + 4000]
-    assert "HERMES_KANBAN_TASK" in body, (
-        "_signal_handler_q must gate its kanban-worker exit path on "
-        "HERMES_KANBAN_TASK — see #28181"
-    )
-    assert "os._exit(0)" in body, (
-        "_signal_handler_q must call os._exit(0) for kanban workers — "
-        "raising KeyboardInterrupt orphans the process when non-daemon "
-        "threads are alive (see #28181)"
-    )
+    handlers = {}
+    interrupts = []
+
+    class FakeAgent:
+        session_id = "signal-test"
+        platform = "cli"
+
+        def interrupt(self, reason):
+            interrupts.append(reason)
+
+    class FakeCLI:
+        system_prompt = ""
+
+        def __init__(self, **_kwargs):
+            self.console = SimpleNamespace(print=lambda *_a, **_kw: None)
+            self.session_id = "signal-test"
+            self.agent = FakeAgent()
+
+        def _claim_active_session(self, *_args, **_kwargs):
+            return True
+
+        def _show_security_advisories(self):
+            pass
+
+        def chat(self, *_args, **_kwargs):
+            return "done"
+
+        def _print_exit_summary(self, **_kwargs):
+            pass
+
+    monkeypatch.setitem(cli_mod.CLI_CONFIG, "worktree", False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda *_args: None)
+    monkeypatch.setattr(cli_mod, "_arm_exit_watchdog_on_shutdown_signal", lambda: None)
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler))
+    monkeypatch.setattr(signal, "alarm", lambda _seconds: None)
+    monkeypatch.setattr(logging, "shutdown", lambda: None)
+
+    cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_28181")
+    monkeypatch.setattr(cli_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli_mod.os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+
+    with pytest.raises(SystemExit) as exc:
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    assert exc.value.code == 0
+    assert interrupts == [f"received signal {signal.SIGTERM}"]
