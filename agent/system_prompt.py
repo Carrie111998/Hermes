@@ -38,6 +38,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
+    PROMPT_PRECEDENCE_NOTE,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
@@ -196,6 +197,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Everything from here on is operational guidance appended AFTER the
+    # identity slot. Later text reads as more specific and more actionable, so
+    # without an explicit rule a guidance block silently outranks the
+    # constitution it follows — which is exactly how SKILLS_GUIDANCE came to
+    # order unreviewed skill edits against a SOUL requiring approval (H-06).
+    # One sentence, placed at the boundary, so the ordering is stated rather
+    # than left to be inferred from position.
+    if _soul_loaded:
+        stable_parts.append(PROMPT_PRECEDENCE_NOTE)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
