@@ -3941,6 +3941,74 @@ class TestSchemaInit:
         assert "messages" in tables
         assert "schema_version" in tables
 
+    def test_role_timestamp_index_is_schema_managed_for_fresh_and_legacy_db(
+        self, tmp_path, monkeypatch
+    ):
+        """Schema setup creates, repairs, and preserves the role lookup index."""
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        explicit_db = tmp_path / "role-index.db"
+
+        def assert_index_contract(session_db):
+            assert session_db._conn is not None
+            plans = [
+                session_db._conn.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT tool_calls FROM messages "
+                    "WHERE role='assistant' AND tool_calls IS NOT NULL "
+                    "AND tool_calls LIKE '%terminal%' AND timestamp >= ?",
+                    (0.0,),
+                ).fetchall(),
+                session_db._conn.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT tool_call_id, content FROM messages "
+                    "WHERE role='tool' AND tool_call_id IS NOT NULL AND timestamp >= ? "
+                    "AND (content LIKE '%BLOCKED%' OR content LIKE '%approval%')",
+                    (0.0,),
+                ).fetchall(),
+            ]
+            details = [[row[3] for row in plan] for plan in plans]
+            assert all(
+                any("USING INDEX idx_messages_role_timestamp" in detail for detail in plan)
+                for plan in details
+            ), details
+
+            rows = session_db._conn.execute(
+                "PRAGMA index_xinfo('idx_messages_role_timestamp')"
+            ).fetchall()
+            key_columns = [(row[2], row[3]) for row in rows if row[5]]
+            assert key_columns == [("role", 0), ("timestamp", 1)]
+
+        fresh = SessionDB(db_path=explicit_db)
+        try:
+            assert_index_contract(fresh)
+        finally:
+            fresh.close()
+
+        with sqlite3.connect(explicit_db) as legacy:
+            legacy.execute("DROP INDEX idx_messages_role_timestamp")
+
+        reconciled = SessionDB(db_path=explicit_db)
+        try:
+            assert_index_contract(reconciled)
+        finally:
+            reconciled.close()
+
+        reopened = SessionDB(db_path=explicit_db)
+        try:
+            assert_index_contract(reopened)
+            assert reopened._conn is not None
+            count = reopened._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'idx_messages_role_timestamp'"
+            ).fetchone()[0]
+            assert count == 1
+        finally:
+            reopened.close()
+
+        assert not (hermes_home / "state.db").exists()
+
     def test_schema_version(self, db):
         from hermes_state import SCHEMA_VERSION
         cursor = db._conn.execute("SELECT version FROM schema_version")
