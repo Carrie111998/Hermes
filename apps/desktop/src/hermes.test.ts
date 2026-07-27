@@ -152,9 +152,9 @@ describe('Hermes REST helpers', () => {
     // Slices reassembled from the legacy per-slice route with the same
     // scoping: recents on the caller's profile, cron + messaging cross-profile.
     expect(result.recents.sessions.map(s => s.id)).toEqual(['recent-1'])
-    // One row back against a 30-row window: the profile is fully loaded, so
-    // the legacy path must not claim there's another page.
-    expect(result.recents.profiles_truncated).toEqual({ default: false })
+    // One row returned against a known total of 7 — the profile still has more
+    // on disk, so the legacy path must claim another page exists.
+    expect(result.recents.profiles_truncated).toEqual({ default: true })
     expect(result.cron.sessions.map(s => s.id)).toEqual(['cron-1'])
     expect(result.messaging.sessions.map(s => s.id)).toEqual(['msg-1'])
 
@@ -409,5 +409,98 @@ describe('Hermes REST helpers', () => {
         path: '/api/model/options?refresh=1&include_unconfigured=1'
       })
     )
+  })
+
+  describe('profilesTruncatedFrom legacy truncation semantics', () => {
+    it('marks a profile truncated when returned count is less than its known total', async () => {
+      // profile_totals: default has 60 total, coder has 20 total.
+      // Backend returns 30 default + 20 coder = 50 sessions (global cap hit).
+      const defaultSessions = Array.from({ length: 30 }, (_, i) => ({
+        id: `d-${i}`,
+        profile: 'default',
+        title: `default-${i}`
+      }))
+      const coderSessions = Array.from({ length: 20 }, (_, i) => ({
+        id: `c-${i}`,
+        profile: 'coder',
+        title: `coder-${i}`
+      }))
+      const sessions = [...defaultSessions, ...coderSessions]
+
+      api.mockImplementation(({ path }: { path: string }) => {
+        if (path.startsWith('/api/profiles/sessions/sidebar')) {
+          return Promise.reject(new Error('404: {"detail":"No such API endpoint: /api/profiles/sessions/sidebar"}'))
+        }
+
+        if (path.includes('source=cron')) {
+          return Promise.resolve({ ...emptySessionsResponse, sessions: [], total: 0 })
+        }
+
+        if (path.includes('exclude_sources=cron%2Cdesktop')) {
+          return Promise.resolve({ ...emptySessionsResponse, sessions: [], total: 0 })
+        }
+
+        return Promise.resolve({
+          ...emptySessionsResponse,
+          sessions,
+          total: 80,
+          profile_totals: { default: 60, coder: 20 }
+        })
+      })
+
+      const result = await listSidebarSessions({
+        recentsProfile: 'all',
+        recentsLimit: 50,
+        recentsExclude: ['cron', 'tool'],
+        cronLimit: 50,
+        messagingLimit: 100,
+        messagingExclude: ['cron', 'desktop']
+      })
+
+      // default has 30 returned out of 60 → truncated
+      // coder has all 20 returned out of 20 → NOT truncated
+      expect(result.recents.profiles_truncated).toEqual({ default: true, coder: false })
+    })
+
+    it('falls back to global-full heuristic when profile_totals is absent', async () => {
+      const sessions = Array.from({ length: 50 }, (_, i) => ({
+        id: `s-${i}`,
+        profile: 'default',
+        title: `session-${i}`
+      }))
+
+      api.mockImplementation(({ path }: { path: string }) => {
+        if (path.startsWith('/api/profiles/sessions/sidebar')) {
+          return Promise.reject(new Error('404: {"detail":"No such API endpoint: /api/profiles/sessions/sidebar"}'))
+        }
+
+        if (path.includes('source=cron')) {
+          return Promise.resolve({ ...emptySessionsResponse, sessions: [], total: 0 })
+        }
+
+        if (path.includes('exclude_sources=cron%2Cdesktop')) {
+          return Promise.resolve({ ...emptySessionsResponse, sessions: [], total: 0 })
+        }
+
+        return Promise.resolve({
+          ...emptySessionsResponse,
+          sessions,
+          total: 200
+          // No profile_totals — even older backend
+        })
+      })
+
+      const result = await listSidebarSessions({
+        recentsProfile: 'all',
+        recentsLimit: 50,
+        recentsExclude: ['cron', 'tool'],
+        cronLimit: 50,
+        messagingLimit: 100,
+        messagingExclude: ['cron', 'desktop']
+      })
+
+      // Global window filled: mark truncated via fallback heuristic.
+      expect(result.recents.profiles_truncated).toEqual({ default: true })
+    })
   })
 })
