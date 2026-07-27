@@ -361,6 +361,29 @@ def test_business_accepts_payment_only_after_provider_readback(treasury):
         purpose="Consulting",
         idempotency_key="invoice-1",
     )
+    assert service.create_receivable(
+        organization_id="org_1",
+        account_id=account,
+        provider="fake",
+        amount_minor=2_500,
+        currency="USD",
+        customer={"email": "buyer@example.com"},
+        customer_jurisdiction="CA-ON",
+        purpose="Consulting",
+        idempotency_key="invoice-1",
+    )["id"] == intent["id"]
+    with pytest.raises(ValueError, match="different payment parameters"):
+        service.create_receivable(
+            organization_id="org_1",
+            account_id=account,
+            provider="fake",
+            amount_minor=2_501,
+            currency="USD",
+            customer={"email": "buyer@example.com"},
+            customer_jurisdiction="CA-ON",
+            purpose="Consulting",
+            idempotency_key="invoice-1",
+        )
     assert intent["payment_url"]
     assert finance_db.account_balance(conn, account) == 0
 
@@ -532,6 +555,21 @@ def test_business_can_pay_only_against_exact_reservation(treasury):
         idempotency_key="pay-1",
     )
     assert result["status"] == "succeeded"
+    assert service.send_payable(
+        organization_id="org_1", account_id=account, objective_id="obj_1",
+        action_id="act_1", provider="fake", amount_minor=1_000,
+        currency="USD", payee={"account": "vendor"}, payee_jurisdiction="US",
+        instrument_id=instrument, merchant_category="software",
+        payee_id="vendor-1", purpose="Contract work", idempotency_key="pay-1",
+    )["id"] == result["id"]
+    with pytest.raises(ValueError, match="different payment parameters"):
+        service.send_payable(
+            organization_id="org_1", account_id=account, objective_id="obj_1",
+            action_id="act_1", provider="fake", amount_minor=999,
+            currency="USD", payee={"account": "vendor"}, payee_jurisdiction="US",
+            instrument_id=instrument, merchant_category="software",
+            payee_id="vendor-1", purpose="Contract work", idempotency_key="pay-1",
+        )
     assert conn.execute(
         "SELECT status FROM payment_spend_holds WHERE action_id=?", ("act_1",)
     ).fetchone()["status"] == "settled"

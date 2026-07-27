@@ -227,6 +227,23 @@ class PaymentService:
     ) -> dict[str, Any]:
         if amount_minor <= 0:
             raise ValueError("receivable amount must be positive")
+        existing = self._by_key(idempotency_key)
+        if existing:
+            self._assert_retry_matches(
+                existing,
+                organization_id=organization_id,
+                account_id=account_id,
+                objective_id=objective_id,
+                direction="incoming",
+                provider=provider,
+                party=customer,
+                amount_minor=amount_minor,
+                currency=currency,
+                purpose=purpose,
+                tax_minor=tax_minor,
+                tax_rule_id=tax_rule_id,
+            )
+            return existing
         assessment_id = compliance_db.authorize_payment_provider(
             self.conn,
             organization_id=organization_id,
@@ -272,9 +289,6 @@ class PaymentService:
                 raise accounting_db.AccountingError(
                     "invoice tax does not match the effective verified tax rule"
                 )
-        existing = self._by_key(idempotency_key)
-        if existing:
-            return existing
         rail = self._inbound_rail(provider)
         remote = rail.create_receivable(
             amount_minor=amount_minor,
@@ -361,6 +375,22 @@ class PaymentService:
         purpose: str,
         idempotency_key: str,
     ) -> dict[str, Any]:
+        existing = self._by_key(idempotency_key)
+        if existing:
+            self._assert_retry_matches(
+                existing,
+                organization_id=organization_id,
+                account_id=account_id,
+                objective_id=objective_id,
+                action_id=action_id,
+                direction="outgoing",
+                provider=provider,
+                party=payee,
+                amount_minor=amount_minor,
+                currency=currency,
+                purpose=purpose,
+            )
+            return existing
         reservation = self.conn.execute(
             """
             SELECT * FROM budget_reservations
@@ -389,9 +419,6 @@ class PaymentService:
             direction="outbound",
             jurisdiction=payee_jurisdiction,
         )
-        existing = self._by_key(idempotency_key)
-        if existing:
-            return existing
         remote = self._outbound_rail(provider).send_payment(
             amount_minor=amount_minor,
             currency=currency,
@@ -545,6 +572,26 @@ class PaymentService:
             "SELECT id FROM payment_intents WHERE idempotency_key = ?", (key,)
         ).fetchone()
         return self._get(row["id"]) if row else None
+
+    @staticmethod
+    def _assert_retry_matches(
+        existing: Mapping[str, Any], **expected: Any
+    ) -> None:
+        """Bind idempotency retries to the original financial intent."""
+        for field, value in expected.items():
+            actual = existing.get(field)
+            if field == "party":
+                actual = json.loads(str(existing.get("party_json") or "{}"))
+            elif field == "currency":
+                actual = str(actual or "").upper()
+                value = str(value or "").upper()
+            elif field in {"amount_minor", "tax_minor"}:
+                actual = int(actual or 0)
+                value = int(value or 0)
+            if actual != value:
+                raise ValueError(
+                    "idempotency key was reused with different payment parameters"
+                )
 
     @staticmethod
     def _validate_remote(
