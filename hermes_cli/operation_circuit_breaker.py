@@ -6,6 +6,12 @@ import sqlite3
 import time
 
 
+# A half-open probe is itself a durable lease. If the worker disappears after
+# admission, another probe may be admitted after this interval; while the
+# lease is live, concurrent workers remain fail-closed.
+HALF_OPEN_PROBE_LEASE_SECONDS = 60
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS operation_circuit_breakers (
     operation_key TEXT PRIMARY KEY, consecutive_failures INTEGER NOT NULL DEFAULT 0,
@@ -25,21 +31,53 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def assert_admissible(conn: sqlite3.Connection, operation_key: str) -> None:
     ensure_schema(conn)
+    now = int(time.time())
+    # Claim the first recovery probe atomically. A plain read followed by an
+    # update allows two workers to pass during the same cooldown boundary.
+    with conn:
+        claimed = conn.execute(
+            """UPDATE operation_circuit_breakers
+               SET state='half_open', retry_after=?, updated_at=?
+             WHERE operation_key=? AND state='open'
+               AND retry_after IS NOT NULL AND retry_after <= ?""",
+            (now + HALF_OPEN_PROBE_LEASE_SECONDS, now, operation_key, now),
+        ).rowcount
     row = conn.execute(
         "SELECT state, retry_after FROM operation_circuit_breakers WHERE operation_key = ?",
         (operation_key,),
     ).fetchone()
     if row is None or row["state"] == "closed":
         return
-    now = int(time.time())
+    if row["state"] == "half_open":
+        # The caller that changed open -> half_open owns the probe. If that
+        # probe expired without recording an outcome, atomically grant one
+        # replacement probe; otherwise reject concurrent callers.
+        if claimed:
+            return
+        retry_after = row["retry_after"]
+        if retry_after is not None and int(retry_after) <= now:
+            with conn:
+                reclaimed = conn.execute(
+                    """UPDATE operation_circuit_breakers
+                       SET retry_after=?, updated_at=?
+                     WHERE operation_key=? AND state='half_open'
+                       AND retry_after <= ?""",
+                    (
+                        now + HALF_OPEN_PROBE_LEASE_SECONDS,
+                        now,
+                        operation_key,
+                        now,
+                    ),
+                ).rowcount
+            if reclaimed:
+                return
+        raise CircuitOpenError(
+            f"circuit recovery probe is already in progress for {operation_key}"
+        )
     if row["retry_after"] is not None and int(row["retry_after"]) <= now:
-        with conn:
-            conn.execute(
-                """UPDATE operation_circuit_breakers
-                   SET state = 'half_open', updated_at = ? WHERE operation_key = ?""",
-                (now, operation_key),
-            )
-        return
+        # The conditional claim above should have handled this path. Treat a
+        # race or unexpected backend response as fail-closed.
+        raise CircuitOpenError(f"circuit recovery is contended for {operation_key}")
     raise CircuitOpenError(f"circuit is open for {operation_key}")
 
 
