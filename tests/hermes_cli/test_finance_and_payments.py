@@ -11,6 +11,21 @@ from hermes_cli import objectives_db
 from hermes_cli.payments import PaymentRail, PaymentService, ProviderPayment
 
 
+def test_finance_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    finance_db.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO treasury_accounts "
+        "(id, organization_id, name, currency, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("acct_txn", "org_txn", "operating", "USD", 1),
+    )
+    assert finance_db.ensure_schema(conn) is None
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 class FakeRail(PaymentRail):
     name = "fake"
 
