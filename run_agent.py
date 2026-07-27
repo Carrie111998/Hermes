@@ -6652,7 +6652,11 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
-        from agent.conversation_compression import compress_context
+        from agent.conversation_compression import (
+            compress_context,
+            resolve_context_compression_timeouts,
+            run_compress_context_with_progress_timeout,
+        )
         from agent.portal_tags import (
             get_conversation_context,
             reset_conversation_context,
@@ -6678,12 +6682,97 @@ class AIAgent:
             if root:
                 token = set_conversation_context(root)
         try:
-            return compress_context(
-                self, messages, system_message,
-                approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
-                force=force,
-                defer_context_engine_notification=defer_context_engine_notification,
-                commit_fence=commit_fence,
+            def _run(fence=None):
+                return compress_context(
+                    self, messages, system_message,
+                    approx_tokens=approx_tokens, task_id=task_id,
+                    focus_topic=focus_topic,
+                    force=force,
+                    defer_context_engine_notification=(
+                        defer_context_engine_notification
+                    ),
+                    commit_fence=fence,
+                )
+
+            # Callers that already own a progress-aware wait (gateway session
+            # hygiene) pass commit_fence and must not be double-wrapped.
+            if commit_fence is not None:
+                return _run(commit_fence)
+
+            idle_timeout, total_ceiling = resolve_context_compression_timeouts()
+            if idle_timeout <= 0:
+                return _run(None)
+
+            # Resolve the fallback prompt lazily on timeout only. Eager
+            # rebuild here would raise before compress_context runs whenever
+            # _cached_system_prompt is unset and _build_system_prompt fails
+            # (lock-refresher / noop-exception tests rely on that path).
+            def _fallback_prompt():
+                cached = getattr(self, "_cached_system_prompt", None)
+                if cached:
+                    return cached
+                try:
+                    return self._build_system_prompt(system_message)
+                except Exception:
+                    logger.debug(
+                        "compress_context timeout fallback prompt rebuild "
+                        "failed; using raw system_message",
+                        exc_info=True,
+                    )
+                    return system_message or ""
+
+            def _on_timeout(idle, waited, since_progress):
+                logger.warning(
+                    "Context compression made no progress for %.1fs "
+                    "(total wait %.1fs, ceiling %.1fs); continuing without "
+                    "compression",
+                    since_progress,
+                    waited,
+                    total_ceiling,
+                )
+                # Same timeout cooldown ladder as summary-LLM timeouts
+                # (#62452): avoid re-burning the full idle budget every turn.
+                compressor = getattr(self, "context_compressor", None)
+                if compressor is not None:
+                    streak = (
+                        getattr(compressor, "_consecutive_timeout_failures", 0) + 1
+                    )
+                    compressor._consecutive_timeout_failures = streak
+                    ladder = (60, 300, 900)
+                    cooldown = ladder[min(streak, len(ladder)) - 1]
+                    record = getattr(
+                        compressor, "_record_compression_failure_cooldown", None
+                    )
+                    if callable(record):
+                        try:
+                            record(
+                                float(cooldown),
+                                "host compress_context timeout "
+                                "(no summary progress)",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "failed to record compress_context timeout "
+                                "cooldown",
+                                exc_info=True,
+                            )
+                emit = getattr(self, "_emit_warning", None)
+                if callable(emit):
+                    emit(
+                        "⚠ Context compression timed out "
+                        f"after {idle:.1f}s with no output from the summary "
+                        "model. No messages were dropped — continuing without "
+                        "compression. Run /compress to retry, /new for a clean "
+                        "session, or check auxiliary.compression."
+                    )
+
+            return run_compress_context_with_progress_timeout(
+                worker=_run,
+                messages=messages,
+                system_prompt_fallback=_fallback_prompt,
+                idle_timeout_seconds=idle_timeout,
+                total_ceiling_seconds=total_ceiling,
+                on_timeout=_on_timeout,
             )
         finally:
             # Restore whatever the caller had, so a compaction never leaks its

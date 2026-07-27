@@ -1501,6 +1501,16 @@ DEFAULT_CONFIG = {
                                       # while tokens are still moving — bounds a degenerate
                                       # trickle stream. Clamped to >= hygiene_timeout_seconds.
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
+        "context_timeout_seconds": 120,  # inactivity budget for in-agent compress_context
+                                      # (conversation loop, /compress, preflight, etc.).
+                                      # Same progress-aware semantics as hygiene_timeout_seconds:
+                                      # streamed summary tokens extend the wait; only a silent
+                                      # worker is cut off. 0 = disable the owned wrapper
+                                      # (callers that already pass commit_fence, e.g. gateway
+                                      # hygiene, never use this path).
+        "context_total_ceiling_seconds": 600,  # absolute cap on in-agent compress_context wait
+                                      # even while tokens are still moving. Clamped to
+                                      # >= context_timeout_seconds when the idle budget is > 0.
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to
