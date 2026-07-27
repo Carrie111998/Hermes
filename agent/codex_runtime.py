@@ -1241,6 +1241,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
+    def _nonstream_after_null_sdk_field():
+        nonstream_kwargs = dict(api_kwargs)
+        nonstream_kwargs.pop("stream", None)
+        return active_client.responses.create(**nonstream_kwargs)
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -1258,6 +1263,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(), exc,
                 )
                 continue
+            raise
+        except TypeError as exc:
+            if "'NoneType' object is not iterable" in str(exc):
+                logger.debug(
+                    "Codex Responses stream creation hit a null SDK field; "
+                    "retrying non-streaming. %s err=%s",
+                    agent._client_log_context(), exc,
+                )
+                return _nonstream_after_null_sdk_field()
             raise
 
         # Claim the delta sink for THIS attempt (#65991) — parity with the
@@ -1314,6 +1328,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._client_log_context(), exc,
                     )
                     continue
+                raise
+            except TypeError as exc:
+                if "'NoneType' object is not iterable" in str(exc):
+                    logger.debug(
+                        "Codex Responses stream iteration hit a null SDK field; "
+                        "retrying non-streaming. %s err=%s",
+                        agent._client_log_context(), exc,
+                    )
+                    return _nonstream_after_null_sdk_field()
                 raise
 
             if final.status in {"incomplete", "failed"}:

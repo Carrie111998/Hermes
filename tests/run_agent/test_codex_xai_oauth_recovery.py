@@ -31,7 +31,7 @@ Three distinct failure modes the user community hit during rollout:
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -308,16 +308,18 @@ def test_codex_stream_nonetype_iterable_typeerror_falls_back():
     agent = _make_codex_agent()
 
     mock_client = MagicMock()
-    mock_client.responses.stream.side_effect = TypeError("'NoneType' object is not iterable")
-
     fallback_response = SimpleNamespace(output=[], status="completed")
-    with patch.object(
-        agent, "_run_codex_create_stream_fallback", return_value=fallback_response
-    ) as mock_fallback:
-        result = agent._run_codex_stream({}, client=mock_client)
+    mock_client.responses.create.side_effect = [
+        TypeError("'NoneType' object is not iterable"),
+        fallback_response,
+    ]
+
+    result = agent._run_codex_stream({}, client=mock_client)
 
     assert result is fallback_response
-    mock_fallback.assert_called_once_with({}, client=mock_client)
+    assert mock_client.responses.create.call_count == 2
+    assert "stream" in mock_client.responses.create.call_args_list[0].kwargs
+    assert "stream" not in mock_client.responses.create.call_args_list[1].kwargs
 
 
 def test_codex_create_stream_fallback_nonetype_iterable_uses_nonstream_create():
@@ -699,9 +701,8 @@ def test_codex_transport_native_codex_still_replays_reasoning_in_input():
     reasoning_items = [it for it in input_items if it.get("type") == "reasoning"]
     assert len(reasoning_items) == 1
     assert reasoning_items[0]["encrypted_content"] == "enc_blob"
-    # Native Codex can replay existing encrypted_content, but does not ask
-    # for more until the SDK handles reasoning summary=None safely.
-    assert "reasoning.encrypted_content" not in kwargs.get("include", [])
+    # Native Codex still asks for encrypted_content back.
+    assert "reasoning.encrypted_content" in kwargs.get("include", [])
 
 
 # ---------------------------------------------------------------------------
