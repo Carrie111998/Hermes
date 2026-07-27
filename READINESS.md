@@ -907,6 +907,23 @@ This remains deterministic local-provider evidence and does not establish
 production provider credentials, corporate readiness, or legal/compliance
 certification.
 
+After binding result handoff to the exact Kanban task contract and explicit
+board identity, the acceptance was rerun on current `main` commit
+`9f765b604533db48854b63acc37e5900694bef02` with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result: **current-tree agentic acceptance: PASS**. Install/bootstrap,
+readiness gating, bounded CEO execution, process-separated delegation,
+uncertain provider read-back, inbound tax settlement, durable restart
+recovery, and master-stop fencing passed. The acceptance image digest was
+`sha256:69d612c451a8a5dae63305529e13d5cca022cdc5c805c50b187c0621c1126597`.
+This remains deterministic local-provider evidence and does not establish
+production provider credentials, corporate readiness, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
