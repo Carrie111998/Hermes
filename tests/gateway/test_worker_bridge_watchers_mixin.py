@@ -90,18 +90,8 @@ STATUSES = frozenset(DEFAULT_STATUSES)
 _PENDING_STEP_8 = {
     "test_selects_only_created_and_queued": "plan gives this watcher `created`; shipped design reserves created->queued in GatewayWorkerTaskDispatcherMixin",
     "test_requeued_retry_is_dispatchable": "fixture seeds the retry task as `created`, which this watcher deliberately does not own",
-    "test_format_alert_text_failures_first_with_instructions": "auto-dispatch-aware alert wording not implemented",
-    "test_format_alert_text_includes_pending_section": "auto-dispatch-aware alert wording not implemented",
-    "test_format_alert_text_pending_only_nudge": "auto-dispatch-aware alert wording not implemented",
-    "test_tick_includes_pending_work_in_alert": "auto-dispatch-aware alert wording not implemented",
-    "test_nudge_lists_blocked_when_auto_dispatch_enabled": "auto-dispatch-aware alert wording not implemented",
-    "test_nudge_unchanged_when_auto_dispatch_disabled": "auto-dispatch-aware alert wording not implemented",
-    "test_resolve_target_uses_most_recent_session_when_unpinned": "alert-target resolution differs from the plan",
     "test_claim_marks_task_and_returns_snapshot": "runtime key is gateway_dispatch_claim, not dispatch_claim",
     "test_release_leaves_row_alone_if_live_pid_took_over": "runtime key is gateway_dispatch_claim, not dispatch_claim",
-    "test_auto_dispatch_spawns_and_audits": "spawn/audit semantics differ from the plan",
-    "test_spawn_exception_does_not_corrupt_task": "spawn/audit semantics differ from the plan",
-    "test_skip_audit_deduped_until_reason_changes": "skip-audit dedup not implemented",
 }
 
 

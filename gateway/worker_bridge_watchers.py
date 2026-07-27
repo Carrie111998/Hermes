@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import replace
 import sqlite3
 import time
 from pathlib import Path
@@ -593,7 +594,27 @@ def count_free_global_slots(db_path: Path, maximum_concurrency: int) -> int:
 
 
 def has_active_worker_tasks(db_path: Path) -> bool:
-    return count_free_global_slots(db_path, 1) == 0
+    """Is any worker task running? Gates the idle nudge, NOT dispatch capacity.
+
+    Deliberately standalone rather than ``count_free_global_slots(db_path, 1)``.
+    Sharing that helper coupled two unrelated policies: making capacity
+    leases-backed silently moved this threshold too, so a live global lease with
+    no running task row began suppressing the nudge. A capacity gate wants to
+    fail closed; a nudge wants to fire when nothing is actually running. They
+    disagree at the edges, so they get their own definitions.
+    """
+    if not db_path.exists():
+        return False
+    conn = _connect_readonly(db_path)
+    try:
+        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM tasks WHERE status IN ({placeholders})",
+            ACTIVE_STATUSES,
+        ).fetchone()
+        return int(row["count"] if row else 0) > 0
+    finally:
+        conn.close()
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -606,18 +627,37 @@ def _format_pending_section(
 ) -> list[str]:
     if not pending:
         return []
-    lines = ["", "Pending worker tasks:"]
+    # Auto-dispatch changes what this section means. Under manual dispatch it
+    # was a to-do list for a human. With the dispatcher live, pending work means
+    # the gateway HAS capacity and is choosing not to use it, so the count and
+    # the reason each task is held are the actionable facts.
+    if with_transitions:
+        lines = [
+            "",
+            f"Free worker capacity: {len(pending)} task(s) are pending dispatch.",
+        ]
+    else:
+        lines = [
+            "",
+            "Idle: no worker tasks are currently running; "
+            f"{len(pending)} task(s) are pending dispatch.",
+        ]
     for task in pending[:10]:
         reason = task.get("skip_reason")
-        suffix = f" (held: {reason})" if reason else ""
+        suffix = f" (blocked: {reason})" if reason else ""
         lines.append(
             f"- {task['task_id']} [{task.get('status', '?')}] "
             f"{_truncate(task.get('objective', ''), 120)}{suffix}"
         )
     if with_transitions:
         lines.append(
-            "Triage failures before starting unrelated pending work, then run "
-            "`hermes worker tasks start <task_id>` for work that should proceed."
+            "Triage failures before starting unrelated pending work — ack any "
+            "failures first, then run `hermes worker tasks start <task_id>`."
+        )
+    else:
+        lines.append(
+            "Triage/ack any open failures first, then run "
+            "`hermes worker tasks start <task_id>`."
         )
     return lines
 
@@ -629,8 +669,15 @@ def format_alert_text(
         "[Worker Bridge Alert — automated gateway notification, not a user message]",
         "",
     ]
-    for item in transitions:
-        icon = "✅" if item.get("status") in {"succeeded", "accepted"} else "❌"
+    # Failures first. A batch alert that opens with three green successes buries
+    # the one task that needs a human, and this text is read in a chat client
+    # where only the first lines are visible without expanding.
+    ordered = sorted(
+        transitions,
+        key=lambda item: item.get("status") in _DEP_SATISFIED_STATUSES,
+    )
+    for item in ordered:
+        icon = "✅" if item.get("status") in _DEP_SATISFIED_STATUSES else "❌"
         lines.append(
             f"{icon} {item.get('task_id')} ({item.get('worker', '?')}) "
             f"→ {item.get('status')}"
@@ -639,6 +686,11 @@ def format_alert_text(
             lines.append(f"   objective: {_truncate(item['objective'], 180)}")
         if item.get("error"):
             lines.append(f"   error: {_truncate(item['error'], 240)}")
+    if transitions:
+        lines.append(
+            "Act on each task now: run `hermes worker tasks show <task_id>` for "
+            "detail, then ack or retry."
+        )
     lines.extend(
         _format_pending_section(
             list(pending or []), with_transitions=bool(transitions)
@@ -756,14 +808,46 @@ class GatewayWorkerBridgeWatchersMixin:
         reason: Optional[str] = None,
         error: Optional[str] = None,
     ) -> None:
+        task_id = task["task_id"]
+
+        # A held task is re-evaluated every poll and holds for the same reason
+        # every time, so auditing each pass buries the events that matter under
+        # thousands of identical rows. Audit the first occurrence and each time
+        # the reason CHANGES; forget the task once it stops being skipped, so a
+        # later hold for the same reason is recorded again.
+        memo = getattr(self, "_autodispatch_skip_memo", None)
+        if memo is None:
+            memo = self._autodispatch_skip_memo = {}
+        if action == "skipped":
+            if memo.get(task_id) == reason:
+                return
+            memo[task_id] = reason
+        else:
+            memo.pop(task_id, None)
+
+        payload = {
+            "action": action,
+            "reason": reason,
+            "error": error,
+            "status": task.get("status"),
+            "status_before": task.get("status"),
+            "by": "gateway-watcher",
+            "pid": os.getpid(),
+        }
         try:
-            bridge.store.append_event(
-                "task.gateway_dispatch",
-                {"action": action, "reason": reason, "error": error},
-                task_id=task["task_id"],
-            )
+            try:
+                bridge.store.append_event(
+                    kind="task.autodispatch", payload=payload, task_id=task_id
+                )
+            except TypeError:
+                bridge.store.append_event(
+                    "task.autodispatch", payload, task_id=task_id
+                )
         except Exception:
-            logger.debug("worker dispatch audit failed", exc_info=True)
+            # Warning, not debug. This audit trail IS the record of what the
+            # gateway dispatched on its own; a silent debug-level swallow is
+            # why its absence went unnoticed.
+            logger.warning("worker dispatch audit failed", exc_info=True)
 
     async def _worker_bridge_auto_dispatch(
         self, settings: dict, *, db_path: Path, state_file: Path
@@ -774,7 +858,17 @@ class GatewayWorkerBridgeWatchersMixin:
             return 0
         now = time.time()
         last = await asyncio.to_thread(load_last_auto_dispatch, state_file)
-        if now - last < float(ad.get("interval") or DEFAULT_INTERVAL_SECONDS):
+        # `or` would turn an explicit interval of 0 into the 15 s default, so a
+        # deployment asking for "check every pass" silently got one pass per 15 s.
+        # Config already floors this at MIN_INTERVAL_SECONDS where it is resolved.
+        raw_interval = (
+            ad["interval"] if "interval" in ad else DEFAULT_INTERVAL_SECONDS
+        )
+        try:
+            dispatch_interval = float(raw_interval)
+        except (TypeError, ValueError):
+            dispatch_interval = DEFAULT_INTERVAL_SECONDS
+        if now - last < dispatch_interval:
             return 0
         await asyncio.to_thread(save_last_auto_dispatch, state_file, now)
         loaded = self._get_worker_bridge(db_path)
@@ -824,6 +918,15 @@ class GatewayWorkerBridgeWatchersMixin:
                     reason=SKIP_SPAWN_ERROR,
                     error=str(exc),
                 )
+        # Audit why each eligible-looking task was held back. Without this the
+        # audit trail records only what WAS dispatched, and "nothing dispatched
+        # and nothing logged" is indistinguishable from "the watcher is dead".
+        for task in skipped:
+            reason = task.get("skip_reason")
+            if reason:
+                self._audit_dispatch(
+                    bridge, task, action="skipped", reason=reason
+                )
         self._last_skipped_pending = skipped
         return started
 
@@ -855,7 +958,32 @@ class GatewayWorkerBridgeWatchersMixin:
             return None
         best = max(candidates, key=lambda entry: entry.updated_at or 0)
         platform = getattr(best, "platform", None) or best.origin.platform
-        return adapters[platform], best.origin
+
+        # Re-stamp the borrowed session origin with the bridge's own system
+        # identity. The candidate loop above skips origins whose user_id starts
+        # with "system:", so injecting under the human's identity would make
+        # this alert's own turn the freshest session and the watcher would keep
+        # re-selecting the channel it just wrote to.
+        origin = best.origin
+        try:
+            source = replace(
+                origin,
+                user_id="system:worker-bridge",
+                user_name="Worker Bridge",
+            )
+        except TypeError:
+            from gateway.session import SessionSource
+
+            source = SessionSource(
+                platform=origin.platform,
+                chat_id=origin.chat_id,
+                chat_name=getattr(origin, "chat_name", None),
+                chat_type=getattr(origin, "chat_type", None) or "group",
+                user_id="system:worker-bridge",
+                user_name="Worker Bridge",
+                thread_id=getattr(origin, "thread_id", None),
+            )
+        return adapters[platform], source
 
     def _resolve_worker_alert_target(self, settings: dict):
         if not settings.get("chat_id"):
@@ -1000,7 +1128,19 @@ class GatewayWorkerBridgeWatchersMixin:
             has_active_worker_tasks, db_path
         ):
             return False
-        pending = await asyncio.to_thread(collect_pending_work, db_path)
+        # Same source as the transition alert: with auto-dispatch live, the
+        # useful nudge is "these are the tasks the dispatcher declined, and
+        # why", not a bare list of everything queued. Without it, the operator
+        # sees pending work and free capacity and cannot tell which guard held
+        # it back.
+        if (settings.get("auto_dispatch") or {}).get("enabled"):
+            pending = list(getattr(self, "_last_skipped_pending", []) or [])
+            if not pending:
+                _, pending = await asyncio.to_thread(
+                    select_dispatchable_tasks, db_path, 0
+                )
+        else:
+            pending = await asyncio.to_thread(collect_pending_work, db_path)
         if not pending:
             return False
         target = self._resolve_worker_alert_target(settings)
