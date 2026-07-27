@@ -14938,6 +14938,23 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
     return disabled_count
 
 
+# ponytail: dedicated 2-worker pool isolates the thread leak (asyncio can't
+# cancel a thread mid-walk) from the default executor. Under repeated timeouts
+# only 2 walker threads leak, not the full default pool. multiprocessing.Process
+# was rejected: it requires pickling profile state across the process boundary
+# and adds ~50ms fork overhead per request.
+_LIST_PROFILES_POOL: "concurrent.futures.ThreadPoolExecutor | None" = None
+
+
+def _get_list_profiles_pool() -> "concurrent.futures.ThreadPoolExecutor":
+    global _LIST_PROFILES_POOL
+    if _LIST_PROFILES_POOL is None:
+        _LIST_PROFILES_POOL = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="profiles-walk"
+        )
+    return _LIST_PROFILES_POOL
+
+
 @app.get("/api/profiles")
 async def list_profiles_endpoint():
     from hermes_cli import profiles as profiles_mod
@@ -14950,7 +14967,7 @@ async def list_profiles_endpoint():
         # hangs; the matching apps/desktop renderer timeout (PROFILES_REQUEST_TIMEOUT_MS
         # = 120s) is the ceiling for that fallback response.
         profiles = await asyncio.wait_for(
-            loop.run_in_executor(None, profiles_mod.list_profiles),
+            loop.run_in_executor(_get_list_profiles_pool(), profiles_mod.list_profiles),
             timeout=30.0,
         )
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
