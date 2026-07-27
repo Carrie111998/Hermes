@@ -19,7 +19,7 @@ python scripts/check_patch_ledger.py
 That check fails if a local commit is missing here, which is what stops the
 ledger quietly rotting while the fork keeps diverging.
 
-**Status at last update:** 25 local commits; `origin/main` is 102 commits
+**Status at last update:** 28 local commits; `origin/main` is 114 commits
 ahead. Nothing has been pushed.
 
 ## Classification
@@ -69,6 +69,9 @@ None submitted yet — pushing requires authorization.
 | `6c41512b0` | reasoning-effort probe findings |
 | `2484ec0a0`, `6cd47d16e` | worker auto-dispatch guards for this deployment |
 | `0e32d21f1`, `f66dfbdee` | stop test artifacts leaking into the repo root |
+| `7f9e41aaf` | this ledger, its drift check, and `scripts/safe_update.py` |
+| `d9f3996d8` | behavioral evaluation harness + `.github/workflows/hermes-audit-guards.yml` |
+| `6fab15b17` | FakeRunner composes the ultra mixin; XFAIL disposition recorded |
 
 ## test-only
 
