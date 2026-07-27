@@ -33,6 +33,14 @@ from agent.message_content import flatten_message_text
 # success from "there is output" reports the crash as a completion.
 CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
 
+# The turn-exit reason for "model never produced visible text". Consumers must
+# key on this rather than on the "(empty)" literal: conversation_loop delivers
+# this same terminal as a labeled reasoning excerpt whenever the model DID
+# think but emitted no answer, so the literal only covers the no-reasoning
+# half. Matching the string alone let a reasoning-only child read as a normal
+# answer — non-empty, not a crash prefix — and report success.
+EMPTY_TERMINAL_EXIT_REASON = "empty_response_exhausted"
+
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
@@ -479,7 +487,11 @@ def finalize_turn(
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
-                _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
+                _is_empty_terminal = (
+                    _stripped == ""
+                    or _stripped == "(empty)"
+                    or str(_turn_exit_reason) == EMPTY_TERMINAL_EXIT_REASON
+                )
                 # A short fragment that is not a normal text_response exit
                 # and lacks sentence-ending punctuation is treated as a
                 # truncated partial (the "The" case from #34452).

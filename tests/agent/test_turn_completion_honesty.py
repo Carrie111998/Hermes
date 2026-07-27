@@ -164,3 +164,90 @@ def test_max_iterations_child_is_still_completed():
     assert not str("max_iterations_reached(60)").startswith(
         turn_finalizer.CRASH_EXIT_PREFIXES
     )
+
+
+# ── a reasoning-only child is not a completion either ────────────────────────
+#
+# Upstream 214ae7b77 made the empty terminal deliver a labeled reasoning
+# excerpt instead of the "(empty)" sentinel whenever the model DID think but
+# produced no answer. That is a delivery improvement for a human reader, but
+# delegate_tool consumes the same field programmatically: the banner is
+# non-empty and is not a crash prefix, so the child reported status="completed"
+# and handed the parent raw chain-of-thought as the delegated result.
+
+_BANNER = (
+    "\u26a0\ufe0f The model produced only internal reasoning and no final "
+    "answer, despite retries and fallback. Its last reasoning, which may "
+    "contain the answer:\n\nthe user probably wants me to..."
+)
+
+
+def _delegate_status_for(summary: str, exit_reason: str, *,
+                         interrupted: bool = False) -> str:
+    """Evaluate delegate_tool's status rule in isolation.
+
+    _run_single_child is 660 lines and needs a live child agent, so this is a
+    reproduction of its rule, not the rule itself. What binds the two is
+    test_delegate_tool_consults_the_empty_terminal_exit_reason below — that is
+    the test which fails if the fix is reverted. These cases document the rule.
+    """
+    empty_sentinel = (
+        summary.strip() == "(empty)"
+        or str(exit_reason) == turn_finalizer.EMPTY_TERMINAL_EXIT_REASON
+    )
+    crashed = str(exit_reason).startswith(turn_finalizer.CRASH_EXIT_PREFIXES)
+    if interrupted:
+        return "interrupted"
+    if crashed:
+        return "failed"
+    if summary and not empty_sentinel:
+        return "completed"
+    return "failed"
+
+
+def test_delegate_tool_consults_the_empty_terminal_exit_reason():
+    """The binding test: delegate_tool must key on the exit reason, not just on
+    the "(empty)" literal, or the reasoning-excerpt half of the terminal reads
+    as a normal answer."""
+    import tools.delegate_tool as dt
+
+    src = inspect.getsource(dt)
+    assert "EMPTY_TERMINAL_EXIT_REASON" in src, (
+        "delegate_tool no longer consults the empty-terminal exit reason — a "
+        "child that produced only reasoning is reported as completed again"
+    )
+
+
+def test_reasoning_only_child_is_not_completed():
+    assert _delegate_status_for(_BANNER, "empty_response_exhausted") == "failed", (
+        "a child that produced only internal reasoning reported completed — "
+        "the parent proceeds with chain-of-thought as the delegated result"
+    )
+
+
+def test_bare_empty_sentinel_child_is_still_not_completed():
+    """The pre-existing half of the same terminal must keep failing."""
+    assert _delegate_status_for("(empty)", "empty_response_exhausted") == "failed"
+
+
+def test_a_real_answer_is_still_completed():
+    """Deliberate non-change: the exit reason only fires on the empty terminal."""
+    assert _delegate_status_for("Here is the answer.", "text_response(done)") == "completed"
+
+
+def test_banner_and_sentinel_share_one_exit_reason():
+    """Producer contract: conversation_loop must not give the reasoning-excerpt
+    branch its own exit reason, or consumers keying on it silently stop
+    matching. Guards against upstream drift, not a current regression."""
+    from agent import conversation_loop
+
+    src = inspect.getsource(conversation_loop)
+    start = src.index('_turn_exit_reason = "empty_response_exhausted"')
+    block = src[start:src.index("\n                    break", start)]
+    assert "only internal reasoning and " in block, (
+        "the reasoning-excerpt banner moved out of the empty-terminal block"
+    )
+    assert block.count("_turn_exit_reason =") == 1, (
+        "the empty terminal now assigns more than one exit reason; consumers "
+        "keying on EMPTY_TERMINAL_EXIT_REASON will miss a branch"
+    )

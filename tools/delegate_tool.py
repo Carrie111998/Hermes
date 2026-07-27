@@ -2313,7 +2313,19 @@ def _run_single_child(
         # transport bug (misrouted provider, adapter returning empty
         # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
         # it instead of silently accepting zero-content "success".
-        _empty_sentinel = summary.strip() == "(empty)"
+        # Keyed on the exit reason as well as the literal: when the child DID
+        # produce reasoning but no answer, conversation_loop delivers this same
+        # terminal as a labeled "⚠️ ...only internal reasoning..." excerpt
+        # rather than the sentinel. That text is non-empty and is not a crash
+        # prefix, so matching the literal alone reported a child that never
+        # answered as status="completed", handing the parent raw
+        # chain-of-thought as if it were the delegated result.
+        from agent.turn_finalizer import EMPTY_TERMINAL_EXIT_REASON
+
+        _empty_sentinel = (
+            summary.strip() == "(empty)"
+            or str(result.get("turn_exit_reason") or "") == EMPTY_TERMINAL_EXIT_REASON
+        )
 
         # A crashed child is not a completed one. conversation_loop writes an
         # apology into final_response on a crash exit, which is a non-empty

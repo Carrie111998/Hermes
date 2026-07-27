@@ -217,3 +217,46 @@ session nearly re-did them. Mapping, so it does not:
 reconciliation tool that reads git is only as good as what the commits say, and
 the cost of omitting it is two sessions doing the same work — which already
 happened for H-01, H-05, H-24 and H-25.
+
+## H-26 — reasoning-only child reported as completed (post-merge regression)
+
+Found by the independent review of the 160-commit upstream merge, verified by
+reading both ends of the chain.
+
+Upstream `214ae7b77` improved the empty terminal: when the model *did* think but
+produced no visible answer, `conversation_loop` now delivers a labeled
+"⚠️ ...only internal reasoning..." excerpt instead of the bare `(empty)`
+sentinel. For a human reader that is strictly better. But `delegate_tool`
+consumes the same field programmatically, and its H-01 fix detected a no-answer
+child by matching the literal `"(empty)"`. The banner is non-empty and is not a
+crash prefix, so a delegated child that never answered came back to the parent
+as `status="completed"` — with raw chain-of-thought as the delegated result.
+
+The literal only ever covered the no-reasoning half of the terminal. The exit
+reason `empty_response_exhausted` is set unconditionally at
+`conversation_loop.py:6410`, *above* the branch that picks banner vs sentinel,
+so it is the signal that holds for both. Promoted to
+`turn_finalizer.EMPTY_TERMINAL_EXIT_REASON` — a sibling of `CRASH_EXIT_PREFIXES`,
+which exists as a module-level constant for exactly this "two consumers must
+agree" reason — and both real consumers now key on it:
+
+| Consumer | Change |
+|---|---|
+| `tools/delegate_tool.py` `_empty_sentinel` | ORs the exit reason. **This was the live bug.** |
+| `agent/turn_finalizer.py` `_is_empty_terminal` | ORs the exit reason, so the completion explainer still flags a no-answer turn |
+| `gateway/run.py:14307` | **deliberately unchanged** — that branch exists to turn the raw sentinel into a friendly message, and upstream's banner already *is* one |
+
+Tests: `tests/agent/test_turn_completion_honesty.py`. Only
+`test_delegate_tool_consults_the_empty_terminal_exit_reason` binds the fix —
+reverting the patch fails that test and nothing else. The three rule cases
+reproduce the classification (`_run_single_child` is 660 lines and needs a live
+child agent) and therefore document behaviour rather than detect drift in it;
+this is the same known limitation as the pre-existing `_completed_for` helper
+above them, and is stated in the helper's docstring rather than left implied.
+`test_banner_and_sentinel_share_one_exit_reason` guards the producer contract
+against future upstream drift — it does not fail today.
+
+Regression class worth noting for the next merge: an upstream change that is
+purely cosmetic *at the point of edit* can still be semantic at a consumer that
+parses the same field. String-literal coupling between a producer and a distant
+consumer is the thing to grep for, not the diff's own line count.
