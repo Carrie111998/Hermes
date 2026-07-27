@@ -668,7 +668,31 @@ class ClaudeVisibilityCoordinator:
                 )
             return result
 
-        discovery = self.continuous_once() if discover_continuous else None
+        status_before_discovery: Mapping[str, Any] | None = None
+        if discover_continuous:
+            try:
+                status_before_discovery = self._store.claude_visibility_status(
+                    float(self._clock())
+                )
+                open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(
+                    status_before_discovery
+                )
+            except Exception:
+                return recorded(
+                    ClaudeVisibilityRunResult(
+                        enabled=True,
+                        status="degraded",
+                        degraded=True,
+                        error_code="claim_failed",
+                    )
+                )
+            discovery = (
+                None
+                if open_reasons or fatal_reasons
+                else self.continuous_once()
+            )
+        else:
+            discovery = None
         if discovery is not None and discovery.degraded:
             discovery_error = (
                 discovery.fatal_reasons[0]
@@ -686,7 +710,11 @@ class ClaudeVisibilityCoordinator:
             )
         policy = self._config.claude_visibility
         try:
-            status = self._store.claude_visibility_status(float(self._clock()))
+            status = (
+                status_before_discovery
+                if discovery is None and status_before_discovery is not None
+                else self._store.claude_visibility_status(float(self._clock()))
+            )
             _open, fatal_reasons = _claude_visibility_enqueue_gates(status)
             if fatal_reasons:
                 return recorded(

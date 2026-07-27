@@ -472,6 +472,26 @@ def test_run_once_claims_once_and_calls_registrar_once_only_for_claim() -> None:
     ]
 
 
+def test_continuous_run_processes_open_retry_before_new_discovery() -> None:
+    claim = ClaudeVisibilityClaim(status="claimed", lease_kind="launch", job_id="job")
+    store = FakeStore(claim=claim)
+    store.raw_status["counts"]["claude_retry"] = 1
+    registrar = FakeRegistrar()
+    coordinator, inventory_calls = _coordinator(
+        [_source("newer")],
+        store=store,
+        registrar=registrar,
+        config=_config(continuous=True),
+    )
+
+    result = coordinator.run_once(discover_continuous=True)
+
+    assert result.status == "visible"
+    assert inventory_calls == []
+    assert store.claim_calls == 1
+    assert registrar.claims == [claim]
+
+
 def test_run_once_passes_configured_max_attempts_and_records_limits() -> None:
     class InspectingStore(FakeStore):
         def claim_claude_visibility_job(self, *args):
