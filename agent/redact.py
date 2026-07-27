@@ -68,6 +68,16 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
 
+
+def redaction_enabled() -> bool:
+    """Return the process-snapshotted secret-redaction policy.
+
+    Streaming and subprocess boundaries need to know whether it is safe to
+    emit partial text at all.  Keeping that decision here avoids duplicating
+    the environment parsing (and its import-time snapshot semantics).
+    """
+    return _REDACT_ENABLED
+
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
     r"sk-[A-Za-z0-9_-]{10,}",           # OpenAI / OpenRouter / Anthropic (sk-ant-*)

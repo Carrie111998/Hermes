@@ -66,7 +66,30 @@ def _deterministic_call_id(item_type: str, item_id: str) -> str:
 
 def _format_tool_args(d: dict) -> str:
     """Format a dict as JSON the way Hermes' existing tool_calls path does."""
-    return json.dumps(d, ensure_ascii=False, sort_keys=True)
+    rendered = json.dumps(d, ensure_ascii=False, sort_keys=True)
+    return _redact_projected_text(rendered)
+
+
+def _redact_projected_text(content: Any, *, command: str | None = None) -> str:
+    """Scrub a Codex-owned item before it enters Hermes UI/history.
+
+    Codex app-server executes built-in tools outside Hermes' normal
+    ``terminal_tool``/``model_tools`` path.  Projection is therefore the first
+    Hermes-owned egress boundary for completed command, MCP, dynamic-tool, and
+    assistant content.  Fail closed if the redactor itself is unavailable:
+    losing one diagnostic is preferable to persisting a credential.
+    """
+    text = "" if content is None else str(content)
+    try:
+        if command is not None:
+            from agent.redact import redact_terminal_output
+
+            return redact_terminal_output(text, command)
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text)
+    except Exception:
+        return "«redacted-output-unavailable»"
 
 
 def _bounded_tool_output(content: Any) -> str:
@@ -147,10 +170,12 @@ class CodexEventProjector:
     # ---------- per-type projections ----------
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
-        text = item.get("text") or ""
+        text = _redact_projected_text(item.get("text") or "")
         msg: dict[str, Any] = {"role": "assistant", "content": text}
         if self._pending_reasoning:
-            msg["reasoning"] = "\n".join(self._pending_reasoning)
+            msg["reasoning"] = _redact_projected_text(
+                "\n".join(self._pending_reasoning)
+            )
             self._pending_reasoning = []
         return ProjectionResult(messages=[msg], final_text=text)
 
@@ -190,12 +215,18 @@ class CodexEventProjector:
             ],
         }
         if self._pending_reasoning:
-            assistant_msg["reasoning"] = "\n".join(self._pending_reasoning)
+            assistant_msg["reasoning"] = _redact_projected_text(
+                "\n".join(self._pending_reasoning)
+            )
             self._pending_reasoning = []
         output = item.get("aggregatedOutput") or ""
         exit_code = item.get("exitCode")
         if exit_code is not None and exit_code != 0:
             output = f"[exit {exit_code}]\n{output}"
+        output = _redact_projected_text(
+            output,
+            command=str(item.get("command") or ""),
+        )
         output = _bounded_tool_output(output)
         tool_msg = {
             "role": "tool",
@@ -232,7 +263,9 @@ class CodexEventProjector:
             ],
         }
         if self._pending_reasoning:
-            assistant_msg["reasoning"] = "\n".join(self._pending_reasoning)
+            assistant_msg["reasoning"] = _redact_projected_text(
+                "\n".join(self._pending_reasoning)
+            )
             self._pending_reasoning = []
         status = item.get("status") or "unknown"
         n = len(changes_summary)
@@ -272,7 +305,9 @@ class CodexEventProjector:
             ],
         }
         if self._pending_reasoning:
-            assistant_msg["reasoning"] = "\n".join(self._pending_reasoning)
+            assistant_msg["reasoning"] = _redact_projected_text(
+                "\n".join(self._pending_reasoning)
+            )
             self._pending_reasoning = []
         result = item.get("result")
         error = item.get("error")
@@ -282,7 +317,7 @@ class CodexEventProjector:
             content = json.dumps(result, ensure_ascii=False)[:4000]
         else:
             content = ""
-        content = _bounded_tool_output(content)
+        content = _bounded_tool_output(_redact_projected_text(content))
         tool_msg = {
             "role": "tool",
             "tool_call_id": call_id,
@@ -318,7 +353,9 @@ class CodexEventProjector:
             ],
         }
         if self._pending_reasoning:
-            assistant_msg["reasoning"] = "\n".join(self._pending_reasoning)
+            assistant_msg["reasoning"] = _redact_projected_text(
+                "\n".join(self._pending_reasoning)
+            )
             self._pending_reasoning = []
         content_items = item.get("contentItems") or []
         if isinstance(content_items, list) and content_items:
@@ -326,7 +363,7 @@ class CodexEventProjector:
         else:
             success = item.get("success")
             content = f"success={success}"
-        content = _bounded_tool_output(content)
+        content = _bounded_tool_output(_redact_projected_text(content))
         tool_msg = {
             "role": "tool",
             "tool_call_id": call_id,
@@ -343,6 +380,7 @@ class CodexEventProjector:
             payload = json.dumps(item, ensure_ascii=False)[:1500]
         except (TypeError, ValueError):
             payload = repr(item)[:1500]
+        payload = _redact_projected_text(payload)
         return ProjectionResult(
             messages=[
                 {

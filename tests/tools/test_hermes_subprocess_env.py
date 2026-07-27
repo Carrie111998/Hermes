@@ -100,6 +100,16 @@ class TestInheritCredentials:
     def test_pythonutf8_set_when_inheriting(self):
         assert _build(inherit_credentials=True).get("PYTHONUTF8") == "1"
 
+    def test_unregistered_secret_value_is_not_inherited_by_model_child(self):
+        secret = "sk-" + ("s1canary" * 6)
+        result = _build(
+            {**_PROVIDER_SAMPLE, "UNRELATED_CANARY": secret},
+            inherit_credentials=True,
+        )
+        assert "UNRELATED_CANARY" not in result
+        for var in _PROVIDER_SAMPLE:
+            assert var in result
+
 
 class TestTierInvariants:
     def test_tier1_always_stripped_both_paths(self):

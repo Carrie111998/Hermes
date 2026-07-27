@@ -47,7 +47,8 @@ def _recording_agent():
     return agent, calls
 
 
-def test_agent_message_and_reasoning_deltas_are_forwarded_live():
+def test_agent_message_and_reasoning_deltas_are_forwarded_live(monkeypatch):
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
     agent, calls = _recording_agent()
     bridge = make_codex_app_server_event_bridge(agent)
 

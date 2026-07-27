@@ -228,7 +228,10 @@ class TestCodexItemCompletionPayload:
 
 
 class TestStreamDeltaDispatch:
-    def test_agent_message_delta_fires_stream_delta(self):
+    def test_agent_message_delta_fires_stream_delta_when_redaction_disabled(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
         bridge({"method": "item/agentMessage/delta",
@@ -246,20 +249,35 @@ class TestStreamDeltaDispatch:
         bridge({"method": "item/agentMessage/delta", "params": {}})
         agent._fire_stream_delta.assert_not_called()
 
-    def test_text_field_used_when_delta_missing(self):
+    def test_text_field_used_when_delta_missing(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
         bridge({"method": "item/agentMessage/delta",
                 "params": {"text": "fallback"}})
         agent._fire_stream_delta.assert_called_once_with("fallback")
 
-    def test_reasoning_delta_fires_reasoning_callback(self):
+    def test_reasoning_delta_fires_reasoning_callback(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
         bridge({"method": "item/reasoning/delta",
                 "params": {"delta": "thinking..."}})
         agent._fire_reasoning_delta.assert_called_once_with("thinking...")
         agent._fire_stream_delta.assert_not_called()
+
+    def test_secure_mode_withholds_unredactable_stream_chunks(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "item/agentMessage/delta",
+                "params": {"delta": "sk-"}})
+        bridge({"method": "item/agentMessage/delta",
+                "params": {"delta": "split-secret-body"}})
+        bridge({"method": "item/reasoning/delta",
+                "params": {"delta": "sk-reasoning-secret"}})
+        agent._fire_stream_delta.assert_not_called()
+        agent._fire_reasoning_delta.assert_not_called()
 
 
 class TestToolProgressDispatch:
@@ -305,6 +323,20 @@ class TestToolProgressDispatch:
         assert completed.kwargs["duration"] == pytest.approx(0.042)
         assert completed.kwargs["is_error"] is False
         assert completed.kwargs["result"] == "hi\n"
+
+    def test_command_completion_secret_is_redacted_from_callbacks(self):
+        secret = "sk-" + ("s1canary" * 6)
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "commandExecution",
+            "id": "exec-secret",
+            "command": "printenv S1_REDACTION_CANARY",
+            "exitCode": 0,
+            "aggregatedOutput": secret,
+        }))
+        completed = agent.tool_progress_callback.call_args
+        assert secret not in completed.kwargs["result"]
 
     def test_nonzero_exit_marks_completion_error(self):
         agent = _make_stub_agent()

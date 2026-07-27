@@ -335,20 +335,40 @@ def _codex_item_to_args(item: dict) -> dict:
     _project_mcp_tool_call / _project_dynamic_tool_call shapes."""
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
-        return {"command": item.get("command") or "",
+        args = {"command": item.get("command") or "",
                 "cwd": item.get("cwd") or ""}
+        return _redact_codex_event_value(args)
     if item_type == "fileChange":
-        return {"changes": [
+        return _redact_codex_event_value({"changes": [
             {"kind": (c.get("kind") or {}).get("type") or "update",
              "path": c.get("path") or ""}
             for c in (item.get("changes") or []) if isinstance(c, dict)
-        ]}
+        ]})
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         args = item.get("arguments") or {}
-        return args if isinstance(args, dict) else {"arguments": args}
+        args = args if isinstance(args, dict) else {"arguments": args}
+        return _redact_codex_event_value(args)
     if item_type == "webSearch":
-        return {"query": item.get("query") or ""}
+        return _redact_codex_event_value(
+            {"query": item.get("query") or ""}
+        )
     return {}
+
+
+def _redact_codex_event_value(value: Any) -> Any:
+    """Recursively scrub Codex event material before UI callbacks receive it."""
+    from agent.redact import redact_sensitive_text
+
+    if isinstance(value, str):
+        try:
+            return redact_sensitive_text(value)
+        except Exception:
+            return "«redacted-output-unavailable»"
+    if isinstance(value, dict):
+        return {key: _redact_codex_event_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_codex_event_value(item) for item in value]
+    return value
 
 
 def _codex_item_to_preview(item: dict) -> Any:
@@ -357,7 +377,7 @@ def _codex_item_to_preview(item: dict) -> Any:
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
         cmd = item.get("command") or ""
-        return cmd[:120] if cmd else None
+        return _redact_codex_event_value(cmd[:120]) if cmd else None
     if item_type == "fileChange":
         paths = [c.get("path") for c in (item.get("changes") or [])
                  if isinstance(c, dict) and c.get("path")]
@@ -366,18 +386,20 @@ def _codex_item_to_preview(item: dict) -> Any:
         preview = ", ".join(paths[:3])
         if len(paths) > 3:
             preview += f", +{len(paths) - 3} more"
-        return preview
+        return _redact_codex_event_value(preview)
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         args = item.get("arguments") or {}
         if not isinstance(args, dict) or not args:
             return None
         try:
-            return json.dumps(args, ensure_ascii=False)[:120]
+            return _redact_codex_event_value(
+                json.dumps(args, ensure_ascii=False)[:120]
+            )
         except (TypeError, ValueError):
             return None
     if item_type == "webSearch":
         query = item.get("query") or ""
-        return query[:120] if query else None
+        return _redact_codex_event_value(query[:120]) if query else None
     return None
 
 
@@ -392,24 +414,39 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         is_error = bool(exit_code is not None and exit_code != 0)
         if is_error:
             out = f"[exit {exit_code}]\n{out}"
+        from agent.redact import redact_terminal_output
+
+        try:
+            out = redact_terminal_output(
+                out,
+                str(item.get("command") or ""),
+            )
+        except Exception:
+            out = "«redacted-output-unavailable»"
         return out, is_error
     if item_type == "fileChange":
         status = item.get("status") or "unknown"
         n = len(item.get("changes") or [])
         return (
-            f"apply_patch status={status}, {n} change(s)",
+            _redact_codex_event_value(
+                f"apply_patch status={status}, {n} change(s)"
+            ),
             status not in {"completed", "applied", "success"},
         )
     if item_type == "mcpToolCall":
         error = item.get("error")
         if error:
             return (
-                f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}",
+                _redact_codex_event_value(
+                    f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+                ),
                 True,
             )
         result = item.get("result")
         return (
-            json.dumps(result, ensure_ascii=False)[:4000]
+            _redact_codex_event_value(
+                json.dumps(result, ensure_ascii=False)[:4000]
+            )
             if result is not None else "",
             False,
         )
@@ -417,11 +454,15 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         content_items = item.get("contentItems") or []
         if isinstance(content_items, list) and content_items:
             return (
-                json.dumps(content_items, ensure_ascii=False)[:4000],
+                _redact_codex_event_value(
+                    json.dumps(content_items, ensure_ascii=False)[:4000]
+                ),
                 not bool(item.get("success", True)),
             )
         success = item.get("success", True)
-        return f"success={success}", not bool(success)
+        return _redact_codex_event_value(
+            f"success={success}"
+        ), not bool(success)
     return "", False
 
 
@@ -544,6 +585,14 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        # A credential can be split across arbitrary streaming chunks.  Once
+        # any prefix bytes have been emitted no completed-text redactor can
+        # claw them back, so secure mode withholds raw deltas and emits only
+        # the completed, fully-redacted assistant item.
+        from agent.redact import redaction_enabled
+
+        if redaction_enabled():
+            return
         fn = getattr(agent, "_fire_stream_delta", None)
         if fn is None:
             return
@@ -556,6 +605,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        from agent.redact import redaction_enabled
+
+        if redaction_enabled():
+            return
         fn = getattr(agent, "_fire_reasoning_delta", None)
         if fn is None:
             return
@@ -565,7 +618,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
 
     def _fire_agent_message_completed(item: dict) -> None:
-        text = item.get("text") or ""
+        text = _redact_codex_event_value(item.get("text") or "")
         if not isinstance(text, str) or not text.strip():
             return
         # display.show_commentary=false — mid-turn narration stays off the

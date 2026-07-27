@@ -152,6 +152,23 @@ class TestCommandExecutionProjection:
         assert "OUTPUT TRUNCATED" in tool_message["content"]
         assert "900 chars omitted" in tool_message["content"]
 
+    def test_command_output_secret_is_redacted_before_projection(self) -> None:
+        secret = "sk-" + ("s1canary" * 6)
+        item = {
+            **COMMAND_EXEC_COMPLETED["params"]["item"],
+            "command": "printenv S1_REDACTION_CANARY",
+            "aggregatedOutput": secret + "\n",
+        }
+        notification = {
+            "method": "item/completed",
+            "params": {**COMMAND_EXEC_COMPLETED["params"], "item": item},
+        }
+
+        messages = CodexEventProjector().project(notification).messages
+
+        assert secret not in messages[1]["content"]
+        assert secret not in messages[0]["tool_calls"][0]["function"]["arguments"]
+
 
 class TestAgentMessageProjection:
     """assistant text → final_text + assistant message."""
@@ -198,6 +215,22 @@ class TestAgentMessageProjection:
             "type": "agentMessage", "id": "b", "text": "second"}}}).messages[0]
         assert "reasoning" in first
         assert "reasoning" not in second
+
+    def test_agent_echo_secret_is_redacted_before_final_and_history(self) -> None:
+        secret = "sk-" + ("s1canary" * 6)
+        result = CodexEventProjector().project({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "agentMessage",
+                    "id": "secret-echo",
+                    "text": secret,
+                }
+            },
+        })
+
+        assert secret not in result.final_text
+        assert secret not in result.messages[0]["content"]
 
 
 class TestFileChangeProjection:

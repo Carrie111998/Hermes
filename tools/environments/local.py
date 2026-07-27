@@ -605,6 +605,34 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
         # Tier 2 — strip provider/tool credentials unless explicitly inherited.
         for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
             env.pop(key, None)
+    else:
+        # A model-driving child needs the explicitly catalogued provider/tool
+        # credentials above, but it does not need arbitrary secret-looking
+        # values inherited from Hermes' ambient process environment.  Codex
+        # app-server executes its own shell commands inside the backing model
+        # thread, before Hermes can project/redact their output.  Removing
+        # recognizable credentials here is therefore the only boundary that
+        # keeps an opaque ambient variable (for example a CI canary whose value
+        # is an sk-* token) out of that model context in the first place.
+        #
+        # Preserve catalogued credentials so the child can still authenticate;
+        # all other values are tested with the same central redactor used for
+        # logs and tool output.  Redaction-disabled sessions retain the prior
+        # passthrough behavior because redact_sensitive_text() is then a no-op.
+        try:
+            from agent.redact import redact_sensitive_text
+
+            for key, value in list(env.items()):
+                if key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+                    continue
+                value_text = str(value)
+                if redact_sensitive_text(value_text) != value_text:
+                    env.pop(key, None)
+        except Exception:
+            # Existing explicit blocklists remain in force if the optional
+            # content classifier cannot load; never broaden credential
+            # inheritance as an error recovery mechanism.
+            pass
 
     # Windows UTF-8 safety for spawned processes (#31420).
     env.setdefault("PYTHONUTF8", "1")
