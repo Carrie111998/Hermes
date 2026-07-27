@@ -1453,6 +1453,28 @@ This remains deterministic local-provider evidence and does not establish
 production Home Assistant credentials, device safety, or external
 authorization.
 
+## Feishu comment authority evidence (33d8f5a97e)
+
+Feishu document comment replies and additions now require separate
+operation-specific permits before provider dispatch. Each target resource is
+the SHA-256 digest of the exact operation, document token, comment ID when
+applicable, file type, and content, so a permit cannot be replayed against a
+different document or payload.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/feishu_drive_tool.py tests/tools/test_feishu_tools.py
+uv run --extra dev pytest -q tests/tools/test_feishu_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **7 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:5cf406577525cc58315fa713efc753a023e7829bb4a94dc2c285614db5c3187e`.
+This remains deterministic local-provider evidence and does not establish
+production Feishu credentials, permissions, or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

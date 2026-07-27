@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Feishu document comment replies and additions now require separate,
+  operation-specific permits bound to the exact document, comment (when
+  applicable), content, and file type before any provider POST.
 - Added `business payment-rails --check`, a read-only machine-check contract
   that returns non-zero when a discovered inbound or outbound rail is
   unavailable, without attempting money movement.

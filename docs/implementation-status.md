@@ -48,6 +48,9 @@ acceptance evidence.
   compatible when no execution contract is present.
 - Home Assistant device-control calls are governed per exact instance and
   service payload before REST dispatch; read-only discovery remains separate.
+- Feishu document comment replies and additions are governed separately and
+  bound to the exact document, comment (when applicable), content, and file
+  type before provider dispatch.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,
