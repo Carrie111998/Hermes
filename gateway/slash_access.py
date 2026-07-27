@@ -34,8 +34,15 @@ included here — only the slash-command access split.
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Iterable, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Pattern matching unresolved ${VAR} references that survived env-var expansion.
+_UNRESOLVED_VAR_RE = re.compile(r"^\$\{[^}]+\}$")
 
 
 # Slash commands that MUST stay reachable for any allowed user, even when
@@ -96,6 +103,10 @@ def _coerce_id_list(raw: Any) -> FrozenSet[str]:
 
     Accepts ``None``, list, tuple, or comma-separated string. Stringifies
     each entry and strips whitespace; empty entries are dropped.
+
+    Logs a warning for entries that look like unresolved ``${VAR}`` references
+    (defense-in-depth for #72096 — the primary fix is env-var expansion in
+    ``load_gateway_config()``).
     """
     if raw is None:
         return frozenset()
@@ -110,6 +121,14 @@ def _coerce_id_list(raw: Any) -> FrozenSet[str]:
     for it in items:
         s = str(it).strip()
         if s:
+            if _UNRESOLVED_VAR_RE.match(s):
+                logger.warning(
+                    "Unresolved env-var reference %r in admin/user id list — "
+                    "the referenced variable is not set. This entry will never "
+                    "match a real user. Fix: set %s in your .env or config.",
+                    s,
+                    s,
+                )
             out.append(s)
     return frozenset(out)
 
