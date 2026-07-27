@@ -1287,6 +1287,27 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production browser-provider isolation or external authorization.
 
+## Raw CDP authority evidence (f07b40c700)
+
+The raw `browser_cdp` escape hatch now requires `browser.cdp` plus an exact
+resource of the form `browser-cdp:<session>:<method>`, with target and frame
+identifiers included when supplied. This prevents a governed worker from
+using direct CDP to bypass the operation-specific browser tools.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/browser_cdp_tool.py tests/tools/test_browser_cdp_tool.py
+uv run --extra dev pytest -q tests/tools/test_browser_cdp_tool.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **26 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:b50fade653fadc28c724dee30efb50a8c53b69ba3e89dbae0373092d983d0153`.
+This remains deterministic local-provider evidence and does not establish
+production CDP endpoint isolation or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

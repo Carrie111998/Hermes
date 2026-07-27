@@ -42,6 +42,9 @@
   an exact browser-session resource. Navigation remains URL-scoped; click,
   type, scroll, history, keypress, console, evaluation, image, snapshot, and
   vision operations cannot be inferred from a generic browser toolset.
+- Raw `browser_cdp` escape-hatch calls now require an exact `browser.cdp`
+  permit bound to the worker session, CDP method, and optional target/frame;
+  direct CDP access cannot bypass the governed browser surface.
 - Grant admission now requires the delegator employee and mandate to be
   active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority
