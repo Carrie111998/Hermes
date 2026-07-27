@@ -169,6 +169,8 @@ recorded.
   including stale PID cleanup and live gateway auto-start after restart.
 - Live Docker sandbox-provider integration now passes the container-only read
   and host-secret non-exfiltration checks; other providers remain unvalidated.
+- Added an independent local artifact installer with Python-version and
+  destination safety checks; package-index publication remains unreleased.
 
 - `757408d82884afd60651762715c3ef00446bc0c0` — recorded the release
   readiness evidence documentation.

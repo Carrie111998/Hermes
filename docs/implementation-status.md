@@ -182,10 +182,10 @@ acceptance evidence.
 - Automatic tax determination for metered usage without verified jurisdictional
   rules (tax-bearing metered invoices remain blocked until configured).
 - PCI DSS, SOC 2, SOX, GDPR, EU AI Act, CASL, CAN-SPAM, or other certification.
-- A published Charterforge installer, package-index release, container registry
-  image, production deployment, or repository rename. Local wheel/sdist builds
-  and a local Docker image/startup smoke are supported and verified; publication
-  remains unreleased work.
+- A published package-index release, container registry image, production
+  deployment, or repository rename. Local wheel/sdist builds, the independent
+  local installer, and a local Docker image/startup smoke are supported and
+  verified; publication remains unreleased work.
 - Trademark clearance for Charterforge.
 - High-availability database replication or disaster-recovery drill evidence.
 - Runtime drift enforcement remains opt-in for migrated installations; fresh

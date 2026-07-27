@@ -86,7 +86,8 @@ uv run charterforge setup
 ```
 
 Local artifact installation is also supported after building the package; see
-[packaging](docs/packaging.md) for the verified wheel and CLI smoke commands.
+[packaging](docs/packaging.md) for the verified wheel, CLI, and independent
+installer smoke commands.
 
 Do not use the upstream Hermes installer and assume it installs Charterforge.
 That installer targets the upstream distribution.
