@@ -592,6 +592,21 @@ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: st
   })
 }
 
+/** Response shape from ``GET /api/profiles/sessions/pinned-ids``. */
+export interface PinnedSessionsIdsResponse {
+  pinned: Array<{ id: string; profile: string }>
+  errors: Array<{ profile: string; error: string }>
+}
+
+/** Fetch the backend's full pinned-session set across all profiles. Used by
+ *  the cross-app pin-sync bridge so Desktop app A's pins are visible on
+ *  Desktop app B without the user re-pinning. */
+export function getPinnedSessionIds(): Promise<PinnedSessionsIdsResponse> {
+  return window.hermesDesktop.api<PinnedSessionsIdsResponse>({
+    path: '/api/profiles/sessions/pinned-ids'
+  })
+}
+
 export function searchSessions(query: string): Promise<SessionSearchResponse> {
   return window.hermesDesktop.api<SessionSearchResponse>({
     path: `/api/sessions/search?q=${encodeURIComponent(query)}`

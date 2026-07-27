@@ -5173,6 +5173,60 @@ def get_profiles_sessions_sidebar(
     }
 
 
+@app.get("/api/profiles/sessions/pinned-ids")
+def get_pinned_session_ids(
+    profile: str = "all",
+):
+    """Return the set of pinned (kept) session IDs across profiles.
+
+    Desktop app A's sidebar pins are mirrored into the backend via
+    ``PATCH /api/sessions/{id}`` (see :func:`setSessionPinnedRemote`).  This
+    endpoint lets Desktop app B discover those same pins on startup so a user
+    doesn't pin the same session on two different machines — the backend is the
+    single source of truth for the keep-flag.
+
+    Returns the durable (potentially lineage-root) ids, so pinning a compressed
+    chat's tip also surfaces its root here.
+    """
+    from hermes_state import SessionDB
+    from hermes_cli import profiles as profiles_mod
+
+    targets: List[Tuple[str, Path]] = []
+    if profile and profile != "all":
+        name, home = _cron_profile_home(profile)
+        targets.append((name, home))
+    else:
+        try:
+            infos = profiles_mod.list_profiles()
+            targets = [(info.name, info.path) for info in infos]
+        except Exception:
+            _log.exception("GET /api/profiles/sessions/pinned-ids: list_profiles failed")
+            targets = []
+        if not targets:
+            targets.append(("default", profiles_mod.get_profile_dir("default")))
+
+    pinned_ids: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    for name, home in targets:
+        db_path = Path(home) / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            db = SessionDB(db_path=db_path, read_only=True)
+        except Exception as exc:
+            errors.append({"profile": name, "error": str(exc)})
+            continue
+        try:
+            ids = db.get_pinned_session_ids()
+            for sid in ids:
+                pinned_ids.append({"id": sid, "profile": name})
+        except Exception as exc:
+            errors.append({"profile": name, "error": str(exc)})
+        finally:
+            db.close()
+    return {"pinned": pinned_ids, "errors": errors}
+
+
 @app.get("/api/sessions/search")
 async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.

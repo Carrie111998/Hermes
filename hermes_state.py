@@ -5691,6 +5691,19 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    def get_pinned_session_ids(self) -> List[str]:
+        """Return all session IDs with ``pinned=1``.
+
+        Used by the cross-app pin-sync bridge so Desktop app A's pins are
+        visible on Desktop app B when both connect to the same backend.
+        Returns the durable (possibly lineage-root) ids, not live tips.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT id FROM sessions WHERE pinned = 1 ORDER BY started_at DESC"
+            )
+            return [row[0] for row in cursor.fetchall()]
+
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
         with self._lock:
