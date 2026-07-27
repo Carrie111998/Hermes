@@ -1958,7 +1958,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
-    messages.append({"role": "user", "content": summary_request})
+    # Deliberately NOT appended to `messages`. That list is the durable
+    # transcript: appending here persisted a system-generated instruction to
+    # the session DB attributed to the USER, and replayed it on the next turn
+    # as though the user had typed "You've reached the maximum number of
+    # tool-calling iterations allowed...". The request only needs to reach the
+    # provider for this one call, so it is added to the API payload below.
 
     try:
         # Build API messages, stripping internal-only fields
@@ -2006,6 +2011,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                             _sanitize_model = _agg_slot["model"]
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
             api_messages.append(api_msg)
+
+        # The summary request lives ONLY in this payload, never in `messages`.
+        api_messages.append({"role": "user", "content": summary_request})
 
         effective_system = agent._cached_system_prompt or ""
         if agent.ephemeral_system_prompt:
