@@ -201,6 +201,9 @@ acceptance evidence.
 - The readiness projection includes the same deterministic security-readiness
   violations used by the worker, including isolation, secret-manager, redaction,
   and non-custodial payment-policy failures, with an explicit no-action boundary.
+- The authenticated Business dashboard now exposes the authoritative readiness
+  projection and exact blocker list, while keeping control-plane readiness
+  distinct from supervised worker liveness.
 - A current-tree container smoke also proves cross-container bootstrap and
   worker-status persistence against one temporary volume. With no approved
   isolation backend or external secret manager, the worker stopped

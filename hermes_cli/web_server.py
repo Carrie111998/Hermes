@@ -3052,15 +3052,19 @@ async def get_health():
 def get_business_status(request: Request, profile: Optional[str] = None):
     """Read-only Business OS projection for the supporting dashboard view."""
     _require_token(request)
-    from hermes_cli.business import build_business_snapshot
+    from hermes_cli.business import build_business_readiness, build_business_snapshot
     from hermes_cli.objectives_db import connect_closing
 
     if (profile or "").strip():
         with _profile_scope(profile):
             with connect_closing() as conn:
-                return build_business_snapshot(conn)
+                snapshot = build_business_snapshot(conn)
+                snapshot["readiness"] = build_business_readiness(conn)
+                return snapshot
     with connect_closing() as conn:
-        return build_business_snapshot(conn)
+        snapshot = build_business_snapshot(conn)
+        snapshot["readiness"] = build_business_readiness(conn)
+        return snapshot
 
 
 class BusinessAutonomyRequest(BaseModel):

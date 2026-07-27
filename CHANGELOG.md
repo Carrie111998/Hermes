@@ -8,6 +8,8 @@
   remains distinct from the tagged `0.19.0-agentic-foundation` boundary.
 - Payment readiness now requires the current screened provider assessment to
   match the credential-ready rail discovered for the declared direction.
+- The authenticated Business dashboard now displays the authoritative readiness
+  state, exact blockers, and separate CEO worker-liveness status.
 - `business payment-rails` now performs credential-safe, read-only payment-rail
   discovery and reports unavailable optional providers without implying
   settlement readiness.

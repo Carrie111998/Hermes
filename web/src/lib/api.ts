@@ -316,6 +316,16 @@ export interface BusinessObjective {
 export interface BusinessStatusResponse {
   configured: boolean;
   reason?: string;
+  readiness?: {
+    ready: boolean;
+    state: "unconfigured" | "blocked" | "ready" | string;
+    blockers: Array<{
+      code: string;
+      summary: string;
+      [key: string]: unknown;
+    }>;
+    runtime_active?: boolean;
+  };
   organization?: {
     id: string;
     name: string;

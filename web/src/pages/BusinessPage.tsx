@@ -114,6 +114,34 @@ export default function BusinessPage() {
         )}
       </div>
 
+      <Card>
+        <CardHeader><CardTitle>Autonomous operation readiness</CardTitle></CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-muted-foreground">
+              Control-plane admissibility is separate from worker liveness.
+            </p>
+            <Badge tone={data.readiness?.ready ? "secondary" : "destructive"}>
+              {data.readiness?.ready ? "ready" : data.readiness?.state ?? "unknown"}
+            </Badge>
+          </div>
+          {(data.readiness?.blockers.length ?? 0) > 0 && (
+            <ul className="list-disc space-y-1 pl-5 text-sm text-destructive">
+              {data.readiness?.blockers.map((blocker) => (
+                <li key={blocker.code}>
+                  <span className="font-mono">{blocker.code}</span>: {blocker.summary}
+                </li>
+              ))}
+            </ul>
+          )}
+          {data.readiness?.ready && (
+            <p className="text-sm text-muted-foreground">
+              Worker liveness: {data.readiness.runtime_active ? "active" : "not started"}.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="grid gap-4 md:grid-cols-3">
         <Metric label="Available capital" value={money(data.treasury?.available_minor, currency)} />
         <Metric label="Reserved capital" value={money(data.treasury?.reserved_minor, currency)} />
