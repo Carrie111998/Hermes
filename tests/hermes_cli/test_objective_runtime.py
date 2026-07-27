@@ -1293,6 +1293,17 @@ def test_rate_limited_planner_recovers_after_durable_backoff_without_duplicate_a
     assert row["last_error"].startswith("rate_limited:")
     assert row["attempts"] == 1
 
+    conn.close()
+    conn = db.connect(tmp_path / "authority.db")
+    loop = runtime.ObjectiveRuntime(
+        conn,
+        planner=planner,
+        executor=executor,
+        verifier=Verifier(),
+        charter=configured,
+        policy_version="charter-v1",
+        runtime_id="runtime-rate-limit-recovery-after-restart",
+    )
     second = loop.tick()
     assert second.status == "verified"
     assert planner.calls == 2
