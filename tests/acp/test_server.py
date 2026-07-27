@@ -1495,6 +1495,79 @@ class TestSessionConfiguration:
             api_mode="chat_completions",
         )
 
+    @pytest.mark.asyncio
+    async def test_set_session_model_agent_failure_preserves_session_state(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(
+            db=db,
+            agent_factory=lambda: SimpleNamespace(
+                model="old-model",
+                provider="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                api_mode="chat_completions",
+            ),
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+        original_agent = state.agent
+        persisted_before = db.get_session(state.session_id)
+        assert persisted_before is not None
+        make_agent = MagicMock(side_effect=RuntimeError("agent construction failed"))
+        save_session = MagicMock(wraps=manager.save_session)
+        monkeypatch.setattr(manager, "_make_agent", make_agent)
+        monkeypatch.setattr(manager, "save_session", save_session)
+        monkeypatch.setattr(
+            "hermes_cli.models.parse_model_input",
+            lambda raw, current: (current, raw),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.detect_provider_for_model",
+            lambda model, current: None,
+        )
+        picker_context = MagicMock()
+        picker_context.with_overrides.return_value = picker_context
+        payload = {
+            "providers": [
+                {
+                    "slug": "openrouter",
+                    "name": "OpenRouter",
+                    "source": "built-in",
+                    "models": ["old-model", "new-model"],
+                }
+            ]
+        }
+
+        with (
+            patch(
+                "hermes_cli.inventory.load_picker_context",
+                return_value=picker_context,
+            ),
+            patch(
+                "hermes_cli.inventory.build_models_payload",
+                return_value=payload,
+            ),
+            patch(
+                "acp_adapter.server._named_custom_provider_catalogs",
+                return_value=[],
+            ),
+            pytest.raises(RuntimeError, match="agent construction failed"),
+        ):
+            await acp_agent.set_session_model(
+                model_id="new-model",
+                session_id=state.session_id,
+            )
+
+        assert state.model == "old-model"
+        assert state.agent is original_agent
+        save_session.assert_not_called()
+        persisted_after = db.get_session(state.session_id)
+        assert persisted_after is not None
+        assert persisted_after["model"] == persisted_before["model"]
+        assert persisted_after["model_config"] == persisted_before["model_config"]
+        db.close()
+
 # ---------------------------------------------------------------------------
 # prompt
 # ---------------------------------------------------------------------------
