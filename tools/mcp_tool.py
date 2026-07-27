@@ -4499,6 +4499,10 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         claim_token = _connect_server_claim.set(None)
     try:
         await server.start(config)
+    except asyncio.CancelledError:
+        # start() already cancels and reaps its run task on this path. Avoid a
+        # redundant second shutdown while preserving cancellation semantics.
+        raise
     except BaseException:
         # Discovery owns claimed tasks and decides whether a failed start is a
         # live recoverable park or a terminal failure. Standalone probes have
@@ -5664,6 +5668,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             and not task_cancelling
         )
         if recoverable_park:
+            assert server is not None
             with _lock:
                 _servers[name] = server
         elif server is not None:

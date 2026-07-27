@@ -271,3 +271,27 @@ def test_standalone_failed_connect_is_reaped_without_global_owner(monkeypatch, t
             assert "probe-only" not in mcp_tool._server_connect_errors
     finally:
         _cleanup_mcp_state(mcp_tool, created)
+
+
+@pytest.mark.asyncio
+async def test_standalone_cancelled_connect_is_not_double_shutdown(monkeypatch):
+    """start() already reaps its task when external cancellation wins."""
+    from tools import mcp_tool
+
+    server = mcp_tool.MCPServerTask("timeout-case")
+    shutdown_calls = []
+
+    async def _cancelled_start(self, config):
+        raise asyncio.CancelledError()
+
+    async def _unexpected_shutdown(self):
+        shutdown_calls.append(True)
+
+    monkeypatch.setattr(type(server), "start", _cancelled_start)
+    monkeypatch.setattr(type(server), "shutdown", _unexpected_shutdown)
+    monkeypatch.setattr(mcp_tool, "MCPServerTask", lambda name: server)
+
+    with pytest.raises(asyncio.CancelledError):
+        await mcp_tool._connect_server("timeout-case", {"command": "unused"})
+
+    assert shutdown_calls == []
