@@ -4579,16 +4579,27 @@ class TestAnthropicAuxiliaryReasoningTranslation:
         assert captured["output_config"] == {"effort": "medium"}
         assert "extra_body" not in captured
 
-    def test_usage_preserves_anthropic_cache_buckets(self):
-        """The OpenAI-shaped shim must normalize like the native response."""
+    @pytest.mark.parametrize(
+        ("cache_read_tokens", "cache_write_tokens"),
+        [
+            (57_335, 194),
+            (0, 4_211),
+        ],
+    )
+    def test_usage_preserves_anthropic_cache_buckets(
+        self,
+        cache_read_tokens,
+        cache_write_tokens,
+    ):
+        """The dual-shaped shim must normalize like the native response."""
         from agent.auxiliary_client import _AnthropicCompletionsAdapter
         from agent.usage_pricing import normalize_usage
 
         raw_usage = SimpleNamespace(
             input_tokens=597,
             output_tokens=17,
-            cache_read_input_tokens=57_335,
-            cache_creation_input_tokens=194,
+            cache_read_input_tokens=cache_read_tokens,
+            cache_creation_input_tokens=cache_write_tokens,
         )
         adapter = _AnthropicCompletionsAdapter(
             MagicMock(), "claude-fable-5", is_oauth=False
@@ -4628,13 +4639,18 @@ class TestAnthropicAuxiliaryReasoningTranslation:
             provider="anthropic",
             api_mode="anthropic_messages",
         )
-        adapted = normalize_usage(
+        adapted_chat = normalize_usage(
             response.usage,
             provider="moa",
             api_mode="chat_completions",
         )
+        adapted_native = normalize_usage(
+            response.usage,
+            provider="anthropic",
+        )
 
-        assert adapted == native
+        assert adapted_chat == native
+        assert adapted_native == native
 
     def test_build_call_kwargs_private_reasoning_only_for_anthropic_messages(self):
         anthropic_kwargs = _build_call_kwargs(

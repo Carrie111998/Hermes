@@ -1486,9 +1486,10 @@ class _AnthropicCompletionsAdapter:
             cache_write_tokens = (
                 getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             )
-            # OpenAI's prompt_tokens total includes cached input. Preserve that
-            # contract in the shim so normalize_usage can recover the native
-            # Anthropic fresh/read/write buckets without losing spend.
+            # Keep both usage shapes because this adapter feeds two normalizers:
+            # native Anthropic accounting reads input/output/cache_* fields,
+            # while MoA's OpenAI-compatible path reads an inclusive
+            # prompt_tokens total and subtracts prompt_tokens_details.
             prompt_tokens = (
                 fresh_input_tokens + cache_read_tokens + cache_write_tokens
             )
@@ -1501,6 +1502,9 @@ class _AnthropicCompletionsAdapter:
                 prompt_tokens_details=SimpleNamespace(
                     cached_tokens=cache_read_tokens,
                 ),
+                input_tokens=fresh_input_tokens,
+                output_tokens=completion_tokens,
+                cache_read_input_tokens=cache_read_tokens,
                 cache_creation_input_tokens=cache_write_tokens,
             )
 
