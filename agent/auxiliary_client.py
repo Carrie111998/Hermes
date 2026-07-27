@@ -3568,7 +3568,7 @@ def _evict_cached_client_instance(target: Any) -> bool:
         return False
     evicted = False
     with _client_cache_lock:
-        for key in list(_client_cache.keys()):
+        for key in list(_client_cache):
             entry = _client_cache.get(key)
             if entry is None:
                 continue
