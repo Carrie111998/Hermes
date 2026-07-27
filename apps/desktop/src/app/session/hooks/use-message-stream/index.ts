@@ -23,9 +23,9 @@ import {
 import { parseTodos } from '@/lib/todos'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
-import { broadcastTranscriptChanged } from '@/store/transcript-sync'
 import { upsertSubagent } from '@/store/subagents'
 import { setSessionTodos } from '@/store/todos'
+import { broadcastTranscriptChanged } from '@/store/transcript-sync'
 
 import type { ClientSessionState } from '../../../types'
 
