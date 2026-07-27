@@ -192,10 +192,19 @@ def build_vertex_base_url(project_id: str, region: str = DEFAULT_REGION) -> str:
 
     The `global` location uses a bare `aiplatform.googleapis.com` hostname,
     while regional locations use `{region}-aiplatform.googleapis.com`.
+    Multi-region identifiers ``us`` and ``eu`` use the REP endpoint format
+    (``aiplatform.us.rep.googleapis.com`` / ``aiplatform.eu.rep.googleapis.com``)
+    per Google's documentation:
+    https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations#multi-region-endpoints
     Gemini 3.x preview models are only served via the global endpoint at
     the time of writing.
     """
-    host = "aiplatform.googleapis.com" if region == "global" else f"{region}-aiplatform.googleapis.com"
+    if region in ("us", "eu"):
+        host = f"aiplatform.{region}.rep.googleapis.com"
+    elif region == "global":
+        host = "aiplatform.googleapis.com"
+    else:
+        host = f"{region}-aiplatform.googleapis.com"
     return f"https://{host}/v1beta1/projects/{project_id}/locations/{region}/endpoints/openapi"
 
 
