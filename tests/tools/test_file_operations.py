@@ -468,7 +468,7 @@ class TestShellFileOpsHelpers:
         assert result.count("'") >= 4  # wrapping + escaping
 
     def test_escape_shell_arg_rewrites_windows_drive_paths_to_msys(self, monkeypatch, file_ops):
-        # bash eats backslashes and MSYS mangles ``C:\...``; the Git Bash
+        # bash eats backslashes and MSYS mangles ``C:\\...``; the Git Bash
         # ``/c/...`` form is the reliable one (reuses _windows_to_msys_path).
         import tools.environments.local as local_mod
 
@@ -476,6 +476,13 @@ class TestShellFileOpsHelpers:
         assert file_ops._escape_shell_arg(r"C:\Users\alice\notes.txt") == "'/c/Users/alice/notes.txt'"
         # Non-drive paths are untouched.
         assert file_ops._escape_shell_arg("/tmp/foo") == "'/tmp/foo'"
+
+    def test_native_windows_cli_keeps_drive_paths_for_rg(self, monkeypatch, file_ops):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_native_cli_path(r"C:\Users\alice\notes.txt") == "'C:/Users/alice/notes.txt'"
+        assert file_ops._escape_native_cli_path("/c/Users/alice/notes.txt") == "'C:/Users/alice/notes.txt'"
 
     def test_escape_shell_arg_normalizes_mixed_msys_paths(self, monkeypatch, file_ops):
         import tools.environments.local as local_mod

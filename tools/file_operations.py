@@ -975,6 +975,24 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    def _escape_native_cli_path(self, path: str) -> str:
+        """Quote a path for native Windows executables invoked from Git Bash.
+
+        Shell builtins understand Git-Bash ``/c/...`` paths, but native
+        ``rg.exe`` does not when MSYS argument conversion is disabled. Keep a
+        drive path in ``C:/...`` form for those binaries.
+        """
+        from tools.environments.local import _IS_WINDOWS
+
+        if not _IS_WINDOWS:
+            return self._escape_shell_arg(path)
+
+        native = path.replace("\\", "/")
+        msys = re.match(r"^/([A-Za-z])(?:/(.*))?$", native)
+        if msys:
+            native = f"{msys.group(1).upper()}:/{msys.group(2) or ''}"
+        return "'" + native.replace("'", "'\"'\"'") + "'"
+
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
 
@@ -2218,7 +2236,7 @@ class ShellFileOperations(FileOperations):
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"{self._escape_native_cli_path(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2229,7 +2247,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{self._escape_native_cli_path(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2283,9 +2301,10 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
         
-        # Add pattern and path
+        # Add pattern and path. rg.exe is a native Windows binary and must
+        # receive a drive path rather than Git Bash's /c/... spelling.
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._escape_native_cli_path(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
