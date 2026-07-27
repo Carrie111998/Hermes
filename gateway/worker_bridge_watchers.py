@@ -22,6 +22,15 @@ from gateway.failure_successors import (
     create_failure_successors as create_failure_successor_tasks,
     resolve_failure_successor_settings,
 )
+from gateway.review_continuation import (
+    create_review_continuations as create_review_continuation_tasks,
+    resolve_review_continuation_settings,
+)
+from gateway.stage_successors import (
+    create_stage_successors as create_stage_successor_tasks,
+    resolve_stage_successor_settings,
+)
+from gateway.worker_bridge_ultra import resolve_ultra_settings
 
 logger = logging.getLogger("gateway.run")
 
@@ -113,6 +122,52 @@ def save_cursor(state_file: Path, last_event_id: int) -> None:
     payload = _read_cursor_payload(state_file)
     payload.update({"last_event_id": int(last_event_id), "updated_at": time.time()})
     _write_cursor_payload(state_file, payload)
+
+
+# Maximum characters of alert text kept in the durable hand-off record. The
+# record only has to be good enough to re-deliver a notification, not to
+# reproduce an unbounded transcript in the cursor file.
+PENDING_TEXT_MAX = 8000
+
+
+def save_pending_injection(state_file: Path, head: int, text: str) -> None:
+    """Durably record an alert *before* the cursor advances past it.
+
+    ``BaseAdapter.handle_message`` documents that it "returns quickly by
+    spawning background tasks" — returning means the event was accepted into
+    an in-memory queue, NOT that it was delivered. The cursor was advanced
+    immediately afterwards, so a crash in that window moved the cursor past a
+    transition whose alert never reached anyone, and ``collect_new_transitions``
+    only ever reads events *newer* than the cursor. The alert was gone.
+
+    Writing the intent first turns that into at-least-once: whatever is in this
+    record has not been confirmed delivered, so startup replays it.
+    """
+    payload = _read_cursor_payload(state_file)
+    payload["pending_injection"] = {
+        "head": int(head),
+        "text": (text or "")[:PENDING_TEXT_MAX],
+        "at": time.time(),
+    }
+    _write_cursor_payload(state_file, payload)
+
+
+def load_pending_injection(state_file: Path) -> Optional[dict]:
+    """Return an unconfirmed hand-off record, or None."""
+    raw = _read_cursor_payload(state_file).get("pending_injection")
+    if not isinstance(raw, dict):
+        return None
+    text = raw.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return raw
+
+
+def clear_pending_injection(state_file: Path) -> None:
+    """Drop the hand-off record. Only called once a replay has been issued."""
+    payload = _read_cursor_payload(state_file)
+    if payload.pop("pending_injection", None) is not None:
+        _write_cursor_payload(state_file, payload)
 
 
 def load_last_nudge(state_file: Path) -> float:
@@ -646,6 +701,7 @@ def _resolve_alert_settings(cfg: Any) -> "Optional[dict]":
             "interval": auto_interval,
             "max_tasks_per_cycle": max_per_cycle,
         },
+        "auto_ultra": resolve_ultra_settings(wb_cfg),
     }
 
 
@@ -826,6 +882,11 @@ class GatewayWorkerBridgeWatchersMixin:
                 len(transitions),
             )
             return False
+        ready, _deferred = self._ultra_route_transitions(transitions, settings)
+        self._ultra_pump(settings)
+        if not ready:
+            await asyncio.to_thread(save_cursor, state_file, head)
+            return False
         if (settings.get("auto_dispatch") or {}).get("enabled"):
             pending = list(getattr(self, "_last_skipped_pending", []) or [])
             if not pending:
@@ -836,7 +897,7 @@ class GatewayWorkerBridgeWatchersMixin:
             pending = await asyncio.to_thread(collect_pending_work, db_path)
         adapter, source = target
         event = MessageEvent(
-            text=format_alert_text(transitions, pending),
+            text=format_alert_text(ready, pending),
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
@@ -844,16 +905,57 @@ class GatewayWorkerBridgeWatchersMixin:
         logger.info(
             "worker-bridge alerts: injecting %d transition(s) (+%d pending) "
             "into %s chat=%s thread=%s (events ≤ %d)",
-            len(transitions),
+            len(ready),
             len(pending),
             getattr(source.platform, "value", source.platform),
             source.chat_id,
             source.thread_id,
             head,
         )
+        # Order matters and is the whole point: persist the hand-off BEFORE the
+        # cursor moves. handle_message only queues the event in memory, so a
+        # crash between here and delivery used to lose the alert outright —
+        # collect_new_transitions never looks back past the cursor.
+        await asyncio.to_thread(save_pending_injection, state_file, head, event.text)
         await adapter.handle_message(event)
         await asyncio.to_thread(save_cursor, state_file, head)
         return True
+
+    async def _replay_pending_alert(self, settings: dict, *, state_file: Path) -> bool:
+        """Re-deliver an unconfirmed alert hand-off after a restart.
+
+        Returns True when a replay was issued. Never raises into the watcher
+        loop: a replay failure must not stop the watcher from starting, and the
+        record survives so the next start tries again.
+        """
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        try:
+            pending = await asyncio.to_thread(load_pending_injection, state_file)
+            if not pending:
+                return False
+            target = self._resolve_worker_alert_target(settings)
+            if not target:
+                # No adapter yet — keep the record and retry on a later start.
+                logger.warning(
+                    "worker-bridge alerts: unconfirmed alert for events ≤ %s held "
+                    "(no delivery target yet)", pending.get("head"),
+                )
+                return False
+            adapter, source = target
+            logger.warning(
+                "worker-bridge alerts: replaying unconfirmed alert for events ≤ %s "
+                "(previous run did not confirm delivery)", pending.get("head"),
+            )
+            await adapter.handle_message(MessageEvent(
+                text=pending["text"], message_type=MessageType.TEXT,
+                source=source, internal=True,
+            ))
+            await asyncio.to_thread(clear_pending_injection, state_file)
+            return True
+        except Exception as exc:
+            logger.error("worker-bridge alerts: pending-alert replay failed: %s", exc)
+            return False
 
     async def _worker_bridge_idle_nudge(
         self, settings: dict, *, db_path: Path, state_file: Path
@@ -921,6 +1023,60 @@ class GatewayWorkerBridgeWatchersMixin:
         finally:
             self._failure_successor_pass_running = False
 
+    async def _worker_bridge_review_continuations(
+        self, config: dict, *, db_path: Path
+    ) -> int:
+        """Run one review-continuation pass, ignoring recursive re-entry."""
+        if getattr(self, "_review_continuation_pass_running", False):
+            logger.warning(
+                "worker-bridge review continuation pass already running; "
+                "recursive entry ignored"
+            )
+            return 0
+        self._review_continuation_pass_running = True
+        try:
+            settings = resolve_review_continuation_settings(config)
+            if not settings["enabled"]:
+                return 0
+            loaded = self._get_worker_bridge(db_path)
+            if loaded is None:
+                return 0
+            bridge, _spawn = loaded
+            return await asyncio.to_thread(
+                create_review_continuation_tasks,
+                bridge,
+                settings,
+            )
+        finally:
+            self._review_continuation_pass_running = False
+
+    async def _worker_bridge_stage_successors(
+        self, config: dict, *, db_path: Path
+    ) -> int:
+        """Run one stage-successor pass, ignoring recursive re-entry."""
+        if getattr(self, "_stage_successor_pass_running", False):
+            logger.warning(
+                "worker-bridge stage successor pass already running; "
+                "recursive entry ignored"
+            )
+            return 0
+        self._stage_successor_pass_running = True
+        try:
+            settings = resolve_stage_successor_settings(config)
+            if not settings["enabled"]:
+                return 0
+            loaded = self._get_worker_bridge(db_path)
+            if loaded is None:
+                return 0
+            bridge, _spawn = loaded
+            return await asyncio.to_thread(
+                create_stage_successor_tasks,
+                bridge,
+                settings,
+            )
+        finally:
+            self._stage_successor_pass_running = False
+
     async def _worker_bridge_notifier_watcher(
         self, interval: Optional[float] = None
     ) -> None:
@@ -942,6 +1098,14 @@ class GatewayWorkerBridgeWatchersMixin:
                     config,
                     db_path=db_path,
                 )
+                await self._worker_bridge_review_continuations(
+                    config,
+                    db_path=db_path,
+                )
+                await self._worker_bridge_stage_successors(
+                    config,
+                    db_path=db_path,
+                )
                 if settings is None:
                     await asyncio.sleep(sleep_for)
                     continue
@@ -956,6 +1120,15 @@ class GatewayWorkerBridgeWatchersMixin:
                         MAX_CURSOR_BACKLOG,
                     )
                     cursor_ready = True
+                    # Re-deliver an alert whose hand-off was never confirmed.
+                    # The record is written before the cursor advances, so its
+                    # presence at startup means the previous process died (or
+                    # was killed) between queueing the event and delivering it.
+                    # Replaying is at-least-once: a duplicate notification is
+                    # strictly better than a worker failure nobody is told
+                    # about, and the record is cleared only after the replay is
+                    # issued so a crash mid-replay still leaves it pending.
+                    await self._replay_pending_alert(settings, state_file=state_file)
                 sleep_for = interval or settings["interval"]
                 if not announced:
                     logger.info(
