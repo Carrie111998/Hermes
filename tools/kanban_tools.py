@@ -184,17 +184,18 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
-    if not env_tid:
-        # Orchestrator or CLI context — no task-scope restriction.
+    # Shared with `hermes kanban complete` (hermes_cli/kanban.py) so both
+    # completion paths enforce identical scoping — the CLI path had no check
+    # at all, which made it a complete bypass of this one.
+    from hermes_cli.kanban_db import worker_scope_violation
+
+    reason = worker_scope_violation(tid)
+    if reason is None:
         return None
-    if tid != env_tid:
-        return tool_error(
-            f"worker is scoped to task {env_tid}; refusing to mutate "
-            f"{tid}. Use kanban_comment to hand off information to other "
-            f"tasks, or kanban_create to spawn follow-up work."
-        )
-    return None
+    return tool_error(
+        f"{reason} Use kanban_comment to hand off information to other "
+        f"tasks, or kanban_create to spawn follow-up work."
+    )
 
 
 def _connect(board: Optional[str] = None):
@@ -624,6 +625,7 @@ def _handle_complete(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             gate = judge_gate.evaluate(
                 kb, conn, task, summary or result or "", task_id=tid,
+                run_id=_worker_run_id(tid),
             )
             if not gate.allow:
                 return tool_error(judge_gate.rejection_message(tid, gate))

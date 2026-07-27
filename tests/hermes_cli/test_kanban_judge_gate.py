@@ -9,6 +9,7 @@ cards were refused, the worker burned its turn budget, and the run ended
 
 from __future__ import annotations
 
+import json
 import types
 
 import pytest
@@ -17,15 +18,26 @@ from hermes_cli import kanban_judge_gate as gate
 
 
 class _FakeConn:
-    """Minimal connection stub returning a controlled COUNT(*) result."""
+    """Connection stub returning prior judge_rejected payload rows.
 
-    def __init__(self, count: int = 0):
+    ``count`` prior rejections are synthesised with DISTINCT evidence
+    digests, matching the real counting rule (distinct evidence per run).
+    Pass ``same_evidence=True`` to simulate a worker resubmitting the
+    identical rejected summary.
+    """
+
+    def __init__(self, count: int = 0, same_evidence: bool = False):
         self.count = count
+        self.same_evidence = same_evidence
         self.executed: list[tuple] = []
 
     def execute(self, sql, params=()):
         self.executed.append((sql, params))
-        return types.SimpleNamespace(fetchone=lambda: (self.count,))
+        rows = [
+            (json.dumps({"resp": "same" if self.same_evidence else f"d{i}"}),)
+            for i in range(self.count)
+        ]
+        return types.SimpleNamespace(fetchall=lambda: rows)
 
 
 class _FakeKb:
@@ -43,7 +55,8 @@ class _FakeKb:
 
         return _cm()
 
-    def _append_event(self, conn, task_id, kind, payload=None):
+    # Mirrors kanban_db._append_event, which takes run_id keyword-only.
+    def _append_event(self, conn, task_id, kind, payload=None, *, run_id=None):
         self.events.append((task_id, kind, payload))
 
 
@@ -99,9 +112,13 @@ def test_reachable_judge_rejection_still_blocks(monkeypatch):
     d = gate.evaluate(kb, _FakeConn(count=0), _task(), "half done", task_id="t1")
     assert d.allow is False
     assert d.reason == "criteria not met"
-    assert kb.events == [("t1", gate.EVENT_REJECTED,
-                          {"reason": "criteria not met", "attempt": 1,
-                           "ceiling": 2})]
+    assert len(kb.events) == 1
+    tid, kind, payload = kb.events[0]
+    assert (tid, kind) == ("t1", gate.EVENT_REJECTED)
+    assert payload["reason"] == "criteria not met"
+    assert payload["attempt"] == 1 and payload["ceiling"] == 2
+    # Evidence digest is what makes repeat submissions non-counting.
+    assert payload["resp"] == gate._evidence_digest("half done")
 
 
 def test_transport_failure_fails_open(monkeypatch):
@@ -163,6 +180,35 @@ def test_unrecordable_rejection_fails_open(monkeypatch):
     # corroborate that claim, so stamping one would be a false audit trail.
     assert d.override is False
     assert d.bypass == gate.BYPASS_UNRECORDABLE
+
+
+def test_repeat_submissions_cannot_brute_force_the_ceiling(monkeypatch):
+    """Resubmitting the SAME rejected evidence must not open the escape hatch.
+
+    Counting attempts rather than distinct evidence let a worker close any
+    card by calling kanban_complete three times with identical junk — and the
+    rejection message explicitly invites a retry.
+    """
+    _patch_judge(monkeypatch, "continue", "criteria not met", False)
+    # Five prior rejections, all of the same summary -> one distinct piece of
+    # evidence, well under ceiling 2.
+    d = gate.evaluate(_FakeKb(), _FakeConn(count=5, same_evidence=True),
+                      _task(), "same junk", task_id="t1")
+    assert d.allow is False, "identical retries must not reach the ceiling"
+
+
+def test_ceiling_counts_only_the_current_run(monkeypatch):
+    """Rejections are scoped to run_id when it is known.
+
+    Lifetime counting meant a contested card arrived at each respawn already
+    at its ceiling, so the first attempt of every later run was ungated.
+    """
+    _patch_judge(monkeypatch, "continue", "nope", False)
+    conn = _FakeConn(count=0)
+    gate.evaluate(_FakeKb(), conn, _task(), "x", task_id="t1", run_id=42)
+    sql, params = conn.executed[0]
+    assert "run_id = ?" in sql
+    assert params[-1] == 42
 
 
 def test_ceiling_is_configurable(monkeypatch):

@@ -2178,9 +2178,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # for the transport-failure and rejection-ceiling semantics.
             from hermes_cli import kanban_judge_gate as judge_gate
 
+            # Worker task-scope check. The kanban_complete tool has always
+            # enforced this; this path did not, so a dispatcher-spawned
+            # worker with a shell could close another worker's card simply by
+            # shelling out to the CLI. Operators (no HERMES_KANBAN_TASK) are
+            # unaffected.
+            scope_error = kb.worker_scope_violation(tid)
+            if scope_error:
+                print(f"kanban: {scope_error}", file=sys.stderr)
+                failed.append(tid)
+                continue
+
             task = kb.get_task(conn, tid)
             gate = judge_gate.evaluate(
                 kb, conn, task, summary or args.result or "", task_id=tid,
+                run_id=_worker_run_id_for(tid),
             )
             if not gate.allow:
                 print(

@@ -37,6 +37,8 @@ Two guards, therefore:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from typing import Any, NamedTuple, Optional
@@ -47,10 +49,11 @@ logger = logging.getLogger(__name__)
 #: an override. Auditable: it writes a ``judge_override`` event and sets
 #: ``bypass=BYPASS_CEILING`` so callers can stamp metadata.
 #:
-#: NOTE: counted over the card's LIFETIME, not consecutively — see
-#: ``_count_rejections``. A card that accrued rejections in an earlier run
-#: carries them forward, so a contested card can arrive at a later run already
-#: at its ceiling. Scoping this to ``run_id`` is the known next improvement.
+#: Counted per RUN and per DISTINCT piece of evidence — see
+#: ``_count_rejections``. So the ceiling opens for a worker that genuinely
+#: tried ``ceiling`` different things within one run, not for one that
+#: resubmits the same rejected summary, and not for a card carrying rejections
+#: forward from an earlier run.
 DEFAULT_MAX_REJECTIONS = 2
 
 EVENT_REJECTED = "judge_rejected"
@@ -143,38 +146,70 @@ def judge_available() -> bool:
         return False
 
 
-def _count_rejections(conn: Any, task_id: str) -> int:
-    """Number of ``judge_rejected`` events recorded for this card.
+def _evidence_digest(response: str) -> str:
+    """Stable short digest of the evidence a completion attempt offered."""
+    return hashlib.sha256(response.strip().encode("utf-8", "replace")).hexdigest()[:16]
 
-    Returns 0 for anything that is not a genuine integer count. ``COUNT(*)``
-    always yields an ``int`` from sqlite, so a non-int here means we are not
-    talking to a real connection (a ``MagicMock`` stand-in coerces to 1 via
-    ``__int__``, which would trip the ceiling on the very first rejection and
-    silently disable the gate).
+
+def _count_rejections(conn: Any, task_id: str, run_id: Optional[int] = None) -> int:
+    """Distinct pieces of evidence already rejected for this card.
+
+    Two deliberate narrowings, both closing brute-force paths:
+
+    * **Scoped to the current run** when ``run_id`` is known. A lifetime count
+      meant a card that accrued rejections in an earlier run arrived at its
+      next run already at the ceiling — and since the dispatcher respawns
+      blocked goal cards, that was the steady state for any contested card.
+    * **Distinct evidence only.** Counting attempts let a worker submit the
+      same rejected summary three times to reach the ceiling and close the
+      card. The escape hatch is meant for a worker that genuinely tried
+      different things, not one that repeats itself.
+
+    Returns 0 on anything that is not a real result set — a ``MagicMock``
+    stand-in coerces to 1 via ``__int__``, which would trip the ceiling on the
+    very first rejection and silently disable the gate.
     """
+    sql = ("SELECT payload FROM task_events "
+           "WHERE task_id = ? AND kind = ?")
+    params: list = [task_id, EVENT_REJECTED]
+    if run_id is not None:
+        sql += " AND run_id = ?"
+        params.append(run_id)
     try:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
-            (task_id, EVENT_REJECTED),
-        ).fetchone()
+        rows = conn.execute(sql, tuple(params)).fetchall()
     except Exception:  # pragma: no cover - defensive
         logger.debug("judge gate: could not count rejections for %s", task_id,
                      exc_info=True)
         return 0
-    if not row:
+    if not isinstance(rows, (list, tuple)):
+        # Not a real cursor (mocked connection) — refuse to infer a count.
         return 0
-    value = row[0]
-    if isinstance(value, bool) or not isinstance(value, int):
-        logger.debug(
-            "judge gate: non-integer rejection count %r for %s; treating as 0",
-            value, task_id,
-        )
-        return 0
-    return max(0, value)
+
+    digests: set[str] = set()
+    unattributed = 0
+    for row in rows:
+        try:
+            raw = row[0]
+        except Exception:
+            continue
+        if not isinstance(raw, str):
+            continue
+        try:
+            digest = json.loads(raw).get("resp")
+        except Exception:
+            digest = None
+        if isinstance(digest, str) and digest:
+            digests.add(digest)
+        else:
+            # Rows written before evidence digests existed: count each once
+            # rather than silently discarding real rejection history.
+            unattributed += 1
+    return len(digests) + unattributed
 
 
 def _record(kb: Any, conn: Any, task_id: str, kind: str,
-            payload: Optional[dict] = None) -> bool:
+            payload: Optional[dict] = None,
+            run_id: Optional[int] = None) -> bool:
     """Append a gate event. Never raises; returns whether the write landed.
 
     The return value matters for rejections specifically. The ceiling is
@@ -186,7 +221,7 @@ def _record(kb: Any, conn: Any, task_id: str, kind: str,
     """
     try:
         with kb.write_txn(conn):
-            kb._append_event(conn, task_id, kind, payload)
+            kb._append_event(conn, task_id, kind, payload, run_id=run_id)
         return True
     except Exception:  # pragma: no cover - defensive
         logger.warning("judge gate: could not record %s for %s", kind, task_id,
@@ -195,7 +230,7 @@ def _record(kb: Any, conn: Any, task_id: str, kind: str,
 
 
 def evaluate(kb: Any, conn: Any, task: Any, response_text: str, *,
-             task_id: str) -> GateDecision:
+             task_id: str, run_id: Optional[int] = None) -> GateDecision:
     """Decide whether a goal-mode card may complete.
 
     ``kb`` is the ``kanban_db`` module, ``conn`` an open connection, ``task``
@@ -329,7 +364,8 @@ def evaluate(kb: Any, conn: Any, task: Any, response_text: str, *,
         return GateDecision(allow=True, reason=reason)
 
     ceiling = max_rejections()
-    prior = _count_rejections(conn, task_id)
+    prior = _count_rejections(conn, task_id, run_id)
+    digest = _evidence_digest(response)
     attempt = prior + 1
     # Strictly greater: `ceiling` is the number of rejections actually
     # tolerated, so ceiling=2 rejects twice and overrides on the third
@@ -346,7 +382,8 @@ def evaluate(kb: Any, conn: Any, task: Any, response_text: str, *,
         return GateDecision(allow=True, reason=reason, bypass=BYPASS_CEILING)
 
     if not _record(kb, conn, task_id, EVENT_REJECTED,
-                   {"reason": reason, "attempt": attempt, "ceiling": ceiling}):
+                   {"reason": reason, "attempt": attempt, "ceiling": ceiling,
+                    "resp": digest}, run_id=run_id):
         # We cannot persist this rejection, so we cannot count toward the
         # ceiling either — blocking now would block forever. Fail open and
         # say why.
