@@ -2700,6 +2700,31 @@ def test_attach_roundtrips_bytes_to_row_and_disk(worker_env):
         conn.close()
 
 
+def test_attach_authorization_binds_content_identity(worker_env, monkeypatch):
+    import base64
+    from tools import kanban_tools as kt
+
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_authorize_kanban_mutation",
+        lambda operation, scope: calls.append((operation, scope)),
+    )
+    content = b"exact bytes"
+    out = kt._handle_attach({
+        "filename": "exact.bin",
+        "content_base64": base64.b64encode(content).decode(),
+        "content_type": "application/octet-stream",
+    })
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "attach"
+    assert scope["task_id"] == worker_env
+    assert scope["filename"] == "exact.bin"
+    assert scope["size"] == len(content)
+    assert scope["content_sha256"]
+
+
 def test_attach_rejects_oversize(worker_env, monkeypatch):
     """A decoded payload over the cap returns a clean tool error, no row."""
     import base64
@@ -2839,6 +2864,33 @@ def test_attach_url_fetches_local_fixture(worker_env, allow_private_urls):
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_attach_url_authorization_binds_source_and_artifact(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_authorize_kanban_mutation",
+        lambda operation, scope: calls.append((operation, scope)),
+    )
+    monkeypatch.setattr(
+        kt,
+        "_download_url_with_cap",
+        lambda url, max_bytes: (b"remote bytes", "application/octet-stream"),
+    )
+    out = kt._handle_attach_url({
+        "url": "https://cdn.example.test/report.bin",
+        "filename": "report.bin",
+        "content_type": "application/octet-stream",
+    })
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "attach_url"
+    assert scope["task_id"] == worker_env
+    assert scope["url"] == "https://cdn.example.test/report.bin"
+    assert scope["filename"] == "report.bin"
 
 
 def test_attach_url_rejects_oversize_stream(worker_env, monkeypatch, allow_private_urls):

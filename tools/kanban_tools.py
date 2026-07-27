@@ -954,6 +954,21 @@ def _handle_attach(args: dict, **kw) -> str:
     content_type = args.get("content_type")
     board = args.get("board")
     try:
+        _authorize_kanban_mutation(
+            "attach",
+            {
+                "operation": "attach",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+                "filename": str(filename),
+                "content_type": content_type,
+                "content_sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_attach authorization denied: {exc}")
+    try:
         _, conn = _connect(board=board)
         try:
             att_id = kb.store_attachment_bytes(
@@ -1073,6 +1088,20 @@ def _handle_attach_url(args: dict, **kw) -> str:
         filename = leaf or "download"
     content_type = args.get("content_type")
     board = args.get("board")
+    try:
+        _authorize_kanban_mutation(
+            "attach_url",
+            {
+                "operation": "attach_url",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+                "url": url,
+                "filename": str(filename),
+                "content_type": content_type,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_attach_url authorization denied: {exc}")
     try:
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
