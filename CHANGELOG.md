@@ -75,6 +75,10 @@
 - Governed cross-channel messaging and reactions now require exact
   `message.send` or `message.react` capability plus platform/target resource
   equality before an outbound action is attempted.
+- Added a direct delegated-worker boundary regression proving that an exact
+  read target is allowed only for the granted resource and operation; sibling
+  resources and write capabilities are rejected at the live authorization
+  chokepoint.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

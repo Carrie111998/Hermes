@@ -1085,6 +1085,28 @@ This remains deterministic local-provider evidence and does not establish
 production provider credentials, corporate readiness, or legal/compliance
 certification.
 
+The exact delegated-worker resource boundary was additionally validated on
+current `main` commit `21273d2407` with:
+
+```sh
+uv run --extra dev pytest -q tests/hermes_cli/test_workforce_delegation.py
+```
+
+Result: **17 passed, 0 failed**. The regression proves that a worker granted
+one exact read resource cannot retarget the read or infer a write operation.
+The full current-tree acceptance was also rerun with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result: **current-tree agentic acceptance: PASS**. The acceptance image
+manifest digest was
+`sha256:199840b4c6e4026bf4112cbe8de62d460d4512be47e8f36faca7d5f9f203878a`.
+This remains deterministic local-provider evidence and does not establish
+production provider credentials, corporate readiness, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
