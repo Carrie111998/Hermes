@@ -1,6 +1,11 @@
 """Real state-machine proof across two independently triggered business cycles."""
 
+import json
+import subprocess
+import sys
 import time
+
+import pytest
 
 from hermes_cli import (
     compliance_db,
@@ -10,6 +15,7 @@ from hermes_cli import (
     objective_service,
     objectives_db,
     organization_db,
+    profiles,
     payment_controls,
     workforce_delegation,
     verification_evidence,
@@ -308,15 +314,21 @@ def test_ceo_evaluates_then_hires_worker_across_verified_cycles(
         "allowed_capabilities": [
             "organization.hire.evaluate",
             "organization.hire",
+            "work.delegate",
+            "security.audit",
         ],
         "forbidden_capabilities": [],
-        "allowed_systems": ["organization"],
+        "allowed_systems": ["organization", "kanban", "security"],
         "approval_required_capabilities": [],
         "max_autonomous_risk": "high",
         "allow_irreversible": True,
-        "max_action_spend_minor": 0,
+        "max_action_spend_minor": 100,
         "permit_ttl_seconds": 300,
         "organization": {},
+        "solo_founder": {
+            "toolsets": ["terminal"],
+            "skills": ["security.audit"],
+        },
     }
     organization_id, ceo_id = organization_db.bootstrap_solo_founder(
         conn,
@@ -617,6 +629,336 @@ def test_ceo_evaluates_then_hires_worker_across_verified_cycles(
         """SELECT event_type FROM objective_inbox
            WHERE event_type='kanban.task.done'"""
     ).fetchone()["event_type"] == "kanban.task.done"
+
+
+def test_process_separated_delegation_wakes_ceo_and_advances_objective(
+    tmp_path, monkeypatch
+):
+    """Acceptance gate: a bounded employee process completes and hands evidence back."""
+    authority_path = tmp_path / "delegation-authority.db"
+    board = "process-separated-delegation"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    conn = objectives_db.connect(authority_path)
+    charter = {
+        "enabled": True,
+        "operating_mode": "autonomous",
+        "operator_role": "advisor",
+        "policy_version": "charter-v1",
+        "allowed_capabilities": ["work.delegate", "security.audit"],
+        "forbidden_capabilities": [],
+        "allowed_systems": ["kanban", "security"],
+        "approval_required_capabilities": [],
+        "max_autonomous_risk": "low",
+        "allow_irreversible": False,
+        "max_action_spend_minor": 100,
+        "permit_ttl_seconds": 300,
+        "operating_cadence": {"enabled": False},
+        "solo_founder": {
+            "toolsets": ["terminal"],
+            "skills": ["security.audit"],
+        },
+    }
+    organization_id, ceo_id = organization_db.bootstrap_solo_founder(
+        conn,
+        organization_name="Process Delegation Company",
+        purpose="Prove governed employee handoffs",
+        profile_name="default",
+        charter=charter,
+    )
+    employee_id = organization_db.propose_employee(
+        conn,
+        organization_id=organization_id,
+        display_name="Evidence Analyst",
+        title="Evidence Analyst",
+        level="individual_contributor",
+        manager_id=ceo_id,
+        proposed_by=f"employee:{ceo_id}",
+        employment_type="agent",
+    )
+    organization_db.transition_employee(
+        conn, employee_id, "approved", actor=f"employee:{ceo_id}"
+    )
+    organization_db.transition_employee(
+        conn, employee_id, "provisioning", actor=f"employee:{ceo_id}"
+    )
+    organization_db.create_mandate(
+        conn,
+        employee_id,
+        purpose="Return bounded audit evidence",
+        responsibilities=["inspect the assigned record"],
+        decision_rights=["report findings"],
+        prohibited_actions=["work.delegate"],
+        capabilities=["security.audit", "security.deploy"],
+        systems=["security"],
+        kpis=["evidence returned"],
+        escalation={"to": ceo_id},
+        toolsets=["terminal"],
+        skills=["security.audit"],
+        created_by=f"employee:{ceo_id}",
+        budget_minor=100,
+        expires_at=int(time.time()) + 3600,
+    )
+    organization_db.transition_employee(
+        conn,
+        employee_id,
+        "active",
+        actor=f"employee:{ceo_id}",
+        profile_name="security-auditor",
+    )
+    mandate = organization_db.get_current_mandate(conn, employee_id)
+    profiles.get_profile_dir("security-auditor").mkdir(parents=True, exist_ok=True)
+    profiles.write_profile_meta(
+        profiles.get_profile_dir("security-auditor"),
+        organization_id=organization_id,
+        employee_id=employee_id,
+        manager_employee_id=ceo_id,
+        corporate_level="individual_contributor",
+        employment_class="agent",
+        mandate_id=str(mandate["id"]),
+        mandate_version=int(mandate["version"]),
+        mandate_expires_at=mandate["expires_at"],
+    )
+    objective = objectives_db.create_objective(
+        conn,
+        organization_id=organization_id,
+        desired_outcome="Complete the delegated evidence review",
+        originator=f"employee:{ceo_id}",
+        permitted_systems=["kanban", "security"],
+        success_criteria=[
+            {"verifier": "kanban.task.done_with_evidence", "params": {}}
+        ],
+    )
+    objectives_db.transition_objective(
+        conn, objective.id, "accepted", actor=f"employee:{ceo_id}"
+    )
+    objectives_db.transition_objective(
+        conn, objective.id, "planned", actor=f"employee:{ceo_id}"
+    )
+    plan_id = objectives_db.create_plan(
+        conn,
+        objective.id,
+        assumptions=["the analyst has the exact grant"],
+        tasks=[{"step": "complete bounded evidence review"}],
+        dependencies=[],
+        risks=[],
+        created_by=f"employee:{ceo_id}",
+    )
+    executor = objective_adapters.ActionExecutorRegistry(
+        identity=f"employee:{ceo_id}", authority_conn=conn
+    )
+    verifier = objective_adapters.IndependentVerifierRegistry()
+    objective_adapters.register_kanban_adapters(
+        executor,
+        verifier,
+        board=board,
+        authority_conn=conn,
+        manager_employee_id=ceo_id,
+    )
+    payload = {
+        "system": "kanban",
+        "target_resource": board,
+        "idempotency_key": "process-separated-delegation-0001",
+        "title": "Return evidence",
+        "body": "Inspect the assigned control and return read-back evidence.",
+        "assignee": "security-auditor",
+        "skills": ["security.audit"],
+        "task_capabilities": ["security.audit"],
+        "task_systems": ["security"],
+        "task_toolsets": ["terminal"],
+        "task_budget_minor": 100,
+        "task_expires_at": int(time.time()) + 1800,
+    }
+    action_id = objectives_db.propose_action(
+        conn,
+        objective_id=objective.id,
+        plan_id=plan_id,
+        action_type="kanban.create_task",
+        payload=payload,
+        expected_outcome="bounded task assigned",
+        required_capability="work.delegate",
+        verification_method="kanban.task.created",
+        risk_class="low",
+        reversible=True,
+        proposed_by=f"employee:{ceo_id}",
+    )
+    delegated = executor.execute_governed(
+        action_id, objective.id, "kanban.create_task", payload
+    )
+    if delegated.status != "succeeded":
+        raise AssertionError(str(delegated))
+    task_id = str(delegated.external_reference)
+    grant = conn.execute(
+        "SELECT id FROM employee_task_grants WHERE action_id=?", (action_id,)
+    ).fetchone()
+    assert grant is not None
+    with pytest.raises(
+        workforce_delegation.DelegationError,
+        match="delegator authority",
+    ):
+        workforce_delegation.create_grant(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective.id,
+            action_id=action_id,
+            manager_employee_id=ceo_id,
+            assignee_profile="security-auditor",
+            title="Return evidence",
+            body="Inspect the assigned control and return read-back evidence.",
+            capabilities=["security.deploy"],
+            systems=["security"],
+            toolsets=["terminal"],
+            skills=["security.audit"],
+            budget_minor=100,
+            expires_at=int(time.time()) + 300,
+        )
+    assert verifier.verify(
+        ActionProposal(
+            action_type="kanban.create_task",
+            payload=payload,
+            expected_outcome="bounded task assigned",
+            required_capability="work.delegate",
+            verification_method="kanban.task.created",
+            risk_class="low",
+            reversible=True,
+        ),
+        delegated,
+    ).verdict == "pass"
+    permit_id = objectives_db.issue_permit(
+        conn,
+        action_id,
+        capability="work.delegate",
+        issued_to=f"employee:{ceo_id}",
+        policy_version="charter-v1",
+        expires_at=int(time.time()) + 300,
+        target_resource=board,
+        constraints={"organization_id": organization_id, "task_id": task_id},
+    )
+    objectives_db.consume_permit(
+        conn,
+        permit_id,
+        action_id=action_id,
+        payload=payload,
+        executor=f"employee:{ceo_id}",
+        organization_id=organization_id,
+        current_policy_version="charter-v1",
+    )
+    objectives_db.record_execution_result(
+        conn,
+        action_id=action_id,
+        permit_id=permit_id,
+        executor=f"employee:{ceo_id}",
+        organization_id=organization_id,
+        status=delegated.status,
+        result=delegated.result,
+        started_at=int(time.time()),
+        external_reference=task_id,
+    )
+    conn.commit()
+
+    evidence_path = tmp_path / "worker-evidence.json"
+    worker_code = """
+import json, os
+from pathlib import Path
+from hermes_cli import kanban_db, workforce_delegation
+
+grant = workforce_delegation.validate_worker_launch(
+    enabled_toolsets=["terminal"], enabled_skills=["security.audit"]
+)
+with kanban_db.connect_closing(board=os.environ["HERMES_DELEGATION_BOARD"]) as board:
+    task_id = os.environ["HERMES_KANBAN_TASK"]
+    assert kanban_db.complete_task(
+        board, task_id,
+        summary="Read-back confirms the assigned control is compliant.",
+        metadata={"evidence": {"control": "security.audit", "verdict": "pass"}},
+    )
+Path(os.environ["HERMES_WORKER_EVIDENCE"]).write_text(
+    json.dumps({"grant_id": grant["id"], "task_id": task_id, "evidence_recorded": True})
+)
+"""
+    worker_env = {
+        **__import__("os").environ,
+        "HERMES_EXECUTION_CONTRACT_ID": str(grant["id"]),
+        "HERMES_KANBAN_TASK": task_id,
+        "HERMES_BUSINESS_AUTHORITY_DB": str(authority_path),
+        "HERMES_PROFILE": "security-auditor",
+        "HERMES_DELEGATION_BOARD": board,
+        "HERMES_KANBAN_DB": str(kanban_db.kanban_db_path(board=board)),
+        "HERMES_WORKER_EVIDENCE": str(evidence_path),
+    }
+    child = subprocess.run(
+        [sys.executable, "-c", worker_code],
+        env=worker_env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert child.returncode == 0
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence == {
+        "grant_id": str(grant["id"]),
+        "task_id": task_id,
+        "evidence_recorded": True,
+    }
+
+    assert objective_service.sync_kanban_events(conn, board=board) == 1
+    event = conn.execute(
+        """SELECT event_type, payload_json FROM objective_inbox
+           WHERE objective_id=? AND event_type='kanban.task.done'""",
+        (objective.id,),
+    ).fetchone()
+    assert event is not None
+    assert json.loads(event["payload_json"])["status"] == "done"
+
+    class CEOCompletionPlanner:
+        identity = f"employee:{ceo_id}"
+
+        def propose(self, snapshot, event):
+            return PlanProposal(
+                assumptions=["employee evidence is present in provider read-back"],
+                tasks=[], dependencies=[], risks=[], actions=(),
+                objective_complete_when_verified=True,
+            )
+
+    class CEOCompletionVerifier:
+        identity = "control:ceo-delegation-verifier"
+
+        def verify_objective(self, snapshot, plan, action_verifications):
+            with kanban_db.connect_closing(board=board) as board_conn:
+                task = kanban_db.get_task(board_conn, task_id)
+                run = board_conn.execute(
+                    "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            run_metadata = json.loads(run["metadata"] or "{}") if run else {}
+            return VerificationOutcome(
+                "pass"
+                if task
+                and task.status == "done"
+                and run_metadata.get("evidence", {}).get("verdict") == "pass"
+                else "fail",
+                verification_evidence.build(
+                    observer=self.identity,
+                    source_kind="authoritative_database_readback",
+                    source_reference=f"kanban:{task_id}",
+                    facts={"task_done": bool(task and task.status == "done")},
+                ),
+            )
+
+    class NoopExecutor:
+        identity = f"employee:{ceo_id}"
+
+    ceo_runtime = ObjectiveRuntime(
+        conn,
+        planner=CEOCompletionPlanner(),
+        executor=NoopExecutor(),
+        verifier=CEOCompletionVerifier(),
+        charter=charter,
+        policy_version="charter-v1",
+        runtime_id="runtime:process-separated-ceo",
+    )
+    outcome = ceo_runtime.tick()
+    assert outcome.status == "verified", outcome.reason
+    assert objectives_db.get_objective(conn, objective.id).status == "verified"
 
 
 def test_ceo_evaluates_procurement_before_autonomous_software_payment(

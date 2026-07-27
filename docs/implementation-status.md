@@ -13,6 +13,9 @@ acceptance evidence.
   actions cannot regain execution authority.
 - Permit consumption rejects permits whose policy version is stale for the
   active runtime.
+- Delegation is authority-monotone: grants are bounded by the current
+  delegator mandate as well as the subordinate mandate, objective scope,
+  budget, and expiry; privilege cannot be amplified through hierarchy.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Registered action payload schemas and temporal observation windows are
@@ -35,9 +38,10 @@ acceptance evidence.
 - The same acceptance also dispatches a due durable schedule and verifies that
   the CEO worker advances the objective from that event without turn-by-turn
   operator input.
-- Workforce acceptance now covers the complete delegated-worker handoff:
-  hierarchy-bound mandate, exact launch contract, subordinate completion, and
-  durable `kanban.task.done` wake-up for CEO planning.
+- Workforce acceptance now covers the complete process-separated delegated-worker
+  handoff: hierarchy-bound mandate, exact profile/mandate/system/toolset/skill
+  grant, subordinate process launch, evidence-bearing completion, durable
+  `kanban.task.done` wake-up, and CEO verification of the parent objective.
 - The current-tree acceptance routes its initial objective through the typed,
   authenticated external-event boundary, including freshness evidence and
   source-reference idempotency, before the CEO worker acts.

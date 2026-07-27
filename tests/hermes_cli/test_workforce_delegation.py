@@ -26,8 +26,8 @@ def _company(tmp_path, monkeypatch):
         purpose="Delegate within exact authority",
         profile_name="default",
         charter={
-            "allowed_capabilities": ["work.delegate"],
-            "allowed_systems": ["kanban"],
+            "allowed_capabilities": ["work.delegate", "web.read"],
+            "allowed_systems": ["kanban", "web"],
             "solo_founder": {
                 "toolsets": ["web"],
                 "skills": ["research"],

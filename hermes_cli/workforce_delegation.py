@@ -153,6 +153,11 @@ def create_grant(
     mandate = organization_db.get_current_mandate(conn, str(employee["id"]))
     if mandate is None:
         raise DelegationError("assignee has no mandate")
+    manager_mandate = organization_db.get_current_mandate(
+        conn, str(manager_employee_id)
+    )
+    if manager_mandate is None:
+        raise DelegationError("delegator has no current mandate")
     if int(mandate["starts_at"]) > now or (
         mandate["expires_at"] is not None and int(mandate["expires_at"]) <= now
     ):
@@ -174,6 +179,10 @@ def create_grant(
         raise DelegationError("employee task grant must expire in the future")
     if mandate["expires_at"] is not None and expires_at > int(mandate["expires_at"]):
         raise DelegationError("task grant outlives the employee mandate")
+    if manager_mandate["expires_at"] is not None and expires_at > int(
+        manager_mandate["expires_at"]
+    ):
+        raise DelegationError("task grant outlives delegator authority")
     requested_capabilities = sorted(set(capabilities))
     requested_systems = sorted(set(systems))
     requested_toolsets = sorted(set(toolsets))
@@ -188,15 +197,32 @@ def create_grant(
         )
     if not set(requested_capabilities).issubset(set(mandate["capabilities"])):
         raise DelegationError("task capability exceeds employee mandate")
+    if not set(requested_capabilities).issubset(
+        set(manager_mandate.get("capabilities") or [])
+    ):
+        raise DelegationError("task capability exceeds delegator authority")
     if not set(requested_systems).issubset(set(mandate["systems"])):
         raise DelegationError("task system exceeds employee mandate")
+    if not set(requested_systems).issubset(
+        set(manager_mandate.get("systems") or [])
+    ):
+        raise DelegationError("task system exceeds delegator authority")
     mandate_toolsets = set(str(item) for item in mandate.get("toolsets") or [])
     if "all" in requested_toolsets or not set(requested_toolsets).issubset(
         mandate_toolsets
     ):
         raise DelegationError("task toolset exceeds employee mandate")
+    manager_toolsets = set(str(item) for item in manager_mandate.get("toolsets") or [])
+    if "all" in requested_toolsets or not set(requested_toolsets).issubset(
+        manager_toolsets
+    ):
+        raise DelegationError("task toolset exceeds delegator authority")
     if not set(requested_skills).issubset(set(mandate.get("skills") or [])):
         raise DelegationError("task skill exceeds employee mandate")
+    if not set(requested_skills).issubset(
+        set(manager_mandate.get("skills") or [])
+    ):
+        raise DelegationError("task skill exceeds delegator authority")
     if budget_minor < 0:
         raise DelegationError("task budget cannot be negative")
     mandate_budget = mandate["budget_minor"]
@@ -215,6 +241,10 @@ def create_grant(
         )
         if allocated + budget_minor > int(mandate_budget):
             raise DelegationError("task grants exceed employee mandate budget")
+    if manager_mandate["budget_minor"] is not None and budget_minor > int(
+        manager_mandate["budget_minor"]
+    ):
+        raise DelegationError("task budget exceeds delegator authority")
     objective = conn.execute(
         """SELECT organization_id,max_spend_minor,permitted_systems_json
              FROM objectives WHERE id=?""",

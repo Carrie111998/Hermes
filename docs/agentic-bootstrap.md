@@ -128,6 +128,19 @@ provider readiness, container-registry publication, or high availability.
 
 ## Current-tree Founder/CEO acceptance
 
+The process-separated delegation gate is also covered by:
+
+```sh
+python3 -m pytest -q tests/hermes_cli/test_agentic_business_e2e.py -k process_separated_delegation
+```
+
+It launches the subordinate as a separate interpreter with only its exact
+grant-bound environment, persists evidence in the Kanban task-run record, then
+lets a fresh CEO runtime consume `kanban.task.done` and verify the parent
+objective. The grant is specific to the employee profile, mandate version,
+capabilities, systems, toolsets, skills, budget, and expiry; it is not a
+standing account-wide authorization.
+
 The single current-tree acceptance scenario is the decisive bounded runtime
 proof. It builds and installs the wheel, starts a fresh container, demonstrates
 blocked readiness before controls are satisfied, applies the test charter and

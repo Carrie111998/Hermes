@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added a process-separated delegation acceptance gate: the Founder/CEO creates
+  a grant-bound Kanban task, a fresh subordinate Python process validates the
+  exact profile/mandate/toolset/skill grant, records evidence in the task run,
+  and a fresh CEO runtime consumes the completion event and verifies the parent
+  objective. The proof uses deterministic local databases and providers.
+- Delegation grants now fail closed when any capability, system, toolset, skill,
+  budget, or expiry would exceed the current delegator mandate, in addition to
+  the subordinate mandate and objective scope.
 - Tax-rate records now use immutable supersession lineage; amended rates replace
   the current rule explicitly, branch-from-old-rule attempts are rejected, and
   tax calculation ignores superseded rules.

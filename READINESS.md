@@ -383,6 +383,23 @@ Image ID: `sha256:ee59306e2257eb3e2a4267d5146dfa996bba75d36a78d4a51a7b580d4875d2
 
 ## Latest current-tree acceptance record
 
+The process-separated delegation acceptance gate was validated on the current
+tree with:
+
+```sh
+python3 -m pytest -q tests/hermes_cli/test_agentic_business_e2e.py -k process_separated_delegation
+```
+
+Result: **1 passed, 6 deselected**. The test proves that the CEO-issued grant
+is bound to one subordinate profile, mandate, system, toolset, skill, budget,
+and expiry; a separate process performs the task and records evidence; and a
+fresh CEO runtime receives the completion event, performs authoritative
+read-back, and advances the parent objective to `verified`. This is local
+deterministic acceptance evidence, not proof of production worker deployment.
+The same gate attempts an unauthorized capability and confirms that delegation
+is rejected because subordinate authority may never exceed the delegator's
+current mandate.
+
 The complete acceptance command was rerun from commit `d1cd322ffa` on
 2026-07-27 with:
 
