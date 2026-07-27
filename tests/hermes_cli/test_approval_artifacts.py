@@ -230,6 +230,7 @@ def test_exact_approval_materializes_one_permit_then_consumes_on_execution(tmp_p
         conn,
         permit_id,
         action_id=action_id,
+        organization_id=organization_id,
         payload=payload,
         executor="employee:ceo",
     )
@@ -284,6 +285,7 @@ def test_materialized_approval_can_be_revoked_before_execution(tmp_path):
             conn,
             permit_id,
             action_id=action_id,
+            organization_id=organization_id,
             payload={
                 "system": "crm",
                 "target_resource": "customer:1",

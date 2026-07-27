@@ -153,6 +153,7 @@ def test_policy_revision_revokes_every_unconsumed_execution_permit(tmp_path):
             conn,
             permit_id,
             action_id=action_id,
+            organization_id=organization_id,
             payload=payload,
             executor="executor:kanban",
         )

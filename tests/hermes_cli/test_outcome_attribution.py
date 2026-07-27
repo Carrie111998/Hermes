@@ -62,6 +62,9 @@ def _company(tmp_path):
 
 
 def _verified_action(conn, objective_id: str) -> tuple[str, str]:
+    organization_id = conn.execute(
+        "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)
+    ).fetchone()["organization_id"]
     plan_id = objectives_db.create_plan(
         conn,
         objective_id,
@@ -99,6 +102,7 @@ def _verified_action(conn, objective_id: str) -> tuple[str, str]:
         conn,
         permit_id,
         action_id=action_id,
+        organization_id=organization_id,
         payload={"resource": "customer:1", "value": "active"},
         executor="worker",
     )

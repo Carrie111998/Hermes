@@ -210,6 +210,7 @@ def test_restart_recovery_creates_one_evidenced_handoff_and_never_replays(tmp_pa
         conn,
         permit_id,
         action_id=action_id,
+        organization_id="__unscoped__",
         payload={"system": "payments", "target_resource": "vendor:1"},
         executor="employee:ceo",
     )

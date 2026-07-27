@@ -1096,9 +1096,9 @@ def consume_permit(
     permit_id: str,
     *,
     action_id: str,
-    organization_id: Optional[str] = None,
     payload: Mapping[str, Any],
     executor: str,
+    organization_id: str,
     current_policy_version: Optional[str] = None,
 ) -> None:
     with conn:
@@ -1115,10 +1115,7 @@ def consume_permit(
         ).fetchone()
         if objective is None:
             raise PermitError("permit action objective was removed")
-        if (
-            organization_id is not None
-            and str(objective["organization_id"]) != organization_id
-        ):
+        if str(objective["organization_id"]) != organization_id:
             raise PermitError("permit organization does not match objective")
         if objective["status"] not in {"planned", "authorized", "executing"}:
             raise PermitError(

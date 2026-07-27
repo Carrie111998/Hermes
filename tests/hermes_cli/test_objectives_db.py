@@ -179,9 +179,9 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
     with pytest.raises(odb.PermitError, match="organization"):
         odb.consume_permit(
             conn,
-            permit_id,
-            action_id=action_id,
-            organization_id="organization_other",
+                permit_id,
+                action_id=action_id,
+                organization_id="organization_other",
             payload=payload,
             executor="worker-1",
         )
@@ -189,9 +189,10 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
     with pytest.raises(odb.PermitError, match="payload"):
         odb.consume_permit(
             conn,
-            permit_id,
-            action_id=action_id,
-            payload={**payload, "sha256": "changed"},
+                permit_id,
+                action_id=action_id,
+                organization_id="__unscoped__",
+                payload={**payload, "sha256": "changed"},
             executor="worker-1",
         )
     with pytest.raises(odb.PermitError, match="different executor"):
@@ -199,6 +200,7 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
             conn,
             permit_id,
             action_id=action_id,
+            organization_id="__unscoped__",
             payload=payload,
             executor="worker-2",
         )
@@ -207,6 +209,7 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
         conn,
         permit_id,
         action_id=action_id,
+        organization_id="__unscoped__",
         payload=payload,
         executor="worker-1",
     )
@@ -215,6 +218,7 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
             conn,
             permit_id,
             action_id=action_id,
+            organization_id="__unscoped__",
             payload=payload,
             executor="worker-1",
         )
@@ -263,8 +267,8 @@ def test_permit_consumption_rejects_stale_policy_version(conn):
         policy_version="policy-v1", expires_at=int(time.time()) + 60,
     )
     with pytest.raises(odb.PermitError, match="policy version is stale"):
-        odb.consume_permit(
-            conn, permit_id, action_id=action_id, payload=payload,
+            odb.consume_permit(
+            conn, permit_id, action_id=action_id, organization_id="__unscoped__", payload=payload,
             executor="worker", current_policy_version="policy-v2",
         )
 
@@ -290,7 +294,7 @@ def test_permit_consumption_rejects_cancelled_objective(conn):
     odb.transition_objective(conn, objective.id, "cancelled", actor="human:advisor")
     with pytest.raises(odb.PermitError, match="no longer admits execution"):
         odb.consume_permit(
-            conn, permit_id, action_id=action_id, payload=payload, executor="worker",
+            conn, permit_id, action_id=action_id, organization_id="__unscoped__", payload=payload, executor="worker",
             current_policy_version="policy-v1",
         )
 
@@ -386,7 +390,7 @@ def test_authority_contracts_and_evidence_are_database_immutable(conn):
         policy_version="v1", expires_at=int(time.time()) + 60,
     )
     odb.consume_permit(
-        conn, permit_id, action_id=action_id, payload=payload, executor="worker",
+        conn, permit_id, action_id=action_id, organization_id="__unscoped__", payload=payload, executor="worker",
     )
     result_id = odb.record_execution_result(
         conn, action_id=action_id, permit_id=permit_id, executor="worker",
