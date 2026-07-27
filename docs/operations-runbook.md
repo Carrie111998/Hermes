@@ -74,6 +74,11 @@ these artifacts.
   reports the exact baseline mismatch and autonomy pauses. Inspect the host and
   provider state, then use `charterforge business runtime-rebaseline` with a
   human reason only after accepting the change; resume autonomy separately.
+- **Stale intent:** when an objective's reaffirmation window expires, the
+  runtime blocks it and opens an `objective_reaffirmation_required`
+  intervention. Verify that the mission and constraints still apply before
+  resolving with `reaffirm`; do not extend the window by editing the database
+  directly.
 - **Conflicting workers:** claims and resource leases select one writer.
 - **Accounting interruption:** reconcile provider records before posting or
   reversing journal entries.

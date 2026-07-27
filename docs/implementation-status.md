@@ -85,6 +85,9 @@ acceptance evidence.
 - Proposed objectives that reach the runtime without acceptance now create a
   durable acceptance handoff; an evidence-bearing advisor acceptance
   transitions the objective to `accepted` and emits a fresh wake event.
+- Objective intent freshness is durable: `reaffirmed_at` and the configured
+  reaffirmation TTL block stale objectives and require evidence-bearing advisor
+  reaffirmation before planning resumes.
 - Runtime-host mismatches and charters with no registered action contracts also
   persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted

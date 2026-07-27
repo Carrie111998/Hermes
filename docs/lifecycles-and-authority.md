@@ -23,6 +23,12 @@ Cancellation, expiry, abandonment, and supersession are explicit. Plans are
 immutable versions. Objective completion requires registered success-criteria
 verifiers; generated prose is not completion evidence.
 
+Each objective carries a durable `reaffirmed_at` timestamp. When
+`agentic.reaffirmation_ttl_seconds` elapses, the runtime blocks the objective
+and opens an `objective_reaffirmation_required` advisor handoff. Execution
+resumes only after evidence-bearing reaffirmation refreshes intent and emits a
+new wake event.
+
 ## Task lifecycle
 
 Kanban tasks move through ready, claimed/in-progress, completed, blocked, or
@@ -43,4 +49,3 @@ At launch, the dispatcher loads toolsets and skills from the immutable grant,
 not from a broader profile. The worker refuses mismatches. At handoff, current
 employment, mandate, task binding, and result authority are checked again.
 Comments, email, web content, and task prose cannot expand the grant.
-
