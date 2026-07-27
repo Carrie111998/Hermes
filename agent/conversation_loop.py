@@ -73,6 +73,7 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.chat_completion_helpers import rewrite_prompt_current_date
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -1542,6 +1543,14 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Keep the "Conversation started:" date current across long-lived
+        # sessions: the cached system prompt is built once and replayed
+        # verbatim, so in a multi-day gateway session the date line goes stale
+        # and leaks into memory captures. Run outside the _use_prompt_caching
+        # gate so non-Anthropic providers also see today's date, and before
+        # apply_anthropic_cache_control so the wire split stays consistent.
+        rewrite_prompt_current_date(agent, api_messages)
 
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible

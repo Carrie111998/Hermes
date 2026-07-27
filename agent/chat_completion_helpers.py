@@ -1536,6 +1536,37 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
+def rewrite_prompt_current_date(agent, api_messages=None) -> None:
+    """Keep the ``Conversation started:`` date current in long-lived sessions.
+
+    The cached system prompt is built once per session and replayed verbatim
+    on continuation, so in a gateway session spanning days/weeks the date line
+    goes stale (and the model copies the wrong date into long-term memory).
+    Rewrite that one line in place each turn, mirroring
+    ``rewrite_prompt_model_identity``: only the volatile tail changes, so the
+    stable-prefix cache still matches; not persisted to the session DB, so the
+    stored row stays byte-stable across sessions.
+
+    When ``api_messages`` head is the system message, the line is rewritten
+    there too so this turn (not just the next) sees today's date.
+    """
+    sp = getattr(agent, "_cached_system_prompt", None)
+    if not isinstance(sp, str) or not sp:
+        return
+    from hermes_time import now as _hermes_now
+    today = _hermes_now().strftime("%A, %B %d, %Y")
+    m = re.search(r"(?m)^Conversation started: .*$", sp)
+    if not m:
+        return
+    expected_line = f"Conversation started: {today}"
+    if m.group() == expected_line:
+        return
+    new_sp = sp[: m.start()] + expected_line + sp[m.end() :]
+    agent._cached_system_prompt = new_sp
+    if api_messages and api_messages[0].get("role") == "system":
+        api_messages[0]["content"] = new_sp
+
+
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     return (
         str(fb.get("provider") or "").strip().lower(),
