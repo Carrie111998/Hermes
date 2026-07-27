@@ -328,6 +328,26 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   anchor custom `{#surfacing-env-vars-in-hermes-config}`, header
   `X-Hermes-Session-Id/Key`. 2 headings cambiaron, sin anchors internos. Build limpio:
   98/98 warnings idénticos a la baseline.
+- Lote 13 (este commit, cierre GRUPO 6): `index.mdx` (home) + `user-stories.mdx`.
+  **No calificó para auto-aprobación**: el home en inglés (lote 15) no fue transformación
+  mecánica sino reescritura a mano (título/descripción/hero atribuidos a Digital
+  Services LLC + link `iyari.io`, y frase "Now maintained by Digital Services LLC as
+  IYARI" añadida a las 2 menciones de "the lab behind Hermes, Nomos, and Psyche"). El
+  chino tenía el texto **pre-rebranding** intacto. Traducida la misma reescritura
+  (confirmada por el usuario): título/descripción/hero → `Digital Services LLC`
+  (hero con link a `iyari.io`, reemplaza `nousresearch.com`); las 2 frases de
+  atribución del laboratorio mantienen `Nous Research` intacto (atribución honesta,
+  precedente index.mdx inglés) + se añadió "现由 Digital Services LLC 以 IYARI 之名维护".
+  **Bug evitado**: el transformador con `--skip-nous-research` igual transforma
+  bare "Hermes" en "该实验室是 Hermes、Nomos 和 Psyche" (coma no protegida por el
+  lookahead) → revertido a mano en las 2 líneas, igual que el inglés preserva "Hermes"
+  ahí (modelo/proyecto, no producto). Resto del archivo (heading, repo `NousResearch/
+  hermes-agent`, menciones genéricas de Hermes en tabla de enlaces) transformación
+  normal sin incidentes. `user-stories.mdx`: cambio mecánico único, limpio.
+  Build limpio: 98/98 warnings idénticos a la baseline.
+- **GRUPO 6 (i18n `website/i18n/zh-Hans/`) COMPLETO.** 13 lotes, 316 archivos
+  (314 `.md` + 2 `.mdx`), mismo criterio y transformador que GRUPO 5. Pendiente futuro:
+  código `.py` heredado (fuera de alcance de ambos grupos de docs).
 
 ## Auto-aprobación delegada (GRUPO 6)
 
