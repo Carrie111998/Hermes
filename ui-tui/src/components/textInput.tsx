@@ -1486,6 +1486,7 @@ export const shouldPassThroughToGlobalHandler = (
   voiceRecordKey: ParsedVoiceRecordKey = DEFAULT_VOICE_RECORD_KEY
 ): boolean =>
   (key.ctrl && input === 'c') ||
+  (key.ctrl && input === 'p') ||
   (key.ctrl && input === 'x') ||
   key.tab ||
   (key.shift && key.tab) ||

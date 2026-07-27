@@ -17,8 +17,7 @@ import { prevRenderedMsg } from '../domain/blockLayout.js'
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
-  inputVisualHeight,
-  stableComposerColumns
+  inputVisualHeight
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
 import { composerPromptText } from '../lib/prompt.js'
@@ -27,7 +26,9 @@ import { ActiveWidgetSlot, AmbientDock, AmbientRail, useAmbientRailWidth } from 
 import { AgentsOverlay } from './agentsOverlay.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
 import { FloatingOverlays, PromptZone } from './appOverlays.js'
-import { Banner, Panel, SessionPanel } from './branding.js'
+import { Panel } from './branding.js'
+import { ComposerSurface, composerSurfaceColumns } from './composerSurface.js'
+import { CompactWelcome } from './emptyState.js'
 import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
 import { Journey } from './journey.js'
@@ -204,18 +205,7 @@ const TranscriptPane = memo(function TranscriptPane({
               )}
 
               {row.msg.kind === 'intro' ? (
-                <Box flexDirection="column" paddingTop={1}>
-                  <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
-
-                  {row.msg.info && (
-                    <SessionPanel
-                      info={row.msg.info}
-                      maxWidth={Math.max(1, composer.cols - 2)}
-                      sid={ui.sid}
-                      t={ui.theme}
-                    />
-                  )}
-                </Box>
+                <CompactWelcome cols={Math.max(1, composer.cols - 2)} info={row.msg.info ?? null} t={ui.theme} />
               ) : row.msg.kind === 'panel' && row.msg.panelData ? (
                 <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
               ) : (
@@ -289,7 +279,7 @@ const ComposerPane = memo(function ComposerPane({
 
   const promptWidth = composerPromptWidth(promptText)
   const promptBlank = ' '.repeat(promptWidth)
-  const inputColumns = stableComposerColumns(composer.cols, promptWidth, TERMUX_TUI_MODE)
+  const inputColumns = composerSurfaceColumns(composer.cols, promptWidth, TERMUX_TUI_MODE)
   const inputHeight = inputVisualHeight(composer.input, inputColumns)
   const inputMouseRef = useRef<null | TextInputMouseApi>(null)
 
@@ -362,10 +352,9 @@ const ComposerPane = memo(function ComposerPane({
         <Box height={1} onMouseDown={captureInputDrag} onMouseDrag={dragFromSpacer} onMouseUp={endInputDrag} />
       )}
 
-      <StatusRulePane at="top" composer={composer} status={status} />
       <AmbientDock placement="dock-top" />
 
-      <Box flexDirection="column" marginTop={ui.statusBar === 'top' ? 0 : 1} position="relative">
+      <Box flexDirection="column" position="relative">
         <FloatingOverlays
           cols={composer.cols}
           compIdx={composer.compIdx}
@@ -381,7 +370,15 @@ const ComposerPane = memo(function ComposerPane({
 
         {composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
-        {!isBlocked && (
+        <ComposerSurface
+          blocked={isBlocked}
+          cols={composer.cols}
+          footer={footerCols => (
+            <StatusRulePane at="composer" cols={footerCols} composer={composer} status={status} />
+          )}
+          shell={sh}
+          t={ui.theme}
+        >
           <>
             {composer.inputBuf.map((line, i) => (
               <Box key={i}>
@@ -402,7 +399,7 @@ const ComposerPane = memo(function ComposerPane({
               onMouseDrag={dragFromPromptRow}
               onMouseUp={endInputDrag}
               position="relative"
-              width={Math.max(1, composer.cols - 2)}
+              width={Math.max(1, composer.cols - 6)}
             >
               <Box width={promptWidth}>
                 {sh ? (
@@ -419,11 +416,14 @@ const ComposerPane = memo(function ComposerPane({
                 <TextInput
                   color={ui.theme.color.text}
                   columns={inputColumns}
+                  focus={!isBlocked}
                   mouseApiRef={inputMouseRef}
                   onChange={composer.updateInput}
                   onPaste={composer.handleTextPaste}
                   onSubmit={composer.submit}
-                  placeholder={composer.empty ? PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''}
+                  placeholder={
+                    isBlocked ? (composer.empty ? 'Complete the prompt above…' : '') : composer.empty ? PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''
+                  }
                   // Exactly the "(and N more toolsets…)" tone. `muted` is a
                   // MID-luminance family tone, so it reads receded on both
                   // poles even when polarity detection is wrong (transparent
@@ -440,13 +440,12 @@ const ComposerPane = memo(function ComposerPane({
               </Box>
             </Box>
           </>
-        )}
+        </ComposerSurface>
       </Box>
 
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>⚕ {ui.status}</Text>}
 
       <AmbientDock placement="dock-bottom" />
-      <StatusRulePane at="bottom" composer={composer} status={status} />
     </NoSelect>
   )
 })
@@ -475,23 +474,27 @@ const JourneyPane = memo(function JourneyPane() {
 
 const StatusRulePane = memo(function StatusRulePane({
   at,
+  cols,
   composer,
   status
-}: Pick<AppLayoutProps, 'composer' | 'status'> & { at: 'bottom' | 'top' }) {
+}: Pick<AppLayoutProps, 'composer' | 'status'> & { at: 'bottom' | 'composer' | 'top'; cols?: number }) {
   const ui = useStore($uiState)
+  const embedded = at === 'composer'
 
-  if (ui.statusBar !== at) {
+  if (embedded ? ui.statusBar === 'off' : ui.statusBar !== at) {
     return null
   }
 
   return (
-    <Box marginTop={at === 'top' ? 1 : 0}>
+    <Box marginTop={!embedded && at === 'top' ? 1 : 0}>
       <StatusRule
         battery={ui.battery ? ui.batteryStatus : null}
         bgCount={ui.bgTasks.size}
         busy={ui.busy}
-        cols={composer.cols}
+        busyInputMode={ui.busyInputMode}
+        cols={cols ?? composer.cols}
         cwdLabel={status.cwdLabel}
+        embedded={embedded}
         focusView={ui.focusView}
         indicatorStyle={ui.indicatorStyle}
         lastTurnEndedAt={status.lastTurnEndedAt}
@@ -501,7 +504,10 @@ const StatusRulePane = memo(function StatusRulePane({
         modelReasoningEffort={ui.info?.reasoning_effort}
         notice={ui.notice}
         onSessionCountClick={() => patchOverlayState({ sessions: true })}
+        profile={ui.info?.profile_name}
+        queueCount={composer.queuedDisplay.length}
         sessionStartedAt={status.sessionStartedAt}
+        shell={(composer.inputBuf[0] ?? composer.input).startsWith('!')}
         status={ui.status}
         statusColor={status.statusColor}
         t={ui.theme}

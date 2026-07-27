@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import {
   applyVoiceRecordResponse,
+  canOpenCommandPalette,
   dismissSensitivePrompt,
   handleIdleHotkeyExit,
   shouldAllowIdleHotkeyExit,
@@ -46,6 +47,17 @@ describe('shouldFallThroughForScroll — keep transcript scrolling alive during 
 
   it('does NOT fall through for unrelated state (no scroll keys held)', () => {
     expect(shouldFallThroughForScroll(baseKey)).toBe(false)
+  })
+})
+
+describe('canOpenCommandPalette', () => {
+  it('does not compete with protected prompts or active widget apps', () => {
+    resetOverlayState()
+    const idle = getOverlayState()
+
+    expect(canOpenCommandPalette(idle)).toBe(true)
+    expect(canOpenCommandPalette({ ...idle, approval: { requestId: 'approval-1' } } as any)).toBe(false)
+    expect(canOpenCommandPalette({ ...idle, widget: { appId: 'grid-test' } } as any)).toBe(false)
   })
 })
 

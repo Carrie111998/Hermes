@@ -1,7 +1,9 @@
+import { stringWidth, wrapAnsi } from '@hermes/ink'
+
 import { TERMUX_TUI_MODE } from '../config/env.js'
 import type { Msg } from '../types.js'
 
-import { transcriptBodyWidth } from './inputMetrics.js'
+import { transcriptBodyWidth, transcriptCardWidth } from './inputMetrics.js'
 
 const hashText = (text: string) => {
   let h = 5381
@@ -21,7 +23,17 @@ export const messageHeightKey = (msg: Msg) => {
       .map(s => `${s.title ?? ''}:${s.text?.length ?? 0}:${s.items?.length ?? 0}:${s.rows?.length ?? 0}`)
       .join('\u0001') ?? ''
 
-  const introSig = msg.kind === 'intro' ? (msg.info?.version ?? '') : ''
+  const introSig =
+    msg.kind === 'intro'
+      ? [
+          msg.info?.version ?? '',
+          msg.info?.cwd ?? '',
+          msg.info?.model ?? '',
+          msg.info?.profile_name ?? '',
+          msg.info?.install_warning ?? '',
+          msg.info?.update_behind ?? ''
+        ].join('\u0001')
+      : ''
 
   return [
     msg.role,
@@ -40,6 +52,7 @@ export const messageHeightKey = (msg: Msg) => {
 // 800 covers any realistic assistant message (the prior history-clip
 // ceiling was 16 lines, then full text — this is the sane middle).
 const MAX_ESTIMATE_LINES = 800
+const EXACT_WORD_WRAP_MAX_CHARS = 4096
 
 export const wrappedLines = (text: string, width: number, maxLines: number = MAX_ESTIMATE_LINES) => {
   const w = Math.max(1, width)
@@ -50,16 +63,30 @@ export const wrappedLines = (text: string, width: number, maxLines: number = MAX
   const budget = Math.min(text.length, maxLines * w + maxLines)
   let n = 0
   let start = 0
+  let plainAsciiLine = true
 
   for (let i = 0; i <= budget; i++) {
-    if (i === text.length || i === budget || text.charCodeAt(i) === 10) {
-      const rows = Math.max(1, Math.ceil((i - start) / w))
+    const code = text.charCodeAt(i)
+
+    if (i === text.length || i === budget || code === 10) {
+      const line = text.slice(start, i)
+
+      // Match Ink's word wrapping exactly for ordinary messages. Giant lines
+      // intentionally fall back to display-width division: Yoga measures the
+      // mounted row afterward, while keeping cold virtual-offset rebuilds fast.
+      const rows = line.length <= EXACT_WORD_WRAP_MAX_CHARS && /\s/.test(line)
+        ? wrapAnsi(line, w, { hard: true, trim: false }).split('\n').length
+        : Math.max(1, Math.ceil((plainAsciiLine ? line.length : stringWidth(line)) / w))
+
       n += rows >= maxLines - n ? maxLines - n : rows
       start = i + 1
+      plainAsciiLine = true
 
       if (n >= maxLines) {
         return maxLines
       }
+    } else if (code > 0x7f || code === 0x1b) {
+      plainAsciiLine = false
     }
   }
 
@@ -88,7 +115,7 @@ export const estimatedMsgHeight = (
   }
 ) => {
   if (msg.kind === 'intro') {
-    return msg.info?.version ? 9 : 5
+    return 4 + (msg.info?.install_warning ? 1 : 0) + ((msg.info?.update_behind ?? 0) > 0 ? 1 : 0)
   }
 
   if (msg.kind === 'panel') {
@@ -103,7 +130,12 @@ export const estimatedMsgHeight = (
     return Math.max(2, msg.todos.length + 2)
   }
 
-  const bodyWidth = transcriptBodyWidth(cols, msg.role, userPrompt, TERMUX_TUI_MODE)
+  const conversationCard = msg.kind === undefined && (msg.role === 'user' || msg.role === 'assistant')
+
+  const bodyWidth = conversationCard
+    ? Math.max(1, transcriptCardWidth(cols) - 4)
+    : transcriptBodyWidth(cols, msg.role, userPrompt, TERMUX_TUI_MODE)
+
   const text = msg.text
   let h = wrappedLines(text || ' ', bodyWidth)
 
@@ -137,6 +169,13 @@ export const estimatedMsgHeight = (
     h += 2
   } else if (msg.kind === 'slash') {
     h++
+  }
+
+  if (conversationCard) {
+    // Ink does not materialize the trailing outer margin as another rendered
+    // row. Reserve the role label, label gap, and vertical padding; the user
+    // card's leading row is already accounted for above.
+    h += msg.role === 'user' ? 3 : 4
   }
 
   // Group-boundary blank line owned by BlockSlot: model prose, reasoning/tool

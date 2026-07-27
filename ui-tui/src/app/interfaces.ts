@@ -286,6 +286,7 @@ export interface OverlayState {
   approval: ApprovalReq | null
   billing: BillingOverlayState | null
   clarify: ClarifyReq | null
+  commandPalette: null | { query: string }
   confirm: ConfirmReq | null
   /** Ambient widget apps — glanceable dock, non-blocking (never in $isBlocked). */
   ambient: ActiveWidget[]

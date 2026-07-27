@@ -1,7 +1,59 @@
+import { stringWidth } from '@hermes/ink'
 import { describe, expect, it } from 'vitest'
 
 import type { StatusBarSegments } from '../components/appChrome.js'
-import { busyIndicatorWidth, statusBarSegments, statusRuleWidths } from '../components/appChrome.js'
+import {
+  busyIndicatorWidth,
+  composerDiscoveryLabel,
+  composerModeLabel,
+  composerProfileLabel,
+  statusBarSegments,
+  statusRuleWidths
+} from '../components/appChrome.js'
+
+describe('composerModeLabel', () => {
+  it('makes the busy Enter behavior explicit', () => {
+    expect(composerModeLabel(true, 'queue', false)).toBe('Enter: queue')
+    expect(composerModeLabel(true, 'steer', false)).toBe('Enter: steer')
+    expect(composerModeLabel(true, 'interrupt', false)).toBe('Enter: interrupt')
+  })
+
+  it('labels shell mode without relying on prompt color', () => {
+    expect(composerModeLabel(false, 'queue', true)).toBe('Shell')
+  })
+
+  it('makes the idle send behavior explicit', () => {
+    expect(composerModeLabel(false, 'queue', false)).toBe('Enter: send')
+  })
+})
+
+describe('composerDiscoveryLabel', () => {
+  it('shows completion entry points only while idle', () => {
+    expect(composerDiscoveryLabel(false, false)).toBe('@ context · Ctrl+P')
+    expect(composerDiscoveryLabel(true, false)).toBe('')
+    expect(composerDiscoveryLabel(false, true)).toBe('')
+  })
+})
+
+describe('composerProfileLabel', () => {
+  it('keeps named profiles visible without allowing unbounded rail width', () => {
+    expect(composerProfileLabel('coder')).toBe('coder')
+    expect(composerProfileLabel('a-very-long-specialist-profile')).toBe('a-very-long-speci…')
+  })
+
+  it('omits generic profile names', () => {
+    expect(composerProfileLabel('default')).toBe('')
+    expect(composerProfileLabel('custom')).toBe('')
+    expect(composerProfileLabel()).toBe('')
+  })
+
+  it('truncates wide Unicode profiles by terminal display cells', () => {
+    const label = composerProfileLabel('开发者开发者开发者开发者')
+
+    expect(label).toMatch(/…$/)
+    expect(stringWidth(label)).toBeLessThanOrEqual(18)
+  })
+})
 
 describe('statusRuleWidths', () => {
   it('keeps the status rule within the terminal width', () => {

@@ -86,7 +86,7 @@ describe('toTranscriptMessages', () => {
 })
 
 describe('MessageLine', () => {
-  it('preserves a separator after compound user prompt glyphs in transcript rows', () => {
+  it('does not retain compound composer prompt glyphs in sent-message cards', () => {
     const stdout = new PassThrough()
     const stdin = new PassThrough()
     const stderr = new PassThrough()
@@ -125,7 +125,8 @@ describe('MessageLine', () => {
       .split('\n')
       .find(line => line.includes('Okay'))
 
-    expect(renderedLine).toContain('Ψ > Okay')
+    expect(renderedLine).toContain('Okay')
+    expect(renderedLine).not.toContain('Ψ >')
   })
 })
 

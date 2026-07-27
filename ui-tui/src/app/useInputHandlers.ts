@@ -17,6 +17,7 @@ import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionW
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
 
+import { setActionContextProvider } from './actionRegistry.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import {
   type GatewayRpc,
@@ -25,13 +26,35 @@ import {
   type InputHandlerResult,
   type OverlayState
 } from './interfaces.js'
-import { $isBlocked, $overlayState, patchOverlayState } from './overlayStore.js'
+import { $isBlocked, $overlayState, hasModalInputOwner, patchOverlayState } from './overlayStore.js'
 import { turnController } from './turnController.js'
 import { patchTurnState } from './turnStore.js'
 import { getUiState } from './uiStore.js'
 
 const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
 const DASHBOARD_NEW_SESSION_MESSAGE = 'starting a fresh dashboard chat...'
+
+export const canOpenCommandPalette = (overlay: OverlayState): boolean => !hasModalInputOwner(overlay)
+
+export const handleCommandPaletteHotkey = (ch: string, key: { ctrl: boolean }): boolean => {
+  if (!isCtrl(key, ch, 'p')) {
+    return false
+  }
+
+  patchOverlayState({
+    agents: false,
+    commandPalette: { query: '' },
+    journey: false,
+    modelPicker: false,
+    pager: null,
+    petPicker: false,
+    pluginsHub: false,
+    sessions: false,
+    skillsHub: false
+  })
+
+  return true
+}
 
 export const shouldAllowIdleHotkeyExit = (dashboardTuiMode = DASHBOARD_TUI_MODE) => !dashboardTuiMode
 
@@ -140,6 +163,17 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   const pagerPageSize = Math.max(5, (terminal.stdout?.rows ?? 24) - 6)
   const scrollIdleTimer = useRef<null | ReturnType<typeof setTimeout>>(null)
 
+  setActionContextProvider(() => {
+    const live = getUiState()
+
+    return {
+      busy: live.busy,
+      dashboard: DASHBOARD_TUI_MODE,
+      dispatchSlash: actions.dispatchSubmission,
+      hasSession: Boolean(live.sid)
+    }
+  })
+
   // Wheel accel ported from claude-code: inter-event timing drives step size,
   // direction flips reset. wheelStep (WHEEL_SCROLL_STEP) is the base; final
   // rows = wheelStep × accelMult. State mutates in place across renders.
@@ -185,6 +219,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
     if (overlay.sudo || overlay.secret) {
       return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys)
+    }
+
+    if (overlay.commandPalette) {
+      return patchOverlayState({ commandPalette: null })
     }
 
     if (overlay.modelPicker) {
@@ -322,6 +360,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
   useInput((ch, key) => {
     const live = getUiState()
+
+    if (canOpenCommandPalette(overlay) && handleCommandPaletteHotkey(ch, key)) {
+      return
+    }
 
     if (isBlocked) {
       // When approval/clarify/confirm overlays are active, their own useInput

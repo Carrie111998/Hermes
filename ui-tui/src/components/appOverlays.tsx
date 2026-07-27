@@ -1,15 +1,17 @@
-import { Box, stringWidth, Text } from '@hermes/ink'
+import { Box, stringWidth, Text, useStdout } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import type { ReactNode } from 'react'
 
+import { ACTION_REGISTRY, executeAction, getActionContext } from '../app/actionRegistry.js'
 import { useGateway } from '../app/gatewayContext.js'
-import type { AppOverlaysProps } from '../app/interfaces.js'
+import type { AppOverlaysProps, OverlayState } from '../app/interfaces.js'
 import { $overlayState, patchOverlayState } from '../app/overlayStore.js'
 import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
 
 import { ActiveSessionSwitcher } from './activeSessionSwitcher.js'
 import { FloatBox } from './appChrome.js'
 import { BillingOverlay } from './billingOverlay.js'
+import { CommandPalette, paletteContentWidth, paletteUsesFrame } from './commandPalette.js'
 import { MaskedPrompt } from './maskedPrompt.js'
 import { ModelPicker } from './modelPicker.js'
 import { OverlayHint } from './overlayControls.js'
@@ -22,6 +24,9 @@ import { SubscriptionOverlay } from './subscriptionOverlay.js'
 import { WidgetGrid, type WidgetGridWidget } from './widgetGrid.js'
 
 const COMPLETION_WINDOW = 16
+
+export const shouldRenderCompletions = (commandPalette: OverlayState['commandPalette'], count: number) =>
+  !commandPalette && count > 0
 
 /**
  * A prompt hosted in a single-cell WidgetGrid with the classic 1-cell padding.
@@ -187,11 +192,13 @@ export function FloatingOverlays({
   | 'pagerPageSize'
 >) {
   const { gw } = useGateway()
+  const { stdout } = useStdout()
   const overlay = useStore($overlayState)
   const sid = useStore($uiSessionId)
   const theme = useStore($uiTheme)
 
   const hasAny =
+    overlay.commandPalette ||
     overlay.modelPicker ||
     overlay.pager ||
     overlay.petPicker ||
@@ -217,6 +224,26 @@ export function FloatingOverlays({
   // not a rewrite. `maxWidth` hands each panel its cell budget — with one
   // column it never binds, so rendering is identical to the pre-grid layout.
   const widgets: WidgetGridWidget[] = []
+
+  if (overlay.commandPalette) {
+    const palette = (width: number) => (
+      <CommandPalette
+        context={getActionContext()}
+        initialQuery={overlay.commandPalette?.query ?? ''}
+        maxWidth={paletteContentWidth(width)}
+        onClose={() => patchOverlayState({ commandPalette: null })}
+        onRun={executeAction}
+        registry={ACTION_REGISTRY}
+        t={theme}
+      />
+    )
+
+    widgets.push({
+      id: 'command-palette',
+      render: width =>
+        paletteUsesFrame(stdout?.rows ?? 24) ? <FloatBox color={theme.color.border}>{palette(width)}</FloatBox> : palette(width)
+    })
+  }
 
   if (overlay.sessions) {
     widgets.push({
@@ -327,7 +354,7 @@ export function FloatingOverlays({
     })
   }
 
-  if (completions.length) {
+  if (shouldRenderCompletions(overlay.commandPalette, completions.length)) {
     widgets.push({
       id: 'completions',
       render: () => (

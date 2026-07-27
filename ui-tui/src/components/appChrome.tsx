@@ -4,7 +4,7 @@ import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } 
 import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
-import type { BatteryInfo, IndicatorStyle, Notice } from '../app/interfaces.js'
+import type { BatteryInfo, BusyInputMode, IndicatorStyle, Notice } from '../app/interfaces.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import { DEV_CREDITS_MODE } from '../config/env.js'
 import { FACES } from '../content/faces.js'
@@ -297,6 +297,49 @@ export function statusBarSegments(cols: number): StatusBarSegments {
   }
 }
 
+/** Submit behavior belongs beside the composer, not in a placeholder that
+ * disappears as soon as the user starts typing. Shell mode wins because its
+ * Enter key executes locally rather than submitting an agent prompt. */
+export function composerModeLabel(busy: boolean, busyInputMode: BusyInputMode, shell: boolean): string {
+  if (shell) {
+    return 'Shell'
+  }
+
+  return busy ? `Enter: ${busyInputMode}` : 'Enter: send'
+}
+
+export function composerDiscoveryLabel(busy: boolean, shell: boolean): string {
+  return busy || shell ? '' : '@ context · Ctrl+P'
+}
+
+const profileSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+
+export function composerProfileLabel(profile?: null | string): string {
+  if (!profile || profile === 'default' || profile === 'custom') {
+    return ''
+  }
+
+  if (stringWidth(profile) <= 18) {
+    return profile
+  }
+
+  let label = ''
+  let width = 0
+
+  for (const { segment } of profileSegmenter.segment(profile)) {
+    const segmentWidth = stringWidth(segment)
+
+    if (width + segmentWidth > 17) {
+      break
+    }
+
+    label += segment
+    width += segmentWidth
+  }
+
+  return `${label}…`
+}
+
 function SpawnHud({ t }: { t: Theme }) {
   // Tight HUD that only appears when the session is actually fanning out.
   // Colour escalates to warn/error as depth or concurrency approaches the cap.
@@ -438,6 +481,8 @@ export function StatusRule({
   cwdLabel,
   cols,
   busy,
+  busyInputMode = 'queue',
+  embedded = false,
   status,
   statusColor,
   model,
@@ -445,6 +490,9 @@ export function StatusRule({
   modelReasoningEffort,
   indicatorStyle = 'kaomoji',
   notice,
+  profile,
+  queueCount = 0,
+  shell = false,
   usage,
   bgCount,
   lastTurnEndedAt,
@@ -471,6 +519,17 @@ export function StatusRule({
 
   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
+  const composerModeText = composerModeLabel(busy, busyInputMode, shell)
+  const activeModeText = busy || shell || embedded ? composerModeText : ''
+
+  const idleHintText =
+    !busy && !shell
+      ? embedded
+        ? composerDiscoveryLabel(busy, shell)
+        : `${composerModeText} · ${composerDiscoveryLabel(busy, shell)}`
+      : ''
+
+  const profileText = composerProfileLabel(profile)
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery = !!battery && battery.available && battery.percent != null
@@ -502,14 +561,17 @@ export function StatusRule({
       : stringWidth(status)
 
   const essentialWidth =
-    stringWidth('─ ') +
+    (embedded ? 0 : stringWidth('─ ')) +
     batteryWidth +
     slotWidth +
+    (activeModeText ? stringWidth(' │ ') + stringWidth(activeModeText) : 0) +
     stringWidth(' │ ') +
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
 
-  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, cwdLabel, essentialWidth)
+  const { leftWidth, rightWidth, separatorWidth } = embedded
+    ? { leftWidth: cols, rightWidth: 0, separatorWidth: 0 }
+    : statusRuleWidths(cols, cwdLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
   // if it fits in the space left after the pinned essentials, evaluated in
@@ -541,6 +603,9 @@ export function StatusRule({
       ? `Δ ${(usage.dev_credits_spent_micros / 10000).toFixed(1)}¢`
       : ''
 
+  const showProfile = !!profileText && fits(SEP + stringWidth(profileText))
+  const queueText = queueCount > 0 ? `Queued ${queueCount}` : ''
+  const showQueue = !!queueText && fits(SEP + stringWidth(queueText))
   const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
   const showDuration = segs.duration && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
 
@@ -570,6 +635,7 @@ export function StatusRule({
   // Dev-gated readout (HERMES_DEV_CREDITS), lowest priority,
   // so it consumes tail budget LAST and drops first on a narrow terminal.
   const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
+  const showIdleHint = !!idleHintText && fits(SEP + stringWidth(idleHintText))
 
   // Focus-view badge. Pinned (not tail-budgeted) on purpose: the whole point of
   // the indicator is that the user can never be in reduced-output mode without
@@ -597,7 +663,7 @@ export function StatusRule({
             renders as a separate shrinkable box below so a long notice
             ellipsizes instead of crushing model │ ctx (R3-M7). */}
         <Box flexDirection="row" flexShrink={0}>
-          <Text color={t.color.border}>{'─ '}</Text>
+          {!embedded && <Text color={t.color.border}>{'─ '}</Text>}
           {showBattery ? (
             <Text color={batteryColorVal}>
               {batteryText}
@@ -611,6 +677,7 @@ export function StatusRule({
               {status}
             </Text>
           )}
+          {activeModeText ? <Text color={shell ? t.color.shellDollar : t.color.accent}> │ {activeModeText}</Text> : null}
         </Box>
         {/* Notice slot — the only shrinkable left element (R3-M7). Sits in a
             flexShrink={1} box with truncate-end so it yields/ellipsizes
@@ -640,6 +707,19 @@ export function StatusRule({
             </Text>
           ) : null}
         </Box>
+        {showProfile ? (
+          <Text color={t.color.label} wrap="truncate-end">
+            {' │ '}
+            {profileText}
+          </Text>
+        ) : null}
+        {showQueue ? (
+          <Text color={t.color.accent} wrap="truncate-end">
+            {' │ '}
+            {queueText}
+          </Text>
+        ) : null}
+
         {showFocus ? (
           <Box flexDirection="row" flexShrink={0}>
             <Text color={t.color.muted}>{' │ '}</Text>
@@ -707,13 +787,19 @@ export function StatusRule({
             {devCreditsText}
           </Text>
         ) : null}
+        {showIdleHint ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {idleHintText}
+          </Text>
+        ) : null}
         {/* SpawnHud isn't part of the tail budget (its width is dynamic), so it
             renders last — any overflow truncates the HUD itself rather than the
             budgeted segments before it. It self-hides when no delegation runs. */}
         <SpawnHud t={t} />
       </Box>
 
-      {rightWidth > 0 ? (
+      {!embedded && rightWidth > 0 ? (
         <>
           <Text color={t.color.border}>{separatorWidth >= 3 ? ' ─ ' : ' '}</Text>
           <Box flexShrink={0} width={rightWidth}>
@@ -732,7 +818,7 @@ export function FloatBox({ children, color }: { children: ReactNode; color: stri
     <Box
       alignSelf="flex-start"
       borderColor={color}
-      borderStyle="double"
+      borderStyle="round"
       flexDirection="column"
       marginTop={1}
       opaque
@@ -829,16 +915,21 @@ interface StatusRuleProps {
   lastTurnEndedAt?: null | number
   liveSessionCount: number
   busy: boolean
+  busyInputMode?: BusyInputMode
   cols: number
   cwdLabel: string
+  embedded?: boolean
   model: string
   modelFast?: boolean
   modelReasoningEffort?: string
   indicatorStyle?: IndicatorStyle
   notice?: Notice | null
+  profile?: null | string
+  queueCount?: number
   sessionStartedAt?: null | number
   status: string
   statusColor: string
+  shell?: boolean
   t: Theme
   turnStartedAt?: null | number
   usage: Usage

@@ -10,6 +10,11 @@ describe('virtual height estimates', () => {
     expect(messageHeightKey(msg)).toBe(messageHeightKey({ ...msg }))
   })
 
+  it('accounts for the flat surface padding and role label on conversation cards', () => {
+    expect(estimatedMsgHeight({ role: 'user', text: 'prompt' }, 80, { compact: false, details: false })).toBe(6)
+    expect(estimatedMsgHeight({ role: 'assistant', text: 'response' }, 80, { compact: false, details: false })).toBe(5)
+  })
+
   it('accounts for wrapping and preserved blank-block rhythm', () => {
     const msg: Msg = { role: 'assistant', text: `one\n\n${'x'.repeat(90)}` }
 
@@ -17,14 +22,13 @@ describe('virtual height estimates', () => {
     expect(estimatedMsgHeight(msg, 35, { compact: false, details: false })).toBeGreaterThan(5)
   })
 
-  it('uses compound user prompt width when estimating user message wrapping', () => {
-    // cols must clear the 20-col body-width floor for both prompts (gutter +
-    // horizontalReserve=4) so the wider 'Ψ >' prompt actually narrows the
-    // body enough to wrap an extra line vs the single-cell '❯' prompt.
+  it('does not reserve the composer prompt gutter inside sent-message cards', () => {
+    // Sent cards use their full padded body width; the active composer's
+    // prompt glyph must not keep affecting transcript wrapping.
     const msg: Msg = { role: 'user', text: 'x'.repeat(23) }
 
-    expect(estimatedMsgHeight(msg, 30, { compact: false, details: false, userPrompt: '❯' })).toBe(3)
-    expect(estimatedMsgHeight(msg, 30, { compact: false, details: false, userPrompt: 'Ψ >' })).toBe(4)
+    expect(estimatedMsgHeight(msg, 34, { compact: false, details: false, userPrompt: '❯' })).toBe(6)
+    expect(estimatedMsgHeight(msg, 34, { compact: false, details: false, userPrompt: 'Ψ >' })).toBe(6)
   })
 
   it('adds one row for a group-boundary lead gap', () => {
@@ -100,6 +104,16 @@ describe('virtual height estimates', () => {
     const t0 = performance.now()
     const rows = wrappedLines(giant, 80)
     const elapsed = performance.now() - t0
+
+    expect(rows).toBeLessThanOrEqual(800)
+    expect(elapsed).toBeLessThan(50)
+  })
+
+  it('keeps the estimator bounded for giant whitespace-rich prose', () => {
+    const text = 'word '.repeat(400_000)
+    const started = performance.now()
+    const rows = wrappedLines(text, 120)
+    const elapsed = performance.now() - started
 
     expect(rows).toBeLessThanOrEqual(800)
     expect(elapsed).toBeLessThan(50)

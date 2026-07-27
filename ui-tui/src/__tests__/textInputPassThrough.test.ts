@@ -43,6 +43,7 @@ describe('shouldPassThroughToGlobalHandler', () => {
 
   it('always passes through non-voice global control keys', () => {
     expect(shouldPassThroughToGlobalHandler('c', key({ ctrl: true }))).toBe(true)
+    expect(shouldPassThroughToGlobalHandler('p', key({ ctrl: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('x', key({ ctrl: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ escape: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ tab: true }))).toBe(true)

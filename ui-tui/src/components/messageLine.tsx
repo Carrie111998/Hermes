@@ -8,7 +8,7 @@ import { sectionMode } from '../domain/details.js'
 import { userDisplay } from '../domain/messages.js'
 import { ROLE } from '../domain/roles.js'
 import { splitSlashSkillRefs } from '../domain/slash.js'
-import { transcriptBodyWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
+import { transcriptBodyWidth, transcriptCardWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
 import {
   boundedLiveRenderText,
   compactPreview,
@@ -27,6 +27,8 @@ import { TodoPanel } from './todoPanel.js'
 
 // Collapse threshold for long system messages (system prompt etc.)
 const SYSTEM_COLLAPSE_CHARS = 400
+
+export const messageCardWidth = transcriptCardWidth
 
 export const MessageLine = memo(function MessageLine({
   cols,
@@ -141,6 +143,9 @@ export const MessageLine = memo(function MessageLine({
   }
 
   const { body, glyph, prefix } = ROLE[msg.role](t)
+  const conversationCard = msg.kind === undefined && (msg.role === 'user' || msg.role === 'assistant')
+  const contentCols = conversationCard ? messageCardWidth(cols) : cols
+  const conversationBodyWidth = Math.max(1, messageCardWidth(cols) - 4)
   const gutterWidth = transcriptGutterWidth(msg.role, t.brand.prompt)
 
   const showDetails =
@@ -179,7 +184,9 @@ export const MessageLine = memo(function MessageLine({
     }
 
     if (msg.role === 'assistant') {
-      const bodyWidth = transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)
+      const bodyWidth = conversationCard
+        ? conversationBodyWidth
+        : transcriptBodyWidth(contentCols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)
 
       return isStreaming ? (
         // Incremental markdown: split at the last stable block boundary so
@@ -234,12 +241,8 @@ export const MessageLine = memo(function MessageLine({
   // against the prose around it.
   const isDiffSegment = msg.kind === 'diff'
 
-  return (
-    <Box
-      flexDirection="column"
-      marginBottom={msg.role === 'user' || isDiffSegment ? 1 : 0}
-      marginTop={msg.role === 'user' || msg.kind === 'slash' || isDiffSegment || leadGap ? 1 : 0}
-    >
+  const messageBody = (
+    <>
       {showDetails && (
         <Box flexDirection="column" marginBottom={1}>
           <ToolTrail
@@ -266,15 +269,57 @@ export const MessageLine = memo(function MessageLine({
         </Box>
       )}
 
-      <Box>
-        <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
-          <Text bold={msg.role === 'user'} color={prefix}>
-            {glyph}{' '}
-          </Text>
-        </NoSelect>
+      {conversationCard ? (
+        <Box width={conversationBodyWidth}>{content}</Box>
+      ) : (
+        <Box>
+          <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
+            <Text bold={msg.role === 'user'} color={prefix}>
+              {glyph}{' '}
+            </Text>
+          </NoSelect>
 
-        <Box width={transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)}>{content}</Box>
+          <Box width={transcriptBodyWidth(contentCols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)}>{content}</Box>
+        </Box>
+      )}
+    </>
+  )
+
+  if (conversationCard) {
+    const laneWidth = Math.max(1, Math.trunc(cols) - 4)
+
+    return (
+      <Box
+        justifyContent={msg.role === 'user' ? 'flex-end' : 'flex-start'}
+        marginBottom={1}
+        marginTop={leadGap || msg.role === 'user' ? 1 : 0}
+        width={laneWidth}
+      >
+        <Box
+          backgroundColor={t.color.statusBg}
+          flexDirection="column"
+          paddingX={2}
+          paddingY={1}
+          width={messageCardWidth(cols)}
+        >
+          <Box marginBottom={1}>
+            <Text bold color={prefix}>
+              {msg.role === 'user' ? 'You' : isStreaming ? 'Hermes · responding' : 'Hermes'}
+            </Text>
+          </Box>
+          {messageBody}
+        </Box>
       </Box>
+    )
+  }
+
+  return (
+    <Box
+      flexDirection="column"
+      marginBottom={msg.role === 'user' || isDiffSegment ? 1 : 0}
+      marginTop={msg.role === 'user' || msg.kind === 'slash' || isDiffSegment || leadGap ? 1 : 0}
+    >
+      {messageBody}
     </Box>
   )
 })

@@ -191,6 +191,14 @@ export function transcriptBodyWidth(totalCols: number, role: Role, userPrompt: s
   return Math.max(20, available)
 }
 
+export function transcriptCardWidth(totalCols: number) {
+  const available = Math.max(1, Math.trunc(totalCols) - 4)
+
+  // Wide panes gain conversational rhythm from opposed, 4/5-width cards.
+  // Narrow panes keep every usable cell so borders never starve the message.
+  return available < 60 ? available : Math.max(48, Math.floor((available * 4) / 5))
+}
+
 export function stableComposerColumns(totalCols: number, promptWidth: number, termuxMode = false) {
   // Physical render/wrap width. Always reserve outer composer padding and
   // prompt prefix. Only reserve the transcript scrollbar gutter when the

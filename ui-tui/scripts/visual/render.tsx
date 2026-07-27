@@ -19,10 +19,14 @@ import { Box, renderSync, Text } from '@hermes/ink'
 import React, { type ReactElement } from 'react'
 
 import { GatewayProvider } from '../../src/app/gatewayContext.js'
-import { patchOverlayState, resetOverlayState } from '../../src/app/overlayStore.js'
+import { ACTION_REGISTRY } from '../../src/app/actionRegistry.js'
+import { resetOverlayState } from '../../src/app/overlayStore.js'
 import { patchUiState, resetUiState } from '../../src/app/uiStore.js'
-import { FloatingOverlays } from '../../src/components/appOverlays.js'
-import { Banner, SessionPanel } from '../../src/components/branding.js'
+import { FloatBox } from '../../src/components/appChrome.js'
+import { CommandPalette, paletteContentWidth } from '../../src/components/commandPalette.js'
+import { ComposerSurface } from '../../src/components/composerSurface.js'
+import { CompactWelcome } from '../../src/components/emptyState.js'
+import { MessageLine } from '../../src/components/messageLine.js'
 import { fromSkin, type Theme } from '../../src/theme.js'
 import type { SessionInfo } from '../../src/types.js'
 
@@ -73,14 +77,6 @@ const info: SessionInfo = {
   update_behind: 1,
   version: '3.2.1'
 }
-
-const completions = [
-  { display: '/new', meta: 'Start a new session (fresh session ID + history)', text: '/new' },
-  { display: '/reset', meta: 'Start a new session (alias for /new)', text: '/reset' },
-  { display: '/clear', meta: 'Clear screen and start a new session', text: '/clear' },
-  { display: '/redraw', meta: 'Force a full UI repaint', text: '/redraw' },
-  { display: '/history', meta: 'Show conversation history', text: '/history' }
-]
 
 function renderAnsi(node: ReactElement, columns: number): string {
   const stdout = new PassThrough()
@@ -248,52 +244,78 @@ addScene('default · light terminal (Cursor)', '#ffffff', {})
 addScene('slate · dark terminal', '#101014', SLATE)
 addScene('slate · light terminal (raw palette + display shim)', '#ffffff', SLATE)
 
-let page = `<!doctype html><meta charset="utf-8"><body style="margin:0;background:#666;font:13px/1.35 Menlo,monospace"><div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px">`
+let page = `<!doctype html><meta charset="utf-8"><body style="margin:0;background:#666;font:13px/1 Menlo,monospace"><div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px">`
 
 for (const scene of scenes) {
   setup(scene.bg)
   patchUiState({ sid: 'd2a6ecf8', theme: scene.theme })
 
-  const intro = renderAnsi(
-    <Box flexDirection="column">
-      <Banner maxWidth={86} t={scene.theme} />
-      <SessionPanel info={info} maxWidth={86} sid="d2a6ecf8" t={scene.theme} />
-    </Box>,
-    88
-  )
+  const intro = renderAnsi(<CompactWelcome cols={86} info={info} t={scene.theme} />, 88)
 
-  patchOverlayState({})
-
-  const comps = renderAnsi(
-    <Box flexDirection="column" height={10} position="relative" width={88}>
-      <Box flexGrow={1} />
-      <FloatingOverlays
-        cols={88}
-        compIdx={0}
-        completions={completions}
-        onActiveSessionClose={pending}
-        onActiveSessionSelect={noop}
-        onModelSelect={noop}
-        onNewLiveSession={noop}
-        onNewPromptSession={noop}
-        onResumeSelect={noop}
-        pagerPageSize={8}
+  const palette = renderAnsi(
+    <FloatBox color={scene.theme.color.border}>
+      <CommandPalette
+        context={{ busy: false, dashboard: false, dispatchSlash: noop, hasSession: true }}
+        maxWidth={paletteContentWidth(84)}
+        onClose={noop}
+        onRun={() => true}
+        registry={ACTION_REGISTRY}
+        t={scene.theme}
       />
+    </FloatBox>,
+    88
+  )
+
+  const composer = renderAnsi(
+    <Box flexDirection="column">
+      <ComposerSurface
+        blocked={false}
+        cols={88}
+        footer={
+          <Text>
+            <Text color={scene.theme.color.statusGood}>ready</Text>
+            <Text color={scene.theme.color.muted}> │ opus 4.8 fast │ 4s │ voice off │ </Text>
+            <Text color={scene.theme.color.accent}>Enter: send · Ctrl+P</Text>
+          </Text>
+        }
+        shell={false}
+        t={scene.theme}
+      >
+        <Text>
+          <Text color={scene.theme.color.prompt}>{scene.theme.brand.prompt} </Text>
+          <Text>Draft a polished release note with @file:src/app.ts</Text>
+        </Text>
+      </ComposerSurface>
+      <Box height={1} />
+      <ComposerSurface
+        blocked
+        cols={48}
+        footer={
+          <Text>
+            <Text color={scene.theme.color.statusGood}>ready</Text>
+            <Text color={scene.theme.color.muted}> │ opus 4.8 │ blank</Text>
+          </Text>
+        }
+        shell={false}
+        t={scene.theme}
+      >
+        <Text>
+          <Text color={scene.theme.color.prompt}>{scene.theme.brand.prompt} </Text>
+          <Text>A narrow multiline draft that stays inset</Text>
+        </Text>
+      </ComposerSurface>
     </Box>,
     88
   )
 
-  const statusLine = renderAnsi(
+  const conversation = renderAnsi(
     <Box flexDirection="column">
-      <Text>
-        <Text color={scene.theme.color.statusGood}>— ready </Text>
-        <Text color={scene.theme.color.muted}>| opus 4.8 fast | 4s | voice off</Text>
-      </Text>
-      <Text>
-        <Text color={scene.theme.color.muted}>{scene.theme.brand.prompt} </Text>
-        <Text backgroundColor={scene.theme.color.muted} color={scene.bg}>T</Text>
-        <Text color={scene.theme.color.muted}>ry &quot;fix the lint errors&quot;</Text>
-      </Text>
+      <MessageLine cols={88} msg={{ role: 'user', text: 'testing UI' }} t={scene.theme} />
+      <MessageLine
+        cols={88}
+        msg={{ role: 'assistant', text: 'UI test received successfully.\n\nMarkdown, inline code, and status indicators render here.' }}
+        t={scene.theme}
+      />
     </Box>,
     88
   )
@@ -301,8 +323,9 @@ for (const scene of scenes) {
   page += `<div style="background:${scene.bg};color:${scene.fg};padding:14px;border-radius:6px">`
   page += `<div style="font:bold 12px sans-serif;opacity:.6;margin-bottom:8px;color:${scene.fg}">${scene.name}</div>`
   page += `<pre style="margin:0;white-space:pre">${ansiToHtml(intro, scene.fg, scene.bg)}</pre>`
-  page += `<pre style="margin:8px 0 0;white-space:pre">${ansiToHtml(comps, scene.fg, scene.bg)}</pre>`
-  page += `<pre style="margin:8px 0 0;white-space:pre">${ansiToHtml(statusLine, scene.fg, scene.bg)}</pre>`
+  page += `<pre style="margin:8px 0 0;white-space:pre">${ansiToHtml(palette, scene.fg, scene.bg)}</pre>`
+  page += `<pre style="margin:14px 0 0;white-space:pre">${ansiToHtml(conversation, scene.fg, scene.bg)}</pre>`
+  page += `<pre style="margin:14px 0 0;white-space:pre">${ansiToHtml(composer, scene.fg, scene.bg)}</pre>`
   page += `</div>`
 }
 

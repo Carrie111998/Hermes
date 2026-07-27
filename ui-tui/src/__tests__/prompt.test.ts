@@ -7,8 +7,9 @@ describe('composerPromptText', () => {
     expect(composerPromptText('❯', 'coder', true)).toBe('$')
   })
 
-  it('prefixes named profiles onto the normal prompt', () => {
-    expect(composerPromptText('❯', 'coder')).toBe('coder ❯')
+  it('keeps the edit gutter stable when a profile is active', () => {
+    expect(composerPromptText('❯', 'coder')).toBe('❯')
+    expect(composerPromptText('❯', 'a-very-long-specialist-profile')).toBe('❯')
   })
 
   it('does not prefix default or custom profiles', () => {
@@ -25,7 +26,7 @@ describe('composerPromptText', () => {
     expect(composerPromptText('❯', 'upstr', false, true, 72)).toBe('>')
   })
 
-  it('allows profile prefix on very wide Termux panes', () => {
-    expect(composerPromptText('❯', 'upstr', false, true, 120)).toBe('upstr >')
+  it('keeps the edit gutter stable on very wide Termux panes', () => {
+    expect(composerPromptText('❯', 'upstr', false, true, 120)).toBe('>')
   })
 })
