@@ -54,3 +54,13 @@ Status: PROPOSED. Dependency-ordered implementation plan; no row below is comple
 
 ## Verification discipline
 All integration/E2E work uses a temporary `HERMES_HOME`, isolated fake adapters/clock/storage and no remote provider calls. No task is marked integrated until production call-path wiring and the mapped boundary test exist. Feature flags are not proof of integration; enabled/disabled/rollback behavior must be exercised.
+
+## Contract-slice evidence — 2026-07-27
+
+- `tests/agent/test_dynamic_orchestration.py`: 144 passed, 0 failed.
+- `tests/agent`: 6,614 passed; 3 failures outside this diff (`copilot_acp_client` and concurrent compression), plus one context-compressor timeout.
+- Ruff, `py_compile`, and `git diff --check`: passed.
+- Gitleaks 8.30.1, verified against the official SHA-256 and run against the patch: 0 findings.
+- Independent Kimi review found incomplete IDNA endpoint canonicalization; the finding was reproduced and fixed together with equivalent IPv6 normalization and `route-v1` fixtures.
+- Final cross-family attestation remains unavailable: Claude Max weekly limit, Kimi route/quota exhaustion, and incorrect GLM resolver routing. An independent-context review is recorded separately and does not substitute for cross-family attestation.
+- This slice is pure contract/domain code. It does not implement `CredentialPool.snapshot_for_capacity()`, production `CapacityView`, persistent reservation ledger, circuit breakers, legacy resolver projection, runtime wiring, shadow mode, canary, rollout, or rollback E2E; therefore no task above is marked complete yet.
