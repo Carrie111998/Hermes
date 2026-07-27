@@ -176,6 +176,8 @@ recorded.
 - The sample charter now explicitly admits gateway or standalone supervision;
   a real standalone `worker --once` smoke records `security_blocked` and stops
   without fabricating an external outcome when provider evidence is absent.
+- Blocked worker cycles now retain the exact readiness reason in durable worker
+  health evidence for advisor diagnosis.
 
 - `757408d82884afd60651762715c3ef00446bc0c0` — recorded the release
   readiness evidence documentation.

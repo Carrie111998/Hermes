@@ -130,8 +130,8 @@ tag above.
 - Standalone worker launch smoke: after a clean charter bootstrap,
   `charterforge objectives worker --once` registered a durable
   `objective-runtime` worker, recorded `security_blocked`, and stopped cleanly;
-  `objectives worker-status` read the stopped evidence back. No provider or
-  external outcome was fabricated.
+  `objectives worker-status` read the stopped evidence and exact readiness
+  violations back. No provider or external outcome was fabricated.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 

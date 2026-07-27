@@ -26,6 +26,8 @@ acceptance evidence.
   charter handoff without starting autonomy.
 - Standalone objective-worker launch registers durable worker health and stops
   fail-closed when the provider/evidence boundary is unavailable.
+- Fail-closed worker cycle reasons are retained in `last_error` for operator
+  diagnosis instead of being reduced to a status-only signal.
 - Advisor-by-default authority policy.
 - Exact solo-founder and employee delegation grants.
 - Evidence-based contractor/FTE decision and hierarchical profiles.
