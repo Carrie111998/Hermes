@@ -40,9 +40,18 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
-from tools.terminal_tool import (
-    get_active_env,
-)
+if (
+    (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    and (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip()
+    in {"implementation", "review"}
+    and os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP") == "1"
+    and os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED") == "1"
+    and not os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR")
+):
+    def get_active_env(_task_id: str = ""):
+        return None
+else:
+    from tools.terminal_tool import get_active_env
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
@@ -51,6 +60,13 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _managed_short_task_restricted(agent) -> bool:
+    """Keep checkpoint/Git side effects out of managed worker dispatch."""
+    return bool(
+        getattr(agent, "_managed_short_task_bootstrap_verified", False)
+    )
 
 
 def _ensure_file_checkpoint(
@@ -96,6 +112,98 @@ _MAX_TOOL_WORKERS = 8
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+_KANBAN_TERMINAL_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+
+
+def _managed_kanban_terminal_succeeded(
+    agent,
+    function_name: str,
+    *,
+    result: Any,
+) -> bool:
+    """Require an explicit structured acknowledgement for the live barrier."""
+    if (
+        function_name not in _KANBAN_TERMINAL_TOOLS
+        or not getattr(
+            agent, "_managed_short_task_bootstrap_verified", False
+        )
+    ):
+        return False
+    value = result
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return False
+    if not isinstance(value, dict) or value.get("error"):
+        return False
+    return value.get("ok") is True or value.get("success") is True
+
+
+def _append_committed_kanban_terminal_result(
+    agent,
+    messages: list,
+    *,
+    function_name: str,
+    function_result: Any,
+    tool_call_id: str,
+) -> None:
+    """Record a terminal acknowledgement without fallible result transforms."""
+    try:
+        content = (
+            function_result
+            if isinstance(function_result, str)
+            else json.dumps(function_result, ensure_ascii=False)
+        )
+        tool_message = make_tool_result_message(
+            function_name,
+            content,
+            tool_call_id,
+            effect_disposition="landed",
+        )
+    except Exception:
+        tool_message = {
+            "role": "tool",
+            "name": function_name,
+            "tool_call_id": tool_call_id,
+            "content": '{"ok":true,"terminal_state_committed":true}',
+        }
+    messages.append(tool_message)
+    _flush_session_db_after_tool_progress(
+        agent,
+        messages,
+        stage=f"committed kanban terminal result {function_name}",
+    )
+
+
+def _append_kanban_terminal_skips(agent, messages: list, tool_calls) -> None:
+    """Pair every unstarted call after a successful terminal transition."""
+    for skipped_tc in tool_calls:
+        skipped_name = skipped_tc.function.name
+        skipped_content = (
+            "[Tool execution skipped — the Kanban worker already committed "
+            "its terminal transition and is exiting]"
+        )
+        try:
+            tool_message = make_tool_result_message(
+                skipped_name,
+                skipped_content,
+                skipped_tc.id,
+                effect_disposition="none",
+            )
+        except Exception:
+            tool_message = {
+                "role": "tool",
+                "name": skipped_name,
+                "tool_call_id": skipped_tc.id,
+                "content": skipped_content,
+            }
+        messages.append(tool_message)
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"kanban terminal skipped tool result {skipped_name}",
+        )
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
@@ -425,23 +533,24 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # the session was not granted is rejected before any checkpoint,
         # hook, or dispatch fires.
         _ts_scope_block = None
-        try:
-            from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
-                if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
-                        function_name = _underlying
-                        function_args = _underlying_args
-                    else:
-                        _ts_scope_block = json.dumps({
-                            "error": (
-                                f"'{_underlying}' is not available in this session. "
-                                "Use tool_search to find tools you can call."
-                            ),
-                        }, ensure_ascii=False)
-        except Exception:
-            pass
+        if not _managed_short_task_restricted(agent):
+            try:
+                from tools import tool_search as _ts
+                if function_name == _ts.TOOL_CALL_NAME:
+                    _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                    if not _err and _underlying:
+                        if _underlying in _tool_search_scoped_names(agent):
+                            function_name = _underlying
+                            function_args = _underlying_args
+                        else:
+                            _ts_scope_block = json.dumps({
+                                "error": (
+                                    f"'{_underlying}' is not available in this session. "
+                                    "Use tool_search to find tools you can call."
+                                ),
+                            }, ensure_ascii=False)
+            except Exception:
+                pass
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
@@ -450,6 +559,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
+        if function_name == "kanban_create":
+            function_args = dict(function_args)
+            # A trusted gateway delivery owns exactly one implementation
+            # chain.  Keep the slot stable across provider retries, process
+            # crashes, and regenerated tool-call ids; a second, semantically
+            # different create for the same inbound message is rejected by
+            # the durable creation ledger instead of opening a parallel lane.
+            function_args["_hermes_creation_slot"] = "tool"
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
@@ -522,7 +639,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
             # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
+            if (
+                function_name in {"write_file", "patch"}
+                and not _managed_short_task_restricted(agent)
+                and agent._checkpoint_mgr.enabled
+            ):
                 try:
                     _ensure_file_checkpoint(
                         agent,
@@ -534,7 +655,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     pass
 
             # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and agent._checkpoint_mgr.enabled:
+            if (
+                function_name == "terminal"
+                and not _managed_short_task_restricted(agent)
+                and agent._checkpoint_mgr.enabled
+            ):
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
@@ -1107,21 +1232,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
         _ts_scope_block: Optional[str] = None
-        try:
-            from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
-                if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
-                        function_name = _underlying
-                        function_args = _underlying_args
-                    else:
-                        _ts_scope_block = (
-                            f"'{_underlying}' is not available in this session. "
-                            "Use tool_search to find tools you can call."
-                        )
-        except Exception:
-            pass
+        if not _managed_short_task_restricted(agent):
+            try:
+                from tools import tool_search as _ts
+                if function_name == _ts.TOOL_CALL_NAME:
+                    _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                    if not _err and _underlying:
+                        if _underlying in _tool_search_scoped_names(agent):
+                            function_name = _underlying
+                            function_args = _underlying_args
+                        else:
+                            _ts_scope_block = (
+                                f"'{_underlying}' is not available in this session. "
+                                "Use tool_search to find tools you can call."
+                            )
+            except Exception:
+                pass
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
@@ -1130,6 +1256,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
+        if function_name == "kanban_create":
+            function_args = dict(function_args)
+            # Match the concurrent executor: one stable, replay-safe create
+            # slot per authenticated inbound message.
+            function_args["_hermes_creation_slot"] = "tool"
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
@@ -1211,7 +1342,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logging.debug(f"Tool start callback error: {cb_err}")
 
         # Checkpoint: snapshot working dir before file-mutating tools
-        if not _execution_blocked and function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
+        if (
+            not _execution_blocked
+            and function_name in {"write_file", "patch"}
+            and not _managed_short_task_restricted(agent)
+            and agent._checkpoint_mgr.enabled
+        ):
             try:
                 _ensure_file_checkpoint(
                     agent,
@@ -1223,7 +1359,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         # Checkpoint before destructive terminal commands
-        if not _execution_blocked and function_name == "terminal" and agent._checkpoint_mgr.enabled:
+        if (
+            not _execution_blocked
+            and function_name == "terminal"
+            and not _managed_short_task_restricted(agent)
+            and agent._checkpoint_mgr.enabled
+        ):
             try:
                 cmd = function_args.get("command", "")
                 if _is_destructive_command(cmd):
@@ -1583,6 +1724,35 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        if _managed_kanban_terminal_succeeded(
+            agent,
+            function_name,
+            result=function_result,
+        ):
+            # Arm the exit before any result transformation, storage, display,
+            # steer, or learning hook can fail. The database transition and
+            # self gate are already durable at this point.
+            agent._kanban_worker_terminal_transitioned = True
+            agent._current_tool = None
+            try:
+                agent._touch_activity(
+                    f"tool completed: {function_name} ({tool_duration:.1f}s)"
+                )
+            except Exception:
+                pass
+            _append_committed_kanban_terminal_result(
+                agent,
+                messages,
+                function_name=function_name,
+                function_result=function_result,
+                tool_call_id=tool_call.id,
+            )
+            if i < len(assistant_message.tool_calls):
+                _append_kanban_terminal_skips(
+                    agent, messages, assistant_message.tool_calls[i:]
+                )
+            break
+
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -1752,6 +1922,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             time.sleep(agent.tool_delay)
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
+    if getattr(agent, "_kanban_worker_terminal_transitioned", False):
+        return
+
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
@@ -1795,7 +1968,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -1807,6 +1980,21 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
             )
+        if getattr(
+            agent, "_kanban_worker_terminal_transitioned", False
+        ):
+            later_calls = [
+                call
+                for _later_kind, later_segment in segments[
+                    segment_index + 1:
+                ]
+                for call in later_segment
+            ]
+            if later_calls:
+                _append_kanban_terminal_skips(
+                    agent, messages, later_calls
+                )
+            return
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

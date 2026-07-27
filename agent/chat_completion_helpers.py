@@ -39,7 +39,13 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
-from tools.terminal_tool import is_persistent_env
+from agent.managed_short_task import verified_managed_short_task_lane
+
+if verified_managed_short_task_lane():
+    def is_persistent_env(*_args, **_kwargs) -> bool:
+        return False
+else:
+    from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -1949,11 +1955,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
-    print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
+def handle_max_iterations(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    summary_request: str | None = None,
+    status_label: str | None = None,
+) -> str:
+    """Request a tool-less terminal/checkpoint summary.
 
-    summary_request = (
+    The default preserves the historical hard-limit behavior. Kanban
+    auto-handoff supplies a checkpoint-specific request and label so a planned
+    short-task boundary is never misreported as budget exhaustion.
+    """
+    print(
+        status_label
+        or f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    )
+
+    summary_request = summary_request or (
         "You've reached the maximum number of tool-calling iterations allowed. "
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."

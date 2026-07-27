@@ -365,6 +365,19 @@ def test_wal_checkpoint_truncates_wal_file(tmp_path, monkeypatch):
 
     conn = kb.connect(db_path=db_path)
     try:
+        # ``connect`` deliberately falls back to DELETE journaling on SQLite
+        # builds where this repository's WAL safety probe reports a known
+        # runtime vulnerability.  In that supported mode there is no ``-wal``
+        # sidecar to truncate, so this WAL-specific assertion is inapplicable.
+        journal_mode = str(
+            conn.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        if journal_mode != "wal":
+            pytest.skip(
+                f"WAL checkpoint assertion requires WAL mode; runtime selected "
+                f"{journal_mode!r} for safety"
+            )
+
         # Generate WAL frames.
         for i in range(30):
             kb.create_task(conn, title=f"wal-{i}")

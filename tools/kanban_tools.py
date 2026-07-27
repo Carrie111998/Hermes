@@ -33,12 +33,35 @@ import logging
 import os
 from typing import Any, Optional
 
+from agent.managed_short_task import (
+    managed_short_task_lane_claimed,
+    verified_managed_short_task_lane,
+)
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+
+def load_config():
+    """Lazy compatibility seam; managed task paths never call it."""
+    from hermes_cli.config import load_config as _load_config
+
+    return _load_config()
+
+
+def cfg_get(*args, **kwargs):
+    """Lazy compatibility seam for ordinary orchestrator configuration."""
+    from hermes_cli.config import cfg_get as _cfg_get
+
+    return _cfg_get(*args, **kwargs)
+
+
+def judge_goal(*args, **kwargs):
+    """Lazy compatibility seam for ordinary goal-mode workers."""
+    from hermes_cli.goals import judge_goal as _judge_goal
+
+    return _judge_goal(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +147,112 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _kanban_control_mode_state() -> str:
+    """Return enabled, disabled, or unknown for trusted gateway control."""
+    if (
+        _is_delegated_child_context()
+        or os.environ.get("HERMES_KANBAN_TASK")
+        or os.environ.get("_HERMES_GATEWAY") != "1"
+    ):
+        return "disabled"
+    try:
+        from agent.kanban_handoff_scope import decide_current_gateway_origin
+
+        config = load_config()
+        if "kanban" not in (config.get("toolsets") or []):
+            return "disabled"
+        decision = decide_current_gateway_origin()
+        if decision.get("validation_error"):
+            return "unknown"
+        return "enabled" if decision.get("authorized") is True else "disabled"
+    except Exception:
+        return "unknown"
+
+
+def _check_kanban_control_mode() -> bool:
+    """Expose user-control mutation only when policy is explicitly enabled."""
+    return _kanban_control_mode_state() == "enabled"
+
+
+def _gateway_request_is_internal() -> bool:
+    """Whether this turn is a synthetic Gateway event, never a human command."""
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return False
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env("HERMES_SESSION_INTERNAL", "") == "1"
+    except Exception:
+        # A Gateway request whose provenance cannot be read must never inherit
+        # an assumed human-control capability.
+        return True
+
+
+def _gateway_control_identity_evidence() -> Optional[dict[str, str]]:
+    """Return partial canonical request evidence without granting authority.
+
+    Creation needs the partial mapping to distinguish a genuinely unrelated
+    source from an allowlisted source whose stable delivery proof is missing.
+    Callers must separately require :func:`_gateway_control_identity_complete`
+    before attaching a durable control binding.
+    """
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return None
+    try:
+        from gateway.session_context import get_session_env
+
+        identity = {
+            "platform": get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower(),
+            "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID", "").strip(),
+            "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE", "").strip().lower(),
+            "chat_id": (
+                get_session_env("HERMES_SESSION_CHAT_ID_ALT", "")
+                or get_session_env("HERMES_SESSION_CHAT_ID", "")
+            ).strip(),
+            "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "").strip(),
+            "user_id": (
+                get_session_env("HERMES_SESSION_USER_ID_ALT", "")
+                or get_session_env("HERMES_SESSION_USER_ID", "")
+            ).strip(),
+            "notifier_profile": get_session_env(
+                "HERMES_SESSION_PROFILE", ""
+            ).strip(),
+            "session_key": get_session_env("HERMES_SESSION_KEY", "").strip(),
+            "message_id": get_session_env(
+                "HERMES_SESSION_MESSAGE_ID", ""
+            ).strip(),
+        }
+    except Exception:
+        return None
+    return identity
+
+
+def _gateway_control_identity_complete(
+    identity: Optional[dict[str, str]],
+) -> bool:
+    """Whether partial evidence can support an exact durable control receipt."""
+    if not identity:
+        return False
+    required = (
+        "platform",
+        "chat_type",
+        "chat_id",
+        "user_id",
+        "notifier_profile",
+        "session_key",
+        "message_id",
+    )
+    return all(str(identity.get(name) or "").strip() for name in required)
+
+
+def _trusted_gateway_control_identity() -> Optional[dict[str, str]]:
+    """Read one complete, human-authenticated request identity."""
+    if _gateway_request_is_internal():
+        return None
+    identity = _gateway_control_identity_evidence()
+    return identity if _gateway_control_identity_complete(identity) else None
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -149,6 +278,26 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _short_task_worker_restriction_active() -> bool:
+    """Fail closed for one scoped Phase-1 implementation/review worker."""
+    if verified_managed_short_task_lane() or managed_short_task_lane_claimed():
+        return True
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    if os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1":
+        return True
+    raw = os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY")
+    if not raw:
+        return False
+    try:
+        snapshot = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return True
+    if not isinstance(snapshot, dict) or snapshot.get("validation_error"):
+        return True
+    return snapshot.get("enabled") is not False
 
 
 def _stamp_worker_session_metadata(
@@ -193,6 +342,271 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"worker is scoped to task {env_tid}; refusing to mutate "
             f"{tid}. Use kanban_comment to hand off information to other "
             f"tasks, or kanban_create to spawn follow-up work."
+        )
+    return None
+
+
+def _enforce_short_task_worker_scope(
+    tid: str,
+    board: Any,
+    tool_name: str,
+) -> Optional[str]:
+    """Keep every Phase-1 lifecycle call on its frozen task and board.
+
+    Ordinary and goal workers retain the historical cross-task read/comment
+    behavior. An implementation worker and its independent reviewer are both
+    single-task capabilities: even read-only tools must not inspect a sibling,
+    and an explicit board may only repeat the dispatcher-pinned board.
+    """
+    if not _short_task_worker_restriction_active():
+        return None
+    env_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not env_tid or tid != env_tid:
+        return tool_error(
+            f"{tool_name} refused: this Phase-1 worker is scoped only to "
+            f"task {env_tid or '(missing)'}."
+        )
+    supplied_board = str(board).strip() if board is not None else ""
+    if supplied_board:
+        env_board = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+        if not env_board or supplied_board != env_board:
+            return tool_error(
+                f"{tool_name} refused: this Phase-1 worker is pinned to "
+                f"board {env_board or '(environment default)'}; explicit "
+                f"board {supplied_board!r} is outside its scope."
+            )
+    return None
+
+
+def _phase1_bound_task_mutation_error(
+    kb: Any,
+    conn: Any,
+    task_id: str,
+    tool_name: str,
+) -> Optional[str]:
+    """Protect a bound Phase-1 task from ordinary agent/orchestrator writes.
+
+    The normal model tool surface historically lets an orchestrator mutate any
+    task id.  A non-empty Phase-1 control binding changes that contract: only
+    the exact dispatcher-owned implementation/review/goal run may use its own
+    lifecycle tools.  Human stop/correction remains on ``kanban_control``,
+    whose complete authenticated binding check is intentionally separate.
+    """
+    from hermes_cli.kanban_control_guard import (
+        MANAGED_CONTROL_DENIED_MESSAGE,
+        authorize_managed_task_mutation,
+    )
+
+    decision = authorize_managed_task_mutation(conn, task_id, None)
+    if not decision.managed:
+        return None
+
+    env_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id = _worker_run_id(task_id)
+    if env_task_id == task_id and run_id is not None:
+        task = kb.get_task(conn, task_id)
+        if task is not None and task.worker_pid == os.getpid():
+            if task.current_run_id == run_id:
+                lane = kb.short_task_completion_authorization(
+                    conn,
+                    task_id,
+                    expected_run_id=run_id,
+                    policy_snapshot_raw=os.environ.get(
+                        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"
+                    ),
+                )
+                if lane in {"implementation", "review", "goal"}:
+                    return None
+            elif tool_name == "kanban_complete" and task.status == "review":
+                # The implementation submission commits before the tool reply.
+                # Preserve its exact transport-replay acknowledgement while the
+                # old PID is retained behind the self exit gate; the DB helper
+                # still verifies the summary/metadata are byte-for-byte equal.
+                run = conn.execute(
+                    "SELECT status, outcome, worker_pid FROM task_runs "
+                    "WHERE id = ? AND task_id = ?",
+                    (run_id, task_id),
+                ).fetchone()
+                try:
+                    frozen = kb._task_short_handoff_worker_policy(conn, task_id)
+                    snapshot_ok = bool(
+                        frozen
+                        and kb._short_task_snapshot_matches_lane(
+                            frozen,
+                            os.environ.get(
+                                "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"
+                            ),
+                            "implementation",
+                        )
+                    )
+                except Exception:
+                    snapshot_ok = False
+                if (
+                    run is not None
+                    and run["status"] == "review_requested"
+                    and run["outcome"] == "review_requested"
+                    and run["worker_pid"] == os.getpid()
+                    and snapshot_ok
+                ):
+                    return None
+
+    return tool_error(f"{tool_name}：{MANAGED_CONTROL_DENIED_MESSAGE}")
+
+
+def _managed_attachment_surface_error(tool_name: str) -> Optional[str]:
+    """Keep direct attachment storage/network outside the Phase-1 runtime."""
+    if not _short_task_worker_restriction_active():
+        return None
+    return tool_error(
+        f"{tool_name}：受控短任务不能使用附件库或远程附件下载；"
+        "请把交付文件保存在本次专属工作目录内，并在完成时通过 artifacts 声明。"
+    )
+
+
+def _managed_completion_path_guard(
+    *,
+    summary: Any,
+    result: Any,
+    metadata: Optional[dict],
+    artifacts: Optional[list[str]],
+) -> tuple[Optional[str], Optional[dict], Optional[list[str]]]:
+    """Validate every managed completion path against the frozen workspace."""
+    if not _short_task_worker_restriction_active():
+        return None, metadata, artifacts
+
+    from hermes_cli.kanban_control_guard import (
+        extract_managed_local_path_mentions,
+        resolve_managed_workspace_path,
+    )
+
+    declared: list[str] = list(artifacts or [])
+    guarded_metadata = dict(metadata or {}) if metadata is not None else None
+    if guarded_metadata is not None and "artifacts" in guarded_metadata:
+        metadata_artifacts = guarded_metadata.get("artifacts")
+        if isinstance(metadata_artifacts, str):
+            metadata_artifacts = [metadata_artifacts]
+        if not isinstance(metadata_artifacts, (list, tuple)):
+            return (
+                tool_error(
+                    "kanban_complete：受控短任务的 metadata.artifacts 必须是文件路径列表。"
+                ),
+                metadata,
+                artifacts,
+            )
+        declared.extend(
+            str(item).strip()
+            for item in metadata_artifacts
+            if str(item).strip()
+        )
+
+    mentions: list[str] = []
+    for value in (summary, result):
+        if isinstance(value, str) and value:
+            mentions.extend(extract_managed_local_path_mentions(value))
+
+    if not declared and not mentions:
+        return None, metadata, artifacts
+
+    workspace = (os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+    if not workspace:
+        return (
+            tool_error(
+                "kanban_complete：无法确认本次短任务的专属工作目录，未保存任何路径。"
+            ),
+            metadata,
+            artifacts,
+        )
+
+    for mention in mentions:
+        if resolve_managed_workspace_path(
+            mention, workspace, require_file=False
+        ) is None:
+            return (
+                tool_error(
+                    "kanban_complete：总结或结果中包含专属工作目录之外的本地路径，"
+                    "任务仍保持进行中。"
+                ),
+                metadata,
+                artifacts,
+            )
+
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for path in declared:
+        resolved = resolve_managed_workspace_path(
+            path, workspace, require_file=True
+        )
+        if resolved is None:
+            return (
+                tool_error(
+                    "kanban_complete：交付文件不存在，或不在本次短任务的专属工作目录内；"
+                    "任务仍保持进行中。"
+                ),
+                metadata,
+                artifacts,
+            )
+        if resolved not in seen:
+            seen.add(resolved)
+            canonical.append(resolved)
+
+    if guarded_metadata is not None and "artifacts" in guarded_metadata:
+        guarded_metadata["artifacts"] = list(canonical)
+    return None, guarded_metadata, canonical if declared else artifacts
+
+
+def _review_completion_process_error() -> Optional[str]:
+    """Refuse review completion until every local subprocess is quiescent.
+
+    The normal batch planner serializes Terminal and Kanban terminal calls.
+    This check is the stale/direct-call backstop for concurrent callers and for
+    process-registry entries created by an older worker implementation.
+    """
+    if not (
+        (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+    ):
+        return None
+    if os.environ.get("HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"):
+        return tool_error(
+            "Independent review cannot complete because subprocess cleanup "
+            "was not proven. The task remains gated for operator inspection."
+        )
+    if verified_managed_short_task_lane():
+        # A verified Phase-1 reviewer has no terminal/code/LSP/browser tool,
+        # imports only the managed file + lifecycle surface, and runs in a
+        # fresh process.  Importing the legacy process registries here would
+        # recreate the executable stack solely to prove that an unavailable
+        # capability was idle.  The earliest bootstrap and positive tool
+        # allowlist are the structural proof; the explicit unsafe marker above
+        # remains a fail-closed dispatcher escape hatch.
+        return None
+    try:
+        from tools.environments.base import (
+            wait_for_short_task_foreground_cleanup,
+        )
+
+        if not wait_for_short_task_foreground_cleanup(0):
+            return tool_error(
+                "Independent review cannot complete while a foreground "
+                "verification command is still running or being cleaned up."
+            )
+    except Exception:
+        return tool_error(
+            "Independent review cannot complete because foreground process "
+            "cleanup could not be verified."
+        )
+    try:
+        from tools.process_registry import process_registry
+
+        if process_registry.has_any_active():
+            return tool_error(
+                "Independent review cannot complete while a registered "
+                "background process is active."
+            )
+    except Exception:
+        return tool_error(
+            "Independent review cannot complete because the background "
+            "process registry could not be verified."
         )
     return None
 
@@ -379,6 +793,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "validation_class": task.validation_class,
         "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
@@ -407,6 +822,9 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(tid, board, "kanban_show")
+    if scope_err:
+        return scope_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -426,6 +844,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "validation_class": t.validation_class,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -503,7 +922,15 @@ def _handle_list(args: dict, **kw) -> str:
         try:
             # Match CLI list: dependencies that cleared since the last
             # dispatcher tick should be visible to orchestrators immediately.
-            promoted = kb.recompute_ready(conn)
+            # A model-facing list is read-only for Phase-1-bound cards.  The
+            # dispatcher remains responsible for their promotion; otherwise a
+            # plain CodingMan/orchestrator could mutate a managed card merely
+            # by listing the board.
+            from hermes_cli.kanban_control_guard import all_managed_task_ids
+
+            promoted = (
+                0 if all_managed_task_ids(conn) else kb.recompute_ready(conn)
+            )
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             rows = kb.list_tasks(
@@ -537,7 +964,7 @@ def _handle_list(args: dict, **kw) -> str:
 
 
 def _handle_complete(args: dict, **kw) -> str:
-    """Mark the current task done with a structured handoff."""
+    """Close the current run: submit Phase-1 work for review or mark done."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
     if delegated_err:
         return delegated_err
@@ -549,9 +976,17 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
-    summary = args.get("summary")
+    if os.environ.get("HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"):
+        return tool_error(
+            "kanban_complete refused because a subprocess could not be "
+            "safely stopped. Block this task for operator review; do not "
+            "start a replacement worker."
+        )
+    raw_summary = args.get("summary")
+    raw_result = args.get("result")
+    summary = raw_summary
     metadata = args.get("metadata")
-    result = args.get("result")
+    result = raw_result
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -625,17 +1060,167 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    path_err, metadata, artifacts = _managed_completion_path_guard(
+        summary=raw_summary,
+        result=raw_result,
+        metadata=metadata,
+        artifacts=artifacts,
+    )
+    if path_err:
+        return path_err
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(
+        tid, board, "kanban_complete"
+    )
+    if scope_err:
+        return scope_err
+    process_err = _review_completion_process_error()
+    if process_err:
+        return process_err
     try:
         kb, conn = _connect(board=board)
         try:
+            mutation_err = _phase1_bound_task_mutation_error(
+                kb, conn, tid, "kanban_complete"
+            )
+            if mutation_err:
+                return mutation_err
+            task = kb.get_task(conn, tid)
+            worker_run_id = _worker_run_id(tid)
+            # The implementation submission transaction is durable before
+            # this tool response reaches the worker. A transport retry will
+            # therefore see the task already in review with no active run.
+            # Let the narrowly-scoped DB helper authenticate that exact
+            # retained run/PID, policy snapshot, metadata, and open self gate
+            # before acknowledging the replay. Conflicting or stale retries
+            # continue into the normal fail-closed authorization path.
+            if (
+                task
+                and not task.goal_mode
+                and task.status == "review"
+                and worker_run_id is not None
+                and kb.submit_task_for_review(
+                    conn,
+                    tid,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=worker_run_id,
+                    expected_worker_pid=os.getpid(),
+                )
+            ):
+                return _ok(
+                    task_id=tid,
+                    run_id=worker_run_id,
+                    status="review",
+                    review_required=True,
+                    message="Implementation submitted for independent review.",
+                )
+            completion_lane = kb.short_task_completion_authorization(
+                conn,
+                tid,
+                expected_run_id=worker_run_id,
+                policy_snapshot_raw=os.environ.get(
+                    "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"
+                ),
+            )
+            if completion_lane == "invalid":
+                return tool_error(
+                    "kanban_complete refused because this trusted task's "
+                    "worker policy snapshot is missing or inconsistent. "
+                    "The task remains in-flight for safe dispatcher recovery."
+                )
+            if (
+                task
+                and not task.goal_mode
+                and completion_lane == "implementation"
+            ):
+                if created_cards:
+                    return tool_error(
+                        "kanban_complete cannot claim created_cards in the "
+                        "Phase-1 implementation lane. Submit the bounded "
+                        "file changes and evidence for independent review."
+                    )
+                if worker_run_id is None:
+                    return tool_error(
+                        "kanban_complete could not verify this implementation "
+                        "run. The task remains in-flight; do not retry as a "
+                        "legacy completion."
+                    )
+                ok = kb.submit_task_for_review(
+                    conn,
+                    tid,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=worker_run_id,
+                    expected_worker_pid=os.getpid(),
+                )
+                if not ok:
+                    return tool_error(
+                        f"could not submit {tid} for independent review "
+                        "because the exact implementation run/PID no longer "
+                        "owns it"
+                    )
+                try:
+                    run = kb.latest_run(conn, tid)
+                    committed_run_id = run.id if run else worker_run_id
+                except Exception:
+                    logger.warning(
+                        "review submission committed but run readback failed "
+                        "for %s",
+                        tid,
+                        exc_info=True,
+                    )
+                    committed_run_id = worker_run_id
+                return _ok(
+                    task_id=tid,
+                    run_id=committed_run_id,
+                    status="review",
+                    review_required=True,
+                    message="Implementation submitted for independent review.",
+                )
+
+            if completion_lane == "review":
+                review_decision = kb.managed_review_completion_decision(
+                    conn,
+                    tid,
+                    metadata=metadata,
+                )
+                if review_decision.get("allowed") is not True:
+                    reason = str(
+                        review_decision.get("reason")
+                        or "当前独立审查没有足够证据，任务未完成。"
+                    )
+                    if review_decision.get("action") == "block_for_verifier":
+                        if worker_run_id is None or not kb.block_task(
+                            conn,
+                            tid,
+                            reason=reason,
+                            kind="capability",
+                            expected_run_id=worker_run_id,
+                            expected_worker_pid=os.getpid(),
+                        ):
+                            return tool_error(
+                                "kanban_complete：验证能力不足，但任务状态已经变化；"
+                                "没有把任务标记为完成。"
+                            )
+                        return _ok(
+                            task_id=tid,
+                            run_id=worker_run_id,
+                            status="blocked",
+                            block_kind="capability",
+                            verification_required=True,
+                            message=reason,
+                        )
+                    return tool_error(f"kanban_complete：{reason}")
+
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
-            task = kb.get_task(conn, tid)
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
@@ -671,7 +1256,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=worker_run_id,
+                    expected_worker_pid=(
+                        os.getpid() if worker_run_id is not None else None
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -704,8 +1292,17 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
-            run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            try:
+                run = kb.latest_run(conn, tid)
+                committed_run_id = run.id if run else worker_run_id
+            except Exception:
+                logger.warning(
+                    "kanban_complete committed but run readback failed for %s",
+                    tid,
+                    exc_info=True,
+                )
+                committed_run_id = worker_run_id
+            return _ok(task_id=tid, run_id=committed_run_id)
         finally:
             conn.close()
     except ValueError as e:
@@ -733,9 +1330,23 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    return_to_implementation, return_bool_error = _parse_bool_arg(
+        args, "return_to_implementation"
+    )
+    if return_bool_error:
+        return tool_error(return_bool_error)
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(tid, board, "kanban_block")
+    if scope_err:
+        return scope_err
     try:
         kb, conn = _connect(board=board)
+        mutation_err = _phase1_bound_task_mutation_error(
+            kb, conn, tid, "kanban_block"
+        )
+        if mutation_err:
+            conn.close()
+            return mutation_err
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
@@ -752,6 +1363,38 @@ def _handle_block(args: dict, **kw) -> str:
         # and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
+        if return_to_implementation:
+            worker_run_id = _worker_run_id(tid)
+            if worker_run_id is None:
+                conn.close()
+                return tool_error(
+                    "kanban_block：无法确认当前独立审查批次，任务没有被退回。"
+                )
+            returned = kb.return_review_to_implementation(
+                conn,
+                tid,
+                reason=reason,
+                expected_run_id=worker_run_id,
+                expected_worker_pid=os.getpid(),
+            )
+            if returned is None:
+                conn.close()
+                return tool_error(
+                    "kanban_block：只有当前受控的独立审查可以退回实现阶段；"
+                    "任务状态没有改变。"
+                )
+            returned_run_id = returned["run_id"]
+            conn.close()
+            return _ok(
+                task_id=tid,
+                run_id=returned_run_id,
+                status="todo",
+                review_changes_requested=True,
+                message=(
+                    "审查发现的问题已退回实现阶段。当前审查不会批准；"
+                    "本轮完全退出后会由新的实现任务接手，修正后再启动新的独立审查。"
+                ),
+            )
         if (
             task
             and task.goal_mode
@@ -766,25 +1409,48 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            worker_run_id = _worker_run_id(tid)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=worker_run_id,
+                expected_worker_pid=(
+                    os.getpid() if worker_run_id is not None else None
+                ),
             )
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
-            run = kb.latest_run(conn, tid)
-            # Tell the worker where the task actually landed so it doesn't
-            # assume it's sitting in 'blocked' when routing sent it elsewhere.
-            landed = kb.get_task(conn, tid)
+            try:
+                run = kb.latest_run(conn, tid)
+                committed_run_id = run.id if run else worker_run_id
+            except Exception:
+                logger.warning(
+                    "kanban_block committed but run readback failed for %s",
+                    tid,
+                    exc_info=True,
+                )
+                committed_run_id = worker_run_id
+            # Tell the worker where the task actually landed when readback is
+            # available. A readback failure must never turn an already-durable
+            # terminal transition into a tool error.
+            try:
+                landed = kb.get_task(conn, tid)
+                landed_status = landed.status if landed else "terminal"
+            except Exception:
+                logger.warning(
+                    "kanban_block committed but task readback failed for %s",
+                    tid,
+                    exc_info=True,
+                )
+                landed_status = "terminal"
             return _ok(
                 task_id=tid,
-                run_id=run.id if run else None,
-                status=landed.status if landed else "blocked",
+                run_id=committed_run_id,
+                status=landed_status,
                 block_kind=kind,
             )
         finally:
@@ -819,9 +1485,19 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(
+        tid, board, "kanban_heartbeat"
+    )
+    if scope_err:
+        return scope_err
     try:
         kb, conn = _connect(board=board)
         try:
+            mutation_err = _phase1_bound_task_mutation_error(
+                kb, conn, tid, "kanban_heartbeat"
+            )
+            if mutation_err:
+                return mutation_err
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
             # (see _default_spawn in kanban_db.py); falling back to the
@@ -876,9 +1552,17 @@ def _handle_comment(args: dict, **kw) -> str:
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(tid, board, "kanban_comment")
+    if scope_err:
+        return scope_err
     try:
         kb, conn = _connect(board=board)
         try:
+            mutation_err = _phase1_bound_task_mutation_error(
+                kb, conn, tid, "kanban_comment"
+            )
+            if mutation_err:
+                return mutation_err
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
             return _ok(task_id=tid, comment_id=cid)
         finally:
@@ -888,6 +1572,177 @@ def _handle_comment(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_comment failed")
         return tool_error(f"kanban_comment: {e}")
+
+
+def _handle_control_locked(args: dict, **kw) -> str:
+    """Route a user stop/correction to a detached dispatcher worker."""
+    delegated_err = _reject_delegated_child_mutation("kanban_control")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_control")
+    if guard:
+        return guard
+    if not _check_kanban_control_mode():
+        return tool_error(
+            "kanban_control is available only in an authenticated gateway "
+            "session with short-task handoff enabled"
+        )
+    identity = _trusted_gateway_control_identity()
+    if identity is None:
+        return tool_error(
+            "trusted gateway user, chat, session, or message identity is unavailable"
+        )
+
+    task_id = str(args.get("task_id") or "").strip()
+    kind = str(args.get("kind") or "").strip().lower()
+    message = redact_sensitive_text(str(args.get("message") or ""), force=True)
+    if not task_id:
+        return tool_error("task_id is required; inspect the board for the exact id")
+    if kind not in {"stop", "redirect", "steer"}:
+        return tool_error("kind must be stop, redirect, or steer")
+    if kind != "stop" and not message.strip():
+        return tool_error("message is required for redirect or steer")
+
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        actor_fingerprint = kb.control_actor_fingerprint(
+            **{
+                name: identity[name]
+                for name in (
+                    "platform",
+                    "scope_id",
+                    "chat_type",
+                    "chat_id",
+                    "thread_id",
+                    "user_id",
+                    "notifier_profile",
+                    "session_key",
+                )
+            }
+        )
+        control_id = kb.derive_handoff_control_id(
+            actor_fingerprint=actor_fingerprint,
+            message_id=identity["message_id"],
+            kind=kind,
+        )
+        receipt_matches: list[tuple[Any, dict[str, Any]]] = []
+        for receipt_path in kb.control_receipt_db_paths():
+            receipt_conn = kb.connect(db_path=receipt_path)
+            try:
+                prior = receipt_conn.execute(
+                    "SELECT * FROM task_handoff_controls WHERE control_id = ?",
+                    (control_id,),
+                ).fetchone()
+                if prior is not None:
+                    receipt_matches.append((receipt_path, dict(prior)))
+            finally:
+                receipt_conn.close()
+        if len(receipt_matches) > 1:
+            return tool_error(
+                "the same control receipt exists on more than one board; no task changed"
+            )
+
+        if receipt_matches:
+            routed_path, prior = receipt_matches[0]
+            conn = kb.connect(db_path=routed_path)
+            binding_id = str(prior["binding_id"])
+            routed_task_id = str(
+                prior["requested_task_id"] or prior["source_task_id"]
+            )
+        else:
+            kb, conn = _connect(board=board)
+            routed_task_id = task_id
+        try:
+            if not receipt_matches:
+                matches = kb.control_bound_active_tasks(
+                    conn,
+                    **{
+                        name: identity[name]
+                        for name in (
+                            "platform",
+                            "scope_id",
+                            "chat_type",
+                            "chat_id",
+                            "thread_id",
+                            "user_id",
+                            "notifier_profile",
+                            "session_key",
+                        )
+                    },
+                )
+                exact = [match for match in matches if match["task_id"] == task_id]
+                if len(exact) != 1:
+                    return tool_error(
+                        "the exact task is not bound to this authenticated chat user"
+                    )
+                binding_id = exact[0]["binding_id"]
+            result = kb.route_task_control(
+                conn,
+                task_id=routed_task_id,
+                control_id=control_id,
+                kind=kind,
+                message=message,
+                binding_id=binding_id,
+                **{
+                    name: identity[name]
+                    for name in (
+                        "platform",
+                        "scope_id",
+                        "chat_type",
+                        "chat_id",
+                        "thread_id",
+                        "user_id",
+                        "notifier_profile",
+                        "session_key",
+                    )
+                },
+                require_binding=True,
+            )
+        finally:
+            conn.close()
+        if result.get("status") == "recorded_signal_failed":
+            return _ok(
+                task_id=result.get("target_task_id") or task_id,
+                control_kind=kind,
+                persisted=True,
+                worker_exit_confirmed=False,
+                warning=result.get("error"),
+            )
+        if result.get("status") not in {"recorded", "already_recorded"}:
+            return tool_error(result.get("error") or "task control was not accepted")
+        if result.get("status") == "already_recorded":
+            return _ok(
+                task_id=result.get("target_task_id") or task_id,
+                control_kind=kind,
+                persisted=True,
+                already_processed=True,
+                worker_exit_pending=bool(result.get("worker_exit_pending")),
+            )
+        phase = str(result.get("phase") or "")
+        return _ok(
+            task_id=result.get("target_task_id") or task_id,
+            control_kind=kind,
+            persisted=True,
+            worker_exit_pending=(
+                bool(result.get("worker_exit_pending"))
+                or phase in {"before_commit", "after_commit", "after_terminal"}
+            ),
+        )
+    except ValueError as e:
+        return tool_error(f"kanban_control: {e}")
+    except Exception as e:
+        logger.exception("kanban_control failed")
+        return tool_error(f"kanban_control: {e}")
+
+
+def _handle_control(args: dict, **kw) -> str:
+    """Serialize global receipt discovery and the exact board mutation."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.trusted_control_serialization():
+        return _handle_control_locked(args, **kw)
 
 
 def _handle_attach(args: dict, **kw) -> str:
@@ -908,6 +1763,9 @@ def _handle_attach(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    managed_err = _managed_attachment_surface_error("kanban_attach")
+    if managed_err:
+        return managed_err
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -925,9 +1783,17 @@ def _handle_attach(args: dict, **kw) -> str:
         return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(tid, board, "kanban_attach")
+    if scope_err:
+        return scope_err
     try:
         _, conn = _connect(board=board)
         try:
+            mutation_err = _phase1_bound_task_mutation_error(
+                kb, conn, tid, "kanban_attach"
+            )
+            if mutation_err:
+                return mutation_err
             att_id = kb.store_attachment_bytes(
                 conn,
                 tid,
@@ -1030,6 +1896,9 @@ def _handle_attach_url(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    managed_err = _managed_attachment_surface_error("kanban_attach_url")
+    if managed_err:
+        return managed_err
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1045,6 +1914,29 @@ def _handle_attach_url(args: dict, **kw) -> str:
         filename = leaf or "download"
     content_type = args.get("content_type")
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(
+        tid, board, "kanban_attach_url"
+    )
+    if scope_err:
+        return scope_err
+    # Refuse before downloading an attacker-selected URL. Recheck again on the
+    # write connection below so a concurrent binding move cannot create a
+    # time-of-check/time-of-use bypass.
+    try:
+        _, guard_conn = _connect(board=board)
+        try:
+            mutation_err = _phase1_bound_task_mutation_error(
+                kb, guard_conn, tid, "kanban_attach_url"
+            )
+            if mutation_err:
+                return mutation_err
+        finally:
+            guard_conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_attach_url: {e}")
+    except Exception as e:
+        logger.exception("kanban_attach_url authorization failed")
+        return tool_error(f"kanban_attach_url: {e}")
     try:
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
@@ -1055,6 +1947,11 @@ def _handle_attach_url(args: dict, **kw) -> str:
     try:
         _, conn = _connect(board=board)
         try:
+            mutation_err = _phase1_bound_task_mutation_error(
+                kb, conn, tid, "kanban_attach_url"
+            )
+            if mutation_err:
+                return mutation_err
             att_id = kb.store_attachment_bytes(
                 conn,
                 tid,
@@ -1083,7 +1980,15 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    managed_err = _managed_attachment_surface_error("kanban_attachments")
+    if managed_err:
+        return managed_err
     board = args.get("board")
+    scope_err = _enforce_short_task_worker_scope(
+        tid, board, "kanban_attachments"
+    )
+    if scope_err:
+        return scope_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1124,6 +2029,7 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    creation_slot = str(args.get("_hermes_creation_slot") or "").strip()
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1161,6 +2067,7 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    validation_class = str(args.get("validation_class") or "code").strip()
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1170,6 +2077,30 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    if idempotency_key:
+        # The legacy DB helper scopes this key globally. In multi-channel use,
+        # reusing a model-supplied key could return somebody else's task and
+        # then auto-subscribe the current chat to it. Phase 1 therefore keeps
+        # the baseline untouched while disabled, but rejects tool-supplied keys
+        # whenever short-task governance is enabled. Automatic handoff uses a
+        # separate internal parent-scoped key and never passes through here.
+        try:
+            from agent.kanban_auto_handoff import (
+                load_current_dispatcher_policy_snapshot,
+            )
+
+            _handoff_snapshot = load_current_dispatcher_policy_snapshot()
+        except Exception:
+            _handoff_snapshot = {"enabled": False, "validation_error": "unreadable"}
+        if (
+            _handoff_snapshot.get("enabled") is True
+            or _handoff_snapshot.get("validation_error")
+        ):
+            return tool_error(
+                "idempotency_key is unavailable while short-task handoff is enabled "
+                "or its policy cannot be verified; "
+                "inspect the board and use a trusted exact task id instead"
+            )
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1198,6 +2129,93 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            from hermes_cli.kanban_control_guard import (
+                MANAGED_CONTROL_DENIED_MESSAGE,
+                authorize_managed_task_mutations,
+            )
+
+            parent_guard = authorize_managed_task_mutations(conn, parents, None)
+            if not parent_guard.allowed:
+                return tool_error(
+                    f"kanban_create：{MANAGED_CONTROL_DENIED_MESSAGE}"
+                )
+            control_origin = None
+            control_mode = _kanban_control_mode_state()
+            if control_mode == "unknown":
+                return tool_error(
+                    "cannot safely verify short-task control policy; no task was created"
+                )
+            if (
+                os.environ.get("_HERMES_GATEWAY") == "1"
+                and not os.environ.get("HERMES_KANBAN_TASK")
+                and not _is_delegated_child_context()
+            ):
+                from agent.kanban_handoff_scope import (
+                    decide_gateway_identity_current_config,
+                    match_gateway_identity_current_config,
+                )
+
+                identity_evidence = _gateway_control_identity_evidence()
+                source_match = match_gateway_identity_current_config(
+                    identity_evidence
+                )
+                if source_match.get("validation_error"):
+                    return tool_error(
+                        "cannot safely verify the short-task source allowlist; "
+                        "no task was created"
+                    )
+                if source_match.get("candidate") is True:
+                    if (
+                        _gateway_request_is_internal()
+                        or source_match.get("matched") is not True
+                        or not _gateway_control_identity_complete(identity_evidence)
+                    ):
+                        return tool_error(
+                            "this request matches an approved short-task source, "
+                            "but its complete human message and delivery identity "
+                            "could not be verified; no task was created"
+                        )
+                    if control_mode != "enabled":
+                        return tool_error(
+                            "the approved short-task source could not be authorized "
+                            "at execution time; no task was created"
+                        )
+                    if not creation_slot:
+                        return tool_error(
+                            "cannot safely distinguish multiple task creations in "
+                            "this gateway turn because the deterministic operation "
+                            "slot is missing"
+                        )
+                    scope_decision = decide_gateway_identity_current_config(
+                        identity_evidence
+                    )
+                    if scope_decision.get("validation_error"):
+                        return tool_error(
+                            "cannot safely verify the short-task source allowlist; "
+                            "no task was created"
+                        )
+                    if scope_decision.get("authorized") is not True:
+                        # Policy or request identity changed between discovery and
+                        # execution. Never downgrade the intended controlled launch
+                        # to an ordinary task.
+                        return tool_error(
+                            "the approved short-task source could not be authorized "
+                            "at execution time; no task was created"
+                        )
+                    control_origin = dict(identity_evidence)
+                    control_origin["short_handoff_policy"] = scope_decision[
+                        "task_policy_json"
+                    ]
+                elif control_mode == "enabled":
+                    # This can occur only if request identity or owner policy
+                    # changed between the visibility check and this handler.
+                    # Treat that race as a refusal, never as ordinary creation.
+                    return tool_error(
+                        "short-task authorization changed before execution; "
+                        "no task was created"
+                    )
+            if control_origin is not None:
+                control_origin["operation_slot"] = creation_slot
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -1218,6 +2236,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                validation_class=validation_class,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
@@ -1236,6 +2255,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                control_origin=control_origin,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1244,8 +2264,12 @@ def _handle_create(args: dict, **kw) -> str:
                 status=new_task.status if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
+                validation_class=(
+                    new_task.validation_class if new_task else None
+                ),
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                controllable=control_origin is not None,
             )
         finally:
             conn.close()
@@ -1254,8 +2278,6 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
-
-
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -1373,6 +2395,11 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            mutation_err = _phase1_bound_task_mutation_error(
+                kb, conn, str(tid), "kanban_unblock"
+            )
+            if mutation_err:
+                return mutation_err
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
@@ -1400,6 +2427,12 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            for guarded_id in (str(parent_id), str(child_id)):
+                mutation_err = _phase1_bound_task_mutation_error(
+                    kb, conn, guarded_id, "kanban_link"
+                )
+                if mutation_err:
+                    return mutation_err
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
@@ -1510,21 +2543,23 @@ KANBAN_LIST_SCHEMA = {
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
-        "Mark your current task done with a structured handoff for "
-        "downstream workers and humans. Prefer ``summary`` for a "
+        "Close your current run with a structured handoff for downstream "
+        "workers and humans. In a bounded Phase-1 implementation worker this "
+        "submits the same task for fresh independent review and does not mark "
+        "the overall task done; an ordinary or review worker keeps the legacy "
+        "done transition. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
         "``summary`` or ``result`` is required. If you created new "
-        "tasks via ``kanban_create`` during this run, list their ids "
+        "tasks via ``kanban_create`` during an ordinary run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
         "automation. If you produced deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
-        "in ``artifacts`` — the gateway notifier will upload them as "
-        "native attachments to the human who subscribed to the task, "
-        "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "in ``artifacts``. A final done transition can deliver them through "
+        "the gateway notifier; a Phase-1 implementation submission records "
+        "them only as review evidence and sends no completion notification."
     ),
     "parameters": {
         "type": "object",
@@ -1572,7 +2607,8 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Only list ids you got back from a successful "
                     "``kanban_create`` call — do not invent or "
                     "remember ids from prose. Omit the field if you "
-                    "did not create any cards."
+                    "did not create any cards. Phase-1 implementation "
+                    "workers cannot create or claim cards."
                 ),
             },
             "artifacts": {
@@ -1587,7 +2623,9 @@ KANBAN_COMPLETE_SCHEMA = {
                     "uploads each path as a native attachment to the "
                     "subscribed chat (images embed inline, everything "
                     "else uploads as a file) so the deliverable "
-                    "lands with the completion notification. Skip "
+                    "lands with a final completion notification. A "
+                    "Phase-1 implementation submission only carries "
+                    "these paths into reviewer evidence; it does not notify. Skip "
                     "intermediate scratch files and references that "
                     "are not the deliverable. The path must exist "
                     "on disk at completion. Files inside a managed scratch "
@@ -1638,6 +2676,15 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "return_to_implementation": {
+                "type": "boolean",
+                "description": (
+                    "Managed independent review only. Set true when file "
+                    "evidence shows an implementation defect. The current "
+                    "review closes without approval, then the same task waits "
+                    "for a fresh implementation run and a later fresh review."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1699,6 +2746,35 @@ KANBAN_COMMENT_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["task_id", "body"],
+    },
+}
+
+KANBAN_CONTROL_SCHEMA = {
+    "name": "kanban_control",
+    "description": (
+        "Persist a user's stop or correction to one exact background Kanban "
+        "task, including across a fresh-worker checkpoint. Inspect the board "
+        "first and use only the exact active task id. Use stop to pause, "
+        "redirect for a changed objective, or steer for an added constraint."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Exact active task id obtained from kanban_list.",
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["stop", "redirect", "steer"],
+            },
+            "message": {
+                "type": "string",
+                "description": "The user's plain-language instruction or stop reason.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "kind"],
     },
 }
 
@@ -1871,6 +2947,19 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "validation_class": {
+                "type": "string",
+                "enum": ["code", "text_mechanism"],
+                "description": (
+                    "Creation-time validation class, frozen for the whole "
+                    "managed chain. Use 'text_mechanism' only for the named "
+                    "Phase-1 pilot whose acceptance can be proved by reading "
+                    "plain text files in one exact explicit dir workspace. "
+                    "Use 'code' for code, builds, tests, runtime behavior, or "
+                    "anything uncertain; Phase 1 will pause those for an "
+                    "isolated verifier. Defaults to 'code'."
                 ),
             },
             "project": {
@@ -2074,6 +3163,16 @@ registry.register(
     handler=_handle_comment,
     check_fn=_check_kanban_mode,
     emoji="💬",
+)
+
+registry.register(
+    name="kanban_control",
+    toolset="kanban",
+    schema=KANBAN_CONTROL_SCHEMA,
+    handler=_handle_control,
+    check_fn=_check_kanban_control_mode,
+    request_scoped_check=True,
+    emoji="🛑",
 )
 
 registry.register(

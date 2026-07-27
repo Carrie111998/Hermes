@@ -11,6 +11,7 @@ import threading
 
 import pytest
 
+from agent import kanban_auto_handoff as handoff
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
 from run_agent import AIAgent
 
@@ -493,6 +494,177 @@ class TestSteerCommandRegistry:
 
         assert "steer" in ACTIVE_SESSION_BYPASS_COMMANDS
         assert should_bypass_active_session("steer") is True
+
+
+class _ObservedLock:
+    """A real mutex that exposes when another thread starts waiting for it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.attempted = threading.Event()
+
+    def acquire(self, *args, **kwargs):
+        self.attempted.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+def _enable_idle_handoff_linearization(agent: AIAgent) -> None:
+    agent._auto_handoff_control_lock = threading.RLock()
+    agent._auto_handoff_control_phase = "idle"
+    agent._auto_handoff_control_source = "task-source"
+    agent._auto_handoff_control_target = None
+    agent._auto_handoff_control_events = []
+    agent._auto_handoff_control_seq = 0
+    agent._auto_handoff_control_route_failed = None
+    agent._pending_steer_receipts = []
+    agent._pending_steer_receipt_seq = 0
+    agent._pending_steer_inflight_receipt_ids = []
+
+
+def test_postcommit_stop_persistence_failure_is_not_locally_acked(monkeypatch):
+    agent = _bare_agent()
+    _enable_idle_handoff_linearization(agent)
+    agent._auto_handoff_control_phase = "committed"
+    agent._auto_handoff_control_source = "task-source"
+    agent._auto_handoff_control_target = "task-successor"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-source")
+    monkeypatch.setattr(
+        handoff,
+        "stage_pending_handoff_control",
+        lambda control, **_kwargs: {
+            **dict(control),
+            "state": "pending_supervisor_retry",
+        },
+    )
+
+    def hold_for_supervisor(event):
+        event["supervisor_pending"] = True
+        event["error"] = "database unavailable"
+        return False
+
+    agent._persist_auto_handoff_control_event = hold_for_supervisor
+
+    assert agent.interrupt("stop now") is False
+    assert agent._interrupt_requested is False
+    assert agent._interrupt_message is None
+    assert len(agent._auto_handoff_control_events) == 1
+    assert agent._auto_handoff_control_events[0]["kind"] == "stop"
+    assert agent._auto_handoff_control_events[0]["supervisor_pending"] is True
+
+
+@pytest.mark.parametrize("first_kind", ["stop", "redirect", "steer"])
+@pytest.mark.parametrize("second_kind", ["stop", "redirect", "steer"])
+def test_handoff_control_kind_matrix_has_one_precommit_and_fifo_followers(
+    monkeypatch, first_kind, second_kind
+):
+    agent = _bare_agent()
+    _enable_idle_handoff_linearization(agent)
+    agent._auto_handoff_control_phase = "summarizing"
+    agent._auto_handoff_control_source = "task-source"
+    agent._model_request_active.set()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-source")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "77")
+    staged = []
+    routed = []
+
+    def stage(control, *, error=""):
+        staged.append(dict(control))
+        return {**dict(control), "state": "pending_supervisor_retry"}
+
+    monkeypatch.setattr(handoff, "stage_pending_handoff_control", stage)
+    agent._persist_auto_handoff_control_event = (
+        lambda event: routed.append(event) is None
+    )
+
+    first = agent._queue_auto_handoff_control(first_kind, "first")
+    second = agent._queue_auto_handoff_control(second_kind, "second")
+
+    assert first["state"] == "queued"
+    assert first["accepted"] is True
+    assert second["state"] == "routed"
+    assert second["accepted"] is True
+    assert [control["message"] for control in staged] == ["first", "second"]
+    assert staged[0]["phase"] == "before_commit"
+    expected_second_phase = (
+        "superseded"
+        if first_kind == "stop" and second_kind != "stop"
+        else "after_terminal"
+    )
+    assert staged[1]["phase"] == expected_second_phase
+    if expected_second_phase == "superseded":
+        assert staged[1]["superseded_by_control_id"] == staged[0]["control_id"]
+    assert len(routed) == 1
+    assert routed[0]["durable_control"] == staged[1]
+    assert agent._auto_handoff_control_winner_kind == (
+        "stop" if "stop" in {first_kind, second_kind} else first_kind
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "blocked_slot", "expected_delivery_slot"),
+    [
+        ("stop", "_pending_redirect_lock", "interrupt"),
+        ("redirect", "_pending_redirect_lock", "redirect"),
+        ("steer", "_pending_steer_lock", "steer"),
+    ],
+)
+def test_idle_control_acceptance_holds_handoff_lock_until_receipt_is_staged(
+    kind,
+    blocked_slot,
+    expected_delivery_slot,
+):
+    """The finalizer cannot open a budget phase after an idle phase check but
+    before the accepted Stop/redirect/steer has reached pending state + receipt.
+
+    Holding the destination slot forces the control thread to pause inside its
+    idle action. While paused, the handoff lock must still be unavailable.
+    """
+    agent = _bare_agent()
+    _enable_idle_handoff_linearization(agent)
+    agent._model_request_active.set()
+
+    observed_lock = _ObservedLock()
+    observed_lock.acquire()
+    observed_lock.attempted.clear()
+    setattr(agent, blocked_slot, observed_lock)
+    outcome = {}
+
+    def submit_control():
+        if kind == "stop":
+            outcome["accepted"] = agent.interrupt("stop now")
+        elif kind == "redirect":
+            outcome["accepted"] = agent.redirect("redirect now")
+        else:
+            outcome["accepted"] = agent.steer("steer now")
+
+    worker = threading.Thread(target=submit_control)
+    worker.start()
+    try:
+        assert observed_lock.attempted.wait(timeout=2)
+        acquired = agent._auto_handoff_control_lock.acquire(blocking=False)
+        if acquired:
+            agent._auto_handoff_control_lock.release()
+        assert acquired is False
+    finally:
+        observed_lock.release()
+        worker.join(timeout=2)
+
+    assert worker.is_alive() is False
+    assert outcome == {"accepted": True}
+    assert len(agent._pending_steer_receipts) == 1
+    receipt = agent._pending_steer_receipts[0]
+    assert receipt["kind"] == kind
+    assert receipt["delivery_slot"] == expected_delivery_slot
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -42,10 +42,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent.context_engine import (
-    automatic_compaction_status_message,
-    sanitize_memory_context,
-)
+from agent.managed_short_task import verified_managed_short_task_lane
+
+if verified_managed_short_task_lane():
+    def automatic_compaction_status_message(*_args, **_kwargs):
+        return None
+
+    def sanitize_memory_context(_memory_context: str) -> str:
+        return ""
+else:
+    from agent.context_engine import (
+        automatic_compaction_status_message,
+        sanitize_memory_context,
+    )
 from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)

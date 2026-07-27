@@ -4327,10 +4327,10 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
             conn, title="loop forever", assignee="slow-worker",
             max_runtime_seconds=1,
         )
-        # Drop the failure_limit to 3 so we don't need 5 timeouts.
-        # This uses the module-level DEFAULT; we simulate by calling
-        # _record_task_failure directly with a tight limit.
-        for _ in range(3):
+        # Pass the dispatcher threshold explicitly. Changing the module
+        # constant would not affect enforce_max_runtime's already-bound
+        # default argument and could let this test pass at the wrong limit.
+        for attempt in range(1, 4):
             # Fresh claim + "started long ago" each iteration.
             with kb.write_txn(conn):
                 conn.execute(
@@ -4363,16 +4363,22 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
                     (rid, tid),
                 )
             state["sent_term"] = False
-            # Lower the threshold by monkeypatching the default.
-            monkeypatch.setattr(_kb, "DEFAULT_FAILURE_LIMIT", 3)
-            kb.enforce_max_runtime(conn, signal_fn=_signal)
+            timed_out = kb.enforce_max_runtime(
+                conn, signal_fn=_signal, failure_limit=3
+            )
+            assert timed_out == [tid]
+            current = kb.get_task(conn, tid)
+            assert current.consecutive_failures == attempt
+            assert current.status == (
+                "blocked" if attempt == 3 else "ready"
+            )
 
         final = kb.get_task(conn, tid)
         # After 3 consecutive timeouts with failure_limit=3, task should
         # be auto-blocked, not looping forever as ``ready``.
         assert final.status == "blocked", \
             f"expected blocked after 3 timeouts, got {final.status}"
-        assert final.consecutive_failures >= 3
+        assert final.consecutive_failures == 3
         # ``gave_up`` event emitted (plus 3 ``timed_out`` events).
         kinds = [
             r["kind"] for r in conn.execute(

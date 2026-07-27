@@ -19,7 +19,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
-from typing import IO, Callable, Protocol
+from typing import IO, Callable, Optional, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -43,6 +43,167 @@ if _DEBUG_INTERRUPT:
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
+
+
+# A dispatcher worker may receive SIGTERM on its main thread while a terminal
+# command is being drained either on another thread *or on that same main
+# thread* (the quiet sequential-tool path).  Retain the exact Popen object and
+# its LocalEnvironment cleanup callback so the signal handler can synchronously
+# terminate and prove the foreground process group before waiting on the latch.
+# An RLock is intentional: Python may deliver SIGTERM while the main thread is
+# already inside one of these small registry critical sections.
+_SHORT_TASK_FOREGROUND_LOCK = threading.RLock()
+_SHORT_TASK_FOREGROUND_ACTIVE = 0
+_SHORT_TASK_FOREGROUND_IDLE = threading.Event()
+_SHORT_TASK_FOREGROUND_IDLE.set()
+_SHORT_TASK_FOREGROUND_PROCESSES: dict[int, tuple[object, Callable, threading.RLock]] = {}
+
+
+def _short_task_worker_cleanup_required() -> bool:
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    # Independent reviewers may run bounded foreground verification commands.
+    # Their short-handoff policy is intentionally disabled (they must not
+    # auto-chain another worker), so review mode is the separate, dispatcher-
+    # owned authority that turns on the same exact process-group accounting.
+    if os.environ.get("HERMES_KANBAN_MANAGED_LANE") == "review":
+        try:
+            from agent.managed_short_task import verified_managed_short_task_lane
+
+            return verified_managed_short_task_lane()
+        except Exception:
+            return True
+    if not os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"):
+        return False
+    try:
+        from tools.terminal_tool import _short_task_handoff_worker_enabled
+
+        return _short_task_handoff_worker_enabled(invalid_is_enabled=True)
+    except Exception:
+        # An unreadable dispatcher-owned policy must never make cleanup fail
+        # open inside a task worker.
+        return True
+
+
+def _begin_short_task_foreground_cleanup() -> None:
+    global _SHORT_TASK_FOREGROUND_ACTIVE
+    with _SHORT_TASK_FOREGROUND_LOCK:
+        _SHORT_TASK_FOREGROUND_ACTIVE += 1
+        _SHORT_TASK_FOREGROUND_IDLE.clear()
+
+
+def register_short_task_foreground_process(proc, cleanup_fn: Callable) -> None:
+    """Register one exact foreground child for signal-time process-group cleanup."""
+    if proc is None or not callable(cleanup_fn):
+        raise ValueError("foreground process registration requires a process and cleanup")
+    key = id(proc)
+    with _SHORT_TASK_FOREGROUND_LOCK:
+        if getattr(proc, "_hermes_short_task_cleanup_finished", False):
+            raise RuntimeError("foreground cleanup was already finished")
+        existing = _SHORT_TASK_FOREGROUND_PROCESSES.get(key)
+        if existing is not None and existing[0] is not proc:
+            raise RuntimeError("foreground process identity collision")
+        _SHORT_TASK_FOREGROUND_PROCESSES[key] = (
+            proc,
+            cleanup_fn,
+            threading.RLock(),
+        )
+
+
+def _finish_short_task_foreground_cleanup(proc=None) -> None:
+    global _SHORT_TASK_FOREGROUND_ACTIVE
+    with _SHORT_TASK_FOREGROUND_LOCK:
+        if proc is not None:
+            if getattr(proc, "_hermes_short_task_cleanup_finished", False):
+                return
+            proc._hermes_short_task_cleanup_finished = True
+            entry = _SHORT_TASK_FOREGROUND_PROCESSES.get(id(proc))
+            if entry is not None and entry[0] is proc:
+                _SHORT_TASK_FOREGROUND_PROCESSES.pop(id(proc), None)
+        _SHORT_TASK_FOREGROUND_ACTIVE = max(0, _SHORT_TASK_FOREGROUND_ACTIVE - 1)
+        if _SHORT_TASK_FOREGROUND_ACTIVE == 0:
+            _SHORT_TASK_FOREGROUND_IDLE.set()
+
+
+def wait_for_short_task_foreground_cleanup(timeout: float) -> bool:
+    """Wait until every in-process foreground command has cleanup proof."""
+    return _SHORT_TASK_FOREGROUND_IDLE.wait(timeout=max(0.0, float(timeout)))
+
+
+def cleanup_short_task_foreground_process(
+    proc, *, fallback_cleanup: Optional[Callable] = None
+) -> str | None:
+    """Clean one exact registered process, serializing signal/tool callers."""
+    with _SHORT_TASK_FOREGROUND_LOCK:
+        if getattr(proc, "_hermes_short_task_cleanup_finished", False):
+            return None
+        entry = _SHORT_TASK_FOREGROUND_PROCESSES.get(id(proc))
+        if entry is not None and entry[0] is not proc:
+            return "foreground process identity changed before cleanup"
+    cleanup_fn = entry[1] if entry is not None else fallback_cleanup
+    cleanup_lock = entry[2] if entry is not None else threading.RLock()
+    if not callable(cleanup_fn):
+        return "foreground process cleanup callback was unavailable"
+    with cleanup_lock:
+        with _SHORT_TASK_FOREGROUND_LOCK:
+            if getattr(proc, "_hermes_short_task_cleanup_finished", False):
+                return None
+        try:
+            cleanup_error = cleanup_fn(proc)
+        except BaseException as exc:
+            cleanup_error = f"foreground process cleanup raised: {exc}"
+        if cleanup_error:
+            return str(cleanup_error)
+        _finish_short_task_foreground_cleanup(proc)
+        return None
+
+
+def cleanup_registered_short_task_foreground_processes() -> list[str]:
+    """Synchronously clean every exact foreground process known to this worker."""
+    with _SHORT_TASK_FOREGROUND_LOCK:
+        processes = [entry[0] for entry in _SHORT_TASK_FOREGROUND_PROCESSES.values()]
+    errors: list[str] = []
+    for proc in processes:
+        error = cleanup_short_task_foreground_process(proc)
+        if error:
+            pid = getattr(proc, "pid", "unknown")
+            errors.append(f"pid {pid}: {error}")
+    return errors
+
+
+def mark_short_task_process_cleanup_unsafe(reason: str) -> bool:
+    """Persist one sticky exact-run veto and retain an env fallback."""
+    unsafe_reason = str(reason or "subprocess cleanup was not proven")[:500]
+    os.environ["HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"] = unsafe_reason
+    marker_saved = False
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_text = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    if task_id and run_text.isdigit() and claim_lock:
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect()
+            try:
+                marker_saved = _kb.mark_run_process_cleanup_unsafe(
+                    conn,
+                    task_id=task_id,
+                    run_id=int(run_text),
+                    claim_lock=claim_lock,
+                    worker_pid=os.getpid(),
+                    reason=unsafe_reason,
+                )
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("could not persist unsafe subprocess cleanup marker")
+    if marker_saved:
+        os.environ["HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE_DURABLE"] = "1"
+    else:
+        os.environ.pop(
+            "HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE_DURABLE", None
+        )
+    return marker_saved
 
 
 # Sentinel capacity for full-fidelity capture (internal consumers). Large
@@ -461,6 +622,17 @@ class BaseEnvironment(ABC):
         ``_snapshot_ready = True`` so subsequent commands source the snapshot
         instead of running with ``bash -l``.
         """
+        # A Phase-1 managed worker uses shell-backed file primitives, but it
+        # must never source user/project profiles: those files can run
+        # arbitrary commands or detach a process before the first file call.
+        # Keep this backend on a clean non-login path for its whole lifetime.
+        # Explicit enabled=false goal/review/ordinary workers retain the
+        # historical snapshot behavior.
+        if _short_task_worker_cleanup_required():
+            self._snapshot_ready = False
+            self._prefer_nonlogin = True
+            return
+
         # Full capture: env vars, functions, aliases, shell options.
         # Restore configured cwd after login shell profile scripts, which may
         # change the working directory (e.g. bashrc `cd ~`).  Without this,
@@ -841,6 +1013,38 @@ class BaseEnvironment(ABC):
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
+        _cleanup_registered_before_wait = (
+            getattr(proc, "_hermes_short_task_cleanup_registered", False) is True
+        )
+        _short_task_worker = (
+            _cleanup_registered_before_wait
+            or _short_task_worker_cleanup_required()
+        )
+        _short_task_cleanup_finished = False
+        if _short_task_worker and not _cleanup_registered_before_wait:
+            _begin_short_task_foreground_cleanup()
+
+        def _finish_cleanup_latch() -> None:
+            nonlocal _short_task_cleanup_finished
+            if _short_task_worker and not _short_task_cleanup_finished:
+                _short_task_cleanup_finished = True
+                _finish_short_task_foreground_cleanup(proc)
+
+        def _forced_cleanup(context: str) -> tuple[str | None, bool]:
+            cleanup_error = cleanup_short_task_foreground_process(
+                proc,
+                fallback_cleanup=self._cleanup_process_group_with_proof,
+            )
+            if cleanup_error:
+                cleanup_error = f"{context}: {cleanup_error}"
+            marker_saved = False
+            if _short_task_worker and cleanup_error:
+                marker_saved = mark_short_task_process_cleanup_unsafe(
+                    cleanup_error
+                )
+            _finish_cleanup_latch()
+            return cleanup_error, marker_saved
+
         deadline = time.monotonic() + timeout
         _now = time.monotonic()
         _activity_state = {
@@ -878,10 +1082,18 @@ class BaseEnvironment(ABC):
                             "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
                             _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
                         )
-                    self._kill_process(proc)
+                    cleanup_error, marker_saved = _forced_cleanup("interrupt")
                     drain_thread.join(timeout=2)
+                    unsafe_suffix = ""
+                    if cleanup_error:
+                        durable = "" if marker_saved else " (durable marker failed)"
+                        unsafe_suffix = (
+                            f"\n[Unsafe foreground cleanup: {cleanup_error}{durable}]"
+                        )
                     return {
-                        "output": output.render(suffix="\n[Command interrupted]"),
+                        "output": output.render(
+                            suffix="\n[Command interrupted]" + unsafe_suffix
+                        ),
                         "returncode": 130,
                     }
                 if time.monotonic() > deadline:
@@ -891,9 +1103,14 @@ class BaseEnvironment(ABC):
                             "tid=%s pid=%s iter=%d timeout=%ss",
                             _tid, _pid, _iter_count, timeout,
                         )
-                    self._kill_process(proc)
+                    cleanup_error, marker_saved = _forced_cleanup("timeout")
                     drain_thread.join(timeout=2)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
+                    if cleanup_error:
+                        durable = "" if marker_saved else " (durable marker failed)"
+                        timeout_msg += (
+                            f"\n[Unsafe foreground cleanup: {cleanup_error}{durable}]"
+                        )
                     return {
                         "output": output.render(suffix=timeout_msg).lstrip()
                         if output.total_chars == 0
@@ -947,17 +1164,49 @@ class BaseEnvironment(ABC):
                     _tid, _pid, _iter_count,
                     time.monotonic() - _activity_state["start"],
                 )
-            try:
-                self._kill_process(proc)
-                drain_thread.join(timeout=2)
-            except Exception:
-                pass  # cleanup is best-effort
+            _forced_cleanup("worker shutdown")
+            drain_thread.join(timeout=2)
             raise
 
         # Drain thread now exits promptly after bash does (~300ms idle
         # check).  A short join is enough; a long one would be a bug since
         # it means the non-blocking loop itself stopped cooperating.
         drain_thread.join(timeout=2)
+
+        # Enabled short-task workers share a checkout across fresh processes.
+        # A foreground shell can exit while grandchildren in its process group
+        # keep running, so clean and prove that group empty before returning a
+        # successful tool result. Arbitrary descendants that deliberately call
+        # setsid remain outside the Phase-1 supported command contract and are
+        # rejected at the terminal/execute_code boundaries where detectable.
+        if _short_task_worker:
+            cleanup = getattr(self, "_cleanup_process_group_with_proof", None)
+            cleanup_error = (
+                cleanup_short_task_foreground_process(
+                    proc,
+                    fallback_cleanup=cleanup,
+                )
+                if callable(cleanup)
+                else "foreground process-group cleanup is unsupported"
+            )
+            if cleanup_error:
+                # Returning a non-zero tool result is not enough: the model
+                # could continue and later call kanban_complete or reach the
+                # handoff checkpoint. Persist an exact-run safety veto first,
+                # and retain a process-local fallback if DB recording fails.
+                marker_saved = mark_short_task_process_cleanup_unsafe(cleanup_error)
+                _finish_cleanup_latch()
+                marker_note = "" if marker_saved else " (durable marker failed)"
+                return {
+                    "output": output.render(
+                        suffix=(
+                            f"\n[Unsafe foreground cleanup: {cleanup_error}"
+                            f"{marker_note}]"
+                        )
+                    ),
+                    "returncode": 125,
+                }
+        _finish_cleanup_latch()
 
         try:
             proc.stdout.close()
@@ -976,11 +1225,21 @@ class BaseEnvironment(ABC):
         return {"output": output.render(), "returncode": proc.returncode}
 
     def _kill_process(self, proc: ProcessHandle):
-        """Terminate a process. Subclasses may override for process-group kill."""
+        """Terminate a process. Subclasses may override for group kill."""
         try:
             proc.kill()
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+    def _cleanup_process_group_with_proof(
+        self, proc: ProcessHandle
+    ) -> str | None:
+        """Terminate foreground work and return None only with exit proof."""
+        self._kill_process(proc)
+        # Only LocalEnvironment's POSIX override can prove an entire process
+        # group empty.  Other backends are outside Phase 1 and fail closed if
+        # a dispatcher policy is ever misapplied to them.
+        return "execution backend cannot prove the foreground process group exited"
 
     # ------------------------------------------------------------------
     # CWD extraction

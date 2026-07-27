@@ -62,6 +62,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent.managed_short_task import verified_managed_short_task_lane
 from hermes_constants import get_hermes_home
 
 
@@ -122,9 +123,18 @@ from hermes_cli.timeouts import (
     get_provider_stale_timeout,
 )
 
+_MANAGED_SHORT_TASK_IMPORT = verified_managed_short_task_lane()
+
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+_loaded_env_paths = (
+    []
+    if _MANAGED_SHORT_TASK_IMPORT
+    else load_hermes_dotenv(
+        hermes_home=_hermes_home,
+        project_env=_project_env,
+    )
+)
 if _loaded_env_paths:
     for _env_path in _loaded_env_paths:
         logger.info("Loaded environment variables from %s", _env_path)
@@ -139,9 +149,24 @@ from model_tools import (
     handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
-from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
+
+if _MANAGED_SHORT_TASK_IMPORT:
+    # Managed workers never receive terminal/browser tools.  Keeping these
+    # imports at module scope still executes both subsystems before the first
+    # model request, so provide the only semantics this lane needs without
+    # importing either capability.
+    def cleanup_vm(_task_id: str = "") -> None:
+        return None
+
+    def cleanup_browser(_task_id: str = "") -> None:
+        return None
+
+    def get_active_env(_task_id: str = ""):
+        return None
+else:
+    from tools.terminal_tool import cleanup_vm, get_active_env
+    from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -154,11 +179,18 @@ from agent.model_metadata import (
     is_local_endpoint,
 )
 from agent.usage_pricing import normalize_usage
-# Re-exported for tests that monkeypatch these symbols on run_agent.
-from agent.context_compressor import (  # noqa: F401
-    COMPRESSED_SUMMARY_METADATA_KEY,
-    ContextCompressor,
-)
+# Re-exported for tests that monkeypatch these symbols on run_agent. Managed
+# workers use a static counter and must not import the auxiliary compressor.
+if _MANAGED_SHORT_TASK_IMPORT:
+    COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+
+    def ContextCompressor(*_args, **_kwargs):
+        raise RuntimeError("Managed workers do not construct ContextCompressor")
+else:
+    from agent.context_compressor import (  # noqa: F401
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        ContextCompressor,
+    )
 from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
     DEFAULT_AGENT_IDENTITY,
@@ -2845,7 +2877,277 @@ class AIAgent:
                 logging.warning(f"Failed to save session log: {e}")
 
 
-    def interrupt(self, message: str = None) -> None:
+    def _persist_auto_handoff_control_event(self, event: dict) -> bool:
+        """Write one post-linearization control event to its gated task."""
+        control = dict(event.get("durable_control") or {})
+        persisted_phase = str(control.get("phase") or "")
+        try:
+            from agent.kanban_auto_handoff import (
+                confirm_pending_handoff_control,
+                persist_worker_handoff_control,
+                stage_pending_handoff_control,
+            )
+
+            if not control:
+                raise RuntimeError("handoff control was not durably admitted")
+            if not isinstance(event.get("pending_handoff_control"), dict):
+                event["pending_handoff_control"] = stage_pending_handoff_control(
+                    control,
+                    error="awaiting direct durable confirmation",
+                )
+            event["supervisor_pending"] = True
+            result = persist_worker_handoff_control(control, attempts=2)
+            accepted = result.get("status") in {"recorded", "already_recorded"}
+            event["persisted"] = accepted
+            if accepted:
+                confirm_pending_handoff_control(control)
+                event["supervisor_pending"] = False
+                event["receipt_status"] = result.get("status")
+                if persisted_phase == "before_commit":
+                    gate = getattr(self, "_auto_handoff_control_lock", None)
+                    if gate is not None:
+                        with gate:
+                            if getattr(
+                                self, "_auto_handoff_control_phase", ""
+                            ) == "veto_pending":
+                                self._auto_handoff_control_phase = "vetoed"
+                                self._auto_handoff_control_target = control[
+                                    "target_task_id"
+                                ]
+            else:
+                event["error"] = result.get("error") or "control routing failed"
+                event["pending_handoff_control"] = stage_pending_handoff_control(
+                    control,
+                    error=str(event["error"]),
+                )
+            return accepted
+        except Exception as exc:
+            event["persisted"] = False
+            event["error"] = str(exc)
+            logger.warning("Failed to persist post-handoff user control", exc_info=True)
+            return False
+
+    def _queue_auto_handoff_control(
+        self,
+        kind: str,
+        message: str,
+        *,
+        idle_action=None,
+    ) -> Optional[dict]:
+        """Linearize a user control against an automatic handoff commit.
+
+        Returns ``None`` outside the short checkpoint window unless
+        ``idle_action`` is supplied. In that case the ordinary pending-state
+        write runs while the same control lock still proves the phase is idle.
+        This makes "phase check + accept user direction" one linearized action;
+        a finalizer cannot open its commit window in between those two steps.
+
+        During summary it stores the control in the normal pending slot and in
+        an ordered event list for the finalizer to durably veto the handoff.
+        After commit/veto it routes the event to the still exit-gated target task
+        before accepting.
+        """
+        gate = getattr(self, "_auto_handoff_control_lock", None)
+        if gate is None:
+            return None
+        route_event = None
+        with gate:
+            phase = getattr(self, "_auto_handoff_control_phase", "idle")
+            if phase not in {
+                "summarizing",
+                "committing",
+                "budget_summarizing",
+                "budget_committing",
+                "committed",
+                "vetoed",
+                "commit_failed",
+                "veto_pending",
+                "safety_limited",
+                "budget_finalized",
+            }:
+                if callable(idle_action):
+                    idle_result = idle_action()
+                    accepted = (
+                        bool(idle_result.get("accepted"))
+                        if isinstance(idle_result, dict)
+                        else bool(idle_result)
+                    )
+                    return {
+                        "state": "idle",
+                        "accepted": accepted,
+                        "idle_result": idle_result,
+                    }
+                return None
+            self._auto_handoff_control_seq = int(
+                getattr(self, "_auto_handoff_control_seq", 0)
+            ) + 1
+            event = {
+                "control_id": f"hc_{uuid.uuid4().hex}",
+                "seq": self._auto_handoff_control_seq,
+                "kind": kind,
+                "message": (message or "").strip(),
+                "phase": phase,
+                "persisted": False,
+            }
+            source_task_id = str(
+                getattr(self, "_auto_handoff_control_source", "") or ""
+            ).strip()
+            target_task_id = str(
+                getattr(self, "_auto_handoff_control_target", "") or ""
+            ).strip()
+            if phase in {
+                "summarizing",
+                "committing",
+                "budget_summarizing",
+                "budget_committing",
+                "commit_failed",
+            }:
+                durable_phase = "before_commit"
+                target_task_id = source_task_id
+            elif phase == "committed":
+                durable_phase = "after_commit"
+            else:
+                durable_phase = "after_terminal"
+
+            winner_kind = str(
+                getattr(self, "_auto_handoff_control_winner_kind", "") or ""
+            )
+            winner_id = str(
+                getattr(self, "_auto_handoff_control_winner_id", "") or ""
+            )
+            if winner_kind == "stop" and kind != "stop":
+                durable_phase = "superseded"
+            if not source_task_id or not target_task_id:
+                event["error"] = "handoff target is unavailable"
+                return {"state": "routed", "accepted": False, "event": event}
+
+            durable_control = {
+                "control_id": event["control_id"],
+                "source_task_id": source_task_id,
+                "target_task_id": target_task_id,
+                "kind": kind,
+                "message": event["message"],
+                "phase": durable_phase,
+            }
+            if durable_phase == "before_commit":
+                run_text = (
+                    os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+                ).strip()
+                if not run_text.isdigit():
+                    event["error"] = "handoff control requires the active run id"
+                    return {
+                        "state": "routed",
+                        "accepted": False,
+                        "event": event,
+                    }
+                durable_control.update(
+                    expected_run_id=int(run_text),
+                    expected_worker_pid=os.getpid(),
+                )
+            elif durable_phase == "superseded":
+                durable_control["superseded_by_control_id"] = winner_id
+
+            # Admission is the exact immutable receipt, not a local token.  It
+            # is installed while the control lock still linearizes the phase,
+            # and stage_pending_handoff_control starts its non-daemon replay
+            # owner before returning.  A hard-exit claim can therefore win
+            # before admission or lose to a complete independently replayable
+            # receipt; there is no check-to-exit gap between those outcomes.
+            try:
+                from agent.kanban_auto_handoff import (
+                    stage_pending_handoff_control,
+                )
+
+                event["pending_handoff_control"] = (
+                    stage_pending_handoff_control(
+                        durable_control,
+                        error="awaiting durable confirmation",
+                    )
+                )
+            except Exception as exc:
+                event["error"] = str(exc)
+                return {"state": "routed", "accepted": False, "event": event}
+
+            event["durable_control"] = durable_control
+            event["durable_phase"] = durable_phase
+            event["source_task_id"] = source_task_id
+            event["target_task_id"] = target_task_id
+            event["supervisor_pending"] = True
+            if durable_phase == "superseded":
+                event["state"] = "consumed"
+                event["superseded_by_control_id"] = winner_id
+            elif kind == "stop":
+                self._auto_handoff_control_winner_kind = "stop"
+                self._auto_handoff_control_winner_id = event["control_id"]
+            elif not winner_kind:
+                self._auto_handoff_control_winner_kind = kind
+                self._auto_handoff_control_winner_id = event["control_id"]
+            self._auto_handoff_control_events.append(event)
+
+            if durable_phase == "before_commit":
+                self._auto_handoff_control_phase = "veto_pending"
+                self._auto_handoff_control_target = source_task_id
+
+            if phase in {
+                "committed",
+                "vetoed",
+                "commit_failed",
+                "veto_pending",
+                "safety_limited",
+                "budget_finalized",
+            }:
+                route_event = event
+            elif kind == "steer":
+                lock = getattr(self, "_pending_steer_lock", None)
+                if lock is not None:
+                    with lock:
+                        self._pending_steer = (
+                            f"{self._pending_steer}\n{event['message']}"
+                            if self._pending_steer
+                            else event["message"]
+                        )
+                else:
+                    self._pending_steer = event["message"]
+            else:
+                lock = getattr(self, "_pending_redirect_lock", None)
+                if lock is not None:
+                    with lock:
+                        if kind == "stop":
+                            self._interrupt_requested = True
+                            self._interrupt_message = event["message"] or None
+                            self._pending_redirect = None
+                        elif not (self._interrupt_requested and not self._pending_redirect):
+                            self._pending_redirect = (
+                                f"{self._pending_redirect}\n\n"
+                                f"[Additional user correction]\n{event['message']}"
+                                if self._pending_redirect
+                                else event["message"]
+                            )
+                            self._interrupt_requested = True
+                            self._interrupt_message = None
+                elif kind == "stop":
+                    self._interrupt_requested = True
+                    self._interrupt_message = event["message"] or None
+                    self._pending_redirect = None
+                else:
+                    self._pending_redirect = event["message"]
+                    self._interrupt_requested = True
+                    self._interrupt_message = None
+
+        if route_event is not None:
+            if not route_event.get("source_task_id") or not route_event.get(
+                "target_task_id"
+            ):
+                route_event["error"] = "handoff target is unavailable"
+                return {"state": "routed", "accepted": False, "event": route_event}
+            return {
+                "state": "routed",
+                "accepted": self._persist_auto_handoff_control_event(route_event),
+                "event": route_event,
+            }
+        return {"state": "queued", "accepted": True, "event": event}
+
+    def interrupt(self, message: str = None, *, system_signal: bool = False) -> bool:
         """
         Request the agent to interrupt its current tool-calling loop.
         
@@ -2869,18 +3171,102 @@ class AIAgent:
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
-        # A hard stop and redirect share one lock so /stop cannot race with an
-        # accepted correction and accidentally turn itself into a retry.
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is not None:
-            with _redirect_lock:
+        # A POSIX shutdown signal is transport cleanup, never a second user
+        # command. In particular, the gateway sends SIGTERM after persisting a
+        # redirect; turning that signal back into `stop` would overwrite the
+        # user's correction and re-block the task.
+        # Some legacy callers and tests intentionally use a partial agent
+        # double. Only enter the durable handoff path when normal agent
+        # initialization installed its real state; dynamic mock attributes
+        # must not masquerade as an active handoff gate.
+        _handoff_state_ready = "_auto_handoff_control_lock" in getattr(
+            self, "__dict__", {}
+        )
+        if not system_signal and _handoff_state_ready:
+            # Gateway interrupt-mode first attempts a semantic redirect, then
+            # falls back to interrupt() when that method returns False. If the
+            # redirect is already held by the exact-receipt supervisor, do not
+            # reinterpret the same text as a second, stronger Stop control.
+            clean_interrupt_message = (message or "").strip()
+            with self._auto_handoff_control_lock:
+                held_same_message = any(
+                    event.get("supervisor_pending") is True
+                    and event.get("kind") in {"redirect", "steer"}
+                    and str(event.get("message") or "").strip()
+                    == clean_interrupt_message
+                    for event in getattr(self, "_auto_handoff_control_events", [])
+                )
+            if held_same_message:
+                logger.error(
+                    "Interrupt fallback suppressed because the same user "
+                    "direction is already held for durable handoff recovery"
+                )
+                return False
+
+        def _store_idle_stop():
+            redirect_lock = getattr(self, "_pending_redirect_lock", None)
+            steer_lock = getattr(self, "_pending_steer_lock", None)
+            if redirect_lock is not None:
+                redirect_lock.acquire()
+            try:
+                if steer_lock is not None:
+                    steer_lock.acquire()
+                try:
+                    self._interrupt_requested = True
+                    self._interrupt_message = message
+                    self._pending_redirect = None
+                    self._record_pending_steer_receipt_locked(
+                        kind="stop",
+                        message=(message or "").strip(),
+                        delivery_slot="interrupt",
+                    )
+                finally:
+                    if steer_lock is not None:
+                        steer_lock.release()
+            finally:
+                if redirect_lock is not None:
+                    redirect_lock.release()
+            return {"accepted": True, "mode": "stop"}
+
+        _handoff_control = (
+            self._queue_auto_handoff_control(
+                "stop",
+                message or "",
+                idle_action=_store_idle_stop,
+            )
+            if not system_signal and _handoff_state_ready
+            else None
+        )
+        if _handoff_control and _handoff_control["state"] == "routed":
+            if _handoff_control.get("accepted"):
+                return True
+            _route_event = _handoff_control.get("event") or {}
+            _route_error = str(
+                _route_event.get("error") or "handoff control routing failed"
+            )
+            self._auto_handoff_control_route_failed = _route_error
+            logger.error(
+                "Durable handoff stop routing is pending supervisor recovery; "
+                "the old worker remains exit-gated: %s",
+                _route_error,
+            )
+            # Do not acknowledge a local-only fallback. The exact receipt is
+            # supervised and the old worker stays alive, but the caller must see
+            # that durable acceptance has not yet been confirmed.
+            return False
+        if not _handoff_control:
+            # A hard stop and redirect share one lock so /stop cannot race with
+            # an accepted correction and accidentally turn itself into a retry.
+            _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+            if _redirect_lock is not None:
+                with _redirect_lock:
+                    self._interrupt_requested = True
+                    self._interrupt_message = message
+                    self._pending_redirect = None
+            else:
                 self._interrupt_requested = True
                 self._interrupt_message = message
                 self._pending_redirect = None
-        else:
-            self._interrupt_requested = True
-            self._interrupt_message = message
-            self._pending_redirect = None
 
         # Codex app-server owns its model/tool loop and watches a private
         # interrupt event rather than Hermes' per-thread flag.
@@ -2942,11 +3328,18 @@ class AIAgent:
             children_copy = list(self._active_children)
         for child in children_copy:
             try:
-                child.interrupt(message)
+                # Preserve the long-standing one-argument child contract for
+                # ordinary user interrupts (including plugin/test doubles).
+                # Only the managed shutdown path needs the new signal marker.
+                if system_signal:
+                    child.interrupt(message, system_signal=True)
+                else:
+                    child.interrupt(message)
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
+        return True
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
@@ -2999,9 +3392,141 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_receipts = []
+                self._pending_steer_inflight_receipt_ids = []
         return True
 
-    def steer(self, text: str) -> bool:
+    def _record_pending_steer_receipt_locked(
+        self,
+        *,
+        kind: str,
+        message: str,
+        delivery_slot: str = "steer",
+    ) -> None:
+        self._pending_steer_receipt_seq = int(
+            getattr(self, "_pending_steer_receipt_seq", 0)
+        ) + 1
+        receipts = getattr(self, "_pending_steer_receipts", None)
+        if not isinstance(receipts, list):
+            receipts = []
+            self._pending_steer_receipts = receipts
+        receipts.append(
+            {
+                "control_id": f"hc_{uuid.uuid4().hex}",
+                "seq": self._pending_steer_receipt_seq,
+                "kind": kind,
+                "message": message,
+                "delivery_slot": delivery_slot,
+                "injected": False,
+            }
+        )
+
+    def _mark_pending_steer_receipts_injected(self) -> None:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            inflight = set(
+                getattr(
+                    self, "_pending_steer_inflight_receipt_ids", []
+                )
+                or []
+            )
+            for receipt in getattr(self, "_pending_steer_receipts", []) or []:
+                if str(receipt.get("control_id")) in inflight:
+                    receipt["injected"] = True
+            self._pending_steer_inflight_receipt_ids = []
+            return
+        with lock:
+            inflight = set(
+                getattr(
+                    self, "_pending_steer_inflight_receipt_ids", []
+                )
+                or []
+            )
+            for receipt in getattr(self, "_pending_steer_receipts", []) or []:
+                if str(receipt.get("control_id")) in inflight:
+                    receipt["injected"] = True
+            self._pending_steer_inflight_receipt_ids = []
+
+    def _steer_injected_watermark(self) -> int:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            receipts = list(
+                getattr(self, "_pending_steer_receipts", []) or []
+            )
+        else:
+            with lock:
+                receipts = list(
+                    getattr(self, "_pending_steer_receipts", []) or []
+                )
+        return max(
+            (
+                int(receipt.get("seq", 0))
+                for receipt in receipts
+                if receipt.get("injected") is True
+            ),
+            default=0,
+        )
+
+    def _consume_injected_steer_receipts(self, watermark: int) -> None:
+        if watermark <= 0:
+            return
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            receipts = getattr(self, "_pending_steer_receipts", []) or []
+            self._pending_steer_receipts = [
+                receipt
+                for receipt in receipts
+                if not (
+                    receipt.get("injected") is True
+                    and int(receipt.get("seq", 0)) <= int(watermark)
+                )
+            ]
+            return
+        with lock:
+            receipts = getattr(self, "_pending_steer_receipts", []) or []
+            self._pending_steer_receipts = [
+                receipt
+                for receipt in receipts
+                if not (
+                    receipt.get("injected") is True
+                    and int(receipt.get("seq", 0)) <= int(watermark)
+                )
+            ]
+
+    def _snapshot_unconsumed_steer_receipts(self) -> list[dict]:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            receipts = getattr(self, "_pending_steer_receipts", []) or []
+            return [dict(receipt) for receipt in receipts]
+        with lock:
+            return [
+                dict(receipt)
+                for receipt in (
+                    getattr(self, "_pending_steer_receipts", []) or []
+                )
+            ]
+
+    def _clear_consumed_steer_receipts(self, control_ids: set[str]) -> None:
+        if not control_ids:
+            return
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            receipts = getattr(self, "_pending_steer_receipts", []) or []
+            self._pending_steer_receipts = [
+                receipt
+                for receipt in receipts
+                if str(receipt.get("control_id")) not in control_ids
+            ]
+            return
+        with lock:
+            receipts = getattr(self, "_pending_steer_receipts", []) or []
+            self._pending_steer_receipts = [
+                receipt
+                for receipt in receipts
+                if str(receipt.get("control_id")) not in control_ids
+            ]
+
+    def steer(self, text: str, *, _control_kind: str = "steer") -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3022,6 +3547,43 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+
+        def _store_idle_steer():
+            lock = getattr(self, "_pending_steer_lock", None)
+            if lock is None:
+                existing = getattr(self, "_pending_steer", None)
+                self._pending_steer = (
+                    existing + "\n" + cleaned if existing else cleaned
+                )
+                self._record_pending_steer_receipt_locked(
+                    kind=_control_kind,
+                    message=cleaned,
+                )
+            else:
+                with lock:
+                    if self._pending_steer:
+                        self._pending_steer = (
+                            self._pending_steer + "\n" + cleaned
+                        )
+                    else:
+                        self._pending_steer = cleaned
+                    self._record_pending_steer_receipt_locked(
+                        kind=_control_kind,
+                        message=cleaned,
+                    )
+            return {"accepted": True, "mode": "steer"}
+
+        _handoff_control = (
+            self._queue_auto_handoff_control(
+                _control_kind,
+                cleaned,
+                idle_action=_store_idle_steer,
+            )
+            if "_auto_handoff_control_lock" in getattr(self, "__dict__", {})
+            else None
+        )
+        if _handoff_control:
+            return bool(_handoff_control["accepted"])
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3029,12 +3591,20 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            self._record_pending_steer_receipt_locked(
+                kind=_control_kind,
+                message=cleaned,
+            )
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            self._record_pending_steer_receipt_locked(
+                kind=_control_kind,
+                message=cleaned,
+            )
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3055,9 +3625,132 @@ class AIAgent:
             return False
         cleaned = text.strip()
 
+        def _store_idle_redirect():
+            # This callback runs while the handoff control lock still proves
+            # the phase is idle. All ordinary acceptance paths therefore finish
+            # before a finalizer can open summarizing/committing.
+            if getattr(self, "api_mode", None) == "codex_app_server":
+                codex_session = getattr(self, "_codex_session", None)
+                native_steer = getattr(codex_session, "request_steer", None)
+                if not callable(native_steer):
+                    return {"accepted": False, "mode": "codex"}
+                redirect_lock = getattr(self, "_pending_redirect_lock", None)
+                if redirect_lock is not None:
+                    with redirect_lock:
+                        if self._interrupt_requested:
+                            return {"accepted": False, "mode": "codex"}
+                elif self._interrupt_requested:
+                    return {"accepted": False, "mode": "codex"}
+                try:
+                    return {
+                        "accepted": bool(native_steer(cleaned)),
+                        "mode": "codex",
+                    }
+                except Exception:
+                    logger.debug(
+                        "Codex app-server turn/steer failed",
+                        exc_info=True,
+                    )
+                    return {"accepted": False, "mode": "codex"}
+
+            if getattr(self, "_executing_tools", False):
+                steer_lock = getattr(self, "_pending_steer_lock", None)
+                if steer_lock is not None:
+                    steer_lock.acquire()
+                try:
+                    existing = getattr(self, "_pending_steer", None)
+                    self._pending_steer = (
+                        existing + "\n" + cleaned if existing else cleaned
+                    )
+                    self._record_pending_steer_receipt_locked(
+                        kind="redirect",
+                        message=cleaned,
+                        delivery_slot="steer",
+                    )
+                finally:
+                    if steer_lock is not None:
+                        steer_lock.release()
+                return {"accepted": True, "mode": "tool_steer"}
+
+            model_active = getattr(self, "_model_request_active", None)
+            redirect_lock = getattr(self, "_pending_redirect_lock", None)
+            steer_lock = getattr(self, "_pending_steer_lock", None)
+            if redirect_lock is not None:
+                redirect_lock.acquire()
+            try:
+                if model_active is None or not model_active.is_set():
+                    return {"accepted": False, "mode": "redirect"}
+                existing = getattr(self, "_pending_redirect", None)
+                if self._interrupt_requested and not existing:
+                    return {"accepted": False, "mode": "redirect"}
+                self._pending_redirect = (
+                    f"{existing}\n\n[Additional user correction]\n{cleaned}"
+                    if existing
+                    else cleaned
+                )
+                self._interrupt_requested = True
+                self._interrupt_message = None
+                if steer_lock is not None:
+                    steer_lock.acquire()
+                try:
+                    self._record_pending_steer_receipt_locked(
+                        kind="redirect",
+                        message=cleaned,
+                        delivery_slot="redirect",
+                    )
+                finally:
+                    if steer_lock is not None:
+                        steer_lock.release()
+            finally:
+                if redirect_lock is not None:
+                    redirect_lock.release()
+            return {"accepted": True, "mode": "redirect"}
+
+        _handoff_control = (
+            self._queue_auto_handoff_control(
+                "redirect",
+                cleaned,
+                idle_action=_store_idle_redirect,
+            )
+            if "_auto_handoff_control_lock" in getattr(self, "__dict__", {})
+            else None
+        )
+        _idle_redirect_stored = False
+        if _handoff_control:
+            if _handoff_control["state"] == "routed":
+                return bool(_handoff_control["accepted"])
+            if _handoff_control["state"] == "idle":
+                if not _handoff_control["accepted"]:
+                    return False
+                idle_result = _handoff_control.get("idle_result") or {}
+                idle_mode = idle_result.get("mode")
+                if idle_mode in {"codex", "tool_steer"}:
+                    return True
+                _idle_redirect_stored = idle_mode == "redirect"
+            else:
+                # A summary request is the only active request in this phase.
+                # Cancel it so the finalizer can discard the provisional summary
+                # and durably requeue the current task with this direction.
+                _execution_thread_id = getattr(self, "_execution_thread_id", None)
+                if _execution_thread_id is not None:
+                    _set_interrupt(True, _execution_thread_id)
+                    self._interrupt_thread_signal_pending = False
+                else:
+                    self._interrupt_thread_signal_pending = True
+                _abort_active_request = getattr(self, "_active_request_abort", None)
+                if callable(_abort_active_request):
+                    try:
+                        _abort_active_request("redirect_abort")
+                    except Exception:
+                        logger.debug("Failed to abort request for redirect", exc_info=True)
+                return True
+
         # Codex owns its internal reasoning/tool loop, so use its first-class
         # active-turn steering protocol rather than interrupting the subprocess.
-        if getattr(self, "api_mode", None) == "codex_app_server":
+        if (
+            not _idle_redirect_stored
+            and getattr(self, "api_mode", None) == "codex_app_server"
+        ):
             _codex_session = getattr(self, "_codex_session", None)
             _native_steer = getattr(_codex_session, "request_steer", None)
             if callable(_native_steer):
@@ -3077,41 +3770,42 @@ class AIAgent:
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
         # model decision, including delegate_task children.
-        if getattr(self, "_executing_tools", False):
-            return self.steer(cleaned)
+        if not _idle_redirect_stored and getattr(self, "_executing_tools", False):
+            return self.steer(cleaned, _control_kind="redirect")
 
-        _model_active = getattr(self, "_model_request_active", None)
-        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            if _model_active is None or not _model_active.is_set():
-                return False
-            existing = getattr(self, "_pending_redirect", None)
-            if self._interrupt_requested and not existing:
-                return False
-            self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}"
-                if existing
-                else cleaned
-            )
-            self._interrupt_requested = True
-            self._interrupt_message = None
-        else:
-            with _redirect_lock:
+        if not _idle_redirect_stored:
+            _model_active = getattr(self, "_model_request_active", None)
+            _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+            if _redirect_lock is None:
                 if _model_active is None or not _model_active.is_set():
-                    # The response completed before we acquired the state lock.
-                    # Reject so the surface queues a new turn.
                     return False
-                if self._interrupt_requested and not self._pending_redirect:
+                existing = getattr(self, "_pending_redirect", None)
+                if self._interrupt_requested and not existing:
                     return False
-                if self._pending_redirect:
-                    self._pending_redirect = (
-                        f"{self._pending_redirect}\n\n"
-                        f"[Additional user correction]\n{cleaned}"
-                    )
-                else:
-                    self._pending_redirect = cleaned
+                self._pending_redirect = (
+                    f"{existing}\n\n[Additional user correction]\n{cleaned}"
+                    if existing
+                    else cleaned
+                )
                 self._interrupt_requested = True
                 self._interrupt_message = None
+            else:
+                with _redirect_lock:
+                    if _model_active is None or not _model_active.is_set():
+                        # The response completed before we acquired the state lock.
+                        # Reject so the surface queues a new turn.
+                        return False
+                    if self._interrupt_requested and not self._pending_redirect:
+                        return False
+                    if self._pending_redirect:
+                        self._pending_redirect = (
+                            f"{self._pending_redirect}\n\n"
+                            f"[Additional user correction]\n{cleaned}"
+                        )
+                    else:
+                        self._pending_redirect = cleaned
+                    self._interrupt_requested = True
+                    self._interrupt_message = None
 
         # Interrupt only the model request. Do not fan out to tool workers or
         # child agents as interrupt() does.
@@ -3139,14 +3833,36 @@ class AIAgent:
 
     def _drain_pending_redirect(self) -> Optional[str]:
         """Return and clear pending active-turn correction text."""
+        def _mark_redirect_receipts_injected_locked():
+            for receipt in getattr(self, "_pending_steer_receipts", []) or []:
+                if (
+                    receipt.get("injected") is not True
+                    and str(receipt.get("delivery_slot") or "steer")
+                    == "redirect"
+                ):
+                    receipt["injected"] = True
+
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        _steer_lock = getattr(self, "_pending_steer_lock", None)
         if _redirect_lock is None:
             text = getattr(self, "_pending_redirect", None)
             self._pending_redirect = None
+            if text:
+                if _steer_lock is not None:
+                    with _steer_lock:
+                        _mark_redirect_receipts_injected_locked()
+                else:
+                    _mark_redirect_receipts_injected_locked()
             return text
         with _redirect_lock:
             text = self._pending_redirect
             self._pending_redirect = None
+            if text:
+                if _steer_lock is not None:
+                    with _steer_lock:
+                        _mark_redirect_receipts_injected_locked()
+                else:
+                    _mark_redirect_receipts_injected_locked()
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
@@ -3159,10 +3875,30 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            if text:
+                self._pending_steer_inflight_receipt_ids = [
+                    str(receipt.get("control_id"))
+                    for receipt in (
+                        getattr(self, "_pending_steer_receipts", []) or []
+                    )
+                    if receipt.get("injected") is not True
+                    and str(receipt.get("delivery_slot") or "steer") == "steer"
+                    and receipt.get("control_id")
+                ]
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            if text:
+                self._pending_steer_inflight_receipt_ids = [
+                    str(receipt.get("control_id"))
+                    for receipt in (
+                        getattr(self, "_pending_steer_receipts", []) or []
+                    )
+                    if receipt.get("injected") is not True
+                    and str(receipt.get("delivery_slot") or "steer") == "steer"
+                    and receipt.get("control_id")
+                ]
         return text
 
     def _record_file_mutation_result(
@@ -3674,17 +4410,28 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        suppress_learning = bool(
+            getattr(self, "_suppress_session_end_learning", False)
+        )
+        # Consume the marker once.  A long-lived host that later ends a real
+        # user session must retain the baseline learning behaviour.
+        self._suppress_session_end_learning = False
         if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
+            if not suppress_learning:
+                try:
+                    self._memory_manager.on_session_end(messages or [])
+                except Exception as e:
+                    logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
                 self._memory_manager.shutdown_all()
             except Exception:
                 pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
-        if hasattr(self, "context_compressor") and self.context_compressor:
+        if (
+            not suppress_learning
+            and hasattr(self, "context_compressor")
+            and self.context_compressor
+        ):
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
@@ -3698,7 +4445,10 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
-        if self._memory_manager:
+        suppress_learning = bool(
+            getattr(self, "_suppress_session_end_learning", False)
+        )
+        if self._memory_manager and not suppress_learning:
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception:
@@ -3709,7 +4459,11 @@ class AIAgent:
         # the rotated-out session into whatever comes next under the same
         # compressor instance. Mirrors the call in shutdown_memory_provider().
         # See issue #22394.
-        if hasattr(self, "context_compressor") and self.context_compressor:
+        if (
+            not suppress_learning
+            and hasattr(self, "context_compressor")
+            and self.context_compressor
+        ):
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
@@ -5012,6 +5766,8 @@ class AIAgent:
         No-op for Anthropic/Bedrock modes, which don't use the OpenAI client,
         and when no overrides are configured.
         """
+        if getattr(self, "_managed_short_task_bootstrap_verified", False):
+            return
         if self.api_mode in ("anthropic_messages", "bedrock_converse"):
             return
         from agent.auxiliary_client import (
@@ -6638,10 +7394,15 @@ class AIAgent:
         from agent.tool_executor import execute_tool_calls_sequential
         return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
 
-    def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
+    def _handle_max_iterations(
+        self,
+        messages: list,
+        api_call_count: int,
+        **kwargs,
+    ) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
         from agent.chat_completion_helpers import handle_max_iterations
-        return handle_max_iterations(self, messages, api_call_count)
+        return handle_max_iterations(self, messages, api_call_count, **kwargs)
 
     def _conversation_root_id(self) -> Optional[str]:
         """Resolve the stable conversation id for Portal usage attribution.

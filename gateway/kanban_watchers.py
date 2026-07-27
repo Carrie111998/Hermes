@@ -279,6 +279,15 @@ class GatewayKanbanWatchersMixin:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                from hermes_cli.kanban_control_guard import (
+                                    authorize_managed_task_mutation,
+                                )
+
+                                managed_short_task = (
+                                    authorize_managed_task_mutation(
+                                        conn, sub["task_id"], None
+                                    ).managed
+                                )
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -290,6 +299,7 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "managed_short_task": managed_short_task,
                                 })
                         finally:
                             conn.close()
@@ -344,7 +354,29 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
-                    for ev in d["events"]:
+                    notification_events = list(d["events"])
+                    final_managed_failure = bool(
+                        d.get("managed_short_task")
+                        and task is not None
+                        and task.status == "blocked"
+                        and task.max_retries == 1
+                        and any(ev.kind == "gave_up" for ev in notification_events)
+                    )
+                    if final_managed_failure:
+                        # A first failure at max_retries=1 atomically records a
+                        # diagnostic crash/timeout plus the final gave_up event.
+                        # Only the latter is actionable. Sending both used to
+                        # tell the user "will retry" immediately before "gave
+                        # up", creating a false promise and two noisy pings.
+                        notification_events = [
+                            next(
+                                ev
+                                for ev in reversed(notification_events)
+                                if ev.kind == "gave_up"
+                            )
+                        ]
+                    managed_short_task = bool(d.get("managed_short_task"))
+                    for ev in notification_events:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
@@ -369,23 +401,65 @@ class GatewayKanbanWatchersMixin:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
+                            if managed_short_task:
+                                msg = (
+                                    f"✔ {board_tag}{tag}这项短任务已完成，"
+                                    f"并已通过独立复核。{handoff}"
+                                )
+                            else:
+                                msg = (
+                                    f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                    f" — {title}{handoff}"
+                                )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            if managed_short_task:
+                                payload = ev.payload or {}
+                                emergency_brake = (
+                                    payload.get("source")
+                                    == "short_task_policy_emergency_brake"
+                                )
+                                exit_unconfirmed = bool(
+                                    payload.get("exit_pending")
+                                    or payload.get("identity_verified") is False
+                                )
+                                if emergency_brake and exit_unconfirmed:
+                                    msg = (
+                                        f"⏸ {board_tag}{tag}暂停要求已保存，"
+                                        f"Hermes 还不能确认当前步骤已经完全停止；"
+                                        f"不会开始下一步。{reason}"
+                                    )
+                                else:
+                                    msg = (
+                                        f"⏸ {board_tag}{tag}这项短任务已暂停，"
+                                        f"不会自动继续。{reason}"
+                                    )
+                            else:
+                                msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
+                            if final_managed_failure:
+                                payload = ev.payload or {}
+                                if payload.get("exit_pending"):
+                                    msg = (
+                                        f"✖ {board_tag}{tag}这项短任务未完成，"
+                                        f"已停止继续推进，但当前步骤是否完全停止"
+                                        f"还未确认；不会开始下一步，也不会自动重试。"
+                                    )
+                                else:
+                                    msg = (
+                                        f"✖ {board_tag}{tag}这项短任务未完成，"
+                                        f"已停止继续推进，不会自动重试。"
+                                    )
+                            else:
+                                msg = (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                    f"after repeated spawn failures{err}"
+                                )
                         elif kind == "crashed":
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
@@ -480,6 +554,12 @@ class GatewayKanbanWatchersMixin:
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
+                                        managed_short_task=bool(
+                                            d.get("managed_short_task")
+                                        ),
+                                        workspace_path=(
+                                            task.workspace_path if task else None
+                                        ),
                                     )
                                 except Exception as art_exc:
                                     logger.debug(
@@ -536,7 +616,11 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = {
+                            ev.kind
+                            for ev in notification_events
+                            if ev.kind in _WAKE_KINDS
+                        }
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
@@ -761,6 +845,8 @@ class GatewayKanbanWatchersMixin:
         metadata: dict,
         event_payload: Optional[dict],
         task,
+        managed_short_task: bool = False,
+        workspace_path: Optional[str] = None,
     ) -> None:
         """Upload artifact files referenced by a completed kanban task.
 
@@ -779,6 +865,11 @@ class GatewayKanbanWatchersMixin:
         errors are logged but do not break the notifier loop.
         """
         from pathlib import Path as _Path
+        from gateway.platforms.base import BasePlatformAdapter
+        from hermes_cli.kanban_control_guard import (
+            extract_managed_local_path_mentions,
+            resolve_managed_workspace_path,
+        )
 
         candidates: list[str] = []
         seen: set[str] = set()
@@ -786,7 +877,21 @@ class GatewayKanbanWatchersMixin:
         def _add(path: str) -> None:
             if not path:
                 return
-            expanded = os.path.expanduser(path)
+            if managed_short_task:
+                expanded = resolve_managed_workspace_path(
+                    path,
+                    workspace_path or "",
+                    require_file=True,
+                )
+                if expanded is None:
+                    logger.warning(
+                        "kanban notifier: blocked managed artifact outside "
+                        "task workspace for %s",
+                        getattr(task, "id", "<unknown>"),
+                    )
+                    return
+            else:
+                expanded = os.path.expanduser(path)
             if expanded in seen:
                 return
             if not os.path.isfile(expanded):
@@ -805,22 +910,42 @@ class GatewayKanbanWatchersMixin:
             # 2. Paths embedded in the payload summary.
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
-                paths, _ = adapter.extract_local_files(summary)
+                if managed_short_task:
+                    paths = extract_managed_local_path_mentions(summary)
+                else:
+                    paths, _ = adapter.extract_local_files(summary)
                 for p in paths:
                     _add(p)
 
         # 3. Legacy: paths embedded in task.result.
         if task is not None and getattr(task, "result", None):
             result_text = str(task.result)
-            paths, _ = adapter.extract_local_files(result_text)
+            if managed_short_task:
+                paths = extract_managed_local_path_mentions(result_text)
+            else:
+                paths, _ = adapter.extract_local_files(result_text)
             for p in paths:
                 _add(p)
 
         if not candidates:
             return
 
-        from gateway.platforms.base import BasePlatformAdapter
         candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        if managed_short_task:
+            # Defence in depth after the generic media filter: a historical DB
+            # row or a symlink changed between collection and delivery must not
+            # widen the Phase-1 workspace boundary.
+            candidates = [
+                safe
+                for path in candidates
+                if (
+                    safe := resolve_managed_workspace_path(
+                        path,
+                        workspace_path or "",
+                        require_file=True,
+                    )
+                )
+            ]
         if not candidates:
             return
 

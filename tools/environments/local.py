@@ -10,10 +10,21 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+from typing import Optional
 
-from tools.environments.base import BaseEnvironment, _pipe_stdin
+from tools.environments.base import (
+    BaseEnvironment,
+    _begin_short_task_foreground_cleanup,
+    _finish_short_task_foreground_cleanup,
+    cleanup_short_task_foreground_process,
+    mark_short_task_process_cleanup_unsafe,
+    _pipe_stdin,
+    _short_task_worker_cleanup_required,
+    register_short_task_foreground_process,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -1202,6 +1213,85 @@ def _make_run_env(env: dict) -> dict:
     return run_env
 
 
+_SHORT_TASK_SHELL_ENV_KEYS = frozenset(
+    {
+        # Non-interactive shell startup and alternate profile roots.
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        # Environment-controlled shell semantics/cwd/trace behavior.
+        "BASHOPTS",
+        "SHELLOPTS",
+        "BASH_XTRACEFD",
+        "CDPATH",
+        "GLOBIGNORE",
+        "PROMPT_COMMAND",
+        "PS4",
+        # Dynamic-loader injection can execute code before bash/coreutils.
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        # Interpreter/tool startup injection. File primitives must never run
+        # workspace ``sitecustomize`` or env-selected startup code.
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONUSERBASE",
+        "PYTHONBREAKPOINT",
+        "PYTHONWARNINGS",
+        "PYTHONPYCACHEPREFIX",
+        "RIPGREP_CONFIG_PATH",
+        "PERL5OPT",
+        "PERL5LIB",
+        "NODE_OPTIONS",
+    }
+)
+
+
+def _sanitize_short_task_file_shell_env(
+    env: dict[str, str], *, bash: str, cwd: Optional[str] = None
+) -> dict[str, str]:
+    """Return a profile-free environment for managed worker shells.
+
+    Both implementation and independent-review workers are file/lifecycle
+    only. They use the platform's fixed system PATH; a workspace virtualenv,
+    inherited PATH entry, or project shim must never execute behind a file
+    primitive.
+    """
+    clean = dict(env)
+    for key in list(clean):
+        if key in _SHORT_TASK_SHELL_ENV_KEYS or key.startswith("BASH_FUNC_"):
+            clean.pop(key, None)
+    if not _IS_WINDOWS:
+        # File primitives only require POSIX core utilities. Excluding user
+        # package/bin directories prevents a PATH shim named cat/rg/mv/etc.
+        # from turning a nominal file operation into arbitrary execution.
+        clean["PATH"] = os.defpath
+    else:
+        # Keep the selected Git-for-Windows runtime usable while excluding a
+        # current-directory PATH entry and putting its own binaries first.
+        git_root = _git_root_from_bash(bash)
+        trusted = [
+            ntpath.join(git_root, "usr", "bin"),
+            ntpath.join(git_root, "bin"),
+        ]
+        inherited = [
+            part
+            for part in str(clean.get("PATH") or clean.get("Path") or "").split(
+                os.pathsep
+            )
+            if part and part != "."
+        ]
+        path_key = _path_env_key(clean) or "PATH"
+        clean[path_key] = os.pathsep.join(
+            list(dict.fromkeys([*trusted, *inherited]))
+        )
+    return clean
+
+
 def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
     """Return (shell_init_files, auto_source_bashrc) from config.yaml.
 
@@ -1359,6 +1449,27 @@ class LocalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        cleanup_registered = _short_task_worker_cleanup_required()
+        if cleanup_registered:
+            # Ignore a PATH-selected shim on POSIX and refuse every profile
+            # surface, even if a caller accidentally asks for login=True.
+            if not _IS_WINDOWS:
+                trusted_bash = next(
+                    (
+                        candidate
+                        for candidate in ("/bin/bash", "/usr/bin/bash")
+                        if os.path.isfile(candidate)
+                        and os.access(candidate, os.X_OK)
+                    ),
+                    None,
+                )
+                if trusted_bash is None:
+                    raise RuntimeError(
+                        "Automatic short-task file shell requires a trusted "
+                        "system bash."
+                    )
+                bash = trusted_bash
+            login = False
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
@@ -1369,8 +1480,15 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        if cleanup_registered:
+            args = [bash, "--noprofile", "--norc", "-c", cmd_string]
+        else:
+            args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        if cleanup_registered:
+            run_env = _sanitize_short_task_file_shell_env(
+                run_env, bash=bash, cwd=self.cwd
+            )
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
@@ -1401,32 +1519,100 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            args,
-            text=True,
-            env=run_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=_popen_cwd,
-            **_popen_kwargs,
-        )
-        if not _IS_WINDOWS:
+        previous_signal_mask = None
+        if (
+            cleanup_registered
+            and not _IS_WINDOWS
+            and hasattr(signal, "pthread_sigmask")
+            and threading.current_thread() is threading.main_thread()
+        ):
+            # Close the only unregistered-child window in the sequential path:
+            # defer Python's shutdown handlers until Popen has returned and the
+            # exact child/PGID is visible in the process registry below.
+            blocked_signals = {signal.SIGINT, signal.SIGTERM}
+            if hasattr(signal, "SIGHUP"):
+                blocked_signals.add(signal.SIGHUP)
             try:
-                proc._hermes_pgid = os.getpgid(proc.pid)
-            except ProcessLookupError:
-                pass
+                previous_signal_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    blocked_signals,
+                )
+            except (OSError, ValueError):
+                previous_signal_mask = None
+        if cleanup_registered:
+            _begin_short_task_foreground_cleanup()
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                args,
+                text=True,
+                env=run_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=(
+                    subprocess.PIPE
+                    if stdin_data is not None
+                    else subprocess.DEVNULL
+                ),
+                start_new_session=True,
+                cwd=_popen_cwd,
+                **_popen_kwargs,
+            )
+            proc._hermes_short_task_cleanup_registered = cleanup_registered
+            if not _IS_WINDOWS:
+                # start_new_session=True makes the child the leader of a fresh
+                # process group, so PGID is deterministically its PID. Cache that
+                # identity immediately: a very fast command can exit before a
+                # follow-up os.getpgid() probe and would otherwise become
+                # impossible to clean up conservatively.
+                proc._hermes_pgid = int(proc.pid)
+                if cleanup_registered and hasattr(proc, "_waitpid_lock"):
+                    # Python signal handlers can re-enter this Popen from the
+                    # same main thread while _internal_poll still owns its
+                    # private waitpid lock. Use a re-entrant lock before signals
+                    # are unmasked so exact signal-time cleanup cannot self-lock.
+                    proc._waitpid_lock = threading.RLock()
+            if cleanup_registered:
+                register_short_task_foreground_process(
+                    proc,
+                    self._cleanup_process_group_with_proof,
+                )
+        except BaseException:
+            if cleanup_registered:
+                if proc is not None:
+                    try:
+                        self._cleanup_process_group_with_proof(proc)
+                    finally:
+                        _finish_short_task_foreground_cleanup(proc)
+                else:
+                    _finish_short_task_foreground_cleanup()
+            raise
+        finally:
+            if previous_signal_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
 
         if stdin_data is not None:
-            _pipe_stdin(proc, stdin_data)
+            try:
+                _pipe_stdin(proc, stdin_data)
+            except BaseException:
+                if cleanup_registered:
+                    cleanup_error = cleanup_short_task_foreground_process(
+                        proc,
+                        fallback_cleanup=self._cleanup_process_group_with_proof,
+                    )
+                    if cleanup_error:
+                        mark_short_task_process_cleanup_unsafe(
+                            f"stdin delivery cleanup: {cleanup_error}"
+                        )
+                    _finish_short_task_foreground_cleanup(proc)
+                raise
 
         return proc
 
-    def _kill_process(self, proc):
-        """Kill the entire process group (all children)."""
+    def _kill_process(self, proc) -> str | None:
+        """Kill the entire process group and prove it no longer exists."""
 
         def _group_alive(pgid: int) -> bool:
             try:
@@ -1468,41 +1654,74 @@ class LocalEnvironment(BaseEnvironment):
                 try:
                     proc.wait(timeout=2.0)
                 except (subprocess.TimeoutExpired, OSError):
-                    pass
+                    return "worker process did not exit after termination"
+                return None
             else:
-                try:
+                pgid = getattr(proc, "_hermes_pgid", None)
+                if pgid is None:
                     pgid = os.getpgid(proc.pid)
-                except ProcessLookupError:
-                    pgid = getattr(proc, "_hermes_pgid", None)
-                    if pgid is None:
-                        raise
 
                 try:
                     os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)
                 except ProcessLookupError:
-                    return
+                    return None
 
                 # Wait on the process group, not just the shell wrapper. Under
                 # load the wrapper can exit before grandchildren do; returning
                 # at that point leaves orphaned process-group members behind.
-                if _wait_for_group_exit(pgid, 1.0):
-                    return
+                if _wait_for_group_exit(pgid, 0.75):
+                    return None
 
                 try:
                     # POSIX-only: _IS_WINDOWS is handled by the outer branch.
                     os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX process-group SIGKILL
                 except ProcessLookupError:
-                    return
-                _wait_for_group_exit(pgid, 2.0)
+                    return None
+                if not _wait_for_group_exit(pgid, 1.0):
+                    return "foreground process group survived SIGKILL escalation"
                 try:
                     proc.wait(timeout=0.2)
                 except (subprocess.TimeoutExpired, OSError):
                     pass
-        except (ProcessLookupError, PermissionError, OSError):
+                return None
+        except ProcessLookupError:
+            return None
+        except (PermissionError, OSError) as exc:
             try:
                 proc.kill()
             except Exception:
                 pass
+            return f"foreground process-group termination failed: {exc}"
+
+    def _cleanup_process_group_with_proof(self, proc) -> Optional[str]:
+        """Remove same-group descendants and prove the group is empty."""
+        if _IS_WINDOWS:
+            return None
+        pgid = getattr(proc, "_hermes_pgid", None)
+        if pgid is None:
+            return "foreground process group identity was unavailable"
+
+        def _alive() -> bool:
+            try:
+                os.killpg(int(pgid), 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+
+        if not _alive():
+            return None
+        cleanup_error = self._kill_process(proc)
+        if cleanup_error:
+            return cleanup_error
+        return None if not _alive() else "foreground process group did not exit"
+
+    # Backward-compatible alias for older tests/plugins that called the
+    # natural-exit-only helper directly. New code uses the proof hook above on
+    # every exit path.
+    def _cleanup_natural_process_group(self, proc) -> Optional[str]:
+        return self._cleanup_process_group_with_proof(proc)
 
     def _update_cwd(self, result: dict):
         """Update cwd from the stdout marker emitted by the wrapped command.

@@ -79,6 +79,32 @@ class PluginToolOverrideError(PermissionError):
 logger = logging.getLogger(__name__)
 
 
+def _verified_managed_short_task_bootstrap() -> bool:
+    """Return true only for a lane attested by the real CLI bootstrap.
+
+    Merely setting a task or lane string is intentionally insufficient.  The
+    dispatcher strips inherited bootstrap markers and the earliest CLI entry
+    re-creates the verified marker only after validating the lane, snapshot,
+    review consistency, and workspace.  Plugin entry points use this single
+    boundary so managed workers cannot discover, register, query, or invoke
+    plugin behavior later in the conversation loop.
+    """
+    if (
+        os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP") != "1"
+        or os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED") != "1"
+        or os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR")
+    ):
+        return False
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    lane = (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip()
+    review_mode = os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+    return bool(
+        task_id
+        and lane in {"implementation", "review"}
+        and ((lane == "review") == review_mode)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
 # ---------------------------------------------------------------------------
@@ -2043,6 +2069,8 @@ def discover_plugins(force: bool = False) -> None:
     Default behavior is idempotent. Pass ``force=True`` to rescan plugin
     manifests and reload state in the current process.
     """
+    if _verified_managed_short_task_bootstrap():
+        return
     get_plugin_manager().discover_and_load(force=force)
 
 
@@ -2051,6 +2079,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
+    if _verified_managed_short_task_bootstrap():
+        return []
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
@@ -2059,11 +2089,15 @@ def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from middleware callbacks.
     """
+    if _verified_managed_short_task_bootstrap():
+        return []
     return get_plugin_manager().invoke_middleware(kind, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:
     """Return True when middleware callbacks are registered for ``kind``."""
+    if _verified_managed_short_task_bootstrap():
+        return False
     manager = get_plugin_manager()
     method = getattr(manager, "has_middleware", None)
     if callable(method):
@@ -2073,6 +2107,8 @@ def has_middleware(kind: str) -> bool:
 
 def has_hook(hook_name: str) -> bool:
     """Return True when a hook has registered callbacks."""
+    if _verified_managed_short_task_bootstrap():
+        return False
     return get_plugin_manager().has_hook(hook_name)
 
 
@@ -2333,17 +2369,23 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     Pass ``force=True`` to rescan in the current process.
     """
     manager = get_plugin_manager()
+    if _verified_managed_short_task_bootstrap():
+        return manager
     manager.discover_and_load(force=force)
     return manager
 
 
 def get_plugin_context_engine():
     """Return the plugin-registered context engine, or None."""
+    if _verified_managed_short_task_bootstrap():
+        return None
     return _ensure_plugins_discovered()._context_engine
 
 
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
+    if _verified_managed_short_task_bootstrap():
+        return None
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
 
@@ -2403,6 +2445,8 @@ def get_plugin_commands() -> Dict[str, dict]:
     Triggers idempotent plugin discovery so callers can use plugin commands
     before any explicit discover_plugins() call.
     """
+    if _verified_managed_short_task_bootstrap():
+        return {}
     return _ensure_plugins_discovered()._plugin_commands
 
 
@@ -2417,6 +2461,8 @@ def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
     before any explicit ``discover_plugins()`` call. Sorted by ``key`` for
     deterministic ordering in pickers and tests.
     """
+    if _verified_managed_short_task_bootstrap():
+        return []
     manager = _ensure_plugins_discovered()
     return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
 
@@ -2427,6 +2473,8 @@ def get_plugin_toolsets() -> List[tuple]:
     Used by the ``hermes tools`` TUI so plugin-provided toolsets appear
     alongside the built-in ones and can be toggled on/off per platform.
     """
+    if _verified_managed_short_task_bootstrap():
+        return []
     manager = get_plugin_manager()
     if not manager._plugin_tool_names:
         return []

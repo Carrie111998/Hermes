@@ -38,7 +38,13 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
     recover_rotated_compression_session,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.managed_short_task import verified_managed_short_task_lane
+
+if verified_managed_short_task_lane():
+    def automatic_compaction_status_message(*_args, **_kwargs):
+        return None
+else:
+    from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.model_metadata import (

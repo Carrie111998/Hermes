@@ -17,6 +17,7 @@ def _make_agent(**overrides):
         _tool_use_enforcement=False,
         _environment_probe=False,
         _kanban_worker_guidance="",
+        _kanban_short_task_handoff_enabled=False,
         _memory_store=None,
         _memory_manager=None,
         model="",
@@ -128,6 +129,174 @@ def test_build_system_prompt_records_stable_prefix():
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
+
+
+def test_kanban_orchestrator_gets_cross_channel_routing_contract():
+    agent = _make_agent(
+        # Real control-plane toolsets expose kanban_show too; tool membership
+        # must not misclassify the main workbench as a worker.
+        valid_tool_names=[
+            "kanban_create",
+            "kanban_list",
+            "kanban_show",
+            "kanban_control",
+        ],
+        _kanban_short_task_handoff_enabled=True,
+    )
+
+    stable = _stable_prompt(agent)
+
+    assert "Durable development routing" in stable
+    assert "idempotency_key" in stable
+    assert "tenant" in stable
+    assert "does not automatically merge requests" in stable
+    assert "Shell commands, test runners, Git, project scripts" in stable
+    assert "separate non-handoff task/workspace" in stable
+    assert "Kanban task execution protocol" not in stable
+
+
+def test_disabled_handoff_does_not_change_orchestrator_prompt():
+    agent = _make_agent(valid_tool_names=["kanban_create", "kanban_list"])
+
+    stable = _stable_prompt(agent)
+
+    assert "Durable development routing" not in stable
+    assert "cross-channel convergence" not in stable
+
+
+def test_kanban_worker_guidance_takes_precedence_over_orchestrator_contract():
+    agent = _make_agent(
+        valid_tool_names=["kanban_create", "kanban_show"],
+        _kanban_worker_guidance="WORKER LIFECYCLE CONTRACT",
+    )
+
+    stable = _stable_prompt(agent)
+
+    assert "WORKER LIFECYCLE CONTRACT" in stable
+    assert "Durable development routing" not in stable
+
+
+def test_legacy_worker_contract_keeps_ordinary_terminal_workflow():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    agent = _make_agent(
+        valid_tool_names=["kanban_show", "terminal"],
+        _kanban_worker_guidance=KANBAN_GUIDANCE,
+    )
+    stable = _stable_prompt(agent)
+    assert "cd $HERMES_KANBAN_WORKSPACE" in stable
+    assert "during long subprocesses" in stable
+    assert "cannot use Terminal or execute_code" not in stable
+    assert "git worktree" in stable
+    assert "delegate_task" in stable
+
+
+def test_short_task_worker_contract_matches_file_only_review_boundary():
+    from agent.prompt_builder import KANBAN_SHORT_TASK_WORKER_GUIDANCE
+
+    agent = _make_agent(
+        valid_tool_names=["read_file", "patch", "kanban_complete"],
+        _kanban_worker_guidance=KANBAN_SHORT_TASK_WORKER_GUIDANCE,
+        _kanban_short_task_handoff_enabled=True,
+    )
+
+    stable = _stable_prompt(agent)
+
+    assert "deterministic file-only execution boundary" in stable
+    assert "Cron and scheduled work" not in stable
+    assert "cron/scheduled work" in stable
+    assert "does not mark the overall work done" in stable
+    assert "fresh reviewer independently inspects the files" in stable
+    assert "Do not claim tests, Git operations, builds, deployments" in stable
+    assert "git worktree" not in stable
+    assert "delegate_task" not in stable
+    assert "cd $HERMES_KANBAN_WORKSPACE" not in stable
+
+
+def test_managed_review_contract_is_file_only_without_command_claims():
+    from agent.prompt_builder import KANBAN_INDEPENDENT_REVIEW_GUIDANCE
+
+    agent = _make_agent(
+        valid_tool_names=["read_file", "kanban_block", "kanban_complete"],
+        _kanban_worker_guidance=KANBAN_INDEPENDENT_REVIEW_GUIDANCE,
+        _kanban_short_task_handoff_enabled=True,
+    )
+
+    stable = _stable_prompt(agent)
+
+    assert "This Phase-1 review is read-only" in stable
+    assert "Terminal, process execution, tests, builds" in stable
+    assert "`write_file`, and `patch` are unavailable" in stable
+    assert "return_to_implementation=true" in stable
+    assert "second-stage verifier is still required" in stable
+    assert "Never invent `commands_run`" in stable
+    assert "Use Terminal only" not in stable
+    assert "Do not claim any of them ran" in stable
+
+
+def test_managed_review_fallback_never_inherits_legacy_terminal_contract(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_MANAGED_LANE", "review")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_MODE", "1")
+    agent = _make_agent(
+        valid_tool_names=["read_file", "kanban_block", "kanban_complete"],
+        _kanban_worker_guidance=None,
+        _managed_short_task_bootstrap=True,
+    )
+
+    stable = _stable_prompt(agent)
+
+    assert "# Independent implementation review" in stable
+    assert "This Phase-1 review is read-only" in stable
+    assert "cd $HERMES_KANBAN_WORKSPACE" not in stable
+    assert "git worktree add" not in stable
+    assert "during long subprocesses" not in stable
+    assert "kanban_attach" not in stable
+
+
+def test_worker_fallback_selects_contract_from_frozen_policy(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.delenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", raising=False
+    )
+
+    legacy = _make_agent(
+        valid_tool_names=["kanban_show", "terminal"],
+        _kanban_worker_guidance=None,
+        _kanban_short_task_handoff_enabled=False,
+    )
+    short = _make_agent(
+        valid_tool_names=["kanban_show", "read_file"],
+        _kanban_worker_guidance=None,
+        _kanban_short_task_handoff_enabled=True,
+    )
+
+    legacy_stable = _stable_prompt(legacy)
+    short_stable = _stable_prompt(short)
+
+    assert "Kanban task execution protocol" in legacy_stable
+    assert "deterministic file-only execution boundary" not in legacy_stable
+    assert "deterministic file-only execution boundary" in short_stable
+    assert "Kanban task execution protocol" not in short_stable
+
+
+def test_worker_fallback_prompt_fails_closed_for_malformed_policy(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", "{malformed"
+    )
+    agent = _make_agent(
+        valid_tool_names=["kanban_show", "read_file"],
+        _kanban_worker_guidance=None,
+        _kanban_short_task_handoff_enabled=False,
+    )
+
+    stable = _stable_prompt(agent)
+
+    assert "deterministic file-only execution boundary" in stable
+    assert "Kanban task execution protocol" not in stable
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):

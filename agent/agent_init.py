@@ -30,7 +30,6 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
-from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
@@ -58,6 +57,21 @@ from utils import base_url_host_matches, is_truthy_value
 # ``logger = logging.getLogger(__name__)``, which resolves to "run_agent"
 # from inside that module.)
 logger = logging.getLogger("run_agent")
+
+
+def ContextCompressor(*args, **kwargs):
+    """Lazy ordinary-session compressor constructor."""
+    from agent.context_compressor import ContextCompressor as _ContextCompressor
+
+    return _ContextCompressor(*args, **kwargs)
+
+
+def _managed_short_task_lane_claimed() -> bool:
+    """Recognize a managed worker without trusting a missing bootstrap mark."""
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    lane = (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip()
+    return bool(lane) or os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
 
 
 def _ra():
@@ -571,6 +585,24 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    _managed_short_task = _managed_short_task_lane_claimed()
+    _managed_bootstrap_verified = (
+        os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP") == "1"
+        and os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED") == "1"
+        and not os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR")
+    )
+    if _managed_short_task:
+        # The real CLI validates the dispatcher snapshot before reaching this
+        # constructor.  A direct caller that claims the lane without that mark
+        # is still restricted rather than downgraded.  No shared identity,
+        # memory, prefill, or caller-configured prompt enters this worker.
+        skip_context_files = True
+        skip_memory = True
+        load_soul_identity = False
+        ephemeral_system_prompt = None
+        prefill_messages = None
+        checkpoints_enabled = False
+
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
@@ -598,6 +630,8 @@ def init_agent(
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
+    agent._managed_short_task_bootstrap = _managed_short_task
+    agent._managed_short_task_bootstrap_verified = _managed_bootstrap_verified
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
@@ -724,7 +758,8 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if not _managed_short_task and \
+            (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -776,6 +811,13 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Accepted directions stay receipted until a later successful model
+    # response has actually consumed the injected marker. This closes the
+    # last-tool-result → hard-budget boundary where the text had left the
+    # pending slot but the model had no remaining turn to see it.
+    agent._pending_steer_receipts: list[dict] = []
+    agent._pending_steer_receipt_seq = 0
+    agent._pending_steer_inflight_receipt_ids: list[str] = []
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn
@@ -783,6 +825,24 @@ def init_agent(
     # the correction. The loop drains this slot at a role-safe boundary.
     agent._pending_redirect: Optional[str] = None
     agent._pending_redirect_lock = threading.Lock()
+
+    # Linearization state for the brief automatic-checkpoint boundary. User
+    # stop/redirect/steer calls take this one lock before touching their normal
+    # slots. Before commit they veto and are durably attached to the current
+    # task; after commit they are durably routed to the gated successor.
+    agent._auto_handoff_control_lock = threading.RLock()
+    agent._auto_handoff_control_phase = "idle"
+    agent._auto_handoff_control_source: Optional[str] = None
+    agent._auto_handoff_control_target: Optional[str] = None
+    agent._auto_handoff_control_events: list[dict] = []
+    agent._auto_handoff_control_seq = 0
+    agent._auto_handoff_control_route_failed: Optional[str] = None
+    agent._kanban_worker_terminal_transitioned = False
+    # A planned Kanban checkpoint is transport state, not a completed user
+    # session.  The finalizer arms this one-shot flag so process teardown can
+    # close providers without teaching external/shared memory from the
+    # provisional checkpoint transcript.
+    agent._suppress_session_end_learning = False
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker
@@ -891,7 +951,8 @@ def init_agent(
     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
     # (which creates a new AIAgent per message) won't duplicate handlers.
     from hermes_logging import setup_logging, setup_verbose_logging
-    setup_logging(hermes_home=_ra()._hermes_home)
+    if not _managed_short_task:
+        setup_logging(hermes_home=_ra()._hermes_home)
 
     if agent.verbose_logging:
         setup_verbose_logging()
@@ -1134,7 +1195,18 @@ def init_agent(
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
-            if base_url_host_matches(effective_base, "openrouter.ai"):
+            if _managed_short_task:
+                from agent.managed_short_task_runtime import (
+                    managed_main_model_headers,
+                )
+
+                _managed_headers = managed_main_model_headers(
+                    effective_base,
+                    api_key if isinstance(api_key, str) else "",
+                )
+                if _managed_headers:
+                    client_kwargs["default_headers"] = _managed_headers
+            elif base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
                 client_kwargs["default_headers"] = build_or_headers()
             elif base_url_host_matches(effective_base, "integrate.api.nvidia.com"):
@@ -1168,6 +1240,11 @@ def init_agent(
                     pass
         else:
             # No explicit creds — use the centralized provider router
+            if _managed_short_task:
+                raise RuntimeError(
+                    "Managed short-task startup requires pre-resolved main "
+                    "model credentials."
+                )
             from agent.auxiliary_client import resolve_provider_client
             _routed_client, _ = resolve_provider_client(
                 agent.provider or "auto", model=agent.model, raw_codex=True)
@@ -1406,14 +1483,40 @@ def init_agent(
 
     # Kanban worker/orchestrator lifecycle guidance is session-static:
     # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
+    # worker. Orchestrator chats can expose the same board tools, so tool
+    # membership is not an identity boundary; only the dispatcher-owned worker
+    # task environment selects worker guidance.
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    from agent.prompt_builder import (
+        KANBAN_GUIDANCE,
+        KANBAN_INDEPENDENT_REVIEW_GUIDANCE,
+        KANBAN_SHORT_TASK_WORKER_GUIDANCE,
     )
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        if _managed_short_task:
+            agent._kanban_worker_guidance = (
+                KANBAN_INDEPENDENT_REVIEW_GUIDANCE
+                if os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+                else KANBAN_SHORT_TASK_WORKER_GUIDANCE
+            )
+        else:
+            agent._kanban_worker_guidance = (
+                KANBAN_GUIDANCE
+                + "\n\n"
+                + KANBAN_INDEPENDENT_REVIEW_GUIDANCE
+                if os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+                else KANBAN_GUIDANCE
+            )
+    elif any(name.startswith("kanban_") for name in agent.valid_tool_names):
+        # Ordinary configured Kanban control sessions keep their historical
+        # orchestrator contract. Tool membership is sufficient only for this
+        # non-worker guidance; managed/legacy worker identity above remains
+        # dispatcher-owned.
+        agent._kanban_worker_guidance = KANBAN_GUIDANCE
+    else:
+        agent._kanban_worker_guidance = ""
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
@@ -1499,14 +1602,20 @@ def init_agent(
     # from the persisted string and is used only to place an early cache marker.
     agent._cached_system_prompt_static: Optional[str] = None
     
-    # Filesystem checkpoint manager (transparent — not a tool)
-    from tools.checkpoint_manager import CheckpointManager
-    agent._checkpoint_mgr = CheckpointManager(
-        enabled=checkpoints_enabled,
-        max_snapshots=checkpoint_max_snapshots,
-        max_total_size_mb=checkpoint_max_total_size_mb,
-        max_file_size_mb=checkpoint_max_file_size_mb,
-    )
+    # Managed workers must not import or instantiate the Git-backed manager.
+    if _managed_short_task:
+        from agent.managed_short_task_runtime import NullCheckpointManager
+
+        agent._checkpoint_mgr = NullCheckpointManager()
+    else:
+        from tools.checkpoint_manager import CheckpointManager
+
+        agent._checkpoint_mgr = CheckpointManager(
+            enabled=checkpoints_enabled,
+            max_snapshots=checkpoint_max_snapshots,
+            max_total_size_mb=checkpoint_max_total_size_mb,
+            max_file_size_mb=checkpoint_max_file_size_mb,
+        )
     
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
@@ -1543,11 +1652,105 @@ def init_agent(
     agent._todo_store = TodoStore()
     
     # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
+    if _managed_short_task:
+        # Provider credentials/runtime were already resolved by the CLI before
+        # AIAgent construction.  The rest of user config is behavioral input
+        # (memory, Hindsight/context engine, system prompt, prefill, skills,
+        # background helpers) and is intentionally absent in this lane.
         _agent_cfg = {}
+    else:
+        try:
+            from hermes_cli.config import load_config as _load_agent_config
+            _agent_cfg = _load_agent_config()
+        except Exception:
+            _agent_cfg = {}
+
+    # Resolve short-task continuation once per process.  Runtime config edits
+    # intentionally do not change an already-running worker or its cached
+    # system prompt; restart/new-worker is the explicit activation boundary.
+    try:
+        from agent.kanban_auto_handoff import (
+            AutoHandoffPolicy,
+            resolve_policy as _resolve_handoff_policy,
+        )
+
+        _handoff_task_id = os.environ.get("HERMES_KANBAN_TASK")
+        agent._kanban_auto_handoff_policy = _resolve_handoff_policy(
+            _agent_cfg,
+            max_iterations=agent.max_iterations,
+            task_id=_handoff_task_id,
+        )
+        if _handoff_task_id:
+            agent._kanban_short_task_handoff_enabled = (
+                agent._kanban_auto_handoff_policy.enabled
+            )
+            _gateway_scope_error = None
+        else:
+            # A process-wide opt-in is only the kill switch. Control-plane
+            # guidance is exposed to the exact authenticated Gateway origin
+            # named in allowed_origins; CLI/local and every mismatch retain
+            # the historical prompt and task behavior.
+            from agent.kanban_handoff_scope import decide_current_gateway_origin
+
+            _gateway_scope = decide_current_gateway_origin()
+            agent._kanban_short_task_handoff_enabled = bool(
+                _gateway_scope.get("authorized") is True
+            )
+            _gateway_scope_error = _gateway_scope.get("validation_error")
+        _handoff_error = (
+            agent._kanban_auto_handoff_policy.validation_error
+            if _handoff_task_id
+            else _gateway_scope_error
+        )
+        if _handoff_error:
+            logger.warning(
+                "kanban.short_task_handoff disabled: %s",
+                _handoff_error,
+            )
+        if _managed_short_task:
+            _short_task_safety_restricted = True
+        elif _handoff_task_id:
+            try:
+                from tools.terminal_tool import (
+                    _short_task_handoff_worker_enabled,
+                )
+
+                _short_task_safety_restricted = (
+                    _short_task_handoff_worker_enabled(invalid_is_enabled=True)
+                )
+            except Exception:
+                _short_task_safety_restricted = bool(
+                    os.environ.get(
+                        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"
+                    )
+                )
+        else:
+            _short_task_safety_restricted = False
+        if (
+            _handoff_task_id
+            and os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+        ):
+            if _managed_short_task:
+                from agent.prompt_builder import (
+                    KANBAN_INDEPENDENT_REVIEW_GUIDANCE,
+                )
+
+                agent._kanban_worker_guidance = (
+                    KANBAN_INDEPENDENT_REVIEW_GUIDANCE
+                )
+        elif _handoff_task_id and _short_task_safety_restricted:
+            from agent.prompt_builder import KANBAN_SHORT_TASK_WORKER_GUIDANCE
+
+            # Replace the legacy worker contract rather than appending a
+            # contradictory suffix. The legacy block legitimately documents
+            # Terminal, Git/worktree setup, long subprocesses, and delegation;
+            # none of those capabilities exists in a Phase-1 file-only worker.
+            agent._kanban_worker_guidance = KANBAN_SHORT_TASK_WORKER_GUIDANCE
+    except Exception:
+        from agent.kanban_auto_handoff import AutoHandoffPolicy
+
+        agent._kanban_auto_handoff_policy = AutoHandoffPolicy()
+        agent._kanban_short_task_handoff_enabled = False
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
@@ -1608,7 +1811,10 @@ def init_agent(
     # the memory tool dispatches with store=None and every call fails (#65429).
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
-    _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    _memory_toolset_requested = bool(
+        not _managed_short_task
+        and "memory" in (agent.enabled_toolsets or [])
+    )
     if not skip_memory or _memory_toolset_requested:
         try:
             mem_config = _agent_cfg.get("memory", {})
@@ -1735,7 +1941,11 @@ def init_agent(
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
+    agent._environment_probe = (
+        False
+        if _managed_short_task
+        else bool(_agent_section.get("environment_probe", True))
+    )
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
     # subprocess round-trips) and its result lands in the FIRST system
     # prompt build, which sits on the time-to-first-token critical path.
@@ -1797,35 +2007,33 @@ def init_agent(
         _compression_cfg.get("codex_gpt55_autoraise_notice", True)
     ).lower() in {"true", "1", "yes"}
     agent._compression_threshold_autoraised = None
-    try:
-        from agent.auxiliary_client import (
-            _compression_threshold_for_model as _cthresh_fn,
-            _is_codex_gpt54_or_gpt55 as _is_codex_gpt54_or_gpt55_fn,
-            _is_codex_spark as _is_codex_spark_fn,
-        )
-        _model_cthresh = _cthresh_fn(
-            agent.model,
-            agent.provider,
-            allow_codex_gpt55_autoraise=_codex_gpt55_autoraise,
-        )
-        # The Codex autoraises (gpt-5.4/5.5 272K family and gpt-5.3-codex-spark)
-        # apply only when they RAISE (never lower a user's higher global
-        # threshold). The notice is populated only when it actually fires, and
-        # carries the model slug so the banner names the right family. Arcee
-        # Trinity keeps its long-standing unconditional behaviour.
-        compression_threshold, agent._compression_threshold_autoraised = (
-            _resolve_compression_threshold(
-                compression_threshold,
-                _model_cthresh,
-                model=agent.model,
-                is_codex_autoraise=(
-                    _is_codex_gpt54_or_gpt55_fn(agent.model, agent.provider)
-                    or _is_codex_spark_fn(agent.model, agent.provider)
-                ),
+    if not _managed_short_task:
+        try:
+            from agent.auxiliary_client import (
+                _compression_threshold_for_model as _cthresh_fn,
+                _is_codex_gpt54_or_gpt55 as _is_codex_gpt54_or_gpt55_fn,
+                _is_codex_spark as _is_codex_spark_fn,
             )
-        )
-    except Exception:
-        pass
+            _model_cthresh = _cthresh_fn(
+                agent.model,
+                agent.provider,
+                allow_codex_gpt55_autoraise=_codex_gpt55_autoraise,
+            )
+            # Apply ordinary-session per-model compression policy only outside
+            # the bounded managed lane.
+            compression_threshold, agent._compression_threshold_autoraised = (
+                _resolve_compression_threshold(
+                    compression_threshold,
+                    _model_cthresh,
+                    model=agent.model,
+                    is_codex_autoraise=(
+                        _is_codex_gpt54_or_gpt55_fn(agent.model, agent.provider)
+                        or _is_codex_spark_fn(agent.model, agent.provider)
+                    ),
+                )
+            )
+        except Exception:
+            pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
@@ -2267,7 +2475,8 @@ def init_agent(
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
 
-    agent._ensure_lmstudio_runtime_loaded(_config_context_length)
+    if not _managed_short_task:
+        agent._ensure_lmstudio_runtime_loaded(_config_context_length)
 
 
 
@@ -2284,6 +2493,9 @@ def init_agent(
         _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
     except Exception:
         pass
+
+    if _managed_short_task:
+        _engine_name = "compressor"
 
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
@@ -2330,7 +2542,11 @@ def init_agent(
             )
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
-    if _selected_engine is not None:
+    if _managed_short_task:
+        from agent.managed_short_task_runtime import ManagedShortTaskContext
+
+        agent.context_compressor = ManagedShortTaskContext()
+    elif _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy: the host compression
         # threshold (including the Codex gpt-5.5 autoraise above) only
@@ -2392,12 +2608,14 @@ def init_agent(
             min_tail_user_messages=compression_min_tail_users,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
-    if callable(_bind_session_state):
+    if not _managed_short_task and callable(_bind_session_state):
         try:
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
-    agent.compression_enabled = compression_enabled
+    agent.compression_enabled = (
+        False if _managed_short_task else compression_enabled
+    )
     agent.compression_in_place = compression_in_place
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.max_compression_attempts = compression_max_attempts
@@ -2462,6 +2680,8 @@ def init_agent(
     # same local-model latency penalty.
     agent._context_engine_tool_names: set = set()
     if (
+        not _managed_short_task
+        and
         hasattr(agent, "context_compressor")
         and agent.context_compressor
         and agent.tools is not None
@@ -2497,8 +2717,27 @@ def init_agent(
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 
+    # Memory/context-engine providers can inject schemas after the registry
+    # snapshot was assembled. Reapply the managed-worker allowlist at the true
+    # final boundary so a plugin, alias, or future dynamic tool cannot reopen
+    # command execution, scheduling, or another detached side effect.
+    if agent.tools is not None:
+        from model_tools import restrict_short_task_worker_tool_definitions
+
+        agent.tools = restrict_short_task_worker_tool_definitions(agent.tools)
+        agent.valid_tool_names = {
+            tool["function"]["name"] for tool in agent.tools
+        }
+        agent._context_engine_tool_names.intersection_update(
+            agent.valid_tool_names
+        )
+
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not _managed_short_task
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,
@@ -2548,7 +2787,12 @@ def init_agent(
             agent._ollama_num_ctx = int(_ollama_num_ctx_override)
         except (TypeError, ValueError):
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
+    if (
+        not _managed_short_task
+        and agent._ollama_num_ctx is None
+        and agent.base_url
+        and is_local_endpoint(agent.base_url)
+    ):
         try:
             # ``agent.api_key`` may be a callable (Entra token provider).
             # Ollama detection makes a manual HTTP request and expects a

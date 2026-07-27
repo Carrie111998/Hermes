@@ -257,6 +257,104 @@ class TestBoardCRUD:
         assert res["action"] == "deleted"
         assert not d.exists()
 
+    def test_hard_delete_refuses_legacy_trusted_binding_without_creation_receipt(
+        self, fresh_home
+    ):
+        kb.create_board("legacy-controlled")
+        with kb.connect(board="legacy-controlled") as conn:
+            task_id = kb.create_task(conn, title="legacy", assignee="dev")
+            assert kb.add_control_binding(
+                conn,
+                binding_id="legacy-binding",
+                task_id=task_id,
+                platform="feishu",
+                scope_id="tenant",
+                chat_type="group",
+                chat_id="group",
+                user_id="user",
+                notifier_profile="default",
+                session_key="legacy-session",
+            )
+            assert conn.execute(
+                "SELECT COUNT(*) FROM kanban_control_creations"
+            ).fetchone()[0] == 0
+
+        with pytest.raises(ValueError, match="cannot be hard-deleted"):
+            kb.remove_board("legacy-controlled", archive=False)
+        assert kb.board_dir("legacy-controlled").exists()
+
+    @pytest.mark.parametrize("archive", [True, False])
+    def test_remove_refuses_active_run_until_it_is_closed(
+        self, fresh_home, archive
+    ):
+        kb.create_board("active")
+        board_path = kb.board_dir("active")
+        with kb.connect(board="active") as conn:
+            task_id = kb.create_task(conn, title="still working", assignee="dev")
+            claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+            assert claimed is not None
+
+        with pytest.raises(ValueError, match="active or draining worker"):
+            kb.remove_board("active", archive=archive)
+        assert board_path.exists()
+
+        with kb.connect(board="active") as conn:
+            assert kb.block_task(
+                conn,
+                task_id,
+                reason="closed before board removal",
+                kind="needs_input",
+                expected_run_id=claimed.current_run_id,
+            )
+        result = kb.remove_board("active", archive=archive)
+        assert result["action"] == ("archived" if archive else "deleted")
+
+    def test_remove_refuses_unreleased_exit_gate(self, fresh_home):
+        kb.create_board("draining")
+        with kb.connect(board="draining") as conn:
+            parent_id = kb.create_task(conn, title="parent", assignee="dev")
+            child_id = kb.create_task(conn, title="child", assignee="dev")
+            conn.execute(
+                "INSERT INTO task_exit_gates ("
+                "gate_id, gate_kind, parent_task_id, child_task_id, "
+                "parent_run_id, created_at, "
+                "owner_node_id, owner_boot_id, worker_pid, worker_start_token, "
+                "worker_pgid"
+                ") VALUES ('gate-test', 'successor', ?, ?, 1, 1, "
+                "'node', 'boot', 123, 'start', 123)",
+                (parent_id, child_id),
+            )
+
+        with pytest.raises(ValueError, match="active or draining worker"):
+            kb.remove_board("draining")
+        assert kb.board_dir("draining").exists()
+
+        with kb.connect(board="draining") as conn:
+            conn.execute(
+                "UPDATE task_exit_gates SET released_at = 2, "
+                "release_reason = 'test' WHERE released_at IS NULL"
+            )
+        assert kb.remove_board("draining")["action"] == "archived"
+
+    def test_remove_refuses_worker_still_behind_start_barrier(self, fresh_home):
+        kb.create_board("starting")
+        read_fd, release_fd = os.pipe()
+
+        class PendingProcess:
+            pid = 987654
+
+        kb._register_pending_worker_start(PendingProcess(), release_fd, "starting")
+        try:
+            with pytest.raises(ValueError, match="start barrier"):
+                kb.remove_board("starting")
+            assert kb.board_dir("starting").exists()
+        finally:
+            pending = kb._take_pending_worker_start(PendingProcess.pid)
+            if pending is not None:
+                os.close(pending[1])
+            os.close(read_fd)
+        assert kb.remove_board("starting")["action"] == "archived"
+
     def test_remove_default_forbidden(self, fresh_home):
         with pytest.raises(ValueError, match="default"):
             kb.remove_board("default")

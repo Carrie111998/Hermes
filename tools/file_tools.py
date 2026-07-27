@@ -26,6 +26,28 @@ logger = logging.getLogger(__name__)
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 
+def _managed_review_write_error() -> str | None:
+    """Reject edits from the exact managed independent-review lane.
+
+    Legacy review sessions do not carry ``HERMES_KANBAN_MANAGED_LANE`` and
+    keep their historical behaviour.  This guard lives inside the concrete
+    file handlers because schema filtering alone is not an authorization
+    boundary: stale transcripts and direct dispatcher calls can still name a
+    hidden tool.
+    """
+    if (
+        (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+        and os.environ.get("HERMES_KANBAN_MANAGED_LANE") == "review"
+    ):
+        return (
+            "当前是独立审查阶段，只能查看交付内容，不能直接修改。"
+            "如果发现问题，请把任务退回实现阶段；系统会让新的实现任务修正，"
+            "之后再由新的独立审查任务复核。"
+        )
+    return None
+
+
 def _expand_tilde(path: str) -> str:
     """Expand ``~`` using the effective profile home when available.
 
@@ -396,6 +418,107 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
         return p.resolve()
     resolved = _resolve_base_dir(task_id, container_paths=False) / p
     return resolved.resolve()
+
+
+def _short_task_workspace_path_error(
+    paths: list[str],
+    task_id: str = "default",
+    *,
+    search_globs: list[str] | None = None,
+) -> str | None:
+    """Confine managed Phase-1 file operations to the frozen workspace.
+
+    Ordinary and goal workers retain the historical absolute/traversal
+    behavior. An implementation worker with an enabled/malformed snapshot and
+    every independent reviewer are workspace-confined. ``Path.resolve(strict=False)`` resolves
+    every existing symlink ancestor while still normalizing a not-yet-created
+    target and its parents, so both direct and symlink/traversal escapes are
+    rejected before any file backend is reached.
+    """
+    try:
+        from tools.terminal_tool import _short_task_handoff_worker_enabled
+
+        restricted = (
+            os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+            or _short_task_handoff_worker_enabled(invalid_is_enabled=True)
+        )
+    except Exception:
+        restricted = bool(
+            (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            and (
+                os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+                or os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY")
+                or os.environ.get("HERMES_KANBAN_MANAGED_LANE")
+                == "implementation"
+            )
+        )
+    if not restricted:
+        return None
+
+    raw_workspace = (os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+    if not raw_workspace:
+        return (
+            "Automatic short-task file access is blocked because the "
+            "dispatcher workspace is missing."
+        )
+    try:
+        workspace = Path(_expand_tilde(raw_workspace))
+        if not workspace.is_absolute():
+            raise ValueError("workspace is not absolute")
+        workspace = workspace.resolve(strict=True)
+        if not workspace.is_dir():
+            raise ValueError("workspace is not a directory")
+    except (OSError, RuntimeError, ValueError):
+        return (
+            "Automatic short-task file access is blocked because the "
+            "dispatcher workspace cannot be verified."
+        )
+
+    # The shared-checkout guarantee is host-path based. A container/remote
+    # namespace cannot be proven to refer to the same real directory, so the
+    # safe Phase-1 behavior is to reject it instead of comparing unlike paths.
+    if _uses_container_paths(task_id):
+        return (
+            "Automatic short-task file access is blocked because this file "
+            "backend does not share the dispatcher's verified host workspace."
+        )
+
+    for raw_path in paths:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return "Automatic short-task file access requires a concrete path."
+        try:
+            resolved = Path(
+                _resolve_path_for_task(raw_path, task_id)
+            ).resolve(strict=False)
+            resolved.relative_to(workspace)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return (
+                f"Automatic short-task file access is limited to the assigned "
+                f"workspace; refused path {raw_path!r}."
+            )
+
+    # Search globs are filters, not path roots, but reject absolute/home and
+    # parent-traversal forms anyway so a future backend cannot reinterpret one
+    # as an out-of-workspace base. Directory-bearing in-workspace globs such as
+    # ``src/**/*.py`` remain valid.
+    for raw_glob in search_globs or []:
+        if raw_glob is None:
+            continue
+        if not isinstance(raw_glob, str):
+            return "Automatic short-task search requires a string glob."
+        normalized = raw_glob.replace("\\", "/")
+        pure = PurePosixPath(normalized)
+        if (
+            normalized.startswith("~")
+            or pure.is_absolute()
+            or any(part == ".." for part in pure.parts)
+            or (len(normalized) >= 2 and normalized[1] == ":")
+        ):
+            return (
+                "Automatic short-task search globs must remain relative to "
+                f"the assigned workspace; refused glob {raw_glob!r}."
+            )
+    return None
 
 
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
@@ -1109,6 +1232,10 @@ def clear_file_ops_cache(task_id: str = None):
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        workspace_error = _short_task_workspace_path_error([path], task_id)
+        if workspace_error:
+            return tool_error(workspace_error)
+
         offset, limit = normalize_read_pagination(offset, limit)
 
         # ── Device path guard ─────────────────────────────────────────
@@ -1580,6 +1707,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    review_error = _managed_review_write_error()
+    if review_error:
+        return tool_error(review_error)
+    workspace_error = _short_task_workspace_path_error([path], task_id)
+    if workspace_error:
+        return tool_error(workspace_error)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1662,6 +1795,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     targets under another profile's skills/plugins/cron/memories
     directory. Same shape as ``write_file``'s flag.
     """
+    review_error = _managed_review_write_error()
+    if review_error:
+        return tool_error(review_error)
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
@@ -1707,6 +1843,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _err:
                     return _err
                 _paths_to_check.append(v4a_path)
+    if _paths_to_check:
+        workspace_error = _short_task_workspace_path_error(
+            _paths_to_check, task_id
+        )
+        if workspace_error:
+            return tool_error(workspace_error)
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
@@ -1852,6 +1994,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
+        search_globs = [pattern] if target == "files" else [file_glob]
+        workspace_error = _short_task_workspace_path_error(
+            [path], task_id, search_globs=search_globs
+        )
+        if workspace_error:
+            return tool_error(workspace_error)
+
         offset, limit = normalize_search_pagination(offset, limit)
 
         # Track searches to detect *consecutive* repeated search loops.

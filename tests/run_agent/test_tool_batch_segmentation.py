@@ -116,6 +116,21 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["c1"]
 
+    @pytest.mark.parametrize("terminal_name", ["kanban_complete", "kanban_block"])
+    def test_kanban_terminal_tool_is_a_hard_barrier(self, terminal_name):
+        calls = [
+            _tc("web_search", call_id="before-1"),
+            _tc("web_search", call_id="before-2"),
+            _tc(terminal_name, call_id="terminal"),
+            _tc("web_search", call_id="after-1"),
+            _tc("web_search", call_id="after-2"),
+        ]
+
+        segments = _plan_tool_batch_segments(calls)
+
+        assert _kinds(segments) == ["parallel", "sequential", "parallel"]
+        assert [tc.id for tc in segments[1][1]] == ["terminal"]
+
     def test_malformed_args_call_is_a_barrier_not_a_batch_poison(self):
         calls = [
             _tc("web_search", call_id="r1"),
@@ -302,6 +317,157 @@ class TestSegmentedDispatchIntegration:
         t1_pos = executed.index("t1")
         assert {"s1", "s2"} == set(executed[:t1_pos])
         assert {"s3", "s4"} == set(executed[t1_pos + 1:])
+
+    @pytest.mark.parametrize("terminal_name", ["kanban_complete", "kanban_block"])
+    def test_successful_managed_kanban_terminal_skips_all_later_calls(
+        self, agent, monkeypatch, terminal_name
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_managed")
+        agent._managed_short_task_bootstrap_verified = True
+        calls = [
+            _tc("web_search", call_id="before-1"),
+            _tc("web_search", call_id="before-2"),
+            _tc(terminal_name, call_id="terminal"),
+            _tc("web_search", call_id="after-1"),
+            _tc("web_search", call_id="after-2"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+        lock = threading.Lock()
+
+        def fake_handle(name, args, task_id, **kwargs):
+            with lock:
+                executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert set(executed[:2]) == {"before-1", "before-2"}
+        assert executed[2:] == ["terminal"]
+        assert [m["tool_call_id"] for m in messages] == [
+            "before-1", "before-2", "terminal", "after-1", "after-2"
+        ]
+        assert all(
+            "skipped" in m["content"].lower() for m in messages[-2:]
+        )
+        assert agent._kanban_worker_terminal_transitioned is True
+
+    @pytest.mark.parametrize(
+        "terminal_result",
+        [json.dumps({"ok": False}), "done"],
+    )
+    def test_unproven_managed_kanban_terminal_does_not_stop_later_calls(
+        self, agent, monkeypatch, terminal_result
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_managed")
+        calls = [
+            _tc("kanban_complete", call_id="terminal"),
+            _tc("web_search", call_id="after-1"),
+            _tc("web_search", call_id="after-2"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            if name == "kanban_complete":
+                return terminal_result
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert executed == ["terminal", "after-1", "after-2"]
+        assert agent._kanban_worker_terminal_transitioned is False
+
+    @pytest.mark.parametrize(
+        "postprocessor",
+        ["persist", "content_transform"],
+    )
+    def test_committed_terminal_bypasses_fallible_result_postprocessing(
+        self, agent, monkeypatch, postprocessor
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_managed")
+        agent._managed_short_task_bootstrap_verified = True
+        calls = [
+            _tc("kanban_complete", call_id="terminal"),
+            _tc("terminal", '{"command":"must-not-run"}', call_id="after"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True})
+
+        if postprocessor == "persist":
+            monkeypatch.setattr(
+                "agent.tool_executor.maybe_persist_tool_result",
+                lambda **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("must be bypassed")
+                ),
+            )
+        else:
+            agent._tool_result_content_for_active_model = lambda *_args: (
+                (_ for _ in ()).throw(RuntimeError("must be bypassed"))
+            )
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert executed == ["terminal"]
+        assert agent._kanban_worker_terminal_transitioned is True
+        assert [m["tool_call_id"] for m in messages] == ["terminal", "after"]
+
+    def test_nonmanaged_terminal_acknowledgement_does_not_stop_batch(
+        self, agent, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        calls = [
+            _tc("kanban_complete", call_id="terminal"),
+            _tc("terminal", '{"command":"ordinary"}', call_id="after"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert executed == ["terminal", "after"]
+        assert agent._kanban_worker_terminal_transitioned is False
+
+    def test_successful_terminal_skips_later_call_in_same_sequential_segment(
+        self, agent, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_managed")
+        agent._managed_short_task_bootstrap_verified = True
+        calls = [
+            _tc("kanban_complete", call_id="terminal"),
+            _tc("terminal", '{"command":"must-not-run"}', call_id="after"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert executed == ["terminal"]
+        assert [m["tool_call_id"] for m in messages] == ["terminal", "after"]
+        assert "skipped" in messages[-1]["content"].lower()
 
     def test_homogeneous_safe_batch_still_uses_plain_concurrent_path(self, agent):
         calls = [_tc("web_search", '{"query":"a"}'), _tc("web_search", '{"query":"b"}')]

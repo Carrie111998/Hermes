@@ -18,7 +18,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agent.kanban_handoff_scope import decide_gateway_origin
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_control_guard import MANAGED_CONTROL_DENIED_MESSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +60,157 @@ def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     return TestClient(app)
+
+
+_MANAGED_STATUS_TARGETS = (
+    "ready",
+    "todo",
+    "triage",
+    "done",
+    "blocked",
+    "scheduled",
+    "archived",
+)
+
+
+_ORIGIN_IDENTITY = {
+    "platform": "feishu",
+    "scope_id": "tenant-1",
+    "chat_type": "group",
+    "chat_id": "group-1",
+    "thread_id": "",
+    "user_id": "user-1",
+    "notifier_profile": "default",
+    "session_key": "agent:default:feishu:group:group-1:user-1",
+}
+
+
+def _create_origin_bound_task(*, title: str = "origin-bound dashboard task") -> str:
+    workspace = Path(kb.kanban_home()).resolve(strict=True).parent
+    config = {
+        "agent": {"max_turns": 90},
+        "terminal": {"backend": "local"},
+        "kanban": {
+            "failure_limit": 2,
+            "short_task_handoff": {
+                "enabled": True,
+                "soft_iteration_limit": 4,
+                "max_handoffs": 1,
+                "allowed_workspace_roots": [str(workspace)],
+                "allowed_origins": [
+                    {
+                        "platform": "feishu",
+                        "chat_type": "group",
+                        "chat_id": "group-1",
+                        "user_id": "user-1",
+                    }
+                ],
+            },
+        },
+    }
+    decision = decide_gateway_origin(config, _ORIGIN_IDENTITY)
+    assert decision["authorized"] is True
+    with kb.connect_closing() as conn:
+        return kb.create_task(
+            conn,
+            title=title,
+            assignee="default",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            control_origin={
+                **_ORIGIN_IDENTITY,
+                "message_id": f"create:{title}",
+                "operation_slot": "slash",
+                "short_handoff_policy": decision["task_policy_json"],
+            },
+        )
+
+
+def _create_dashboard_running_task(*, managed: bool = True) -> tuple[str, int]:
+    """Create a realistic claimed run for Dashboard status-guard tests."""
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="dashboard managed worker", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="test-node:dashboard-worker")
+        assert claimed is not None
+        run_id = int(claimed.current_run_id)
+        worker_pid = 424242
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (worker_pid, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, owner_node_id = ?, "
+                "owner_boot_id = ?, worker_start_token = ?, worker_pgid = ?, "
+                "handoff_safety_required = ? WHERE id = ?",
+                (
+                    worker_pid,
+                    "test-node",
+                    "test-boot",
+                    "test-start-token",
+                    worker_pid,
+                    int(managed),
+                    run_id,
+                ),
+            )
+        return task_id, run_id
+    finally:
+        conn.close()
+
+
+def _park_dashboard_task_behind_exit_gate() -> tuple[str, int]:
+    """Represent a managed worker that has stopped logically, not physically."""
+    task_id, run_id = _create_dashboard_running_task(managed=True)
+    now = int(time.time())
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', current_run_id = NULL, "
+                "claim_expires = NULL WHERE id = ?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET status = 'reclaimed', "
+                "outcome = 'reclaimed', ended_at = ? WHERE id = ?",
+                (now, run_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_exit_gates (
+                    gate_id, gate_kind, child_task_id, parent_task_id,
+                    parent_run_id, owner_node_id, owner_boot_id, worker_pid,
+                    worker_start_token, worker_pgid, created_at
+                ) VALUES (?, 'control_drain', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"g_dashboard_{run_id}",
+                    task_id,
+                    task_id,
+                    run_id,
+                    "test-node",
+                    "test-boot",
+                    424242,
+                    "test-start-token",
+                    424242,
+                    now,
+                ),
+            )
+        return task_id, run_id
+    finally:
+        conn.close()
+
+
+def _bulk_status_payload(task_id: str, target: str) -> dict:
+    if target == "archived":
+        return {"ids": [task_id], "archive": True}
+    return {"ids": [task_id], "status": target}
+
+
+def _assert_managed_status_error(message: str) -> None:
+    assert "请先暂停任务" in message
+    assert "完全结束" in message
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +809,97 @@ def test_patch_status_running_rejected(client):
     assert statuses.get(t["id"]) != "running"
 
 
+@pytest.mark.parametrize("bulk", [False, True], ids=["single", "bulk"])
+@pytest.mark.parametrize("guard_state", ["active_run", "open_exit_gate"])
+@pytest.mark.parametrize("target", _MANAGED_STATUS_TARGETS)
+def test_dashboard_status_rejects_managed_worker_state(
+    client, target, guard_state, bulk,
+):
+    if guard_state == "active_run":
+        task_id, run_id = _create_dashboard_running_task(managed=True)
+    else:
+        task_id, run_id = _park_dashboard_task_behind_exit_gate()
+    conn = kb.connect()
+    try:
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    if bulk:
+        response = client.post(
+            "/api/plugins/kanban/tasks/bulk",
+            json=_bulk_status_payload(task_id, target),
+        )
+        assert response.status_code == 200
+        results = response.json()["results"]
+        assert len(results) == 1
+        assert results[0]["id"] == task_id
+        assert results[0]["ok"] is False
+        _assert_managed_status_error(results[0]["error"])
+    else:
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json={"status": target},
+        )
+        assert response.status_code == 409
+        _assert_managed_status_error(response.json()["detail"])
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        if guard_state == "active_run":
+            assert task.status == "running"
+            assert task.current_run_id == run_id
+            assert run.status == "running"
+            assert run.ended_at is None
+            assert run.outcome is None
+        else:
+            assert task.status == "todo"
+            assert task.current_run_id is None
+            assert run.status == "reclaimed"
+            assert run.ended_at is not None
+            gate = conn.execute(
+                "SELECT released_at FROM task_exit_gates WHERE parent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            assert gate["released_at"] is None
+        assert task.claim_lock
+        assert task.worker_pid == 424242
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)
+        ).fetchone()[0] == event_count
+    finally:
+        conn.close()
+
+
+def test_patch_status_preserves_legacy_running_behavior(client):
+    """Full identity alone does not opt a legacy run into Phase-1 rules."""
+    task_id, run_id = _create_dashboard_running_task(managed=False)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "ready"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"]["status"] == "ready"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert run.status == "reclaimed"
+        assert run.outcome == "reclaimed"
+        assert run.ended_at is not None
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
@@ -681,6 +925,89 @@ def test_delete_task_not_found(client):
     r = client.delete("/api/plugins/kanban/tasks/t_nonexistent")
     assert r.status_code == 404
     assert "not found" in r.json()["detail"]
+
+
+def test_origin_bound_task_is_readable_but_dashboard_cannot_edit_or_delete(client):
+    task_id = _create_origin_bound_task()
+
+    assert client.get(f"/api/plugins/kanban/tasks/{task_id}").status_code == 200
+    board = client.get("/api/plugins/kanban/board")
+    assert board.status_code == 200
+    assert any(
+        task["id"] == task_id
+        for column in board.json()["columns"]
+        for task in column["tasks"]
+    )
+
+    edited = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"title": "must not change"},
+    )
+    deleted = client.delete(f"/api/plugins/kanban/tasks/{task_id}")
+
+    assert edited.status_code == 403
+    assert edited.json()["detail"] == MANAGED_CONTROL_DENIED_MESSAGE
+    assert deleted.status_code == 403
+    assert deleted.json()["detail"] == MANAGED_CONTROL_DENIED_MESSAGE
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.title == "origin-bound dashboard task"
+
+
+def test_origin_bound_task_rejects_dashboard_comment_link_and_bulk_write(client):
+    task_id = _create_origin_bound_task()
+    ordinary = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "ordinary sibling"}
+    ).json()["task"]["id"]
+
+    comment = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/comments",
+        json={"body": "must not land"},
+    )
+    link = client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": task_id, "child_id": ordinary},
+    )
+    bulk = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_id], "priority": 99},
+    )
+
+    assert comment.status_code == 403
+    assert link.status_code == 403
+    assert bulk.status_code == 200
+    assert bulk.json()["results"] == [
+        {
+            "id": task_id,
+            "ok": False,
+            "error": MANAGED_CONTROL_DENIED_MESSAGE,
+        }
+    ]
+    with kb.connect_closing() as conn:
+        assert kb.list_comments(conn, task_id) == []
+        assert kb.get_task(conn, task_id).priority != 99
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (task_id, ordinary),
+        ).fetchone()[0] == 0
+
+
+def test_origin_bound_task_rejects_dashboard_attachment_but_keeps_list_readable(client):
+    task_id = _create_origin_bound_task()
+
+    uploaded = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("evidence.txt", b"must not land", "text/plain")},
+    )
+    listed = client.get(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments"
+    )
+
+    assert uploaded.status_code == 403
+    assert uploaded.json()["detail"] == MANAGED_CONTROL_DENIED_MESSAGE
+    assert listed.status_code == 200
+    assert listed.json() == {"attachments": []}
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +1089,80 @@ def test_dispatch_dry_run(client):
     body = r.json()
     # DispatchResult is serialized as a dataclass dict.
     assert isinstance(body, dict)
+
+
+def test_dashboard_dispatch_refuses_board_with_origin_bound_task(client):
+    _create_origin_bound_task()
+
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == MANAGED_CONTROL_DENIED_MESSAGE
+
+
+def test_completed_pilot_does_not_block_ordinary_dashboard_dispatch(
+    client, monkeypatch
+):
+    managed_id = _create_origin_bound_task(title="completed pilot")
+    with kb.connect_closing() as conn:
+        ordinary_id = kb.create_task(
+            conn,
+            title="ordinary follow-up",
+            assignee="default",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), managed_id),
+            )
+
+    plugin_module = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    called = {}
+
+    def fake_dispatch_once(_conn, **kwargs):
+        called.update(kwargs)
+        return plugin_module.kanban_db.DispatchResult(
+            spawned=[(ordinary_id, "default", "/tmp/ordinary-follow-up")]
+        )
+
+    monkeypatch.setattr(
+        plugin_module.kanban_db,
+        "dispatch_once",
+        fake_dispatch_once,
+    )
+
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true")
+
+    assert response.status_code == 200
+    assert called["dry_run"] is True
+    assert response.json()["spawned"][0][0] == ordinary_id
+
+
+@pytest.mark.parametrize(
+    ("configured_limit", "expected_limit"),
+    [(4, 4), (0, kb.DEFAULT_FAILURE_LIMIT), ("bad", kb.DEFAULT_FAILURE_LIMIT)],
+)
+def test_dispatch_uses_validated_configured_failure_limit(
+    client, monkeypatch, configured_limit, expected_limit
+):
+    plugin_module = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    plugin_kanban_db = plugin_module.kanban_db
+    captured = {}
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"failure_limit": configured_limit}},
+    )
+
+    def fake_dispatch_once(_conn, **kwargs):
+        captured.update(kwargs)
+        return plugin_kanban_db.DispatchResult()
+
+    monkeypatch.setattr(plugin_kanban_db, "dispatch_once", fake_dispatch_once)
+
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
+
+    assert response.status_code == 200
+    assert captured["failure_limit"] == expected_limit
 
 
 # ---------------------------------------------------------------------------
@@ -1192,6 +1593,38 @@ def test_bulk_status_running_rejected(client):
         for tt in col["tasks"]
     }
     assert statuses.get(t["id"]) != "running"
+
+
+def test_bulk_status_blocks_managed_task_without_aborting_legacy_sibling(client):
+    managed_id, managed_run_id = _create_dashboard_running_task(managed=True)
+    legacy_id, legacy_run_id = _create_dashboard_running_task(managed=False)
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [managed_id, legacy_id], "status": "ready"},
+    )
+
+    assert response.status_code == 200
+    results = {entry["id"]: entry for entry in response.json()["results"]}
+    assert results[managed_id]["ok"] is False
+    _assert_managed_status_error(results[managed_id]["error"])
+    assert results[legacy_id]["ok"] is True
+    conn = kb.connect()
+    try:
+        managed_task = kb.get_task(conn, managed_id)
+        managed_run = kb.get_run(conn, managed_run_id)
+        assert managed_task.status == "running"
+        assert managed_run.status == "running"
+        assert managed_run.ended_at is None
+
+        legacy_task = kb.get_task(conn, legacy_id)
+        legacy_run = kb.get_run(conn, legacy_run_id)
+        assert legacy_task.status == "ready"
+        assert legacy_run.status == "reclaimed"
+        assert legacy_run.outcome == "reclaimed"
+        assert legacy_run.ended_at is not None
+    finally:
+        conn.close()
 
 
 def test_dashboard_done_actions_prompt_for_completion_summary():

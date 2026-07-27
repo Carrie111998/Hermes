@@ -1547,21 +1547,6 @@ DEFAULT_CONFIG = {
                                       # Example: 1800 = compact after 30 min idle.
     },
 
-    # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
-    # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
-    # implementations. Per-platform notification opt-out is handled by the
-    # kanban dashboard (see ``hermes dashboard`` -> Notifications).
-    "kanban": {
-        # Auto-subscribe the originating gateway/TUI session to task
-        # completion + block events when ``kanban_create`` is called from
-        # inside a session that has a persistent delivery channel. The
-        # agent that dispatched the task will get notified automatically
-        # instead of having to poll. Disable to mirror pre-feature
-        # behaviour — e.g. for a profile that prefers explicit
-        # ``kanban_notify-subscribe`` calls per task.
-        "auto_subscribe_on_create": True,
-    },
-
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {
@@ -2898,6 +2883,33 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Auto-subscribe the originating gateway/TUI session to task
+        # completion + block events when ``kanban_create`` is called from
+        # inside a session that has a persistent delivery channel. The
+        # agent that dispatched the task will get notified automatically
+        # instead of having to poll. Disable to mirror pre-feature
+        # behaviour — e.g. for a profile that prefers explicit
+        # ``kanban_notify-subscribe`` calls per task.
+        "auto_subscribe_on_create": True,
+        # Fresh-worker continuation for long implementation tasks. Disabled by
+        # default so installing/updating Hermes never changes live sessions.
+        # When enabled, dispatcher-spawned Kanban workers checkpoint before the
+        # hard agent.max_turns ceiling and continue through one sequential child
+        # task in the same resolved workspace. Ordinary chat sessions are never
+        # affected.
+        "short_task_handoff": {
+            "enabled": False,
+            "soft_iteration_limit": 36,
+            "max_handoffs": 8,
+            # Exact canonical directories allowed for the first controlled
+            # pilot. Enabling the feature with an empty list fails closed.
+            "allowed_workspace_roots": [],
+            # Required exact Gateway-origin allowlist. The feature remains
+            # closed when this list is absent/empty or the current source does
+            # not match platform + chat type/id + user id. Optional fields
+            # narrow an entry further (for example one session or thread).
+            "allowed_origins": [],
+        },
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
@@ -7376,6 +7388,118 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
+class CurrentConfigReadError(RuntimeError):
+    """The current on-disk configuration could not be read safely.
+
+    Normal application startup deliberately retains a last-known-good config
+    after a transient edit error. Safety-critical live policy checks need the
+    opposite contract: uncertainty about the file that is authoritative *now*
+    must be visible to the caller so it can fail closed.
+    """
+
+
+def _prepare_user_config_for_merge(user_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply pre-default compatibility aliases to one parsed user mapping."""
+    prepared = copy.deepcopy(user_config)
+    # This promotion must happen before DEFAULT_CONFIG is merged. The default
+    # already contains agent.max_turns, so normalizing the legacy root key only
+    # afterwards would incorrectly let the default win over the user's value.
+    if "max_turns" in prepared:
+        agent_user_config = dict(prepared.get("agent") or {})
+        if agent_user_config.get("max_turns") is None:
+            agent_user_config["max_turns"] = prepared["max_turns"]
+        prepared["agent"] = agent_user_config
+        prepared.pop("max_turns", None)
+    return prepared
+
+
+def _compose_effective_config_parts(
+    user_config: Dict[str, Any],
+    managed_config: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build the effective config from already-parsed current mappings.
+
+    Both the ordinary cached/LKG loader and the strict live-policy loader use
+    this pure composer so defaults, compatibility normalization, environment
+    expansion, and managed-scope precedence cannot drift apart.
+    """
+    prepared_user = _prepare_user_config_for_merge(user_config)
+    config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), prepared_user)
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    expanded = _expand_env_vars(normalized)
+    if managed_config:
+        managed_expanded = _expand_env_vars(managed_config)
+        expanded = _deep_merge(expanded, managed_expanded)
+    return expanded, normalized
+
+
+def _compose_effective_config(
+    user_config: Dict[str, Any],
+    managed_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return only the effective mapping from the shared pure composer."""
+    expanded, _normalized_user = _compose_effective_config_parts(
+        user_config,
+        managed_config,
+    )
+    return expanded
+
+
+def _read_current_mapping_strict(
+    path: Path,
+    *,
+    label: str,
+    parser,
+) -> Dict[str, Any]:
+    """Read one YAML mapping without cache, fallback, backup, or mutation."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            parsed = parser(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        raise CurrentConfigReadError(
+            f"current {label} config could not be read: {path}"
+        ) from exc
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise CurrentConfigReadError(
+            f"current {label} config root must be a mapping: {path}"
+        )
+    return parsed
+
+
+def load_config_current_strict() -> Dict[str, Any]:
+    """Read and compose the files authoritative at this exact moment.
+
+    This path is for live safety toggles. It intentionally bypasses all config
+    caches and last-known-good state, never creates Hermes directories or a
+    corrupt-file backup, and never persists an in-memory migration. Missing
+    files mean defaults; an existing unreadable/malformed/non-mapping user or
+    managed file raises :class:`CurrentConfigReadError` so the caller can stop.
+    """
+    with _CONFIG_LOCK:
+        user_config = _read_current_mapping_strict(
+            get_config_path(),
+            label="user",
+            parser=lambda f: fast_safe_load(f),
+        )
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+        managed_config = (
+            _read_current_mapping_strict(
+                managed_dir / "config.yaml",
+                label="managed",
+                parser=lambda f: yaml.safe_load(f),
+            )
+            if managed_dir is not None
+            else {}
+        )
+        return _compose_effective_config(user_config, managed_config)
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
@@ -7583,21 +7707,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
-        config = copy.deepcopy(DEFAULT_CONFIG)
-
+        user_config: Dict[str, Any] = {}
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = fast_safe_load(f) or {}
-
-                if "max_turns" in user_config:
-                    agent_user_config = dict(user_config.get("agent") or {})
-                    if agent_user_config.get("max_turns") is None:
-                        agent_user_config["max_turns"] = user_config["max_turns"]
-                    user_config["agent"] = agent_user_config
-                    user_config.pop("max_turns", None)
-
-                config = _deep_merge(config, user_config)
+                if not isinstance(user_config, dict):
+                    raise TypeError("config root must be a mapping")
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
@@ -7639,17 +7755,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
-        if managed_config:
-            managed_expanded = _expand_env_vars(managed_config)
-            expanded = _deep_merge(expanded, managed_expanded)
+        expanded, normalized = _compose_effective_config_parts(
+            user_config,
+            managed_config,
+        )
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``

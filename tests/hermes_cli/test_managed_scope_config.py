@@ -95,3 +95,77 @@ def test_user_cannot_shadow_managed_literal_via_envref(homes, monkeypatch):
     _write(home / "config.yaml", "model:\n  default: ${EVIL}\n")
     _write(managed / "config.yaml", "model:\n  default: managed/locked\n")
     assert cfg_get(load_config(), "model", "default") == "managed/locked"
+
+
+def test_strict_current_honors_managed_handoff_enable_without_user_value(homes):
+    from hermes_cli.config import load_config_current_strict
+
+    _home, managed = homes
+    _write(
+        managed / "config.yaml",
+        """
+        kanban:
+          short_task_handoff:
+            enabled: true
+            soft_iteration_limit: 12
+            max_handoffs: 2
+        """,
+    )
+
+    policy = load_config_current_strict()["kanban"]["short_task_handoff"]
+    assert policy == {
+        "enabled": True,
+        "soft_iteration_limit": 12,
+        "max_handoffs": 2,
+        "allowed_workspace_roots": [],
+        "allowed_origins": [],
+    }
+
+
+def test_strict_current_managed_disable_wins_over_user_enable(homes):
+    from hermes_cli.config import load_config_current_strict
+
+    home, managed = homes
+    _write(
+        home / "config.yaml",
+        """
+        kanban:
+          short_task_handoff:
+            enabled: true
+            soft_iteration_limit: 10
+        """,
+    )
+    _write(
+        managed / "config.yaml",
+        """
+        kanban:
+          short_task_handoff:
+            enabled: false
+        """,
+    )
+
+    policy = load_config_current_strict()["kanban"]["short_task_handoff"]
+    assert policy["enabled"] is False
+    assert policy["soft_iteration_limit"] == 10
+
+
+def test_strict_current_rejects_malformed_managed_config_without_writes(homes):
+    from hermes_cli.config import CurrentConfigReadError, load_config_current_strict
+
+    home, managed = homes
+    _write(
+        home / "config.yaml",
+        "kanban:\n  short_task_handoff:\n    enabled: true\n",
+    )
+    managed_path = managed / "config.yaml"
+    _write(managed_path, "kanban: [unclosed\n")
+    before_user = (home / "config.yaml").read_bytes()
+    before_managed = managed_path.read_bytes()
+
+    with pytest.raises(CurrentConfigReadError):
+        load_config_current_strict()
+
+    assert (home / "config.yaml").read_bytes() == before_user
+    assert managed_path.read_bytes() == before_managed
+    assert list(home.glob("*.bak")) == []
+    assert list(managed.glob("*.bak")) == []

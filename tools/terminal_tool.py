@@ -45,9 +45,106 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from agent.managed_short_task import verified_managed_short_task_lane
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _short_task_handoff_worker_enabled(*, invalid_is_enabled: bool = False) -> bool:
+    """Resolve worker safety mode, optionally treating invalid snapshots as enabled."""
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    managed_implementation = (
+        os.environ.get("HERMES_KANBAN_MANAGED_LANE") == "implementation"
+    )
+    raw = os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY")
+    if not raw:
+        # The dispatcher records this lane only for a durably bound trusted
+        # task. Losing the JSON snapshot must fail closed, not silently restore
+        # the ordinary tool surface.
+        return bool(invalid_is_enabled and managed_implementation)
+    try:
+        snapshot = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return bool(invalid_is_enabled)
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != 2:
+        return bool(invalid_is_enabled)
+    # A dispatcher may deliberately launch an unrelated/legacy task with the
+    # same complete snapshot but ``enabled=false``. That explicit scope result
+    # must preserve ordinary Terminal behavior even when Phase 1 is globally
+    # configured for a different trusted task.
+    if snapshot.get("enabled") is False:
+        return False
+    if snapshot.get("enabled") is not True:
+        return bool(invalid_is_enabled)
+    valid_positive_ints = all(
+        isinstance(snapshot.get(key), int)
+        and not isinstance(snapshot.get(key), bool)
+        and int(snapshot[key]) > 0
+        for key in (
+            "soft_iteration_limit",
+            "max_handoffs",
+            "max_iterations",
+            "failure_limit",
+        )
+    )
+    valid_shape = bool(
+        valid_positive_ints
+        and int(snapshot["soft_iteration_limit"])
+        < int(snapshot["max_iterations"])
+        and not snapshot.get("validation_error")
+    )
+    return True if valid_shape else bool(invalid_is_enabled)
+
+
+def _short_task_managed_worker_active() -> bool:
+    """Fail closed for either managed implementation or review lane."""
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    lane = (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip()
+    if lane in {"implementation", "review"}:
+        return True
+    return _short_task_handoff_worker_enabled(invalid_is_enabled=True)
+
+
+def _short_task_detach_guard(
+    command: str,
+    *,
+    background: bool,
+    cwd: Optional[str] = None,
+    pty: bool = False,
+    notify_on_complete: bool = False,
+    watch_patterns: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Keep Phase-1 shared-checkout workers from creating any subprocess.
+
+    A shell command allowlist is not a containment boundary: PATH aliases,
+    shell startup files, test plugins, Git hooks, and project configuration can
+    all execute code that was not visible in the original command string. The
+    first rollout therefore disables Terminal entirely for a managed handoff
+    worker. Ordinary Hermes sessions retain the existing Terminal behavior.
+    """
+    review_mode = bool(
+        (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip() == "review"
+        and verified_managed_short_task_lane()
+    )
+    if review_mode:
+        return (
+            "Managed independent review cannot use Terminal in Phase 1 until "
+            "an OS-isolated verifier is available. Use only the bounded file "
+            "and Kanban lifecycle tools exposed for this review."
+        )
+    if not _short_task_managed_worker_active():
+        return None
+    return (
+        "Automatic short-task handoff cannot safely continue with Terminal "
+        "in Phase 1. "
+        "Shell startup files, PATH overrides, test plugins, and Git hooks can "
+        "create processes that outlive this worker. Use the file tools for this "
+        "bounded task, or move command execution into a separate non-handoff "
+        "task/workspace until the isolated verifier is available."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2152,6 +2249,29 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        # This is a direct runtime authorization boundary, not merely a schema
+        # hint.  Reject managed implementation/review commands before loading
+        # a backend configuration, resolving a container, or touching any
+        # execution machinery.
+        detach_error = _short_task_detach_guard(
+            command,
+            background=background,
+            cwd=workdir,
+            pty=pty,
+            notify_on_complete=notify_on_complete,
+            watch_patterns=watch_patterns,
+        )
+        if detach_error:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": detach_error,
+                    "status": "blocked",
+                },
+                ensure_ascii=False,
+            )
 
         # Get configuration
         config = _get_env_config()

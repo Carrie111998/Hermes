@@ -47,6 +47,18 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _verified_managed_short_task_cli() -> bool:
+    """Return whether the real CLI attested this managed worker launch."""
+    return bool(
+        os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP") == "1"
+        and os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED") == "1"
+        and not os.environ.get("HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR")
+        and (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip()
+        in {"implementation", "review"}
+    )
+
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
@@ -791,11 +803,12 @@ CLI_CONFIG = load_cli_config()
 
 # Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
 # This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
-try:
-    from hermes_logging import setup_logging
-    setup_logging(mode="cli")
-except Exception:
-    pass  # Logging setup is best-effort — don't crash the CLI
+if not _verified_managed_short_task_cli():
+    try:
+        from hermes_logging import setup_logging
+        setup_logging(mode="cli")
+    except Exception:
+        pass  # Logging setup is best-effort — don't crash the CLI
 
 # Validate config structure early — print warnings before user hits cryptic errors
 try:
@@ -1050,6 +1063,56 @@ def _prepare_deferred_agent_startup() -> None:
             exc_info=True,
         )
 
+def _kanban_watchdog_safe_to_hard_exit() -> bool:
+    """Persist a veto before a watchdog can erase live child-process proof."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    unsafe_reasons: list[str] = []
+    try:
+        from tools.environments.base import (
+            cleanup_registered_short_task_foreground_processes,
+            mark_short_task_process_cleanup_unsafe,
+            wait_for_short_task_foreground_cleanup,
+        )
+
+        cleanup_errors = cleanup_registered_short_task_foreground_processes()
+        if cleanup_errors:
+            unsafe_reasons.append(
+                "exit watchdog could not clean foreground process groups: "
+                + "; ".join(cleanup_errors)
+            )
+        elif not wait_for_short_task_foreground_cleanup(0):
+            unsafe_reasons.append(
+                "exit watchdog fired while foreground process cleanup was pending"
+            )
+    except Exception:
+        unsafe_reasons.append(
+            "exit watchdog could not inspect foreground process cleanup"
+        )
+        mark_short_task_process_cleanup_unsafe = None
+    try:
+        from tools.process_registry import process_registry
+
+        if process_registry.has_any_active():
+            unsafe_reasons.append(
+                "exit watchdog found an active background process"
+            )
+    except Exception:
+        unsafe_reasons.append(
+            "exit watchdog could not inspect background processes"
+        )
+    if unsafe_reasons:
+        reason = "; ".join(unsafe_reasons)
+        if mark_short_task_process_cleanup_unsafe is not None:
+            try:
+                mark_short_task_process_cleanup_unsafe(reason)
+            except Exception:
+                os.environ["HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"] = reason
+        else:
+            os.environ["HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"] = reason
+    return _kanban_cleanup_safe_to_hard_exit()
+
+
 def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
     """Guarantee the process actually exits once shutdown has begun.
 
@@ -1086,6 +1149,27 @@ def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
 
     def _watchdog():
         time.sleep(timeout_s)
+        if (
+            not _kanban_watchdog_safe_to_hard_exit()
+            or not _kanban_try_commit_hard_exit()
+        ):
+            if os.environ.get("HERMES_KANBAN_HANDOFF_CONTROL_PENDING") == "1":
+                logger.error(
+                    "Exit watchdog suppressed: an exact user Stop/redirect/steer "
+                    "receipt is still awaiting durable confirmation; the worker "
+                    "and its exit gate remain alive"
+                )
+            else:
+                # A separate foreground process group may still own the checkout,
+                # while the DB veto could not be saved.  Hard-exiting the worker
+                # would let its dispatcher gate release.  Staying alive is the
+                # deliberate fail-closed state until persistence recovers or an
+                # operator handles both process groups.
+                logger.error(
+                    "Exit watchdog suppressed: unsafe Kanban subprocess cleanup "
+                    "has no durable marker"
+                )
+            return
         # Still alive — cleanup or interpreter teardown is wedged.
         try:
             logger.warning(
@@ -1116,6 +1200,40 @@ def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
 
 
 _signal_watchdog_armed = False
+
+
+def _kanban_cleanup_safe_to_hard_exit() -> bool:
+    """Return whether a worker may disappear without losing its safety veto."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    reason = os.environ.get("HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE")
+    if not reason:
+        return True
+    if os.environ.get("HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE_DURABLE") == "1":
+        return True
+    try:
+        from tools.environments.base import (
+            mark_short_task_process_cleanup_unsafe,
+        )
+
+        return bool(mark_short_task_process_cleanup_unsafe(reason))
+    except Exception:
+        return False
+
+
+def _kanban_try_commit_hard_exit() -> bool:
+    """Atomically fence new durable controls before a managed hard exit."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    try:
+        from agent.kanban_auto_handoff import (
+            try_commit_handoff_control_hard_exit,
+        )
+
+        return bool(try_commit_handoff_control_hard_exit())
+    except Exception:
+        # Import/registry uncertainty is not permission to erase a receipt.
+        return False
 
 
 def _arm_exit_watchdog_on_shutdown_signal() -> None:
@@ -1159,6 +1277,142 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
         pass  # never let the backstop break signal handling
 
 
+def _managed_hard_exit_after_signal(
+    *,
+    cleanup_safe_fn=None,
+    commit_exit_fn=None,
+    sleep_fn=None,
+    hard_exit_fn=None,
+) -> None:
+    """Wait for both durable safety fences, then end a managed worker.
+
+    The injectable callables keep the safety ordering behavior-testable without
+    reading or executing source text. Production callers use the real cleanup,
+    receipt, sleep, and hard-exit functions.
+    """
+    cleanup_safe = cleanup_safe_fn or _kanban_cleanup_safe_to_hard_exit
+    commit_exit = commit_exit_fn or _kanban_try_commit_hard_exit
+    wait = sleep_fn or time.sleep
+    hard_exit = hard_exit_fn or os._exit
+    while True:
+        if cleanup_safe() and commit_exit():
+            break
+        try:
+            logger.error(
+                "Kanban worker hard exit remains fenced while an exact user "
+                "receipt or cleanup veto is unconfirmed"
+            )
+        except Exception:
+            pass
+        wait(1.0)
+    try:
+        import logging as _lg
+
+        _lg.shutdown()
+    except Exception:
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    hard_exit(0)
+
+
+def _handle_single_query_shutdown_signal(
+    cli_instance,
+    signum,
+    *,
+    thread_factory=None,
+) -> None:
+    """Perform the real single-query signal cleanup and begin safe exit.
+
+    This module-level helper is deliberately callable from behavior tests. The
+    registered signal handler below remains tiny and delegates here, so tests
+    no longer need source/AST extraction to exercise the production path.
+    """
+    logger.debug("Received signal %s in single-query mode", signum)
+    _arm_exit_watchdog_on_shutdown_signal()
+    kanban_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    try:
+        agent = getattr(cli_instance, "agent", None)
+        if agent is not None:
+            agent.interrupt(f"received signal {signum}", system_signal=True)
+    except Exception:
+        pass
+
+    if kanban_worker:
+        process_registry = None
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.kill_all()
+        except Exception:
+            logger.exception("Failed to clean Kanban worker background processes")
+
+        try:
+            cleanup_grace = float(
+                os.getenv("HERMES_KANBAN_FOREGROUND_CLEANUP_GRACE", "2.25")
+            )
+        except (TypeError, ValueError):
+            cleanup_grace = 2.25
+        cleanup_grace = max(0.0, min(cleanup_grace, 2.5))
+        try:
+            from tools.environments.base import (
+                cleanup_registered_short_task_foreground_processes,
+                mark_short_task_process_cleanup_unsafe,
+                wait_for_short_task_foreground_cleanup,
+            )
+
+            foreground_errors = (
+                cleanup_registered_short_task_foreground_processes()
+            )
+            if foreground_errors:
+                mark_short_task_process_cleanup_unsafe(
+                    "worker shutdown could not prove foreground "
+                    "process-group cleanup: " + "; ".join(foreground_errors)
+                )
+            elif not wait_for_short_task_foreground_cleanup(cleanup_grace):
+                mark_short_task_process_cleanup_unsafe(
+                    "worker shutdown timed out before foreground "
+                    "process-group cleanup was proven"
+                )
+            try:
+                if process_registry is None:
+                    raise RuntimeError("background process registry unavailable")
+                process_registry.kill_all()
+                if process_registry.has_any_active():
+                    mark_short_task_process_cleanup_unsafe(
+                        "background process registry was not empty at "
+                        "worker shutdown"
+                    )
+            except Exception:
+                mark_short_task_process_cleanup_unsafe(
+                    "background process cleanup failed during worker shutdown"
+                )
+        except Exception:
+            os.environ["HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"] = (
+                "worker shutdown could not verify subprocess cleanup"
+            )
+            logger.exception("Failed to verify Kanban subprocess cleanup")
+    else:
+        try:
+            grace = float(os.getenv("HERMES_SIGTERM_GRACE", "1.5"))
+        except (TypeError, ValueError):
+            grace = 1.5
+        if grace > 0:
+            time.sleep(grace)
+
+    if kanban_worker:
+        factory = thread_factory or threading.Thread
+        factory(
+            target=_managed_hard_exit_after_signal,
+            daemon=True,
+            name="kanban-signal-hard-exit",
+        ).start()
+    raise KeyboardInterrupt()
+
+
 def _run_cleanup(*, notify_session_finalize: bool = True):
     """Run resource cleanup exactly once."""
     global _cleanup_done
@@ -1177,35 +1431,89 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     # can't skip the reset (#36823). No-op unless the TUI actually ran.
     _reset_terminal_input_modes_on_exit()
 
-    try:
-        _cleanup_all_terminals()
-    except Exception:
-        pass
-    try:
-        from tools.async_delegation import interrupt_all as _interrupt_async_delegations
-        _interrupt_async_delegations(reason="CLI shutdown")
-    except Exception:
-        pass
-    try:
-        _cleanup_all_browsers()
-    except Exception:
-        pass
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except BaseException:
-        pass
+    # Normal one-shot completion must provide the same subprocess proof as the
+    # signal path. A reviewer can legitimately run foreground tests, while a
+    # stale/direct call from an older transcript may have created a registered
+    # background process. Drain both registries before its managed exit gate is
+    # allowed to release.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        _managed_cleanup_errors: list[str] = []
+        try:
+            from tools.environments.base import (
+                cleanup_registered_short_task_foreground_processes,
+                mark_short_task_process_cleanup_unsafe,
+                wait_for_short_task_foreground_cleanup,
+            )
+
+            _managed_cleanup_errors.extend(
+                cleanup_registered_short_task_foreground_processes()
+            )
+            if not wait_for_short_task_foreground_cleanup(0):
+                _managed_cleanup_errors.append(
+                    "foreground process cleanup remained active at normal shutdown"
+                )
+        except Exception as _foreground_exc:
+            _managed_cleanup_errors.append(
+                f"foreground process cleanup could not be inspected: {_foreground_exc}"
+            )
+            mark_short_task_process_cleanup_unsafe = None
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.kill_all()
+            if process_registry.has_any_active():
+                _managed_cleanup_errors.append(
+                    "background process registry remained active at normal shutdown"
+                )
+        except Exception as _background_exc:
+            _managed_cleanup_errors.append(
+                f"background process cleanup failed at normal shutdown: {_background_exc}"
+            )
+        if _managed_cleanup_errors:
+            _managed_reason = "; ".join(_managed_cleanup_errors)
+            if mark_short_task_process_cleanup_unsafe is not None:
+                try:
+                    mark_short_task_process_cleanup_unsafe(_managed_reason)
+                except Exception:
+                    os.environ["HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"] = (
+                        _managed_reason
+                    )
+            else:
+                os.environ["HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE"] = (
+                    _managed_reason
+                )
+
+    if not _verified_managed_short_task_cli():
+        try:
+            _cleanup_all_terminals()
+        except Exception:
+            pass
+        try:
+            from tools.async_delegation import interrupt_all as _interrupt_async_delegations
+            _interrupt_async_delegations(reason="CLI shutdown")
+        except Exception:
+            pass
+        try:
+            _cleanup_all_browsers()
+        except Exception:
+            pass
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except BaseException:
+            pass
     # Close cached auxiliary LLM clients (sync + async) so that
     # AsyncHttpxClientWrapper.__del__ doesn't fire on a closed event loop
     # and trigger prompt_toolkit's "Press ENTER to continue..." handler.
-    try:
-        from agent.auxiliary_client import shutdown_cached_clients
-        shutdown_cached_clients()
-    except Exception:
-        pass
+    if not _verified_managed_short_task_cli():
+        try:
+            from agent.auxiliary_client import shutdown_cached_clients
+            shutdown_cached_clients()
+        except Exception:
+            pass
     # Shut down memory provider (on_session_end + shutdown_all) at actual
     # session boundary — NOT per-turn inside run_conversation().
-    if notify_session_finalize:
+    if notify_session_finalize and not _verified_managed_short_task_cli():
         cleanup_session_id = _active_agent_ref.session_id if _active_agent_ref else None
         if _should_emit_cleanup_session_finalize(cleanup_session_id):
             _notify_session_finalize(
@@ -4133,7 +4441,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         cp_cfg = CLI_CONFIG.get("checkpoints", {})
         if isinstance(cp_cfg, bool):
             cp_cfg = {"enabled": cp_cfg}
-        self.checkpoints_enabled = checkpoints or cp_cfg.get("enabled", False)
+        self.checkpoints_enabled = bool(
+            not _verified_managed_short_task_cli()
+            and (checkpoints or cp_cfg.get("enabled", False))
+        )
         self.checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 20)
         self.checkpoint_max_total_size_mb = cp_cfg.get("max_total_size_mb", 500)
         self.checkpoint_max_file_size_mb = cp_cfg.get("max_file_size_mb", 10)
@@ -4152,8 +4463,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.personalities = CLI_CONFIG["agent"].get("personalities", {})
         
         # Ephemeral prefill messages (few-shot priming, never persisted)
-        self.prefill_messages = _load_prefill_messages(
-            _resolve_prefill_messages_file(CLI_CONFIG)
+        self.prefill_messages = (
+            None
+            if _verified_managed_short_task_cli()
+            else _load_prefill_messages(_resolve_prefill_messages_file(CLI_CONFIG))
         )
         
         # Reasoning config (OpenRouter reasoning effort level)
@@ -4250,12 +4563,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # min_interval_hours, tracked via state_meta in state.db itself so
         # it's shared across all Hermes processes for this HERMES_HOME.
         # Never blocks startup on failure.
-        _run_state_db_auto_maintenance(self._session_db)
+        if not _verified_managed_short_task_cli():
+            _run_state_db_auto_maintenance(self._session_db)
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
-        _run_checkpoint_auto_maintenance()
+        if not _verified_managed_short_task_cli():
+            _run_checkpoint_auto_maintenance()
 
         # Deferred title: stored in memory until the session is created in the DB
         self._pending_title: Optional[str] = None
@@ -12767,7 +13082,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             response = result.get("final_response", "") if result else ""
 
             # Auto-generate session title after first exchange (non-blocking)
-            if response and result and not result.get("failed") and not result.get("partial"):
+            if (
+                response
+                and result
+                and not result.get("failed")
+                and not result.get("partial")
+                and not _verified_managed_short_task_cli()
+            ):
                 try:
                     from agent.title_generator import maybe_auto_title
                     # Route title-generation failures through the agent's
@@ -13000,6 +13321,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 else:
                     print(f"\n⚡ Sending after interrupt: '{preview}'")
                 self._pending_input.put(combined)
+
+            # A checkpoint/budget finalizer returns a structured control receipt
+            # when its own bounded DB attempts fail. Replay that exact id before
+            # the CLI process can exit; never degrade Stop into ordinary text.
+            if result and result.get("pending_handoff_control"):
+                try:
+                    from agent.kanban_auto_handoff import (
+                        recover_pending_handoff_control,
+                    )
+
+                    _control_recovery = recover_pending_handoff_control(
+                        result,
+                        attempts=2,
+                    )
+                    if (
+                        _control_recovery
+                        and _control_recovery.get("status")
+                        not in {"recorded", "already_recorded"}
+                    ):
+                        print(
+                            "\n⚠ User direction could not be saved after bounded "
+                            "retries; the task remains stopped for review."
+                        )
+                except Exception:
+                    logger.exception(
+                        "CLI deferred handoff-control recovery failed"
+                    )
 
             # If a /steer was left over (agent finished before another tool
             # batch could absorb it), deliver it as the next user turn.
@@ -13578,16 +13926,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # if the schedule says we're due.  Runs in a daemon thread so it
         # never blocks the interactive loop.  Best-effort; any failure is
         # swallowed to avoid breaking session startup.
-        try:
-            from agent.curator import maybe_run_curator
-            maybe_run_curator(
-                idle_for_seconds=float("inf"),  # CLI startup = fully idle
-                on_summary=lambda msg: self._console_print(
-                    f"[dim #6b7684]💾 {msg}[/]"
-                ),
-            )
-        except Exception:
-            pass
+        if not _verified_managed_short_task_cli():
+            try:
+                from agent.curator import maybe_run_curator
+                maybe_run_curator(
+                    idle_for_seconds=float("inf"),  # CLI startup = fully idle
+                    on_summary=lambda msg: self._console_print(
+                        f"[dim #6b7684]💾 {msg}[/]"
+                    ),
+                )
+            except Exception:
+                pass
         if self.preloaded_skills and not self._startup_skills_line_shown:
             skills_label = ", ".join(self.preloaded_skills)
             self._console_print(
@@ -16039,6 +16388,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _wait_for_kanban_start_barrier() -> None:
+    """Wait until the dispatcher atomically binds this worker to its run.
+
+    The child is already a distinct process/session but has not initialized an
+    agent or touched its task workspace. EOF, malformed input, or a bounded
+    timeout exits before task execution; only the parent's one-byte release
+    after the run/claim/PID CAS lets startup continue.
+    """
+    raw_fd = os.environ.pop("HERMES_KANBAN_START_BARRIER_FD", "").strip()
+    if not raw_fd:
+        return
+    try:
+        fd = int(raw_fd)
+        if fd < 0:
+            raise ValueError("negative barrier fd")
+        import select
+
+        readable, _, _ = select.select([fd], [], [], 30.0)
+        token = os.read(fd, 1) if readable else b""
+    except Exception:
+        token = b""
+    finally:
+        try:
+            os.close(int(raw_fd))
+        except (OSError, TypeError, ValueError):
+            pass
+    if token != b"1":
+        os._exit(75)
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -16189,6 +16567,8 @@ def main(
     """
     global _active_worktree
 
+    _wait_for_kanban_start_barrier()
+
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
     # UnicodeEncodeError on cp1252.  No-op on Linux/macOS.
@@ -16244,7 +16624,12 @@ def main(
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
     toolsets_list = None
-    if toolsets:
+    if _verified_managed_short_task_cli():
+        # Do not inspect coding posture, Git state, profile tool preferences,
+        # or configured MCP names. The model-level allowlist narrows these two
+        # built-in sets further for implementation versus independent review.
+        toolsets_list = ["file", "kanban"]
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):
@@ -16290,7 +16675,7 @@ def main(
         ignore_rules=ignore_rules,
     )
 
-    if parsed_skills:
+    if parsed_skills and not _verified_managed_short_task_cli():
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
             parsed_skills,
             task_id=cli.session_id,
@@ -16359,57 +16744,7 @@ def main(
     # so main unwinds normally.  HERMES_SIGTERM_GRACE overrides the 1.5 s
     # default for debugging.
     def _signal_handler_q(signum, frame):
-        logger.debug("Received signal %s in single-query mode", signum)
-        # Arm the exit backstop now that shutdown intent is unambiguous —
-        # covers wedges in the unwind below that would otherwise leave the
-        # process alive with no watchdog (#65998 class). Never raises.
-        _arm_exit_watchdog_on_shutdown_signal()
-        try:
-            _agent = getattr(cli, "agent", None)
-            if _agent is not None:
-                _agent.interrupt(f"received signal {signum}")
-                try:
-                    _grace = float(os.getenv("HERMES_SIGTERM_GRACE", "1.5"))
-                except (TypeError, ValueError):
-                    _grace = 1.5
-                if _grace > 0:
-                    time.sleep(_grace)
-        except Exception:
-            pass  # never block signal handling
-        # Kanban worker exit path (#28181): SIGTERM hits a dispatcher-spawned
-        # worker that's likely in a non-daemon thread waiting on a child
-        # subprocess in _wait_for_process. Raising KeyboardInterrupt only
-        # unwinds the main thread; the worker thread keeps running, the
-        # process gets reparented to init, and the dispatcher's _pid_alive
-        # check returns True forever — task stuck in 'running' indefinitely.
-        # Skip the controlled-unwind dance and call os._exit(0) so the kernel
-        # reclaims the PID immediately and detect_crashed_workers can reclaim
-        # the stale claim on the next tick. Flush logging + stdout/stderr
-        # first so the final debug trace isn't lost; SIGALRM deadman guards
-        # the flush against any rare blocking-I/O case (the reporter measured
-        # flush in <1ms; the alarm is a failsafe, not the common path).
-        if os.environ.get("HERMES_KANBAN_TASK"):
-            try:
-                import signal as _sig_mod
-                if hasattr(_sig_mod, "SIGALRM"):
-                    # Cancel any pre-existing alarm to avoid colliding with
-                    # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
-                    _sig_mod.alarm(2)
-            except Exception:
-                pass
-            try:
-                import logging as _lg
-                _lg.shutdown()
-            except Exception:
-                pass
-            for _stream in (sys.stdout, sys.stderr):
-                try:
-                    _stream.flush()
-                except Exception:
-                    pass
-            os._exit(0)
-        raise KeyboardInterrupt()
+        _handle_single_query_shutdown_signal(cli, signum)
     try:
         import signal as _signal
         _signal.signal(_signal.SIGINT, _signal_handler_q)

@@ -1948,7 +1948,21 @@ def anthropic_prompt_cache_policy(
 
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
-    from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
+    if getattr(agent, "_managed_short_task_bootstrap_verified", False):
+        from agent.managed_short_task_runtime import (
+            validate_managed_main_client_urls,
+        )
+
+        def _validate_proxy_env_urls() -> None:
+            validate_managed_main_client_urls("")
+
+        def _validate_base_url(base_url: str) -> None:
+            validate_managed_main_client_urls(base_url)
+    else:
+        from agent.auxiliary_client import (
+            _validate_base_url,
+            _validate_proxy_env_urls,
+        )
     from agent.ssl_verify import resolve_httpx_verify
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
     # copies of it) in; any in-place mutation leaks back into the stored dict and is
@@ -3494,6 +3508,11 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             messages[target_idx]["content"] = f"{existing_content}{marker}"
     else:
         messages[target_idx]["content"] = existing_content + marker
+    mark_injected = getattr(
+        agent, "_mark_pending_steer_receipts_injected", None
+    )
+    if callable(mark_injected):
+        mark_injected()
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

@@ -63,6 +63,26 @@ def test_promote_stuck_todo_succeeds(conn):
     assert kb.get_task(conn, child).status == "ready"
 
 
+def test_promote_safety_prechecks_share_the_write_transaction(conn, monkeypatch):
+    """The exit/cleanup proof must not go stale before promotion writes."""
+    child, _ = _stuck_todo(conn, parents_done=True)
+    original = kb._task_has_process_cleanup_unsafe
+    observed = []
+
+    def checked_inside_transaction(db, task_id):
+        observed.append(db.in_transaction)
+        return original(db, task_id)
+
+    monkeypatch.setattr(
+        kb, "_task_has_process_cleanup_unsafe", checked_inside_transaction
+    )
+    ok, err = kb.promote_task(conn, child, actor="tester")
+
+    assert ok and err is None
+    assert observed and all(observed)
+    assert kb.get_task(conn, child).status == "ready"
+
+
 def test_promote_refuses_when_parent_not_done(conn):
     child, parents = _stuck_todo(conn, parents_done=False)
     ok, err = kb.promote_task(conn, child, actor="tester")

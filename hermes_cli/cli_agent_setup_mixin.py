@@ -19,6 +19,18 @@ import sys
 from rich.markup import escape as _escape
 
 
+def _managed_short_task_lane_claimed() -> bool:
+    import os
+
+    return bool(
+        (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and (
+            (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip()
+            or os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+        )
+    )
+
+
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 
@@ -239,16 +251,19 @@ class CLIAgentSetupMixin:
         if self.agent is not None:
             return True
 
-        _prepare_deferred_agent_startup()
+        _managed_short_task = _managed_short_task_lane_claimed()
+        if not _managed_short_task:
+            _prepare_deferred_agent_startup()
         self._install_tool_callbacks()
         self._ensure_tirith_security()
 
         if not self._ensure_runtime_credentials():
             return False
 
-        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+        if not _managed_short_task:
+            from hermes_cli.mcp_startup import wait_for_mcp_discovery
 
-        wait_for_mcp_discovery()
+            wait_for_mcp_discovery()
 
         # Initialize SQLite session store for CLI sessions (if not already done in __init__)
         if self._session_db is None:
@@ -374,8 +389,16 @@ class CLIAgentSetupMixin:
                 verbose_logging=self.verbose,
                 quiet_mode=not self.verbose,
                 tool_progress_mode=getattr(self, "tool_progress_mode", "all"),
-                ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
-                prefill_messages=self.prefill_messages or None,
+                ephemeral_system_prompt=(
+                    None
+                    if _managed_short_task
+                    else self.system_prompt if self.system_prompt else None
+                ),
+                prefill_messages=(
+                    None
+                    if _managed_short_task
+                    else self.prefill_messages or None
+                ),
                 reasoning_config=self.reasoning_config,
                 service_tier=self.service_tier,
                 request_overrides=request_overrides,
@@ -399,8 +422,12 @@ class CLIAgentSetupMixin:
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
-                skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
+                skip_context_files=(
+                    True if _managed_short_task else self.ignore_rules
+                ),
+                skip_memory=(
+                    True if _managed_short_task else self.ignore_rules
+                ),
                 tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,

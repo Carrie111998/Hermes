@@ -8,6 +8,8 @@ nothing and reply "no active task to stop".  Authorized users should be able to
 stop any run in the same thread.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
@@ -148,6 +150,7 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 
     runner._interrupt_and_clear_session = _fake_interrupt
     runner._is_user_authorized = lambda source: False
+    runner._route_background_kanban_control = AsyncMock(return_value={"status": "none"})
 
     event = MessageEvent(
         text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
@@ -178,6 +181,7 @@ async def test_stop_no_active_agent_clears_stuck_status():
     key = _per_user_key("userA")
     runner.session_store = _FakeStore(key)
     runner._is_user_authorized = lambda source: True
+    runner._route_background_kanban_control = AsyncMock(return_value={"status": "none"})
 
     adapter = _FakeStatusAdapter()
     runner.adapters = {Platform.DISCORD: adapter}
@@ -203,6 +207,7 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
     key = _per_user_key("userA")
     runner.session_store = _FakeStore(key)
     runner._is_user_authorized = lambda source: True
+    runner._route_background_kanban_control = AsyncMock(return_value={"status": "none"})
 
     class _BoomAdapter:
         async def _stop_typing_with_metadata(self, chat_id, metadata=None):

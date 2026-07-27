@@ -73,6 +73,130 @@ suppress_platform_ver_console()
 import os
 import sys
 
+
+_MANAGED_SHORT_TASK_BOOTSTRAP_ENV = "HERMES_KANBAN_MANAGED_BOOTSTRAP"
+_MANAGED_SHORT_TASK_BOOTSTRAP_VERIFIED_ENV = (
+    "HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED"
+)
+_MANAGED_SHORT_TASK_BOOTSTRAP_ERROR_ENV = (
+    "HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR"
+)
+
+
+def _managed_short_task_bootstrap_status_early() -> tuple[bool, bool, str]:
+    """Validate the dispatcher-owned Phase-1 lane using stdlib only.
+
+    This runs before recovery, config, parser, plugin, MCP, hook, or skill
+    startup.  A claimed managed lane is therefore never allowed to downgrade
+    to an ordinary CLI merely because its snapshot is missing or malformed.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    lane = (os.environ.get("HERMES_KANBAN_MANAGED_LANE") or "").strip()
+    review_mode = os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+    claimed = bool(task_id and (lane or review_mode))
+    if not claimed:
+        return False, True, ""
+    if lane not in {"implementation", "review"}:
+        return True, False, "managed lane is missing or unknown"
+    if (lane == "review") != review_mode:
+        return True, False, "managed review markers disagree"
+
+    raw = os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", "")
+    try:
+        import json as _json_early
+
+        snapshot = _json_early.loads(raw)
+    except Exception:
+        return True, False, "managed policy snapshot is missing or malformed"
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != 2:
+        return True, False, "managed policy snapshot schema is invalid"
+    if snapshot.get("validation_error"):
+        return True, False, "managed policy snapshot contains a validation error"
+    for key in (
+        "soft_iteration_limit",
+        "max_handoffs",
+        "max_iterations",
+        "failure_limit",
+    ):
+        value = snapshot.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return True, False, f"managed policy field {key} is invalid"
+    if snapshot["soft_iteration_limit"] >= snapshot["max_iterations"]:
+        return True, False, "managed policy iteration limits are invalid"
+    if lane == "implementation" and snapshot.get("enabled") is not True:
+        return True, False, "managed implementation policy is not enabled"
+    if lane == "review" and snapshot.get("enabled") is not False:
+        return True, False, "managed review policy was not frozen inactive"
+
+    workspace = (
+        os.environ.get("HERMES_KANBAN_WORKSPACE") or ""
+    ).strip()
+    if not workspace or not os.path.isabs(os.path.expanduser(workspace)):
+        return True, False, "managed workspace is not an absolute path"
+    return True, True, ""
+
+
+(
+    _MANAGED_SHORT_TASK_CLI_ACTIVE,
+    _MANAGED_SHORT_TASK_BOOTSTRAP_VALID,
+    _MANAGED_SHORT_TASK_BOOTSTRAP_ERROR,
+) = _managed_short_task_bootstrap_status_early()
+
+if _MANAGED_SHORT_TASK_CLI_ACTIVE:
+    # These values are set before any user config or plugin module can be
+    # imported.  The AIAgent layer re-checks this verified marker and also
+    # treats a missing marker on a claimed lane as restricted (fail closed).
+    os.environ[_MANAGED_SHORT_TASK_BOOTSTRAP_ENV] = "1"
+    os.environ["HERMES_IGNORE_RULES"] = "1"
+    os.environ["HERMES_DEFER_AGENT_STARTUP"] = "0"
+    os.environ.pop("HERMES_ACCEPT_HOOKS", None)
+    if not _MANAGED_SHORT_TASK_BOOTSTRAP_VALID:
+        os.environ.pop(_MANAGED_SHORT_TASK_BOOTSTRAP_VERIFIED_ENV, None)
+        os.environ[_MANAGED_SHORT_TASK_BOOTSTRAP_ERROR_ENV] = (
+            _MANAGED_SHORT_TASK_BOOTSTRAP_ERROR
+        )
+    else:
+        os.environ[_MANAGED_SHORT_TASK_BOOTSTRAP_VERIFIED_ENV] = "1"
+        os.environ.pop(_MANAGED_SHORT_TASK_BOOTSTRAP_ERROR_ENV, None)
+
+
+def _require_managed_short_task_bootstrap_valid() -> None:
+    """Stop an invalid claimed managed lane before any startup side effect."""
+    if _MANAGED_SHORT_TASK_CLI_ACTIVE and not _MANAGED_SHORT_TASK_BOOTSTRAP_VALID:
+        print(
+            "Managed short-task worker refused to start: "
+            + _MANAGED_SHORT_TASK_BOOTSTRAP_ERROR,
+            file=sys.stderr,
+        )
+        raise SystemExit(75)
+
+
+def _wait_for_dispatcher_start_barrier_early() -> None:
+    """Block a Kanban worker before recovery, config, or plugin side effects."""
+    raw_fd = os.environ.pop("HERMES_KANBAN_START_BARRIER_FD", "").strip()
+    if not raw_fd:
+        return
+    try:
+        fd = int(raw_fd)
+        if fd < 0:
+            raise ValueError("negative barrier fd")
+        import select
+
+        readable, _, _ = select.select([fd], [], [], 30.0)
+        token = os.read(fd, 1) if readable else b""
+    except Exception:
+        token = b""
+    finally:
+        try:
+            os.close(int(raw_fd))
+        except (OSError, TypeError, ValueError):
+            pass
+    if token != b"1":
+        os._exit(75)
+
+
+_wait_for_dispatcher_start_barrier_early()
+
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
 # files were wiped (#57828 — failed lazy backend refresh), the module-level
@@ -87,10 +211,15 @@ import sys
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
+# Managed implementation/review workers are deliberately read/edit-only.
+# Recovery can run package installers or Git before the CLI reaches its normal
+# agent-startup gates, so it is categorically skipped for the claimed lane --
+# including a malformed claim, which exits fail-closed from ``main()``.
+if not _MANAGED_SHORT_TASK_CLI_ACTIVE:
+    try:
+        _early_recovery_mod.recover_if_needed()
+    except Exception:
+        pass
 
 
 def _exit_after_oneshot(rc: object) -> None:
@@ -137,31 +266,39 @@ def _cleanup_oneshot_runtime() -> None:
     if _oneshot_cleanup_done:
         return
     _oneshot_cleanup_done = True
-    try:
-        from tools.terminal_tool import cleanup_all_environments
-        cleanup_all_environments()
-    except Exception:
-        pass
-    try:
-        from tools.async_delegation import interrupt_all
-        interrupt_all(reason="oneshot shutdown")
-    except Exception:
-        pass
-    try:
-        from tools.browser_tool import _emergency_cleanup_all_sessions
-        _emergency_cleanup_all_sessions()
-    except Exception:
-        pass
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except BaseException:
-        pass
-    try:
-        from agent.auxiliary_client import shutdown_cached_clients
-        shutdown_cached_clients()
-    except Exception:
-        pass
+    if not (
+        _MANAGED_SHORT_TASK_CLI_ACTIVE
+        and _MANAGED_SHORT_TASK_BOOTSTRAP_VALID
+    ):
+        try:
+            from tools.terminal_tool import cleanup_all_environments
+            cleanup_all_environments()
+        except Exception:
+            pass
+        try:
+            from tools.async_delegation import interrupt_all
+            interrupt_all(reason="oneshot shutdown")
+        except Exception:
+            pass
+        try:
+            from tools.browser_tool import _emergency_cleanup_all_sessions
+            _emergency_cleanup_all_sessions()
+        except Exception:
+            pass
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except BaseException:
+            pass
+    if not (
+        _MANAGED_SHORT_TASK_CLI_ACTIVE
+        and _MANAGED_SHORT_TASK_BOOTSTRAP_VALID
+    ):
+        try:
+            from agent.auxiliary_client import shutdown_cached_clients
+            shutdown_cached_clients()
+        except Exception:
+            pass
 
 
 def _run_and_exit_oneshot(
@@ -730,19 +867,23 @@ except Exception:
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-try:
-    from hermes_logging import setup_logging as _setup_logging
+if not (
+    _MANAGED_SHORT_TASK_CLI_ACTIVE
+    and _MANAGED_SHORT_TASK_BOOTSTRAP_VALID
+):
+    try:
+        from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
-except Exception:
-    pass  # best-effort — don't crash the CLI if logging setup fails
+    except Exception:
+        pass  # best-effort — don't crash the CLI if logging setup fails
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -912,6 +1053,8 @@ def _sync_bundled_skills_for_startup() -> bool:
     storage. The git/ref stamp keeps post-update correctness: a changed
     checkout revision forces one real sync, then later starts skip it.
     """
+    if _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        return False
     if _is_termux_startup_environment() and not _termux_bundled_skills_sync_needed():
         return False
 
@@ -2390,6 +2533,8 @@ def _sync_bundled_skills_quietly() -> None:
     dependency. Hermes still functions without them; the user just sees an
     empty skills library.
     """
+    if _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        return
     try:
         from tools.skills_sync import sync_skills
 
@@ -2443,6 +2588,17 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    _require_managed_short_task_bootstrap_valid()
+    if _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        # The dispatcher owns the complete worker contract.  Never accept a
+        # profile/persona/rule preload or hook opt-in from argv/config in this
+        # lane, even if a future caller bypasses ``main()`` and invokes
+        # ``cmd_chat`` directly.
+        args.ignore_rules = True
+        args.skills = None
+        args.accept_hooks = False
+        args.worktree = False
+        args.checkpoints = False
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
@@ -2560,7 +2716,10 @@ def cmd_chat(args):
     # Start update check in background (runs while other init happens).
     # On Termux this imports rich/prompt_toolkit in the foreground and then
     # competes for CPU on single-core devices, so keep it opt-in there.
-    if _termux_should_prefetch_update_check():
+    if (
+        not _MANAGED_SHORT_TASK_CLI_ACTIVE
+        and _termux_should_prefetch_update_check()
+    ):
         try:
             from hermes_cli.banner import prefetch_update_check
 
@@ -2569,10 +2728,11 @@ def cmd_chat(args):
             pass
 
     # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
-    try:
-        _sync_bundled_skills_for_startup()
-    except Exception:
-        pass
+    if not _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        try:
+            _sync_bundled_skills_for_startup()
+        except Exception:
+            pass
 
     # --yolo: bypass all dangerous command approvals.
     # Also set in main() before _prepare_agent_startup() — that is the
@@ -14220,6 +14380,9 @@ def _should_background_mcp_startup(args) -> bool:
 
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    if _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        _require_managed_short_task_bootstrap_valid()
+        return
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -14586,6 +14749,8 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    _require_managed_short_task_bootstrap_valid()
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
@@ -14600,10 +14765,11 @@ def main():
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
     # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
-    try:
-        _cleanup_quarantined_exes()
-    except Exception:
-        pass
+    if not _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        try:
+            _cleanup_quarantined_exes()
+        except Exception:
+            pass
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
@@ -14615,16 +14781,18 @@ def main():
     # ``hermes skills install update``) merely defers recovery one launch;
     # under-matching (missing ``hermes -p work update``) would race a recovery
     # install against the real one. Loose wins.
-    try:
-        if "update" not in sys.argv[1:]:
-            _recover_from_interrupted_install()
-    except Exception:
-        pass
+    if not _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        try:
+            if "update" not in sys.argv[1:]:
+                _recover_from_interrupted_install()
+        except Exception:
+            pass
 
-    if _try_termux_fast_tui_launch():
-        return
-    if _try_termux_fast_cli_launch():
-        return
+    if not _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        if _try_termux_fast_tui_launch():
+            return
+        if _try_termux_fast_cli_launch():
+            return
 
     from hermes_cli._parser import build_top_level_parser
 
@@ -15020,7 +15188,10 @@ def main():
     # (google.cloud.pubsub_v1, aiohttp, grpc, PIL …) which costs
     # 500-650ms on typical installs.
     # =========================================================================
-    if _plugin_cli_discovery_needed():
+    if (
+        not _MANAGED_SHORT_TASK_CLI_ACTIVE
+        and _plugin_cli_discovery_needed()
+    ):
         try:
             from plugins.memory import discover_plugin_cli_commands
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
@@ -16586,7 +16757,11 @@ def main():
     # transparently instead of being intercepted by argparse on the host.
     from hermes_cli.config import get_container_exec_info
 
-    container_info = get_container_exec_info()
+    container_info = (
+        None
+        if _MANAGED_SHORT_TASK_CLI_ACTIVE
+        else get_container_exec_info()
+    )
     if container_info:
         _exec_in_container(container_info, sys.argv[1:])
         # Unreachable: os.execvp never returns on success (process is replaced)
@@ -16635,6 +16810,33 @@ def main():
     else:
         subparsers.required = False
         args = parser.parse_args(_processed_argv)
+
+    if _MANAGED_SHORT_TASK_CLI_ACTIVE:
+        # A managed child is a single dispatcher-authored CLI chat turn, not a
+        # general-purpose Hermes entrypoint.  Refuse argv drift before update,
+        # plugin, MCP, hook, worktree, checkpoint, resume, or TUI code can run.
+        invalid_worker_argv = bool(
+            getattr(args, "command", None) != "chat"
+            or not str(getattr(args, "query", "") or "").strip()
+            or getattr(args, "oneshot", None)
+            or getattr(args, "resume", None)
+            or getattr(args, "continue_last", None)
+            or getattr(args, "worktree", False)
+            or getattr(args, "checkpoints", False)
+            or getattr(args, "tui", False)
+            or getattr(args, "yolo", False)
+            or getattr(args, "accept_hooks", False)
+            or getattr(args, "skills", None)
+            or getattr(args, "image", None)
+        )
+        if invalid_worker_argv:
+            print(
+                "Managed short-task worker refused an unexpected CLI mode.",
+                file=sys.stderr,
+            )
+            raise SystemExit(75)
+        args.cli = True
+        args.ignore_rules = True
 
     # Handle --version flag
     if args.version:

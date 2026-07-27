@@ -1215,6 +1215,40 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    # A short-task worker must be able to prove that its entire process tree
+    # is gone before a successor uses the same checkout. Arbitrary Python can
+    # fork, daemonize, or start a new session without passing through the
+    # managed terminal registry, so Phase 1 disables this escape hatch only
+    # for workers carrying the dispatcher-owned enabled policy snapshot.
+    _has_worker_policy = bool(
+        (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY")
+    )
+    try:
+        from tools.terminal_tool import _short_task_managed_worker_active
+
+        _short_task_worker = _short_task_managed_worker_active()
+    except Exception:
+        # Once a dispatcher policy is present, inability to validate the
+        # process-safety gate must block arbitrary code rather than fail open.
+        _short_task_worker = _has_worker_policy
+    if _short_task_worker:
+        return json.dumps(
+            {
+                "status": "blocked",
+                "error": (
+                    "execute_code is disabled for automatic short-task workers "
+                    "because arbitrary child processes cannot be safely handed "
+                    "off. Use the normal file-reading and file-editing tools in "
+                    "this bounded worker; run commands in a separate non-handoff "
+                    "verification task."
+                ),
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            },
+            ensure_ascii=False,
+        )
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
@@ -1989,6 +2023,22 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
 EXECUTE_CODE_SCHEMA = build_execute_code_schema()
 
 
+def _check_execute_code_requirements() -> bool:
+    """Hide arbitrary code from enabled or invalid-policy short workers."""
+    try:
+        from tools.terminal_tool import _short_task_managed_worker_active
+
+        if _short_task_managed_worker_active():
+            return False
+    except Exception:
+        if (
+            (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            and os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY")
+        ):
+            return False
+    return check_sandbox_requirements()
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -2000,7 +2050,7 @@ registry.register(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
         enabled_tools=kw.get("enabled_tools")),
-    check_fn=check_sandbox_requirements,
+    check_fn=_check_execute_code_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,
 )

@@ -34,6 +34,9 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
+    KANBAN_INDEPENDENT_REVIEW_GUIDANCE,
+    KANBAN_ORCHESTRATOR_GUIDANCE,
+    KANBAN_SHORT_TASK_WORKER_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
@@ -168,6 +171,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
+    _managed_short_task = bool(
+        getattr(agent, "_managed_short_task_bootstrap", False)
+    )
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -228,16 +234,60 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Kanban worker/orchestrator lifecycle — only present when the
-    # dispatcher spawned this process (kanban_show check_fn gates on
-    # HERMES_KANBAN_TASK env var). Normal chat sessions never see
-    # this block. Resolved once at __init__ (see _kanban_worker_guidance).
+    # Kanban worker/orchestrator lifecycle. Tool membership is shared by some
+    # control-plane chats, so only the dispatcher-owned task environment is a
+    # worker identity boundary. Resolved once at __init__.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
+    elif (
+        _kanban_guidance is None
+        and (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    ):
         # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
+        _short_task_safety_restricted = getattr(
+            agent, "_kanban_short_task_handoff_enabled", False
+        )
+        if not _short_task_safety_restricted:
+            try:
+                from tools.terminal_tool import (
+                    _short_task_handoff_worker_enabled,
+                )
+
+                _short_task_safety_restricted = (
+                    _short_task_handoff_worker_enabled(invalid_is_enabled=True)
+                )
+            except Exception:
+                _short_task_safety_restricted = bool(
+                    os.environ.get(
+                        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"
+                    )
+                )
+        if os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1":
+            tool_guidance.append(
+                KANBAN_INDEPENDENT_REVIEW_GUIDANCE
+                if _managed_short_task
+                else (
+                    KANBAN_GUIDANCE
+                    + "\n\n"
+                    + KANBAN_INDEPENDENT_REVIEW_GUIDANCE
+                )
+            )
+        else:
+            tool_guidance.append(
+                KANBAN_SHORT_TASK_WORKER_GUIDANCE
+                if _short_task_safety_restricted
+                else KANBAN_GUIDANCE
+            )
+    elif (
+        getattr(agent, "_kanban_short_task_handoff_enabled", False)
+        and "kanban_control" in agent.valid_tool_names
+    ):
+        # Control-plane chats get a compact, static routing contract. It keeps
+        # implementation out of the long-lived channel session while refusing
+        # to infer cross-session identity from soft tenant labels. Worker
+        # processes use the richer lifecycle block above instead.
+        tool_guidance.append(KANBAN_ORCHESTRATOR_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
@@ -254,7 +304,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    nous_subscription_prompt = (
+        ""
+        if _managed_short_task
+        else _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    )
     if nous_subscription_prompt:
         stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
@@ -293,7 +347,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+    has_skills_tools = bool(
+        not _managed_short_task
+        and any(
+            name in agent.valid_tool_names
+            for name in ['skills_list', 'skill_view', 'skill_manage']
+        )
+    )
     if has_skills_tools:
         avail_toolsets = {
             toolset
@@ -342,7 +402,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = (
+        "" if _managed_short_task else _r.build_environment_hints()
+    )
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -353,7 +415,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # stay in their historical position after the workspace snapshot.
     coding_workspace_parts: List[str] = []
     coding_trailing_parts: List[str] = []
-    if agent.valid_tool_names:
+    if agent.valid_tool_names and not _managed_short_task:
         try:
             from agent.coding_context import coding_system_prompt_parts
 
@@ -383,7 +445,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # entirely for remote terminal backends (the host's Python state is
     # irrelevant when tools run inside docker/modal/ssh).  Gated by
     # config.yaml ``agent.environment_probe`` (default True).
-    if getattr(agent, "_environment_probe", True):
+    if (
+        not _managed_short_task
+        and getattr(agent, "_environment_probe", True)
+    ):
         try:
             from tools.env_probe import get_environment_probe_line
             _probe_line = get_environment_probe_line()
@@ -400,32 +465,33 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
-    try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
-    except Exception:
-        active_profile = "default"
-    if active_profile == "default":
-        post_workspace_parts.append(
-            "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
-            "skills/, plugins/, cron/, and memories/ that affect a different "
-            "session than this one. Do not modify another profile's "
-            "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
-        )
-    else:
-        post_workspace_parts.append(
-            f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
-            f"different session run from a different shell. Do NOT modify "
-            f"another profile's skills/plugins/cron/memories unless the user "
-            f"explicitly directs you to. The cross-profile write guard will "
-            f"refuse such writes by default; pass cross_profile=True only "
-            f"after explicit direction."
-        )
+    if not _managed_short_task:
+        try:
+            from agent.file_safety import _resolve_active_profile_name
+            active_profile = _resolve_active_profile_name()
+        except Exception:
+            active_profile = "default"
+        if active_profile == "default":
+            post_workspace_parts.append(
+                "Active Hermes profile: default. Other profiles (if any) live "
+                "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+                "skills/, plugins/, cron/, and memories/ that affect a different "
+                "session than this one. Do not modify another profile's "
+                "skills/plugins/cron/memories unless the user explicitly directs "
+                "you to."
+            )
+        else:
+            post_workspace_parts.append(
+                f"Active Hermes profile: {active_profile}. This session reads "
+                f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
+                f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
+                f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+                f"different session run from a different shell. Do NOT modify "
+                f"another profile's skills/plugins/cron/memories unless the user "
+                f"explicitly directs you to. The cross-profile write guard will "
+                f"refuse such writes by default; pass cross_profile=True only "
+                f"after explicit direction."
+            )
 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply
@@ -473,7 +539,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Note: ephemeral_system_prompt is NOT included here. It's injected at
     # API-call time only so it stays out of the cached/stored system prompt.
-    if system_message is not None:
+    if system_message is not None and not _managed_short_task:
         context_parts.append(system_message)
 
     if not agent.skip_context_files:

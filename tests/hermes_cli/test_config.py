@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from hermes_cli.config import (
+    CurrentConfigReadError,
     DEFAULT_CONFIG,
     check_config_version,
     get_hermes_home,
@@ -17,6 +18,7 @@ from hermes_cli.config import (
     _normalize_max_turns_config,
     is_provider_enabled,
     load_config,
+    load_config_current_strict,
     load_env,
     migrate_config,
     read_raw_config,
@@ -109,6 +111,15 @@ class TestEnsureHermesHome:
 
 
 class TestLoadConfigDefaults:
+    def test_short_task_handoff_defaults_are_in_effective_kanban_block(self):
+        assert DEFAULT_CONFIG["kanban"]["short_task_handoff"] == {
+            "enabled": False,
+            "soft_iteration_limit": 36,
+            "max_handoffs": 8,
+            "allowed_workspace_roots": [],
+            "allowed_origins": [],
+        }
+
     def test_returns_defaults_when_no_file(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config = load_config()
@@ -127,6 +138,74 @@ class TestLoadConfigDefaults:
             config = load_config()
             assert config["agent"]["max_turns"] == 42
             assert "max_turns" not in config
+
+    def test_strict_current_matches_defaults_without_creating_files(self, tmp_path):
+        before = set(tmp_path.iterdir())
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config_current_strict()
+
+        assert config["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
+        assert config["kanban"]["short_task_handoff"]["enabled"] is False
+        assert set(tmp_path.iterdir()) == before
+
+    def test_strict_current_preserves_legacy_root_max_turns(self, tmp_path):
+        (tmp_path / "config.yaml").write_text("max_turns: 42\n", encoding="utf-8")
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config_current_strict()
+
+        assert config["agent"]["max_turns"] == 42
+        assert "max_turns" not in config
+
+    def test_strict_current_rejects_corruption_without_lkg_or_backup(self, tmp_path):
+        from hermes_cli import config as cfg_mod
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "kanban:\n  short_task_handoff:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            # Seed the ordinary loader's cache and last-known-good state. The
+            # strict path must still inspect the broken file now on disk.
+            assert load_config()["kanban"]["short_task_handoff"]["enabled"] is True
+            config_path.write_text("kanban: [unclosed\n", encoding="utf-8")
+            before = config_path.read_bytes()
+
+            with pytest.raises(CurrentConfigReadError):
+                load_config_current_strict()
+
+        assert config_path.read_bytes() == before
+        assert list(tmp_path.glob("config.yaml.corrupt.*.bak")) == []
+        # The safety read must not mutate either normal-loader cache.
+        assert str(config_path) in cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH
+
+    def test_strict_current_rejects_non_mapping_root_without_writes(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("- not\n- a\n- mapping\n", encoding="utf-8")
+        before = config_path.read_bytes()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(CurrentConfigReadError, match="root must be a mapping"):
+                load_config_current_strict()
+
+        assert config_path.read_bytes() == before
+
+    def test_strict_current_rejects_unreadable_existing_file(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("kanban: {}\n", encoding="utf-8")
+        real_open = open
+
+        def deny_config_read(path, *args, **kwargs):
+            if Path(path) == config_path:
+                raise PermissionError("synthetic unreadable config")
+            return real_open(path, *args, **kwargs)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with patch("builtins.open", side_effect=deny_config_read):
+                with pytest.raises(CurrentConfigReadError, match="could not be read"):
+                    load_config_current_strict()
+
+        assert config_path.read_text(encoding="utf-8") == "kanban: {}\n"
 
 
 class TestLoadConfigParseFailure:

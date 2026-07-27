@@ -7,6 +7,7 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -15,6 +16,19 @@ from typing import Any, Dict, List, Optional, Union
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _short_task_cron_blocked() -> bool:
+    """Fail closed when a dispatcher-owned short-task snapshot is present."""
+    try:
+        from tools.terminal_tool import _short_task_managed_worker_active
+
+        return _short_task_managed_worker_active()
+    except Exception:
+        return bool(
+            (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            and os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY")
+        )
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -682,6 +696,18 @@ def cronjob(
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
 
+    # A scheduled job outlives the worker that created it and can later reopen
+    # Terminal, scripts, or an arbitrary project workdir after the successor
+    # has started. Keep cron unavailable at both schema and handler boundaries
+    # for Phase-1 shared-checkout workers.
+    if _short_task_cron_blocked():
+        return tool_error(
+            "Cron and scheduled work are disabled for automatic short-task "
+            "workers because the job can outlive this bounded segment. Use a "
+            "separate non-handoff task with an explicit lifecycle.",
+            success=False,
+        )
+
     try:
         normalized = (action or "").strip().lower()
 
@@ -1111,6 +1137,9 @@ def check_cronjob_requirements() -> bool:
     every consumer of these flags agrees on the truthy set.
     """
     from utils import env_var_enabled
+
+    if _short_task_cron_blocked():
+        return False
 
     return (
         env_var_enabled("HERMES_INTERACTIVE")

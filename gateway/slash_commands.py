@@ -90,6 +90,427 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    def _kanban_handoff_policy_for_source(
+        self,
+        source: SessionSource,
+    ) -> dict[str, Any]:
+        """Resolve the one policy owned by this gateway/dispatcher process."""
+        from agent.kanban_auto_handoff import (
+            load_current_dispatcher_policy_snapshot,
+        )
+
+        # ``source`` still determines task/control identity, but never the
+        # process-level dispatch policy. Otherwise two chats routed to
+        # different profiles could disagree with the embedded dispatcher.
+        _ = source
+        return load_current_dispatcher_policy_snapshot()
+
+    async def _trusted_kanban_control_identity(
+        self,
+        event: MessageEvent,
+    ) -> Optional[dict[str, str]]:
+        """Return the best authenticated origin evidence for one message.
+
+        Canonical alternate IDs are preferred (notably Feishu union_id), so
+        two people in the same group never collapse into one controller. The
+        durable session key and active profile are also part of the binding.
+        Missing delivery fields remain empty in the returned mapping so task
+        creation can distinguish an unrelated source from an allowlisted source
+        whose exactly-once proof is incomplete. Mutation callers must use
+        :meth:`_kanban_control_identity_complete` before writing.
+        """
+        source = event.source
+        if source is None:
+            return None
+        session_key = ""
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(source)
+        except Exception:
+            logger.warning("could not resolve session for Kanban control", exc_info=True)
+        else:
+            session_key = str(session_entry.session_key or "").strip()
+        platform_obj = getattr(source, "platform", None)
+        platform = (
+            platform_obj.value
+            if hasattr(platform_obj, "value")
+            else str(platform_obj or "")
+        ).strip().lower()
+        identity = {
+            "platform": platform,
+            "scope_id": str(getattr(source, "scope_id", "") or "").strip(),
+            "chat_type": str(getattr(source, "chat_type", "") or "").strip().lower(),
+            "chat_id": str(
+                getattr(source, "chat_id_alt", "")
+                or getattr(source, "chat_id", "")
+                or ""
+            ).strip(),
+            "thread_id": str(getattr(source, "thread_id", "") or "").strip(),
+            "user_id": str(
+                getattr(source, "user_id_alt", "")
+                or getattr(source, "user_id", "")
+                or ""
+            ).strip(),
+            "notifier_profile": str(
+                (
+                    getattr(source, "profile", "")
+                    if getattr(
+                        getattr(self, "config", None),
+                        "multiplex_profiles",
+                        False,
+                    )
+                    else ""
+                )
+                or getattr(self, "_kanban_notifier_profile", "")
+                or self._active_profile_name()
+                or ""
+            ).strip(),
+            "session_key": session_key,
+            "message_id": str(
+                getattr(event, "message_id", "")
+                or getattr(source, "message_id", "")
+                or (
+                    f"update:{event.platform_update_id}"
+                    if getattr(event, "platform_update_id", None) is not None
+                    else ""
+                )
+            ).strip(),
+        }
+        return identity
+
+    @staticmethod
+    def _kanban_control_identity_complete(
+        identity: Optional[dict[str, str]],
+    ) -> bool:
+        """Whether one candidate can support an exact durable control receipt."""
+        if not identity:
+            return False
+        required = (
+            "platform",
+            "chat_type",
+            "chat_id",
+            "user_id",
+            "notifier_profile",
+            "session_key",
+            "message_id",
+        )
+        return all(str(identity.get(name) or "").strip() for name in required)
+
+    async def _route_background_kanban_control(
+        self,
+        event: MessageEvent,
+        *,
+        kind: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """Route /stop or /steer to one exact control-bound background task.
+
+        A detached Kanban worker is not present in ``_running_agents`` and has
+        no stdin. We act only when the authenticated task-creation identity
+        maps to one active task across all boards; notification subscriptions
+        are never treated as authority. Zero or multiple matches never guess.
+        """
+        from agent.redact import redact_sensitive_text
+
+        if getattr(event, "internal", False):
+            # Internal handoff/notification events bypass normal inbound user
+            # authentication and may carry a copied source. They can never be
+            # treated as fresh human authority over a background worker.
+            return {
+                "status": "error",
+                "error": "internal events cannot control a background task",
+            }
+
+        message = redact_sensitive_text(str(message or ""), force=True)
+        try:
+            policy = self._kanban_handoff_policy_for_source(event.source)
+            policy_enabled = policy.get("enabled") is True
+        except Exception as exc:
+            logger.warning("background kanban control policy unavailable: %s", exc)
+            # Rollback disables new handoffs, but an already-created trusted
+            # binding must remain stoppable. Continue with read-only discovery;
+            # if nothing exists, report disabled below.
+            policy_enabled = False
+
+        identity = await self._trusted_kanban_control_identity(event)
+        if not self._kanban_control_identity_complete(identity):
+            if not policy_enabled:
+                # Preserve the pre-feature slash behavior when rollback is
+                # active and this platform cannot provide an exactly-once
+                # delivery identity. No trusted mutation is attempted.
+                return {"status": "disabled"}
+            return {
+                "status": "error",
+                "error": "exact channel, user, session, or message identity is unavailable",
+            }
+
+        def _route_serialized() -> dict[str, Any]:
+            from hermes_cli import kanban_db as kb
+
+            actor_fingerprint = kb.control_actor_fingerprint(
+                **{
+                    name: identity[name]
+                    for name in (
+                        "platform",
+                        "scope_id",
+                        "chat_type",
+                        "chat_id",
+                        "thread_id",
+                        "user_id",
+                        "notifier_profile",
+                        "session_key",
+                    )
+                }
+            )
+            control_id = kb.derive_handoff_control_id(
+                actor_fingerprint=actor_fingerprint,
+                message_id=identity["message_id"],
+                kind=kind,
+            )
+            # Receipt lookup spans live and recoverably archived boards. This
+            # happens before active-task discovery so a delayed old delivery
+            # cannot land on a newly-created chain or a different project.
+            receipt_matches: list[tuple[Path, dict[str, Any]]] = []
+            for receipt_path in kb.control_receipt_db_paths():
+                conn = kb.connect(db_path=receipt_path)
+                try:
+                    prior = conn.execute(
+                        "SELECT * FROM task_handoff_controls WHERE control_id = ?",
+                        (control_id,),
+                    ).fetchone()
+                    if prior is not None:
+                        receipt_matches.append((receipt_path, dict(prior)))
+                finally:
+                    conn.close()
+            # Discovery failure is not permission to fall back to a guessed
+            # default board: that could route a group command to the wrong job.
+            boards = kb.list_boards(include_archived=False)
+            matches: list[tuple[str, str, str]] = []
+            seen_db_paths: set[str] = set()
+            for board_meta in boards:
+                slug = board_meta.get("slug") or kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                resolved = str(
+                    Path(db_path).expanduser().resolve()
+                    if db_path
+                    else kb.kanban_db_path(slug).resolve()
+                )
+                if resolved in seen_db_paths:
+                    continue
+                seen_db_paths.add(resolved)
+                conn = kb.connect(board=slug)
+                try:
+                    for match in kb.control_bound_active_tasks(
+                        conn,
+                        **{
+                            name: identity[name]
+                            for name in (
+                                "platform",
+                                "scope_id",
+                                "chat_type",
+                                "chat_id",
+                                "thread_id",
+                                "user_id",
+                                "notifier_profile",
+                                "session_key",
+                            )
+                        },
+                    ):
+                        matches.append(
+                            (slug, match["task_id"], match["binding_id"])
+                        )
+                finally:
+                    conn.close()
+            if receipt_matches:
+                if len(receipt_matches) != 1:
+                    return {
+                        "status": "ambiguous",
+                        "task_ids": [
+                            str(prior.get("target_task_id") or "")
+                            for _, prior in receipt_matches
+                        ],
+                    }
+                prior_path, prior = receipt_matches[0]
+                conn = kb.connect(db_path=prior_path)
+                try:
+                    replay = kb.route_task_control(
+                        conn,
+                        task_id=str(
+                            prior.get("requested_task_id")
+                            or prior.get("source_task_id")
+                            or ""
+                        ),
+                        control_id=control_id,
+                        kind=kind,
+                        message=message,
+                        binding_id=str(prior.get("binding_id") or ""),
+                        **{
+                            name: identity[name]
+                            for name in (
+                                "platform",
+                                "scope_id",
+                                "chat_type",
+                                "chat_id",
+                                "thread_id",
+                                "user_id",
+                                "notifier_profile",
+                                "session_key",
+                            )
+                        },
+                        require_binding=True,
+                    )
+                finally:
+                    conn.close()
+                if replay.get("status") == "recorded_signal_failed":
+                    return {
+                        "status": "saved_but_waiting",
+                        "task_id": replay.get("target_task_id"),
+                        "kind": kind,
+                        "error": replay.get("error"),
+                    }
+                if replay.get("status") not in {"recorded", "already_recorded"}:
+                    return {
+                        "status": "error",
+                        "task_id": replay.get("target_task_id"),
+                        "error": replay.get("error") or "control replay conflicted",
+                    }
+                if replay.get("status") == "already_recorded":
+                    return {
+                        "status": "already_processed",
+                        "task_id": replay.get("target_task_id"),
+                        "kind": kind,
+                    }
+                replay_phase = str(replay.get("phase") or "")
+                return {
+                    "status": (
+                        "draining"
+                        if (
+                            replay.get("worker_exit_pending")
+                            or replay_phase
+                            in {"before_commit", "after_commit", "after_terminal"}
+                        )
+                        else "routed"
+                    ),
+                    "task_id": replay.get("target_task_id"),
+                    "kind": kind,
+                }
+            if not matches:
+                return {"status": "none" if policy_enabled else "disabled"}
+            if len(matches) != 1:
+                return {
+                    "status": "ambiguous",
+                    "task_ids": [task_id for _, task_id, _ in matches],
+                }
+            slug, task_id, binding_id = matches[0]
+            conn = kb.connect(board=slug)
+            try:
+                result = kb.route_task_control(
+                    conn,
+                    task_id=task_id,
+                    control_id=control_id,
+                    kind=kind,
+                    message=message,
+                    binding_id=binding_id,
+                    **{
+                        name: identity[name]
+                        for name in (
+                            "platform",
+                            "scope_id",
+                            "chat_type",
+                            "chat_id",
+                            "thread_id",
+                            "user_id",
+                            "notifier_profile",
+                            "session_key",
+                        )
+                    },
+                    require_binding=True,
+                )
+            finally:
+                conn.close()
+            if result.get("status") == "recorded_signal_failed":
+                return {
+                    "status": "saved_but_waiting",
+                    "task_id": result.get("target_task_id") or task_id,
+                    "kind": kind,
+                    "error": result.get("error"),
+                }
+            if result.get("status") not in {"recorded", "already_recorded"}:
+                return {
+                    "status": "error",
+                    "task_id": task_id,
+                    "error": result.get("error") or "control was not accepted",
+                }
+            if result.get("status") == "already_recorded":
+                return {
+                    "status": "already_processed",
+                    "task_id": result.get("target_task_id") or task_id,
+                    "kind": kind,
+                }
+            phase = str(result.get("phase") or "")
+            waiting = bool(result.get("worker_exit_pending")) or phase in {
+                "before_commit",
+                "after_commit",
+                "after_terminal",
+            }
+            return {
+                "status": "draining" if waiting else "routed",
+                "task_id": result.get("target_task_id") or task_id,
+                "kind": kind,
+            }
+
+        def _route() -> dict[str, Any]:
+            from hermes_cli import kanban_db as kb
+
+            # Receipt lookup, active-chain discovery, and the board-local
+            # mutation are one host-wide operation.  Trusted creation plus
+            # archive/delete paths take the same lock, so an old delivery
+            # cannot be retargeted to a newly-created chain between scan and
+            # commit.
+            with kb.trusted_control_serialization():
+                return _route_serialized()
+
+        try:
+            return await asyncio.to_thread(_route)
+        except Exception as exc:
+            logger.warning("background kanban control failed", exc_info=True)
+            return {"status": "error", "error": str(exc)}
+
+    @staticmethod
+    def _background_kanban_control_reply(result: dict[str, Any]) -> Optional[str]:
+        """Render a truthful, non-technical control result for chat users."""
+        status = result.get("status")
+        if status == "routed":
+            if result.get("kind") == "stop":
+                return "已安全暂停当前短任务。"
+            return "新要求已保存，后续接力会按新要求继续。"
+        if status == "draining":
+            if result.get("kind") == "stop":
+                return (
+                    "暂停要求已保存。当前这一步正在安全收尾，完成前不会开始下一步。"
+                )
+            return (
+                "新要求已保存。当前这一步会先安全收尾，下一步再按新要求继续。"
+            )
+        if status == "saved_but_waiting":
+            return (
+                "要求已安全保存，暂时不会开始下一步；但当前这一步是否已经完全停止，"
+                "Hermes 还未确认。请稍后再试一次或查看任务状态。"
+            )
+        if status == "already_processed":
+            return (
+                "这条要求之前已经处理过；本次重复消息没有再次改变任务。"
+            )
+        if status == "ambiguous":
+            return (
+                "这个群里有不止一个正在进行的短任务，我无法确定你指的是哪一个，"
+                "因此没有做任何更改。"
+            )
+        if status == "error":
+            return (
+                "这次无法安全更新短任务，因此没有冒险更改。请稍后重试。"
+            )
+        return None
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -428,7 +849,10 @@ class GatewaySlashCommandsMixin:
         import asyncio
         import re
         import shlex
-        from hermes_cli.kanban import run_slash
+        from hermes_cli.kanban import (
+            MANAGED_TASK_MUTATING_ACTIONS,
+            run_slash,
+        )
 
         text = (event.text or "").strip()
         # Strip the leading "/kanban" (with or without slash), leaving args.
@@ -457,9 +881,99 @@ class GatewaySlashCommandsMixin:
             break
 
         is_create = action == "create"
+        create_may_touch_existing_task = is_create and any(
+            token in {"--parent", "--idempotency-key"}
+            or token.startswith("--parent=")
+            or token.startswith("--idempotency-key=")
+            for token in tokens
+        )
+
+        mutation_identity = None
+        if (
+            action in MANAGED_TASK_MUTATING_ACTIONS
+            and (not is_create or create_may_touch_existing_task)
+            and not getattr(event, "internal", False)
+        ):
+            mutation_identity = await self._trusted_kanban_control_identity(event)
+
+        control_origin = None
+        if is_create:
+            try:
+                _control_policy = self._kanban_handoff_policy_for_source(event.source)
+            except Exception:
+                logger.warning(
+                    "trusted Kanban creation policy lookup failed",
+                    exc_info=True,
+                )
+                return "目前无法确认这次启动是否安全，因此没有开始任务。请稍后重试。"
+            if _control_policy.get("validation_error"):
+                return "短任务接力设置目前不可用，因此没有开始任务。"
+            _control_policy_enabled = _control_policy.get("enabled") is True
+            if _control_policy_enabled:
+                if getattr(event, "internal", False):
+                    return "系统通知不能代替你启动短任务，因此没有开始任务。"
+                if (
+                    mutation_identity is None
+                ):
+                    mutation_identity = await self._trusted_kanban_control_identity(
+                        event
+                    )
+                candidate_origin = mutation_identity
+                from agent.kanban_handoff_scope import (
+                    decide_gateway_identity_current_config,
+                    match_gateway_identity_current_config,
+                )
+
+                _source_match = match_gateway_identity_current_config(
+                    candidate_origin
+                )
+                if _source_match.get("validation_error"):
+                    return "允许启动短任务的群聊设置有误，因此没有开始任务。"
+                _scope_decision = decide_gateway_identity_current_config(
+                    candidate_origin
+                )
+                if _scope_decision.get("validation_error"):
+                    return "允许启动短任务的群聊设置有误，因此没有开始任务。"
+                if (
+                    _source_match.get("candidate") is True
+                    and (
+                        getattr(event, "internal", False)
+                        or _source_match.get("matched") is not True
+                        or not self._kanban_control_identity_complete(candidate_origin)
+                    )
+                ):
+                    return (
+                        "这条请求来自允许的群聊，但目前无法确认完整的发起人信息，"
+                        "因此没有开始任务。请在同一个群里重新发送一次。"
+                    )
+                if _scope_decision.get("authorized") is True:
+                    if any(
+                        token == "--idempotency-key"
+                        or token.startswith("--idempotency-key=")
+                        for token in tokens
+                    ):
+                        return (
+                            "这个启动方式已经会自动避免重复任务，不需要再提供额外的"
+                            "去重参数；本次没有开始任务。"
+                        )
+                    if not self._kanban_control_identity_complete(candidate_origin):
+                        return (
+                            "目前无法确认具体发起人，因此没有开始任务。"
+                            "请在同一个群里重新发送一次。"
+                        )
+                    control_origin = dict(candidate_origin)
+                    control_origin["operation_slot"] = "slash"
+                    control_origin["short_handoff_policy"] = _scope_decision[
+                        "task_policy_json"
+                    ]
 
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            output = await asyncio.to_thread(
+                run_slash,
+                text,
+                control_origin=control_origin,
+                mutation_identity=mutation_identity,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
@@ -469,8 +983,8 @@ class GatewaySlashCommandsMixin:
         # can call /kanban notify-subscribe explicitly.
         if is_create and output:
             m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
-            if m:
-                task_id = m.group(1)
+            task_id = m.group(1) if m else ""
+            if task_id:
                 try:
                     source = event.source
                     platform = getattr(source, "platform", None)
@@ -1127,6 +1641,13 @@ class GatewaySlashCommandsMixin:
                 ", ".join(sibling_keys),
             )
             return EphemeralReply(t("gateway.stop.stopped"))
+
+        bg = await self._route_background_kanban_control(
+            event, kind="stop", message="用户已要求停止这项短任务。"
+        )
+        bg_reply = self._background_kanban_control_reply(bg)
+        if bg_reply:
+            return EphemeralReply(bg_reply)
 
         # No running agent anywhere for this scope. A platform status
         # indicator can still be stuck — e.g. Slack's persistent

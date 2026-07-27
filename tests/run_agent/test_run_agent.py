@@ -1204,6 +1204,22 @@ class TestInterrupt:
             agent.interrupt("new question")
             assert agent._interrupt_message == "new question"
 
+    def test_ordinary_interrupt_preserves_one_argument_child_contract(
+        self, agent
+    ):
+        calls = []
+
+        class OrdinaryChild:
+            def interrupt(self, message):
+                calls.append(message)
+
+        with agent._active_children_lock:
+            agent._active_children = [OrdinaryChild()]
+        with patch("run_agent._set_interrupt"):
+            assert agent.interrupt("new question") is True
+
+        assert calls == ["new question"]
+
     def test_clear_interrupt(self, agent):
         with patch("run_agent._set_interrupt"):
             agent.interrupt("msg")
@@ -3254,6 +3270,49 @@ class TestConcurrentToolExecution:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
+
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments"),
+        [
+            ("write_file", '{"path":"managed.txt","content":"hello"}'),
+            (
+                "patch",
+                '{"path":"managed.txt","old_string":"a","new_string":"b"}',
+            ),
+        ],
+    )
+    def test_managed_file_mutation_executes_without_checkpoint_git(
+        self, agent, monkeypatch, tool_name, arguments
+    ):
+        """Managed writes remain usable but never touch the shadow Git store."""
+        tool_call = _mock_tool_call(
+            name=tool_name,
+            arguments=arguments,
+            call_id="managed-file-call",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        agent._managed_short_task_bootstrap = True
+        agent._managed_short_task_bootstrap_verified = True
+        agent._checkpoint_mgr.enabled = True
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            return_value='{"success": true}',
+        ) as execute:
+            with patch.object(
+                agent._checkpoint_mgr, "ensure_checkpoint"
+            ) as checkpoint:
+                agent._execute_tool_calls_sequential(
+                    mock_msg, messages, "task-1"
+                )
+
+        execute.assert_called_once()
+        checkpoint.assert_not_called()
 
     def test_sequential_blocked_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
         """Blocked pre_tool_call decisions still terminate observer tool spans."""
@@ -5997,6 +6056,61 @@ class TestRunConversation:
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
+        assert call.kwargs.get("summary") == "Could not finish — budget exhausted."
+
+    def test_successful_managed_terminal_tool_exits_without_second_model_call(
+        self, agent, monkeypatch
+    ):
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_managed")
+        agent._managed_short_task_bootstrap = True
+        agent._managed_short_task_bootstrap_verified = True
+        agent.valid_tool_names.add("kanban_complete")
+        terminal_call = _mock_tool_call(
+            name="kanban_complete",
+            arguments='{"summary":"done"}',
+            call_id="terminal-1",
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[terminal_call],
+        )
+        context_hook = MagicMock(name="context_hook")
+        plugin_hook = MagicMock(name="plugin_hook", return_value=[])
+        agent._sync_external_memory_for_turn = MagicMock(name="memory_sync")
+        agent._spawn_background_review = MagicMock(name="background_review")
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps({"ok": True, "task_id": "t_managed"}),
+            ),
+            patch(
+                "agent.conversation_loop._notify_context_engine_turn_complete",
+                context_hook,
+            ),
+            patch("hermes_cli.plugins.invoke_hook", plugin_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("finish the managed task")
+
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "kanban_terminal_transition"
+        assert agent._suppress_session_end_learning is True
+        context_hook.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+        agent._spawn_background_review.assert_not_called()
+        forbidden_hooks = {
+            "transform_llm_output", "post_llm_call", "on_session_end"
+        }
+        assert all(
+            not call.args or call.args[0] not in forbidden_hooks
+            for call in plugin_hook.call_args_list
+        )
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK

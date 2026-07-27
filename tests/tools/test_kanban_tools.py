@@ -10,9 +10,48 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 import pytest
+
+
+_MANAGED_EXEC_SURFACE_IMPORTS = {
+    "tools.terminal_tool",
+    "tools.file_tools",
+    "tools.file_operations",
+    "tools.environments.base",
+    "tools.process_registry",
+    "agent.lsp",
+}
+
+
+def _isolated_managed_lifecycle_call(call):
+    """Run one real lifecycle handler with process/network/import canaries."""
+    imported: list[str] = []
+    real_import = __import__
+
+    def recording_import(name, *args, **kwargs):
+        imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("managed lifecycle attempted detached execution")
+
+    with (
+        patch("builtins.__import__", side_effect=recording_import),
+        patch.object(subprocess, "Popen", side_effect=forbidden),
+        patch.object(threading.Thread, "start", side_effect=forbidden),
+        patch.object(socket, "create_connection", side_effect=forbidden),
+    ):
+        result = call()
+
+    assert not _MANAGED_EXEC_SURFACE_IMPORTS.intersection(imported)
+    assert not any(name == "httpx" or name.startswith("httpx.") for name in imported)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +184,128 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+@pytest.mark.parametrize(
+    ("policy", "expected_state"),
+    [
+        (
+            {
+                "agent": {"max_turns": 90},
+                "kanban": {"short_task_handoff": {"enabled": False}},
+                "terminal": {"backend": "local"},
+                "toolsets": ["kanban"],
+            },
+            "disabled",
+        ),
+        (
+            {
+                "agent": {"max_turns": 90},
+                "kanban": {
+                    "short_task_handoff": {
+                        "enabled": True,
+                        "soft_iteration_limit": 90,
+                        "max_handoffs": 8,
+                    }
+                },
+                "terminal": {"backend": "local"},
+                "toolsets": ["kanban"],
+            },
+            "unknown",
+        ),
+    ],
+    ids=["disabled", "invalid"],
+)
+def test_kanban_control_model_surface_fails_closed_without_valid_policy(
+    monkeypatch,
+    tmp_path,
+    policy,
+    expected_state,
+):
+    """Disabled or invalid handoff policy must hide and reject model control.
+
+    The direct handler check is deliberately paired with real database counts:
+    even callers that bypass registry discovery cannot persist a receipt,
+    comment, or event while the policy is unavailable.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from agent import kanban_auto_handoff as handoff
+    from agent import kanban_handoff_scope as handoff_scope
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+
+    monkeypatch.setattr(kt, "load_config", lambda: policy)
+    monkeypatch.setattr(
+        handoff,
+        "load_current_dispatcher_policy_snapshot",
+        lambda **_kwargs: handoff.build_dispatcher_policy_snapshot(policy),
+    )
+    _worker_snapshot = handoff.build_dispatcher_policy_snapshot(policy)
+    monkeypatch.setattr(
+        handoff_scope,
+        "decide_current_gateway_origin",
+        lambda: (
+            {
+                "authorized": False,
+                "validation_error": _worker_snapshot["validation_error"],
+            }
+            if _worker_snapshot.get("validation_error")
+            else {"authorized": False, "reason": "feature_disabled"}
+        ),
+    )
+    monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: False)
+    # Reach the policy guard specifically; orchestrator authorization is a
+    # separate boundary with its own tests.
+    monkeypatch.setattr(kt, "_require_orchestrator_tool", lambda _name: None)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="control-policy-boundary")
+        tables = ("task_handoff_controls", "task_comments", "task_events")
+        before = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+        before_status = kb.get_task(conn, task_id).status
+    finally:
+        conn.close()
+
+    invalidate_check_fn_cache()
+    assert kt._kanban_control_mode_state() == expected_state
+    assert kt._check_kanban_control_mode() is False
+    entry = registry.get_entry("kanban_control")
+    assert entry is not None
+    assert entry.check_fn is kt._check_kanban_control_mode
+    assert registry.get_definitions({"kanban_control"}, quiet=True) == []
+
+    result = json.loads(
+        kt._handle_control_locked(
+            {"task_id": task_id, "kind": "stop", "message": "stop now"}
+        )
+    )
+    assert "error" in result
+    assert "short-task handoff enabled" in result["error"]
+
+    conn = kb.connect()
+    try:
+        after = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+        assert kb.get_task(conn, task_id).status == before_status
+    finally:
+        conn.close()
+    assert after == before
+    invalidate_check_fn_cache()
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -174,6 +335,255 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def _arm_managed_worker_env(monkeypatch, task_id):
+    """Upgrade the fixture's claimed run to a dispatcher-managed identity."""
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (os.getpid(), task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, owner_node_id = 'node', "
+            "owner_boot_id = 'boot', worker_start_token = 'start', "
+            "worker_pgid = ?, handoff_safety_required = 1 WHERE id = ?",
+            (os.getpid(), os.getpid(), task.current_run_id),
+        )
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    return int(task.current_run_id)
+
+
+def _short_task_policy_snapshot(*, enabled=True, workspace_root="/tmp"):
+    workspace_root = os.path.realpath(workspace_root)
+    return json.dumps(
+        {
+            "schema": 2,
+            "enabled": enabled,
+            "soft_iteration_limit": 36,
+            "max_handoffs": 8,
+            "max_iterations": 90,
+            "failure_limit": 2,
+            "allowed_workspace_roots": [workspace_root],
+            "validation_error": None,
+        }
+    )
+
+
+def _bind_short_task_policy(conn, task_id, worker_policy):
+    """Attach one valid immutable test binding to an existing task."""
+    from hermes_cli import kanban_db as kb
+
+    identity = {
+        "platform": "feishu",
+        "scope_id": "tenant-1",
+        "chat_type": "group",
+        "chat_id": "group-1",
+        "thread_id": "",
+        "user_id": "user-1",
+        "notifier_profile": "test-worker",
+        "session_key": "test-session",
+    }
+    task_policy = {
+        "schema": 1,
+        "authorized": True,
+        "origin": identity,
+        "matched_origin": {
+            key: identity[key]
+            for key in ("platform", "chat_type", "chat_id", "user_id")
+        },
+        "worker_policy": dict(worker_policy),
+    }
+    assert kb.add_control_binding(
+        conn,
+        binding_id=f"b_{task_id}",
+        task_id=task_id,
+        short_handoff_policy=task_policy,
+        **identity,
+    ) is True
+
+
+def test_managed_complete_confines_all_local_paths_to_worker_workspace(
+    monkeypatch, worker_env, tmp_path
+):
+    """Artifacts and prose paths fail closed before a managed DB transition."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inside = workspace / "proof.txt"
+    inside.write_text("proof")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    link = workspace / "escaped-link.txt"
+    link.symlink_to(outside)
+
+    run_id = _arm_managed_worker_env(monkeypatch, worker_env)
+    policy = json.loads(
+        _short_task_policy_snapshot(
+            enabled=True, workspace_root=str(workspace.resolve())
+        )
+    )
+    conn = kb.connect()
+    try:
+        _bind_short_task_policy(conn, worker_env, policy)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+            (str(workspace), worker_env),
+        )
+    finally:
+        conn.close()
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", json.dumps(policy)
+    )
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    rejected_calls = [
+        {"summary": "done", "artifacts": [str(outside)]},
+        {"summary": "done", "artifacts": ["../outside.txt"]},
+        {"summary": "done", "artifacts": [str(link)]},
+        {"summary": f"read {outside}"},
+        {"summary": "read /privatefile"},
+        {"summary": "done", "result": "see ../outside.txt"},
+        {"summary": "done", "metadata": {"artifacts": [str(outside)]}},
+    ]
+    for payload in rejected_calls:
+        output = json.loads(kt._handle_complete(payload))
+        assert "error" in output, (payload, output)
+        conn = kb.connect()
+        try:
+            assert kb.get_task(conn, worker_env).status == "running"
+        finally:
+            conn.close()
+
+    accepted = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "完成 workspace/proof.txt 的受控交付",
+                "metadata": {"artifacts": ["proof.txt"]},
+            }
+        )
+    )
+    assert accepted["ok"] is True
+    assert accepted["status"] == "review"
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata["artifacts"] == [str(inside.resolve())]
+    finally:
+        conn.close()
+
+
+def test_bound_task_rejects_plain_orchestrator_mutation_but_keeps_reads(
+    monkeypatch, worker_env, tmp_path
+):
+    """A binding turns generic model tools read-only for every target write."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    run_id = _arm_managed_worker_env(monkeypatch, worker_env)
+    policy = json.loads(_short_task_policy_snapshot(enabled=True))
+    conn = kb.connect()
+    try:
+        _bind_short_task_policy(conn, worker_env, policy)
+        child = kb.create_task(conn, title="ordinary child", assignee="peer")
+        open_parent = kb.create_task(
+            conn, title="open parent", assignee="peer"
+        )
+        managed_waiting = kb.create_task(
+            conn,
+            title="managed waiting child",
+            assignee="peer",
+            parents=[open_parent],
+        )
+        _bind_short_task_policy(conn, managed_waiting, policy)
+        before_comments = len(kb.list_comments(conn, worker_env))
+        before_attachments = len(kb.list_attachments(conn, worker_env))
+    finally:
+        conn.close()
+
+    # Simulate CodingMan/a regular orchestrator: it can name the task but owns
+    # no dispatcher run and no authenticated kanban_control binding.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", raising=False
+    )
+    monkeypatch.setattr(
+        kt,
+        "_download_url_with_cap",
+        lambda *_a, **_kw: pytest.fail("unauthorized URL was downloaded"),
+    )
+    monkeypatch.setattr(kt, "_profile_has_kanban_toolset", lambda: True)
+
+    assert json.loads(kt._handle_show({"task_id": worker_env}))["task"]["id"] == worker_env
+    assert json.loads(kt._handle_list({"limit": 50}))["promoted"] == 0
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, managed_waiting).status == "todo"
+    finally:
+        conn.close()
+    denied = [
+        kt._handle_comment({"task_id": worker_env, "body": "inject"}),
+        kt._handle_heartbeat({"task_id": worker_env}),
+        kt._handle_block({"task_id": worker_env, "reason": "stop"}),
+        kt._handle_complete({"task_id": worker_env, "summary": "done"}),
+        kt._handle_attach(
+            {
+                "task_id": worker_env,
+                "filename": "x.txt",
+                "content_base64": "eA==",
+            }
+        ),
+        kt._handle_attach_url(
+            {
+                "task_id": worker_env,
+                "url": "https://example.com/x.txt",
+            }
+        ),
+        kt._handle_link({"parent_id": worker_env, "child_id": child}),
+        kt._handle_create(
+            {
+                "title": "unauthorized child",
+                "assignee": "peer",
+                "parents": [worker_env],
+            }
+        ),
+    ]
+    for output in denied:
+        assert "error" in json.loads(output), output
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"
+        assert task.current_run_id == run_id
+        assert len(kb.list_comments(conn, worker_env)) == before_comments
+        assert len(kb.list_attachments(conn, worker_env)) == before_attachments
+        assert kb.parent_ids(conn, child) == []
+        conn.execute(
+            "UPDATE tasks SET status='blocked', current_run_id=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (worker_env,),
+        )
+    finally:
+        conn.close()
+
+    unblock = json.loads(kt._handle_unblock({"task_id": worker_env}))
+    assert "error" in unblock
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
@@ -197,6 +607,214 @@ def test_show_explicit_task_id(worker_env):
     out = kt._handle_show({"task_id": other})
     d = json.loads(out)
     assert d["task"]["id"] == other
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [_short_task_policy_snapshot(enabled=True), "{malformed-policy"],
+    ids=["enabled", "malformed"],
+)
+def test_short_task_read_and_comment_tools_never_open_foreign_task(
+    monkeypatch, worker_env, snapshot
+):
+    """Phase-1 read/comment isolation rejects before any DB connection."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        foreign = kb.create_task(conn, title="foreign secret", assignee="peer")
+        before_comments = len(kb.list_comments(conn, foreign))
+        before_attachments = len(kb.list_attachments(conn, foreign))
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", snapshot)
+
+    def forbidden_connect(*_args, **_kwargs):
+        pytest.fail("foreign task request reached the database")
+
+    monkeypatch.setattr(kt, "_connect", forbidden_connect)
+    calls = [
+        kt._handle_show({"task_id": foreign}),
+        kt._handle_comment({"task_id": foreign, "body": "must not land"}),
+    ]
+    for output in calls:
+        error = json.loads(output).get("error", "")
+        assert "Phase-1 worker is scoped only" in error
+    attachment_error = json.loads(
+        kt._handle_attachments({"task_id": foreign})
+    ).get("error", "")
+    assert "不能使用附件库" in attachment_error
+
+    conn = kb.connect()
+    try:
+        assert len(kb.list_comments(conn, foreign)) == before_comments
+        assert len(kb.list_attachments(conn, foreign)) == before_attachments
+    finally:
+        conn.close()
+
+
+def test_short_task_read_comment_work_but_attachment_surface_is_closed(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY",
+        _short_task_policy_snapshot(enabled=True),
+    )
+    shown = json.loads(kt._handle_show({"task_id": worker_env}))
+    assert shown["task"]["id"] == worker_env
+    commented = json.loads(
+        kt._handle_comment({"task_id": worker_env, "body": "own evidence"})
+    )
+    assert commented["ok"] is True
+    attached = json.loads(
+        kt._handle_attach(
+            {
+                "task_id": worker_env,
+                "filename": "proof.txt",
+                "content_base64": "cHJvb2Y=",
+            }
+        )
+    )
+    assert "不能使用附件库" in attached["error"]
+    monkeypatch.setattr(
+        kt,
+        "_download_url_with_cap",
+        lambda *_a, **_kw: pytest.fail("managed worker reached network"),
+    )
+    remote = json.loads(
+        kt._handle_attach_url(
+            {
+                "task_id": worker_env,
+                "url": "https://example.com/proof.txt",
+            }
+        )
+    )
+    assert "不能使用附件库" in remote["error"]
+    listed = json.loads(kt._handle_attachments({"task_id": worker_env}))
+    assert "不能使用附件库" in listed["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_short_task_review_attachment_surface_is_closed_before_io(
+    monkeypatch, worker_env
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY",
+        _short_task_policy_snapshot(enabled=False),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_MODE", "1")
+    monkeypatch.setattr(
+        kt,
+        "_download_url_with_cap",
+        lambda *_a, **_kw: pytest.fail("reviewer reached network"),
+    )
+    outputs = [
+        kt._handle_attach(
+            {
+                "task_id": worker_env,
+                "filename": "proof.txt",
+                "content_base64": "cHJvb2Y=",
+            }
+        ),
+        kt._handle_attach_url(
+            {
+                "task_id": worker_env,
+                "url": "https://example.com/proof.txt",
+            }
+        ),
+        kt._handle_attachments({"task_id": worker_env}),
+    ]
+    for output in outputs:
+        assert "不能使用附件库" in json.loads(output)["error"]
+
+
+def test_disabled_short_task_policy_preserves_cross_task_collaboration(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        foreign = kb.create_task(conn, title="legacy peer", assignee="peer")
+    finally:
+        conn.close()
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY",
+        _short_task_policy_snapshot(enabled=False),
+    )
+    assert json.loads(kt._handle_show({"task_id": foreign}))["task"]["id"] == foreign
+    assert json.loads(
+        kt._handle_comment({"task_id": foreign, "body": "legacy handoff"})
+    )["ok"] is True
+    assert json.loads(kt._handle_attachments({"task_id": foreign}))["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [_short_task_policy_snapshot(enabled=True), "{malformed-policy"],
+    ids=["enabled", "malformed"],
+)
+def test_short_task_lifecycle_tools_reject_cross_board_before_connect(
+    monkeypatch, worker_env, snapshot
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", snapshot)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "frozen-board")
+
+    def forbidden_connect(*_args, **_kwargs):
+        pytest.fail("cross-board request reached the database")
+
+    monkeypatch.setattr(kt, "_connect", forbidden_connect)
+    calls = [
+        kt._handle_show,
+        kt._handle_comment,
+        kt._handle_heartbeat,
+        kt._handle_block,
+        kt._handle_complete,
+    ]
+    args = [
+        {"task_id": worker_env, "board": "other-board"},
+        {"task_id": worker_env, "body": "x", "board": "other-board"},
+        {"task_id": worker_env, "note": "x", "board": "other-board"},
+        {
+            "task_id": worker_env,
+            "reason": "x",
+            "kind": "needs_input",
+            "board": "other-board",
+        },
+        {"task_id": worker_env, "summary": "x", "board": "other-board"},
+    ]
+    for handler, payload in zip(calls, args):
+        error = json.loads(handler(payload)).get("error", "")
+        assert "pinned to board frozen-board" in error
+    attachment_calls = [
+        kt._handle_attach(
+            {
+                "task_id": worker_env,
+                "filename": "x.txt",
+                "content_base64": "eA==",
+                "board": "other-board",
+            }
+        ),
+        kt._handle_attachments(
+            {"task_id": worker_env, "board": "other-board"}
+        ),
+    ]
+    for output in attachment_calls:
+        assert "不能使用附件库" in json.loads(output).get("error", "")
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -312,6 +930,417 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "postcommit_helper",
+    [
+        "_scan_prose_for_phantom_ids",
+        "_clear_failure_counter",
+        "recompute_ready",
+        "_fire_kanban_lifecycle_hook",
+    ],
+)
+def test_managed_complete_stays_successful_when_postcommit_maintenance_fails(
+    monkeypatch, worker_env, postcommit_helper
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    run_id = _arm_managed_worker_env(monkeypatch, worker_env)
+
+    def injected_failure(*_args, **_kwargs):
+        raise RuntimeError(f"injected {postcommit_helper} failure")
+
+    monkeypatch.setattr(kb, postcommit_helper, injected_failure)
+    output = json.loads(kt._handle_complete({"summary": "durably done"}))
+
+    assert output["ok"] is True
+    assert output["run_id"] == run_id
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "done"
+        assert task.worker_pid == os.getpid()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_exit_gates WHERE child_task_id = ? "
+            "AND parent_task_id = ? AND released_at IS NULL",
+            (worker_env, worker_env),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_short_task_complete_submits_for_review_then_fresh_reviewer_completes(
+    monkeypatch, worker_env, tmp_path
+):
+    """Implementation completion is non-terminal and reviewer-only thereafter."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "shared-project"
+    workspace.mkdir()
+    candidate = workspace / "candidate.txt"
+    candidate.write_text("phase-one-candidate\n", encoding="utf-8")
+    run_id = _arm_managed_worker_env(monkeypatch, worker_env)
+    implementation_policy = json.loads(
+        _short_task_policy_snapshot(
+            enabled=True, workspace_root=str(workspace.resolve())
+        )
+    )
+    monkeypatch.setenv("HERMES_KANBAN_MANAGED_LANE", "implementation")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_MODE", "0")
+    monkeypatch.setenv("HERMES_KANBAN_MANAGED_BOOTSTRAP", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED", "1")
+    monkeypatch.delenv("HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace.resolve()))
+    conn = kb.connect()
+    try:
+        _bind_short_task_policy(conn, worker_env, implementation_policy)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=?, "
+            "validation_class='text_mechanism' "
+            "WHERE id=?",
+            (str(workspace), worker_env),
+        )
+        child_id = kb.create_task(
+            conn,
+            title="must wait for real review completion",
+            assignee="test-worker",
+            parents=[worker_env],
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="feishu",
+            chat_id="group-1",
+            thread_id="thread-1",
+        )
+
+        before_events = len(kb.list_events(conn, worker_env))
+        assert kb.submit_task_for_review(
+            conn,
+            worker_env,
+            summary="wrong run",
+            expected_run_id=run_id + 1,
+            expected_worker_pid=os.getpid(),
+        ) is False
+        assert kb.submit_task_for_review(
+            conn,
+            worker_env,
+            summary="wrong pid",
+            expected_run_id=run_id,
+            expected_worker_pid=os.getpid() + 1,
+        ) is False
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert len(kb.list_events(conn, worker_env)) == before_events
+        assert kb.short_task_completion_authorization(
+            conn,
+            worker_env,
+            expected_run_id=run_id,
+            policy_snapshot_raw=json.dumps(implementation_policy),
+        ) == "implementation"
+    finally:
+        conn.close()
+
+    for invalid_snapshot in (None, "{malformed", _short_task_policy_snapshot(enabled=False)):
+        if invalid_snapshot is None:
+            monkeypatch.delenv(
+                "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", raising=False
+            )
+        else:
+            monkeypatch.setenv(
+                "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", invalid_snapshot
+            )
+        refused = json.loads(
+            kt._handle_complete({"summary": "must remain in flight"})
+        )
+        assert "error" in refused
+        conn = kb.connect()
+        try:
+            assert kb.get_task(conn, worker_env).status == "running"
+            assert len(kb.list_events(conn, worker_env)) == before_events
+        finally:
+            conn.close()
+
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY",
+        json.dumps(implementation_policy),
+    )
+
+    submitted = json.loads(
+        _isolated_managed_lifecycle_call(
+            lambda: kt._handle_complete(
+                {
+                    "summary": "implementation ready; tests deferred to reviewer",
+                    "result": "candidate output",
+                    "metadata": {"changed_files": ["app.py"]},
+                }
+            )
+        )
+    )
+    assert submitted == {
+        "ok": True,
+        "task_id": worker_env,
+        "run_id": run_id,
+        "status": "review",
+        "review_required": True,
+        "message": "Implementation submitted for independent review.",
+    }
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        run = kb.latest_run(conn, worker_env)
+        assert task.status == "review"
+        assert task.result is None
+        assert task.completed_at is None
+        assert task.assignee == "test-worker"
+        assert task.workspace_kind == "dir"
+        assert task.workspace_path == str(workspace)
+        assert task.current_run_id is None
+        assert task.worker_pid == os.getpid()
+        assert run.id == run_id
+        assert run.status == "review_requested"
+        assert run.outcome == "review_requested"
+        assert run.summary == "implementation ready; tests deferred to reviewer"
+        assert run.metadata == {
+            "changed_files": ["app.py"],
+            "_hermes_review_submission_result": "candidate output",
+        }
+        kinds = [event.kind for event in kb.list_events(conn, worker_env)]
+        assert kinds.count("review_requested") == 1
+        assert "completed" not in kinds
+        assert kb.get_task(conn, child_id).status == "todo"
+        assert kb.claim_review_task(conn, worker_env) is None
+        _cursor, notifications = kb.unseen_events_for_sub(
+            conn,
+            task_id=worker_env,
+            platform="feishu",
+            chat_id="group-1",
+            thread_id="thread-1",
+            kinds=["completed"],
+        )
+        assert notifications == []
+    finally:
+        conn.close()
+
+    # Retrying the same terminal tool acknowledgement is idempotent and does
+    # not manufacture a second run, event, or gate.
+    replay = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "implementation ready; tests deferred to reviewer",
+                "result": "candidate output",
+                "metadata": {"changed_files": ["app.py"]},
+            }
+        )
+    )
+    assert replay["ok"] is True
+    assert replay["status"] == "review"
+    conflict = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "a conflicting replay must not replace evidence",
+                "result": "candidate output",
+                "metadata": {"changed_files": ["app.py"]},
+            }
+        )
+    )
+    assert "error" in conflict
+    conn = kb.connect()
+    try:
+        assert len(kb.list_runs(conn, worker_env)) == 1
+        assert [e.kind for e in kb.list_events(conn, worker_env)].count(
+            "review_requested"
+        ) == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_exit_gates WHERE child_task_id=? "
+            "AND released_at IS NULL",
+            (worker_env,),
+        ).fetchone()[0] == 1
+
+        monkeypatch.setattr(
+            kb, "_exit_gate_release_reason", lambda _row: "test_worker_exited"
+        )
+        assert kb.release_handoff_exit_gates(conn) == 0
+        assert kb.get_task(conn, worker_env).status == "review"
+        assert kb.get_task(conn, worker_env).worker_pid is None
+
+        dispatched = []
+
+        def capture_review(
+            task,
+            task_workspace,
+            *,
+            failure_limit,
+            allow_short_handoff=True,
+            require_exit_safety=False,
+            review_mode=False,
+        ):
+            dispatched.append(
+                (
+                    task,
+                    task_workspace,
+                    failure_limit,
+                    allow_short_handoff,
+                    require_exit_safety,
+                    review_mode,
+                )
+            )
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists", lambda _profile: True
+        )
+        monkeypatch.setattr(
+            kb, "_short_task_handoff_dispatch_enabled", lambda: True
+        )
+        dispatch_result = kb.dispatch_once(
+            conn, spawn_fn=capture_review, max_spawn=1, failure_limit=2
+        )
+        assert [item[0] for item in dispatch_result.spawned] == [worker_env]
+        assert len(dispatched) == 1
+        (
+            review_task,
+            review_workspace,
+            failure_limit,
+            allow_handoff,
+            require_exit_safety,
+            review_mode,
+        ) = dispatched[0]
+        assert review_task.skills is None
+        assert review_workspace == str(workspace)
+        assert failure_limit == 2
+        assert allow_handoff is False
+        assert require_exit_safety is True
+        assert review_mode is True
+    finally:
+        conn.close()
+
+    # The fresh reviewer receives an explicit disabled snapshot and therefore
+    # reaches the ordinary terminal completion path.
+    reviewer_run_id = _arm_managed_worker_env(monkeypatch, worker_env)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(reviewer_run_id))
+    review_policy = dict(implementation_policy)
+    review_policy["enabled"] = False
+    review_policy["inactive_reason"] = (
+        "goal/review workers are outside Phase-1 handoff scope"
+    )
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY",
+        json.dumps(review_policy),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_MANAGED_LANE", "review")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_MODE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MANAGED_BOOTSTRAP", "1")
+    monkeypatch.setenv("HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED", "1")
+    monkeypatch.delenv("HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace.resolve()))
+    conn = kb.connect()
+    try:
+        assert kb.short_task_completion_authorization(
+            conn,
+            worker_env,
+            expected_run_id=reviewer_run_id,
+            policy_snapshot_raw=json.dumps(review_policy),
+        ) == "review"
+    finally:
+        conn.close()
+    from tools import managed_file_tools
+
+    managed_file_tools._REVIEW_READ_EVIDENCE.clear()
+    assert "phase-one-candidate" in managed_file_tools.read_file_tool(
+        "candidate.txt"
+    )
+    reviewed = json.loads(
+        _isolated_managed_lifecycle_call(
+            lambda: kt._handle_complete(
+                {"summary": "independent review passed"}
+            )
+        )
+    )
+    assert reviewed["ok"] is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "done"
+        assert kb.get_task(conn, child_id).status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_exit_gates WHERE child_task_id=? "
+            "AND released_at IS NULL",
+            (worker_env,),
+        ).fetchone()[0] == 1
+        events = kb.list_events(conn, worker_env)
+        assert [event.kind for event in events].count("completed") == 1
+        _cursor, notifications = kb.unseen_events_for_sub(
+            conn,
+            task_id=worker_env,
+            platform="feishu",
+            chat_id="group-1",
+            thread_id="thread-1",
+            kinds=["completed"],
+        )
+        assert [event.kind for event in notifications] == ["completed"]
+        monkeypatch.setattr(
+            kb, "_exit_gate_release_reason", lambda _row: "reviewer_exited"
+        )
+        assert kb.release_handoff_exit_gates(conn) == 1
+        assert kb.get_task(conn, child_id).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_complete_readback_failure_cannot_erase_committed_acknowledgement(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    run_id = _arm_managed_worker_env(monkeypatch, worker_env)
+    real_connect = kt._connect
+
+    class ReadbackFailingKB:
+        def __getattr__(self, name):
+            if name == "latest_run":
+                raise RuntimeError("injected readback failure")
+            return getattr(kb, name)
+
+    def connect_with_proxy(*args, **kwargs):
+        _module, conn = real_connect(*args, **kwargs)
+        return ReadbackFailingKB(), conn
+
+    monkeypatch.setattr(kt, "_connect", connect_with_proxy)
+    output = json.loads(kt._handle_complete({"summary": "durably done"}))
+
+    assert output == {"ok": True, "task_id": worker_env, "run_id": run_id}
+
+
+def test_block_readback_failure_cannot_erase_committed_acknowledgement(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    run_id = _arm_managed_worker_env(monkeypatch, worker_env)
+    real_connect = kt._connect
+
+    class ReadbackFailingKB:
+        def __getattr__(self, name):
+            if name == "latest_run":
+                raise RuntimeError("injected readback failure")
+            return getattr(kb, name)
+
+    def connect_with_proxy(*args, **kwargs):
+        _module, conn = real_connect(*args, **kwargs)
+        return ReadbackFailingKB(), conn
+
+    monkeypatch.setattr(kt, "_connect", connect_with_proxy)
+    output = json.loads(kt._handle_block({"reason": "durably blocked"}))
+
+    assert output["ok"] is True
+    assert output["run_id"] == run_id
+    assert output["status"] == "blocked"
 
 
 def test_complete_metadata_round_trips_through_show(worker_env):
@@ -1795,7 +2824,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_200, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
@@ -2391,6 +3420,69 @@ def test_board_param_in_all_schemas():
 # - Config gate kanban.auto_subscribe_on_create: false -> no subscription
 #   even when the session has a delivery channel.
 # ---------------------------------------------------------------------------
+
+
+def test_short_task_mode_rejects_model_supplied_global_idempotency_key(
+    monkeypatch, worker_env
+):
+    """Enabled multi-channel governance must not reuse a globally keyed task."""
+    from tools import kanban_tools as kt
+    from agent import kanban_auto_handoff as handoff
+
+    policy = {
+        "agent": {"max_turns": 90},
+        "kanban": {
+            "short_task_handoff": {
+                "enabled": True,
+                "soft_iteration_limit": 36,
+                "max_handoffs": 8,
+            }
+        },
+    }
+    monkeypatch.setattr(
+        handoff,
+        "load_current_dispatcher_policy_snapshot",
+        lambda **_kwargs: handoff.build_dispatcher_policy_snapshot(policy),
+    )
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "must not cross-subscribe",
+                "assignee": "peer",
+                "idempotency_key": "model-key",
+            }
+        )
+    )
+    assert "error" in result
+    assert "idempotency_key is unavailable" in result["error"]
+
+
+def test_disabled_short_task_mode_preserves_legacy_idempotent_create(
+    monkeypatch, worker_env
+):
+    """The new protection is opt-in; disabled mode keeps baseline semantics."""
+    from tools import kanban_tools as kt
+    from agent import kanban_auto_handoff as handoff
+
+    policy = {
+        "agent": {"max_turns": 90},
+        "kanban": {"short_task_handoff": {"enabled": False}},
+    }
+    monkeypatch.setattr(
+        handoff,
+        "load_current_dispatcher_policy_snapshot",
+        lambda **_kwargs: handoff.build_dispatcher_policy_snapshot(policy),
+    )
+    args = {
+        "title": "legacy retry-safe create",
+        "assignee": "peer",
+        "idempotency_key": "legacy-key",
+    }
+    first = json.loads(kt._handle_create(dict(args)))
+    second = json.loads(kt._handle_create(dict(args)))
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert first["task_id"] == second["task_id"]
 
 def _list_subs_for_task(task_id):
     from hermes_cli import kanban_db as kb

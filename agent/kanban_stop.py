@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -35,33 +36,47 @@ def kanban_stop_nudge_enabled() -> bool:
     return bool(task)
 
 
-def _tool_call_name(tc: Any) -> str:
-    if isinstance(tc, dict):
-        fn = tc.get("function")
-        if isinstance(fn, dict):
-            return str(fn.get("name") or "")
-        return str(tc.get("name") or "")
-    fn = getattr(tc, "function", None)
-    if fn is not None:
-        return str(getattr(fn, "name", "") or "")
-    return str(getattr(tc, "name", "") or "")
+def _terminal_result_succeeded(content: Any) -> bool:
+    """Reject error/cancel/skip results; accept explicit or legacy success."""
+    value = content
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        if (
+            lowered.startswith("error")
+            or lowered.startswith("[tool execution skipped")
+            or lowered.startswith("[tool execution cancelled")
+        ):
+            return False
+        try:
+            value = json.loads(text)
+        except Exception:
+            return True
+    if isinstance(value, dict):
+        if value.get("error"):
+            return False
+        if value.get("ok") is False or value.get("success") is False:
+            return False
+        return value.get("ok") is True or value.get("success") is True
+    return False
 
 
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True only after a terminal Kanban tool returned successful evidence."""
     if not messages:
         return False
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
-        if role == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
-                    return True
-        elif role == "tool":
+        if role == "tool":
             name = str(msg.get("name") or "")
-            if name in _TERMINAL_KANBAN_TOOLS:
+            if (
+                name in _TERMINAL_KANBAN_TOOLS
+                and _terminal_result_succeeded(msg.get("content"))
+            ):
                 return True
     return False
 

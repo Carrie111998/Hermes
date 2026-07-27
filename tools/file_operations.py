@@ -1294,6 +1294,46 @@ class ShellFileOperations(FileOperations):
         if denied:
             return WriteResult(error=denied)
 
+        # Managed Phase-1 patches are local, workspace-contained file edits.
+        # Do not shell out to ``python -c`` here: even with a sanitized PATH,
+        # CPython can import ``sitecustomize`` from its working directory before
+        # the deletion snippet starts.  Resolve and delete in this already-
+        # gated Hermes process instead, with a second containment check.
+        try:
+            from tools.terminal_tool import _short_task_managed_worker_active
+
+            _managed_worker = _short_task_managed_worker_active()
+        except Exception:
+            _managed_worker = bool(
+                (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+                and os.environ.get("HERMES_KANBAN_MANAGED_LANE")
+            )
+        if _managed_worker:
+            workspace_raw = (
+                os.environ.get("HERMES_KANBAN_WORKSPACE") or ""
+            ).strip()
+            try:
+                workspace = Path(workspace_raw).expanduser().resolve(strict=True)
+                target = Path(path).expanduser()
+                if not target.is_absolute():
+                    target = workspace / target
+                target = target.resolve(strict=False)
+                if os.path.commonpath([str(workspace), str(target)]) != str(workspace):
+                    return WriteResult(
+                        error="Delete is outside the managed task workspace"
+                    )
+                if target.is_dir() and not target.is_symlink():
+                    if not recursive:
+                        return WriteResult(error=f"is a directory: {target}")
+                    import shutil
+
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+                return WriteResult()
+            except (OSError, RuntimeError, ValueError) as exc:
+                return WriteResult(error=f"Failed to delete {path}: {exc}")
+
         # We can't shell out to ``rm`` here — it doesn't exist on Windows
         # ``cmd.exe`` or PowerShell, so this code path is what's left when
         # the backend's terminal is a Windows shell. Path is baked into the
@@ -1743,6 +1783,40 @@ class ShellFileOperations(FileOperations):
                 return LintResult(skipped=True, message=f"No linter available for {ext} (missing dependency)")
             return LintResult(success=ok, output="" if ok else err)
 
+        # External linters are project/user executables resolved through the
+        # shell and may load plugins or spawn helpers. The bounded Phase-1 file
+        # backend permits only controlled synchronous file primitives; its
+        # independent reviewer runs the real project verification afterward.
+        try:
+            from tools.terminal_tool import _short_task_handoff_worker_enabled
+
+            _short_task_worker = (
+                os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+                or _short_task_handoff_worker_enabled(
+                    invalid_is_enabled=True
+                )
+            )
+        except Exception:
+            _short_task_worker = bool(
+                (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+                and (
+                    os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+                    or os.environ.get(
+                        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"
+                    )
+                    or os.environ.get("HERMES_KANBAN_MANAGED_LANE")
+                    == "implementation"
+                )
+            )
+        if _short_task_worker:
+            return LintResult(
+                skipped=True,
+                message=(
+                    "External lint deferred to the independent reviewer for "
+                    "automatic short-task safety"
+                ),
+            )
+
         # Fall back to shell linter.
         if ext not in LINTERS:
             return LintResult(skipped=True, message=f"No linter for {ext} files")
@@ -1888,6 +1962,33 @@ class ShellFileOperations(FileOperations):
         host-side LSP server can't reach them, so we skip the LSP
         path for those entirely.
         """
+        # Language servers are intentionally long-lived child processes. A
+        # Phase-1 automatic-handoff worker must leave no process behind when a
+        # fresh successor starts in the same checkout, so even a local backend
+        # cannot enable LSP enrichment in this bounded worker. Invalid policy
+        # snapshots fail closed; explicit enabled=false review/goal/ordinary
+        # workers retain the historical LSP behavior.
+        try:
+            from tools.terminal_tool import _short_task_handoff_worker_enabled
+
+            if (
+                os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+                or _short_task_handoff_worker_enabled(invalid_is_enabled=True)
+            ):
+                return False
+        except Exception:
+            if (
+                (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+                and (
+                    os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+                    or os.environ.get(
+                        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY"
+                    )
+                    or os.environ.get("HERMES_KANBAN_MANAGED_LANE")
+                    == "implementation"
+                )
+            ):
+                return False
         env = getattr(self, "env", None)
         if env is None:
             # Defensive: some tests construct ShellFileOperations via

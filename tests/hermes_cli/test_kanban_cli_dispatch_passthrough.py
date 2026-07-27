@@ -43,6 +43,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "max_spawn": 5,
             "default_assignee": "default",
             "max_in_progress_per_profile": 2,
+            "failure_limit": 4,
         }
     }
     monkeypatch.setattr(
@@ -57,7 +58,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
 
     monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
 
-    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=None, json=False)
     kb_cli._cmd_dispatch(args)
 
     # Every config value must have reached dispatch_once.
@@ -69,6 +70,117 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
     assert captured.get("default_assignee") == "default"
     assert captured.get("max_in_progress_per_profile") == 2
+    assert captured.get("failure_limit") == 4
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1])
+def test_cli_dispatch_rejects_invalid_explicit_failure_limit(
+    isolated_kanban_home, monkeypatch, capsys, bad_limit
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"failure_limit": 4}},
+    )
+    called = []
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda *_args, **_kwargs: called.append(True),
+    )
+
+    args = argparse.Namespace(
+        dry_run=True, max=None, failure_limit=bad_limit, json=False
+    )
+    assert kb_cli._cmd_dispatch(args) == 2
+    assert called == []
+    assert "positive integer" in capsys.readouterr().err
+
+
+def test_cli_dispatch_invalid_config_failure_limit_falls_back_to_default(
+    isolated_kanban_home, monkeypatch
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"failure_limit": 0}},
+    )
+    captured = {}
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda _conn, **kwargs: (
+            captured.update(kwargs),
+            kanban_db.DispatchResult(),
+        )[1],
+    )
+
+    args = argparse.Namespace(
+        dry_run=True, max=None, failure_limit=None, json=False
+    )
+    assert kb_cli._cmd_dispatch(args) == 0
+    assert captured["failure_limit"] == kanban_db.DEFAULT_FAILURE_LIMIT
+
+
+def test_cli_daemon_uses_configured_failure_limit(
+    isolated_kanban_home, monkeypatch
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(kanban_db, "init_db", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"failure_limit": 4}},
+    )
+    captured = {}
+    monkeypatch.setattr(
+        kb_cli,
+        "_run_guarded_daemon_loop",
+        lambda **kwargs: (captured.update(kwargs), True)[1],
+    )
+    args = argparse.Namespace(
+        force=True,
+        interval=1.0,
+        max=2,
+        failure_limit=None,
+        pidfile=None,
+        verbose=False,
+    )
+
+    assert kb_cli._cmd_daemon(args) == 0
+    assert captured["failure_limit"] == 4
+
+
+def test_cli_daemon_rejects_invalid_explicit_failure_limit(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(kanban_db, "init_db", lambda: None)
+    called = []
+    monkeypatch.setattr(
+        kb_cli,
+        "_run_guarded_daemon_loop",
+        lambda **_kwargs: (called.append(True), True)[1],
+    )
+    args = argparse.Namespace(
+        force=True,
+        interval=1.0,
+        max=2,
+        failure_limit=0,
+        pidfile=None,
+        verbose=False,
+    )
+
+    assert kb_cli._cmd_daemon(args) == 2
+    assert called == []
+    assert "positive integer" in capsys.readouterr().err
 
 
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):

@@ -37,7 +37,13 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.managed_short_task import verified_managed_short_task_lane
+
+if verified_managed_short_task_lane():
+    def automatic_compaction_status_message(*_args, **_kwargs):
+        return None
+else:
+    from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -1058,6 +1064,55 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
+
+        # User direction always wins the checkpoint boundary. A redirect is
+        # processed by at least one more model call, and a queued /steer is
+        # allowed to reach the existing pre-API injection path below before a
+        # later iteration can hand off.
+        _pending_steer_lock = getattr(agent, "_pending_steer_lock", None)
+        if _pending_steer_lock is not None:
+            with _pending_steer_lock:
+                _has_pending_steer = bool(getattr(agent, "_pending_steer", None))
+        else:
+            _has_pending_steer = bool(getattr(agent, "_pending_steer", None))
+        _steer_receipts_fn = getattr(
+            agent, "_snapshot_unconsumed_steer_receipts", None
+        )
+        _has_unconsumed_steer = bool(
+            _steer_receipts_fn()
+            if callable(_steer_receipts_fn)
+            else []
+        )
+
+        # Enabled Kanban workers checkpoint before the hard iteration ceiling
+        # and continue in a fresh child worker. The policy was frozen at agent
+        # initialization; ordinary chats and disabled workers are a strict no-op.
+        _request_auto_handoff = False
+        if (
+            not _redirect_text
+            and not _has_pending_steer
+            and not _has_unconsumed_steer
+        ):
+            try:
+                from agent.kanban_auto_handoff import (
+                    AUTO_HANDOFF_EXIT_REASON,
+                    should_request_handoff,
+                )
+
+                _request_auto_handoff = should_request_handoff(
+                    policy=getattr(agent, "_kanban_auto_handoff_policy", None),
+                    api_call_count=api_call_count,
+                    messages=messages,
+                )
+            except Exception:
+                logger.debug("Kanban auto-handoff boundary check failed", exc_info=True)
+                _request_auto_handoff = False
+        if _request_auto_handoff:
+            _turn_exit_reason = AUTO_HANDOFF_EXIT_REASON
+            agent._emit_status(
+                "🔄 已完成当前这一小段，正在整理交接内容。"
+            )
+            break
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -1071,7 +1126,9 @@ def run_conversation(
         elif not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
-                agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
+                agent._safe_print(
+                    "\n⚠️  本轮处理已达到预设上限，正在整理当前进展。"
+                )
             break
 
         # Fire step_callback for gateway hooks (agent:step event)
@@ -1140,6 +1197,13 @@ def run_conversation(
                         except Exception:
                             pass
                     _injected = True
+                    _mark_steer_injected = getattr(
+                        agent,
+                        "_mark_pending_steer_receipts_injected",
+                        None,
+                    )
+                    if callable(_mark_steer_injected):
+                        _mark_steer_injected()
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",
                         _si,
@@ -1992,6 +2056,14 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                _steer_watermark_fn = getattr(
+                    agent, "_steer_injected_watermark", None
+                )
+                _steer_consumption_watermark = (
+                    int(_steer_watermark_fn())
+                    if callable(_steer_watermark_fn)
+                    else 0
+                )
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -2306,6 +2378,11 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                _consume_steer_receipts = getattr(
+                    agent, "_consume_injected_steer_receipts", None
+                )
+                if callable(_consume_steer_receipts):
+                    _consume_steer_receipts(_steer_consumption_watermark)
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -5738,6 +5815,21 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if getattr(
+                    agent, "_kanban_worker_terminal_transitioned", False
+                ) and getattr(
+                    agent, "_managed_short_task_bootstrap_verified", False
+                ):
+                    # kanban_complete/kanban_block already committed the
+                    # logical terminal state and installed the old worker's
+                    # self exit gate. Do not spend another model request or
+                    # allow any post-terminal tool work; return directly to
+                    # process cleanup so the dispatcher can prove this PGID
+                    # gone and release the gate.
+                    _turn_exit_reason = "kanban_terminal_transition"
+                    final_response = ""
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

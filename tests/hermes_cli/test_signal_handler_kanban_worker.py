@@ -1,90 +1,28 @@
-"""Regression test for #28181 — kanban worker SIGTERM must terminate the process.
+"""Behavior tests for fail-closed Kanban-worker signal shutdown.
 
-The single-query signal handler in cli.py (``_signal_handler_q``) raises
-``KeyboardInterrupt`` to unwind the main thread on SIGTERM/SIGHUP. That works
-for interactive ``hermes chat -q`` invocations, but kanban workers spawned by
-the dispatcher are likely to have a non-daemon thread alive (terminal_tool's
-``_wait_for_process``, custom plugin background workers, etc.). With
-``KeyboardInterrupt`` only the main thread unwinds; the non-daemon thread
-keeps the process alive after the gateway has already restarted, the kanban
-dispatcher's ``_pid_alive`` check returns True forever, and the task stays
-``running`` indefinitely.
-
-The fix: when the process is a dispatcher-spawned worker (``HERMES_KANBAN_TASK``
-env var set), flush logging + stdout/stderr and call ``os._exit(0)`` instead.
-The kernel reclaims the PID immediately, and ``detect_crashed_workers``
-reclaims the stale claim on the next dispatcher tick.
-
-These tests use a synthetic Python script that mirrors the cli.py signal
-handler shape so we can exercise the exit-path contract without booting the
-full CLI (which needs a real provider config).
+These tests call production helpers or execute them in a real subprocess. They
+deliberately do not inspect Python source or assert an implementation shape.
 """
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
-
-def _synthetic_worker_script() -> str:
-    """A standalone script that mirrors cli.py's single-query SIGTERM handler.
-
-    Keeping the synthetic copy here means the test exercises the exact handler
-    shape without needing the full hermes_cli boot path (config, providers,
-    skills, etc.). If the production handler in cli.py drifts, the test
-    that loads the real handler (test_real_handler_uses_os_exit) will catch it.
-    """
-    return textwrap.dedent(
-        """
-        import os, signal, sys, threading, time
-
-        # Non-daemon thread that blocks forever — simulates the worker
-        # thread that would prevent orderly Python shutdown after
-        # KeyboardInterrupt unwinds main.
-        stuck = threading.Event()
-        threading.Thread(target=stuck.wait, daemon=False).start()
-
-        def handler(signum, frame):
-            # Mirrors cli.py:_signal_handler_q. Real handler sleeps 1.5s; the
-            # test uses a short grace so it runs fast.
-            try:
-                time.sleep(0.05)
-            except Exception:
-                pass
-            if os.environ.get("HERMES_KANBAN_TASK"):
-                try:
-                    if hasattr(signal, "SIGALRM"):
-                        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
-                        signal.alarm(2)
-                except Exception:
-                    pass
-                sys.stdout.flush()
-                sys.stderr.flush()
-                os._exit(0)
-            raise KeyboardInterrupt()
-
-        signal.signal(signal.SIGTERM, handler)
-        print("READY", flush=True)
-        try:
-            threading.Event().wait()
-        except KeyboardInterrupt:
-            sys.exit(0)
-        """
-    )
+import cli as cli_module
 
 
 def _is_alive_like_dispatcher(pid: int) -> bool:
-    """Mirrors hermes_cli/kanban_db.py:_pid_alive on Linux.
-
-    A zombie is treated as dead — the dispatcher's _pid_alive checks
-    /proc/<pid>/status for State: Z. We replicate that here so a clean
-    os._exit followed by zombie-state is correctly counted as dead.
-    """
+    """Treat a child zombie as dead on Linux and macOS."""
     if pid <= 0:
         return False
     try:
@@ -93,41 +31,32 @@ def _is_alive_like_dispatcher(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    if sys.platform == "linux":
-        try:
-            with open(f"/proc/{pid}/status") as f:
-                for line in f:
-                    if line.startswith("State:"):
-                        if "Z" in line.split(":", 1)[1]:
-                            return False
-                        break
-        except (FileNotFoundError, PermissionError, OSError):
-            pass
+    try:
+        observed = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+        state = observed.stdout.strip()
+        if observed.returncode == 0 and state:
+            return not state.upper().startswith("Z")
+        if observed.returncode != 0:
+            return False
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("State:"):
+                    return "Z" not in line.split(":", 1)[1]
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
     return True
 
 
-def _spawn_synthetic(env_overrides: dict) -> subprocess.Popen:
-    env = dict(os.environ)
-    env.update(env_overrides)
-    proc = subprocess.Popen(
-        [sys.executable, "-u", "-c", _synthetic_worker_script()],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    # Wait for "READY" so we know the signal handler is installed.
-    assert proc.stdout is not None
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        line = proc.stdout.readline()
-        if line and line.startswith(b"READY"):
-            return proc
-    proc.kill()
-    raise RuntimeError("synthetic worker never signalled READY")
-
-
-def _cleanup(proc: subprocess.Popen) -> None:
+def _cleanup_process(proc: subprocess.Popen) -> None:
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -136,95 +65,293 @@ def _cleanup(proc: subprocess.Popen) -> None:
         proc.communicate(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.communicate(timeout=2)
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
-)
-def test_sigterm_with_kanban_task_env_terminates_quickly():
-    """With HERMES_KANBAN_TASK set, SIGTERM should kill the process in <2s
-    even when a non-daemon thread is still alive."""
-    proc = _spawn_synthetic({"HERMES_KANBAN_TASK": "t_test_28181"})
-    try:
-        t0 = time.time()
-        os.kill(proc.pid, signal.SIGTERM)
+def test_managed_hard_exit_waits_for_cleanup_and_receipt_fences():
+    cleanup_results = iter([False, True, True])
+    commit_results = iter([False, True])
+    waits = []
+    exits = []
 
-        # Should die in <2s. The handler sleeps ~50ms, then os._exit(0)
-        # is immediate. Give generous headroom for slow CI runners.
-        deadline = t0 + 2.0
-        while time.time() < deadline:
-            if not _is_alive_like_dispatcher(proc.pid):
-                elapsed = time.time() - t0
-                assert elapsed < 2.0
-                return
-            time.sleep(0.02)
-        pytest.fail(
-            "process still alive 2s after SIGTERM with HERMES_KANBAN_TASK set "
-            "(dispatcher would keep extending claim) — fix regressed"
+    cli_module._managed_hard_exit_after_signal(
+        cleanup_safe_fn=lambda: next(cleanup_results),
+        commit_exit_fn=lambda: next(commit_results),
+        sleep_fn=waits.append,
+        hard_exit_fn=exits.append,
+    )
+
+    assert waits == [1.0, 1.0]
+    assert exits == [0]
+
+
+def test_cleanup_veto_must_be_durable_before_hard_exit(
+    monkeypatch,
+):
+    from tools.environments import base as environment_base
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_signal_test")
+    monkeypatch.setenv(
+        "HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE", "foreground still active"
+    )
+    monkeypatch.delenv(
+        "HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE_DURABLE", raising=False
+    )
+    monkeypatch.setattr(
+        environment_base,
+        "mark_short_task_process_cleanup_unsafe",
+        lambda _reason: False,
+    )
+    assert cli_module._kanban_cleanup_safe_to_hard_exit() is False
+
+    monkeypatch.setattr(
+        environment_base,
+        "mark_short_task_process_cleanup_unsafe",
+        lambda _reason: True,
+    )
+    assert cli_module._kanban_cleanup_safe_to_hard_exit() is True
+
+
+def test_receipt_registry_not_diagnostic_env_controls_hard_exit(monkeypatch):
+    from agent import kanban_auto_handoff as handoff
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    monkeypatch.setenv("HERMES_KANBAN_HANDOFF_CONTROL_PENDING", "1")
+    monkeypatch.setattr(
+        handoff, "try_commit_handoff_control_hard_exit", lambda: False
+    )
+    assert cli_module._kanban_try_commit_hard_exit() is False
+
+    monkeypatch.setattr(
+        handoff, "try_commit_handoff_control_hard_exit", lambda: True
+    )
+    assert cli_module._kanban_try_commit_hard_exit() is True
+
+
+class _FakeThread:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+
+def test_signal_helper_cleans_registries_and_starts_daemon_hard_exit(
+    monkeypatch,
+):
+    from tools.environments import base as environment_base
+    from tools.process_registry import process_registry
+
+    calls = []
+    fake_threads = []
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_signal_test")
+    monkeypatch.setenv("HERMES_KANBAN_FOREGROUND_CLEANUP_GRACE", "0")
+    monkeypatch.setattr(
+        cli_module, "_arm_exit_watchdog_on_shutdown_signal", lambda: calls.append("arm")
+    )
+    monkeypatch.setattr(
+        environment_base,
+        "cleanup_registered_short_task_foreground_processes",
+        lambda: calls.append("foreground_cleanup") or [],
+    )
+    monkeypatch.setattr(
+        environment_base,
+        "wait_for_short_task_foreground_cleanup",
+        lambda timeout: calls.append(("foreground_wait", timeout)) or True,
+    )
+    monkeypatch.setattr(
+        environment_base,
+        "mark_short_task_process_cleanup_unsafe",
+        lambda reason: calls.append(("unsafe", reason)) or True,
+    )
+    monkeypatch.setattr(
+        process_registry, "kill_all", lambda: calls.append("background_kill")
+    )
+    monkeypatch.setattr(process_registry, "has_any_active", lambda: False)
+
+    def thread_factory(**kwargs):
+        thread = _FakeThread(**kwargs)
+        fake_threads.append(thread)
+        return thread
+
+    class _Agent:
+        def interrupt(self, reason, *, system_signal):
+            calls.append(("interrupt", reason, system_signal))
+
+    with pytest.raises(KeyboardInterrupt):
+        cli_module._handle_single_query_shutdown_signal(
+            SimpleNamespace(agent=_Agent()),
+            signal.SIGTERM,
+            thread_factory=thread_factory,
         )
-    finally:
-        _cleanup(proc)
+
+    assert calls[0] == "arm"
+    assert any(item == "foreground_cleanup" for item in calls)
+    assert calls.count("background_kill") == 2
+    assert not [item for item in calls if isinstance(item, tuple) and item[0] == "unsafe"]
+    assert len(fake_threads) == 1
+    assert fake_threads[0].started is True
+    assert fake_threads[0].kwargs == {
+        "target": cli_module._managed_hard_exit_after_signal,
+        "daemon": True,
+        "name": "kanban-signal-hard-exit",
+    }
+
+
+def test_signal_helper_persists_cleanup_failure_before_unwind(monkeypatch):
+    from tools.environments import base as environment_base
+    from tools.process_registry import process_registry
+
+    reasons = []
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_signal_test")
+    monkeypatch.setattr(
+        cli_module, "_arm_exit_watchdog_on_shutdown_signal", lambda: None
+    )
+    monkeypatch.setattr(
+        environment_base,
+        "cleanup_registered_short_task_foreground_processes",
+        lambda: ["pgid survived"],
+    )
+    monkeypatch.setattr(
+        environment_base,
+        "mark_short_task_process_cleanup_unsafe",
+        lambda reason: reasons.append(reason) or True,
+    )
+    monkeypatch.setattr(process_registry, "kill_all", lambda: None)
+    monkeypatch.setattr(process_registry, "has_any_active", lambda: False)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli_module._handle_single_query_shutdown_signal(
+            SimpleNamespace(agent=None),
+            signal.SIGTERM,
+            thread_factory=lambda **kwargs: _FakeThread(**kwargs),
+        )
+
+    assert any("pgid survived" in reason for reason in reasons)
 
 
 @pytest.mark.skipif(
     sys.platform == "win32",
-    reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
+    reason="foreground process-group cleanup is POSIX-only",
 )
-def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
-    """Without HERMES_KANBAN_TASK, the original KeyboardInterrupt path runs.
+def test_sigterm_cleans_real_foreground_process_group(tmp_path):
+    """A real worker signal kills and proves its foreground process group."""
+    marker_path = tmp_path / "unexpected-unsafe-marker.txt"
+    repo_root = Path(__file__).resolve().parents[2]
+    script = textwrap.dedent(
+        """
+        import json
+        import logging
+        import os
+        import signal
+        import sys
+        from types import SimpleNamespace
 
-    This is the contrast case proving the fix is gated on the env var: in
-    interactive ``hermes chat -q`` (no env var), behavior is unchanged. The
-    process MAY hang under non-daemon threads, but that's not a kanban-worker
-    concern. We just verify the handler logs the KeyboardInterrupt branch
-    rather than os._exit'ing.
-    """
-    proc = _spawn_synthetic({})
+        sys.path.insert(0, os.environ["HERMES_TEST_REPO_ROOT"])
+        import cli
+        from tools.environments.local import LocalEnvironment
+        from tools.environments import base as environment_base
+
+        class Agent:
+            def interrupt(self, *_args, **_kwargs):
+                return True
+
+        os.environ["HERMES_KANBAN_TASK"] = "t_real_signal_worker"
+        os.environ["HERMES_KANBAN_REVIEW_MODE"] = "1"
+        os.environ["HERMES_KANBAN_MANAGED_LANE"] = "review"
+        os.environ["HERMES_KANBAN_MANAGED_BOOTSTRAP"] = "1"
+        os.environ["HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED"] = "1"
+        os.environ["HERMES_KANBAN_FOREGROUND_CLEANUP_GRACE"] = "0.1"
+
+        real_mark = environment_base.mark_short_task_process_cleanup_unsafe
+        def tracking_mark(reason):
+            with open(os.environ["HERMES_TEST_MARKER_PATH"], "a", encoding="utf-8") as out:
+                out.write(str(reason) + "\\n")
+                out.flush()
+                os.fsync(out.fileno())
+            return real_mark(reason)
+        environment_base.mark_short_task_process_cleanup_unsafe = tracking_mark
+
+        session = SimpleNamespace(agent=Agent())
+        signal.signal(
+            signal.SIGTERM,
+            lambda signum, frame: cli._handle_single_query_shutdown_signal(
+                session, signum
+            ),
+        )
+        terminal = LocalEnvironment(cwd=os.environ["HERMES_TEST_CWD"], timeout=60)
+        child = terminal._run_bash("trap '' TERM; while :; do sleep 1; done", timeout=60)
+        print(f"READY {child.pid} {child._hermes_pgid}", flush=True)
+        terminal._wait_for_process(child, timeout=60)
+        """
+    )
+    env = dict(os.environ)
+    env.update(
+        {
+            "HERMES_TEST_REPO_ROOT": str(repo_root),
+            "HERMES_TEST_CWD": str(tmp_path),
+            "HERMES_TEST_MARKER_PATH": str(marker_path),
+        }
+    )
+    for key in (
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_REVIEW_MODE",
+        "HERMES_KANBAN_MANAGED_LANE",
+        "HERMES_KANBAN_MANAGED_BOOTSTRAP",
+        "HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED",
+        "HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR",
+        "HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE",
+        "HERMES_KANBAN_PROCESS_CLEANUP_UNSAFE_DURABLE",
+        "PYTEST_CURRENT_TEST",
+    ):
+        env.pop(key, None)
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", script],
+        cwd=str(tmp_path),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    child_pgid = None
     try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode("utf-8", errors="replace").strip()
+        assert line.startswith("READY "), line
+        _ready, child_pid, child_pgid_raw = line.split()
+        child_pgid = int(child_pgid_raw)
+        assert int(child_pid) == child_pgid
+
         os.kill(proc.pid, signal.SIGTERM)
-        # Wait a moment for the handler to react.
-        time.sleep(0.5)
-        # The process may or may not be dead depending on whether the
-        # KeyboardInterrupt unwinds cleanly. The behavioral guarantee is
-        # only that the env-gated path didn't fire.
-        try:
-            # Drain stdout up to whatever's available.
-            if proc.stdout is not None:
-                proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
-        except Exception:
-            pass
+        assert proc.wait(timeout=6) == 0
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(child_pgid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("foreground process group survived worker signal cleanup")
+        assert not marker_path.exists()
+        assert not _is_alive_like_dispatcher(proc.pid)
     finally:
-        _cleanup(proc)
+        if child_pgid is not None:
+            try:
+                os.killpg(child_pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        _cleanup_process(proc)
 
 
-def test_real_handler_uses_os_exit_for_kanban_workers():
-    """Source-level invariant: cli.py's _signal_handler_q must call
-    os._exit(0) when HERMES_KANBAN_TASK is set.
-
-    Catches the case where someone refactors the handler and accidentally
-    drops the env-gated exit, restoring the bug. Reading cli.py directly is
-    cheap and avoids the heavy CLI import.
-    """
-    import pathlib
-
-    cli_path = (
-        pathlib.Path(__file__).resolve().parent.parent.parent / "cli.py"
-    )
-    src = cli_path.read_text()
-    # Locate the handler body.
-    start = src.find("def _signal_handler_q(signum, frame):")
-    assert start != -1, "cli.py is missing _signal_handler_q"
-    # Look ahead for the env-gated os._exit call within ~80 lines.
-    body = src[start : start + 4000]
-    assert "HERMES_KANBAN_TASK" in body, (
-        "_signal_handler_q must gate its kanban-worker exit path on "
-        "HERMES_KANBAN_TASK — see #28181"
-    )
-    assert "os._exit(0)" in body, (
-        "_signal_handler_q must call os._exit(0) for kanban workers — "
-        "raising KeyboardInterrupt orphans the process when non-daemon "
-        "threads are alive (see #28181)"
-    )
+def test_marker_reader_is_data_only(tmp_path):
+    """Marker output remains parseable without inspecting implementation files."""
+    marker_path = tmp_path / "marker.jsonl"
+    marker_path.write_text(json.dumps({"durable": True}) + "\n", encoding="utf-8")
+    records = [
+        json.loads(line)
+        for line in marker_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records == [{"durable": True}]

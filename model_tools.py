@@ -20,6 +20,7 @@ Public API (signatures preserved from the original 2,400-line version):
     check_tool_availability(quiet) -> tuple
 """
 
+import importlib
 import os
 import json
 import re
@@ -29,10 +30,15 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.managed_short_task import (
+    managed_short_task_lane_claimed as _managed_short_task_lane_claimed,
+    verified_managed_short_task_lane,
+)
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
+
 
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
@@ -194,7 +200,19 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+if _managed_short_task_lane_claimed():
+    # A dispatcher-managed worker has a frozen file/lifecycle-only contract.
+    # Do not discover the whole tools package and filter it afterward: module
+    # imports are executable startup behavior, so a disallowed tool could run
+    # top-level code before its schema is removed.  Import only the two
+    # built-ins that own the allowlisted surface.
+    for _managed_tool_module in (
+        "tools.managed_file_tools",
+        "tools.kanban_tools",
+    ):
+        importlib.import_module(_managed_tool_module)
+else:
+    discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()
@@ -209,12 +227,16 @@ discover_builtin_tools()
 #   - tui_gateway/server.py     -> inline on startup (no event loop)
 #   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
-# Plugin tool discovery (user/project/pip plugins)
-try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+# Plugin tool discovery (user/project/pip plugins).  A managed worker's
+# earliest CLI gate has already validated and frozen its file/lifecycle-only
+# surface; importing plugins here would run their register code before that
+# allowlist is assembled.
+if not _managed_short_task_lane_claimed():
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # =============================================================================
@@ -277,6 +299,143 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 # serves) while keeping the cap small. (#19251)
 _TOOL_DEFS_CACHE_MAX = 8
 
+# A Phase-1 automatic-handoff worker shares one checkout with later fresh
+# processes. Its model-visible surface is therefore an allowlist, not a list of
+# individually remembered denials: any newly registered plugin, alias, tool
+# search bridge, scheduler, or other side-effecting tool stays unavailable
+# unless it is explicitly proven safe here. ``kanban_complete`` is retained as
+# the submission verb; the handler routes an enabled implementation worker to
+# the existing review lane rather than directly to ``done``.
+_SHORT_TASK_WORKER_ALLOWED_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "write_file",
+        "patch",
+        "kanban_show",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_block",
+        "kanban_complete",
+    }
+)
+
+# A managed independent reviewer is deliberately read-only.  It may inspect
+# the frozen workspace and move the *task* through its bounded lifecycle, but
+# it must never repair the implementation it is judging.  Keeping this as a
+# separate positive allowlist also means future implementation tools remain
+# unavailable to review until explicitly audited.
+_SHORT_TASK_REVIEW_WORKER_ALLOWED_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "kanban_show",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_block",
+        "kanban_complete",
+    }
+)
+
+
+def _short_task_review_worker_active() -> bool:
+    return bool(
+        (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and os.environ.get("HERMES_KANBAN_REVIEW_MODE") == "1"
+        and os.environ.get("HERMES_KANBAN_MANAGED_LANE") == "review"
+    )
+
+
+def _short_task_worker_tool_restriction_active() -> bool:
+    """Restrict attested workers without importing any executable tool."""
+    return bool(
+        verified_managed_short_task_lane()
+        or _managed_short_task_lane_claimed()
+    )
+
+
+def restrict_short_task_worker_tool_definitions(
+    tool_definitions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Apply the final file/lifecycle allowlist to any assembled schemas.
+
+    This helper is also called after memory/context-engine plugins inject
+    dynamic schemas during ``AIAgent`` initialization. Keeping the filter at
+    both assembly boundaries prevents a plugin or tool-search alias from
+    silently reopening cron, command execution, or another detached side
+    effect after the built-in registry was filtered.
+    """
+    review_mode = _short_task_review_worker_active()
+    if (
+        not review_mode
+        and not _short_task_worker_tool_restriction_active()
+        and not _managed_short_task_lane_claimed()
+    ):
+        return list(tool_definitions)
+    allowed = (
+        _SHORT_TASK_REVIEW_WORKER_ALLOWED_TOOLS
+        if review_mode
+        else _SHORT_TASK_WORKER_ALLOWED_TOOLS
+    )
+    filtered: List[Dict[str, Any]] = []
+    for tool in tool_definitions:
+        if (
+            isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name") in allowed
+        ):
+            filtered.append(tool)
+    return filtered
+
+
+def _request_scoped_checks_requested(
+    enabled_toolsets: Optional[List[str]],
+) -> bool:
+    """Whether this schema request can contain a request-scoped check.
+
+    The normal definitions cache is process-wide.  A tool whose visibility
+    depends on one inbound message's ContextVars cannot safely participate in
+    that cache: the next chat/user/session may have the same toolset list but
+    a different authorization result.  Keep all ordinary capability probes on
+    their existing caches and bypass only schemas that can include an entry
+    explicitly marked ``request_scoped_check``.
+    """
+    # The current request-scoped tool is Gateway-only and is categorically
+    # unavailable to dispatcher workers/delegated children. Those contexts
+    # remain safe to memoize like ordinary CLI schemas.
+    if (
+        os.environ.get("_HERMES_GATEWAY") != "1"
+        or os.environ.get("HERMES_KANBAN_TASK")
+        or _is_delegated_child_context()
+    ):
+        return False
+
+    request_tools = {
+        entry.name
+        for entry in registry._snapshot_entries()
+        if getattr(entry, "request_scoped_check", False)
+    }
+    if not request_tools:
+        return False
+    if enabled_toolsets is None:
+        return True
+
+    effective_toolsets = list(enabled_toolsets)
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and not _is_delegated_child_context()
+        and "kanban" not in effective_toolsets
+    ):
+        effective_toolsets.append("kanban")
+    for toolset_name in effective_toolsets:
+        if validate_toolset(toolset_name):
+            if request_tools.intersection(resolve_toolset(toolset_name)):
+                return True
+        elif toolset_name in _LEGACY_TOOLSET_MAP:
+            if request_tools.intersection(_LEGACY_TOOLSET_MAP[toolset_name]):
+                return True
+    return False
+
 
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
@@ -317,7 +476,10 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    if quiet_mode:
+    _cache_request = quiet_mode and not _request_scoped_checks_requested(
+        enabled_toolsets
+    )
+    if _cache_request:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -331,6 +493,8 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            os.environ.get("HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY", ""),
+            os.environ.get("HERMES_KANBAN_REVIEW_MODE", ""),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),
         )
@@ -346,7 +510,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode:
+    if _cache_request:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -457,6 +621,7 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    filtered_tools = restrict_short_task_worker_tool_definitions(filtered_tools)
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -558,27 +723,32 @@ def _compute_tool_definitions(
     # This is deliberately the last step before returning — sanitization
     # has already normalized schemas, and the assembly is idempotent in
     # case some caller invokes get_tool_definitions twice.
-    try:
-        from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
-        ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
-            context_length = _resolve_active_context_length()
-            assembly = assemble_tool_defs(
-                filtered_tools,
-                context_length=context_length,
-                config=ts_cfg,
-            )
-            if assembly.activated and not quiet_mode:
-                print(
-                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
-                    f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
-                    f"Threshold ~{assembly.threshold_tokens} tokens."
+    if not _managed_short_task_lane_claimed():
+        try:
+            from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
+            ts_cfg = _load_ts_config()
+            if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+                context_length = _resolve_active_context_length()
+                assembly = assemble_tool_defs(
+                    filtered_tools,
+                    context_length=context_length,
+                    config=ts_cfg,
                 )
-            filtered_tools = assembly.tool_defs
-    except Exception as e:  # pragma: no cover — never break tool loading
-        logger.warning("Tool search assembly skipped: %s", e)
+                if assembly.activated and not quiet_mode:
+                    print(
+                        f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
+                        f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
+                        f"Threshold ~{assembly.threshold_tokens} tokens."
+                    )
+                filtered_tools = assembly.tool_defs
+        except Exception as e:  # pragma: no cover — never break tool loading
+            logger.warning("Tool search assembly skipped: %s", e)
 
-    return filtered_tools
+    # Defense in depth after Tool Search assembly. A future assembly strategy
+    # may synthesize bridge/alias schemas even from an otherwise narrow input;
+    # no such dynamic name belongs in the managed worker unless this explicit
+    # allowlist is deliberately reviewed and extended.
+    return restrict_short_task_worker_tool_definitions(filtered_tools)
 
 
 def _resolve_active_context_length() -> int:
@@ -1040,6 +1210,8 @@ def _emit_post_tool_call_hook(
     result *after* the gate (parsing the result is only worth it when a
     listener will actually consume it).
     """
+    if _managed_short_task_lane_claimed():
+        return
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
@@ -1112,16 +1284,49 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # Schema filtering is not an authorization boundary: a stale transcript,
+    # plugin alias, or malformed model response can still name a hidden tool
+    # directly. Enforce the same explicit allowlist before Tool Search bridge
+    # unwrapping, middleware, hooks, or registry dispatch so every unknown or
+    # dynamically registered name fails closed in a managed Phase-1 worker.
+    _review_worker = _short_task_review_worker_active()
+    _managed_worker = bool(
+        _review_worker
+        or _short_task_worker_tool_restriction_active()
+        or _managed_short_task_lane_claimed()
+    )
+    _worker_allowed = (
+        _SHORT_TASK_REVIEW_WORKER_ALLOWED_TOOLS
+        if _review_worker
+        else _SHORT_TASK_WORKER_ALLOWED_TOOLS
+    )
+    if (
+        _managed_worker
+        and function_name not in _worker_allowed
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    f"Tool {function_name!r} is unavailable in this automatic "
+                    "short-task worker. Use only the bounded file and Kanban "
+                    "lifecycle tools exposed for this segment."
+                ),
+                "success": False,
+            },
+            ensure_ascii=False,
+        )
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
     # downstream hook (pre/post, edit approval, guardrails) sees the real
     # tool name, not the bridge.
     _ts_mod = None
-    try:
-        from tools import tool_search as _ts_mod  # noqa: F401
-    except Exception:
-        _ts_mod = None
+    if not _managed_worker:
+        try:
+            from tools import tool_search as _ts_mod  # noqa: F401
+        except Exception:
+            _ts_mod = None
 
     if _ts_mod is not None and _ts_mod.is_bridge_tool(function_name):
         try:
@@ -1188,7 +1393,7 @@ def handle_function_call(
             )
 
     _tool_original_args = dict(function_args)
-    if not skip_tool_request_middleware:
+    if not _managed_worker and not skip_tool_request_middleware:
         try:
             from hermes_cli.middleware import apply_tool_request_middleware
 
@@ -1222,7 +1427,7 @@ def handle_function_call(
         # gate denied/timed-out/errored (fail-closed). Observer plugins see
         # the hook on that same pass. When skip=True, the caller already
         # fired it — do nothing here.
-        if not skip_pre_tool_call_hook:
+        if not _managed_worker and not skip_pre_tool_call_hook:
             block_message: Optional[str] = None
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
@@ -1260,16 +1465,17 @@ def handle_function_call(
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
         # are unaffected when it is unset.
-        try:
-            from acp_adapter.edit_approval import maybe_require_edit_approval
+        if not _managed_worker:
+            try:
+                from acp_adapter.edit_approval import maybe_require_edit_approval
 
-            edit_block_message = maybe_require_edit_approval(function_name, function_args)
-            if edit_block_message is not None:
-                return edit_block_message
-        except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
-            if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
+                edit_block_message = maybe_require_edit_approval(function_name, function_args)
+                if edit_block_message is not None:
+                    return edit_block_message
+            except Exception as _edit_approval_err:
+                logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
+                if function_name in {"write_file", "patch"}:
+                    return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
@@ -1289,17 +1495,19 @@ def handle_function_call(
         # unaffected by wall-clock adjustments during the call.
         _dispatch_start = time.monotonic()
         _approval_tokens = None
-        try:
-            from tools.approval import (
-                reset_current_observability_context,
-                set_current_observability_context,
-            )
-            _approval_tokens = set_current_observability_context(
-                turn_id=turn_id or "",
-                tool_call_id=tool_call_id or "",
-            )
-        except Exception:
-            reset_current_observability_context = None
+        reset_current_observability_context = None
+        if not _managed_worker:
+            try:
+                from tools.approval import (
+                    reset_current_observability_context,
+                    set_current_observability_context,
+                )
+                _approval_tokens = set_current_observability_context(
+                    turn_id=turn_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+            except Exception:
+                reset_current_observability_context = None
         try:
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
@@ -1310,6 +1518,7 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id or "",
                         enabled_tools=sandbox_enabled,
                     )
             else:
@@ -1318,21 +1527,25 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id or "",
                         user_task=user_task,
                     )
-            from hermes_cli.middleware import run_tool_execution_middleware
+            if _managed_worker:
+                result = _dispatch(function_args)
+            else:
+                from hermes_cli.middleware import run_tool_execution_middleware
 
-            result = run_tool_execution_middleware(
-                function_name,
-                function_args,
-                _dispatch,
-                original_args=_tool_original_args,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=turn_id or "",
-                api_request_id=api_request_id or "",
-            )
+                result = run_tool_execution_middleware(
+                    function_name,
+                    function_args,
+                    _dispatch,
+                    original_args=_tool_original_args,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    api_request_id=api_request_id or "",
+                )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
@@ -1363,8 +1576,9 @@ def handle_function_call(
         # Gated on has_hook so the no-listener path skips both the result
         # field derivation and the payload dispatch.
         try:
-            from hermes_cli.plugins import has_hook, invoke_hook
-            if has_hook("transform_tool_result"):
+            if not _managed_worker:
+                from hermes_cli.plugins import has_hook, invoke_hook
+            if not _managed_worker and has_hook("transform_tool_result"):
                 status, error_type, error_message = _tool_result_observer_fields(result)
                 hook_results = invoke_hook(
                     "transform_tool_result",

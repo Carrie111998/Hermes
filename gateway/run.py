@@ -11904,11 +11904,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
-            # Strip the prefix so downstream treats it as a normal user
-            # message. If the payload is empty, surface the usage hint.
+            # First try the unique trusted background task. Only a definite
+            # no-match or disabled feature keeps the historical normal-turn
+            # fallback; ambiguity/error must not guess or create a new turn.
             steer_payload = event.get_command_args().strip()
             if not steer_payload:
                 return "Usage: /steer <prompt>  (no agent is running; sending as a normal message)"
+            background_result = await self._route_background_kanban_control(
+                event,
+                kind="steer",
+                message=steer_payload,
+            )
+            if background_result.get("status") not in {"none", "disabled"}:
+                background_reply = self._background_kanban_control_reply(
+                    background_result
+                )
+                if background_reply:
+                    return EphemeralReply(background_reply)
+                return EphemeralReply(
+                    "目前无法确定你要调整的是哪一个短任务，因此没有开始新一轮，"
+                    "也没有更改任何任务。"
+                )
+            # No trusted background match: preserve the established behavior
+            # by stripping the prefix and sending a normal user turn.
             try:
                 event.text = steer_payload
             except Exception:
@@ -12961,6 +12979,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+        # Carry the exact inbound delivery id on the context while preserving
+        # the long-standing one-argument _set_session_env seam used by gateway
+        # extensions and tests.
+        context._inbound_message_id = str(
+            getattr(event, "message_id", "")
+            or source.message_id
+            or (
+                f"update:{event.platform_update_id}"
+                if getattr(event, "platform_update_id", None) is not None
+                else ""
+            )
+        )
+        context._inbound_internal = bool(getattr(event, "internal", False))
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -17338,7 +17369,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -17361,13 +17395,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
+            chat_id_alt=str(context.source.chat_id_alt or ""),
+            scope_id=str(context.source.scope_id or ""),
+            chat_type=str(context.source.chat_type or ""),
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
+            user_id_alt=str(context.source.user_id_alt or ""),
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            message_id=str(
+                getattr(context, "_inbound_message_id", "")
+                or context.source.message_id
+                or ""
+            ),
+            profile=(
+                (
+                    getattr(context.source, "profile", "")
+                    if getattr(
+                        getattr(self, "config", None),
+                        "multiplex_profiles",
+                        False,
+                    )
+                    else ""
+                )
+                or getattr(self, "_kanban_notifier_profile", "")
+                or self._active_profile_name()
+                or ""
+            ),
+            internal=bool(getattr(context, "_inbound_internal", False)),
             async_delivery=_async_delivery,
         )
 
@@ -22972,6 +23028,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
+            if result and result.get("pending_handoff_control"):
+                try:
+                    from agent.kanban_auto_handoff import (
+                        recover_pending_handoff_control,
+                    )
+
+                    _control_recovery = recover_pending_handoff_control(
+                        result,
+                        attempts=2,
+                    )
+                    if (
+                        _control_recovery
+                        and _control_recovery.get("status")
+                        not in {"recorded", "already_recorded"}
+                    ):
+                        logger.error(
+                            "Gateway could not recover deferred handoff control %s: %s",
+                            _control_recovery.get("control_id"),
+                            _control_recovery.get("error"),
+                        )
+                except Exception:
+                    logger.exception(
+                        "Gateway deferred handoff-control recovery failed"
+                    )
             adapter = self._adapter_for_source(source)
             
             # Get pending message from adapter.

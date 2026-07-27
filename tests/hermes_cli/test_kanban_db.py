@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +27,99 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+def _seed_supervised_identity(conn, task_id, monkeypatch, *, pid):
+    """Attach one exact dispatcher-captured POSIX process-group identity."""
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.current_run_id is not None
+    run_id = int(task.current_run_id)
+    node_id = "test-dispatcher-node"
+    boot_id = "test-dispatcher-boot"
+    start_token = str(100_000 + run_id)
+    state = {"pid_alive": True, "group_alive": True}
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (int(pid), task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, owner_node_id = ?, "
+            "owner_boot_id = ?, worker_start_token = ?, worker_pgid = ?, "
+            "handoff_safety_required = 1 "
+            "WHERE id = ?",
+            (int(pid), node_id, boot_id, start_token, int(pid), run_id),
+        )
+
+    def _capture(probe_pid):
+        if int(probe_pid) != int(pid) or not state["pid_alive"]:
+            return None
+        return {
+            "owner_node_id": node_id,
+            "owner_boot_id": boot_id,
+            "worker_pid": int(pid),
+            "worker_start_token": start_token,
+            "worker_pgid": int(pid),
+        }
+
+    monkeypatch.setattr(kb, "_local_node_id", lambda: node_id)
+    monkeypatch.setattr(kb, "_local_boot_id", lambda: boot_id)
+    monkeypatch.setattr(kb, "_capture_process_group_identity", _capture)
+    monkeypatch.setattr(
+        kb,
+        "_pid_alive",
+        lambda probe_pid: (
+            state["pid_alive"] if int(probe_pid) == int(pid) else False
+        ),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_process_group_alive",
+        lambda probe_pgid: (
+            state["group_alive"] if int(probe_pgid) == int(pid) else False
+        ),
+    )
+    monkeypatch.setattr(
+        "gateway.status.get_process_start_time",
+        lambda probe_pid: (
+            int(start_token)
+            if int(probe_pid) == int(pid) and state["pid_alive"]
+            else None
+        ),
+    )
+    return state, run_id
+
+
+def _assert_supervised_exit_is_gated(conn, task_id, *, pid, run_id):
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "todo"
+    assert task.current_run_id is None
+    assert task.worker_pid == int(pid)
+    assert kb.claim_task(conn, task_id) is None
+    gate = conn.execute(
+        "SELECT * FROM task_exit_gates WHERE child_task_id = ? "
+        "AND released_at IS NULL",
+        (task_id,),
+    ).fetchone()
+    assert gate is not None
+    assert gate["gate_kind"] == "control_drain"
+    assert gate["parent_task_id"] == task_id
+    assert gate["parent_run_id"] == int(run_id)
+    assert gate["worker_pid"] == int(pid)
+    return gate
+
+
+def _prove_supervised_exit_and_assert_ready(conn, task_id, state):
+    state["pid_alive"] = False
+    state["group_alive"] = False
+    assert kb.release_handoff_exit_gates(conn) == 1
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.worker_pid is None
+    assert task.claim_lock is None
 
 
 def _init_git_repo(repo: Path) -> None:
@@ -426,31 +520,30 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
-    import signal
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
-        killed: list[int] = []
-
-        def _signal(_pid, sig):
-            killed.append(sig)
-
         kb._set_worker_pid(conn, t, 12345)
+        state, run_id = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=12345,
+        )
         # Rewind claim_expires so it looks stale.
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 3600, t),
         )
-        # Worker PID has died — exactly the case ``release_stale_claims``
-        # should still reclaim (post-#23025: live PIDs are now extended).
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-        reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
+        # The leader and group are already gone. The logical reclaim still
+        # parks behind a durable gate first; only the gate releaser may make
+        # the task claimable again.
+        state["pid_alive"] = False
+        state["group_alive"] = False
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
-        assert kb.get_task(conn, t).status == "ready"
-        assert killed == [signal.SIGTERM]
+        _assert_supervised_exit_is_gated(conn, t, pid=12345, run_id=run_id)
+        _prove_supervised_exit_and_assert_ready(conn, t, state)
 
 
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
@@ -583,7 +676,7 @@ def test_stale_claim_deferred_when_live_worker_survives_termination(
 def test_stale_claim_reclaimed_when_termination_succeeds(
     kanban_home, monkeypatch,
 ):
-    """When the worker is actually killed, the claim is released as before."""
+    """A cooperative exit is still released only through its durable gate."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -591,33 +684,32 @@ def test_stale_claim_reclaimed_when_termination_succeeds(
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kb._set_worker_pid(conn, t, 12345)
+        state, run_id = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=12345,
+        )
         conn.execute(
             "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
             "WHERE id = ?",
             (int(time.time()) - 60, int(time.time()) - 7200, t),
         )
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-        monkeypatch.setattr(
-            _kb, "_terminate_reclaimed_worker",
-            lambda *a, **k: {
-                "termination_attempted": True,
-                "host_local": True,
-                "terminated": True,
-            },
-        )
-        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        signals: list[int] = []
+
+        def _cooperative_exit(_pgid, sig):
+            signals.append(sig)
+            state["pid_alive"] = False
+            state["group_alive"] = False
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=_cooperative_exit)
         assert reclaimed == 1
-        assert kb.get_task(conn, t).status == "ready"
+        assert signals == [signal.SIGTERM]
+        _assert_supervised_exit_is_gated(conn, t, pid=12345, run_id=run_id)
+        _prove_supervised_exit_and_assert_ready(conn, t, state)
 
 
-def test_stale_claim_released_when_worker_not_host_local(
+def test_stale_claim_with_unmanageable_supervised_worker_stays_gated(
     kanban_home, monkeypatch,
 ):
-    """The defer guard only holds OUR own surviving workers.
-
-    A claim we cannot manage (different host, or no kill attempted) must still
-    be released, otherwise a foreign-host claim could strand a task forever.
-    """
+    """Signal refusal must never expose a replacement beside the old worker."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -625,33 +717,37 @@ def test_stale_claim_released_when_worker_not_host_local(
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kb._set_worker_pid(conn, t, 12345)
+        state, run_id = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=12345,
+        )
         conn.execute(
             "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
             "WHERE id = ?",
             (int(time.time()) - 60, int(time.time()) - 7200, t),
         )
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
-        monkeypatch.setattr(
-            _kb, "_terminate_reclaimed_worker",
-            lambda *a, **k: {
-                "termination_attempted": False,
-                "host_local": False,
-                "terminated": False,
-            },
+        def _permission_denied(_pgid, _sig):
+            raise PermissionError("worker cannot be signalled")
+
+        reclaimed = kb.release_stale_claims(
+            conn, signal_fn=_permission_denied,
         )
-        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
-        assert kb.get_task(conn, t).status == "ready"
+        _assert_supervised_exit_is_gated(conn, t, pid=12345, run_id=run_id)
+        assert kb.release_handoff_exit_gates(conn) == 0
+        _prove_supervised_exit_and_assert_ready(conn, t, state)
 
 
 def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch):
-    """detect_stale_running must also hold the claim when the worker survives."""
+    """A stale live worker is logically closed but remains exit-gated."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="wedged", assignee="worker")
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
+        state, run_id = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=os.getpid(),
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         with kb.write_txn(conn):
@@ -666,26 +762,25 @@ def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch)
                 (five_hours_ago, t),
             )
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
-        monkeypatch.setattr(
-            _kb, "_terminate_reclaimed_worker",
-            lambda *a, **k: {
-                "termination_attempted": True,
-                "host_local": True,
-                "terminated": False,
-            },
-        )
+        def _permission_denied(_pgid, _sig):
+            raise PermissionError("worker survived")
+
         stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+            conn, stale_timeout_seconds=14400, signal_fn=_permission_denied,
         )
-        assert stale == []
-        assert kb.get_task(conn, t).status == "running"
+        assert stale == [t]
+        _assert_supervised_exit_is_gated(
+            conn, t, pid=os.getpid(), run_id=run_id,
+        )
         kinds = [
             r["kind"] for r in conn.execute(
                 "SELECT kind FROM task_events WHERE task_id = ?", (t,),
             ).fetchall()
         ]
-        assert "reclaim_deferred" in kinds
+        assert "stale" in kinds
+        assert "process_exit_signal_failed" in kinds
+        assert "reclaim_deferred" not in kinds
+        _prove_supervised_exit_and_assert_ready(conn, t, state)
 
 
 def test_stale_claim_reclaim_event_records_diagnostic_payload(
@@ -703,6 +798,9 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kb._set_worker_pid(conn, t, 12345)
+        state, run_id = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=12345,
+        )
         old_expires = int(time.time()) - 3600
         hb_at = int(time.time()) - 1800
         conn.execute(
@@ -710,9 +808,10 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
             "WHERE id = ?",
             (old_expires, hb_at, t),
         )
-
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        state["pid_alive"] = False
+        state["group_alive"] = False
         kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        _assert_supervised_exit_is_gated(conn, t, pid=12345, run_id=run_id)
         row = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id = ? AND kind = 'reclaimed'",
@@ -724,6 +823,7 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["last_heartbeat_at"] == hb_at
         assert payload["worker_pid"] == 12345
         assert payload["host_local"] is True
+        _prove_supervised_exit_and_assert_ready(conn, t, state)
 
 
 def test_detect_crashed_workers_systemic_failure_fast_block(
@@ -786,6 +886,78 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             assert task.status == "ready", (
                 f"task {tid} should stay ready (isolated), got {task.status}"
             )
+
+
+@pytest.mark.parametrize(
+    (
+        "dispatcher_limit",
+        "max_retries",
+        "attempts",
+        "expected_source",
+        "expected_limit",
+    ),
+    [
+        (3, None, 3, "dispatcher", 3),
+        (4, 1, 1, "task", 1),
+    ],
+    ids=["dispatcher-boundary", "task-override"],
+)
+def test_normal_crash_exact_boundary_honors_task_override(
+    kanban_home,
+    monkeypatch,
+    dispatcher_limit,
+    max_retries,
+    attempts,
+    expected_source,
+    expected_limit,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb, "_classify_worker_exit", lambda _pid: ("unknown", None)
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="normal crash boundary",
+            assignee="worker",
+            max_retries=max_retries,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+
+        for attempt in range(1, attempts + 1):
+            claimed = kb.claim_task(
+                conn, task_id, claimer=f"{host}:crash-{attempt}"
+            )
+            assert claimed is not None
+            kb._set_worker_pid(conn, task_id, 910_000 + attempt)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET started_at = ? WHERE id = ?",
+                    (int(time.time()) - 60, task_id),
+                )
+
+            crashed = kb.detect_crashed_workers(
+                conn, failure_limit=dispatcher_limit
+            )
+
+            assert crashed == [task_id]
+            current = kb.get_task(conn, task_id)
+            assert current.consecutive_failures == attempt
+            if attempt < attempts:
+                assert current.status == "ready"
+
+        final = kb.get_task(conn, task_id)
+        assert final.status == "blocked"
+        assert getattr(kb.detect_crashed_workers, "_last_auto_blocked") == [
+            task_id
+        ]
+        gave_up = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "gave_up"
+        ]
+        assert gave_up[-1].payload["limit_source"] == expected_source
+        assert gave_up[-1].payload["effective_limit"] == expected_limit
 
 
 def test_detect_crashed_workers_skips_freshly_claimed_tasks(
@@ -1071,8 +1243,6 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
     ``task_runs.started_at`` row; otherwise every retry of an old task is
     immediately timed out again.
     """
-    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
-
     with kb.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         t = kb.create_task(
@@ -1090,10 +1260,18 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
             "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
             (old_started, 999999, first_run_id),
         )
+        first_state, _ = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=999999,
+        )
+        first_state["pid_alive"] = False
+        first_state["group_alive"] = False
 
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == [t]
-        assert kb.get_task(conn, t).status == "ready"
+        _assert_supervised_exit_is_gated(
+            conn, t, pid=999999, run_id=first_run_id,
+        )
+        _prove_supervised_exit_and_assert_ready(conn, t, first_state)
 
         kb.claim_task(conn, t, claimer=f"{host}:retry")
         retry_run = kb.latest_run(conn, t)
@@ -1105,10 +1283,60 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
             "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
             (999999, retry_run.id),
         )
+        _seed_supervised_identity(conn, t, monkeypatch, pid=999999)
 
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == []
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_managed_max_runtime_uses_custom_dispatcher_failure_limit(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        task_id = kb.create_task(
+            conn,
+            title="managed timeout boundary",
+            assignee="worker",
+            max_runtime_seconds=1,
+        )
+        claimed = kb.claim_task(
+            conn, task_id, claimer=f"{host}:managed-timeout"
+        )
+        assert claimed is not None
+        state, run_id = _seed_supervised_identity(
+            conn, task_id, monkeypatch, pid=920_001
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
+                (2, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (int(time.time()) - 30, run_id),
+            )
+
+        def signal_denied(_pgid, _sig):
+            raise PermissionError("keep the managed exit gate open")
+
+        timed_out = kb.enforce_max_runtime(
+            conn, signal_fn=signal_denied, failure_limit=4
+        )
+
+        assert timed_out == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task.status == "todo"
+        assert task.consecutive_failures == 3
+        assert getattr(kb.enforce_max_runtime, "_last_auto_blocked") == []
+        assert not any(
+            event.kind == "gave_up" for event in kb.list_events(conn, task_id)
+        )
+        _assert_supervised_exit_is_gated(
+            conn, task_id, pid=920_001, run_id=run_id
+        )
+        _prove_supervised_exit_and_assert_ready(conn, task_id, state)
 
 
 def test_heartbeat_extends_claim(kanban_home):
@@ -3246,6 +3474,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     yet).
     """
     import sqlite3 as _sqlite3
+    import hermes_state as _hermes_state
     from unittest.mock import patch as _patch
 
     home = tmp_path / ".hermes"
@@ -3255,6 +3484,11 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
+    # Warning de-duplication is process-global. This file intentionally runs
+    # many connection tests in one subprocess, so isolate both journals rather
+    # than inheriting an earlier test's "already warned" state.
+    monkeypatch.setattr(_hermes_state, "_wal_fallback_warned_paths", set())
+    monkeypatch.setattr(_hermes_state, "_wal_reset_bug_warned_paths", set())
 
     real_connect = _sqlite3.connect
 
@@ -3841,6 +4075,31 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
     assert len(spawns) == 2, f"expected 2 spawns (cap 3 - 1 running), got {len(spawns)}"
 
 
+def test_dispatch_combined_live_caps_do_not_double_subtract_running(
+    kanban_home, all_assignees_spawnable,
+):
+    """live=1 with absolute caps 5/3 has exactly two free slots."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        assert kb.claim_task(conn, running) is not None
+        for title in ("ready-1", "ready-2", "ready-3", "ready-4"):
+            kb.create_task(conn, title=title, assignee="bob")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=5,
+            max_in_progress=3,
+        )
+
+    assert len(spawns) == 2
+    assert len(result.spawned) == 2
+
+
 def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_spawnable):
     """Default None means no limit — all ready tasks are spawned."""
     spawns = []
@@ -3860,8 +4119,12 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
 
 
 def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
-    """Test helper: set a task's status directly."""
-    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    """Test helper: install a coherent direct status/lane fixture."""
+    resume_lane = "review" if status == "review" else "implementation"
+    conn.execute(
+        "UPDATE tasks SET status = ?, resume_lane = ? WHERE id = ?",
+        (status, resume_lane, task_id),
+    )
 
 
 def test_claim_review_task_transitions_to_running(kanban_home):
@@ -3911,11 +4174,23 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
 def test_dispatch_review_spawns_with_correct_skills(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review tasks get sdlc-review skill set before spawning."""
+    """Legacy review keeps its established skill and ordinary spawn contract."""
     spawned_tasks = []
+    captured_flags = []
 
-    def capture_spawn(task, workspace, board=None):
+    def capture_spawn(
+        task,
+        workspace,
+        board=None,
+        *,
+        allow_short_handoff=True,
+        require_exit_safety=False,
+        review_mode=False,
+    ):
         spawned_tasks.append(task)
+        captured_flags.append(
+            (allow_short_handoff, require_exit_safety, review_mode)
+        )
         return 42  # fake PID
 
     with kb.connect() as conn:
@@ -3925,6 +4200,7 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
     assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert captured_flags == [(True, False, False)]
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
@@ -3957,6 +4233,52 @@ def test_dispatch_review_counts_toward_max_spawn(
     # Only 2 should spawn (ready tasks get priority in the loop)
     assert len(res.spawned) == 2
     assert len(spawns) == 2
+
+
+def test_dispatch_review_only_uses_remaining_absolute_capacity(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review workers consume only the two slots left below a live cap of 3."""
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        assert kb.claim_task(conn, running) is not None
+        review_ids = []
+        for title in ("review-1", "review-2", "review-3"):
+            task_id = kb.create_task(conn, title=title, assignee="bob")
+            _set_task_status(conn, task_id, "review")
+            review_ids.append(task_id)
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress=3,
+        )
+
+    assert [item[0] for item in result.spawned] == review_ids[:2]
+
+
+def test_dispatch_ready_and_review_share_per_profile_capacity(
+    kanban_home, all_assignees_spawnable,
+):
+    """A profile full in implementation cannot also start a reviewer."""
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="alice running", assignee="alice")
+        assert kb.claim_task(conn, running) is not None
+        ready_bob = kb.create_task(conn, title="bob ready", assignee="bob")
+        review_alice = kb.create_task(
+            conn, title="alice review", assignee="alice"
+        )
+        _set_task_status(conn, review_alice, "review")
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_spawn=3,
+            max_in_progress_per_profile=1,
+        )
+
+    assert [item[0] for item in result.spawned] == [ready_bob]
+    assert result.skipped_per_profile_capped == [
+        (review_alice, "alice", 1)
+    ]
 
 
 def test_dispatch_review_spawns_when_ready_empty(
@@ -4042,6 +4364,9 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
         t = kb.create_task(conn, title="stale-no-hb", assignee="worker")
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
+        state, run_id = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=os.getpid(),
+        )
 
         # Rewind started_at so the task appears to have been running for 5 hours.
         five_hours_ago = int(time.time()) - (5 * 3600)
@@ -4056,14 +4381,17 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
             )
         # No heartbeat set — last_heartbeat_at stays NULL.
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        state["pid_alive"] = False
+        state["group_alive"] = False
         killed = []
         stale = kb.detect_stale_running(
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: killed.append(s),
         )
         assert t in stale, "Task with no heartbeat for >4h should be reclaimed"
-        task = kb.get_task(conn, t)
-        assert task.status == "ready"
+        _assert_supervised_exit_is_gated(
+            conn, t, pid=os.getpid(), run_id=run_id,
+        )
+        _prove_supervised_exit_and_assert_ready(conn, t, state)
 
 
 def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch):
@@ -4074,6 +4402,9 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
         t = kb.create_task(conn, title="stale-hb", assignee="worker")
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
+        state, run_id = _seed_supervised_identity(
+            conn, t, monkeypatch, pid=os.getpid(),
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         heartbeat_2h_ago = int(time.time()) - (2 * 3600)
@@ -4089,14 +4420,18 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
                 (five_hours_ago, t),
             )
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        state["pid_alive"] = False
+        state["group_alive"] = False
         stale = kb.detect_stale_running(
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
         )
         assert t in stale, (
             "Task with heartbeat >1h old and started >4h ago should be stale"
         )
-        assert kb.get_task(conn, t).status == "ready"
+        _assert_supervised_exit_is_gated(
+            conn, t, pid=os.getpid(), run_id=run_id,
+        )
+        _prove_supervised_exit_and_assert_ready(conn, t, state)
 
 
 def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch):

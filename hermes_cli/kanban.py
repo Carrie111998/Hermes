@@ -26,6 +26,12 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_control_guard import (
+    MANAGED_CONTROL_DENIED_MESSAGE,
+    all_managed_task_ids,
+    authorize_managed_task_mutations,
+    managed_dispatch_write_target_ids,
+)
 from hermes_cli.profiles import get_active_profile_name
 
 
@@ -68,6 +74,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
+        "validation_class": t.validation_class,
         "branch_name": t.branch_name,
         "project_id": t.project_id,
         "created_by": t.created_by,
@@ -315,6 +322,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
+    p_create.add_argument(
+        "--validation-class",
+        choices=sorted(kb.VALID_VALIDATION_CLASSES),
+        default=kb.DEFAULT_VALIDATION_CLASS,
+        help=(
+            "Independent-review evidence class "
+            f"(default: {kb.DEFAULT_VALIDATION_CLASS}). "
+            "The text_mechanism class is reserved for an authorized "
+            "managed pilot in one approved directory."
+        ),
+    )
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--project", default=None,
@@ -678,6 +696,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    p_cleanup = sub.add_parser(
+        "resolve-unsafe-cleanup",
+        help=(
+            "Release one exact managed-worker safety hold after verifying "
+            "all task-owned processes are stopped"
+        ),
+    )
+    p_cleanup.add_argument("task_id")
+    p_cleanup.add_argument("--run-id", type=int, required=True)
+    p_cleanup.add_argument("--gate-id", required=True)
+    p_cleanup.add_argument(
+        "--note",
+        required=True,
+        help="What was checked before confirming that every process stopped",
+    )
+    p_cleanup.add_argument(
+        "--confirm-all-processes-stopped",
+        action="store_true",
+        required=True,
+        help="Required explicit safety confirmation",
+    )
+    p_cleanup.add_argument("--json", action="store_true")
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -693,9 +734,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
     p_disp.add_argument("--failure-limit", type=int,
-                        default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
+                        default=None,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
-                             f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
+                             f"(spawn_failed, timed_out, or crashed; default: kanban.failure_limit, "
+                             f"then {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
@@ -708,7 +750,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_daemon.add_argument("--max", type=int, default=None,
                           help="Cap number of spawns per tick")
     p_daemon.add_argument("--failure-limit", type=int,
-                          default=kb.DEFAULT_SPAWN_FAILURE_LIMIT)
+                          default=None)
     p_daemon.add_argument("--pidfile", default=None,
                           help="Write the daemon's PID to this file on start")
     p_daemon.add_argument("--verbose", "-v", action="store_true",
@@ -970,6 +1012,8 @@ def kanban_command(args: argparse.Namespace) -> int:
     # reports beta as the current board even when the on-disk pointer is
     # alpha.
     if action == "boards":
+        if not _authorize_managed_board_removal(args):
+            return 1
         return _dispatch_boards(args)
 
     # `--board <slug>` applies to every subcommand below by way of an
@@ -1019,6 +1063,21 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
 
+        if action in MANAGED_TASK_MUTATING_ACTIONS:
+            with kb.connect_closing() as conn:
+                targets = _managed_mutation_targets(conn, args)
+                decision = authorize_managed_task_mutations(
+                    conn,
+                    targets,
+                    (
+                        getattr(args, "_mutation_identity", None)
+                        or getattr(args, "_control_origin", None)
+                    ),
+                )
+            if not decision.allowed:
+                print(MANAGED_CONTROL_DENIED_MESSAGE, file=sys.stderr)
+                return 1
+
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
@@ -1046,6 +1105,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "resolve-unsafe-cleanup": _cmd_resolve_unsafe_cleanup,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1111,6 +1171,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unblock",
     "promote",
     "archive",
+    "resolve-unsafe-cleanup",
     "dispatch",
     "daemon",
     "repair",
@@ -1133,6 +1194,109 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "rename",
     "set-default-workdir",
 })
+
+
+# Read-only verbs deliberately remain available everywhere.  Every verb in
+# this set can change task state, task evidence, routing, or task-owned files
+# and therefore passes through the durable origin guard before its handler.
+MANAGED_TASK_MUTATING_ACTIONS: frozenset[str] = frozenset({
+    "boards",
+    "create",
+    "swarm",
+    "assign",
+    "set-model",
+    "reclaim",
+    "reassign",
+    "link",
+    "unlink",
+    "claim",
+    "comment",
+    "attach",
+    "attach-rm",
+    "complete",
+    "edit",
+    "block",
+    "schedule",
+    "unblock",
+    "promote",
+    "archive",
+    "resolve-unsafe-cleanup",
+    "dispatch",
+    "daemon",
+    "heartbeat",
+    "notify-subscribe",
+    "notify-unsubscribe",
+    "specify",
+    "decompose",
+})
+
+
+def _managed_mutation_targets(
+    conn,
+    args: argparse.Namespace,
+) -> list[str]:
+    """Resolve every task one CLI action could change before it writes."""
+    action = str(getattr(args, "kanban_action", "") or "")
+    if action in {"link", "unlink"}:
+        return [
+            str(getattr(args, "parent_id", "") or ""),
+            str(getattr(args, "child_id", "") or ""),
+        ]
+    if action in {"create", "swarm"}:
+        targets = (
+            [str(v) for v in (getattr(args, "parent", None) or [])]
+            if action == "create"
+            else []
+        )
+        idempotency_key = str(
+            getattr(args, "idempotency_key", "") or ""
+        ).strip()
+        if idempotency_key:
+            row = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? "
+                "AND status != 'archived' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                targets.append(str(row["id"]))
+        return targets
+    if action in {"complete", "unblock"}:
+        return [str(v) for v in (getattr(args, "task_ids", None) or [])]
+    if action == "archive":
+        return [
+            str(v)
+            for v in (
+                list(getattr(args, "task_ids", None) or [])
+                + list(getattr(args, "purge_ids", None) or [])
+            )
+        ]
+    if action in {"block", "schedule", "promote"}:
+        return [
+            str(getattr(args, "task_id", "") or ""),
+            *[str(v) for v in (getattr(args, "ids", None) or [])],
+        ]
+    if action == "attach-rm":
+        attachment = kb.get_attachment(conn, int(args.attachment_id))
+        return [attachment.task_id] if attachment is not None else []
+    if action in {"specify", "decompose"} and getattr(
+        args, "all_triage", False
+    ):
+        tenant = getattr(args, "tenant", None)
+        if tenant:
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE status = 'triage' AND tenant = ?",
+                (tenant,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE status = 'triage'"
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+    if action in {"dispatch", "daemon"}:
+        return managed_dispatch_write_target_ids(conn)
+    task_id = str(getattr(args, "task_id", "") or "").strip()
+    return [task_id] if task_id else []
 
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
@@ -1181,6 +1345,35 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_set_default_workdir(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
+
+
+def _authorize_managed_board_removal(args: argparse.Namespace) -> bool:
+    """Protect an entire board before archive/delete can move its evidence."""
+    sub = getattr(args, "boards_action", None) or "list"
+    if sub not in {"rm", "remove", "delete"}:
+        return True
+    try:
+        slug = kb._normalize_board_slug(getattr(args, "slug", ""))
+    except ValueError:
+        return True  # The normal command reports the invalid slug.
+    if not slug or not kb.board_exists(slug):
+        return True  # The normal command reports a missing/forbidden board.
+    try:
+        with kb.connect_closing(board=slug) as conn:
+            managed_ids = all_managed_task_ids(conn)
+    except Exception:
+        print(
+            "这个看板的任务记录目前无法安全核对，因此没有删除或归档。",
+            file=sys.stderr,
+        )
+        return False
+    if managed_ids:
+        print(
+            "这个看板包含需要保留的短任务记录，因此不能整板删除或归档。",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
@@ -1482,6 +1675,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
+            validation_class=getattr(
+                args,
+                "validation_class",
+                kb.DEFAULT_VALIDATION_CLASS,
+            ),
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
@@ -1497,6 +1695,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            control_origin=getattr(args, "_control_origin", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2116,6 +2315,47 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_terminal_identity_for(
+    conn,
+    task_id: str,
+) -> tuple[Optional[int], Optional[int]]:
+    """Resolve the dispatcher worker PID for a CLI child, fail closed.
+
+    ``hermes kanban ...`` may itself be a subprocess of the managed worker,
+    so its own PID is not the PID bound to the task run.  The inherited run
+    and unguessable claim token must both match the live task/run rows before
+    the stored owner PID can be forwarded to the terminal-transition CAS.
+    """
+    run_id = _worker_run_id_for(task_id)
+    if run_id is None:
+        return None, None
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    if not claim_lock:
+        return run_id, None
+    row = conn.execute(
+        """
+        SELECT t.current_run_id, t.worker_pid AS task_worker_pid,
+               t.claim_lock AS task_claim_lock,
+               r.worker_pid AS run_worker_pid, r.claim_lock AS run_claim_lock
+          FROM tasks t
+          LEFT JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return run_id, None
+    valid = bool(
+        row["current_run_id"] is not None
+        and int(row["current_run_id"]) == run_id
+        and row["task_worker_pid"] is not None
+        and row["run_worker_pid"] == row["task_worker_pid"]
+        and row["task_claim_lock"] == claim_lock
+        and row["run_claim_lock"] == claim_lock
+    )
+    return run_id, int(row["task_worker_pid"]) if valid else None
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2191,12 +2431,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
+            expected_run_id, expected_worker_pid = _worker_terminal_identity_for(
+                conn, tid
+            )
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
+                expected_worker_pid=expected_worker_pid,
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2241,18 +2485,22 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            expected_run_id, expected_worker_pid = _worker_terminal_identity_for(
+                conn, tid
+            )
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
+                expected_worker_pid=expected_worker_pid,
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                if reason:
+                    kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2277,17 +2525,21 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
+            expected_run_id, expected_worker_pid = _worker_terminal_identity_for(
+                conn, tid
+            )
             if not kb.schedule_task(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
+                expected_worker_pid=expected_worker_pid,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
+                if reason:
+                    kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
@@ -2304,12 +2556,12 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
+                if reason:
+                    kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
@@ -2393,6 +2645,43 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_resolve_unsafe_cleanup(args: argparse.Namespace) -> int:
+    confirmation = (
+        kb.UNSAFE_PROCESS_CLEANUP_CONFIRMATION
+        if args.confirm_all_processes_stopped
+        else ""
+    )
+    with kb.connect_closing() as conn:
+        result = kb.resolve_unsafe_process_cleanup(
+            conn,
+            task_id=args.task_id,
+            run_id=args.run_id,
+            gate_id=args.gate_id,
+            actor=_profile_author(),
+            note=args.note,
+            confirmation=confirmation,
+        )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    elif result.get("status") == "resolved":
+        print(
+            f"Resolved cleanup safety hold for {args.task_id}; "
+            "the exact exit gate is released"
+        )
+    elif result.get("status") == "resolved_waiting_for_exit":
+        print(
+            f"Verified cleanup for {args.task_id}; the exact gate remains "
+            "closed until worker-exit proof is available"
+        )
+    else:
+        print(
+            f"cannot resolve unsafe cleanup for {args.task_id}: "
+            f"{result.get('error') or 'state changed'}",
+            file=sys.stderr,
+        )
+    return 0 if str(result.get("status", "")).startswith("resolved") else 1
+
+
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
@@ -2444,18 +2733,33 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        configured_failure_limit = (
+            _coerce_positive_int(_kanban_cfg.get("failure_limit"))
+            or kb.DEFAULT_SPAWN_FAILURE_LIMIT
+        )
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        configured_failure_limit = kb.DEFAULT_SPAWN_FAILURE_LIMIT
+    failure_limit = (
+        args.failure_limit
+        if getattr(args, "failure_limit", None) is not None
+        else configured_failure_limit
+    )
+    try:
+        failure_limit = kb.require_positive_failure_limit(failure_limit)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            failure_limit=failure_limit,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
@@ -2516,6 +2820,60 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"{', '.join(res.skipped_nonspawnable)}"
         )
     return 0
+
+
+def _run_guarded_daemon_loop(
+    *,
+    interval: float,
+    max_spawn: Optional[int],
+    failure_limit: int,
+    on_tick,
+    control_identity,
+) -> bool:
+    """Run legacy ticks while rechecking managed authority before each one."""
+    import signal
+    import threading
+    import traceback
+
+    stop_event = threading.Event()
+
+    def _handle(_signum, _frame):
+        stop_event.set()
+
+    if threading.current_thread() is threading.main_thread():
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is not None:
+                try:
+                    signal.signal(sig, _handle)
+                except (ValueError, OSError):
+                    pass
+
+    while not stop_event.is_set():
+        try:
+            with kb.connect_closing() as conn:
+                decision = authorize_managed_task_mutations(
+                    conn,
+                    managed_dispatch_write_target_ids(conn),
+                    control_identity,
+                )
+                if not decision.allowed:
+                    print(MANAGED_CONTROL_DENIED_MESSAGE, file=sys.stderr)
+                    return False
+                result = kb.dispatch_once(
+                    conn,
+                    max_spawn=max_spawn,
+                    failure_limit=failure_limit,
+                )
+            if on_tick is not None:
+                try:
+                    on_tick(result)
+                except Exception:
+                    pass
+        except Exception:
+            traceback.print_exc()
+        stop_event.wait(timeout=interval)
+    return True
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -2642,12 +3000,37 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         except Exception:
             return False
 
+    daemon_failure_limit = getattr(args, "failure_limit", None)
+    if daemon_failure_limit is None:
+        try:
+            from hermes_cli.config import load_config
+
+            daemon_failure_limit = int(
+                (load_config().get("kanban") or {}).get(
+                    "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT
+                )
+            )
+            if daemon_failure_limit < 1:
+                raise ValueError("failure limit must be positive")
+        except Exception:
+            daemon_failure_limit = kb.DEFAULT_SPAWN_FAILURE_LIMIT
     try:
-        kb.run_daemon(
+        daemon_failure_limit = kb.require_positive_failure_limit(
+            daemon_failure_limit
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        completed = _run_guarded_daemon_loop(
             interval=args.interval,
             max_spawn=args.max,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            failure_limit=daemon_failure_limit,
             on_tick=_on_tick,
+            control_identity=(
+                getattr(args, "_mutation_identity", None)
+                or getattr(args, "_control_origin", None)
+            ),
         )
     finally:
         if pidfile:
@@ -2655,6 +3038,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 Path(pidfile).unlink()
             except OSError:
                 pass
+    if not completed:
+        return 1
     print("(dispatcher stopped)")
     return 0
 
@@ -3003,8 +3388,13 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kb.connect_closing() as conn:
+        managed_ids = set(all_managed_task_ids(conn))
         rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
+            "SELECT id, workspace_kind, workspace_path FROM tasks "
+            "WHERE status = 'archived' AND NOT EXISTS ("
+            "SELECT 1 FROM kanban_control_bindings b "
+            "WHERE b.task_id = tasks.id AND b.short_handoff_policy != ''"
+            ")"
         ).fetchall()
     for row in rows:
         if row["workspace_kind"] != "scratch":
@@ -3025,13 +3415,39 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
-    with kb.connect_closing() as conn:
-        removed_events = kb.gc_events(
-            conn, older_than_seconds=event_days * 24 * 3600,
+    event_cutoff = int(time.time()) - event_days * 24 * 3600
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        removed = conn.execute(
+            "DELETE FROM task_events WHERE created_at < ? AND task_id IN ("
+            "SELECT t.id FROM tasks t WHERE t.status IN ('done', 'archived') "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM kanban_control_bindings b "
+            "WHERE b.task_id = t.id AND b.short_handoff_policy != ''"
+            ")"
+            ")",
+            (event_cutoff,),
         )
-    removed_logs = kb.gc_worker_logs(
-        older_than_seconds=log_days * 24 * 3600,
-    )
+        removed_events = int(removed.rowcount or 0)
+
+    log_cutoff = time.time() - log_days * 24 * 3600
+    removed_logs = 0
+    log_dir = kb.worker_logs_dir()
+    if log_dir.exists():
+        for path in log_dir.iterdir():
+            if not path.is_file():
+                continue
+            if any(
+                path.name == f"{task_id}.log"
+                or path.name.startswith(f"{task_id}.log.")
+                for task_id in managed_ids
+            ):
+                continue
+            try:
+                if path.stat().st_mtime < log_cutoff:
+                    path.unlink()
+                    removed_logs += 1
+            except OSError:
+                continue
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
@@ -3135,7 +3551,12 @@ Read-only commands are safe while an agent is running.\
 """
 
 
-def run_slash(rest: str) -> str:
+def run_slash(
+    rest: str,
+    *,
+    control_origin: Optional[dict[str, str]] = None,
+    mutation_identity: Optional[dict[str, str]] = None,
+) -> str:
     """Execute a ``/kanban …`` string and return captured stdout/stderr.
 
     ``rest`` is everything after ``/kanban`` (may be empty).  Used from
@@ -3187,6 +3608,10 @@ def run_slash(rest: str) -> str:
     try:
         with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
             args = kanban_parser.parse_args(tokens)
+            # Internal-only authenticated gateway metadata. It is never parsed
+            # from slash text, so a chat user cannot forge these fields.
+            args._control_origin = control_origin
+            args._mutation_identity = mutation_identity
     except SystemExit as exc:
         out = buf_out.getvalue().rstrip()
         err = buf_err.getvalue().rstrip()

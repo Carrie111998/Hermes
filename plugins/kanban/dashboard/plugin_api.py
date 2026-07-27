@@ -50,10 +50,26 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_control_guard import (
+    MANAGED_CONTROL_DENIED_MESSAGE,
+    all_managed_task_ids,
+    authorize_managed_task_mutations,
+    managed_dispatch_write_target_ids,
+)
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _require_dashboard_task_write(
+    conn: sqlite3.Connection,
+    *task_ids: str,
+) -> None:
+    """Keep the Dashboard read-only for origin-bound Phase-1 tasks."""
+    decision = authorize_managed_task_mutations(conn, task_ids, None)
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=MANAGED_CONTROL_DENIED_MESSAGE)
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +633,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(conn, *payload.parents)
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -710,6 +727,7 @@ async def upload_task_attachment(
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_dashboard_task_write(conn, task_id)
 
         safe_name = _safe_attachment_name(file.filename or "")
 
@@ -794,8 +812,12 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        current = kanban_db.get_attachment(conn, attachment_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        _require_dashboard_task_write(conn, current.task_id)
         att = kanban_db.delete_attachment(conn, attachment_id)
-        if att is None:
+        if att is None:  # pragma: no cover - guarded row vanished concurrently
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
     finally:
@@ -828,6 +850,60 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
 
 
+_DASHBOARD_MANAGED_STATUS_TARGETS = frozenset(
+    {"ready", "todo", "triage", "done", "blocked", "scheduled", "archived"}
+)
+_DASHBOARD_MANAGED_STATUS_ERROR = (
+    "这个任务仍在执行或安全收尾中。请先暂停任务；如果已经暂停，"
+    "请等当前这一步完全结束后再改状态。"
+)
+
+
+def _dashboard_managed_status_block_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Explain why Dashboard must not directly change this task's status.
+
+    Phase-1 workers carry a durable run marker and may retain their checkout
+    while a cooperative stop drains.  Dashboard status verbs do not own that
+    stop protocol, so they must not clear the task/run identity or make the
+    task dispatchable.  Legacy runs (marker=0) deliberately keep the existing
+    Dashboard behavior.
+
+    Treat an inconsistent current-run pointer as active too: a managed run
+    must fail closed until its ownership has been repaired or its exit gate is
+    released.
+    """
+    managed_run = conn.execute(
+        """
+        SELECT 1
+          FROM tasks t
+          JOIN task_runs r ON r.task_id = t.id
+         WHERE t.id = ?
+           AND r.handoff_safety_required = 1
+           AND (
+                r.id = t.current_run_id
+                OR (r.status = 'running' AND r.ended_at IS NULL)
+           )
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if managed_run is not None:
+        return _DASHBOARD_MANAGED_STATUS_ERROR
+
+    open_gate = conn.execute(
+        "SELECT 1 FROM task_exit_gates "
+        "WHERE released_at IS NULL "
+        "AND (parent_task_id = ? OR child_task_id = ?) LIMIT 1",
+        (task_id, task_id),
+    ).fetchone()
+    if open_gate is not None:
+        return _DASHBOARD_MANAGED_STATUS_ERROR
+    return None
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -836,6 +912,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_dashboard_task_write(conn, task_id)
+
+        if (
+            payload.status in _DASHBOARD_MANAGED_STATUS_TARGETS
+            and (
+                block_reason := _dashboard_managed_status_block_reason(
+                    conn, task_id,
+                )
+            )
+        ):
+            raise HTTPException(status_code=409, detail=block_reason)
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -972,6 +1059,7 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(conn, task_id)
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1023,6 +1111,13 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+
+        # Defense in depth for direct callers and for a worker becoming
+        # managed between the endpoint's readable pre-check and this write
+        # transaction.  The HTTP entry points perform the same check first so
+        # they can return the actionable Stop/Reclaim message.
+        if _dashboard_managed_status_block_reason(conn, task_id) is not None:
             return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
@@ -1123,6 +1218,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_dashboard_task_write(conn, task_id)
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
         )
@@ -1145,6 +1241,7 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(conn, payload.parent_id, payload.child_id)
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
         return {"ok": True}
     except ValueError as e:
@@ -1162,6 +1259,7 @@ def delete_link(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(conn, parent_id, child_id)
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
         return {"ok": bool(ok)}
     finally:
@@ -1208,6 +1306,27 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 task = kanban_db.get_task(conn, tid)
                 if task is None:
                     entry.update(ok=False, error="not found")
+                    results.append(entry)
+                    continue
+                managed_decision = authorize_managed_task_mutations(
+                    conn, [tid], None,
+                )
+                if not managed_decision.allowed:
+                    entry.update(ok=False, error=MANAGED_CONTROL_DENIED_MESSAGE)
+                    results.append(entry)
+                    continue
+                requested_status = (
+                    "archived" if payload.archive else payload.status
+                )
+                if (
+                    requested_status in _DASHBOARD_MANAGED_STATUS_TARGETS
+                    and (
+                        block_reason := _dashboard_managed_status_block_reason(
+                            conn, tid,
+                        )
+                    )
+                ):
+                    entry.update(ok=False, error=block_reason)
                     results.append(entry)
                     continue
                 if payload.archive:
@@ -1577,6 +1696,7 @@ def terminate_run_endpoint(
         r = kanban_db.get_run(conn, run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        _require_dashboard_task_write(conn, r.task_id)
         if r.ended_at is not None:
             raise HTTPException(
                 status_code=409,
@@ -1620,6 +1740,7 @@ def reclaim_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(conn, task_id)
         ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
         if not ok:
             raise HTTPException(
@@ -1662,6 +1783,11 @@ def specify_task_endpoint(
     ``async def`` without an explicit ``run_in_executor``.
     """
     board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        _require_dashboard_task_write(conn, task_id)
+    finally:
+        conn.close()
     # Pin the board for the duration of this call so the specifier module
     # (which calls ``kb.connect()`` with no args) hits the right DB. Use a
     # context-local override rather than mutating the process-global
@@ -1708,6 +1834,7 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(conn, task_id)
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,
@@ -1876,6 +2003,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_dashboard_task_write(conn, task_id)
         kanban_db.add_notify_sub(
             conn,
             task_id=task_id,
@@ -1902,6 +2030,7 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(conn, task_id)
         kanban_db.remove_notify_sub(
             conn,
             task_id=task_id,
@@ -2004,8 +2133,28 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_dashboard_task_write(
+            conn, *managed_dispatch_write_target_ids(conn)
+        )
+        try:
+            from hermes_cli.config import load_config
+
+            raw_limit = (
+                (load_config().get("kanban") or {}).get(
+                    "failure_limit", kanban_db.DEFAULT_FAILURE_LIMIT
+                )
+            )
+            failure_limit = int(raw_limit)
+            if failure_limit < 1:
+                raise ValueError("failure limit must be positive")
+        except Exception:
+            failure_limit = kanban_db.DEFAULT_FAILURE_LIMIT
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            board=board,
+            failure_limit=failure_limit,
         )
         # DispatchResult is a dataclass.
         try:
@@ -2202,6 +2351,16 @@ def rename_board(slug: str, payload: RenameBoardBody):
 def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")):
     """Archive (default) or hard-delete a board."""
     try:
+        normed = kanban_db._normalize_board_slug(slug)
+        if normed and kanban_db.board_exists(normed):
+            conn = _conn(board=normed)
+            try:
+                _require_dashboard_task_write(
+                    conn,
+                    *all_managed_task_ids(conn),
+                )
+            finally:
+                conn.close()
         res = kanban_db.remove_board(slug, archive=not delete)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2365,6 +2524,11 @@ def decompose_task_endpoint(
     can take minutes on reasoning models.
     """
     board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        _require_dashboard_task_write(conn, task_id)
+    finally:
+        conn.close()
     # Context-local board pin (see specify endpoint above): this sync
     # endpoint runs in FastAPI's threadpool, so mutating the process-global
     # HERMES_KANBAN_BOARD env var would let concurrent requests for

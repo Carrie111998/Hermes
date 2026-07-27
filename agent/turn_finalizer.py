@@ -22,7 +22,9 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import os
+import uuid
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -91,6 +93,88 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    try:
+        from agent.kanban_auto_handoff import AUTO_HANDOFF_EXIT_REASON
+    except Exception:
+        AUTO_HANDOFF_EXIT_REASON = "kanban_auto_handoff_requested"
+    auto_handoff_requested = str(_turn_exit_reason) == AUTO_HANDOFF_EXIT_REASON
+    kanban_terminal_transition = (
+        str(_turn_exit_reason) == "kanban_terminal_transition"
+    )
+    verified_managed_lane = bool(
+        getattr(agent, "_managed_short_task_bootstrap_verified", False)
+    )
+    # A planned checkpoint summary exists only to transport work into the next
+    # bounded worker.  It must not look like a user-completed turn to plugins,
+    # context engines, or session-end memory extractors.  The source worker
+    # will consume this flag during process teardown while still closing its
+    # providers normally.
+    agent._suppress_session_end_learning = bool(
+        verified_managed_lane
+        and (auto_handoff_requested or kanban_terminal_transition)
+    )
+    auto_handoff_result = None
+    deferred_handoff_direction = None
+    deferred_handoff_control = None
+
+    def _admit_existing_handoff_events(
+        events: list[dict],
+        *,
+        source_task_id: str,
+    ) -> None:
+        """Give pre-window receipts complete replayable identities in order."""
+        if not events:
+            return
+        from agent.kanban_auto_handoff import stage_pending_handoff_control
+
+        run_text = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        if not run_text.isdigit():
+            raise RuntimeError("handoff control requires the active run id")
+        winner_kind = ""
+        winner_id = ""
+        for index, event in enumerate(events):
+            kind = str(event.get("kind") or "steer")
+            phase = "before_commit" if index == 0 else "after_terminal"
+            if winner_kind == "stop" and kind != "stop":
+                phase = "superseded"
+            control = {
+                "control_id": str(event["control_id"]),
+                "source_task_id": source_task_id,
+                "target_task_id": source_task_id,
+                "kind": kind,
+                "message": str(event.get("message") or ""),
+                "phase": phase,
+            }
+            if phase == "before_commit":
+                control.update(
+                    expected_run_id=int(run_text),
+                    expected_worker_pid=os.getpid(),
+                )
+            elif phase == "superseded":
+                control["superseded_by_control_id"] = winner_id
+            event["durable_control"] = control
+            event["durable_phase"] = phase
+            event["source_task_id"] = source_task_id
+            event["target_task_id"] = source_task_id
+            event["pending_handoff_control"] = stage_pending_handoff_control(
+                control,
+                error="awaiting durable confirmation",
+            )
+            event["supervisor_pending"] = True
+            if phase == "superseded":
+                event["state"] = "consumed"
+                event["superseded_by_control_id"] = winner_id
+            elif kind == "stop":
+                winner_kind = "stop"
+                winner_id = str(event["control_id"])
+            elif not winner_kind:
+                winner_kind = kind
+                winner_id = str(event["control_id"])
+        agent._auto_handoff_control_winner_kind = winner_kind
+        agent._auto_handoff_control_winner_id = winner_id
+        agent._auto_handoff_control_phase = "veto_pending"
+        agent._auto_handoff_control_target = source_task_id
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -107,8 +191,112 @@ def finalize_turn(
         and budget_fallback_eligible
     )
 
+    # The hard 90/90 fallback is also a managed terminal transition. Open the
+    # same control window used by a planned checkpoint before either reusing a
+    # held verification response or making the final summary request. This
+    # lets Stop/redirect/steer linearize against timeout accounting instead of
+    # being accepted into memory and applied only after the DB commit.
+    _budget_source_task_id = (
+        os.environ.get("HERMES_KANBAN_TASK") or ""
+    ).strip()
+    _managed_budget_worker = False
+    if _budget_source_task_id and verified_managed_lane:
+        try:
+            from agent.kanban_auto_handoff import resolve_policy
+
+            _managed_budget_worker = bool(
+                resolve_policy(
+                    None,
+                    max_iterations=agent.max_iterations,
+                    task_id=_budget_source_task_id,
+                ).enabled
+            )
+        except Exception:
+            _managed_budget_worker = False
+    _budget_control_lock = getattr(agent, "_auto_handoff_control_lock", None)
+    _budget_redirect_lock = getattr(agent, "_pending_redirect_lock", None)
+    _budget_steer_lock = getattr(agent, "_pending_steer_lock", None)
+    _budget_model_request_active = getattr(agent, "_model_request_active", None)
+    _budget_message_count = len(messages)
+    _budget_prior_receipts: list[dict] = []
+    _hard_budget_control_window = bool(
+        _budget_source_task_id
+        and _managed_budget_worker
+        and budget_fallback_eligible
+        and final_response is None
+        and (continuation_budget_exhausted or not auto_handoff_requested)
+    )
+    if _hard_budget_control_window:
+        agent._suppress_session_end_learning = True
+        with ExitStack() as _budget_summary_gate:
+            if _budget_control_lock is not None:
+                _budget_summary_gate.enter_context(_budget_control_lock)
+                agent._auto_handoff_control_phase = "budget_summarizing"
+                agent._auto_handoff_control_source = _budget_source_task_id
+                agent._auto_handoff_control_target = None
+                agent._auto_handoff_control_winner_kind = ""
+                agent._auto_handoff_control_winner_id = ""
+            if _budget_redirect_lock is not None:
+                _budget_summary_gate.enter_context(_budget_redirect_lock)
+            if _budget_steer_lock is not None:
+                _budget_summary_gate.enter_context(_budget_steer_lock)
+                # Snapshot the durable direction receipts while the control
+                # phase and steer slot are held by the same linearization
+                # window. A steer that wins before this point is represented
+                # here; one that arrives after it is queued directly against
+                # ``budget_summarizing``. There is no gap where it can be
+                # accepted into memory but omitted from the commit decision.
+                _budget_prior_receipts = [
+                    dict(receipt)
+                    for receipt in (
+                        getattr(agent, "_pending_steer_receipts", []) or []
+                    )
+                ]
+            else:
+                _receipt_snapshot = getattr(
+                    agent, "_snapshot_unconsumed_steer_receipts", None
+                )
+                if callable(_receipt_snapshot):
+                    try:
+                        _budget_prior_receipts = list(
+                            _receipt_snapshot() or []
+                        )
+                    except Exception:
+                        _budget_prior_receipts = []
+            if _budget_control_lock is not None:
+                agent._auto_handoff_control_events = [
+                    {
+                        "control_id": str(
+                            receipt.get("control_id")
+                            or f"hc_{uuid.uuid4().hex}"
+                        ),
+                        "seq": index,
+                        "kind": str(receipt.get("kind") or "steer"),
+                        "message": str(receipt.get("message") or ""),
+                        "delivery_slot": str(
+                            receipt.get("delivery_slot") or "steer"
+                        ),
+                        "phase": "budget_summarizing",
+                        "persisted": False,
+                    }
+                    for index, receipt in enumerate(
+                        _budget_prior_receipts,
+                        start=1,
+                    )
+                ]
+                agent._auto_handoff_control_seq = len(
+                    agent._auto_handoff_control_events
+                )
+                _admit_existing_handoff_events(
+                    agent._auto_handoff_control_events,
+                    source_task_id=_budget_source_task_id,
+                )
+            if _budget_model_request_active is not None:
+                _budget_model_request_active.set()
+
     iteration_limit_fallback = False
     preserved_verification_fallback = False
+    _budget_summary_error = None
     if continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
@@ -124,21 +312,402 @@ def finalize_turn(
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
+    elif final_response is None and auto_handoff_requested and not interrupted and not failed:
+        # The Kanban soft limit deliberately leaves hard-budget headroom. Use
+        # one tool-less request to turn the bounded worker history into a
+        # durable checkpoint, then continue through a fresh child worker.
+        agent._emit_status(
+            "🔄 正在整理本段进展，准备自动交接。"
+        )
+        checkpoint_message_count = len(messages)
+        _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
+        _steer_lock = getattr(agent, "_pending_steer_lock", None)
+        _model_request_active = getattr(agent, "_model_request_active", None)
+        _control_lock = getattr(agent, "_auto_handoff_control_lock", None)
+        _source_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        _checkpoint_prior_receipts: list[dict] = []
+        with ExitStack() as _summary_start_gate:
+            if _control_lock is not None:
+                _summary_start_gate.enter_context(_control_lock)
+                agent._auto_handoff_control_phase = "summarizing"
+                agent._auto_handoff_control_source = _source_task_id
+                agent._auto_handoff_control_target = None
+                agent._auto_handoff_control_winner_kind = ""
+                agent._auto_handoff_control_winner_id = ""
+            if _redirect_lock is not None:
+                _summary_start_gate.enter_context(_redirect_lock)
+            if _steer_lock is not None:
+                _summary_start_gate.enter_context(_steer_lock)
+                _checkpoint_prior_receipts = [
+                    dict(receipt)
+                    for receipt in (
+                        getattr(agent, "_pending_steer_receipts", []) or []
+                    )
+                ]
+            else:
+                _receipt_snapshot = getattr(
+                    agent, "_snapshot_unconsumed_steer_receipts", None
+                )
+                if callable(_receipt_snapshot):
+                    try:
+                        _checkpoint_prior_receipts = list(
+                            _receipt_snapshot() or []
+                        )
+                    except Exception:
+                        _checkpoint_prior_receipts = []
+            if _control_lock is not None:
+                # Every ordinary Stop/redirect/steer acceptance now creates a
+                # structured receipt under the same control lock. Seed the
+                # checkpoint event stream from those pre-window receipts so a
+                # later control cannot make the earlier direction disappear.
+                agent._auto_handoff_control_events = [
+                    {
+                        "control_id": str(
+                            receipt.get("control_id")
+                            or f"hc_{uuid.uuid4().hex}"
+                        ),
+                        "seq": index,
+                        "kind": str(receipt.get("kind") or "steer"),
+                        "message": str(receipt.get("message") or ""),
+                        "delivery_slot": str(
+                            receipt.get("delivery_slot") or "steer"
+                        ),
+                        "phase": "summarizing",
+                        "persisted": False,
+                    }
+                    for index, receipt in enumerate(
+                        _checkpoint_prior_receipts,
+                        start=1,
+                    )
+                ]
+                agent._auto_handoff_control_seq = len(
+                    agent._auto_handoff_control_events
+                )
+                _admit_existing_handoff_events(
+                    agent._auto_handoff_control_events,
+                    source_task_id=_source_task_id,
+                )
+            if _model_request_active is not None:
+                _model_request_active.set()
+
+        _summary_error = None
+        try:
+            final_response = agent._handle_max_iterations(
+                messages,
+                api_call_count,
+                summary_request=(
+                    "This is a planned short-task checkpoint, not the end of the overall "
+                    "task. Without calling tools, write a concise handoff for a fresh "
+                    "worker. Include: original objective, work completed, files or state "
+                    "changed, verification already run and its result, exact next step, "
+                    "and any genuine blocker. Do not claim the overall task is complete."
+                ),
+                status_label=(
+                    f"🔄 Short-task checkpoint ({api_call_count}/{agent.max_iterations}). "
+                    "Preparing handoff summary..."
+                ),
+            )
+        except Exception as exc:
+            # Redirect/stop may intentionally abort the provisional summary.
+            # Decide under the control gate below before treating it as failure.
+            _summary_error = exc
+        try:
+            from agent.kanban_auto_handoff import create_successor_and_close
+
+            _veto_control = None
+            _primary_veto_event = None
+            with ExitStack() as _handoff_gate:
+                if _control_lock is not None:
+                    _handoff_gate.enter_context(_control_lock)
+                    if agent._auto_handoff_control_phase != "veto_pending":
+                        agent._auto_handoff_control_phase = "committing"
+                if _redirect_lock is not None:
+                    _handoff_gate.enter_context(_redirect_lock)
+                if _steer_lock is not None:
+                    _handoff_gate.enter_context(_steer_lock)
+                try:
+                    _pending_redirect = getattr(agent, "_pending_redirect", None)
+                    _pending_steer = getattr(agent, "_pending_steer", None)
+                    _hard_or_redirect_interrupt = bool(
+                        getattr(agent, "_interrupt_requested", False)
+                    )
+                    _events = sorted(
+                        list(getattr(agent, "_auto_handoff_control_events", []) or []),
+                        key=lambda item: int(item.get("seq", 0)),
+                    )
+                    if (
+                        _hard_or_redirect_interrupt
+                        or _pending_redirect
+                        or _pending_steer
+                        or _events
+                    ):
+                        _kinds = [str(item.get("kind") or "") for item in _events]
+                        if "stop" in _kinds or (
+                            _hard_or_redirect_interrupt
+                            and not _pending_redirect
+                            and "redirect" not in _kinds
+                        ):
+                            _control_kind = "stop"
+                        elif "redirect" in _kinds or _pending_redirect:
+                            _control_kind = "redirect"
+                        else:
+                            _control_kind = "steer"
+                        _parts = [
+                            str(item.get("message") or "").strip()
+                            for item in _events
+                            if str(item.get("message") or "").strip()
+                        ]
+                        if not _events:
+                            for _fallback_text in (
+                                _pending_redirect,
+                                _pending_steer,
+                            ):
+                                _clean = str(_fallback_text or "").strip()
+                                if _clean and _clean not in _parts:
+                                    _parts.append(_clean)
+                        _chosen_event = next(
+                            (
+                                item
+                                for item in _events
+                                if str(item.get("kind") or "")
+                                == _control_kind
+                            ),
+                            _events[0] if _events else None,
+                        )
+                        _control_message = "\n\n".join(_parts)
+                        _veto_control = {
+                            "control_id": (
+                                _chosen_event.get("control_id")
+                                if _chosen_event is not None
+                                else f"hc_{uuid.uuid4().hex}"
+                            ),
+                            "kind": _control_kind,
+                            "message": _control_message,
+                        }
+                        _primary_veto_event = next(
+                            (
+                                item
+                                for item in _events
+                                if (item.get("durable_control") or {}).get(
+                                    "phase"
+                                )
+                                == "before_commit"
+                            ),
+                            None,
+                        )
+                        if _primary_veto_event is None:
+                            _primary_veto_event = {
+                                "control_id": str(_veto_control["control_id"]),
+                                "seq": 1,
+                                "kind": str(_veto_control["kind"]),
+                                "message": str(_veto_control["message"]),
+                                "phase": "summarizing",
+                                "persisted": False,
+                            }
+                            _admit_existing_handoff_events(
+                                [_primary_veto_event],
+                                source_task_id=_source_task_id,
+                            )
+                            _events.append(_primary_veto_event)
+                            agent._auto_handoff_control_events.append(
+                                _primary_veto_event
+                            )
+                        if _control_lock is not None:
+                            agent._auto_handoff_control_phase = "veto_pending"
+                            agent._auto_handoff_control_target = _source_task_id
+                        interrupted = True
+                        _turn_exit_reason = "interrupted_by_user_direction"
+                        final_response = None
+                        del messages[checkpoint_message_count:]
+                    else:
+                        if _summary_error is not None:
+                            raise _summary_error
+                        try:
+                            auto_handoff_result = create_successor_and_close(
+                                policy=getattr(
+                                    agent, "_kanban_auto_handoff_policy", None
+                                ),
+                                summary=final_response
+                                or "No checkpoint summary was returned.",
+                                api_call_count=api_call_count,
+                                max_iterations=agent.max_iterations,
+                            )
+                        except Exception:
+                            if _control_lock is not None:
+                                agent._auto_handoff_control_phase = "commit_failed"
+                                agent._auto_handoff_control_target = _source_task_id
+                            raise
+                        if _control_lock is not None:
+                            if auto_handoff_result.get("status") == "handed_off":
+                                agent._auto_handoff_control_phase = "committed"
+                                agent._auto_handoff_control_target = (
+                                    auto_handoff_result.get("successor_task_id")
+                                )
+                            elif auto_handoff_result.get("status") == "safety_limit":
+                                agent._auto_handoff_control_phase = "safety_limited"
+                                agent._auto_handoff_control_target = _source_task_id
+                            else:
+                                agent._auto_handoff_control_phase = "commit_failed"
+                                agent._auto_handoff_control_target = _source_task_id
+                finally:
+                    if _model_request_active is not None:
+                        _model_request_active.clear()
+                if _veto_control is not None:
+                    # Persist before releasing the same control lock that chose
+                    # veto. A second stop/redirect cannot slip into a phase
+                    # where the self exit-gate is not yet present.
+                    from agent.kanban_auto_handoff import (
+                        confirm_pending_handoff_control,
+                        persist_worker_handoff_control,
+                        stage_pending_handoff_control,
+                    )
+
+                    if _primary_veto_event is None:
+                        raise RuntimeError(
+                            "handoff veto has no admitted primary receipt"
+                        )
+                    _durable_control = dict(
+                        _primary_veto_event["durable_control"]
+                    )
+                    _control_result = persist_worker_handoff_control(
+                        _durable_control,
+                        attempts=2,
+                    )
+                    if _control_result.get("status") not in {
+                        "recorded", "already_recorded"
+                    }:
+                        deferred_handoff_control = stage_pending_handoff_control(
+                            _durable_control,
+                            error=str(
+                                _control_result.get("error")
+                                or "user direction could not be persisted"
+                            ),
+                        )
+                        agent._pending_redirect = None
+                        agent._pending_steer = None
+                        _moved_ids = {
+                            str(item.get("control_id"))
+                            for item in _events
+                            if item.get("control_id")
+                        }
+                        agent._pending_steer_receipts = [
+                            receipt
+                            for receipt in (
+                                getattr(agent, "_pending_steer_receipts", [])
+                                or []
+                            )
+                            if str(receipt.get("control_id")) not in _moved_ids
+                        ]
+                        raise RuntimeError(
+                            _control_result.get("error")
+                            or "user direction could not be persisted"
+                        )
+                    confirm_pending_handoff_control(_durable_control)
+                    _primary_veto_event["persisted"] = True
+                    _primary_veto_event["supervisor_pending"] = False
+                    agent._pending_redirect = None
+                    agent._pending_steer = None
+                    _consumed_ids = {
+                        str(item.get("control_id"))
+                        for item in _events
+                        if item.get("control_id")
+                    }
+                    agent._pending_steer_receipts = [
+                        receipt
+                        for receipt in (
+                            getattr(agent, "_pending_steer_receipts", []) or []
+                        )
+                        if str(receipt.get("control_id"))
+                        not in _consumed_ids
+                    ]
+                    if _control_lock is not None:
+                        agent._auto_handoff_control_phase = "vetoed"
+                        agent._auto_handoff_control_target = _source_task_id
+                    auto_handoff_result = {
+                        "status": "cancelled_by_user_direction",
+                        "task_id": _source_task_id,
+                        "control_id": _veto_control["control_id"],
+                        "control_kind": _veto_control["kind"],
+                        "persisted": True,
+                    }
+            status = auto_handoff_result.get("status")
+            if status == "handed_off":
+                successor_id = auto_handoff_result.get("successor_task_id")
+                _turn_exit_reason = f"kanban_auto_handoff(successor={successor_id})"
+                agent._emit_status(
+                    "✅ 本段工作已收口，系统正在自动接续下一段。"
+                )
+            elif status == "safety_limit":
+                _turn_exit_reason = "kanban_auto_handoff_safety_limit"
+                final_response = (
+                    (final_response or "").rstrip()
+                    + "\n\n自动接力已达到本次设置的安全上限，工作已暂停，等待你确认是否继续。"
+                ).strip()
+            elif status == "cancelled_by_user_direction":
+                pass
+            else:
+                failed = True
+                _turn_exit_reason = f"kanban_auto_handoff_{status}"
+                final_response = (
+                    (final_response or "").rstrip()
+                    + "\n\n自动接力暂时未能安全完成，当前工作没有被误报为完成。"
+                    "请稍后查看状态或重试。"
+                ).strip()
+        except Exception as exc:
+            if _model_request_active is not None:
+                if _redirect_lock is not None:
+                    with _redirect_lock:
+                        _model_request_active.clear()
+                else:
+                    _model_request_active.clear()
+            if _control_lock is not None:
+                with _control_lock:
+                    if _veto_control is not None:
+                        agent._auto_handoff_control_phase = "commit_failed"
+                        agent._auto_handoff_control_target = _source_task_id
+                    elif agent._auto_handoff_control_phase not in {
+                        "commit_failed", "safety_limited", "vetoed"
+                    }:
+                        agent._auto_handoff_control_phase = "idle"
+                        agent._auto_handoff_control_target = None
+            failed = True
+            _turn_exit_reason = "kanban_auto_handoff_failed"
+            auto_handoff_result = {"status": "failed", "error": str(exc)}
+            final_response = (
+                (final_response or "").rstrip()
+                + "\n\n自动接力的进度保存失败，当前工作没有被误报为完成。"
+                "系统已停止继续接力，避免重复执行。"
+            ).strip()
+            logger.warning("Kanban automatic handoff failed", exc_info=True)
     elif final_response is None and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        logger.info(
+            "Iteration budget exhausted (%s/%s); requesting summary",
+            api_call_count,
+            agent.max_iterations,
+        )
         agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-            "— asking model to summarise"
+            "⚠️ 本轮处理已达到预设上限，正在整理当前进展。"
         )
         if not agent.quiet_mode:
             agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— requesting summary..."
+                "\n⚠️  本轮处理已达到预设上限，正在整理当前进展。"
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        try:
+            final_response = agent._handle_max_iterations(
+                messages, api_call_count
+            )
+        except Exception as exc:
+            # A concurrent redirect may intentionally cancel this provisional
+            # request. Resolve the queued control under the commit gate below
+            # before deciding whether the exception is fatal.
+            if _hard_budget_control_window:
+                _budget_summary_error = exc
+            else:
+                raise
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -152,21 +721,327 @@ def finalize_turn(
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
+        if _kanban_task and _hard_budget_control_window:
+            _budget_veto_control = None
+            _budget_primary_event = None
             try:
                 from hermes_cli import kanban_db as _kb
+                from agent.kanban_auto_handoff import (
+                    confirm_pending_handoff_control,
+                    persist_worker_handoff_control,
+                    stage_pending_handoff_control,
+                    worker_failure_limit,
+                )
+
+                _run_text = (
+                    os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+                ).strip()
+                _claim_lock = (
+                    os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or ""
+                ).strip()
+                if not _run_text.isdigit() or not _claim_lock:
+                    raise RuntimeError(
+                        "managed budget finalization requires exact run identity"
+                    )
+                with ExitStack() as _budget_commit_gate:
+                    if _budget_control_lock is not None:
+                        _budget_commit_gate.enter_context(_budget_control_lock)
+                        if agent._auto_handoff_control_phase != "veto_pending":
+                            agent._auto_handoff_control_phase = "budget_committing"
+                    if _budget_redirect_lock is not None:
+                        _budget_commit_gate.enter_context(_budget_redirect_lock)
+                    if _budget_steer_lock is not None:
+                        _budget_commit_gate.enter_context(_budget_steer_lock)
+                    try:
+                        _pending_redirect = getattr(
+                            agent, "_pending_redirect", None
+                        )
+                        _pending_steer = getattr(agent, "_pending_steer", None)
+                        _hard_or_redirect_interrupt = bool(
+                            getattr(agent, "_interrupt_requested", False)
+                        )
+                        _events = sorted(
+                            list(
+                                getattr(
+                                    agent,
+                                    "_auto_handoff_control_events",
+                                    [],
+                                )
+                                or []
+                            ),
+                            key=lambda item: int(item.get("seq", 0)),
+                        )
+                        if (
+                            _hard_or_redirect_interrupt
+                            or _pending_redirect
+                            or _pending_steer
+                            or _events
+                        ):
+                            _kinds = [
+                                str(item.get("kind") or "") for item in _events
+                            ]
+                            if "stop" in _kinds or (
+                                _hard_or_redirect_interrupt
+                                and not _pending_redirect
+                                and "redirect" not in _kinds
+                            ):
+                                _control_kind = "stop"
+                            elif "redirect" in _kinds or _pending_redirect:
+                                _control_kind = "redirect"
+                            else:
+                                _control_kind = "steer"
+                            _parts = [
+                                str(item.get("message") or "").strip()
+                                for item in _events
+                                if str(item.get("message") or "").strip()
+                            ]
+                            if not _events:
+                                for _fallback_text in (
+                                    _pending_redirect,
+                                    _pending_steer,
+                                ):
+                                    _clean = str(
+                                        _fallback_text or ""
+                                    ).strip()
+                                    if _clean and _clean not in _parts:
+                                        _parts.append(_clean)
+                            _chosen_event = next(
+                                (
+                                    item
+                                    for item in _events
+                                    if str(item.get("kind") or "")
+                                    == _control_kind
+                                ),
+                                _events[0] if _events else None,
+                            )
+                            _budget_veto_control = {
+                                "control_id": (
+                                    _chosen_event.get("control_id")
+                                    if _chosen_event is not None
+                                    else f"hc_{uuid.uuid4().hex}"
+                                ),
+                                "kind": _control_kind,
+                                "message": "\n\n".join(_parts),
+                            }
+                            _budget_primary_event = next(
+                                (
+                                    item
+                                    for item in _events
+                                    if (item.get("durable_control") or {}).get(
+                                        "phase"
+                                    )
+                                    == "before_commit"
+                                ),
+                                None,
+                            )
+                            if _budget_primary_event is None:
+                                _budget_primary_event = {
+                                    "control_id": str(
+                                        _budget_veto_control["control_id"]
+                                    ),
+                                    "seq": 1,
+                                    "kind": str(
+                                        _budget_veto_control["kind"]
+                                    ),
+                                    "message": str(
+                                        _budget_veto_control["message"]
+                                    ),
+                                    "phase": "budget_summarizing",
+                                    "persisted": False,
+                                }
+                                _admit_existing_handoff_events(
+                                    [_budget_primary_event],
+                                    source_task_id=_budget_source_task_id,
+                                )
+                                _events.append(_budget_primary_event)
+                                agent._auto_handoff_control_events.append(
+                                    _budget_primary_event
+                                )
+                            interrupted = True
+                            _turn_exit_reason = "interrupted_by_user_direction"
+                            final_response = None
+                            del messages[_budget_message_count:]
+
+                            if _budget_primary_event is None:
+                                raise RuntimeError(
+                                    "budget veto has no admitted primary receipt"
+                                )
+                            _durable_control = dict(
+                                _budget_primary_event["durable_control"]
+                            )
+                            _control_result = (
+                                persist_worker_handoff_control(
+                                    _durable_control,
+                                    attempts=2,
+                                )
+                            )
+                            if _control_result.get("status") not in {
+                                "recorded",
+                                "already_recorded",
+                            }:
+                                deferred_handoff_control = (
+                                    stage_pending_handoff_control(
+                                        _durable_control,
+                                        error=str(
+                                            _control_result.get("error")
+                                            or "user direction could not be persisted"
+                                        ),
+                                    )
+                                )
+                                agent._pending_redirect = None
+                                agent._pending_steer = None
+                                _moved_ids = {
+                                    str(item.get("control_id"))
+                                    for item in _events
+                                    if item.get("control_id")
+                                }
+                                agent._pending_steer_receipts = [
+                                    receipt
+                                    for receipt in (
+                                        getattr(
+                                            agent,
+                                            "_pending_steer_receipts",
+                                            [],
+                                        )
+                                        or []
+                                    )
+                                    if str(receipt.get("control_id"))
+                                    not in _moved_ids
+                                ]
+                                raise RuntimeError(
+                                    _control_result.get("error")
+                                    or "user direction could not be persisted"
+                                )
+                            confirm_pending_handoff_control(_durable_control)
+                            _budget_primary_event["persisted"] = True
+                            _budget_primary_event["supervisor_pending"] = False
+                            agent._pending_redirect = None
+                            agent._pending_steer = None
+                            _persisted_receipt_ids = {
+                                str(item.get("control_id"))
+                                for item in _events
+                                if item.get("control_id")
+                            }
+                            _receipts = getattr(
+                                agent, "_pending_steer_receipts", []
+                            ) or []
+                            agent._pending_steer_receipts = [
+                                receipt
+                                for receipt in _receipts
+                                if str(receipt.get("control_id"))
+                                not in _persisted_receipt_ids
+                            ]
+                            if _budget_control_lock is not None:
+                                agent._auto_handoff_control_phase = "vetoed"
+                                agent._auto_handoff_control_target = (
+                                    _budget_source_task_id
+                                )
+                        else:
+                            if _budget_summary_error is not None:
+                                raise _budget_summary_error
+                            _conn = _kb.connect()
+                            try:
+                                _failure_result = (
+                                    _kb._record_managed_task_failure_exact(
+                                        _conn,
+                                        _kanban_task,
+                                        error=(
+                                            "Iteration budget exhausted "
+                                            f"({api_call_count}/"
+                                            f"{agent.max_iterations}) — task "
+                                            "could not complete within the "
+                                            "allowed iterations"
+                                        ),
+                                        outcome="timed_out",
+                                        summary=(
+                                            (final_response or "").strip()
+                                            or None
+                                        ),
+                                        expected_run_id=int(_run_text),
+                                        expected_worker_pid=os.getpid(),
+                                        expected_claim_lock=_claim_lock,
+                                        failure_limit=worker_failure_limit(
+                                            strict=True
+                                        ),
+                                        event_payload_extra={
+                                            "budget_used": api_call_count,
+                                            "budget_max": agent.max_iterations,
+                                        },
+                                    )
+                                )
+                            finally:
+                                _conn.close()
+                            if _failure_result.get("status") == "recorded":
+                                if _budget_control_lock is not None:
+                                    agent._auto_handoff_control_phase = (
+                                        "budget_finalized"
+                                    )
+                                    agent._auto_handoff_control_target = (
+                                        _budget_source_task_id
+                                    )
+                                logger.info(
+                                    "recorded budget-exhausted failure for "
+                                    "task %s (%d/%d)",
+                                    _kanban_task,
+                                    api_call_count,
+                                    agent.max_iterations,
+                                )
+                            elif _failure_result.get("status") == "superseded":
+                                if _budget_control_lock is not None:
+                                    agent._auto_handoff_control_phase = "vetoed"
+                                    agent._auto_handoff_control_target = (
+                                        _budget_source_task_id
+                                    )
+                                interrupted = True
+                                final_response = None
+                                del messages[_budget_message_count:]
+                                _turn_exit_reason = "kanban_state_superseded"
+                            else:
+                                raise RuntimeError(
+                                    "managed budget failure was not recorded"
+                                )
+                    finally:
+                        if _budget_model_request_active is not None:
+                            _budget_model_request_active.clear()
+            except Exception:
+                if _budget_model_request_active is not None:
+                    _budget_model_request_active.clear()
+                if _budget_control_lock is not None:
+                    with _budget_control_lock:
+                        agent._auto_handoff_control_phase = "commit_failed"
+                        agent._auto_handoff_control_target = (
+                            _budget_source_task_id
+                        )
+                failed = True
+                final_response = None
+                _turn_exit_reason = "kanban_budget_finalize_failed"
+                logger.warning(
+                    "Failed to safely finalize budget-exhausted task %s",
+                    _kanban_task,
+                    exc_info=True,
+                )
+        elif _kanban_task:
+            # Compatibility path for legacy/default workers that were not
+            # launched through the Phase-1 start barrier. They retain the
+            # historical run-closing semantics and never create an exit gate.
+            try:
+                from hermes_cli import kanban_db as _kb
+                from agent.kanban_auto_handoff import worker_failure_limit
+
                 _conn = _kb.connect()
                 try:
                     _kb._record_task_failure(
                         _conn,
                         _kanban_task,
                         error=(
-                            f"Iteration budget exhausted "
+                            "Iteration budget exhausted "
                             f"({api_call_count}/{agent.max_iterations}) — "
                             "task could not complete within the allowed "
                             "iterations"
                         ),
                         outcome="timed_out",
+                        summary=((final_response or "").strip() or None),
+                        failure_limit=worker_failure_limit(strict=False),
                         release_claim=True,
                         end_run=True,
                         event_payload_extra={
@@ -175,14 +1050,14 @@ def finalize_turn(
                         },
                     )
                     logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
+                        "recorded legacy budget-exhausted failure for task "
+                        "%s (%d/%d)",
+                        _kanban_task,
+                        api_call_count,
+                        agent.max_iterations,
                     )
                 finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
+                    _conn.close()
             except Exception:
                 logger.warning(
                     "Failed to record budget-exhausted failure for task %s",
@@ -190,16 +1065,39 @@ def finalize_turn(
                     exc_info=True,
                 )
 
-    # Determine if conversation completed successfully
-    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
-    completed = (
-        final_response is not None
-        and not failed
+    managed_budget_terminal_transition = bool(
+        iteration_limit_fallback and _hard_budget_control_window
+    )
+    terminal_learning_suppressed = bool(
+        verified_managed_lane
         and (
-            api_call_count < agent.max_iterations
-            or normal_text_response
+            auto_handoff_requested
+            or kanban_terminal_transition
+            or managed_budget_terminal_transition
+            or getattr(agent, "_managed_short_task_bootstrap", False)
         )
     )
+
+    # Determine if conversation completed successfully
+    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    if kanban_terminal_transition:
+        completed = not failed and not interrupted
+    elif auto_handoff_requested:
+        completed = bool(
+            final_response is not None
+            and not failed
+            and auto_handoff_result is not None
+            and auto_handoff_result.get("status") == "handed_off"
+        )
+    else:
+        completed = (
+            final_response is not None
+            and not failed
+            and (
+                api_call_count < agent.max_iterations
+                or normal_text_response
+            )
+        )
 
     # Preflight can seed the display count before the provider receives the
     # request. Roll that estimate back only when an interrupt wins the race
@@ -388,7 +1286,12 @@ def finalize_turn(
         agent.session_id or "none",
     )
 
-    if _last_msg_role == "tool" and not interrupted:
+    if (
+        _last_msg_role == "tool"
+        and not interrupted
+        and not kanban_terminal_transition
+        and not managed_budget_terminal_transition
+    ):
         # Agent was mid-work — this is the "just stops" case.
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "
@@ -439,7 +1342,11 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if (
+        not interrupted
+        and not kanban_terminal_transition
+        and not managed_budget_terminal_transition
+    ):
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -486,7 +1393,11 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and not terminal_learning_suppressed
+    ):
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -508,7 +1419,11 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and not terminal_learning_suppressed
+    ):
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -529,29 +1444,30 @@ def finalize_turn(
     # turn has finished, with the finalized transcript. Complements the
     # per-request select_context() hook (selection before the request;
     # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        # Forward the turn's canonical usage when the host has it. The loop
-        # stashes the most recent API response's usage dict (the same
-        # canonical buckets fed to ``update_from_response``) on the agent as
-        # ``_last_turn_usage``. It is ``None`` on turns that never reached a
-        # provider response (early failure / interrupt), which is exactly the
-        # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    if not terminal_learning_suppressed:
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            # Forward the turn's canonical usage when the host has it. The loop
+            # stashes the most recent API response's usage dict (the same
+            # canonical buckets fed to ``update_from_response``) on the agent as
+            # ``_last_turn_usage``. It is ``None`` on turns that never reached a
+            # provider response (early failure / interrupt), which is exactly the
+            # contract: real usage when available, ``None`` otherwise.
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -605,6 +1521,10 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if auto_handoff_result is not None:
+        result["auto_handoff"] = auto_handoff_result
+    if deferred_handoff_control is not None:
+        result["pending_handoff_control"] = deferred_handoff_control
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a
@@ -616,8 +1536,13 @@ def finalize_turn(
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
     _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+    _deferred_parts = [
+        text
+        for text in (deferred_handoff_direction, _leftover_steer)
+        if text
+    ]
+    if _deferred_parts:
+        result["pending_steer"] = "\n".join(_deferred_parts)
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt
@@ -632,23 +1557,30 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (not terminal_learning_suppressed
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not terminal_learning_suppressed:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if (
+        final_response
+        and not interrupted
+        and not terminal_learning_suppressed
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
@@ -668,20 +1600,21 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            interrupted=interrupted,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
+    if not terminal_learning_suppressed:
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                interrupted=interrupted,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_end hook failed: %s", exc)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

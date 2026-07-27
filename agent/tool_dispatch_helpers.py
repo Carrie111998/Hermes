@@ -38,9 +38,13 @@ from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
 
-# Tools that must never run concurrently (interactive / user-facing).
-# When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+# Tools that must never run concurrently. Interactive calls are serialized for
+# user ordering; managed Kanban terminal calls are hard runtime barriers. Once
+# complete/block commits, no sibling call from that model batch may already be
+# in flight or start afterwards.
+_NEVER_PARALLEL_TOOLS = frozenset(
+    {"clarify", "kanban_complete", "kanban_block"}
+)
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
