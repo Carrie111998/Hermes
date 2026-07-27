@@ -280,3 +280,27 @@ def test_abandon_resolution_terminates_blocked_objective_without_replanning(
         "SELECT COUNT(*) FROM objective_inbox WHERE objective_id=?",
         (objective.id,),
     ).fetchone()[0] == 0
+
+
+def test_intervention_dedupe_cannot_cross_organization(tmp_path):
+    conn = _conn(tmp_path)
+    first = operational_control.raise_intervention(
+        conn,
+        organization_id="org_a",
+        category="authority_insufficient",
+        summary="Needs review",
+        context={"scope": "a"},
+        options=[{"id": "abandon", "label": "Abandon"}],
+        dedupe_key="shared-dedupe-key-0001",
+    )
+    assert first
+    with pytest.raises(PermissionError, match="another organization"):
+        operational_control.raise_intervention(
+            conn,
+            organization_id="org_b",
+            category="authority_insufficient",
+            summary="Other review",
+            context={"scope": "b"},
+            options=[{"id": "abandon", "label": "Abandon"}],
+            dedupe_key="shared-dedupe-key-0001",
+        )

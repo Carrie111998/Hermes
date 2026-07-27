@@ -382,19 +382,31 @@ def raise_intervention(
     organization_id = organization_id or "__unscoped__"
     if action_id is not None:
         existing = conn.execute(
-            """SELECT id FROM intervention_queue
+            """SELECT id,organization_id FROM intervention_queue
                WHERE action_id=? AND category=? AND status='open'""",
             (action_id, category),
         ).fetchone()
         if existing is not None:
+            if str(existing["organization_id"]) != organization_id:
+                raise PermissionError(
+                    "action intervention belongs to another organization"
+                )
             return str(existing["id"])
     if dedupe_key is not None:
         existing = conn.execute(
-            """SELECT id FROM intervention_queue
+            """SELECT id,organization_id,category FROM intervention_queue
                WHERE dedupe_key=? AND status='open'""",
             (dedupe_key,),
         ).fetchone()
         if existing is not None:
+            if str(existing["organization_id"]) != organization_id:
+                raise PermissionError(
+                    "intervention dedupe key belongs to another organization"
+                )
+            if str(existing["category"]) != category:
+                raise ValueError(
+                    "intervention dedupe key was reused for another category"
+                )
             return str(existing["id"])
     item_id = f"intervention_{uuid.uuid4().hex}"
     with conn:
