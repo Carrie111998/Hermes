@@ -17,7 +17,13 @@ export CHARTERFORGE_HOME=/srv/charterforge
 charterforge business bootstrap \
   --charter-file examples/agentic-charter.json
 charterforge business status
+charterforge business readiness
 ```
+
+`business readiness` is a read-only deterministic projection. It reports
+`ready: false` with an exact blocker list until bootstrap, autonomy mode,
+runtime-worker health, drift gates, and open advisor interventions all permit
+unattended operation. It never enables autonomy or attempts a provider action.
 
 The checked-in example charter admits both supervised gateway and standalone
 worker hosts (`runtime_host: "either"`). To exercise the standalone process

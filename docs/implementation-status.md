@@ -189,6 +189,9 @@ acceptance evidence.
   standalone Founder/CEO worker. Compose configuration is validated locally;
   this does not constitute a production deployment, registry publication, or
   live-provider readiness proof.
+- `charterforge business readiness` provides a deterministic, read-only
+  projection of bootstrap, autonomy, worker, drift, and advisor-intervention
+  blockers. It does not certify external providers or legal/compliance status.
 - A current-tree container smoke also proves cross-container bootstrap and
   worker-status persistence against one temporary volume. With no approved
   isolation backend or external secret manager, the worker stopped

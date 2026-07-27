@@ -30,6 +30,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     parser.add_argument("--db", type=Path)
     sub = parser.add_subparsers(dest="business_command", required=True)
     sub.add_parser("status", help="Show organization, runway, and financial statements")
+    sub.add_parser(
+        "readiness",
+        help="Show whether autonomous operation is currently admissible (read-only)",
+    )
     bootstrap = sub.add_parser(
         "bootstrap",
         help="Create or resume the solo-founder business from a charter file",
@@ -399,6 +403,75 @@ def build_business_snapshot(conn) -> dict:
     }
 
 
+def build_business_readiness(conn) -> dict:
+    """Project autonomous-operation readiness from authoritative state only."""
+    snapshot = build_business_snapshot(conn)
+    if not snapshot.get("configured"):
+        return {
+            "ready": False,
+            "state": "unconfigured",
+            "blockers": [
+                {
+                    "code": "bootstrap_required",
+                    "summary": "Solo-founder business has not been bootstrapped",
+                }
+            ],
+            "next_step": snapshot.get("next_step"),
+            "source": "authoritative_state",
+        }
+
+    blockers: list[dict[str, Any]] = []
+    autonomy = snapshot.get("autonomy") or {}
+    if autonomy.get("mode") != "autonomous":
+        blockers.append(
+            {
+                "code": "autonomy_not_enabled",
+                "summary": f"Autonomy mode is {autonomy.get('mode')!r}",
+            }
+        )
+    deployment = snapshot.get("runtime_deployment") or {}
+    if not deployment.get("ready"):
+        blockers.append(
+            {
+                "code": "runtime_worker_not_ready",
+                "summary": "No healthy supervised objective worker is registered",
+                "selected_host": deployment.get("selected_host"),
+                "expected_roles": deployment.get("expected_roles", []),
+            }
+        )
+    drift = snapshot.get("runtime_drift") or {}
+    if drift.get("blocked"):
+        blockers.append(
+            {
+                "code": "runtime_drift_blocked",
+                "summary": "Runtime drift gate is blocking autonomous operation",
+                "details": drift,
+            }
+        )
+    open_interventions = [
+        item for item in (snapshot.get("interventions") or [])
+        if item.get("status") == "open"
+    ]
+    for item in open_interventions:
+        blockers.append(
+            {
+                "code": "advisor_intervention_open",
+                "summary": str(item.get("summary") or item.get("category")),
+                "intervention_id": item.get("id"),
+                "category": item.get("category"),
+            }
+        )
+    return {
+        "ready": not blockers,
+        "state": "ready" if not blockers else "blocked",
+        "blockers": blockers,
+        "organization_id": snapshot["organization"]["id"],
+        "selected_host": deployment.get("selected_host"),
+        "autonomy_mode": autonomy.get("mode"),
+        "source": "authoritative_state",
+    }
+
+
 def business_command(args: argparse.Namespace) -> int:
     if args.business_command == "bootstrap":
         from hermes_cli.config import save_config
@@ -451,6 +524,9 @@ def business_command(args: argparse.Namespace) -> int:
         if command == "status":
             value = build_business_snapshot(conn)
             print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if command == "readiness":
+            print(json.dumps(build_business_readiness(conn), indent=2, sort_keys=True))
             return 0
         if command in {"approval-list", "approval-revoke"}:
             from hermes_cli import approval_artifacts

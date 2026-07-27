@@ -95,3 +95,47 @@ def test_payment_rails_is_read_only_and_surfaces_unavailable_provider(
         "reason": "ValueError: STRIPE_SECRET_KEY is required for the Stripe rail",
     }]
     assert output["outbound"] == []
+
+
+def test_business_readiness_is_unconfigured_without_mutation():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    readiness = business.build_business_readiness(conn)
+    assert readiness["ready"] is False
+    assert readiness["state"] == "unconfigured"
+    assert readiness["blockers"] == [{
+        "code": "bootstrap_required",
+        "summary": "Solo-founder business has not been bootstrapped",
+    }]
+    assert readiness["next_step"]["autonomy_started"] is False
+
+
+def test_business_readiness_reports_authoritative_runtime_blockers(monkeypatch):
+    monkeypatch.setattr(
+        business,
+        "build_business_snapshot",
+        lambda _conn: {
+            "configured": True,
+            "organization": {"id": "org-readiness"},
+            "autonomy": {"mode": "paused"},
+            "runtime_deployment": {
+                "ready": False,
+                "selected_host": "standalone",
+                "expected_roles": ["objective-runtime"],
+            },
+            "runtime_drift": {"blocked": True, "reason": "manifest mismatch"},
+            "interventions": [{
+                "id": "int-1", "status": "open", "category": "security",
+                "summary": "Isolation is not configured",
+            }],
+        },
+    )
+    readiness = business.build_business_readiness(sqlite3.connect(":memory:"))
+    assert readiness["ready"] is False
+    assert readiness["state"] == "blocked"
+    assert [item["code"] for item in readiness["blockers"]] == [
+        "autonomy_not_enabled",
+        "runtime_worker_not_ready",
+        "runtime_drift_blocked",
+        "advisor_intervention_open",
+    ]

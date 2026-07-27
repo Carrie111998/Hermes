@@ -11,6 +11,8 @@
 - Rebuilt-image container smoke now covers bootstrap, a standalone CEO worker
   tick, and cross-container durable stop evidence for an expected security
   block.
+- Added the read-only `business readiness` projection with explicit blocker
+  codes and no implicit autonomy or provider side effects.
 
 ## 0.19.0-agentic-foundation — 2026-07-27
 

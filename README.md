@@ -104,6 +104,7 @@ The following commands exist in this checkout:
 ```bash
 uv run charterforge setup
 uv run charterforge business --help
+uv run charterforge business readiness
 uv run charterforge objectives --help
 uv run charterforge gateway --help
 uv run charterforge backup --help
