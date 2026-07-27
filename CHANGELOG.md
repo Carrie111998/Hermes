@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Kanban full-task inspection and attachment listing now require exact
+  task/board read permits, preventing cross-task disclosure of bodies,
+  comments, runs, events, and artifact metadata.
 - Kanban completion and block transitions now require exact lifecycle permits
   bound to task, board, handoff/reason payload, artifacts or block kind, and
   expected worker run identity before objective state can advance or pause.

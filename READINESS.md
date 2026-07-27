@@ -1754,6 +1754,27 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production distributed lifecycle infrastructure or external authorization.
 
+## Kanban read authority evidence (00af90ce79)
+
+`kanban.show` and `kanban.attachments` now require SHA-256 resources derived
+from the exact task and board before reading durable state. This covers task
+bodies, comments, runs, events, worker context, and attachment metadata;
+cross-task reads are not implied by the Kanban toolset.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **129 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:4e9062977a6056e2ba24d1f3e8cff95f1003cb2a3bfe004c4c63adb4b238706a`.
+This remains deterministic local-provider evidence and does not establish
+production multi-tenant read isolation or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
