@@ -1531,6 +1531,33 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production browser credentials, permissions, or external authorization.
 
+## Terminal execution authority evidence (b3be1f7625)
+
+`terminal.exec` permits now use a SHA-256 resource derived from the complete
+execution context: command, resolved working directory, backend, timeout, task
+identity, background and PTY mode, and notification/watch settings. A
+subordinate cannot reuse a command grant to change where or how it executes.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/terminal_tool.py tests/tools/test_terminal_tool.py
+uv run --extra dev pytest -q \
+  tests/tools/test_terminal_tool.py \
+  tests/tools/test_terminal_task_cwd.py \
+  tests/tools/test_terminal_foreground_timeout_cap.py \
+  tests/tools/test_terminal_none_command_guard.py \
+  tests/tools/test_terminal_compound_background.py \
+  tests/tools/test_terminal_exit_semantics.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **119 terminal regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:2e37ddea216ffa45eccd9dee8887ecf091049d6ad5d32053832935ed1ac0b2c5`.
+This remains deterministic local-provider evidence and does not establish
+production shell credentials, sandbox deployment, or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

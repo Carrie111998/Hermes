@@ -57,6 +57,9 @@ acceptance evidence.
 - Outbound messages and reactions are governed against the resolved target and
   exact payload; a target-only grant cannot be replayed with different content,
   emoji, thread, media, or delivery mode.
+- Terminal execution permits are bound to the complete execution context,
+  including command, resolved working directory, backend, timeout, task,
+  background/PTY mode, and notification settings.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,

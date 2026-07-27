@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Terminal execution permits now bind the exact command, resolved working
+  directory, backend, timeout, background/PTY mode, task identity, and
+  notification/watch settings; a command grant cannot be replayed with a
+  different execution context.
 - Browser navigation permits now bind to the exact browser session as well as
   the destination URL, preventing a URL grant from being replayed in another
   worker's browser context.
