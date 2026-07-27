@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import get_hermes_home, _expand_env_vars
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from utils import is_truthy_value
 
@@ -1218,6 +1218,13 @@ def load_gateway_config() -> GatewayConfig:
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
+
+            # Expand ${VAR} references in config values, matching the behavior
+            # of hermes_cli.config.load_config(). Without this, values under
+            # platforms.<name>.extra (admin lists, webhook URLs, chat IDs)
+            # keep the literal ${VAR} text, which silently breaks gating
+            # (#72096).
+            yaml_cfg = _expand_env_vars(yaml_cfg)
 
             # Managed scope: overlay administrator-pinned values so the gateway
             # honors them too. This loader builds its own dict instead of going
