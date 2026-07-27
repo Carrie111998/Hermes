@@ -1,19 +1,19 @@
 ---
 sidebar_position: 3
 title: "Android / Termux"
-description: "通过 Termux 在 Android 手机上直接运行 Hermes Agent"
+description: "通过 Termux 在 Android 手机上直接运行 IYARI"
 ---
 
-# 在 Android 上通过 Termux 运行 Hermes
+# 在 Android 上通过 Termux 运行 IYARI
 
-这是在 Android 手机上通过 [Termux](https://termux.dev/) 直接运行 Hermes Agent 的已验证路径。
+这是在 Android 手机上通过 [Termux](https://termux.dev/) 直接运行 IYARI 的已验证路径。
 
 它为你提供手机上可用的本地 CLI，以及目前已知可在 Android 上干净安装的核心扩展功能。
 
 ## 已验证路径支持哪些功能？
 
 已验证的 Termux 安装包含：
-- Hermes CLI
+- IYARI CLI
 - cron 支持
 - PTY（伪终端）/后台终端支持
 - Telegram gateway 支持（手动 / 尽力而为的后台运行）
@@ -37,13 +37,13 @@ python -m pip install -e '.[termux]' -c constraints-termux.txt
 - 基于 Docker 的终端隔离在 Termux 内不可用
 - Android 可能仍会挂起 Termux 后台任务，因此 gateway 持久化是尽力而为，而非正常的托管服务
 
-这并不妨碍 Hermes 作为手机原生 CLI agent 正常工作——只是意味着推荐的移动端安装有意比桌面/服务器安装更精简。
+这并不妨碍 IYARI 作为手机原生 CLI agent 正常工作——只是意味着推荐的移动端安装有意比桌面/服务器安装更精简。
 
 ---
 
 ## 方式一：一行安装命令
 
-Hermes 现已内置 Termux 感知的安装路径：
+IYARI 现已内置 Termux 感知的安装路径：
 
 ```bash
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
@@ -77,10 +77,10 @@ pkg install -y git python clang rust make pkg-config libffi openssl nodejs ripgr
 - `ripgrep` — 快速文件搜索
 - `ffmpeg` — 媒体 / TTS 转换
 
-### 2. 克隆 Hermes
+### 2. 克隆 IYARI
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/digital-services-llc/iyari.git
 cd hermes-agent
 ```
 
@@ -122,7 +122,7 @@ hermes version
 hermes doctor
 ```
 
-### 7. 启动 Hermes
+### 7. 启动 IYARI
 
 ```bash
 hermes
