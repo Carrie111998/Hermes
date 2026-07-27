@@ -1,0 +1,5 @@
+name: poolside
+kind: model-provider
+version: 1.0.0
+description: Poolside API provider — inference.poolside.ai
+author: Nous Research
