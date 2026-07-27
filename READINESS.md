@@ -574,6 +574,20 @@ Result: **55 passed, 0 failed**. This covers scheduled catch-up without event
 storms, authenticated external-event routing, durable event claims, worker
 recovery, and objective execution after a persistent wake.
 
+Compliance admission and readiness interactions were validated on current
+`main` (`09c92043f76e32f9cfea8a953a5049568ad049e9`) with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_regulatory_compliance.py \
+  tests/hermes_cli/test_compliance_db.py \
+  tests/hermes_cli/test_business_bootstrap_command.py
+```
+
+Result: **29 passed, 0 failed**. The evidence confirms immutable applicability,
+obligation, control, and payment-provider records; explicit supersession
+lineage; fail-closed action admission; and readiness payment-profile gates.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
