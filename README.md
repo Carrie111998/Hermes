@@ -23,6 +23,10 @@ authoritative state, existing decisions, constraints, evidence, delegated
 authority, and success criteria. It escalates only when required authority or
 evidence is absent.
 
+Open advisor interventions are a hard human boundary: only explicitly
+identified human advisor/owner/approver identities may resolve them. CEO,
+worker, and runtime identities cannot self-approve an escalation.
+
 The company begins as a solo-founder organization. A specialist worker is
 considered only when evidence shows a durable capability or capacity gap.
 Staffing policy evaluates whether bounded contract work or an FTE is warranted
