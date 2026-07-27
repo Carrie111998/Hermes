@@ -38,9 +38,16 @@
     "@streamdown/math": "^1.0.2",
     "agent-browser": "^0.26.0"
   },
+  "devDependencies": {
+    "brace-expansion": "file:vendor/brace-expansion-compat/brace-expansion-compat-5.0.8-hermes.2.tgz"
+  },
   "overrides": {
+    "brace-expansion": "$brace-expansion",
     "lodash": "4.18.1",
-    "yauzl": "^3.3.1"
+    "yauzl": "^3.3.1",
+    "concurrently": {
+      "shell-quote": "1.10.0"
+    }
   },
   "engines": {
     "node": ">=20.0.0"

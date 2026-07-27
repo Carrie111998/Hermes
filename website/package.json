@@ -24,6 +24,7 @@
     "@docusaurus/theme-mermaid": "^3.9.2",
     "@easyops-cn/docusaurus-search-local": "^0.55.1",
     "@mdx-js/react": "^3.0.0",
+    "brace-expansion": "file:../vendor/brace-expansion-compat/brace-expansion-compat-5.0.8-hermes.2.tgz",
     "clsx": "^2.0.0",
     "prism-react-renderer": "^2.3.0",
     "react": "^19.0.0",
@@ -36,6 +37,7 @@
     "typescript": "^6.0.3"
   },
   "overrides": {
+    "brace-expansion": "$brace-expansion",
     "serialize-javascript": "^7.0.5",
     "uuid": "^14.0.0"
   },
