@@ -12,6 +12,15 @@ from hermes_cli import (
 )
 
 
+def test_audit_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    business_audit.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    business_audit.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_audit_chain_rejects_database_tampering():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

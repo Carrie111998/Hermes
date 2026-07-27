@@ -30,6 +30,11 @@ BEGIN SELECT RAISE(ABORT, 'business audit events are immutable'); END;
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction and conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='business_audit_events'"
+    ).fetchone():
+        return
     conn.executescript(SCHEMA_SQL)
 
 
