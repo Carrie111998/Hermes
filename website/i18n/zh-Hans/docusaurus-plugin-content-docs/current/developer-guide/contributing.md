@@ -1,12 +1,12 @@
 ---
 sidebar_position: 4
 title: "贡献指南"
-description: "如何为 Hermes Agent 做贡献 — 开发环境配置、代码风格、PR 流程"
+description: "如何为 IYARI 做贡献 — 开发环境配置、代码风格、PR 流程"
 ---
 
 # 贡献指南
 
-感谢您为 Hermes Agent 做贡献！本指南涵盖开发环境配置、代码库结构说明以及 PR 合并流程。
+感谢您为 IYARI 做贡献！本指南涵盖开发环境配置、代码库结构说明以及 PR 合并流程。
 
 ## 贡献优先级
 
@@ -22,8 +22,8 @@ description: "如何为 Hermes Agent 做贡献 — 开发环境配置、代码�
 
 ## 常见贡献路径
 
-- 构建自定义/本地工具而不修改 Hermes 核心？从 [构建 Hermes 插件](../developer-guide/plugins/index.md) 开始
-- 为 Hermes 本身构建新的内置核心工具？从 [添加工具](./adding-tools.md) 开始
+- 构建自定义/本地工具而不修改 IYARI 核心？从 [构建 IYARI 插件](../developer-guide/plugins/index.md) 开始
+- 为 IYARI 本身构建新的内置核心工具？从 [添加工具](./adding-tools.md) 开始
 - 构建新的 skill？从 [创建 Skill](./creating-skills.md) 开始
 - 构建新的推理提供商？从 [添加提供商](./adding-providers.md) 开始
 
@@ -40,7 +40,7 @@ description: "如何为 Hermes Agent 做贡献 — 开发环境配置、代码�
 
 ### 使用标准安装器
 
-对大多数贡献者来说，最好的开发启动方式和用户安装方式相同：运行标准安装器，然后在它克隆出的仓库里开发。安装器会创建 Hermes venv、配置 `hermes` 命令、为 `hermes update` 写入安装方式标记，并把完整 git 项目克隆到 `$HERMES_HOME/hermes-agent`（通常是 `~/.hermes/hermes-agent`）。这样你的开发环境会和 CLI、updater、lazy dependency installer、gateway、docs 默认假设的布局一致。
+对大多数贡献者来说，最好的开发启动方式和用户安装方式相同：运行标准安装器，然后在它克隆出的仓库里开发。安装器会创建 IYARI venv、配置 `hermes` 命令、为 `hermes update` 写入安装方式标记，并把完整 git 项目克隆到 `$HERMES_HOME/hermes-agent`（通常是 `~/.hermes/hermes-agent`）。这样你的开发环境会和 CLI、updater、lazy dependency installer、gateway、docs 默认假设的布局一致。
 
 ```bash
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
@@ -62,10 +62,10 @@ scripts/run_tests.sh
 
 ### 手动克隆备用路径
 
-只有在你明确不想使用 Hermes managed install layout 时才使用这种方式（例如容器或 CI job 里的临时 clone）。如果这样安装，请确保运行的是这个 venv 里的 `hermes` entrypoint；运行系统 `python3 -m hermes_cli.main` 可能会加载无关的系统 Python 包。
+只有在你明确不想使用 IYARI managed install layout 时才使用这种方式（例如容器或 CI job 里的临时 clone）。如果这样安装，请确保运行的是这个 venv 里的 `hermes` entrypoint；运行系统 `python3 -m hermes_cli.main` 可能会加载无关的系统 Python 包。
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/digital-services-llc/iyari.git
 cd hermes-agent
 
 # 使用 Python 3.11 创建虚拟环境
@@ -117,11 +117,11 @@ scripts/run_tests.sh
 - **注释**：仅在解释非显而易见的意图、权衡取舍或 API 特殊行为时添加
 - **错误处理**：捕获具体异常。对于意外错误，使用 `logger.warning()`/`logger.error()` 并设置 `exc_info=True`
 - **跨平台**：不得假设 Unix 环境（见下文）
-- **Profile 安全路径**：不得硬编码 `~/.hermes` — 代码路径使用 `hermes_constants` 中的 `get_hermes_home()`，面向用户的消息使用 `display_hermes_home()`。完整规则参见 [AGENTS.md](https://github.com/NousResearch/hermes-agent/blob/main/AGENTS.md#profiles-multi-instance-support)。
+- **Profile 安全路径**：不得硬编码 `~/.hermes` — 代码路径使用 `hermes_constants` 中的 `get_hermes_home()`，面向用户的消息使用 `display_hermes_home()`。完整规则参见 [AGENTS.md](https://github.com/digital-services-llc/iyari/blob/main/AGENTS.md#profiles-multi-instance-support)。
 
 ## 跨平台兼容性
 
-Hermes 官方支持 **Linux、macOS、WSL2 以及原生 Windows（通过 PowerShell 安装）**。原生 Windows 使用 [Git for Windows](https://git-scm.com/download/win) 提供的 Git Bash 执行 shell 命令。部分功能依赖 POSIX 内核原语，已做条件限制：dashboard 内嵌的 PTY 终端面板（`/chat` 标签页）仅支持 WSL2。如果您主要在 Windows 上开发，推送前请运行 Windows 陷阱（footgun）lint（`scripts/check-windows-footguns.py`）。
+IYARI 官方支持 **Linux、macOS、WSL2 以及原生 Windows（通过 PowerShell 安装）**。原生 Windows 使用 [Git for Windows](https://git-scm.com/download/win) 提供的 Git Bash 执行 shell 命令。部分功能依赖 POSIX 内核原语，已做条件限制：dashboard 内嵌的 PTY 终端面板（`/chat` 标签页）仅支持 WSL2。如果您主要在 Windows 上开发，推送前请运行 Windows 陷阱（footgun）lint（`scripts/check-windows-footguns.py`）。
 
 贡献代码时，请遵守以下规则：
 
@@ -176,7 +176,7 @@ if platform.system() != "Windows":
 
 ## 安全注意事项
 
-Hermes 拥有终端访问权限，安全至关重要。
+IYARI 拥有终端访问权限，安全至关重要。
 
 ### 现有保护措施
 
@@ -253,8 +253,8 @@ fix(security): prevent shell injection in sudo password piping
 
 ## 报告问题
 
-- 使用 [GitHub Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 请包含：操作系统、Python 版本、Hermes 版本（`hermes version`）、完整错误堆栈
+- 使用 [GitHub Issues](https://github.com/digital-services-llc/iyari/issues)
+- 请包含：操作系统、Python 版本、IYARI 版本（`hermes version`）、完整错误堆栈
 - 包含复现步骤
 - 创建前请检查是否已有重复 issue
 - 安全漏洞请私下报告
@@ -267,4 +267,4 @@ fix(security): prevent shell injection in sudo password piping
 
 ## 许可证
 
-提交贡献即表示您同意您的贡献将以 [MIT 许可证](https://github.com/NousResearch/hermes-agent/blob/main/LICENSE) 授权。
+提交贡献即表示您同意您的贡献将以 [MIT 许可证](https://github.com/digital-services-llc/iyari/blob/main/LICENSE) 授权。

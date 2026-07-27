@@ -318,6 +318,16 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   `Digital Services LLC` ya commiteado). 5 headings cambiaron, sin anchors internos.
   Build limpio: 98/98 warnings idénticos a la baseline.
 - **`skills/bundled/` y `skills/optional/` (todo `skills/`) COMPLETOS en GRUPO 6.**
+- Lote 12 (este commit): `developer-guide/` (27 archivos). 2 `Nous Research` en
+  `prompt-assembly.md` (identity strings "You are Hermes...created by Nous
+  Research"/"You are Hermes Agent...created by Nous Research", precedente exacto de
+  G5 lote 13) — transformación normal, coincide con inglés ya commiteado
+  ("You are IYARI...created by Digital Services LLC" ×2). Preservado
+  `NousResearch/hermes-example-plugins` (repo distinto, mismo precedente de lotes
+  5/13), `HermesCLI`/`HermesACPAgent` (clases camelCase), `hermes config` minúscula +
+  anchor custom `{#surfacing-env-vars-in-hermes-config}`, header
+  `X-Hermes-Session-Id/Key`. 2 headings cambiaron, sin anchors internos. Build limpio:
+  98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 
