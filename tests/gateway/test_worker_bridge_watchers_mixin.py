@@ -61,47 +61,26 @@ STATUSES = frozenset(DEFAULT_STATUSES)
 
 
 # ---------------------------------------------------------------------------
-# Step 8 of PLAN_AUTO_DISPATCH.md is built, except for one open question.
+# Step 8 of PLAN_AUTO_DISPATCH.md is complete. This file was written spec-first
+# alongside that plan and carried 19 xfails; all 19 are implemented and pass.
 #
-# This file was written spec-first alongside that plan and carried 19 xfails.
-# Eighteen are now implemented and pass. The comment that used to live here
-# described three of them as designs "superseded during implementation"; that
-# was wrong, and checking each claim against the shipped code is what resolved
-# them:
+# Kept as history, because each was blocked by a claim that turned out to be
+# false rather than by missing work:
 #
-#   * leases-backed capacity was called superseded. gateway/orchestrator.py
+#   * leases-backed capacity was called a superseded design. gateway/orchestrator.py
 #     acquires ("global", maximum_concurrency) before every run and the live
 #     bridge.db has the table — the spec was right and the comment was not.
 #   * renaming `gateway_dispatch_claim` -> `dispatch_claim` was called unsafe
 #     because live rows carry the old key. True only inside the 120 s claim TTL,
 #     and _dispatch_claim_is_live now reads the legacy key too, so the risk is
-#     gone rather than avoided.
+#     removed rather than avoided.
 #   * the auto-dispatch-aware alert wording was simply unbuilt.
-#
-# The one genuine open question is who owns `created` tasks:
-#
-#   The plan gives this watcher both `created` and `queued`, and the live event
-#   log shows it once did (105 task.autodispatch events with
-#   status_before='created'). Today GatewayWorkerTaskDispatcherMixin owns
-#   `created` and reserves each into `queued` (store.reserve_created_task),
-#   while this watcher claims only `queued`. That split matters because the thin
-#   dispatcher applies NONE of the guards below — a `created` task bypasses the
-#   manual-hold, dependency, permission, input and retry gates entirely. Which
-#   loop should own `created` is a deployment decision with live blast radius,
-#   so it is recorded in PATCH_LEDGER.md rather than decided here.
-#
-# The remaining xfail is non-strict on purpose: it is a question awaiting an
-# answer, not a partial implementation.
+#   * `created` ownership was called a race risk. It was the reverse: the thin
+#     dispatcher that owned `created` enforced NONE of the guards below, so
+#     those tasks were dispatched without the manual-hold, dependency,
+#     permission, input or retry checks. Ownership was handed to this watcher
+#     and that loop stands down, so there is no second selector to race.
 # ---------------------------------------------------------------------------
-_PENDING_STEP_8 = {
-    "test_selects_only_created_and_queued": "plan gives this watcher `created`; shipped design reserves created->queued in GatewayWorkerTaskDispatcherMixin",
-}
-
-
-_PENDING_STEP_8 = {
-    name: f"PLAN_AUTO_DISPATCH.md step 8 pending: {reason}"
-    for name, reason in _PENDING_STEP_8.items()
-}
 
 
 # ---------------------------------------------------------------------------

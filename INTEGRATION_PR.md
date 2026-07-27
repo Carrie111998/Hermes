@@ -17,7 +17,7 @@ refs/backup/pre-integration-originmain-20260727  731aa0ccc
 * All local audit commits from both sessions, preserved — nothing squashed or dropped.
 * `origin/main` merged to tip `731aa0ccc` (0 behind).
 * Codex's `stage_successors` continuation repair, committed for the first time.
-* Step 8 of `PLAN_AUTO_DISPATCH.md` finished: 18 of 19 XFAILs resolved.
+* Step 8 of `PLAN_AUTO_DISPATCH.md` finished: all 19 XFAILs resolved.
 
 ## Topology note
 
@@ -54,22 +54,30 @@ imported `gateway.stage_successors`, which did not exist in this tree and
 resolved only because the venv's editable install served it from the *other*
 worktree. Any fresh clone or CI runner would have failed at gateway import.
 
-## XFAIL disposition — 19 of 19 dispositioned, 18 resolved
+## XFAIL disposition — 19 of 19 resolved
 
-18 implemented or corrected; see the ledger table for per-test evidence. The
+Eighteen were implemented or corrected outright; see the ledger table for
+per-test evidence. The
 file's own header claimed four designs were "superseded during implementation" —
 three of those claims were **false**, and checking them against the shipped code
 is what resolved those tests.
 
-**One remains, deliberately:** `test_selects_only_created_and_queued`. Not
-missing work — an open question about whether the guarded watcher or the thin
-dispatcher owns `created` tasks. It matters because
-`hermes_worker_bridge.dispatch.dispatch_pending` applies **none** of the Step-8
-guards, so `created` tasks currently bypass the manual-hold, dependency,
-permission, input and retry gates. Resolving it means either retiring the thin
-dispatcher or editing the production profile plugin — both change live dispatch
-behaviour, and the plugin is outside this repo. Left non-strict so whichever
-lands produces an XPASS immediately.
+**The final one is now resolved too.** `test_selects_only_created_and_queued`
+was left open because it turned on a deployment decision: whether the guarded
+watcher or the thin dispatcher owns `created` tasks. The operator chose the
+guarded watcher, so ownership was handed over.
+
+That closes a real guard bypass. `hermes_worker_bridge.dispatch.dispatch_pending`
+honours only `spec.context.auto_dispatch is False` — every other guard (manual
+hold, `depends_on`, pending permission, pending input, retry budget) lives in
+the watcher and was never consulted, so `created` tasks were dispatched with
+none of them applied. `claim_task_for_dispatch` now performs the created->queued
+reservation inside its own `BEGIN IMMEDIATE`, so the reservation and the guard
+checks cannot be interleaved, and the thin dispatcher stands down rather than
+racing. Its previous body is retained, unreferenced, so reverting the handover
+restores it on the next restart without touching the production plugin.
+
+**All 19 XFAILs now pass. Zero remain.**
 
 ## Tests
 
@@ -79,7 +87,7 @@ evals/behavioral/                              13 passed, 4 skipped
 scripts/verify_protected_behavior.py           16/16 simulated regressions caught
 scripts/check_patch_ledger.py                  ledger covers every local commit (74/74)
 scripts/rehearse_rollback.py                   every rollback path restores and verifies
-gateway watcher suites                         91 passed, 1 xfailed (was 58 passed, 19 xfailed)
+gateway watcher suites                         102 passed, 0 xfailed (was 58 passed, 19 xfailed)
 tests/tools/ -k delegat                        352 passed, 3 skipped
 ```
 

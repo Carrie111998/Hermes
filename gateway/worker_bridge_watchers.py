@@ -1,10 +1,10 @@
 """Gateway worker-bridge alerts, queued-task recovery, and idle nudges.
 
 This module reconstructs the source surface preserved in the orphaned
-``worker_bridge_watchers.cpython-311.pyc``.  The post-rebuild
-``worker_task_dispatcher`` remains the sole owner of ``created`` tasks; this
-watcher only reclaims orphaned ``queued`` tasks so the two loops cannot launch
-the same task.
+``worker_bridge_watchers.cpython-311.pyc``.  It is the sole dispatcher of both
+``created`` and ``queued`` tasks: ``worker_task_dispatcher`` briefly owned
+``created`` after the rebuild but enforced none of the guards here, so
+ownership was handed back and that loop now stands down.
 """
 
 from __future__ import annotations
@@ -59,11 +59,14 @@ SKIP_WAITING_INPUT = "waiting_input"
 SKIP_DEP_INCOMPLETE = "dependency_incomplete"
 SKIP_RETRIES_EXHAUSTED = "retries_exhausted"
 
-# Statuses this watcher may dispatch. ``created`` is owned by
-# GatewayWorkerTaskDispatcherMixin, which atomically reserves it into
-# ``queued`` (store.reserve_created_task) before spawning — see the note on
-# select_dispatchable_tasks.
-AUTO_DISPATCH_STATUSES = ("queued",)
+# Statuses this watcher may dispatch. It owns BOTH, and is the only loop that
+# dispatches either: GatewayWorkerTaskDispatcherMixin used to own ``created``
+# and now stands down. That split existed for recovery reasons, not by design,
+# and it meant every guard below — manual hold, dependencies, pending
+# permission, pending input, retry budget — applied only to orphaned ``queued``
+# tasks while ``created`` tasks went straight out through the thin dispatcher,
+# which enforces none of them.
+AUTO_DISPATCH_STATUSES = ("created", "queued")
 # Additional statuses surfaced as *skipped* so the alert text can explain why
 # work is sitting idle. Resuming these is a human/agent decision.
 PENDING_VISIBLE_STATUSES = ("paused", "waiting_input")
@@ -361,12 +364,12 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def select_dispatchable_tasks(
     db_path: Path, limit: int
 ) -> tuple[list[dict], list[dict]]:
-    """Return dispatchable queued tasks and pending tasks excluded by a guard.
+    """Return dispatchable tasks and pending tasks excluded by a guard.
 
-    ``created`` tasks are deliberately absent from the *dispatchable* set:
-    ``GatewayWorkerTaskDispatcherMixin`` owns them and atomically reserves each
-    one into ``queued`` via ``store.reserve_created_task`` before spawning.
-    Selecting them here too would have both loops racing for the same task.
+    Covers ``created`` and ``queued``. This watcher is the sole dispatcher of
+    both; ``claim_task_for_dispatch`` reserves a ``created`` row into ``queued``
+    inside the claim transaction, so the reservation and the guard checks cannot
+    be interleaved by another process.
 
     ``paused`` and ``waiting_input`` are never dispatchable — resuming them is a
     human/agent decision — but they are returned in ``skipped`` so the alert
@@ -517,14 +520,25 @@ def _dispatch_claim_is_live(runtime: dict) -> bool:
 
 
 def claim_task_for_dispatch(db_path: Path, task_id: str) -> Optional[dict]:
-    """Atomically claim an orphaned queued task for one gateway process."""
+    """Atomically claim a ``created`` or orphaned ``queued`` task.
+
+    A ``created`` row is reserved into ``queued`` in the same transaction that
+    stamps the claim — the same created->queued reservation the thin dispatcher
+    used to perform, moved here now that this watcher owns both statuses. Doing
+    it in one BEGIN IMMEDIATE is what makes the reservation safe: a second
+    process either sees the row already ``queued`` and claimed, or does not see
+    it at all.
+
+    The status the row had is returned in the snapshot so release can put it
+    back — a released ``created`` task must not be left sitting in ``queued``.
+    """
     conn = _connect_readwrite(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT status, runtime FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()
-        if not row or row["status"] != "queued":
+        if not row or row["status"] not in AUTO_DISPATCH_STATUSES:
             conn.rollback()
             return None
         original = _decode_json(row["runtime"])
@@ -536,9 +550,14 @@ def claim_task_for_dispatch(db_path: Path, task_id: str) -> Optional[dict]:
         claimed = dict(original)
         claimed[_DISPATCH_CLAIM_KEY] = {"pid": os.getpid(), "at": time.time()}
         conn.execute(
-            "UPDATE tasks SET runtime=?, updated_at=? "
-            "WHERE task_id=? AND status='queued'",
-            (json.dumps(claimed, sort_keys=True), time.time(), task_id),
+            "UPDATE tasks SET status='queued', runtime=?, updated_at=? "
+            "WHERE task_id=? AND status=?",
+            (
+                json.dumps(claimed, sort_keys=True),
+                time.time(),
+                task_id,
+                row["status"],
+            ),
         )
         conn.commit()
         # Snapshot carries the status too: release has to restore the row as it

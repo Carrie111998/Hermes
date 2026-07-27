@@ -95,21 +95,41 @@ def _create_dispatch_db(path: Path) -> None:
     conn.close()
 
 
-def test_dispatch_selection_is_queued_only_and_does_not_own_created(tmp_path):
+def test_dispatch_selection_owns_created_and_queued(tmp_path):
+    """This watcher is the sole dispatcher of both statuses.
+
+    It used to own `queued` only, and this test asserted that. The split was a
+    recovery artefact, not a design: the thin dispatcher that owned `created`
+    applies none of the guards here, so `created` tasks were dispatched without
+    the manual-hold, dependency, permission, input or retry checks that
+    `queued` tasks got. Ownership was handed over deliberately; the thin
+    dispatcher now stands down, so nothing races for these rows.
+    """
     db_path = tmp_path / "bridge.db"
     _create_dispatch_db(db_path)
 
     eligible, skipped = select_dispatchable_tasks(db_path, 10)
 
-    assert [task["task_id"] for task in eligible] == ["task-queued"]
-    assert all(task["task_id"] != "task-created" for task in eligible + skipped)
+    assert {task["task_id"] for task in eligible} == {"task-created", "task-queued"}
+    assert not [task for task in skipped if task["task_id"] == "task-created"]
+
+    # Claiming a `created` row reserves it into `queued` in the same
+    # transaction, and the snapshot records the status it had so a release can
+    # put it back rather than stranding it in `queued`.
+    snapshot = claim_task_for_dispatch(db_path, "task-created")
+    assert snapshot == {"status": "created", "runtime": {}}
+    conn = sqlite3.connect(db_path)
+    try:
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE task_id='task-created'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert status == "queued", "claim must reserve created->queued atomically"
+
+    # Already claimed by this live pid — a second claim must not hand it out.
     assert claim_task_for_dispatch(db_path, "task-created") is None
-    # A claim on a queued task succeeds and returns the restore snapshot. This
-    # used to assert `== {}` — the bare pre-claim runtime, which happens to be
-    # empty for this fixture. The snapshot now carries status as well, because
-    # release_dispatch_claim has to put the row back as it was and runtime alone
-    # cannot say what status to restore. The contract this test is named for —
-    # queued-only, never owns `created` — is unchanged above.
+
     snapshot = claim_task_for_dispatch(db_path, "task-queued")
     assert snapshot == {"status": "queued", "runtime": {}}
 

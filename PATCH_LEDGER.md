@@ -347,7 +347,7 @@ from the *other* worktree. Any fresh clone or CI runner would have failed at
 gateway import. Verified after the fix that zero `gateway`/`agent`/`tools`/
 `hermes_cli` modules load from outside this worktree.
 
-## The 19 XFAILs — all dispositioned, 18 resolved
+## The 19 XFAILs — all resolved
 
 Classified by reading the shipped code, not by trusting the file's own header —
 which proved wrong on three of its four claims. Independently re-verified, and
@@ -363,7 +363,7 @@ one "invalid spec" verdict was overturned on challenge.
 | 15 | `test_skip_audit_deduped_until_reason_changes` | **Valid — implemented** (`a43209ad2`). Skips audited, deduped per (task, reason). |
 | 16–17 | `test_claim_marks_task_and_returns_snapshot`, `test_release_leaves_row_alone_if_live_pid_took_over` | **Valid — implemented** (`71ffe2316`). Key renamed to `dispatch_claim`; the orphan risk the header cited is removed by reading the legacy key and never writing it. |
 | 18 | `test_requeued_retry_is_dispatchable` | **Test-only fixture fix** (`71ffe2316`). `_retries_exhausted` was already correct; the fixture seeded `created`, a status this watcher does not select, so the guard was never reached. Zero production change. |
-| 19 | `test_selects_only_created_and_queued` | **Open question — remains a documented non-strict xfail.** See below. |
+| 19 | `test_selects_only_created_and_queued` | **Valid — implemented.** Ownership of `created` handed to the guarded watcher on operator instruction; see below. |
 
 Three defects were found *while* implementing and fixed in the same commits:
 `float(ad.get("interval") or DEFAULT)` turned an explicit `0` into 15 s;
@@ -373,29 +373,50 @@ and `release_dispatch_claim` restored its snapshot unconditionally, erasing a
 live runner's pid when a spawn raised after that runner had already stamped it —
 one task, two runners.
 
-## The one open question: who owns `created` tasks
+## Resolved: the guarded watcher now solely owns `created`
 
-Not missing work. A deployment decision with live blast radius, so it is
-recorded rather than decided.
+Recorded here first as an open decision, then **decided by the operator**: give
+the guarded watcher sole ownership.
 
-The plan gives this watcher both `created` and `queued`, and the live event log
-shows it once did — 105 `task.autodispatch` events with `status_before='created'`
-(2026-07-12..16), against 212 `task.auto_dispatched` events from the thin
-dispatcher (07-22..27), with **zero task_ids in both sets**. The fork was
-sequential, not concurrent: the watcher path died with the source loss and the
-thin dispatcher was written on 07-22 as its replacement.
+The evidence for the handover. The plan gave this watcher both statuses and the
+live event log shows it once had them — 105 `task.autodispatch` events with
+`status_before='created'` (2026-07-12..16) against 212 `task.auto_dispatched`
+events from the thin dispatcher (07-22..27), with **zero task_ids in both sets**.
+The fork was sequential, not concurrent: the watcher path died with the source
+loss and the thin dispatcher was written on 07-22 to replace it.
 
-What makes this more than bookkeeping: `hermes_worker_bridge.dispatch.dispatch_pending`
-**applies none of the Step-8 guards**. It honours only `spec.context.auto_dispatch is False`,
-so for every `created` task the manual-hold, `depends_on`, pending-permission,
-pending-input and retries-exhausted gates are bypassed. The guards this
-workstream exists to enforce currently apply only to orphaned `queued` tasks.
+What the split actually cost: `hermes_worker_bridge.dispatch.dispatch_pending`
+honours only `spec.context.auto_dispatch is False`. Every other guard — manual
+hold, `depends_on`, pending permission request, pending input request, retry
+budget — lives in the watcher and was never consulted. So a `created` task was
+dispatched with none of them applied, while an orphaned `queued` task got all of
+them. The "race risk" the test header cited was backwards: the risk was not two
+loops selecting one row, it was one loop selecting rows under no rules.
 
-Resolving it means either giving the guarded watcher sole ownership of `created`
-(and retiring the thin dispatcher), or moving the guards into `dispatch_pending`
-— which lives in the **production profile plugin**, outside this repo and outside
-the authorisation for this work. Both change live dispatch behaviour. The test is
-left non-strict so whichever lands produces an XPASS immediately.
+The change:
+
+* `AUTO_DISPATCH_STATUSES = ("created", "queued")`.
+* `claim_task_for_dispatch` accepts either status and performs the
+  created->queued reservation **inside the claim transaction** — the same
+  reservation `store.reserve_created_task` did, moved to where the guards are.
+  One `BEGIN IMMEDIATE` covers both, so a second process either sees the row
+  already `queued` and claimed, or does not see it at all.
+* The snapshot records the pre-claim status, so releasing a `created` task puts
+  it back rather than stranding it in `queued`.
+* `GatewayWorkerTaskDispatcherMixin._worker_task_dispatcher_watcher` stands down
+  — logs once and returns. It stays scheduled and supervised so the wiring
+  remains observable and the MRO ordering assertions still hold; the previous
+  body is kept as `_legacy_worker_task_dispatcher_watcher`, unreferenced, for
+  one release.
+
+`test_dispatch_selection_is_queued_only_and_does_not_own_created` asserted the
+old split as its whole contract. Rewritten rather than deleted, as
+`test_dispatch_selection_owns_created_and_queued`, and extended to prove the
+reservation is atomic and that a second claim on a live-claimed row is refused.
+
+**Rollback**, if auto-dispatch misbehaves under the guards: revert the handover
+commit and the thin dispatcher resumes on the next gateway restart — its body is
+intact and the production plugin was never modified.
 
 ## Verification
 
@@ -405,7 +426,7 @@ evals/behavioral/                              13 passed, 4 skipped
 scripts/verify_protected_behavior.py           16/16 simulated regressions caught
 scripts/rehearse_rollback.py                   every rollback path restores and verifies
 tests/gateway/test_worker_bridge_watchers_mixin.py + _watchers.py + _watcher_wiring.py
-                                               91 passed, 1 xfailed  (was 58 passed, 19 xfailed)
+                                               102 passed, 0 xfailed (was 58 passed, 19 xfailed)
 tests/gateway/ stage successors + continuation + e2e + wiring   21 passed, 1 skipped
 tests/tools/ -k delegat                        352 passed, 3 skipped
 ```

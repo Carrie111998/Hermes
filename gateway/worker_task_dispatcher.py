@@ -29,9 +29,36 @@ def _settings(config: object) -> tuple[bool, float, int]:
 
 
 class GatewayWorkerTaskDispatcherMixin:
-    """Start worker-bridge tasks that are waiting in ``created`` state."""
+    """Retired. ``created`` tasks are now dispatched by the guarded watcher.
+
+    This loop called ``hermes_worker_bridge.dispatch.dispatch_pending``, which
+    honours only ``spec.context.auto_dispatch is False``. Every other guard —
+    manual hold, ``depends_on``, pending permission request, pending input
+    request, retry budget — lives in GatewayWorkerBridgeWatchersMixin and was
+    never consulted here, so a ``created`` task went out with none of them
+    applied while an orphaned ``queued`` task got all of them.
+
+    GatewayWorkerBridgeWatchersMixin now owns ``created`` as well as ``queued``
+    and performs the created->queued reservation inside its claim transaction.
+    Two loops selecting the same rows would race, so this one stands down
+    rather than duplicating the work under weaker rules.
+
+    The watcher is still scheduled and still supervised: it holds its place in
+    the MRO and startup sequence so the wiring stays observable, and returning
+    here is the same clean exit the import-failure path already took.
+    """
 
     async def _worker_task_dispatcher_watcher(self) -> None:
+        logger.info(
+            "worker task auto-dispatch: standing down — `created` tasks are "
+            "dispatched by the worker-bridge watcher, which applies the "
+            "dependency, retry, hold, permission and input guards"
+        )
+        return
+
+    async def _legacy_worker_task_dispatcher_watcher(self) -> None:
+        """The pre-handover loop. Unreferenced; kept for one release as the
+        record of what the guarded path replaced."""
         try:
             from hermes_cli.config import load_config
             from hermes_constants import get_hermes_home
