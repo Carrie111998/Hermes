@@ -84,7 +84,7 @@ determination until a newer evidence commit is recorded.
 ## Post-boundary evidence on current main
 
 The exact acceptance command set was rerun against current `main` at baseline
-commit `9b21ea30ce7cd579a71ed46fdef77ca6557e3037`. This is a separate,
+commit `8e299933377355651be18c334a467b25537b1a1d`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
@@ -108,6 +108,8 @@ tag above.
 - Compliance schema transaction regression: **7 passed, 0 failed**.
 - Company-email schema transaction regression: **5 passed, 0 failed**.
 - Compliance supersession lineage regression: **9 passed, 0 failed**.
+- Packaging artifact regression: **2 passed, 0 failed**.
+- Combined governed-runtime and packaging command: **84 passed, 0 failed**.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 
