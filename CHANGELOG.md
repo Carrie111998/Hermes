@@ -28,6 +28,10 @@
   side effects.
 - Stripe webhook ingress now rejects missing or malformed positive
   amount/currency evidence before routing.
+- Hardened durable runtime ledgers so schema checks preserve active authority
+  transactions across finance, accounting, payments, compliance, approvals,
+  event ingress, billing, commitments, metrics, worker state, and audit
+  lineage; focused regressions cover rollback preservation.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.

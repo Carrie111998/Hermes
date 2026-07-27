@@ -34,6 +34,11 @@
 - External subscriptions and schedules no longer wake terminal objectives.
 - Durable inbox claims also skip internally emitted events for terminal
   objectives.
+- Runtime schema checks across authority, objectives, worker liveness, finance,
+  accounting, payments, compliance, approvals, event triggers, external
+  ingress, billing, commitments, metrics, and audit lineage preserve active
+  SQLite transactions instead of allowing `executescript` to release a lock or
+  commit a partial state transition.
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
 - Portfolio child/successor admission and employee grant/revocation admission
