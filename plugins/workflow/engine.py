@@ -3224,7 +3224,10 @@ class WorkflowEngine:
                                 )
 
                                 if is_quality_block:
-                                    # Quality review results — enrich upstream, reset, unblock
+                                    # Quality review results — enrich upstream, reset to ready.
+                                    # The reviewer stays blocked until implement re-blocks
+                                    # "pending review", at which point the pending-review
+                                    # handler unblocks it.
                                     print(f"   📋 {nid} BLOCKED (quality review) — enriching {reviewer_for}")
                                     if upstream_state.kanban_card_id:
                                         try:
@@ -3244,19 +3247,9 @@ class WorkflowEngine:
                                         except Exception as e:
                                             print(f"   ⚠  Failed to enrich upstream card: {e}")
 
-                                    # Unblock the reviewer card so it's ready for next round
-                                    if state.kanban_card_id:
-                                        try:
-                                            with kanban_db.connect_closing(board=self.kanban_board) as _conn:
-                                                kanban_db.unblock_task(_conn, state.kanban_card_id)
-                                            state.status = "ready"
-                                            state.completed_at = None
-                                            state.result = None
-                                            # Reset poll counter — review iteration completed
-                                            polls = 0
-                                            print(f"   🔓 {nid} unblocked — ready for next review round")
-                                        except Exception as e:
-                                            print(f"   ⚠  Failed to unblock reviewer: {e}")
+                                    # Reviewer stays blocked — implement must re-block
+                                    # "pending review" before reviewer is unblocked.
+                                    print(f"   ⏸  {nid} stays blocked — waiting for {reviewer_for} to re-block pending review")
                                 else:
                                     # Technical block — notify calling agent
                                     state.status = "blocked"
