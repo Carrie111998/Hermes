@@ -309,7 +309,7 @@ def reconcile_stale_workers(
     ensure_schema(conn)
     cutoff = int(time.time()) - stale_after_seconds
     rows = conn.execute(
-        "SELECT id FROM objective_workers "
+        "SELECT id,organization_id,role FROM objective_workers "
         "WHERE status='running' AND heartbeat_at<? ORDER BY id",
         (cutoff,),
     ).fetchall()
@@ -323,6 +323,27 @@ def reconcile_stale_workers(
             "stopped_at=?, stop_reason='heartbeat_stale' "
             "WHERE id=? AND status='running'",
             [(now, now, worker_id) for worker_id in worker_ids],
+        )
+    from hermes_cli import operational_control
+
+    for row in rows:
+        operational_control.raise_intervention(
+            conn,
+            organization_id=str(row["organization_id"]),
+            category="objective_worker_stale",
+            summary="Supervised objective worker heartbeat expired",
+            context={
+                "worker_id": str(row["id"]),
+                "role": str(row["role"]),
+                "stale_after_seconds": stale_after_seconds,
+                "stop_reason": "heartbeat_stale",
+            },
+            options=[
+                {"id": "restart", "label": "Restart the supervised worker"},
+                {"id": "diagnose", "label": "Diagnose worker host health"},
+                {"id": "manual", "label": "Keep autonomous operation stopped"},
+            ],
+            dedupe_key=f"objective-worker-stale:{row['id']}",
         )
     return worker_ids
 

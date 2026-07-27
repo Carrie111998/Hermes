@@ -35,6 +35,11 @@ def test_stale_worker_reconciliation_persists_stop_state(tmp_path):
         "SELECT status,stop_reason FROM objective_workers WHERE id=?", (worker_id,)
     ).fetchone()
     assert tuple(row) == ("stale", "heartbeat_stale")
+    intervention = conn.execute(
+        "SELECT category FROM intervention_queue WHERE dedupe_key=?",
+        ("objective-worker-stale:stale-worker",),
+    ).fetchone()
+    assert intervention["category"] == "objective_worker_stale"
 
 
 def test_supervised_worker_persists_cycle_and_graceful_stop(tmp_path):

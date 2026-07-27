@@ -29,7 +29,8 @@
 - Stripe webhook ingress now rejects missing or malformed positive
   amount/currency evidence before routing.
 - Worker supervision now persists expired heartbeat leases as `stale` workers
-  with an explicit stop reason during supervisor startup.
+  with an explicit stop reason during supervisor startup and emits a
+  deduplicated advisor intervention for each stale worker.
 - Hardened durable runtime ledgers so schema checks preserve active authority
   transactions across finance, accounting, payments, compliance, approvals,
   event ingress, billing, commitments, metrics, worker state, and audit
