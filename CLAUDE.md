@@ -186,4 +186,40 @@ inversa, build, commits/Co-Authored). Resultado y **lote 16** de corrección:
 - **Commits**: 19 commits en el rango `1a8df5d88..main` (todo GRUPO 5), autor único
   Digital Services LLC, **cero** "Co-Authored" — limpio.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
-- GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).
+
+## Progreso GRUPO 6 (espejo chino `website/i18n/zh-Hans/`)
+
+Mismo transformador y mismo criterio que GRUPO 5, aplicado al mirror `zh-Hans`
+(`website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/`, 314 `.md` + 2 `.mdx`,
+misma estructura de directorios que `website/docs/`). Plan de lotes (mismo orden que
+GRUPO 5): `getting-started`(6) → `guides`(28) → `integrations`+`reference`(14) →
+`user-guide/` sueltos+`secrets`(15) → `user-guide/features`(44) →
+`user-guide/messaging`(28) → `user-guide/skills/bundled`(70, 2 lotes) →
+`user-guide/skills/optional`(81, 2-3 lotes) → `developer-guide`(27) →
+`index.mdx`+`user-stories.mdx`(2).
+
+Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
+- El transformador es case-sensitive: protege `HERMES_*` (env vars mayúsculas),
+  `hermes` minúscula (comando/paths) y `Hermes-3/4` igual que en inglés, sin cambios.
+- 153 headings con `Hermes`/`Nous` detectados en el árbol completo. Los headings en
+  chino generan su propio slug (basado en el texto chino), pero varios enlaces
+  internos ya apuntaban a fragmentos **en inglés que nunca coincidían** con el heading
+  chino real (p.ej. `environment-variables.md` → `#how-hermes-runs-shell-commands-on-windows`
+  contra un heading "## Hermes 在 Windows 上如何运行 shell 命令" sin anchor custom) —
+  **bug preexistente de la traducción, ajeno al rebranding**, no se corrige en este
+  grupo. El rebranding no rompe nada que ya funcionara: solo renombra `Hermes`→`IYARI`
+  en el texto visible del heading, sin tocar el fragmento (minúscula, no matcheado).
+- Build de verificación (`pnpm exec docusaurus build --locale zh-Hans`) reproduce el
+  mismo bug SSG de `theme-mermaid`/React 19 ya documentado en GRUPO 5 (4 páginas,
+  deuda técnica aparte). Los ~98 warnings de enlaces rotos previos al crash son todos
+  por páginas nunca traducidas al chino (`platform-support.md`, `multi-profile-gateways.md`,
+  `worktree-ui-dev.md`, etc.), no por el rebranding. **Nota:** el build reutiliza cache
+  de webpack entre corridas y deja de re-emitir esos warnings en la segunda corrida —
+  no sirve como diff incremental fiable; el chequeo real por lote es el grep de headings
+  con `Hermes`/`Nous` antes de aplicar.
+
+- Lote 1 `47cc184b3`: `getting-started/` (6 archivos). Sin headings con Hermes/Nous en
+  este lote → cero riesgo de ancla. Preservados `HERMES_HOME`, `HERMES_GIT_BASH_PATH`,
+  `HERMES_DISABLE_WINDOWS_UTF8`, `HERMES_DEV`, `HERMES_MANAGED`, `HERMES_BUNDLED_SKILLS`,
+  `Nous` como nombre de provider (Nous Portal). Repo `NousResearch/hermes-agent` →
+  `digital-services-llc/iyari` en comandos `nix run`/`git clone`/flake inputs.
