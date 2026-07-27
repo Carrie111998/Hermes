@@ -617,12 +617,27 @@ class CodexRealtimeSession:
             self._fail(f"Codex realtime protocol error: {exc}")
             await self.stop()
 
-    def _emit_output_pcm(self, pcm: bytes) -> None:
-        if pcm:
-            self._emit(self._on_output_pcm, pcm)
+    def _emit_output_pcm(self, pcm: bytes) -> bool:
+        """Deliver PCM and report whether the downstream sink accepted it."""
+        callback = self._on_output_pcm
+        if not pcm or callback is None:
+            return False
+        try:
+            result = callback(pcm)
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+                return True
+            # Existing fire-and-forget callbacks return None. Only an explicit
+            # False means the concrete output sink rejected the frame.
+            return result is not False
+        except Exception:
+            logger.exception("Codex realtime output callback failed")
+            return False
 
     def _handle_peer_pcm(self, pcm: bytes) -> None:
         if self._speech_gate:
+            if not self._emit_output_pcm(pcm):
+                return
             now = time.monotonic()
             first_pcm = self._speech_last_pcm_at is None
             self._speech_last_pcm_at = now
@@ -632,7 +647,6 @@ class CodexRealtimeSession:
                     now - self._speech_started_at,
                 )
             self._wake_speech_start_waiter()
-            self._emit_output_pcm(pcm)
 
     def _wake_speech_start_waiter(self) -> None:
         event = self._speech_first_pcm_event

@@ -62,11 +62,12 @@ class FakeAdapter:
         self.output_pcm: list[tuple[int, bytes]] = []
         self.mixer_started: list[int] = []
         self.stream_ended: list[int] = []
+        self.output_ready = True
         self._profile_name = None
 
     async def ensure_realtime_voice_output(self, guild_id: int) -> bool:
         self.mixer_started.append(guild_id)
-        return True
+        return self.output_ready
 
     def push_realtime_voice_pcm(self, guild_id: int, pcm: bytes) -> bool:
         self.output_pcm.append((guild_id, pcm))
@@ -176,11 +177,34 @@ async def test_enabled_route_requires_the_configured_single_user():
     assert (
         await manager.append_speech(adapter, 7, "Hoi", transcript_generation=9) is True
     )
+    assert adapter.mixer_started == [7, 7]
     assert session.spoken == [("Hoi", 9)]
 
     await manager.stop_for_voice_channel(adapter, 7)
     assert session.stopped is True
     assert adapter.stream_ended == [7]
+
+
+@pytest.mark.asyncio
+async def test_append_speech_fails_fast_when_discord_output_cannot_be_restored():
+    from agent.transports.codex_realtime_voice import CodexRealtimeUnavailable
+
+    manager = CodexRealtimeVoiceManager(
+        session_factory=FakeSession,
+        dependency_ensurer=lambda: None,
+    )
+    adapter = FakeAdapter({"enabled": True, "user_id": "42"})
+    started = await manager.start_for_voice_channel(
+        adapter=adapter,
+        guild_id=7,
+        user_id=42,
+        on_transcript=lambda *_: None,
+    )
+    assert started.active is True
+    adapter.output_ready = False
+
+    with pytest.raises(CodexRealtimeUnavailable, match="mixer is unavailable"):
+        await manager.append_speech(adapter, 7, "Hoi")
 
 
 @pytest.mark.asyncio

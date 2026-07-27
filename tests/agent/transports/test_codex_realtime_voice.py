@@ -525,6 +525,53 @@ async def test_append_speech_without_first_audio_fails_for_classic_fallback(
 
 
 @pytest.mark.asyncio
+async def test_append_speech_rejected_by_output_sink_fails_for_classic_fallback(
+    monkeypatch,
+):
+    import agent.transports.codex_realtime_voice as realtime_module
+
+    monkeypatch.setattr(realtime_module, "SPEECH_FIRST_AUDIO_TIMEOUT", 0.02)
+    errors: list[str] = []
+    client = FakeClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v3"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "answer"},
+        },
+    ])
+    peer = FakePeer()
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        client_factory=lambda **kwargs: client,
+        peer_factory=lambda: peer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+        on_output_pcm=lambda _pcm: False,
+        on_error=errors.append,
+    )
+    await session.start()
+
+    append_task = asyncio.create_task(session.append_speech("Hermes antwoord"))
+    for _ in range(100):
+        if session._speech_gate:
+            break
+        await asyncio.sleep(0.001)
+    assert session._speech_gate is True
+    assert peer.on_pcm is not None
+    peer.on_pcm(b"provider-pcm")
+
+    try:
+        with pytest.raises(CodexRealtimeUnavailable, match="produced no audio"):
+            await append_task
+    finally:
+        await session.stop()
+
+    assert errors == ["Codex realtime speech produced no audio"]
+
+
+@pytest.mark.asyncio
 async def test_append_speech_failure_reports_provider_failure_and_closes():
     class BrokenSpeechClient(FakeClient):
         def __init__(self, notifications):

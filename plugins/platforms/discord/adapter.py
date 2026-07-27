@@ -3800,8 +3800,15 @@ class DiscordAdapter(BasePlatformAdapter):
             mixer.set_ambient(ambient)
 
         def _after(error):
+            mixers = getattr(self, "_voice_mixers", None)
+            owned = False
+            if isinstance(mixers, dict) and mixers.get(guild_id) is mixer:
+                owned = True
+                mixers.pop(guild_id, None)
             if error:
                 logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
+            elif owned:
+                logger.warning("Voice mixer stream ended unexpectedly (guild=%d)", guild_id)
 
         if vc.is_playing():
             vc.stop()
@@ -3866,9 +3873,32 @@ class DiscordAdapter(BasePlatformAdapter):
                         pass
 
     def voice_mixer_active(self, guild_id: int) -> bool:
-        """True when a continuous mixer is installed for this guild."""
+        """True when the mapped mixer is the live Discord playback source."""
         mixers = getattr(self, "_voice_mixers", None)
-        return bool(mixers) and mixers.get(guild_id) is not None
+        mixer = mixers.get(guild_id) if isinstance(mixers, dict) else None
+        if mixer is None:
+            return False
+        voice_clients = getattr(self, "_voice_clients", None)
+        vc = voice_clients.get(guild_id) if isinstance(voice_clients, dict) else None
+        try:
+            active = bool(
+                vc is not None
+                and vc.is_connected()
+                and vc.is_playing()
+                and vc.source is mixer
+            )
+        except Exception:
+            active = False
+        if not active:
+            # A Discord AudioPlayer can terminate while the adapter still owns
+            # its old mixer object. Never accept PCM into that dead source.
+            if isinstance(mixers, dict) and mixers.get(guild_id) is mixer:
+                mixers.pop(guild_id, None)
+            try:
+                mixer.cleanup()
+            except Exception:
+                pass
+        return active
 
     async def ensure_realtime_voice_output(self, guild_id: int) -> bool:
         """Ensure Discord has one continuous mixer for realtime PCM output."""
@@ -3890,6 +3920,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def push_realtime_voice_pcm(self, guild_id: int, pcm: bytes) -> bool:
         """Append Discord-native PCM to the live WebRTC speech stream."""
+        if not self.voice_mixer_active(guild_id):
+            return False
         mixer = self._voice_mixers.get(guild_id)
         if mixer is None or not pcm:
             return False
@@ -4001,14 +4033,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         # ── Mixer path (overlap + ducking) ──────────────────────────────
-        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
+        mixer = (
+            getattr(self, "_voice_mixers", {}).get(guild_id)
+            if self.voice_mixer_active(guild_id)
+            else None
+        )
         if mixer is not None:
             try:
                 from voice_mixer import decode_to_pcm
             except ImportError:
                 from .voice_mixer import decode_to_pcm
             pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
-            if pcm:
+            mixer_still_active = (
+                pcm
+                and self.voice_mixer_active(guild_id)
+                and self._voice_mixers.get(guild_id) is mixer
+            )
+            if mixer_still_active:
                 speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
                 mixer.play_speech(pcm, gain=speech_gain)
                 # Block until the speech child drains so callers serialise
@@ -4023,7 +4064,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     await asyncio.sleep(0.05)
                 self._reset_voice_timeout(guild_id)
                 return True
-            logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
+            if pcm:
+                logger.warning(
+                    "Voice mixer became unavailable during decode; falling back to legacy playback"
+                )
+            else:
+                logger.warning(
+                    "Mixer decode failed for %s; falling back to legacy playback",
+                    audio_path,
+                )
 
         # ── Legacy one-shot path (no mixer) ─────────────────────────────
         # Pause voice receiver while playing (echo prevention)

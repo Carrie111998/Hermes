@@ -196,8 +196,39 @@ class TestVoiceMixerActive:
 
     def test_true_when_mixer_present(self):
         adapter = _make_adapter()
-        adapter._voice_mixers[111] = object()
+        mixer = object()
+        adapter._voice_mixers[111] = mixer
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.source = mixer
+        adapter._voice_clients[111] = vc
         assert adapter.voice_mixer_active(111) is True
+
+    def test_false_and_discards_stale_mixer_when_audio_player_stopped(self):
+        adapter = _make_adapter()
+        mixer = object()
+        adapter._voice_mixers[111] = mixer
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.source = mixer
+        adapter._voice_clients[111] = vc
+
+        assert adapter.voice_mixer_active(111) is False
+        assert 111 not in adapter._voice_mixers
+
+    def test_false_and_discards_stale_mixer_when_player_uses_another_source(self):
+        adapter = _make_adapter()
+        adapter._voice_mixers[111] = object()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.source = object()
+        adapter._voice_clients[111] = vc
+
+        assert adapter.voice_mixer_active(111) is False
+        assert 111 not in adapter._voice_mixers
 
     @pytest.mark.asyncio
     async def test_realtime_output_installs_mixer_without_ambient_when_fx_disabled(self):
@@ -211,6 +242,12 @@ class TestVoiceMixerActive:
         vc = MagicMock()
         vc.is_connected.return_value = True
         vc.is_playing.return_value = False
+
+        def _play(source, **_kwargs):
+            vc.source = source
+            vc.is_playing.return_value = True
+
+        vc.play.side_effect = _play
         adapter._voice_clients[111] = vc
 
         assert await adapter.ensure_realtime_voice_output(111) is True
@@ -222,6 +259,47 @@ class TestVoiceMixerActive:
         assert adapter.push_realtime_voice_pcm(111, frame) is True
         assert mixer.speech_active is True
         adapter.end_realtime_voice_output(111)
+
+    @pytest.mark.asyncio
+    async def test_realtime_output_reinstalls_stale_mixer_with_stopped_player(self):
+        adapter = _make_adapter({"enabled": False})
+        stale = object()
+        adapter._voice_mixers[111] = stale
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+
+        def _play(source, **_kwargs):
+            vc.source = source
+            vc.is_playing.return_value = True
+
+        vc.play.side_effect = _play
+        adapter._voice_clients[111] = vc
+
+        assert await adapter.ensure_realtime_voice_output(111) is True
+        assert adapter._voice_mixers[111] is not stale
+        vc.play.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_audio_player_completion_discards_its_mixer_mapping(self):
+        adapter = _make_adapter({"enabled": False})
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+
+        def _play(source, **_kwargs):
+            vc.source = source
+            vc.is_playing.return_value = True
+
+        vc.play.side_effect = _play
+        adapter._voice_clients[111] = vc
+        assert await adapter.ensure_realtime_voice_output(111) is True
+        mixer = adapter._voice_mixers[111]
+
+        after = vc.play.call_args.kwargs["after"]
+        after(None)
+
+        assert adapter._voice_mixers.get(111) is not mixer
 
     def test_false_when_attr_missing(self):
         # Defensive getattr path (object.__new__ helper that forgot the attr).
@@ -254,6 +332,8 @@ class TestPlayInVoiceChannelMixerPath:
 
         mixer = _Mixer()
         adapter._voice_mixers[111] = mixer
+        vc.is_playing.return_value = True
+        vc.source = mixer
         adapter._reset_voice_timeout = MagicMock()
 
         fake_pcm = b"\x00" * vm.FRAME_SIZE
@@ -290,6 +370,68 @@ class TestPlayInVoiceChannelMixerPath:
                 ok = await adapter.play_in_voice_channel(111, "/tmp/x.mp3")
         # Fell through to legacy path -> vc.play called.
         assert vc.play.called
+
+    @pytest.mark.asyncio
+    async def test_stale_mixer_uses_legacy_playback_instead_of_false_success(self):
+        adapter = _make_adapter()
+        stale = MagicMock()
+        adapter._voice_mixers[111] = stale
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.source = stale
+        adapter._voice_clients[111] = vc
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._voice_receivers[111] = MagicMock()
+
+        async def _fast(coro, *args, **kwargs):
+            if hasattr(coro, "close"):
+                coro.close()
+            return None
+
+        with patch("plugins.platforms.discord.adapter.discord") as mock_discord, \
+                patch("asyncio.wait_for", _fast):
+            mock_discord.FFmpegPCMAudio.return_value = MagicMock()
+            mock_discord.PCMVolumeTransformer.return_value = MagicMock()
+            assert await adapter.play_in_voice_channel(111, "/tmp/fallback.mp3") is True
+
+        stale.play_speech.assert_not_called()
+        vc.play.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mixer_lost_during_decode_uses_legacy_playback(self):
+        adapter = _make_adapter()
+        mixer = MagicMock()
+        mixer.speech_active = False
+        adapter._voice_mixers[111] = mixer
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        vc.source = mixer
+        adapter._voice_clients[111] = vc
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._voice_receivers[111] = MagicMock()
+
+        def _decode(_audio_path):
+            vc.is_playing.return_value = False
+            adapter._voice_mixers.pop(111, None)
+            mixer.cleanup()
+            return b"\x00" * vm.FRAME_SIZE
+
+        async def _fast(coro, *args, **kwargs):
+            if hasattr(coro, "close"):
+                coro.close()
+            return None
+
+        with patch.object(vm, "decode_to_pcm", side_effect=_decode), \
+                patch("plugins.platforms.discord.adapter.discord") as mock_discord, \
+                patch("asyncio.wait_for", _fast):
+            mock_discord.FFmpegPCMAudio.return_value = MagicMock()
+            mock_discord.PCMVolumeTransformer.return_value = MagicMock()
+            assert await adapter.play_in_voice_channel(111, "/tmp/fallback.mp3") is True
+
+        mixer.play_speech.assert_not_called()
+        vc.play.assert_called_once()
 
 
 class TestPlayAckInVoice:

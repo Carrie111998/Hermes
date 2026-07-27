@@ -14,6 +14,7 @@ from agent.transports.codex_realtime_voice import (
     SUPPORTED_CODEX_REALTIME_WEBRTC_PROTOCOLS,
     CodexRealtimeCapabilities,
     CodexRealtimeSession,
+    CodexRealtimeUnavailable,
     safe_realtime_error,
 )
 
@@ -362,6 +363,8 @@ class CodexRealtimeVoiceManager:
         managed = self._sessions.get(self._key(adapter, guild_id))
         if managed is None:
             return False
+        if not await adapter.ensure_realtime_voice_output(guild_id):
+            raise CodexRealtimeUnavailable("Discord voice mixer is unavailable")
         return bool(
             await managed.session.append_speech(
                 text,
