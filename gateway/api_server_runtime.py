@@ -6,7 +6,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +38,96 @@ _TERMINAL_PLATFORM_ERROR_CODES = {
     "tool_not_implemented",
     "unsupported_capability",
 }
+
+# Each bridge run parks one thread for its whole duration (invoke_platform_tool
+# blocks on pending.ready.wait), so /v1/runtime/runs must never share the small
+# default executor. Runs use a dedicated bounded pool gated before streaming.
+_RUNTIME_MAX_CONCURRENT_ENV = "HERMES_RUNTIME_MAX_CONCURRENT"
+_RUNTIME_MAX_CONCURRENT_DEFAULT = 8
+# Safety cap for pending.ready.wait when the run carries no explicit deadline;
+# prevents a lost tool result from pinning an executor thread forever.
+_UNBOUNDED_TOOL_WAIT_CAP_SECONDS = 3600.0
+_SESSION_SWEEP_INTERVAL_SECONDS = 60.0
+_FINISHED_SESSION_TTL_SECONDS = 120.0
+
+_RUNTIME_GATE_LOCK = threading.Lock()
+_RUNTIME_EXECUTOR: ThreadPoolExecutor | None = None
+_ACTIVE_RUN_COUNT = 0
+_SWEEPERS: dict[int, tuple[asyncio.AbstractEventLoop, "asyncio.Task[None]"]] = {}
+
+
+def _runtime_max_concurrent() -> int:
+    try:
+        value = int(os.environ.get(_RUNTIME_MAX_CONCURRENT_ENV, ""))
+    except ValueError:
+        value = _RUNTIME_MAX_CONCURRENT_DEFAULT
+    return max(1, value)
+
+
+def _runtime_executor() -> ThreadPoolExecutor:
+    global _RUNTIME_EXECUTOR
+    with _RUNTIME_GATE_LOCK:
+        if _RUNTIME_EXECUTOR is None:
+            _RUNTIME_EXECUTOR = ThreadPoolExecutor(
+                max_workers=_runtime_max_concurrent(),
+                thread_name_prefix="runtime-bridge",
+            )
+        return _RUNTIME_EXECUTOR
+
+
+def _acquire_run_slot() -> bool:
+    global _ACTIVE_RUN_COUNT
+    with _RUNTIME_GATE_LOCK:
+        if _ACTIVE_RUN_COUNT >= _runtime_max_concurrent():
+            return False
+        _ACTIVE_RUN_COUNT += 1
+        return True
+
+
+def _release_run_slot() -> None:
+    global _ACTIVE_RUN_COUNT
+    with _RUNTIME_GATE_LOCK:
+        _ACTIVE_RUN_COUNT = max(0, _ACTIVE_RUN_COUNT - 1)
+
+
+def _sweep_finished_sessions(now: float | None = None) -> list[str]:
+    """Evict sessions that finished but were never popped (leak backstop only).
+
+    The normal cleanup path in _handle_runtime_run pops sessions before
+    finished is set; anything still registered past the TTL leaked.
+    """
+    current = time.monotonic() if now is None else now
+    removed: list[str] = []
+    with _SESSIONS_LOCK:
+        for key, session in list(_SESSIONS.items()):
+            finished_at = session.finished_at
+            if (
+                session.finished.is_set()
+                and finished_at is not None
+                and current - finished_at >= _FINISHED_SESSION_TTL_SECONDS
+            ):
+                _SESSIONS.pop(key, None)
+                removed.append(key)
+    for key in removed:
+        logger.warning("Runtime bridge sweeper evicted orphaned session %s", key)
+    return removed
+
+
+async def _session_sweeper_loop() -> None:
+    while True:
+        await asyncio.sleep(_SESSION_SWEEP_INTERVAL_SECONDS)
+        _sweep_finished_sessions()
+
+
+def _ensure_session_sweeper() -> None:
+    loop = asyncio.get_running_loop()
+    for key, (known_loop, task) in list(_SWEEPERS.items()):
+        if known_loop.is_closed() or (known_loop is loop and task.done()):
+            _SWEEPERS.pop(key, None)
+    entry = _SWEEPERS.get(id(loop))
+    if entry is not None and entry[0] is loop and not entry[1].done():
+        return
+    _SWEEPERS[id(loop)] = (loop, loop.create_task(_session_sweeper_loop()))
 
 
 def _pin_run_model(agent: Any, requested_model: Any) -> str:
@@ -79,6 +172,26 @@ def _activity_arguments(tool_name: str, args: Any) -> dict[str, str]:
         for key in allowed.get(tool_name, ())
         if isinstance(args.get(key), str) and str(args[key]).strip()
     }
+
+
+def _skill_body_digest(args: Any, result: Any) -> str:
+    """Digest of a successful SKILL.md body load; "" for sub-file reads or failures."""
+    if not isinstance(args, dict) or str(args.get("file_path") or "").strip():
+        return ""
+    parsed = result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            return ""
+    if not isinstance(parsed, dict):
+        return ""
+    if parsed.get("success") is False or ("error" in parsed and parsed.get("success") is not True):
+        return ""
+    content = parsed.get("content")
+    if not isinstance(content, str):
+        return ""
+    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _activity_failure_message(result: Any) -> str:
@@ -185,6 +298,25 @@ def _replacement_system_prompt(system_context: Any) -> str:
     return stable + ("\n\n" + turn if turn else "")
 
 
+def _run_state_prompt(run_state: Any) -> str:
+    """Render the platform-derived run state as an authenticated instructions block.
+
+    run_state is platform data derived from the orchestrator event log, not
+    user content; it is appended verbatim (compact JSON) without model-side
+    interpretation. Resume and first start are treated identically.
+    """
+    if run_state is None:
+        return ""
+    if not isinstance(run_state, dict):
+        raise ValueError("run_state must be an object")
+    if not run_state:
+        return ""
+    return (
+        "\n\n[RUN STATE — platform-authenticated, read-only]\n"
+        + json.dumps(run_state, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 def _resume_runtime_history(
     messages: list[dict[str, Any]],
     checkpoint: Any,
@@ -210,6 +342,11 @@ def _resume_runtime_history(
     status = str(result.get("status") or "")
     if status == "succeeded":
         content = result.get("output")
+        if content is None and result.get("output_ref") is not None:
+            # Externalized output arrives with only output_ref; mirror the
+            # online projection (hermesfork.go projectToolOutput) instead of
+            # silently degrading the tool message to "null".
+            content = {"status": "externalized", "output_ref": result["output_ref"]}
     elif status == "failed" and isinstance(result.get("error"), dict):
         content = {"error": result["error"]}
     else:
@@ -300,6 +437,8 @@ class RuntimeBridgeSession:
         self.lock = threading.RLock()
         self.interrupted = threading.Event()
         self.finished = threading.Event()
+        self.finished_async = asyncio.Event()
+        self.finished_at: float | None = None
 
     def is_skill_allowed(self, name: str) -> bool:
         return bool(name) and name in self.allowed_skill_names
@@ -339,17 +478,9 @@ class RuntimeBridgeSession:
         name = str(args.get("name") or args.get("skill") or "").strip()
         if not self.is_skill_allowed(name):
             return
-        serialized = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-        try:
-            parsed = json.loads(serialized)
-        except (TypeError, json.JSONDecodeError):
-            parsed = None
-        if isinstance(parsed, dict) and (
-            parsed.get("success") is False
-            or ("error" in parsed and parsed.get("success") is not True)
-        ):
+        digest = _skill_body_digest(args, result)
+        if not digest:
             return
-        digest = "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         with self.lock:
             self.loaded_skills[name] = digest
 
@@ -366,7 +497,7 @@ class RuntimeBridgeSession:
             "arguments": _activity_arguments(name, args),
         })
 
-    def complete_local_activity(self, call_id: str, name: str, result: Any) -> None:
+    def complete_local_activity(self, call_id: str, name: str, args: Any, result: Any) -> None:
         if not call_id:
             return
         with self.lock:
@@ -385,6 +516,10 @@ class RuntimeBridgeSession:
                 "message": message,
                 "retryable": False,
             }
+        elif name == "skill_view":
+            digest = _skill_body_digest(args, result)
+            if digest:
+                payload["arguments"] = {"digest": digest}
         self.emit("activity_completed", payload)
 
     def _checkpoint_message(self, call_id: str, name: str) -> dict[str, Any]:
@@ -496,11 +631,20 @@ class RuntimeBridgeSession:
             payload["skill"] = proofs[0]
         self.emit("checkpoint", {"message": checkpoint})
         self.emit("tool_request", payload)
-        if not pending.ready.wait(self.deadline_seconds) or self.interrupted.is_set():
+        wait_timeout = (
+            self.deadline_seconds
+            if self.deadline_seconds is not None
+            else _UNBOUNDED_TOOL_WAIT_CAP_SECONDS
+        )
+        ready = pending.ready.wait(wait_timeout)
+        if not ready or self.interrupted.is_set():
             with self.lock:
                 self.pending.pop(call_id, None)
-            code = "runtime_deadline_exceeded" if self.deadline_seconds is not None else "run_interrupted"
-            message = "explicit tool-result deadline exceeded" if self.deadline_seconds is not None else "run was interrupted"
+            # An interrupt wakes the same wait; attribute it before deadline.
+            if self.interrupted.is_set():
+                code, message = "run_interrupted", "run was interrupted"
+            else:
+                code, message = "runtime_deadline_exceeded", "tool-result deadline exceeded"
             return json.dumps({"error": {"code": code, "message": message, "retryable": False}})
         result = pending.result or {}
         if result.get("ok"):
@@ -575,12 +719,59 @@ class RuntimeBridgeSession:
             for pending in self.pending.values():
                 pending.ready.set()
 
+    def mark_finished(self) -> None:
+        self.finished_at = time.monotonic()
+        self.finished.set()
+        try:
+            if asyncio.get_running_loop() is self.loop:
+                self.finished_async.set()
+                return
+        except RuntimeError:
+            pass
+        self.loop.call_soon_threadsafe(self.finished_async.set)
+
 
 class APIServerRuntimeMixin:
+    async def _run_agent_bridge(self, **kwargs: Any) -> tuple:
+        """Run one bridge conversation on the dedicated bounded runtime pool.
+
+        Mirrors APIServerRunsMixin._run_agent but swaps the default executor
+        (min(32, cpu+4) threads shared with every other endpoint) for the
+        bridge-owned pool sized by HERMES_RUNTIME_MAX_CONCURRENT.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _run() -> tuple:
+            from gateway.api_agent_runner import run_agent_sync
+
+            return run_agent_sync(self, **kwargs)
+
+        return await loop.run_in_executor(_runtime_executor(), _run)
+
     async def _handle_runtime_run(self, request: "web.Request") -> "web.StreamResponse":
         auth_error = self._check_auth(request)
         if auth_error:
             return auth_error
+        # Concurrency gate before response.prepare: over-limit requests are
+        # rejected with a retryable 429 instead of queueing on the executor.
+        if not _acquire_run_slot():
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "runtime_concurrency_exceeded",
+                        "message": f"too many concurrent runtime runs (max {_runtime_max_concurrent()})",
+                        "retryable": True,
+                    },
+                },
+                status=429,
+                headers={"Retry-After": "1"},
+            )
+        try:
+            return await self._handle_runtime_run_gated(request)
+        finally:
+            _release_run_slot()
+
+    async def _handle_runtime_run_gated(self, request: "web.Request") -> "web.StreamResponse":
         try:
             body = await request.json()
             run_id = str(body.get("run_id") or "").strip()
@@ -591,11 +782,19 @@ class APIServerRuntimeMixin:
             runtime_checkpoint = body.get("runtime_checkpoint")
             if not run_id or not isinstance(messages, list) or not messages:
                 raise ValueError("run_id and messages are required")
+            # Expose the run id to the audit middleware: its completion line
+            # is logged after this handler returns, so the audit trail can
+            # correlate the access log with the run it served.
+            request["hermes_run_id"] = run_id
             resuming = bool(tool_results or runtime_checkpoint)
             if resuming and (not tool_results or runtime_checkpoint is None):
                 raise ValueError("runtime_checkpoint and tool_results are both required for resume")
             allowed_skill_names = _allowed_skill_names(definitions)
-            instructions = _replacement_system_prompt(system_context) + _allowed_skills_prompt(allowed_skill_names)
+            instructions = (
+                _replacement_system_prompt(system_context)
+                + _allowed_skills_prompt(allowed_skill_names)
+                + _run_state_prompt(body.get("run_state"))
+            )
             schemas = _tool_schemas(definitions)
             normalized_messages = [
                 {"role": str(item.get("role") or ""), "content": _message_text(item.get("content"))}
@@ -629,6 +828,7 @@ class APIServerRuntimeMixin:
             agent_session_id,
         )
         _ensure_runtime_middleware()
+        _ensure_session_sweeper()
         with _SESSIONS_LOCK:
             if run_id in _SESSIONS or agent_session_id in _SESSIONS:
                 await response.write(json.dumps({"run_id": run_id, "type": "error", "payload": {"code": "run_state_conflict", "message": "run already active"}}).encode() + b"\n")
@@ -649,6 +849,12 @@ class APIServerRuntimeMixin:
             agent._cached_system_prompt = instructions
             agent._build_system_prompt = lambda _system_message=None: instructions
             agent._resume_from_tool_results = resuming
+            # Runtime bridge runs park on media generation for well over the
+            # default 5m prompt-cache TTL, so a resume repays the full 13-14k
+            # token system prefix at uncached price. Pin the 1h tier (the
+            # other value agent_init accepts) for these runs only; the global
+            # default and ~/.hermes/config.yaml stay untouched.
+            agent._cache_ttl = "1h"
             session.agent_ref[0] = agent
 
         def on_tool_start(tool_call_id: str, function_name: str, function_args: Any) -> None:
@@ -657,17 +863,28 @@ class APIServerRuntimeMixin:
         def on_tool_complete(
             tool_call_id: str,
             function_name: str,
-            _function_args: Any,
+            function_args: Any,
             function_result: Any,
         ) -> None:
-            session.complete_local_activity(tool_call_id, function_name, function_result)
+            session.complete_local_activity(tool_call_id, function_name, function_args, function_result)
 
         async def pump() -> None:
             while True:
                 event = await queue.get()
                 if event is None:
                     return
-                await response.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
+                try:
+                    await response.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
+                except Exception as exc:
+                    # The orchestrator went away; without an interrupt the
+                    # agent keeps running and events pile into the queue.
+                    logger.warning(
+                        "Runtime bridge stream write failed for run %s; interrupting: %s",
+                        run_id,
+                        exc,
+                    )
+                    session.interrupt("orchestrator stream disconnected")
+                    return
 
         pump_task = asyncio.create_task(pump())
         session.emit("run_started", {
@@ -677,7 +894,7 @@ class APIServerRuntimeMixin:
             "system_context_digest": system_context["digest"],
         })
         try:
-            result, usage = await self._run_agent(
+            result, usage = await self._run_agent_bridge(
                 user_message=user_message,
                 conversation_history=history,
                 ephemeral_system_prompt=None,
@@ -691,6 +908,13 @@ class APIServerRuntimeMixin:
             text = str((result or {}).get("final_response") or "")
             session.emit("usage", usage or {})
             session.emit("completed", {"finish_reason": "stop", "text": text})
+        except asyncio.CancelledError:
+            # aiohttp cancels the handler when the orchestrator disconnects;
+            # the agent may keep running on its executor thread unless told
+            # to stop.
+            logger.warning("Runtime bridge request cancelled for run %s; interrupting", run_id)
+            session.interrupt("orchestrator stream disconnected")
+            raise
         except Exception as exc:
             logger.exception("Run Orchestrator runtime run failed: %s", run_id)
             session.emit("error", {"code": "runtime_unavailable", "message": str(exc)})
@@ -698,7 +922,7 @@ class APIServerRuntimeMixin:
             with _SESSIONS_LOCK:
                 _SESSIONS.pop(run_id, None)
                 _SESSIONS.pop(agent_session_id, None)
-            session.finished.set()
+            session.mark_finished()
             queue.put_nowait(None)
             await pump_task
         return response
@@ -708,6 +932,7 @@ class APIServerRuntimeMixin:
         if auth_error:
             return auth_error
         run_id = request.match_info["run_id"]
+        request["hermes_run_id"] = run_id
         with _SESSIONS_LOCK:
             session = _SESSIONS.get(run_id)
         if session is None:
@@ -725,14 +950,18 @@ class APIServerRuntimeMixin:
         if auth_error:
             return auth_error
         run_id = request.match_info["run_id"]
+        request["hermes_run_id"] = run_id
         with _SESSIONS_LOCK:
             session = _SESSIONS.get(run_id)
         if session is None:
             return web.json_response({"error": {"code": "run_not_found", "message": "run is not active"}}, status=404)
         body = await request.json()
         session.interrupt(str(body.get("reason") or "interrupted by orchestrator"))
-        finished = await asyncio.to_thread(session.finished.wait, 10)
-        if not finished:
+        # Wait on the asyncio-side completion event: interrupt must never
+        # borrow an executor thread the runs themselves may have exhausted.
+        try:
+            await asyncio.wait_for(session.finished_async.wait(), 10)
+        except asyncio.TimeoutError:
             return web.json_response(
                 {"error": {"code": "interrupt_timeout", "message": "runtime session did not stop"}},
                 status=503,

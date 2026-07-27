@@ -65,7 +65,7 @@ def _request_fields(request: "web.Request") -> dict[str, str]:
             peer_ip = str(peer[0])
     except Exception:
         peer_ip = ""
-    return {
+    fields = {
         "request_id": request_id_for(request),
         "method": _clean(getattr(request, "method", ""), max_len=16),
         "path": _clean(getattr(request, "path_qs", ""), max_len=500),
@@ -73,6 +73,14 @@ def _request_fields(request: "web.Request") -> dict[str, str]:
         "peer_ip": _clean(peer_ip),
         "user_agent": _clean(request.headers.get("User-Agent", ""), max_len=300),
     }
+    try:
+        run_id = request.get("hermes_run_id")
+    except Exception:
+        run_id = None
+    run_id = _clean(run_id, max_len=128)
+    if run_id:
+        fields["run_id"] = run_id
+    return fields
 
 
 def _scope_fields(scope: Mapping[str, Any] | None) -> dict[str, str]:

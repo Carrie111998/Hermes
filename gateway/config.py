@@ -17,9 +17,33 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
-from utils import env_int, is_truthy_value
+from utils import env_int, env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+# Deployment-mode switches (read from the environment in one place so the
+# gateway never scatters raw os.getenv() checks for these flags).
+RUNTIME_DRIVER_ONLY_ENV = "HERMES_RUNTIME_DRIVER_ONLY"
+DISABLE_CRON_ENV = "HERMES_DISABLE_CRON"
+
+
+def is_runtime_driver_only() -> bool:
+    """True when the gateway must expose only the Runtime Driver surface.
+
+    In this mode the API server registers only ``/healthz`` and the three
+    ``/v1/runtime/*`` routes; every other HTTP entrypoint (chat completions,
+    sessions, responses, jobs, ...) is not registered at all.
+    """
+    return env_var_enabled(RUNTIME_DRIVER_ONLY_ENV)
+
+
+def is_cron_disabled() -> bool:
+    """True when the background cron scheduler thread must not start.
+
+    Either an explicit ``HERMES_DISABLE_CRON`` or runtime-driver-only mode
+    disables cron (a pure Runtime Driver has no business running local jobs).
+    """
+    return env_var_enabled(DISABLE_CRON_ENV) or is_runtime_driver_only()
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:

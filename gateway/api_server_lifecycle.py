@@ -7,28 +7,28 @@ from __future__ import annotations
 
 from gateway.api_server_shared import *
 from gateway.api_server_audit import request_audit_middleware
+from gateway.config import is_runtime_driver_only
 
 
 class APIServerLifecycleMixin:
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Start the aiohttp web server."""
-        if not AIOHTTP_AVAILABLE:
-            logger.warning("[%s] aiohttp not installed", self.name)
-            return False
+    def _setup_routes(self) -> None:
+        """Register HTTP routes on ``self._app``.
 
-        try:
-            mws = [
-                mw
-                for mw in (
-                    request_audit_middleware,
-                    cors_middleware,
-                    body_limit_middleware,
-                    security_headers_middleware,
-                )
-                if mw is not None
-            ]
-            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
-            assert self._app is not None
+        With HERMES_RUNTIME_DRIVER_ONLY set, only the health probe and the
+        private Run Orchestrator Runtime Driver contract are registered —
+        every other entrypoint (chat completions, sessions, responses, jobs,
+        runs) is left off the router so it 404s instead of bypassing
+        upstream billing.
+        """
+        assert self._app is not None
+        runtime_driver_only = is_runtime_driver_only()
+        if runtime_driver_only:
+            logger.info(
+                "[%s] HERMES_RUNTIME_DRIVER_ONLY enabled: registering only "
+                "/healthz and /v1/runtime/* routes",
+                self.name,
+            )
+        else:
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
@@ -69,11 +69,32 @@ class APIServerLifecycleMixin:
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
-            # Private Run Orchestrator Runtime Driver contract.
-            self._app.router.add_get("/healthz", self._handle_health)
-            self._app.router.add_post("/v1/runtime/runs", self._handle_runtime_run)
-            self._app.router.add_post("/v1/runtime/runs/{run_id}/tool-results", self._handle_runtime_tool_result)
-            self._app.router.add_post("/v1/runtime/runs/{run_id}/interrupt", self._handle_runtime_interrupt)
+        # Private Run Orchestrator Runtime Driver contract.
+        self._app.router.add_get("/healthz", self._handle_health)
+        self._app.router.add_post("/v1/runtime/runs", self._handle_runtime_run)
+        self._app.router.add_post("/v1/runtime/runs/{run_id}/tool-results", self._handle_runtime_tool_result)
+        self._app.router.add_post("/v1/runtime/runs/{run_id}/interrupt", self._handle_runtime_interrupt)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Start the aiohttp web server."""
+        if not AIOHTTP_AVAILABLE:
+            logger.warning("[%s] aiohttp not installed", self.name)
+            return False
+
+        try:
+            mws = [
+                mw
+                for mw in (
+                    request_audit_middleware,
+                    cors_middleware,
+                    body_limit_middleware,
+                    security_headers_middleware,
+                )
+                if mw is not None
+            ]
+            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
+            assert self._app is not None
+            self._setup_routes()
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

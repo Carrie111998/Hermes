@@ -32,6 +32,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -78,7 +79,7 @@ _session_context = threading.local()
 # Default log format — includes timestamp, level, optional session tag,
 # logger name, and message.  The ``%(session_tag)s`` field is guaranteed to
 # exist on every LogRecord via _install_session_record_factory() below.
-_LOG_FORMAT = "%(asctime)s %(levelname)s%(session_tag)s %(name)s: %(message)s"
+_LOG_FORMAT = "%(asctime)sZ %(levelname)s%(session_tag)s %(name)s: %(message)s"
 _LOG_FORMAT_VERBOSE = "%(asctime)s - %(name)s - %(levelname)s%(session_tag)s - %(message)s"
 
 
@@ -311,6 +312,13 @@ def setup_logging(
     # Lazy import to avoid circular dependency at module load time.
     from agent.redact import RedactingFormatter
 
+    def utc_file_formatter() -> "RedactingFormatter":
+        # File logs use UTC so they line up with orchestrator run_events
+        # timestamps when correlating a run across services by run_id.
+        formatter = RedactingFormatter(_LOG_FORMAT)
+        formatter.converter = time.gmtime
+        return formatter
+
     root = logging.getLogger()
 
     # --- agent.log (INFO+) — the main activity log -------------------------
@@ -320,7 +328,7 @@ def setup_logging(
         level=level,
         max_bytes=max_bytes,
         backup_count=backups,
-        formatter=RedactingFormatter(_LOG_FORMAT),
+        formatter=utc_file_formatter(),
     )
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
@@ -330,7 +338,7 @@ def setup_logging(
         level=logging.WARNING,
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
-        formatter=RedactingFormatter(_LOG_FORMAT),
+        formatter=utc_file_formatter(),
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
@@ -341,7 +349,7 @@ def setup_logging(
             level=logging.INFO,
             max_bytes=5 * 1024 * 1024,
             backup_count=3,
-            formatter=RedactingFormatter(_LOG_FORMAT),
+            formatter=utc_file_formatter(),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 
@@ -353,7 +361,7 @@ def setup_logging(
             level=logging.INFO,
             max_bytes=10 * 1024 * 1024,
             backup_count=5,
-            formatter=RedactingFormatter(_LOG_FORMAT),
+            formatter=utc_file_formatter(),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
         )
 

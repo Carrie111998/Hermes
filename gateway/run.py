@@ -1653,6 +1653,7 @@ from gateway.config import (
     GatewayConfig,
     HomeChannel,
     PlatformConfig,
+    is_cron_disabled,
     load_gateway_config,
 )
 from gateway.session import (
@@ -18681,15 +18682,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # use live adapters (E2EE support).
     from cron.scheduler_provider import resolve_cron_scheduler
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-scheduler",
-    )
-    cron_thread.start()
+    cron_provider = None
+    cron_thread = None
+    if is_cron_disabled():
+        logger.info(
+            "Cron scheduler disabled (HERMES_DISABLE_CRON or "
+            "HERMES_RUNTIME_DRIVER_ONLY is set); skipping cron thread startup."
+        )
+    else:
+        cron_provider = resolve_cron_scheduler()
+        cron_thread = threading.Thread(
+            target=cron_provider.start,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="cron-scheduler",
+        )
+        cron_thread.start()
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
@@ -18720,11 +18729,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     
     # Stop cron scheduler + housekeeping cleanly
     cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    cron_thread.join(timeout=5)
+    if cron_provider is not None:
+        try:
+            cron_provider.stop()
+        except Exception as e:
+            logger.debug("Cron provider stop() error: %s", e)
+    if cron_thread is not None:
+        cron_thread.join(timeout=5)
     housekeeping_thread.join(timeout=5)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
