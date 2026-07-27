@@ -15,6 +15,22 @@ def conn():
     value.close()
 
 
+def test_accounting_schema_read_preserves_active_transaction(conn):
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO fiscal_periods "
+        "(id, organization_id, name, starts_at, ends_at, evidence_json) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("period_txn", "org_txn", "FY", 1, 2, '{"source":"test"}'),
+    )
+    accounting_db.ensure_schema(conn)
+    assert conn.in_transaction is True
+    assert conn.execute(
+        "SELECT evidence_json FROM fiscal_periods WHERE id=?", ("period_txn",)
+    ).fetchone()[0] == '{"source":"test"}'
+    conn.rollback()
+
+
 def test_journal_is_balanced_idempotent_and_immutable(conn):
     entry = accounting_db.post_journal(
         conn,

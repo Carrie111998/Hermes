@@ -158,6 +158,16 @@ def _json(value: Any) -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        period_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(fiscal_periods)")
+        }
+        trigger = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name='fiscal_periods_contract_immutable_update'"
+        ).fetchone()
+        if "evidence_json" in period_columns and trigger is not None:
+            return
     conn.executescript(SCHEMA_SQL)
     period_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(fiscal_periods)")
