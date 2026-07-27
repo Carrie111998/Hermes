@@ -3900,6 +3900,13 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
             )
+            # Restore any session-level reasoning override (/reasoning
+            # <level>) that switch_model's re-resolution from config may
+            # have overwritten.  Per-model reasoning_overrides are still
+            # applied by switch_model; this only re-applies the user's
+            # active choice when config has no opinion.  See #72856.
+            if isinstance(session.get("create_reasoning_override"), dict):
+                agent.reasoning_config = session["create_reasoning_override"]
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
             # model/client and re-raised.  Abort the commit: do NOT restart the
