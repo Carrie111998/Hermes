@@ -127,6 +127,11 @@ tag above.
 - Docker sandbox-provider integration: `uv run pytest -q -m integration
   tests/integration/test_vision_docker_resolve.py` — **3 passed, 0 failed** in
   6.13 seconds, covering container-only reads and host-secret non-exfiltration.
+- Standalone worker launch smoke: after a clean charter bootstrap,
+  `charterforge objectives worker --once` registered a durable
+  `objective-runtime` worker, recorded `security_blocked`, and stopped cleanly;
+  `objectives worker-status` read the stopped evidence back. No provider or
+  external outcome was fabricated.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 
