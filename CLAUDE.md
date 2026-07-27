@@ -275,6 +275,17 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   interno real. Cosmético `signal-cli link -n "HermesAgent"` → `"IYARI"` (mismo
   precedente que G5 lote 6, camelCase sin word-boundary que el script no toca solo).
   Build limpio: 98/98 warnings idénticos a la baseline.
+- Lote 7 (este commit): `skills/bundled/{apple,autonomous-ai-agents,creative,data-science,
+  dogfood,email,github,media}` = 38 (primera mitad de `bundled/`, 70 en total).
+  **No calificó para auto-aprobación** en el chequeo inicial: 1 `Nous Research` en
+  `autonomous-ai-agents-hermes-agent.md` (prosa descriptiva del framework, no atribución
+  factual de servicio) y un "falso positivo" aparente en `creative-ascii-art.md`
+  (`0xbyt4, Hermes Agent` en fila de autor) — ambos verificados contra la doc en inglés
+  ya commiteada: **coinciden exactamente** con transformación normal ya aplicada allí
+  (`Nous Research`→Digital Services LLC, `Hermes Agent`→IYARI en la fila de autor), no
+  eran casos nuevos. Aplicado transformador normal a los 38. 7 headings cambiaron, sin
+  anchors internos que los referenciaran. Preservados `HermesCLI` (clase), `Nous Portal`.
+  Build limpio: 98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 
