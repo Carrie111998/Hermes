@@ -941,6 +941,24 @@ This remains deterministic local-provider evidence and does not establish
 production provider credentials, corporate readiness, or legal/compliance
 certification.
 
+After reauthorizing governed task completion at the database write boundary,
+the acceptance was rerun on current `main` commit
+`acfa060a8a818ea7b05672261bfb994588eb5cd2` with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result: **current-tree agentic acceptance: PASS**. Install/bootstrap,
+readiness gating, bounded CEO execution, process-separated delegation,
+unauthorized governed-completion rejection, uncertain provider read-back,
+inbound tax settlement, durable restart recovery, and master-stop fencing
+passed. The acceptance image manifest digest was
+`sha256:0134556b879712c94564b1117061c9d0d4c4c7dfaa91417e4b1a8c2ac29a9bd7`.
+This remains deterministic local-provider evidence and does not establish
+production provider credentials, corporate readiness, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
