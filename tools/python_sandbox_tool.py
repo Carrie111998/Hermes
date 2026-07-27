@@ -97,6 +97,8 @@ for root, dirs, files in os.walk("/work", topdown=True, followlinks=False):
 
 subprocess.run(["mount", "-o", "remount,bind,rw", "/export"], check=True)
 subprocess.run(["cp", "-a", "/work/.", "/export/"], check=True)
+if completed.returncode < 0:
+    os._exit(128 - completed.returncode)
 raise SystemExit(completed.returncode)
 """
 
