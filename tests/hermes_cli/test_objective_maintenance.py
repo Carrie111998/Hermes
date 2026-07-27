@@ -290,7 +290,23 @@ def test_stale_outbound_spend_hold_escalates_without_automatic_release(tmp_path)
         ("action-stale-hold",),
     ).fetchone()["status"] == "reserved"
     intervention = conn.execute(
-        "SELECT category FROM intervention_queue WHERE action_id=?",
+        "SELECT id,category FROM intervention_queue WHERE action_id=?",
         ("action-stale-hold",),
     ).fetchone()
     assert intervention["category"] == "outbound_spend_hold_unreconciled"
+    from hermes_cli import operational_control
+
+    operational_control.resolve_intervention(
+        conn,
+        intervention["id"],
+        option_id="release",
+        actor="human:advisor",
+        evidence={
+            "provider_status": "failed",
+            "settlement_reference": "provider-failure-1",
+        },
+    )
+    assert conn.execute(
+        "SELECT status FROM payment_spend_holds WHERE action_id=?",
+        ("action-stale-hold",),
+    ).fetchone()["status"] == "released"

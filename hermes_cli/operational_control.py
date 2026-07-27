@@ -467,6 +467,63 @@ def resolve_intervention(
         raise ValueError("intervention resolution requires evidence")
     context = json.loads(row["context_json"])
     emitted_objective_event = False
+    if row["category"] == "outbound_spend_hold_unreconciled":
+        from hermes_cli import payment_controls
+
+        action_id = str(context.get("action_id") or row["action_id"] or "")
+        if not action_id:
+            raise ValueError("spend-hold intervention has no action identity")
+        if option_id == "provider_readback":
+            payment_intent_id = str(evidence.get("payment_intent_id") or "")
+            if not payment_intent_id:
+                raise ValueError(
+                    "provider read-back resolution requires payment_intent_id"
+                )
+            intent = conn.execute(
+                """SELECT id,action_id,direction,status FROM payment_intents
+                    WHERE id=?""",
+                (payment_intent_id,),
+            ).fetchone()
+            if (
+                intent is None
+                or str(intent["action_id"] or "") != action_id
+                or str(intent["direction"]) != "outgoing"
+                or str(intent["status"]) != "succeeded"
+            ):
+                raise ValueError(
+                    "provider read-back must reference a succeeded outgoing payment"
+                )
+            readback = conn.execute(
+                """SELECT 1 FROM payment_provider_readbacks
+                    WHERE payment_intent_id=? AND status='succeeded'
+                    ORDER BY observed_at DESC,id DESC LIMIT 1""",
+                (payment_intent_id,),
+            ).fetchone()
+            if readback is None:
+                raise ValueError(
+                    "provider read-back requires a durable succeeded read-back record"
+                )
+            if not payment_controls.settle_spend_hold(conn, action_id):
+                raise ValueError("spend hold is no longer reserved")
+        elif option_id == "release":
+            provider_status = str(evidence.get("provider_status") or "")
+            settlement_reference = str(
+                evidence.get("settlement_reference") or ""
+            ).strip()
+            if provider_status not in {"failed", "cancelled"}:
+                raise ValueError(
+                    "spend-hold release requires failed or cancelled provider status"
+                )
+            if not settlement_reference:
+                raise ValueError(
+                    "spend-hold release requires settlement_reference evidence"
+                )
+            if not payment_controls.release_spend_hold(
+                conn,
+                action_id,
+                reason=f"advisor:{provider_status}:{settlement_reference}",
+            ):
+                raise ValueError("spend hold is no longer reserved")
     if row["category"] == "external_content_quarantine":
         content_id = str(context.get("content_id") or "")
         if option_id == "release_as_data":

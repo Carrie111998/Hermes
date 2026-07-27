@@ -22,6 +22,9 @@
   releases them.
 - Housekeeping escalates stale outbound spend holds with a deduplicated advisor
   intervention and never releases an uncertain provider hold automatically.
+- Spend-hold intervention resolution is evidence-bound: succeeded durable
+  provider read-back settles a hold, while failed/cancelled settlement evidence
+  is required to release it.
 - Payment and metered-billing schema initialization preserves active authority
   transactions when the durable tables already exist.
 - Outcome attribution synchronization uses the guarded payment schema path and

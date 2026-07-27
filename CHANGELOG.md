@@ -74,6 +74,8 @@ not a claim of production autonomous-business readiness.
   advisor handoffs before autonomous operation stops.
 - Housekeeping now escalates stale outbound spend holds without automatically
   releasing uncertain provider commitments.
+- Spend-hold advisor resolutions are now evidence-bound to durable provider
+  read-back or failed/cancelled settlement evidence.
 - Hardened durable runtime ledgers so schema checks preserve active authority
   transactions across finance, accounting, payments, compliance, approvals,
   event ingress, billing, commitments, metrics, worker state, and audit
