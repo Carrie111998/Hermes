@@ -317,7 +317,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             lastCwdInfoSessionRef.current = sessionId
             setCurrentCwd(payload.cwd)
 
-            if (cwdMoved && sameSession) {
+            // Only follow genuine cwd moves, not the initial learn on reconnect.
+            // On restart $currentCwd is empty, so the first session.info payload
+            // looks like a "move" from '' to the real path — skip that, or the
+            // sidebar flips into Projects view (hermes-agent#72491).
+            if (cwdMoved && sameSession && $currentCwd.get()) {
               void followActiveSessionCwd(payload.cwd)
             }
           }
