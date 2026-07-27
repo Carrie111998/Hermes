@@ -67,8 +67,31 @@ R20 a stale running review is drained; no parallel review card is spawned.
 R21 legacy untyped review-ish text produces an alert only and never
     auto-creates a review card.
 
+Remediation of the PR #72496 review blockers (all default-off)
+--------------------------------------------------------------
+* The authoritative card's assignee is the valid ``review`` profile.
+* A new head never spawns a *parallel* review while the bound old-head review
+  is still active (running/done/review/blocked): the reconciler returns the
+  typed ``DRAINING_ACTIVE_REVIEW`` disposition and leaves the lane unchanged.
+* The ``kanban_effects`` table enforces, in SQLite, a non-null ``target_task_id``
+  on a *done* effect (``CHECK``) and at most one *leased* effect per lane
+  (partial ``UNIQUE`` index). ``install_effects_schema`` is migration-safe: it
+  rebuilds a pre-remediation table in place without losing rows.
+* Before minting, the reconciler detects manual/unbound parentless review cards
+  for the same repo/PR and returns typed ``CONFLICT_MANUAL_REVIEW_UNBOUND``
+  instead of racing them. A generated card carries a durable, discoverable
+  reverse effect identity (a ``review_card_minted`` event + a body marker) so a
+  scanner can tell it apart from a manual card.
+* Observation freshness defaults to 60s. Before committing, the reconciler
+  re-checks the FULL readiness predicate (temporal/status/policy/checks/head)
+  against the already-injected observation under the lock — no network, and no
+  ``assert`` (so ``-O`` cannot strip the stale-input gate).
+* An explicit, default-off ``scan``/``list`` harness CLI (``main``) exercises
+  the reconciler offline and reports typed per-effect dispositions. It is NOT
+  wired into any dispatcher/cron/loop.
+
 None of this is wired into the dispatcher, cron, plugins, or config. It exists
-to be exercised by tests and an explicit CLI/harness readback.
+to be exercised by tests and an explicit CLI/harness readback (``main``).
 """
 from __future__ import annotations
 
@@ -76,6 +99,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Protocol, runtime_checkable
@@ -114,6 +138,29 @@ CONTAINMENT_DOWNSTREAM_UNAPPROVED = "DOWNSTREAM_RAN_WITHOUT_EXACT_HEAD_APPROVE"
 CONTAINMENT_UNBOUND_REVIEW_CONFLICT = "UNBOUND_REVIEW_CONFLICT"
 CONTAINMENT_STALE_RUNNING_REVIEW = "STALE_RUNNING_REVIEW"
 
+# Reconcile dispositions that refuse to mint a card and leave the lane
+# unchanged (typed so the harness/scanner can report them, not silently drop).
+#   DRAINING_ACTIVE_REVIEW    — a new head arrived while the bound review card
+#                               for the old head is still active/draining; we
+#                               must NOT spawn a parallel review (R20-adjacent).
+#   CONFLICT_MANUAL_REVIEW_UNBOUND — a manually-created, unbound parentless
+#                               review card already exists for this repo/PR; a
+#                               human must reconcile it before we mint.
+DRAINING_ACTIVE_REVIEW = "DRAINING_ACTIVE_REVIEW"
+CONFLICT_MANUAL_REVIEW_UNBOUND = "CONFLICT_MANUAL_REVIEW_UNBOUND"
+
+# Statuses in which an already-bound old-head review is considered live and
+# must be drained (never raced with a parallel review) before a new head can
+# bind. ``ready``/``todo`` are NOT here: an un-started stale card is safe to
+# replace.
+_DRAINING_REVIEW_STATES = frozenset({"running", "done", "review", "blocked"})
+
+# Default freshness window for an injected observation (seconds). An observation
+# older than this is treated as OBSERVATION_STALE — we never reconcile against a
+# stale view of the PR. Deliberately tight (60s) so a reconcile acts only on a
+# just-taken observation.
+DEFAULT_FRESHNESS_SECONDS = 60
+
 # Retry policy defaults (seconds). Backoff is deterministic so a fake clock
 # in tests fully controls scheduling — no wall-clock sleeps anywhere.
 DEFAULT_MAX_ATTEMPTS = 5
@@ -124,9 +171,26 @@ _RETRY_BACKOFF_CAP_SECONDS = 3600
 _SHA40_RE = re.compile(r"[0-9a-f]{40}")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
-# Reviewer assignee for the authoritative card. Deliberately generic; nothing
-# in the live dispatcher routes on it because nothing dispatches this candidate.
-REVIEW_CARD_ASSIGNEE = "reviewer"
+# Assignee for the authoritative card. Must be a *valid profile name* the board
+# understands — the canonical review profile is ``review`` (not ``reviewer``,
+# which is not a profile). Nothing in the live dispatcher routes on it because
+# nothing dispatches this candidate, but the value must still be a legal
+# assignee so a would-be harness could claim the card.
+REVIEW_CARD_ASSIGNEE = "review"
+
+# Discoverable, machine-readable marker embedded in a generated review card's
+# body so a scanner can recognise an effect-minted card by content alone (the
+# durable ``review_card_minted`` event is the authoritative reverse identity;
+# this is a human/grep-friendly belt-and-suspenders).
+EFFECT_CARD_BODY_MARKER = "[hermes-review-effect]"
+
+# Event kind carrying the reverse typed effect identity of a generated card.
+EVENT_REVIEW_CARD_MINTED = "review_card_minted"
+
+# ``tasks.created_by`` stamped on every effect-minted review card. Detection
+# uses it (plus the durable event + body marker) to tell auto-created cards
+# apart from manual/unbound ones.
+EFFECT_CREATED_BY = "kanban_effects"
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +494,7 @@ def evaluate_readiness(
     observation: Optional[GithubObservation],
     *,
     now: int,
-    freshness_seconds: int = 900,
+    freshness_seconds: int = DEFAULT_FRESHNESS_SECONDS,
 ) -> ReadinessResult:
     """Pure readiness evaluation. No I/O, no DB, no mutation.
 
@@ -485,13 +549,33 @@ def evaluate_readiness(
     return ReadinessResult(READY, True, None)
 
 
+def _recheck_ready_locked(
+    payload: ReviewRequiredPayload,
+    observation: Optional[GithubObservation],
+    *,
+    now: int,
+    freshness_seconds: int = DEFAULT_FRESHNESS_SECONDS,
+) -> ReadinessResult:
+    """In-lock readiness re-check against the ALREADY-injected observation.
+
+    Re-evaluates the full predicate (temporal / status / policy / checks /
+    exact head) with no new network call, so a reconcile that leased while
+    ready but whose observation no longer satisfies the gate aborts the commit.
+    Uses plain control flow (never ``assert``) so stale input is rejected even
+    under ``python -O``.
+    """
+    return evaluate_readiness(
+        payload, observation, now=now, freshness_seconds=freshness_seconds
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema installer (R04, R05) — the ONLY place these tables are created.
 # ---------------------------------------------------------------------------
 
 _EFFECT_TABLES = ("kanban_effect_lanes", "kanban_effects", "kanban_effect_outbox")
 
-_INSTALL_SQL = """
+_LANES_SQL = """
 CREATE TABLE IF NOT EXISTS kanban_effect_lanes (
     lane_id        TEXT PRIMARY KEY,
     repo           TEXT NOT NULL,
@@ -506,8 +590,45 @@ CREATE TABLE IF NOT EXISTS kanban_effect_lanes (
     updated_at     INTEGER NOT NULL,
     UNIQUE (repo, pr_number, kind)
 );
+"""
 
-CREATE TABLE IF NOT EXISTS kanban_effects (
+_OUTBOX_SQL = """
+CREATE TABLE IF NOT EXISTS kanban_effect_outbox (
+    effect_id    TEXT PRIMARY KEY,
+    lane_id      TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+"""
+
+# Ordered column list so a rebuild's INSERT…SELECT is explicit and column-safe.
+_EFFECTS_COLUMNS = (
+    "effect_id, lane_id, source_task_id, source_transition, kind, "
+    "payload_json, payload_hash, revision, state, attempts, max_attempts, "
+    "lease_owner, lease_expires_at, next_attempt_at, last_code, last_error, "
+    "target_task_id, created_at, updated_at"
+)
+
+# Marker substring proving the CHECK constraint is present in a table's stored
+# DDL — used to decide whether an existing table needs a migration rebuild.
+_EFFECTS_CHECK_MARKER = "target_task_id IS NOT NULL"
+
+
+def _effects_ddl(table: str = "kanban_effects") -> str:
+    """DDL for the effects table (no ``IF NOT EXISTS`` — callers decide).
+
+    Two durability constraints over the original candidate:
+
+    * ``CHECK (state <> 'done' OR target_task_id IS NOT NULL)`` — a *done*
+      (successfully reconciled) effect must be bound to its target review card.
+      A terminal effect can never claim success with a NULL target.
+    * a partial ``UNIQUE`` index (created separately) enforces at most one
+      *leased* (in-flight reconciling) effect per lane, serializing reconcile
+      at the lane granularity as defense-in-depth beyond the lane CAS.
+    """
+    return f"""
+CREATE TABLE {table} (
     effect_id         TEXT PRIMARY KEY,
     lane_id           TEXT NOT NULL,
     source_task_id    TEXT NOT NULL,
@@ -530,33 +651,79 @@ CREATE TABLE IF NOT EXISTS kanban_effects (
     updated_at        INTEGER NOT NULL,
     -- One effect per source + (lane, payload). Different implementation
     -- sources preserve provenance; replay of one source handoff dedupes (R08).
-    UNIQUE (source_task_id, lane_id, payload_hash)
+    UNIQUE (source_task_id, lane_id, payload_hash),
+    -- A terminal (done) effect must be bound to its target review card.
+    CHECK (state <> 'done' OR target_task_id IS NOT NULL)
 );
+"""
 
-CREATE TABLE IF NOT EXISTS kanban_effect_outbox (
-    effect_id    TEXT PRIMARY KEY,
-    lane_id      TEXT NOT NULL,
-    kind         TEXT NOT NULL,
-    payload_hash TEXT NOT NULL,
-    created_at   INTEGER NOT NULL
-);
 
+_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_effects_state_next
     ON kanban_effects(state, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_effects_lane
     ON kanban_effects(lane_id);
+-- At most one leased (in-flight) effect per lane (R09 defense-in-depth).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_effects_one_leased_per_lane
+    ON kanban_effects(lane_id) WHERE state = 'leased';
 """
 
 
+def _table_sql(conn: sqlite3.Connection, name: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    if row is None:
+        return None
+    return row[0] if not isinstance(row, sqlite3.Row) else row["sql"]
+
+
+def _rebuild_effects_table(conn: sqlite3.Connection) -> None:
+    """Migration-safe, in-place rebuild that adds the new CHECK constraint to a
+    pre-remediation ``kanban_effects`` table without losing rows.
+
+    SQLite cannot ``ALTER TABLE … ADD CONSTRAINT``; the canonical fix is a
+    create-new / copy / drop / rename inside one transaction. The partial
+    ``UNIQUE`` index and secondary indexes are (re)created afterward by the
+    caller via ``CREATE … IF NOT EXISTS``.
+    """
+    from hermes_cli import kanban_db as kb
+
+    with kb.write_txn(conn):
+        conn.execute("DROP TABLE IF EXISTS kanban_effects__migrate")
+        conn.execute(_effects_ddl("kanban_effects__migrate"))
+        conn.execute(
+            f"INSERT INTO kanban_effects__migrate ({_EFFECTS_COLUMNS}) "
+            f"SELECT {_EFFECTS_COLUMNS} FROM kanban_effects"
+        )
+        conn.execute("DROP TABLE kanban_effects")
+        conn.execute("ALTER TABLE kanban_effects__migrate RENAME TO kanban_effects")
+
+
 def install_effects_schema(conn: sqlite3.Connection) -> None:
-    """Create the effect/outbox/lane tables. THE ONLY creation path.
+    """Create (or migrate) the effect/outbox/lane tables. THE ONLY creation path.
 
     Never call this from ``connect``, ``init_db``, migrations, the dispatcher,
     cron, gateway, plugins, config, or any read path. It exists for tests and
     the explicit offline harness so the feature stays default-off: a normal DB
     has none of these tables (R04, R05).
+
+    Idempotent and migration-safe: on a fresh DB it creates the tables with the
+    durability constraints; on a DB that still carries the pre-remediation
+    ``kanban_effects`` shape (no CHECK constraint) it rebuilds the table in
+    place, preserving rows, then (re)creates the indexes including the
+    one-leased-per-lane partial UNIQUE index.
     """
-    conn.executescript(_INSTALL_SQL)
+    conn.executescript(_LANES_SQL)
+    conn.executescript(_OUTBOX_SQL)
+
+    existing = _table_sql(conn, "kanban_effects")
+    if existing is None:
+        conn.executescript(_effects_ddl("kanban_effects"))
+    elif _EFFECTS_CHECK_MARKER not in existing:
+        _rebuild_effects_table(conn)
+
+    conn.executescript(_INDEXES_SQL)
 
 
 def effects_installed(conn: sqlite3.Connection) -> bool:
@@ -814,38 +981,45 @@ def lease_effect(
     """Atomically acquire a lease on a due effect via CAS. Opens its own
     write transaction — callers must NOT already hold one.
 
-    Wins only when the effect is pending-and-due, or leased-but-expired. The
+    Wins only when the effect is pending-and-due, or leased-but-expired, AND no
+    other effect on the same lane is already leased (the one-leased-per-lane
+    partial UNIQUE index serializes reconcile at the lane granularity). The
     revision is bumped so a stale holder's later CAS write fails. Returns the
     leased row, or ``None`` if it could not be leased (R10).
     """
     from hermes_cli import kanban_db as kb
 
-    with kb.write_txn(conn):
-        row = conn.execute(
-            "SELECT * FROM kanban_effects WHERE effect_id = ?", (effect_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        state = row["state"]
-        rev = int(row["revision"])
-        leasable = (
-            (state == STATE_PENDING and int(row["next_attempt_at"]) <= now)
-            or (
-                state == STATE_LEASED
-                and (row["lease_expires_at"] is None or int(row["lease_expires_at"]) <= now)
+    try:
+        with kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT * FROM kanban_effects WHERE effect_id = ?", (effect_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            state = row["state"]
+            rev = int(row["revision"])
+            leasable = (
+                (state == STATE_PENDING and int(row["next_attempt_at"]) <= now)
+                or (
+                    state == STATE_LEASED
+                    and (row["lease_expires_at"] is None or int(row["lease_expires_at"]) <= now)
+                )
             )
-        )
-        if not leasable:
-            return None
-        cur = conn.execute(
-            "UPDATE kanban_effects "
-            "SET state = ?, lease_owner = ?, lease_expires_at = ?, "
-            "    revision = revision + 1, updated_at = ? "
-            "WHERE effect_id = ? AND revision = ?",
-            (STATE_LEASED, owner, now + int(lease_ttl_seconds), now, effect_id, rev),
-        )
-        if cur.rowcount != 1:
-            return None
+            if not leasable:
+                return None
+            cur = conn.execute(
+                "UPDATE kanban_effects "
+                "SET state = ?, lease_owner = ?, lease_expires_at = ?, "
+                "    revision = revision + 1, updated_at = ? "
+                "WHERE effect_id = ? AND revision = ?",
+                (STATE_LEASED, owner, now + int(lease_ttl_seconds), now, effect_id, rev),
+            )
+            if cur.rowcount != 1:
+                return None
+    except sqlite3.IntegrityError:
+        # Another effect on this lane is already leased (one-leased-per-lane
+        # partial UNIQUE index). Treat as "could not lease" rather than an error.
+        return None
     return get_effect(conn, effect_id)
 
 
@@ -913,7 +1087,9 @@ def row_state(conn: sqlite3.Connection, effect_id: str) -> Optional[str]:
 
 @dataclass(frozen=True)
 class ReconcileResult:
-    status: str  # "reconciled" | "not_ready" | "skipped" | "stale"
+    # status: "reconciled" | "not_ready" | "skipped" | "stale" | "draining"
+    #         | "conflict"
+    status: str
     code: str
     effect_id: str
     review_task_id: Optional[str] = None
@@ -921,13 +1097,47 @@ class ReconcileResult:
     detail: Optional[str] = None
 
 
-class _StaleHeadInsideTxn(Exception):
-    """Internal: head drifted between lease and the reconcile txn.
+class _ReconcileBail(Exception):
+    """Internal base: a typed reason to abandon the reconcile write txn.
 
     Raised inside the reconcile write transaction so ``write_txn`` rolls back
     cleanly (no partial review card is ever committed); the public wrapper
-    converts it into a scheduled retry.
+    converts it into a typed, scheduled-retry disposition. Carries the typed
+    ``code`` and human ``detail`` the wrapper surfaces.
     """
+
+    def __init__(self, code: str, detail: Optional[str] = None) -> None:
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
+
+
+class _NotReadyInsideTxn(_ReconcileBail):
+    """In-lock readiness re-check (temporal/status/policy/checks/head) failed.
+
+    Covers the former stale-head case *and* any other predicate that no longer
+    holds when re-evaluated against the injected observation under the lock —
+    without using ``assert`` (which ``-O`` strips) for stale input.
+    """
+
+
+class _DrainingActiveReview(_ReconcileBail):
+    """A new head arrived while the bound old-head review is still active.
+
+    We must not spawn a parallel review; leave the lane unchanged and drain.
+    """
+
+    def __init__(self, review_task_id: str, detail: Optional[str] = None) -> None:
+        super().__init__(DRAINING_ACTIVE_REVIEW, detail)
+        self.review_task_id = review_task_id
+
+
+class _ManualReviewConflict(_ReconcileBail):
+    """A manual/unbound parentless review card already exists for this repo/PR."""
+
+    def __init__(self, task_id: str, detail: Optional[str] = None) -> None:
+        super().__init__(CONFLICT_MANUAL_REVIEW_UNBOUND, detail)
+        self.task_id = task_id
 
 
 def _reconcile_effect_impl(
@@ -992,12 +1202,14 @@ def _reconcile_effect_impl(
         if row is None:
             return ReconcileResult("stale", "REVISION_DRIFT", effect_id)
 
-        # Belt-and-suspenders: the just-observed head must still equal the
-        # payload head (freshness re-check inside the lock; no re-fetch).
-        assert observation is not None  # readiness.ready implies non-None
-        if observation.head_sha != payload.head_sha:
-            # Fall out of the txn without mutation; schedule a retry after.
-            raise _StaleHeadInsideTxn()
+        # Re-check the FULL readiness predicate (temporal / status / policy /
+        # checks / exact head) against the already-injected observation, under
+        # the lock and with NO new network call. Any predicate that no longer
+        # holds bails out of the txn (rollback → typed scheduled retry). No
+        # ``assert`` is used, so `-O` cannot strip this gate on stale input.
+        recheck = _recheck_ready_locked(payload, observation, now=now)
+        if not recheck.ready:
+            raise _NotReadyInsideTxn(recheck.code, recheck.detail)
 
         lane_id = eff.lane_id
         lane = conn.execute(
@@ -1019,6 +1231,33 @@ def _reconcile_effect_impl(
             and kb.get_task(conn, review_task_id) is not None
         )
         if not reuse:
+            # A new head must NOT spawn a parallel review while the bound
+            # old-head review is still active/draining (running/done/review/
+            # blocked). Leave the lane unchanged and drain instead.
+            if review_task_id is not None and lane["head_sha"] != payload.head_sha:
+                existing = kb.get_task(conn, review_task_id)
+                if existing is not None and existing.status in _DRAINING_REVIEW_STATES:
+                    raise _DrainingActiveReview(
+                        review_task_id,
+                        f"old-head review {review_task_id} is {existing.status} at "
+                        f"{(lane['head_sha'] or '')[:8]}; drain before binding new head "
+                        f"{payload.head_sha[:8]} — no parallel review spawned",
+                    )
+
+            # A manual / unbound parentless review card for this repo/PR must be
+            # reconciled by a human before we mint an authoritative one.
+            manual = find_unbound_review_cards(
+                conn, payload.repo, payload.pr_number,
+                lane_review_task_id=review_task_id,
+            )
+            if manual:
+                raise _ManualReviewConflict(
+                    manual[0],
+                    f"manual/unbound review card(s) {manual} exist for "
+                    f"{payload.repo}#{payload.pr_number}; refusing to mint a parallel "
+                    "authoritative review",
+                )
+
             review_task_id = kb._new_task_id()
             kb._create_task_locked(
                 conn,
@@ -1032,7 +1271,11 @@ def _reconcile_effect_impl(
                     "Authoritative review card for PR "
                     f"{payload.repo}#{payload.pr_number} at exact head "
                     f"{payload.head_sha}. Auto-created by the review-required "
-                    "effect reconciler (repository-only candidate)."
+                    "effect reconciler (repository-only candidate).\n"
+                    # Discoverable, machine-readable reverse effect identity so a
+                    # scanner recognises this as effect-minted (not manual).
+                    f"{EFFECT_CARD_BODY_MARKER} "
+                    f"lane={eff.lane_id} effect={effect_id} head={payload.head_sha}"
                 ),
                 assignee=REVIEW_CARD_ASSIGNEE,
                 parents=(),
@@ -1042,7 +1285,7 @@ def _reconcile_effect_impl(
                 # worker has actually claimed it.
                 initial_status="ready",
                 priority=0,
-                created_by="kanban_effects",
+                created_by=EFFECT_CREATED_BY,
                 workspace_kind="scratch",
                 workspace_path=None,
                 branch_name=None,
@@ -1061,6 +1304,21 @@ def _reconcile_effect_impl(
                 session_id=None,
             )
             created_review = True
+            # Durable reverse typed effect identity for the minted card, so the
+            # scanner/harness can discover which effect + lane + head produced
+            # it even if the body is later edited (R19 detection).
+            kb._append_event(
+                conn,
+                review_task_id,
+                EVENT_REVIEW_CARD_MINTED,
+                {
+                    "effect_id": effect_id,
+                    "lane_id": eff.lane_id,
+                    "repo": payload.repo,
+                    "pr_number": payload.pr_number,
+                    "head_sha": payload.head_sha,
+                },
+            )
 
         # Attach the authoritative review card as the parent of the
         # pre-created downstream QA/Release cards and demote todo/ready to
@@ -1136,10 +1394,16 @@ def reconcile_effect(
 ) -> ReconcileResult:
     """Public reconcile entry point.
 
-    Delegates to :func:`_reconcile_effect_impl` and translates a head drift
-    detected inside the write transaction (``_StaleHeadInsideTxn``) into a
-    scheduled retry, so the caller never sees the internal sentinel and no
-    partial review card is committed on a late head change (R14).
+    Delegates to :func:`_reconcile_effect_impl` and translates a typed in-txn
+    bail (``_ReconcileBail``) — a failed in-lock readiness re-check, a draining
+    old-head review, or a manual/unbound review conflict — into a typed,
+    scheduled-retry disposition. The caller never sees the internal sentinel and
+    no partial review card is ever committed (R14, R19, R20-adjacent).
+
+    On every bail the lane is left unchanged (the write txn rolled back) and the
+    effect is retried after a backoff (or moved to the DLQ once ``max_attempts``
+    is exhausted), so a persistent conflict is durably surfaced rather than
+    silently dropped.
     """
     try:
         return _reconcile_effect_impl(
@@ -1150,18 +1414,25 @@ def reconcile_effect(
             owner=owner,
             lease_ttl_seconds=lease_ttl_seconds,
         )
-    except _StaleHeadInsideTxn:
+    except _ReconcileBail as bail:
         eff = get_effect(conn, effect_id)
         expected_rev = eff.revision if eff else 0
         state = _record_attempt_failure(
             conn,
             effect_id,
-            code=STALE_HEAD,
-            detail="head drifted between lease and reconcile",
+            code=bail.code,
+            detail=bail.detail,
             now=now,
             expected_revision=expected_rev,
         )
-        return ReconcileResult("not_ready", STALE_HEAD, effect_id, detail=state)
+        status = "draining" if isinstance(bail, _DrainingActiveReview) else (
+            "conflict" if isinstance(bail, _ManualReviewConflict) else "not_ready"
+        )
+        # Surface the offending task id in ``detail`` for the conflict/draining
+        # dispositions so the harness can point at it; otherwise carry the
+        # resulting effect state.
+        detail = bail.detail if bail.detail else state
+        return ReconcileResult(status, bail.code, effect_id, detail=detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1271,6 +1542,135 @@ def scan_unbound_review_conflict(
     return findings
 
 
+# ---------------------------------------------------------------------------
+# Manual/unbound review detection + reverse effect identity (R19, blocker 4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EffectCardIdentity:
+    """The reverse typed effect identity of an effect-minted review card,
+    recovered from its durable ``review_card_minted`` event."""
+
+    task_id: str
+    effect_id: str
+    lane_id: str
+    repo: str
+    pr_number: int
+    head_sha: str
+
+
+def effect_identity_of_card(
+    conn: sqlite3.Connection, task_id: Optional[str]
+) -> Optional[EffectCardIdentity]:
+    """Recover a review card's reverse effect identity, or ``None`` if the card
+    was not minted by the effect reconciler.
+
+    Reads the durable ``review_card_minted`` event (authoritative even if the
+    card body was later edited). This is what makes an effect-generated card
+    *discoverable* and distinguishable from a manual one.
+    """
+    if not task_id:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = ? AND payload IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, EVENT_REVIEW_CARD_MINTED),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["payload"] if isinstance(row, sqlite3.Row) else row[0])
+    except (TypeError, ValueError):
+        return None
+    try:
+        return EffectCardIdentity(
+            task_id=task_id,
+            effect_id=str(data["effect_id"]),
+            lane_id=str(data["lane_id"]),
+            repo=str(data["repo"]),
+            pr_number=int(data["pr_number"]),
+            head_sha=str(data["head_sha"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _is_effect_generated_review(conn: sqlite3.Connection, task, body: Optional[str]) -> bool:
+    """True iff a card was produced by the effect reconciler (not manual).
+
+    Belt-and-suspenders across three independent signals: the durable
+    ``created_by`` stamp, the discoverable body marker, and the reverse-identity
+    event. Any one is sufficient — an editor stripping the body still leaves the
+    event and the stamp.
+    """
+    if getattr(task, "created_by", None) == EFFECT_CREATED_BY:
+        return True
+    if body and EFFECT_CARD_BODY_MARKER in body:
+        return True
+    return effect_identity_of_card(conn, getattr(task, "id", None)) is not None
+
+
+def find_unbound_review_cards(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    *,
+    lane_review_task_id: Optional[str] = None,
+) -> list[str]:
+    """Return the ids of *manual / unbound* parentless review cards that refer
+    to ``repo#pr_number`` and were NOT minted by the effect reconciler.
+
+    Used both by the reconciler (to refuse minting a parallel authoritative
+    card while a human's unbound review card exists — typed
+    ``CONFLICT_MANUAL_REVIEW_UNBOUND``) and by the offline scanner. A card is
+    flagged when ALL hold:
+
+    * it looks like a review card (assignee/status ``review`` or "review" in
+      the title),
+    * it is parentless (an unbound root, not already re-parented under an
+      authoritative card),
+    * its title/body references the exact ``repo#pr`` (word-boundary, so
+      ``#42`` never matches ``#420``),
+    * it is not the lane's own bound authoritative card, and
+    * it is not itself effect-generated.
+    """
+    from hermes_cli import kanban_db as kb
+
+    ref = re.compile(re.escape(repo) + "#" + str(int(pr_number)) + r"(?!\d)")
+    like = f"%{repo}#{pr_number}%"
+    rows = conn.execute(
+        "SELECT * FROM tasks "
+        "WHERE status != 'archived' AND (title LIKE ? OR IFNULL(body,'') LIKE ?) "
+        "ORDER BY created_at, id",
+        (like, like),
+    ).fetchall()
+
+    out: list[str] = []
+    for row in rows:
+        task = kb.Task.from_row(row)
+        if lane_review_task_id is not None and task.id == lane_review_task_id:
+            continue
+        title = task.title or ""
+        body = task.body
+        looks_review = (
+            (task.assignee == "review")
+            or (task.status == "review")
+            or ("review" in title.lower())
+        )
+        if not looks_review:
+            continue
+        if not (ref.search(title) or (body and ref.search(body))):
+            continue
+        if kb.parent_ids(conn, task.id):
+            continue  # already bound under some parent — not an unbound root
+        if _is_effect_generated_review(conn, task, body):
+            continue
+        out.append(task.id)
+    return out
+
+
 _LEGACY_REVIEW_HINTS = re.compile(
     r"\b(needs?\s+review|please\s+review|review\s+required|awaiting\s+review|"
     r"ready\s+for\s+review|pr\s+review)\b",
@@ -1305,3 +1705,189 @@ def detect_legacy_review_text(text: Optional[str]) -> LegacyReviewAlert:
         "legacy untyped review request detected — alert only; no review card "
         "is auto-created. Re-emit as a typed review_required effect to bind a lane.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Explicit offline harness CLI (default-off — NOT dispatcher/cron wired)
+# ---------------------------------------------------------------------------
+#
+# This entrypoint exists ONLY to be run by a human/operator or a test against a
+# board that has *already* had ``install_effects_schema`` applied. Nothing wires
+# it into the dispatcher, cron, gateway, plugins, config, or any automatic loop:
+# it must be invoked explicitly (``python -m hermes_cli.kanban_effects scan``)
+# and it performs no network I/O — every GitHub observation is *injected* from a
+# JSON file. On a normal default-off board (no effect tables) it fails loudly.
+
+
+def _observation_from_dict(item: Mapping[str, Any]) -> GithubObservation:
+    rcp = item.get("required_check_policy")
+    return GithubObservation(
+        repo=str(item["repo"]),
+        pr_number=int(item["pr_number"]),
+        head_sha=str(item["head_sha"]),
+        is_open=bool(item["is_open"]),
+        has_conflicts=bool(item.get("has_conflicts", False)),
+        checks=dict(item.get("checks") or {}),
+        required_check_policy=(tuple(rcp) if rcp is not None else None),
+        observed_at=int(item["observed_at"]),
+    )
+
+
+def _load_observer(path: Optional[str]) -> InMemoryGithubObserver:
+    """Build an in-memory observer from a JSON list of injected observations.
+
+    No path → an empty observer (every observe() → ``None`` → OBSERVATION_STALE),
+    which is a legitimate, network-free disposition outcome.
+    """
+    observer = InMemoryGithubObserver()
+    if not path:
+        return observer
+    from pathlib import Path
+
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("--observations must contain a JSON list of observations")
+    for item in data:
+        observer.set(_observation_from_dict(item))
+    return observer
+
+
+def _cmd_scan(args) -> int:
+    from hermes_cli import kanban_db as kb
+
+    now = int(args.now) if args.now is not None else int(time.time())
+    observer = _load_observer(args.observations)
+    dispositions: list[dict] = []
+    with kb.connect_closing() as conn:
+        if not effects_installed(conn):
+            raise EffectsNotInstalledError(
+                "effect schema not installed on this board — run the explicit "
+                "installer first (this feature is default-off)"
+            )
+        due = scan_due_effects(conn, now=now)
+        for eff in due:
+            if args.dry_run:
+                # Report the would-be disposition without leasing/mutating.
+                obs = observer.observe(eff.payload.repo, eff.payload.pr_number)
+                readiness = evaluate_readiness(eff.payload, obs, now=now)
+                dispositions.append(
+                    {
+                        "effect_id": eff.effect_id,
+                        "status": "dry_run",
+                        "code": readiness.code,
+                        "ready": readiness.ready,
+                        "detail": readiness.detail,
+                    }
+                )
+                continue
+            r = reconcile_effect(conn, eff.effect_id, observer, now=now)
+            dispositions.append(
+                {
+                    "effect_id": r.effect_id,
+                    "status": r.status,
+                    "code": r.code,
+                    "review_task_id": r.review_task_id,
+                    "created_review": r.created_review,
+                    "detail": r.detail,
+                }
+            )
+    print(
+        json.dumps(
+            {
+                "action": "scan",
+                "now": now,
+                "dry_run": bool(args.dry_run),
+                "scanned": len(dispositions),
+                "dispositions": dispositions,
+            }
+        )
+    )
+    return 0
+
+
+def _cmd_list(args) -> int:
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing() as conn:
+        if not effects_installed(conn):
+            raise EffectsNotInstalledError(
+                "effect schema not installed on this board (default-off)"
+            )
+        effects = list_effects(conn, state=args.state)
+        rows = [
+            {
+                "effect_id": e.effect_id,
+                "lane_id": e.lane_id,
+                "state": e.state,
+                "attempts": e.attempts,
+                "next_attempt_at": e.next_attempt_at,
+                "target_task_id": e.target_task_id,
+                "last_code": e.last_code,
+            }
+            for e in effects
+        ]
+    print(json.dumps({"action": "list", "count": len(rows), "effects": rows}))
+    return 0
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    """Explicit, default-off offline harness. Returns a process exit code.
+
+    Subcommands:
+      * ``scan``  — reconcile every due effect using injected observations and
+        print a typed per-effect disposition outcome (``reconciled`` /
+        ``not_ready`` / ``draining`` / ``conflict`` / ``stale`` / ``skipped``),
+        or ``--dry-run`` to report the disposition without mutating.
+      * ``list``  — dump effect rows (optionally filtered by ``--state``).
+
+    Never invoked automatically; there is no reconcile loop, timer, or wiring.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="hermes-kanban-effects",
+        description=(
+            "Explicit, default-off offline harness for the repository-only "
+            "review-required effect candidate. Not wired into the dispatcher, "
+            "cron, gateway, plugins, or config. No network I/O."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_scan = sub.add_parser(
+        "scan", help="reconcile due effects using injected observations"
+    )
+    p_scan.add_argument(
+        "--now", type=int, default=None,
+        help="unix seconds to evaluate against (default: wall clock)",
+    )
+    p_scan.add_argument(
+        "--observations", default=None,
+        help="path to a JSON list of injected GitHub observations (no network)",
+    )
+    p_scan.add_argument(
+        "--dry-run", action="store_true",
+        help="report dispositions without leasing or mutating",
+    )
+    p_scan.set_defaults(func=_cmd_scan)
+
+    p_list = sub.add_parser("list", help="list effect rows")
+    p_list.add_argument(
+        "--state", default=None,
+        help="filter by state (pending/leased/done/failed/dlq)",
+    )
+    p_list.set_defaults(func=_cmd_list)
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        return int(args.func(args))
+    except EffectsNotInstalledError as exc:
+        print(
+            json.dumps({"error": "effects_not_installed", "detail": str(exc)}),
+            file=sys.stderr,
+        )
+        return 2
+
+
+if __name__ == "__main__":  # pragma: no cover - explicit manual invocation
+    raise SystemExit(main())

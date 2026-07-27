@@ -29,6 +29,28 @@ review-required Kanban effect candidate; earlier history lives in the git log.
     APPROVE, unbound/manual review conflict, stale running review) and
     alert-only detection of legacy untyped review text (never auto-creates a
     review card).
+  - The authoritative review card is assigned to the valid `review` profile.
+  - A new head never spawns a *parallel* review while the bound old-head review
+    is still active (running/done/review/blocked): the reconciler returns the
+    typed `DRAINING_ACTIVE_REVIEW` disposition and leaves the lane unchanged.
+  - Before minting, the reconciler detects manual/unbound parentless review
+    cards for the same repo/PR and returns typed
+    `CONFLICT_MANUAL_REVIEW_UNBOUND` instead of racing them; every generated
+    card carries a durable, discoverable reverse effect identity (a
+    `review_card_minted` event + `[hermes-review-effect]` body marker +
+    `created_by='kanban_effects'` stamp).
+  - SQLite durability: a *done* effect must have a non-null `target_task_id`
+    (`CHECK`), and at most one *leased* effect exists per lane (partial
+    `UNIQUE` index). `install_effects_schema()` is migration-safe — it rebuilds
+    a pre-remediation table in place without losing rows.
+  - Observation freshness defaults to 60s; before committing, the reconciler
+    re-checks the full readiness predicate (temporal/status/policy/checks/head)
+    against the already-injected observation under the lock — no network, and no
+    `assert` for stale input.
+  - An explicit, default-off `scan`/`list` harness CLI
+    (`python -m hermes_cli.kanban_effects`) reconciles due effects against
+    injected observations and prints typed per-effect dispositions. It is not
+    wired into any dispatcher/cron/loop.
   - See `docs/kanban/review-required-effect.md` for the full design and the
     R01–R21 requirement map.
 

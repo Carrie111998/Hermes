@@ -18,6 +18,9 @@ observer, and uses a plain integer fake clock so no test sleeps.
 """
 from __future__ import annotations
 
+import ast
+import json
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -692,3 +695,345 @@ def test_reconcile_never_holds_txn_during_observation(kanban_home: Path) -> None
         r = kfx.reconcile_effect(conn, eff_id, _AssertObserver(), now=now)
         assert r.status == "reconciled"
         assert observed["in_txn"] is False  # no DB txn held during observation
+
+
+# ---------------------------------------------------------------------------
+# PR #72496 review-blocker remediation regressions
+# ---------------------------------------------------------------------------
+
+
+# --- Blocker 1: REVIEW_CARD_ASSIGNEE must be the valid "review" profile ------
+
+
+def test_review_card_assignee_is_review_profile(kanban_home: Path) -> None:
+    assert kfx.REVIEW_CARD_ASSIGNEE == "review"
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        eff_id = _emit(conn)
+        r = kfx.reconcile_effect(conn, eff_id, _observer(now), now=now)
+        assert kb.get_task(conn, r.review_task_id).assignee == "review"
+
+
+# --- Blocker 2: a new head must not spawn a parallel review while an ---------
+#     existing old-head review is still active/draining (running/done/
+#     review/blocked); leave the lane unchanged.
+
+
+@pytest.mark.parametrize("drain_status", ["running", "done", "review", "blocked"])
+def test_new_head_does_not_spawn_parallel_review_while_active(
+    kanban_home: Path, drain_status: str
+) -> None:
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        # First effect at VALID_HEAD reconciles → authoritative review card.
+        eff_id = _emit(conn)
+        r = kfx.reconcile_effect(conn, eff_id, _observer(now), now=now)
+        old_review = r.review_task_id
+        lane_id = kfx.get_effect(conn, eff_id).lane_id
+
+        # A new implementation handoff moves the PR to a NEW head.
+        tid = _ready_task(conn)
+        kb.complete_task(
+            conn, tid, summary="s", review_required=_payload(head_sha=OTHER_HEAD)
+        )
+        new_eff = next(
+            e.effect_id for e in kfx.list_effects(conn) if e.effect_id != eff_id
+        )
+        _make_all_due(conn)
+        # Put the old-head review into the draining state *after* completion so
+        # the completion's recompute_ready() sweep can't auto-promote a
+        # non-sticky ``blocked`` card back to ``ready`` before the reconcile.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?", (drain_status, old_review)
+            )
+        obs = _observer(now, head_sha=OTHER_HEAD)
+        r2 = kfx.reconcile_effect(conn, new_eff, obs, now=now)
+
+        assert r2.code == kfx.DRAINING_ACTIVE_REVIEW
+        assert r2.created_review is False
+        assert r2.review_task_id is None
+        # Lane left completely unchanged — still bound to the old head + card.
+        lane = kfx.get_lane(conn, lane_id)
+        assert lane.review_task_id == old_review
+        assert lane.head_sha == VALID_HEAD
+        # No second authoritative review card was minted.
+        minted = conn.execute(
+            "SELECT COUNT(*) c FROM task_events WHERE kind='review_card_minted'"
+        ).fetchone()["c"]
+        assert minted == 1
+        # The draining effect is retried, not terminally done.
+        assert kfx.get_effect(conn, new_eff).state == kfx.STATE_PENDING
+
+
+# --- Blocker 3: non-null target on terminal (done) effects + one leased ------
+#     effect per lane, both enforced in SQLite.
+
+
+def test_done_effect_requires_nonnull_target(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        _install(conn)
+        eff_id = _emit(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE kanban_effects SET state='done', target_task_id=NULL "
+                    "WHERE effect_id=?",
+                    (eff_id,),
+                )
+
+
+def test_only_one_leased_effect_per_lane(kanban_home: Path) -> None:
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        # Two distinct-payload effects on the SAME lane.
+        t1 = _ready_task(conn)
+        kb.complete_task(conn, t1, summary="s", review_required=_payload(required_checks=["ci"]))
+        t2 = _ready_task(conn)
+        kb.complete_task(conn, t2, summary="s", review_required=_payload(required_checks=["ci", "lint"]))
+        effs = kfx.list_effects(conn)
+        assert len({e.lane_id for e in effs}) == 1
+        _make_all_due(conn)
+        first = kfx.lease_effect(conn, effs[0].effect_id, owner="w1", now=now)
+        assert first is not None
+        # A second active lease on the same lane must be refused at the DB layer.
+        second = kfx.lease_effect(conn, effs[1].effect_id, owner="w2", now=now)
+        assert second is None
+
+
+def test_installer_migrates_legacy_effects_table(kanban_home: Path) -> None:
+    # A pre-remediation table (no CHECK, no partial unique index) must be
+    # upgraded in place by the installer without losing rows.
+    with kb.connect_closing() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE kanban_effect_lanes (
+                lane_id TEXT PRIMARY KEY, repo TEXT NOT NULL, pr_number INTEGER NOT NULL,
+                kind TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
+                review_task_id TEXT, head_sha TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE (repo, pr_number, kind));
+            CREATE TABLE kanban_effects (
+                effect_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL,
+                source_task_id TEXT NOT NULL, source_transition TEXT NOT NULL,
+                kind TEXT NOT NULL, payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 5,
+                lease_owner TEXT, lease_expires_at INTEGER,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                last_code TEXT, last_error TEXT, target_task_id TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE (source_task_id, lane_id, payload_hash));
+            CREATE TABLE kanban_effect_outbox (
+                effect_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL, kind TEXT NOT NULL,
+                payload_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+            INSERT INTO kanban_effects
+                (effect_id, lane_id, source_task_id, source_transition, kind,
+                 payload_json, payload_hash, revision, state, attempts, max_attempts,
+                 next_attempt_at, created_at, updated_at)
+            VALUES ('eff_legacy','lane_legacy','src','complete','review_required',
+                    '{}','h',0,'pending',0,5,0,0,0);
+            """
+        )
+        # Legacy DB accepts a done effect with a NULL target (no CHECK yet).
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_effects SET state='done', target_task_id=NULL "
+                "WHERE effect_id='eff_legacy'"
+            )
+        # Reset so the migration's own integrity check can pass, then migrate.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_effects SET state='pending' WHERE effect_id='eff_legacy'"
+            )
+        kfx.install_effects_schema(conn)
+        assert kfx.effects_installed(conn)
+        # Row preserved.
+        assert kfx.get_effect(conn, "eff_legacy") is not None
+        # New CHECK now enforced.
+        with pytest.raises(sqlite3.IntegrityError):
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE kanban_effects SET state='done', target_task_id=NULL "
+                    "WHERE effect_id='eff_legacy'"
+                )
+
+
+# --- Blocker 4: detect manual/unbound parentless review cards for the same ---
+#     repo/PR before minting; generated card carries a discoverable, reverse
+#     typed effect identity.
+
+
+def test_manual_unbound_review_blocks_minting(kanban_home: Path) -> None:
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        # A human hand-creates a parentless review card for the same PR.
+        manual = kb.create_task(
+            conn, title="Review acme/widget#42 by hand", assignee="review"
+        )
+        eff_id = _emit(conn)
+        r = kfx.reconcile_effect(conn, eff_id, _observer(now), now=now)
+        assert r.code == kfx.CONFLICT_MANUAL_REVIEW_UNBOUND
+        assert r.created_review is False
+        # No authoritative card was minted; the lane is untouched.
+        lane = kfx.get_lane(conn, kfx.get_effect(conn, eff_id).lane_id)
+        assert lane.review_task_id is None
+        # The finding points at the offending manual card.
+        assert r.detail and manual in r.detail
+        # The manual card was NOT adopted/parented.
+        assert kb.parent_ids(conn, manual) == []
+
+
+def test_generated_card_has_discoverable_effect_identity(kanban_home: Path) -> None:
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        eff_id = _emit(conn)
+        r = kfx.reconcile_effect(conn, eff_id, _observer(now), now=now)
+        ident = kfx.effect_identity_of_card(conn, r.review_task_id)
+        assert ident is not None
+        assert ident.effect_id == eff_id
+        assert ident.lane_id == kfx.get_effect(conn, eff_id).lane_id
+        assert ident.head_sha == VALID_HEAD
+        # Body carries the machine-readable marker too.
+        assert kfx.EFFECT_CARD_BODY_MARKER in (kb.get_task(conn, r.review_task_id).body or "")
+        # The effect-generated card is never mistaken for a manual/unbound one.
+        conflicts = kfx.find_unbound_review_cards(
+            conn, "acme/widget", 42, lane_review_task_id=r.review_task_id
+        )
+        assert conflicts == []
+
+
+# --- Blocker 5: explicit, default-off scanner/harness CLI entrypoint ---------
+#     (not dispatcher-wired) with a scan action + disposition outcome.
+
+
+def test_scanner_cli_scan_emits_dispositions(
+    kanban_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        eff_id = _emit(conn)
+
+    obs_file = tmp_path / "obs.json"
+    obs_file.write_text(
+        json.dumps(
+            [
+                {
+                    "repo": "acme/widget",
+                    "pr_number": 42,
+                    "head_sha": VALID_HEAD,
+                    "is_open": True,
+                    "has_conflicts": False,
+                    "checks": {"ci": "success"},
+                    "required_check_policy": ["ci"],
+                    "observed_at": now,
+                }
+            ]
+        )
+    )
+    rc = kfx.main(["scan", "--now", str(now), "--observations", str(obs_file)])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["action"] == "scan"
+    assert payload["scanned"] == 1
+    disp = payload["dispositions"][0]
+    assert disp["effect_id"] == eff_id
+    assert disp["status"] == "reconciled"
+    assert disp["code"] == kfx.READY
+
+    with kb.connect_closing() as conn:
+        assert kfx.get_effect(conn, eff_id).state == kfx.STATE_DONE
+
+
+def test_scanner_cli_scan_without_observations_reports_stale(
+    kanban_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        _emit(conn)
+    rc = kfx.main(["scan", "--now", str(now)])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    # No observation injected → a typed OBSERVATION_STALE disposition, no card.
+    assert payload["dispositions"][0]["code"] == kfx.OBSERVATION_STALE
+
+
+def test_scanner_cli_refuses_uninstalled_db(
+    kanban_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Default-off: on a normal board with no effect tables the scanner fails
+    # loudly rather than silently reading an empty world.
+    rc = kfx.main(["scan", "--now", "1000"])
+    assert rc != 0
+
+
+# --- Blocker 6: freshness defaults to 60s; in-lock predicate recheck uses ----
+#     the injected observation (no network under lock); no assert on stale
+#     input.
+
+
+def test_freshness_default_is_60_seconds(kanban_home: Path) -> None:
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        eff_id = _emit(conn)
+        # 61s old → stale under the new 60s default (would have passed at 900s).
+        obs = kfx.InMemoryGithubObserver()
+        obs.set(_observation(now, observed_at=now - 61))
+        r = kfx.reconcile_effect(conn, eff_id, obs, now=now)
+        assert r.code == kfx.OBSERVATION_STALE
+        # A not-ready attempt scheduled a backoff; make it due again.
+        _make_all_due(conn)
+        # Exactly 60s old is still fresh → reconciles.
+        obs2 = kfx.InMemoryGithubObserver()
+        obs2.set(_observation(now, observed_at=now - 60))
+        r2 = kfx.reconcile_effect(conn, eff_id, obs2, now=now)
+        assert r2.status == "reconciled"
+
+
+def test_reconcile_impl_uses_no_assert_statements() -> None:
+    # "Ensure no assert used for stale input": the reconcile/readiness path
+    # must gate with real control flow, not assertions (which -O strips).
+    import inspect
+
+    src = inspect.getsource(kfx)
+    tree = ast.parse(src)
+    guarded = {
+        "_reconcile_effect_impl",
+        "reconcile_effect",
+        "evaluate_readiness",
+        "_recheck_ready_locked",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in guarded:
+            for inner in ast.walk(node):
+                assert not isinstance(inner, ast.Assert), (
+                    f"{node.name} must not use assert for control flow"
+                )
+
+
+def test_inlock_recheck_reobserves_predicate_not_network(kanban_home: Path) -> None:
+    # The in-lock recheck must reuse the already-injected observation and must
+    # NOT call the observer again (no network under lock).
+    now = 1000
+    with kb.connect_closing() as conn:
+        _install(conn)
+        eff_id = _emit(conn)
+
+        calls = {"n": 0}
+
+        class _CountingObserver:
+            def observe(self, repo, pr_number):
+                calls["n"] += 1
+                return _observation(now)
+
+        r = kfx.reconcile_effect(conn, eff_id, _CountingObserver(), now=now)
+        assert r.status == "reconciled"
+        assert calls["n"] == 1  # observed exactly once, before the write txn

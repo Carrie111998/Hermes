@@ -43,7 +43,7 @@ So:
 | table | role |
 |---|---|
 | `kanban_effect_lanes` | one lane per `(repo, pr, kind)`; holds the CAS `revision`, the bound `review_task_id`, and the reviewed `head_sha`. `UNIQUE(repo, pr_number, kind)`. |
-| `kanban_effects` | the durable state machine: `state` (pending→leased→done/failed→dlq), `attempts`/`max_attempts`, `lease_owner`/`lease_expires_at`, monotonic `next_attempt_at` backoff, `payload_hash`, CAS `revision`, bound `target_task_id`. `UNIQUE(source_task_id, lane_id, payload_hash)` preserves independent source provenance while deduplicating replay. |
+| `kanban_effects` | the durable state machine: `state` (pending→leased→done/failed→dlq), `attempts`/`max_attempts`, `lease_owner`/`lease_expires_at`, monotonic `next_attempt_at` backoff, `payload_hash`, CAS `revision`, bound `target_task_id`. `UNIQUE(source_task_id, lane_id, payload_hash)` preserves independent source provenance while deduplicating replay. `CHECK (state <> 'done' OR target_task_id IS NOT NULL)` forbids a terminal *done* effect with no bound target; a partial `UNIQUE(lane_id) WHERE state='leased'` allows at most one in-flight reconcile per lane. |
 | `kanban_effect_outbox` | the append-once source record written in the transition txn, keyed by the deterministic `effect_id`. |
 
 ### Canonical identities
@@ -88,21 +88,48 @@ effect in each successful block routing (`blocked`, dependency→`todo`, loop→
 1. **Lease** the effect (own txn, CAS on `revision`).
 2. **Observe** GitHub through the injected `GithubObserver` — strictly
    **outside** any DB transaction (no network under lock).
-3. **Evaluate readiness** (pure): a missing required-check policy returns
-   `NOT_READY(REQUIRED_CHECK_POLICY_MISSING)`; a head mismatch is `STALE_HEAD`;
-   a closed PR / merge conflict / unfinished / failed check are each typed
-   NOT_READY. Not-ready schedules a backoff retry, or moves to the DLQ once
-   `max_attempts` is exhausted.
+3. **Evaluate readiness** (pure): an observation older than the freshness
+   window (**60s** by default) is `OBSERVATION_STALE`; a missing required-check
+   policy returns `NOT_READY(REQUIRED_CHECK_POLICY_MISSING)`; a head mismatch is
+   `STALE_HEAD`; a closed PR / merge conflict / unfinished / failed check are
+   each typed NOT_READY. Not-ready schedules a backoff retry, or moves to the
+   DLQ once `max_attempts` is exhausted.
 4. **One outer write transaction**: re-read the effect payload hash + revision,
-   re-check head freshness, CAS the lane forward, **create or reuse exactly one
-   parentless exact-head review card**, re-parent the pre-created downstream
-   QA/Release cards under it and demote any `todo`/`ready` ones to `todo`, then
-   bind `effect.target_task_id` + `lane.review_task_id` and mark the effect
-   `done`. The transaction-internal `_create_task_locked` / `_link_tasks_locked`
-   helpers compose here with **no nested `BEGIN`**.
+   **re-check the FULL readiness predicate** (temporal/status/policy/checks/exact
+   head) against the already-injected observation — under the lock, with no new
+   network call and no `assert` — CAS the lane forward, **create or reuse
+   exactly one parentless exact-head review card**, re-parent the pre-created
+   downstream QA/Release cards under it and demote any `todo`/`ready` ones to
+   `todo`, then bind `effect.target_task_id` + `lane.review_task_id` and mark
+   the effect `done`. The transaction-internal `_create_task_locked` /
+   `_link_tasks_locked` helpers compose here with **no nested `BEGIN`**.
+
+Before minting a fresh card the reconciler returns a typed disposition and
+leaves the lane unchanged (retried, never silently dropped) when:
+
+* the bound old-head review is still active (running/done/review/blocked) at a
+  different head — `DRAINING_ACTIVE_REVIEW`, so no *parallel* review is spawned;
+* a manual/unbound parentless review card already exists for the same repo/PR —
+  `CONFLICT_MANUAL_REVIEW_UNBOUND`, so a human reconciles it first.
+
+Every effect-minted card carries a durable, discoverable **reverse effect
+identity**: a `review_card_minted` event (`effect_id`/`lane_id`/`head_sha`) plus
+a `[hermes-review-effect]` body marker and a `created_by='kanban_effects'` stamp.
+`find_unbound_review_cards` / `effect_identity_of_card` use these to tell an
+auto-created card apart from a manual one.
 
 The injected observation interface performs **no network I/O**; the offline
 harness and tests use `InMemoryGithubObserver`.
+
+## Offline harness CLI (explicit, default-off)
+
+`python -m hermes_cli.kanban_effects scan [--now N] [--observations FILE]
+[--dry-run]` reconciles every due effect against **injected** observations
+(a JSON list — never the network) and prints a typed per-effect disposition
+(`reconciled` / `not_ready` / `draining` / `conflict` / `stale` / `skipped`).
+`… list [--state S]` dumps effect rows. On a normal default-off board (no effect
+tables) it fails loudly (exit 2). Nothing invokes it automatically — there is no
+reconcile loop, timer, cron, or dispatcher wiring.
 
 ## Downstream containment (alert only)
 
