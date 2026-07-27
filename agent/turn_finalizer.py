@@ -199,15 +199,28 @@ def finalize_turn(
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
 
-    # A crash exit is NOT a completion. conversation_loop.py:6659-6672 handles
-    # both crash paths by writing an apology into final_response and breaking —
-    # without setting ``failed``. (`failed = True` appears exactly once in that
-    # 6698-line loop, at :1582, for an unrelated Ollama branch.) Every
-    # ingredient of the old expression was therefore satisfied on a crash, and
-    # the turn reported completed=True: cron/scheduler.py marked the job "ok"
-    # and delegate_task handed the parent exit_reason="completed" for work that
-    # died mid-way. cron's own comment assumed run_agent set failed=True here;
-    # it never did.
+    # A crash exit is NOT a completion. The two crash paths in
+    # conversation_loop (search: ``local_processing_error(`` /
+    # ``error_near_max_iterations(``) write an apology into final_response and
+    # break WITHOUT setting ``failed``. Every ingredient of the old expression
+    # was therefore satisfied on a crash, and the turn reported completed=True:
+    # cron/scheduler.py marked the job "ok" and delegate_task handed the parent
+    # a completed status for work that died mid-way. cron's own comment assumed
+    # run_agent set failed=True on those paths; it does not.
+    #
+    # Deliberately no line numbers or counts here. This comment previously
+    # said ``failed = True`` "appears exactly once, at :1582, in that
+    # 6698-line loop" — all three facts went stale in a single upstream merge
+    # (now three sites, 6900 lines, crash paths moved ~200 lines). PATCH_LEDGER
+    # asks reviewers to hand-check this region after every merge, and this is
+    # the only recorded rationale for keeping ``not crashed``; a reviewer who
+    # tests a false claim can reasonably conclude the patch is obsolete and
+    # delete it. Verify by the searchable property instead.
+    #
+    # Other ``failed = True`` sites are fine and need no coordination: they set
+    # ``failed``, so the ``not failed`` term already excludes them. Upstream's
+    # ``session_persistence_failed`` exit is one such — it is NOT in
+    # CRASH_EXIT_PREFIXES because it does not need to be.
     #
     # Guardrail halts are deliberately NOT included. That path is a bounded,
     # test-locked stop with its own reporting, and treating it as failure would
