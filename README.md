@@ -105,6 +105,17 @@ uv run charterforge backup --help
 uv run charterforge doctor
 ```
 
+The persistent standalone CEO worker can be supervised independently when the
+charter admits `runtime_host: "standalone"` or `"either"`:
+
+```bash
+uv run charterforge objectives worker
+uv run charterforge objectives worker-status
+```
+
+It stops and records a durable failure/escalation state when authority,
+provider evidence, or runtime readiness is insufficient.
+
 The setup flow must explicitly enable governed operation and establish the
 standing charter. Empty solo-founder toolsets mean the CEO may govern but may
 not launch general-purpose execution. Exact capabilities, systems, toolsets,

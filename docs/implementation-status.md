@@ -24,6 +24,8 @@ acceptance evidence.
 - Founder/CEO organization bootstrap and versioned mandate.
 - Unconfigured operator status exposes a structured, non-mutating first-run
   charter handoff without starting autonomy.
+- Standalone objective-worker launch registers durable worker health and stops
+  fail-closed when the provider/evidence boundary is unavailable.
 - Advisor-by-default authority policy.
 - Exact solo-founder and employee delegation grants.
 - Evidence-based contractor/FTE decision and hierarchical profiles.

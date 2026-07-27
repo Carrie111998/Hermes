@@ -19,6 +19,19 @@ charterforge business bootstrap \
 charterforge business status
 ```
 
+The checked-in example charter admits both supervised gateway and standalone
+worker hosts (`runtime_host: "either"`). To exercise the standalone process
+without a second terminal, run one governed tick after bootstrap:
+
+```bash
+HERMES_HOME="$CHARTERFORGE_HOME" charterforge objectives worker --once
+HERMES_HOME="$CHARTERFORGE_HOME" charterforge objectives worker-status
+```
+
+With no configured model/provider evidence, the worker is expected to record a
+durable `security_blocked` cycle and stop; it must not invent an external
+result or continue retrying without authority.
+
 For a container, mount `/srv/charterforge` as the persistent data volume and
 run the same bootstrap command once before starting the supervised gateway.
 The command writes the charter only after the durable bootstrap succeeds; a
