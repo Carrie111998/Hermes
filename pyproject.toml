@@ -176,6 +176,8 @@ voice = [
   "numpy==2.4.3",
 ]
 honcho = ["honcho-ai==2.2.0"]
+# Postgres authority store — production multi-worker coordiation
+postgres = ["psycopg[binary]==3.2.9"]
 # Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
 # (memory.supermemory / memory.mem0) at first use. Exact pins MUST match the
 # LAZY_DEPS pins (enforced by tests/test_project_metadata.py). Deliberately
