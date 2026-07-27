@@ -40,9 +40,18 @@
   },
   "overrides": {
     "lodash": "4.18.1",
-    "yauzl": "^3.3.1"
+    "yauzl": "^3.3.1",
+    "tar": "^7.5.22",
+    "fast-uri": "^4.1.1",
+    "postcss": "^8.5.23",
+    "shell-quote": "^1.10.0",
+    "brace-expansion": "^5.0.8",
+    "react-router": "$react-router"
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "react-router": "8.3.0"
   }
 }
