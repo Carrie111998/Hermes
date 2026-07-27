@@ -193,7 +193,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`42fd303f13d617759ab48fc0ffef97dada7aad4e` passed 6 Founder/CEO E2E tests, 48
+`c0823e1173584cb09aeb84beb666ae7fbff68a61` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -218,6 +218,8 @@ Fiscal-period closure is organization-bound and passed the accounting
 regression, including cross-tenant closure rejection.
 Approval-artifact validation is organization-bound and passed its focused
 regression, including cross-tenant validation rejection.
+Permit consumption is organization-bound and passed its focused regression,
+including cross-tenant consumption rejection.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,

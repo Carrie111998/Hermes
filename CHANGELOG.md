@@ -270,3 +270,5 @@ recorded.
   the organization executing the governed accounting action.
 - `42fd303f13d617759ab48fc0ffef97dada7aad4e` — bound approval-artifact
   validation to the organization executing the governed action.
+- `c0823e1173584cb09aeb84beb666ae7fbff68a61` — enforced organization binding
+  when consuming execution permits.
