@@ -94,6 +94,8 @@ acceptance evidence.
   amounts, and malformed currencies before settlement is recorded.
 - Payment idempotency retries are bound to the original intent's tenant,
   direction, provider, party, amount, currency, purpose, and action fields.
+- Treasury ledger retries are bound to the original entry parameters before a
+  duplicate idempotency key is accepted.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -169,7 +171,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`1e82c8b137b7830534cd0dbb7e5a144877a8be5c` passed 6 Founder/CEO E2E tests, 48
+`9c2bdd63a3360c222046f5bf490dc7cca620f103` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release

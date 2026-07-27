@@ -224,3 +224,6 @@ recorded.
 - `1e82c8b137b7830534cd0dbb7e5a144877a8be5c` — bound payment idempotency
   retries to the original intent parameters, rejecting amount, party, tenant,
   direction, or purpose drift.
+- `9c2bdd63a3360c222046f5bf490dc7cca620f103` — bound treasury ledger
+  idempotency retries to exact entry parameters, rejecting duplicate-key
+  amount, account, action, or external-reference drift.
