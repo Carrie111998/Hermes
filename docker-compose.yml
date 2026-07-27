@@ -83,7 +83,9 @@ services:
     profiles: ["agentic"]
     image: charterforge
     container_name: charterforge-ceo-worker
-    restart: unless-stopped
+    # A governed stop returns success and must remain stopped. Unexpected
+    # crashes return failure and receive at most five automatic retries.
+    restart: "on-failure:5"
     depends_on:
       - gateway
     volumes:

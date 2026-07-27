@@ -69,6 +69,9 @@ docker compose --profile agentic logs --tail=100 ceo-worker
 The worker and gateway share the same durable state volume. Runtime leases and
 host policy prevent a gateway worker from competing with this supervisor; do
 not run the profile with a charter that selects `runtime_host: "gateway"`.
+The worker uses bounded `on-failure:5` restart semantics: controlled governed
+stops return successfully and remain stopped, while unexpected process crashes
+receive at most five automatic retries before requiring advisor intervention.
 This is a deployment contract, not proof of provider credentials, isolation
 readiness, or production availability.
 

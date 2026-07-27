@@ -202,6 +202,9 @@ acceptance evidence.
   isolation backend or external secret manager, the worker stopped
   `security_blocked` and recorded the exact reason without attempting an
   external action.
+- The standalone Compose worker uses bounded crash retries while preserving
+  successful governed stops, preventing a readiness block from becoming an
+  unbounded container restart loop.
 
 ## Not implemented or not proven
 
