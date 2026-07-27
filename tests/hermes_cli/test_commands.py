@@ -121,6 +121,16 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
+    def test_context_command_registered_with_ctx_alias(self):
+        ctx = resolve_command("context")
+        assert ctx is not None
+        assert ctx.name == "context"
+        assert resolve_command("ctx").name == "context"
+        assert "all" in (ctx.subcommands or ())
+        # Available on both CLI and gateway surfaces
+        assert not ctx.cli_only and not ctx.gateway_only
+        assert "context" in GATEWAY_KNOWN_COMMANDS
+
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
@@ -2258,23 +2268,38 @@ class TestDesktopOnlyCommands:
     leave them out rather than dead-ending on a missing handler.
     """
 
-    def test_context_is_registered_as_desktop_only(self):
-        cmd = resolve_command("context")
+    def test_ctxwindow_is_registered_as_desktop_only(self):
+        cmd = resolve_command("ctxwindow")
         assert cmd is not None
         assert cmd.desktop_only is True
 
     def test_desktop_only_commands_stay_out_of_cli_help(self):
-        assert "/context" not in COMMANDS
+        assert "/ctxwindow" not in COMMANDS
         for commands in COMMANDS_BY_CATEGORY.values():
-            assert "/context" not in commands
+            assert "/ctxwindow" not in commands
 
     def test_desktop_only_commands_are_not_gateway_dispatchable(self):
-        assert "context" not in GATEWAY_KNOWN_COMMANDS
+        assert "ctxwindow" not in GATEWAY_KNOWN_COMMANDS
 
     def test_desktop_only_commands_are_absent_from_gateway_surfaces(self):
-        assert not any("/context" in line for line in gateway_help_lines())
-        assert "context" not in {name for name, _desc in telegram_bot_commands()}
-        assert "context" not in set(slack_subcommand_map())
+        assert not any("/ctxwindow" in line for line in gateway_help_lines())
+        assert "ctxwindow" not in {name for name, _desc in telegram_bot_commands()}
+        assert "ctxwindow" not in set(slack_subcommand_map())
+
+    def test_ctxwindow_does_not_shadow_the_cli_context_command(self):
+        """`/context` is the CLI/gateway context-usage view and must stay intact.
+
+        The desktop context-window dialog is a different feature with a
+        different name, so registering it must not steal `/context`'s name,
+        alias, or its reach into the CLI and gateway surfaces.
+        """
+        usage_view = resolve_command("context")
+        assert usage_view is not None
+        assert usage_view.name == "context"
+        assert usage_view.desktop_only is False
+        assert "/context" in COMMANDS
+        assert "context" in GATEWAY_KNOWN_COMMANDS
+        assert resolve_command("ctx").name == "context"
 
     def test_ordinary_commands_are_unaffected(self):
         """The new flag must not narrow any existing command's reach."""

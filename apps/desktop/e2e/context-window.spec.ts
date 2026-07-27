@@ -1,5 +1,5 @@
 /**
- * E2E coverage for `/context` — the context-window quick access.
+ * E2E coverage for `/ctxwindow` — the context-window quick access.
  *
  * Drives the REAL Electron app against the mock-backend fixture, so the whole
  * chain is exercised: composer keystrokes → slash popover → the dialog →
@@ -106,29 +106,29 @@ async function ensureDialogOpen(): Promise<void> {
     return
   }
 
-  await runSlash('/context')
+  await runSlash('/ctxwindow')
   await expect(dialog()).toBeVisible({ timeout: 20_000 })
 }
 
-test.describe('/context quick access', () => {
-  test('is discoverable in the slash popover when typing /con', async ({}, testInfo) => {
+test.describe('/ctxwindow quick access', () => {
+  test('is discoverable in the slash popover when typing /ctxw', async ({}, testInfo) => {
     const page = fixture!.page
     const composer = page.locator('[contenteditable="true"]').first()
 
     await composer.click()
     await page.keyboard.press('ControlOrMeta+a')
     await page.keyboard.press('Backspace')
-    await composer.type('/con', { delay: 60 })
+    await composer.type('/ctxw', { delay: 60 })
 
     const popover = page.locator('[data-slot="composer-completion-drawer"]')
     await expect(popover).toBeVisible({ timeout: 15_000 })
 
-    await page.screenshot({ path: testInfo.outputPath('slash-popover-con.png') })
+    await page.screenshot({ path: testInfo.outputPath('slash-popover-ctxw.png') })
 
     // "As convenient to switch as /model" means the command has to show up
     // while the user is typing a prefix of it — that's the discoverability
     // half of the acceptance criteria.
-    await expect(popover.locator('button', { hasText: '/context' })).toBeVisible({ timeout: 15_000 })
+    await expect(popover.locator('button', { hasText: '/ctxwindow' })).toBeVisible({ timeout: 15_000 })
 
     await page.keyboard.press('Escape')
     await page.keyboard.press('ControlOrMeta+a')
@@ -140,7 +140,7 @@ test.describe('/context quick access', () => {
 
     expect(hasConfigContextLengthKey(fixture!.sandbox.hermesHome)).toBe(false)
 
-    await runSlash('/context')
+    await runSlash('/ctxwindow')
 
     await expect(dialog()).toBeVisible({ timeout: 20_000 })
     await page.screenshot({ path: testInfo.outputPath('context-dialog-auto.png') })
@@ -192,7 +192,7 @@ test.describe('/context quick access', () => {
   test('reopening reflects the persisted pin with no stale draft', async ({}, testInfo) => {
     const page = fixture!.page
 
-    await runSlash('/context')
+    await runSlash('/ctxwindow')
 
     await expect(dialog()).toBeVisible({ timeout: 20_000 })
 
@@ -222,7 +222,7 @@ test.describe('/context quick access', () => {
       .toBe(false)
 
     // And the UI agrees: reopening shows a blank field on the auto value.
-    await runSlash('/context')
+    await runSlash('/ctxwindow')
     await expect(dialog()).toBeVisible({ timeout: 20_000 })
     await expect(page.locator('#context-window-override')).toHaveValue('', { timeout: 20_000 })
     await expect(dialog()).toContainText(`Auto-detected: ${autoDetectedValue}`)

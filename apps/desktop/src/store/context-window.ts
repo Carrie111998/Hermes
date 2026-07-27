@@ -1,6 +1,6 @@
 import { atom } from 'nanostores'
 
-/** Overlay visibility for the context-window dialog (`/context`). */
+/** Overlay visibility for the context-window dialog (`/ctxwindow`). */
 export const $contextWindowOpen = atom(false)
 
 export function setContextWindowOpen(open: boolean): void {

@@ -121,6 +121,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("status", "Show session, model, token, and context info", "Session"),
     CommandDef("egress", "Show Docker egress proxy status", "Session",
                args_hint="[status]", subcommands=("status",)),
+    CommandDef("context", "Show detailed context window view with usage gauge, category breakdown, compression stats, and throughput", "Session",
+               aliases=("ctx",), args_hint="[all]", subcommands=("all",)),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
@@ -143,7 +145,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # execute when typed but never be discoverable. `cli_only=False` +
     # `desktop_only=True` keeps it out of the CLI/gateway help and dispatch,
     # where no handler exists.
-    CommandDef("context", "View or set the context-window override for the current model",
+    CommandDef("ctxwindow", "View or set the context-window override for the current model",
                "Configuration", desktop_only=True),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
@@ -159,9 +161,15 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status"), aliases=("ts",)),
+    CommandDef("diff", "Show git changes in the working directory", "Info",
+               args_hint="[staged|all|session] [--stat] [path...]",
+               subcommands=("staged", "all", "session")),
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose -> log",
                "Configuration", cli_only=True,
                gateway_config_gate="display.tool_progress_command"),
+    CommandDef("focus", "Toggle focus view — show only your prompt and the final response",
+               "Configuration", cli_only=True, args_hint="[on|off|status]",
+               subcommands=("on", "off", "status")),
     CommandDef("footer", "Toggle gateway runtime-metadata footer on final replies",
                "Configuration", args_hint="[on|off|status]",
                subcommands=("on", "off", "status")),
@@ -206,6 +214,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", cli_only=True, aliases=("generate-pet",), args_hint="[description]"),
     CommandDef("learn", "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
                "Tools & Skills", args_hint="<what to learn from>"),
+    CommandDef("init", "Generate or update AGENTS.md project instructions from a repo scan",
+               "Tools & Skills", args_hint="[notes]"),
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
@@ -1201,7 +1211,15 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress"})
+#   - init: repo-scan AGENTS.md bootstrap — a cwd-centric dev command that is
+#     rare from Slack; reachable as /hermes init. Without this entry, adding
+#     /init clamps /version off the native list and breaks Telegram parity.
+#   - version: low-frequency info command; reachable as /hermes version on
+#     Slack. Demoted when /context claimed a native slot (context is a
+#     recurring inspection surface; version is a one-off lookup).
+#   - diff: git working-tree diff; reached via /hermes diff on Slack so it
+#     doesn't displace an existing native slash at the 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

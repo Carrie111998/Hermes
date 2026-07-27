@@ -134,7 +134,7 @@ export function useSlashCompletions(options: {
       try {
         if (!query) {
           // `surface: 'desktop'` opts this caller into commands the backend
-          // marks desktop-only (`/context`), which the Ink TUI must not list
+          // marks desktop-only (`/ctxwindow`), which the Ink TUI must not list
           // because it has no handler for them.
           const catalog = filterDesktopCommandsCatalog(
             await gateway.request<CommandsCatalogLike>('commands.catalog', { surface: 'desktop' })
@@ -160,8 +160,8 @@ export function useSlashCompletions(options: {
         const result = await gateway.request<{ items?: CompletionEntry[]; replace_from?: number }>('complete.slash', {
           text,
           // Same desktop opt-in as the empty-query catalog above. Without it a
-          // typed prefix (`/con`) misses desktop-only commands entirely, so
-          // `/context` would only be discoverable by opening the bare `/`
+          // typed prefix (`/ctxw`) misses desktop-only commands entirely, so
+          // `/ctxwindow` would only be discoverable by opening the bare `/`
           // list — not "as convenient as /model".
           surface: 'desktop'
         })
