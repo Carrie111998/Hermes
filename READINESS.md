@@ -177,11 +177,13 @@ with:
 python3 -m pytest tests/hermes_cli/test_objective_runtime.py -q
 ```
 
-Result: **26 passed, 0 failed**. The regression raises a deterministic 429-like
+Result: **27 passed, 0 failed**. The regression raises a deterministic 429-like
 planner failure, records `rate_limited:` in the durable inbox error, retries
 after the persisted backoff, and verifies exactly one execution result. This
-is local deterministic provider-boundary evidence; it does not establish live
-LLM credentials, vendor rate-limit behavior, or production availability.
+The same suite also validates numeric `Retry-After` and rate-limit reset header
+parsing. This is local deterministic provider-boundary evidence; it does not
+establish live LLM credentials, vendor rate-limit behavior, or production
+availability.
 
 ## Current-tree install-to-restart acceptance
 
