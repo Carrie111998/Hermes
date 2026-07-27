@@ -302,3 +302,5 @@ recorded.
   transactions during compliance schema checks.
 - `6e955798d2fd3f7844628d7e9b571fb6c3e42c33` — preserved active authority
   transactions during company-email schema checks.
+- `9b21ea30ce7cd579a71ed46fdef77ca6557e3037` — added explicit append-only
+  compliance supersession lineage and current-record selection.
