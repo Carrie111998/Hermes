@@ -3386,13 +3386,60 @@ class WorkflowEngine:
                                             print(f"   ⚠  Failed to create reviewer card: {e}")
                                     break  # One reviewer at a time
                             else:
-                                # No reviews attribute — treat as genuine blocker
-                                state.status = "blocked"
-                                state.error = f"Blocked: {body[:100]}"
-                                results[nid] = "blocked"
-                                print(f"   🚫 {nid} BLOCKED (no reviews) — notifying calling agent")
-                                pending.discard(nid)
-                                self._try_block_notify(workflow, nid, state, body, context)
+                                # No reviews attribute — but check if this node is
+                                # a reviewer for an upstream node.
+                                reviewer_for = None
+                                for upstream_nid, upstream_state in states.items():
+                                    upstream_node = workflow.nodes.get(upstream_nid)
+                                    if upstream_node and nid in upstream_node.reviews:
+                                        reviewer_for = upstream_nid
+                                        break
+                                if reviewer_for:
+                                    # Reviewer blocked with "pending review" — treat
+                                    # as a quality review block.
+                                    upstream_state = states[reviewer_for]
+                                    is_quality_block = self._classify_block_reason(
+                                        nid, body, workflow, context
+                                    )
+                                    if is_quality_block:
+                                        print(f"   📋 {nid} BLOCKED (quality review) — enriching {reviewer_for}")
+                                        if upstream_state.kanban_card_id:
+                                            try:
+                                                with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                                    existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
+                                                    feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
+                                                    new_body = existing_body + feedback
+                                                    conn.execute(
+                                                        "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                                        (new_body, upstream_state.kanban_card_id)
+                                                    )
+                                                    conn.commit()
+                                                upstream_state.status = "ready"
+                                                upstream_state.completed_at = None
+                                                upstream_state.result = None
+                                                print(f"   ↩  {reviewer_for} enriched with review feedback, reset to ready")
+                                            except Exception as e:
+                                                print(f"   ⚠  Failed to enrich upstream card: {e}")
+                                        state.status = "blocked"
+                                        pending.discard(nid)
+                                        if upstream_state.kanban_card_id:
+                                            pending.discard(reviewer_for)
+                                        print(f"   ⏸  {nid} stays blocked — waiting for {reviewer_for} to re-block pending review")
+                                    else:
+                                        state.status = "blocked"
+                                        state.error = f"Reviewer blocked (technical): {body[:100]}"
+                                        results[nid] = "blocked"
+                                        print(f"   🚫 {nid} BLOCKED (technical) — notifying calling agent")
+                                        pending.discard(nid)
+                                        self._try_block_notify(workflow, nid, state, body, context)
+                                else:
+                                    # Genuine blocker — not pending review, not a reviewer
+                                    state.status = "blocked"
+                                    state.error = f"Blocked: {body[:100]}"
+                                    results[nid] = "blocked"
+                                    print(f"   🚫 {nid} BLOCKED (no reviews) — notifying calling agent")
+                                    pending.discard(nid)
+                                    self._try_block_notify(workflow, nid, state, body, context)
                         else:
                             # Not "pending review" — check if this node is a reviewer
                             # for an upstream node (i.e., it blocked with review results)
