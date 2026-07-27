@@ -35,6 +35,14 @@ jobs:
             dist/*.whl
           /tmp/charterforge-artifact-venv/bin/charterforge --version
 
+      - name: Exercise the independent installer against the wheel
+        run: |
+          wheel_path="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          CHARTERFORGE_SOURCE="$wheel_path" \
+            CHARTERFORGE_INSTALL_DIR=/tmp/charterforge-installer-venv \
+            scripts/install-charterforge.sh
+          /tmp/charterforge-installer-venv/bin/charterforge --version
+
       - name: Upload package artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -41,6 +41,9 @@
 - Revocation checks now traverse the parent-grant chain and fail closed when
   any ancestor is revoked or the chain is cyclic, fencing descendant workers
   and result handoffs immediately.
+- The independent package-artifact workflow now exercises
+  `scripts/install-charterforge.sh` against the built wheel in a fresh isolated
+  environment before uploading artifacts.
 - Authority-integrity verification now independently checks parent-grant
   expiry, budget, capabilities, systems, toolsets, skills, and exact resource
   equality, detecting persisted hierarchy expansion or stale parent evidence.
