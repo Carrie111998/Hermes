@@ -167,8 +167,11 @@ recorded.
   durable provider read-back or failed/cancelled settlement evidence.
 - `e5ee81ded0b18b53453fc15570fafce231bdef75` — clarified release evidence,
   coverage scope, and the test-provider boundary.
+- `1bf543e12f7b14bd4d808fbb1438690a594f53e9` — stopped the supervised
+  objective worker on global `recovery_blocked` results so unavailable
+  authority recovery cannot leave the runtime polling for new work.
 - Current-main focused acceptance rerun at baseline
-  `c39942466524736fdd8570e646b4a2406f4a0f5a`: 6 Founder/CEO E2E tests, 43
+  `1bf543e12f7b14bd4d808fbb1438690a594f53e9`: 6 Founder/CEO E2E tests, 44
   objective service/runtime/worker tests, and 18 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
