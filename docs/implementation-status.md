@@ -96,4 +96,8 @@ validation passed 361 focused Python tests, desktop/TUI/web TypeScript
 typechecks, Python compilation, and the implemented `charterforge` help and
 version commands. The independent documentation site prebuild completed, but
 its Docusaurus build was unavailable because the local `docusaurus` executable
-is not installed; no build pass is claimed.
+is not installed; no build pass is claimed. The current governed-runtime
+regression sweep covers 20 focused test files and passed 161 tests, including
+objectives, workers, authority, finance, accounting, payments, compliance,
+approvals, workforce, procurement, metrics, commitments, event ingress,
+billing, and audit lineage.
