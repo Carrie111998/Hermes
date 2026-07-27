@@ -181,9 +181,11 @@ recorded.
   decision basis when resolving stale-intent reaffirmation.
 - `33ca4eae20cd4291381e053de7838b2a107138a3` — rejected future-dated payment
   provider assessments before rail authorization.
+- `d38f119ee35f9f0998f220f2883720f32a1d006c` — rejected provider assessments
+  that were already expired at admission.
 - Current-main focused acceptance rerun at baseline
-  `33ca4eae20cd4291381e053de7838b2a107138a3`: 6 Founder/CEO E2E tests, 47
-  objective service/runtime/worker tests, and 19 finance/attribution tests
+  `d38f119ee35f9f0998f220f2883720f32a1d006c`: 6 Founder/CEO E2E tests, 47
+  objective service/runtime/worker tests, and 20 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
 - The containing documentation/control-boundary commit also adds proposal-time

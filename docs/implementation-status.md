@@ -92,6 +92,8 @@ acceptance evidence.
   non-empty JSON payload cannot refresh stale intent.
 - Payment-provider assessments reject future-dated verification evidence before
   a rail can be authorized.
+- Payment-provider assessments also reject evidence already expired at
+  admission; only currently valid assessments can enter the authorization set.
 - Runtime-host mismatches and charters with no registered action contracts also
   persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted
@@ -150,8 +152,8 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`33ca4eae20cd4291381e053de7838b2a107138a3` passed 6 Founder/CEO E2E tests, 47
-objective service/runtime/worker tests, and 19 finance/attribution tests,
+`d38f119ee35f9f0998f220f2883720f32a1d006c` passed 6 Founder/CEO E2E tests, 47
+objective service/runtime/worker tests, and 20 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
 boundary or broaden the inventory coverage claim.
