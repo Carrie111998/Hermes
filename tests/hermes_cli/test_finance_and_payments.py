@@ -222,6 +222,16 @@ def test_reservations_prevent_oversubscription_and_exact_settlement(treasury):
         currency="USD",
         expires_at=9999999999,
     )
+    with pytest.raises(finance_db.BudgetError, match="different budget reservation"):
+        finance_db.reserve_budget(
+            conn,
+            account_id=account,
+            objective_id="obj_changed",
+            action_id="act_1",
+            amount_minor=8_000,
+            currency="USD",
+            expires_at=9999999999,
+        )
     with pytest.raises(finance_db.BudgetError, match="insufficient"):
         finance_db.reserve_budget(
             conn,

@@ -393,13 +393,19 @@ def reserve_budget(
     try:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT id, amount_minor FROM budget_reservations WHERE action_id = ?",
+            "SELECT * FROM budget_reservations WHERE action_id = ?",
             (action_id,),
         ).fetchone()
         if existing is not None:
-            if int(existing["amount_minor"]) != amount_minor:
+            if (
+                str(existing["account_id"]) != account_id
+                or str(existing["objective_id"]) != objective_id
+                or str(existing["action_id"]) != action_id
+                or int(existing["amount_minor"]) != amount_minor
+                or str(existing["currency"]).upper() != str(currency).upper()
+            ):
                 raise BudgetError(
-                    "action already has a different budget reservation"
+                    "action already has a different budget reservation parameters"
                 )
             conn.commit()
             return str(existing["id"])
