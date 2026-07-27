@@ -13,3 +13,4 @@
 The plane-lint command remains globally red on the repository's existing
 79-item baseline. The relevant acceptance claim is the exhaustive branch/main
 delta above: this change introduces zero findings and zero baseline entries.
+- Final branch-head Linux run `30237839217`: 18 unit passed; 9 jailed E2E passed with 0 skips, including both `PTRACE_ATTACH` and `/proc/1/environ` PID-1 isolation checks. Evidence: `linux-jailed-e2e-final-head.txt`.
