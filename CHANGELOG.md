@@ -39,10 +39,11 @@ not a claim of production autonomous-business readiness.
 
 ### Capability inventory present at the designated boundary
 
-The capability entries below are classified from the commit comparison
-`4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe^..4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe`.
-They were present at the designated release boundary and are part of
-`0.19.0-agentic-foundation`, not Unreleased.
+The immutable release tree at tag `v0.19.0-agentic-foundation` is the
+authoritative source for this included capability inventory. The entries below
+describe capabilities present in that tagged tree and are part of
+`0.19.0-agentic-foundation`, not Unreleased. The commit comparison is used
+only to classify changes introduced after the tagged boundary.
 
 - Added the optional standalone `charterforge-stripe-rail` package for
   idempotent inbound Checkout Sessions, provider read-back verification, and
