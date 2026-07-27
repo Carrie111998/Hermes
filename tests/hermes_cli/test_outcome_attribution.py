@@ -80,7 +80,7 @@ def _verified_action(conn, objective_id: str) -> tuple[str, str]:
     action_id = objectives_db.propose_action(
         conn,
         objective_id=objective_id,
-        plan_id=plan_id,
+            plan_id=plan_id,
         action_type="customer.update",
         payload={"resource": "customer:1", "value": "active"},
         expected_outcome="customer is active",
@@ -119,6 +119,7 @@ def _verified_action(conn, objective_id: str) -> tuple[str, str]:
     verification_id = objectives_db.record_verification(
         conn,
         objective_id=objective_id,
+        organization_id=organization_id,
         plan_id=plan_id,
         action_id=action_id,
         execution_result_id=result_id,

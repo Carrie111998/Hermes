@@ -67,6 +67,9 @@ def _create(conn, organization_id, objective_id, **overrides):
 
 
 def _verification(conn, objective_id, *, method, verdict="pass"):
+    organization_id = conn.execute(
+        "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)
+    ).fetchone()["organization_id"]
     plan_id = db.create_plan(
         conn,
         objective_id,
@@ -79,6 +82,7 @@ def _verification(conn, objective_id, *, method, verdict="pass"):
     return db.record_verification(
         conn,
         objective_id=objective_id,
+        organization_id=organization_id,
         plan_id=plan_id,
         verifier="control:delivery",
         method=method,

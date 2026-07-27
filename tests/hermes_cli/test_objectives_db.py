@@ -52,6 +52,7 @@ def test_objective_completion_is_fail_closed_without_verification(conn):
     odb.record_verification(
         conn,
         objective_id=objective.id,
+        organization_id="__unscoped__",
         plan_id=plan_id,
         verifier="http-readback",
         method="content-hash",
@@ -90,6 +91,7 @@ def test_replan_invalidates_older_passing_verification(conn):
     odb.record_verification(
         conn,
         objective_id=objective.id,
+        organization_id="__unscoped__",
         plan_id=plan_v1,
         verifier="test",
         method="fixture",
@@ -134,6 +136,7 @@ def test_authority_database_rejects_unstructured_self_attestation(conn):
         odb.record_verification(
             conn,
             objective_id=objective.id,
+            organization_id="__unscoped__",
             plan_id=plan_id,
             verifier="model:self",
             method="model says done",
@@ -309,7 +312,7 @@ def test_claim_skips_events_for_terminal_objectives(conn):
     odb.transition_objective(conn, objective.id, "executing", actor="ceo")
     odb.transition_objective(conn, objective.id, "completed", actor="ceo")
     odb.record_verification(
-        conn, objective_id=objective.id, plan_id=plan_id, verifier="test",
+        conn, objective_id=objective.id, organization_id="__unscoped__", plan_id=plan_id, verifier="test",
         method="fixture", verdict="pass",
         evidence=verification_evidence.build(
             observer="test", source_kind="deterministic_check",
@@ -398,7 +401,7 @@ def test_authority_contracts_and_evidence_are_database_immutable(conn):
         started_at=int(time.time()),
     )
     verification_id = odb.record_verification(
-        conn, objective_id=objective.id, plan_id=plan_id, action_id=action_id,
+        conn, objective_id=objective.id, organization_id="__unscoped__", plan_id=plan_id, action_id=action_id,
         execution_result_id=result_id, verifier="crm-reader",
         method="crm.readback", verdict="pass",
         evidence=verification_evidence.build(

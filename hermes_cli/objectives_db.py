@@ -357,7 +357,7 @@ def list_objectives(
     *,
     status: Optional[str] = None,
     include_terminal: bool = False,
-    organization_id: Optional[str] = None,
+    organization_id: str,
 ) -> list[dict[str, Any]]:
     if status is not None and status not in OBJECTIVE_STATUSES:
         raise ValueError(f"unknown objective status: {status}")
@@ -1339,7 +1339,7 @@ def record_verification(
     conn: sqlite3.Connection,
     *,
     objective_id: str,
-    organization_id: Optional[str] = None,
+    organization_id: str,
     plan_id: str,
     verifier: str,
     method: str,
@@ -1361,10 +1361,7 @@ def record_verification(
     objective = conn.execute(
         "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)
     ).fetchone()
-    if objective is None or (
-        organization_id is not None
-        and str(objective["organization_id"]) != organization_id
-    ):
+    if objective is None or str(objective["organization_id"]) != organization_id:
         raise ObjectiveStateError("verification organization does not match objective")
     evidence_json = _json(evidence)
     verification_id = _new_id("verify")

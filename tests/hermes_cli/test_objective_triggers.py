@@ -184,7 +184,7 @@ def test_external_events_do_not_wake_terminal_objectives(company):
     objectives_db.transition_objective(conn, objective_id, "executing", actor="ceo")
     objectives_db.transition_objective(conn, objective_id, "completed", actor="ceo")
     objectives_db.record_verification(
-        conn, objective_id=objective_id, plan_id=plan_id, verifier="test",
+        conn, objective_id=objective_id, organization_id=organization_id, plan_id=plan_id, verifier="test",
         method="fixture", verdict="pass",
         evidence=verification_evidence.build(
             observer="test", source_kind="deterministic_check",
