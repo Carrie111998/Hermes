@@ -4191,6 +4191,67 @@ class TestFormatMessage:
     def test_bold_conversion(self, adapter):
         assert adapter.format_message("**hello**") == "*hello*"
 
+    @pytest.mark.parametrize(
+        ("markdown", "mrkdwn"),
+        [
+            (
+                "小さめのゲノム（約100–200 Mbp）では、"
+                "**5～10個程度のRNA-seqデータセットでも高品質な注釈を作れる可能性**"
+                "がある",
+                "小さめのゲノム（約100–200 Mbp）では、"
+                "\u200b*5～10個程度のRNA-seqデータセットでも高品質な注釈を作れる可能性*"
+                "\u200bがある",
+            ),
+            (
+                "・私は **NaotoGPT**。岩瀬直人が運用している AI チャットボット",
+                "・私は *NaotoGPT*\u200b。岩瀬直人が運用している AI チャットボット",
+            ),
+            (
+                "・実行基盤は **Hermes Agent**（Nous Research）",
+                "・実行基盤は *Hermes Agent*\u200b（Nous Research）",
+            ),
+        ],
+    )
+    def test_bold_delimiters_adjacent_to_cjk_text(self, adapter, markdown, mrkdwn):
+        assert adapter.format_message(markdown) == mrkdwn
+
+    @pytest.mark.parametrize(
+        ("markdown", "mrkdwn"),
+        [
+            ("**行頭**", "*行頭*"),
+            ("**行頭**\n**次行**", "*行頭*\n*次行*"),
+            ("前 **空白** 後", "前 *空白* 後"),
+        ],
+    )
+    def test_bold_boundary_controls_do_not_add_zero_width_spaces(
+        self, adapter, markdown, mrkdwn
+    ):
+        assert adapter.format_message(markdown) == mrkdwn
+        assert "\u200b" not in adapter.format_message(markdown)
+
+    def test_bold_boundary_guards_preserve_protected_regions(self, adapter):
+        markdown = (
+            "`前**code**後` [**link**](https://example.com) "
+            r"\*\*escaped\*\* <@U123>**太字**"
+        )
+        expected = (
+            "`前**code**後` <https://example.com|**link**> "
+            r"\_\_escaped\_\_ <@U123>" "\u200b*太字*"
+        )
+        assert adapter.format_message(markdown) == expected
+
+    @pytest.mark.parametrize(
+        ("markdown", "mrkdwn"),
+        [
+            ("\x00SL999\x00**b**", "\x00SL999\x00\u200b*b*"),
+            ("**b**\x00SL999\x00", "*b*\u200b\x00SL999\x00"),
+        ],
+    )
+    def test_bold_boundary_ignores_unknown_placeholder_like_literals(
+        self, adapter, markdown, mrkdwn
+    ):
+        assert adapter.format_message(markdown) == mrkdwn
+
     def test_italic_asterisk_conversion(self, adapter):
         assert adapter.format_message("*hello*") == "_hello_"
 
@@ -4637,7 +4698,7 @@ class TestEditMessageStreamingPipeline:
         result1 = await adapter.edit_message("C123", "ts1", "**Processing**...")
         assert result1.success is True
         kwargs1 = adapter._app.client.chat_update.call_args.kwargs
-        assert kwargs1["text"] == "*Processing*..."
+        assert kwargs1["text"] == "*Processing*\u200b..."
 
         # Second streaming update — bold + link
         result2 = await adapter.edit_message(

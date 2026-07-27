@@ -3664,6 +3664,8 @@ class SlackAdapter(BasePlatformAdapter):
         )
 
         # 9) Convert bold: **text** → *text* (Slack bold)
+        # Separate converted delimiters from adjacent non-whitespace text so
+        # Slack does not absorb CJK text or full-width punctuation into them.
         # Slack's mrkdwn parser fails to recognize the closing * when it is
         # immediately preceded by non-word characters (e.g. ), ], }, ., :, —).
         # This causes the parser to silently truncate the rest of the message.
@@ -3671,9 +3673,24 @@ class SlackAdapter(BasePlatformAdapter):
         # the closing * whenever the last character is not alphanumeric or _.
         def _convert_bold(m):
             inner = m.group(1)
+            before_char = m.string[m.start() - 1] if m.start() > 0 else ""
+            if before_char == "\x00":
+                adjacent = re.search(r"\x00SL\d+\x00$", m.string[: m.start()])
+                resolved = placeholders.get(adjacent.group(0)) if adjacent else None
+                if resolved is not None:
+                    before_char = resolved[-1:]
+            after_char = m.string[m.end()] if m.end() < len(m.string) else ""
+            if after_char == "\x00":
+                adjacent = re.match(r"\x00SL\d+\x00", m.string[m.end() :])
+                resolved = placeholders.get(adjacent.group(0)) if adjacent else None
+                if resolved is not None:
+                    after_char = resolved[:1]
+
+            before = "\u200b" if before_char and not before_char.isspace() else ""
+            after = "\u200b" if after_char and not after_char.isspace() else ""
             if inner and not (inner[-1].isalnum() or inner[-1] == "_"):
-                return _ph(f"*{inner}\u200b*")
-            return _ph(f"*{inner}*")
+                return _ph(f"{before}*{inner}\u200b*{after}")
+            return _ph(f"{before}*{inner}*{after}")
 
         text = re.sub(
             r"\*\*(.+?)\*\*",
