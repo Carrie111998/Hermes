@@ -14,6 +14,7 @@ from hermes_cli import (
     organization_db,
     workforce_delegation,
 )
+from tools.file_tools import read_file_tool, write_file_tool
 
 
 def _company(tmp_path, monkeypatch):
@@ -228,6 +229,13 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
         system="localhost",
         target_resource="/home/mike/ceofile.txt",
     )
+    # Exercise the actual tool entry points as well as the direct chokepoint.
+    # The allowed read may report a normal filesystem miss in this isolated
+    # test, but it must not report an authorization failure.
+    allowed_read = read_file_tool(
+        "/home/mike/ceofile.txt", task_id=task_id
+    )
+    assert "worker action" not in allowed_read
     with pytest.raises(
         workforce_delegation.DelegationError, match="resource exceeds"
     ):
@@ -236,6 +244,10 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
             system="localhost",
             target_resource="/home/mike/notceofile.txt",
         )
+    blocked_read = read_file_tool(
+        "/home/mike/notceofile.txt", task_id=task_id
+    )
+    assert "resource exceeds" in blocked_read
     with pytest.raises(
         workforce_delegation.DelegationError, match="capability .* not granted"
     ):
@@ -244,6 +256,10 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
             system="localhost",
             target_resource="/home/mike/ceofile.txt",
         )
+    blocked_write = write_file_tool(
+        "/home/mike/ceofile.txt", "must not write", task_id=task_id
+    )
+    assert "not granted" in blocked_write
 
     with pytest.raises(
         workforce_delegation.DelegationError,
