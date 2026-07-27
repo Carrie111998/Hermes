@@ -669,6 +669,19 @@ Result: **14 passed, 0 failed**. The suite now proves that a revoked parent
 grant fences descendant authorization, including worker/result authority
 checks, and that malformed cyclic grant chains fail closed.
 
+Parent-scope integrity verification was additionally validated on current
+`main` commit `37ae658513c83bfaae0baf498425cbc374c99836` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_authority_integrity.py
+```
+
+Result: **20 passed, 0 failed**. The integrity path independently checks
+parent-grant scope, budget, expiry, and revocation instead of trusting child
+records alone.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
