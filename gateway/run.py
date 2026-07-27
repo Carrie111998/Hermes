@@ -15495,6 +15495,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _auto_resume_contextual_reset_enabled() -> bool:
+        """Return the opt-in post-expiry continuation policy."""
+        try:
+            cfg = _load_gateway_config()
+            return bool(
+                ((cfg.get("session_reset") or {}).get(
+                    "auto_resume_previous_if_contextual", False
+                ))
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _looks_like_contextual_reset_followup(text: str) -> bool:
+        """Conservatively detect a message that refers to prior dialogue."""
+        normalized = " ".join(str(text or "").strip().lower().split())
+        if not normalized or normalized.startswith("/"):
+            return False
+        words = normalized.split()
+        if len(words) > 80:
+            return False
+        if re.search(
+            r"\b(?:without (?:relying on|using)|do not (?:rely on|use)|"
+            r"don't (?:rely on|use)|ignore) (?:any )?(?:earlier|previous|prior)\b",
+            normalized,
+        ):
+            return False
+        strong = re.search(
+            r"\b(?:keep going|pick (?:it )?up|where were we|"
+            r"as (?:(?:we|you|i) )?(?:discussed|said)|do that)\b",
+            normalized,
+        )
+        if strong:
+            return True
+        if re.fullmatch(
+            r"(?:(?:please|okay|ok),? |(?:can|could|would) you )?"
+            r"(?:continue|try again|finish (?:it|that|this)|"
+            r"(?:do )?(?:the )?same (?:one|thing))[?.!]?",
+            normalized,
+        ):
+            return True
+        dialogue_reference = re.search(
+            r"\b(?:(?:earlier|previous|prior) "
+            r"(?:discussion|conversation|message|request|answer|session)|"
+            r"(?:discussion|conversation|message|request|answer|session) "
+            r"(?:earlier|previously)|(?:you|i|we) (?:said|discussed|explained) "
+            r"(?:earlier|previously)|what we (?:said|discussed|decided)|"
+            r"the above (?:message|request|answer)|"
+            r"now that (?:i've|i have|we've|we have|you've|you have) "
+            r"explained (?:it|that|this))\b",
+            normalized,
+        )
+        if dialogue_reference:
+            return True
+        return bool(
+            re.fullmatch(
+                r"(?:what about )?(?:it|that|this|these|those|them|"
+                r"that one|this one|those ones|these ones)[?.!]?",
+                normalized,
+            )
+        )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -15538,7 +15601,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        _auto_reset_pending = getattr(
+            session_entry, "was_auto_reset", False
+        )
+        _is_internal_event = bool(
+            getattr(event, "internal", False)
+            or (getattr(event, "metadata", None) or {}).get("gateway_session_id")
+        )
+        _auto_reset_reason = getattr(session_entry, "auto_reset_reason", None)
+        _auto_reset_previous_session_id = getattr(
+            session_entry, "prev_session_id", None
+        )
+        _contextual_auto_resume_enabled = (
+            _auto_reset_pending
+            and self._auto_resume_contextual_reset_enabled()
+        )
+        if (
+            _auto_reset_pending
+            and _is_internal_event
+            and _auto_reset_reason in {"idle", "daily"}
+            and _auto_reset_previous_session_id
+            and _contextual_auto_resume_enabled
+        ):
+            return ""
+        _was_auto_reset = _auto_reset_pending
+        _auto_resumed_previous = False
+        if _was_auto_reset:
+            if (
+                _auto_reset_reason in {"idle", "daily"}
+                and _auto_reset_previous_session_id
+                and _contextual_auto_resume_enabled
+                and (
+                    getattr(event, "reply_to_message_id", None)
+                    or getattr(event, "reply_to_text", None)
+                    or self._looks_like_contextual_reset_followup(event.text)
+                )
+            ):
+                switched = await self.async_session_store.switch_session(
+                    session_key, _auto_reset_previous_session_id
+                )
+                if switched is not None:
+                    session_entry = switched
+                    _auto_resumed_previous = True
+                    _was_auto_reset = False
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
+                        source,
+                        session_entry,
+                        reason="contextual-auto-resume",
+                    )
+                    logger.info(
+                        "contextual auto-resume: restored %s for routing key %s",
+                        _auto_reset_previous_session_id,
+                        session_key,
+                    )
+            if not _auto_resumed_previous:
+                await asyncio.to_thread(
+                    self._sync_telegram_topic_binding,
+                    source,
+                    session_entry,
+                    reason="contextual-auto-reset",
+                )
+        _skip_telegram_topic_recovery = _auto_reset_pending
+        if (
+            not _skip_telegram_topic_recovery
+            and await asyncio.to_thread(self._is_telegram_topic_lane, source)
+        ):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
@@ -15571,7 +15699,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and canonical_session_id != bound_session_id
                     ):
                         bound_session_id = canonical_session_id
-                if bound_session_id and bound_session_id != session_entry.session_id:
+                if (
+                    bound_session_id
+                    and bound_session_id
+                    != getattr(
+                        session_entry, "prev_session_id", None
+                    )
+                    and bound_session_id != session_entry.session_id
+                ):
                     # Route the override through SessionStore so the session_key
                     # → session_id mapping is persisted to disk and the previous
                     # lane session is ended cleanly. Mutating session_entry in
@@ -15598,7 +15733,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
-        _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — clear every
             # conversation-scoped per-session dict in one funnel call so the
@@ -15621,7 +15755,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry.created_at == session_entry.updated_at
             or _was_auto_reset
             or getattr(session_entry, "is_fresh_reset", False)
-        )
+        ) and not _auto_resumed_previous
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
