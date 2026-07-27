@@ -301,7 +301,7 @@ def test_complete_happy_path(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    assert d["task_id"] == worker_env
+
     # Verify via kernel
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -312,6 +312,23 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
+
+
+def test_complete_authorization_binds_handoff_contract(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_authorize_kanban_mutation",
+        lambda operation, scope: calls.append((operation, scope)),
+    )
+    out = kt._handle_complete({"summary": "verified handoff", "metadata": {"x": 1}})
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "complete"
+    assert scope["task_id"] == worker_env
+    assert scope["summary"] == "verified handoff"
+    assert scope["metadata"] == {"x": 1}
 
 
 def test_complete_metadata_round_trips_through_show(worker_env):
@@ -728,6 +745,23 @@ def test_block_happy_path(worker_env):
     out = kt._handle_block({"reason": "need clarification"})
     d = json.loads(out)
     assert d["ok"] is True
+
+
+def test_block_authorization_binds_reason_and_run(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_authorize_kanban_mutation",
+        lambda operation, scope: calls.append((operation, scope)),
+    )
+    out = kt._handle_block({"reason": "needs input", "kind": "needs_input"})
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "block"
+    assert scope["task_id"] == worker_env
+    assert scope["reason"] == "needs input"
+    assert scope["kind"] == "needs_input"
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:

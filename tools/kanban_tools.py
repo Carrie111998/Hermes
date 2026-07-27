@@ -643,6 +643,23 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
+        _authorize_kanban_mutation(
+            "complete",
+            {
+                "operation": "complete",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+                "summary": summary,
+                "result": result,
+                "metadata": metadata,
+                "created_cards": list(created_cards) if created_cards is not None else None,
+                "artifacts": list(artifacts) if artifacts is not None else None,
+                "expected_run_id": _worker_run_id(tid),
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_complete authorization denied: {exc}")
+    try:
         kb, conn = _connect(board=board)
         try:
             # Goal-mode pre-completion judge gate (Issue #38367).
@@ -749,6 +766,20 @@ def _handle_block(args: dict, **kw) -> str:
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
     board = args.get("board")
+    try:
+        _authorize_kanban_mutation(
+            "block",
+            {
+                "operation": "block",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+                "reason": reason,
+                "kind": kind,
+                "expected_run_id": _worker_run_id(tid),
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_block authorization denied: {exc}")
     try:
         kb, conn = _connect(board=board)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
