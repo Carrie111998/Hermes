@@ -23,8 +23,9 @@ Cancellation, expiry, abandonment, and supersession are explicit. Plans are
 immutable versions. Objective completion requires registered success-criteria
 verifiers; generated prose is not completion evidence.
 
-Objectives created by the active Founder/CEO inside the organization's
-standing authority scope transition from `proposed` to `accepted` during the
+Objectives created by the active Founder/CEO using the canonical
+`employee:<active-ceo-id>` identity inside the organization's standing
+authority scope transition from `proposed` to `accepted` during the
 runtime cycle. That transition is recorded as durable lifecycle evidence and
 does not require a routine advisor dispatch. Objectives originating outside
 that CEO authority scope remain proposed and create an evidence-bearing

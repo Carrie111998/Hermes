@@ -212,3 +212,6 @@ recorded.
   objectives now enter the operating portfolio under standing authority
   without requiring a routine advisor dispatch; externally originated
   proposals still require evidence-bearing acceptance.
+- `a497763a54767bc5c577e535e4bfafd531981cd7` — bound automatic objective
+  acceptance to the active CEO's canonical employee identity and organization,
+  preventing a forgeable `employee:ceo` label from granting standing authority.
