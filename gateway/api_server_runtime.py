@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -257,6 +259,80 @@ def _message_text(content: Any) -> str:
             if isinstance(part, dict) and part.get("type") == "text"
         ).strip()
     return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
+_RUNTIME_IMAGE_MIME_TYPES = {
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+_RUNTIME_VIDEO_MIME_TYPES = {
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
+}
+_MAX_RUNTIME_IMAGE_BYTES = 20 << 20
+_MAX_RUNTIME_VIDEO_BYTES = 50 << 20
+_MAX_RUNTIME_ATTACHMENT_BYTES = 64 << 20
+
+
+def _runtime_attachment_parts(attachments: Any) -> list[dict[str, Any]]:
+    if attachments in (None, []):
+        return []
+    if not isinstance(attachments, list) or len(attachments) > 8:
+        raise ValueError("attachments must be an array of at most 8 items")
+    parts: list[dict[str, Any]] = []
+    total_bytes = 0
+    image_count = 0
+    video_count = 0
+    for item in attachments:
+        if not isinstance(item, dict):
+            raise ValueError("attachments must contain only objects")
+        asset_id = str(item.get("asset_id") or "").strip()
+        role = str(item.get("role") or "").strip()
+        filename = str(item.get("filename") or "").strip()
+        media_type = str(item.get("media_type") or "").strip()
+        mime_type = str(item.get("mime_type") or "").strip().lower()
+        encoded = item.get("data")
+        if not asset_id or not role or not filename or not isinstance(encoded, str):
+            raise ValueError("attachment identity, role, filename, and data are required")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("attachment data must be valid base64") from exc
+        total_bytes += len(data)
+        if total_bytes > _MAX_RUNTIME_ATTACHMENT_BYTES:
+            raise ValueError("runtime attachments exceed the 64 MiB total limit")
+        if media_type == "image":
+            if mime_type not in _RUNTIME_IMAGE_MIME_TYPES or not data or len(data) > _MAX_RUNTIME_IMAGE_BYTES:
+                raise ValueError("runtime image attachment is invalid or too large")
+            image_count += 1
+            parts.append({
+                "type": "text",
+                "text": f"[Attached image: {filename}; role={role}; asset_id={asset_id}]",
+            })
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+            })
+            continue
+        if media_type == "video":
+            if mime_type not in _RUNTIME_VIDEO_MIME_TYPES or not data or len(data) > _MAX_RUNTIME_VIDEO_BYTES:
+                raise ValueError("runtime video attachment is invalid or too large")
+            video_count += 1
+            parts.append({
+                "type": "text",
+                "text": (
+                    f"[Attached video: {filename}; role={role}; asset_id={asset_id}. "
+                    "Representative frames from this video follow as image attachments.]"
+                ),
+            })
+            continue
+        raise ValueError("runtime attachment media_type must be image or video")
+    if video_count and not image_count:
+        raise ValueError("video attachments require at least one representative image frame")
+    return parts
 
 
 def _tool_schemas(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -803,6 +879,23 @@ class APIServerRuntimeMixin:
             ]
             if len(normalized_messages) != len(messages):
                 raise ValueError("messages must contain only objects")
+            attachment_parts = _runtime_attachment_parts(body.get("attachments"))
+            if attachment_parts:
+                last_user_index = next(
+                    (
+                        index
+                        for index in range(len(normalized_messages) - 1, -1, -1)
+                        if normalized_messages[index].get("role") == "user"
+                    ),
+                    -1,
+                )
+                if last_user_index < 0:
+                    raise ValueError("attachments require a user message")
+                text = _message_text(normalized_messages[last_user_index].get("content"))
+                normalized_messages[last_user_index]["content"] = [
+                    {"type": "text", "text": text or "[Attached media]"},
+                    *attachment_parts,
+                ]
             if resuming:
                 history = _resume_runtime_history(normalized_messages, runtime_checkpoint, tool_results)
                 user_message = ""
@@ -811,7 +904,7 @@ class APIServerRuntimeMixin:
                 last = normalized_messages[-1]
                 if last.get("role") != "user":
                     raise ValueError("last message must be user")
-                user_message = _message_text(last.get("content"))
+                user_message = last.get("content")
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             return web.json_response({"error": {"code": "invalid_param", "message": str(exc)}}, status=422)
         response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
