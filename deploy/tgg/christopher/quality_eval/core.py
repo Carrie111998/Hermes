@@ -684,7 +684,7 @@ class Judge:
                 argv.append("-")
                 try:
                     result = self.command(
-                        argv, input=prompt, capture_output=True, env=checker_env, timeout=60
+                        argv, input=prompt, capture_output=True, env=checker_env, timeout=120
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise EvalError(f"vision judge timed out: {output_name}") from exc
@@ -896,6 +896,14 @@ def trigger_due(
     return False, "below-threshold-and-window"
 
 
+def sample_bundles(bundles: Sequence[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
+    """Choose a deterministic bounded case sample for one cursor window."""
+    return sorted(
+        bundles,
+        key=lambda bundle: hashlib.sha256(str(bundle["case"]["job_no"]).encode()).hexdigest(),
+    )[:limit]
+
+
 class Evaluator:
     def __init__(
         self,
@@ -973,7 +981,8 @@ class Evaluator:
         self.store.save(state)
         if state.get("registry_hash") != registry.digest:
             self._golden(registry, maker_session_id)
-        bundles, unmapped = make_bundles(snapshot)
+        all_bundles, unmapped = make_bundles(snapshot)
+        bundles = sample_bundles(all_bundles)
         start_cursor = int(state["cursor"])
         run_id = f"cursor-{start_cursor + 1}-{events[-1]['seq']}"
         run_dir = self.store.root / "runs" / run_id
@@ -1140,21 +1149,7 @@ def finalize_external(
         return {"ok": True, "ran": False, "reason": "already-finalized", "cursor": state["cursor"]}
     if int(state.get("cursor", 0)) != cursor_start:
         raise EvalError("local cursor does not match the external batch start")
-    two_pass = raw_judgment.get("two_pass_evidence")
-    if not isinstance(two_pass, dict) or set(two_pass) != {
-        "naive_checker_session_id",
-        "registry_checker_session_id",
-        "naive_registry_exposed",
-    }:
-        raise EvalError("external judgment has no strict two-pass evidence")
-    naive_checker = two_pass["naive_checker_session_id"]
-    registry_checker = two_pass["registry_checker_session_id"]
-    if not all(isinstance(item, str) and item for item in (naive_checker, registry_checker)):
-        raise EvalError("external two-pass checker ids are missing")
-    if naive_checker == registry_checker or maker_session_id in {naive_checker, registry_checker}:
-        raise EvalError("external two-pass checker separation failed")
-    if two_pass["naive_registry_exposed"] is not False:
-        raise EvalError("external naive pass was exposed to the registry")
+    raise EvalError("external finalization is disabled; use the isolated two-pass runner")
     run_id = f"external-{cursor_start + 1}-{cursor_end}"
     evidence_dir = store.root / "runs" / run_id
     evidence_dir.mkdir(parents=True, exist_ok=True)

@@ -89,6 +89,14 @@ def test_registry_has_exact_seed_checks_and_portal_scope():
     assert registry.checks[-1].scope == "portal"
 
 
+def test_case_sampling_is_deterministic_and_bounded():
+    bundles = [{"case": {"job_no": f"JOB-{index:02d}"}} for index in range(15)]
+    first = [item["case"]["job_no"] for item in core.sample_bundles(bundles)]
+    second = [item["case"]["job_no"] for item in core.sample_bundles(list(reversed(bundles)))]
+    assert first == second
+    assert len(first) == 10
+
+
 @pytest.mark.parametrize(
     ("count", "last", "trigger", "expected", "reason"),
     [
@@ -749,7 +757,7 @@ def test_run_cli_emits_top_level_health_metrics(tmp_path, monkeypatch, capsys):
     assert (output["human_caught"], output["loop_caught"]) == (2, 3)
 
 
-def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
+def test_external_finalize_refuses_two_pass_self_attestation(tmp_path):
     batch = snapshot()
     batch.update({"cursor_start": 9, "cursor_end": 11})
     # Root's real collector serializes fields as objects, not JSON strings.
@@ -804,44 +812,9 @@ def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
     filer = FakeFiler()
     store = core.StateStore(tmp_path / "state")
     core.initialize_cursor(store, 9, NOW)
-    result = core.finalize_external(
-        store,
-        batch_path=batch_path,
-        judgment_path=judge_path,
-        artifacts_dir=tmp_path,
-        maker_session_id="maker-1",
-        filer=filer,
-        golden_judge=FakeJudge(),
-        now=NOW,
-    )
-    assert result["committed_cursor"] == 11
-    assert store.load()["cursor"] == 11
-    assert len(filer.calls) == 2
-    assert filer.calls[0]["message_ids"] == ["wa-10"]
-    assert filer.calls[1]["screenshot"].endswith("portal-cases.png")
-    evidence_dir = tmp_path / "state" / "runs" / "external-10-11"
-    assert Path(filer.calls[0]["screenshot"]).parent == evidence_dir
-    assert Path(filer.calls[0]["judgment_path"]) == evidence_dir / "judge-result.json"
-    assert (evidence_dir / "source-batch.json").exists()
-    assert (evidence_dir / "case-7.png").exists()
-    assert (evidence_dir / "portal-cases.png").exists()
-    assert core.finalize_external(
-        store,
-        batch_path=batch_path,
-        judgment_path=judge_path,
-        artifacts_dir=tmp_path,
-        maker_session_id="maker-1",
-        filer=filer,
-        golden_judge=FakeJudge(),
-        now=NOW,
-    )["reason"] == "already-finalized"
-    external["evaluator_session"] = "maker-1"
-    judge_path.write_text(json.dumps(external))
-    fresh_store = core.StateStore(tmp_path / "fresh-state")
-    core.initialize_cursor(fresh_store, 9, NOW)
-    with pytest.raises(core.EvalError, match="equals maker"):
+    with pytest.raises(core.EvalError, match="external finalization is disabled"):
         core.finalize_external(
-            fresh_store,
+            store,
             batch_path=batch_path,
             judgment_path=judge_path,
             artifacts_dir=tmp_path,

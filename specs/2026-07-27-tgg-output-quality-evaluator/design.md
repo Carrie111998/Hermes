@@ -39,7 +39,10 @@ One Studio runner owns a durable local cursor and run ledger.
 
 1. Pull source rows read-only over SSH into a Studio-owned run directory.
 2. Resolve touched cases by intersecting message ids with observation
-   `source_refs`; keep unmapped completed messages visible in coverage.
+   `source_refs`; keep unmapped completed messages visible in coverage. Select
+   a deterministic sample of at most ten touched cases per cursor window so
+   two 120-second-bounded vision passes remain inside the one-hour runner
+   budget.
 3. For each case, save a source bundle containing the raw ingress messages,
    case record, matching observations, and retained media paths.
 4. Log into the public portal through the `tgg-pa-admin` agent-browser auth
