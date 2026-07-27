@@ -1025,8 +1025,11 @@ def test_batch_message_output_truncates_long_tails():
     assert prefix not in text
 
 
-def test_single_completion_zero_latency():
-    """A single completion should not wait the full batch window."""
+def test_single_completion_bounded_latency():
+    """A single completion pays the batching window (up to 100 ms) so
+    coalescing remains correct — true zero-latency singletons would
+    require limiting coalescing to work already available in the same
+    loop tick, which is incompatible with a time-window batch."""
     import time as _time
 
     adapter = SimpleNamespace(handle_message=AsyncMock())
@@ -1042,6 +1045,5 @@ def test_single_completion_zero_latency():
 
     assert result is True
     adapter.handle_message.assert_awaited_once()
-    # A single completion should not take the full batch window (100ms).
-    # Allow generous CI margin.
+    # Bounded batching delay — well under 1 s even on slow CI.
     assert elapsed < 1.0, f"Single completion took {elapsed:.3f}s, expected < 1.0s"

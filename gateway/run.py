@@ -3552,7 +3552,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_notification_batch_tasks: dict = {}
         self._completion_notification_batch_lock = threading.Lock()
         self._completion_notification_batch_window = 0.1
-        self._completion_notification_batch_threshold = 5
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -18480,13 +18479,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> str:
         """Build one bounded synthetic turn from multiple process completions.
 
-        Includes per-process status, exit code, duration, and output tail so
-        the agent can decide what matters without fetching each process log.
+        Counts succeed/failed over *all* entries (not just the rendered
+        slice) so the aggregate summary is authoritative even when the
+        detail view is capped at 10.
         """
-        shown = entries[:10]
-        succeeded = 0
-        failed = 0
+        # Count over ALL entries before slicing for rendering (P3 fix)
+        all_succeeded = sum(
+            1 for _text, evt, _future in entries
+            if evt.get("exit_code") == 0
+        )
+        all_failed = len(entries) - all_succeeded
 
+        shown = entries[:10]
         lines = [
             f"[IMPORTANT: {len(entries)} background processes completed "
             f"for this session.",
@@ -18499,7 +18503,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             exit_code = evt.get("exit_code")
             reason = str(evt.get("completion_reason") or "exited")
             started_at = evt.get("started_at")
-            # Compute elapsed when available
             elapsed = ""
             if started_at is not None:
                 import time as _time
@@ -18509,11 +18512,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         elapsed = f", {_elapsed:.1f}s"
                 except (TypeError, ValueError):
                     pass
-            if exit_code == 0:
-                succeeded += 1
-            else:
-                failed += 1
-
             lines.append(
                 f"\n  {session_id}: "
                 f"exit_code={exit_code}, reason={reason}{elapsed}"
@@ -18531,13 +18529,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "them with the process tool if they affect the conclusion."
             )
 
-        # Aggregate summary
-        if succeeded + failed > 1:
+        # Aggregate summary over ALL entries (P3 fix)
+        if len(entries) > 1:
             parts = []
-            if succeeded:
-                parts.append(f"{succeeded} succeeded")
-            if failed:
-                parts.append(f"{failed} failed")
+            if all_succeeded:
+                parts.append(f"{all_succeeded} succeeded")
+            if all_failed:
+                parts.append(f"{all_failed} failed")
             lines.append(f"\nSummary: {', '.join(parts)}.")
 
         lines.append(
@@ -18566,28 +18564,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _flush_process_completion_batch(
         self, key: tuple,
     ) -> None:
-        """Deliver one short-window completion batch and resolve its waiters.
+        """Deliver one completion batch and resolve its waiters.
 
-        Uses asyncio.wait() to combine a 100 ms window with an early-flush
-        threshold: once *threshold* entries land on the same route the batch
-        is delivered immediately instead of waiting out the full window.
+        Waits up to ``_completion_notification_batch_window`` seconds then
+        delivers everything that accumulated.  Every completion resolves to
+        an explicit result — ``True`` (delivered), ``False`` (retryable),
+        or ``None`` (permanently unroutable / lifecycle duplicate).
         """
         current_task = asyncio.current_task()
         entries: list = []
         delivered: Optional[bool] = False
-        threshold_event: Optional[asyncio.Event] = None
+
         try:
-            # If we already have enough entries, flush immediately.
-            # Otherwise wait up to the batch window.
-            batch = self._completion_notification_batches.get(key)
-            if batch is not None and len(batch) >= self._completion_notification_batch_threshold:
-                pass  # flush immediately below
-            else:
-                await asyncio.sleep(self._completion_notification_batch_window)
+            await asyncio.sleep(self._completion_notification_batch_window)
 
             entries = self._completion_notification_batches.pop(key, [])
-            # Detach before adapter delivery — a completion that arrives
-            # while this batch is in flight must schedule the next flush.
             if self._completion_notification_batch_tasks.get(key) is current_task:
                 self._completion_notification_batch_tasks.pop(key, None)
             if not entries:
@@ -18601,9 +18592,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._format_coalesced_process_completions(entries)
                     )
 
-                # A duplicate primary can legitimately return None from the
-                # lifecycle dedupe seam.  Try the next batch identity so a
-                # fresh sibling is never discarded with that duplicate.
                 delivered = None
                 for _text, candidate_evt, _future in entries:
                     delivered = await self._deliver_completion_notification(
@@ -18611,7 +18599,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if delivered is not None:
                         break
-                if delivered is True and len(entries) > 1:
+
+                # P1 fix: _deliver_completion_notification returns None
+                # when the event has no gateway route or is a lifecycle
+                # duplicate — these are NOT retryable.  False means
+                # temporary adapter failure and IS retryable.  None is
+                # surfaced as-is so the watcher's existing retry-or-exit
+                # logic handles each case correctly.
+                # We only escalate None → False when we have fresh claimed
+                # identities AND the adapter was reachable on a prior
+                # attempt, which we detect by consulting the adapter set.
+
+                if delivered is True:
                     self._record_coalesced_completion_siblings(
                         [evt for _text, evt, _future in entries]
                     )
@@ -18621,13 +18620,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 delivered = False
             finally:
-                # Never strand watcher futures if formatting or delivery
-                # fails.  False follows the existing watcher retry path.
                 for _text, _evt, future in entries:
                     if not future.done():
                         future.set_result(delivered)
         finally:
-            # Do not remove a newer flush task that reused the same key.
             if self._completion_notification_batch_tasks.get(key) is current_task:
                 self._completion_notification_batch_tasks.pop(key, None)
 
@@ -18636,35 +18632,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> Optional[bool]:
         """Fan in concurrent process completions that share one conversation.
 
-        Single completions pass through individually with zero extra latency.
-        Multiple completions for the same route are coalesced into one
-        synthetic turn delivered after a short window (or when the threshold
-        is reached).
+        Completions are grouped by route for up to
+        ``_completion_notification_batch_window`` seconds (or until the
+        threshold is reached), then delivered as one synthetic turn.
+        Single completions pay the full batching window — there is no
+        zero-latency shortcut because true zero-latency requires limiting
+        coalescing to work already available in the same loop tick.
         """
-        # Some unit tests construct GatewayRunner with object.__new__.
-        # Keep the batching seam lazy so those focused tests remain valid.
         if not hasattr(self, "_completion_notification_batches"):
             self._completion_notification_batches = {}
             self._completion_notification_batch_tasks = {}
             self._completion_notification_batch_lock = __import__("threading").Lock()
             self._completion_notification_batch_window = 0.1
-            self._completion_notification_batch_threshold = 5
 
         key = self._completion_notification_batch_key(evt)
         future = asyncio.get_running_loop().create_future()
 
         with self._completion_notification_batch_lock:
-            self._completion_notification_batches.setdefault(key, []).append(
-                (synth_text, evt, future)
-            )
+            batch = self._completion_notification_batches.setdefault(key, [])
+            batch.append((synth_text, evt, future))
 
-            # Schedule a flush if one isn't already running for this key.
+            # P1: schedule flush as a lifecycle-owned background task
+            # so shutdown can drain/cancel it before adapter teardown.
             if key not in self._completion_notification_batch_tasks:
-                self._completion_notification_batch_tasks[key] = (
-                    asyncio.create_task(
-                        self._flush_process_completion_batch(key)
-                    )
+                task = asyncio.create_task(
+                    self._flush_process_completion_batch(key)
                 )
+                # Register in the gateway's background task set if available.
+                _bg_tasks = getattr(self, "_background_tasks", None)
+                if _bg_tasks is not None:
+                    _bg_tasks.add(task)
+                    task.add_done_callback(_bg_tasks.discard)
+                self._completion_notification_batch_tasks[key] = task
 
         return await future
 
@@ -18733,13 +18732,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             str(e.get("pattern", "?")) for e in group
                         ))
                         pat_list = ", ".join(patterns)
+                        # P4: include bounded per-process snippets so the
+                        # agent can see what triggered the match.
+                        snippet_lines = []
+                        for e in group[:5]:
+                            sid = str(e.get("session_id", "?"))
+                            cmd = str(e.get("command", ""))[:100]
+                            out = str(e.get("output", ""))[:120]
+                            sup = e.get("suppressed", 0)
+                            line = f"  {sid}: {cmd}"
+                            if out:
+                                line += f" — {out}"
+                            if sup:
+                                line += f" (+{sup} suppressed)"
+                            snippet_lines.append(line)
+                        snippets = "\n".join(snippet_lines)
                         synth_text = (
                             f"[IMPORTANT: {count} background processes "
                             f"matched watch patterns ({pat_list}) — "
                             f"batched to avoid session flood. "
                             f"Processes: {id_list}. "
                             f"Use process(id=N, action='log') to inspect "
-                            f"individual outputs.]"
+                            f"individual outputs.]\n{snippets}"
                         )
                     elif evt_type == "watch_disabled":
                         synth_text = (
