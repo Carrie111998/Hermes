@@ -17,9 +17,9 @@ import {
   setNewChatWorkspaceTarget
 } from '@/store/session'
 
+import { useBackgroundSync } from '../../contrib/hooks/use-background-sync'
 import type { ClientSessionState } from '../../types'
 
-import { useBackgroundSync } from '../../contrib/hooks/use-background-sync'
 import { useHermesConfig } from './use-hermes-config'
 import { useSessionActions } from './use-session-actions'
 
