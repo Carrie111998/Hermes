@@ -118,11 +118,21 @@ class TestStalenessCheck(unittest.TestCase):
         self.assertIn("modified since you last read", result["_warning"])
 
     @patch("tools.file_tools._get_file_ops")
-    def test_no_warning_when_file_never_read(self, mock_ops):
-        """Writing a file that was never read — no warning."""
+    def test_warns_when_overwriting_an_unread_file_with_content(self, mock_ops):
+        """Blind overwrite of existing content must warn (H-23).
+
+        This test previously asserted the opposite — "writing a file that was
+        never read: no warning" — and the file it writes to exists WITH content,
+        so it codified the defect: the agent replaced a file it had never opened
+        and got a success-shaped result with nothing to indicate the previous
+        content was gone. The specification was wrong, not the implementation.
+
+        Net-new files stay silent; see test_no_warning_for_new_file.
+        """
         mock_ops.return_value = _make_fake_ops()
         result = json.loads(write_file_tool(self._tmpfile, "new content", task_id="t2"))
-        self.assertNotIn("_warning", result)
+        self.assertIn("_warning", result)
+        self.assertIn("never read it", result["_warning"])
 
     @patch("tools.file_tools._get_file_ops")
     def test_no_warning_for_new_file(self, mock_ops):
@@ -138,7 +148,17 @@ class TestStalenessCheck(unittest.TestCase):
 
     @patch("tools.file_tools._get_file_ops")
     def test_different_task_isolated(self, mock_ops):
-        """Task A reads, file changes, Task B writes — no warning for B."""
+        """Task B must not inherit Task A's read record.
+
+        The isolation intent is unchanged and still asserted: B is never told
+        the file was "modified since you last read" — B never read it, so that
+        message would be nonsense.
+
+        B *is* warned, for its own reason: it is overwriting existing content it
+        never opened (H-23). Before that fix this asserted no warning at all,
+        which conflated two different things — correct task isolation, and a
+        blind overwrite going unreported.
+        """
         mock_ops.return_value = _make_fake_ops("original content\n", 18)
         read_file_tool(self._tmpfile, task_id="task_a")
 
@@ -147,7 +167,9 @@ class TestStalenessCheck(unittest.TestCase):
             f.write("changed\n")
 
         result = json.loads(write_file_tool(self._tmpfile, "new", task_id="task_b"))
-        self.assertNotIn("_warning", result)
+        self.assertIn("_warning", result)
+        self.assertIn("never read it", result["_warning"])
+        self.assertNotIn("modified since you last read", result["_warning"])
 
     @patch("tools.file_tools._get_file_ops")
     def test_relative_path_uses_recorded_session_cwd_for_staleness_tracking(self, mock_ops):
