@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Current-tree acceptance contract:
 # install -> bootstrap -> blocked readiness -> satisfy controls -> ready
-# -> bounded CEO worker -> container restart -> durable recovery/idempotency.
+# -> bounded CEO worker -> container restart -> durable recovery/idempotency
+# -> uncertain provider effect -> second restart -> read-back convergence.
 
 artifact_dir="$(mktemp -d)"
 state_dir="$(mktemp -d)"
@@ -28,5 +29,14 @@ docker exec "$container_name" python3 \
 docker restart "$container_name" >/dev/null
 docker exec "$container_name" python3 \
   /opt/hermes/scripts/agentic_acceptance.py recover
+
+# Exercise the harder failure boundary in the same installed image and state
+# volume: the provider effect occurs, the response is lost, and recovery must
+# reconcile by read-back after a real container restart without replaying it.
+docker exec "$container_name" python3 \
+  /opt/hermes/scripts/provider_recovery_acceptance.py interrupt
+docker restart "$container_name" >/dev/null
+docker exec "$container_name" python3 \
+  /opt/hermes/scripts/provider_recovery_acceptance.py recover
 
 echo "current-tree agentic acceptance: PASS"
