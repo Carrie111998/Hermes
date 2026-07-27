@@ -12,6 +12,7 @@ from hermes_cli import (
     objectives_db,
     operational_control,
     organization_db,
+    resource_budget,
 )
 from hermes_cli import objective_adapters as adapters
 from hermes_cli import verification_evidence
@@ -82,6 +83,50 @@ def test_auxiliary_planner_returns_typed_bounded_proposal(monkeypatch):
     )
     assert proposal.actions[0].action_type == "kanban.create_task"
     assert proposal.objective_complete_when_verified is False
+
+
+def test_model_failure_releases_durable_compute_reservation(monkeypatch, tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    organization_id, _ = organization_db.bootstrap_solo_founder(
+        conn,
+        organization_name="Planner Recovery Company",
+        purpose="Do not strand compute budget after a provider failure",
+        profile_name="default",
+        charter={"finance": {"base_currency": "USD"}},
+    )
+    objective = objectives_db.create_objective(
+        conn,
+        organization_id=organization_id,
+        desired_outcome="Recover planner failure",
+        originator="employee:ceo",
+    )
+
+    def fail_call(**kwargs):
+        raise RuntimeError("429 rate limit")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fail_call)
+    planner = adapters.AuxiliaryObjectivePlanner(
+        action_contracts=[],
+        authority_conn=conn,
+        resource_limits=resource_budget.DEFAULT_LIMITS,
+        planner_call_compute_reservation_minor=10,
+    )
+    with pytest.raises(RuntimeError, match="rate limit"):
+        planner.propose(
+            {"id": objective.id},
+            {"event_type": "objective.accepted"},
+        )
+
+    assert resource_budget.compute_reservation_posture(
+        conn, organization_id
+    )["unreconciled_count"] == 0
+    reconciliation = conn.execute(
+        "SELECT status,actual_minor,evidence_json "
+        "FROM planner_compute_reconciliations"
+    ).fetchone()
+    assert reconciliation["status"] == "released"
+    assert reconciliation["actual_minor"] == 0
+    assert "llm_call_failed" in reconciliation["evidence_json"]
 
 
 def test_planner_cannot_invent_action_surface(monkeypatch):

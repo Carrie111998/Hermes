@@ -270,6 +270,7 @@ class AuxiliaryObjectivePlanner:
             "timeout": self.timeout,
         }
         compute_reservation_id = None
+        reservation_reconciled = False
         if self.accounts_resources_pre_call:
             from hermes_cli import resource_budget
 
@@ -297,6 +298,29 @@ class AuxiliaryObjectivePlanner:
             request_record["compute_reservation_id"] = (
                 compute_reservation_id
             )
+
+        def release_failed_reservation(reason: str, model: str | None = None) -> None:
+            """Release a pre-call budget hold when no billable result exists."""
+            nonlocal reservation_reconciled
+            if compute_reservation_id is None or reservation_reconciled:
+                return
+            from hermes_cli import resource_budget
+
+            resource_budget.reconcile_compute_reservation(
+                self.authority_conn,
+                reservation_id=compute_reservation_id,
+                status="released",
+                actual_minor=0,
+                model=model,
+                billing_provider=self.billing_provider or "runtime",
+                provider_reference=None,
+                evidence={
+                    "outcome": "no_billable_model_result",
+                    "reason": reason,
+                },
+            )
+            reservation_reconciled = True
+
         started_at = time.time_ns()
         try:
             response = call_llm(
@@ -307,6 +331,7 @@ class AuxiliaryObjectivePlanner:
             timeout=self.timeout,
             )
         except Exception as exc:
+            release_failed_reservation("llm_call_failed")
             if self.authority_conn is not None:
                 from hermes_cli import planner_inferences
 
@@ -372,9 +397,11 @@ class AuxiliaryObjectivePlanner:
                         "route_declared_in_config": True,
                     },
                 )
+                reservation_reconciled = True
         try:
             raw = response.choices[0].message.content or ""
         except Exception as exc:
+            release_failed_reservation("missing_model_message", str(model) if model else None)
             if self.authority_conn is not None:
                 from hermes_cli import planner_inferences
 
@@ -400,6 +427,7 @@ class AuxiliaryObjectivePlanner:
         try:
             data = _extract_json_object(raw)
         except Exception as exc:
+            release_failed_reservation("invalid_model_json", str(model) if model else None)
             if self.authority_conn is not None:
                 from hermes_cli import planner_inferences
 
@@ -445,67 +473,71 @@ class AuxiliaryObjectivePlanner:
                 finished_at=time.time_ns(),
             )
         actions: list[ActionProposal] = []
-        for item in data.get("actions") or []:
-            if not isinstance(item, dict):
-                raise ValueError("objective planner action must be an object")
-            action_type = str(item.get("action_type", ""))
-            capability = str(item.get("required_capability", ""))
-            method = str(item.get("verification_method", ""))
-            payload = item.get("payload")
-            if action_type not in self.action_types:
-                raise ValueError(f"planner proposed unavailable action type: {action_type}")
-            contract = self.action_contracts[action_type]
-            if capability != contract.required_capability:
-                raise ValueError("planner capability does not match action contract")
-            if method != contract.verification_method:
-                raise ValueError("planner verifier does not match action contract")
-            if (
-                not isinstance(payload, dict)
-                or payload.get("system") != contract.target_system
-            ):
-                raise ValueError("planner system does not match action contract")
-            compensation_contract = item.get("compensation")
-            if compensation_contract is not None:
-                if not isinstance(compensation_contract, dict):
-                    raise ValueError("planner compensation contract must be an object")
-                comp_payload = compensation_contract.get("payload")
-                comp_action_type = str(compensation_contract.get("action_type") or "")
-                if comp_action_type not in self.action_contracts:
-                    raise ValueError("planner proposed unavailable compensation action")
-                comp_contract = self.action_contracts[comp_action_type]
+        try:
+            for item in data.get("actions") or []:
+                if not isinstance(item, dict):
+                    raise ValueError("objective planner action must be an object")
+                action_type = str(item.get("action_type", ""))
+                capability = str(item.get("required_capability", ""))
+                method = str(item.get("verification_method", ""))
+                payload = item.get("payload")
+                if action_type not in self.action_types:
+                    raise ValueError(f"planner proposed unavailable action type: {action_type}")
+                contract = self.action_contracts[action_type]
+                if capability != contract.required_capability:
+                    raise ValueError("planner capability does not match action contract")
+                if method != contract.verification_method:
+                    raise ValueError("planner verifier does not match action contract")
                 if (
-                    compensation_contract.get("required_capability")
-                    != comp_contract.required_capability
+                    not isinstance(payload, dict)
+                    or payload.get("system") != contract.target_system
                 ):
-                    raise ValueError("planner compensation capability mismatch")
-                if (
-                    compensation_contract.get("verification_method")
-                    != comp_contract.verification_method
-                ):
-                    raise ValueError("planner compensation verifier mismatch")
-                if (
-                    not isinstance(comp_payload, dict)
-                    or comp_payload.get("system") != comp_contract.target_system
-                ):
-                    raise ValueError("planner compensation system mismatch")
-            actions.append(
-                ActionProposal(
-                    action_type=action_type,
-                    payload=payload,
-                    expected_outcome=str(item.get("expected_outcome", "")).strip(),
-                    required_capability=capability,
-                    verification_method=method,
-                    risk_class=str(item.get("risk_class", "")).strip(),
-                    reversible=bool(item.get("reversible", False)),
-                    rationale=str(item.get("rationale", "")).strip(),
-                    estimated_cost_minor=item.get("estimated_cost_minor"),
-                    compensation=(
-                        dict(compensation_contract)
-                        if isinstance(compensation_contract, dict)
-                        else None
-                    ),
+                    raise ValueError("planner system does not match action contract")
+                compensation_contract = item.get("compensation")
+                if compensation_contract is not None:
+                    if not isinstance(compensation_contract, dict):
+                        raise ValueError("planner compensation contract must be an object")
+                    comp_payload = compensation_contract.get("payload")
+                    comp_action_type = str(compensation_contract.get("action_type") or "")
+                    if comp_action_type not in self.action_contracts:
+                        raise ValueError("planner proposed unavailable compensation action")
+                    comp_contract = self.action_contracts[comp_action_type]
+                    if (
+                        compensation_contract.get("required_capability")
+                        != comp_contract.required_capability
+                    ):
+                        raise ValueError("planner compensation capability mismatch")
+                    if (
+                        compensation_contract.get("verification_method")
+                        != comp_contract.verification_method
+                    ):
+                        raise ValueError("planner compensation verifier mismatch")
+                    if (
+                        not isinstance(comp_payload, dict)
+                        or comp_payload.get("system") != comp_contract.target_system
+                    ):
+                        raise ValueError("planner compensation system mismatch")
+                actions.append(
+                    ActionProposal(
+                        action_type=action_type,
+                        payload=payload,
+                        expected_outcome=str(item.get("expected_outcome", "")).strip(),
+                        required_capability=capability,
+                        verification_method=method,
+                        risk_class=str(item.get("risk_class", "")).strip(),
+                        reversible=bool(item.get("reversible", False)),
+                        rationale=str(item.get("rationale", "")).strip(),
+                        estimated_cost_minor=item.get("estimated_cost_minor"),
+                        compensation=(
+                            dict(compensation_contract)
+                            if isinstance(compensation_contract, dict)
+                            else None
+                        ),
+                    )
                 )
-            )
+        except Exception:
+            release_failed_reservation("invalid_action_contract", str(model) if model else None)
+            raise
         return PlanProposal(
             assumptions=data.get("assumptions") or [],
             tasks=data.get("tasks") or [],

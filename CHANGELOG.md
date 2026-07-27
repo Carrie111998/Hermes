@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Model-backed planner compute reservations now reconcile as an immutable
+  `released` record when an LLM call, response, JSON parse, or typed action
+  contract fails before any billable result exists. This prevents rate-limit
+  and crash paths from stranding budget holds while preserving the failure
+  inference and durable retry boundary.
 - The provider recovery acceptance now includes a verified tax rule, proving a
   tax-bearing inbound receipt splits revenue and tax liability correctly while
   preserving idempotent settlement.

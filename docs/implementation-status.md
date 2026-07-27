@@ -58,6 +58,10 @@ acceptance evidence.
   `Retry-After`, and rate-limit reset headers, and recover on a later tick
   after authority-store restart without losing the claim or duplicating an
   action.
+- Model-backed planner pre-call compute holds are append-only reconciled as
+  `released` when the provider fails, returns no message, emits invalid JSON,
+  or proposes an invalid typed action. This prevents failed inference retries
+  from accumulating unreconciled budget reservations.
 - Fail-closed worker cycle reasons are retained in `last_error` for operator
   diagnosis instead of being reduced to a status-only signal.
 - Security-readiness blocks now create deduplicated, organization-scoped

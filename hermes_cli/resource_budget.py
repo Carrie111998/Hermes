@@ -503,7 +503,7 @@ def reconcile_compute_reservation(
     evidence: Mapping[str, Any],
 ) -> str:
     """Append independently evidenced settlement for one compute reservation."""
-    if status not in {"included", "provider_confirmed"}:
+    if status not in {"included", "provider_confirmed", "released"}:
         raise ValueError("compute reconciliation status is invalid")
     if actual_minor < 0:
         raise ValueError("actual compute cost cannot be negative")
@@ -518,7 +518,7 @@ def reconcile_compute_reservation(
         raise ResourceBudgetError(
             "actual compute cost exceeds conservative reservation"
         )
-    if status == "included" and actual_minor != 0:
+    if status in {"included", "released"} and actual_minor != 0:
         raise ValueError("included compute must reconcile at zero cost")
     if not billing_provider:
         raise ValueError(

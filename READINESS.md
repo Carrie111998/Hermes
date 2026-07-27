@@ -185,6 +185,18 @@ verifies exactly one execution result. The same suite also validates numeric
 provider-boundary evidence; it does not establish live LLM credentials, vendor
 rate-limit behavior, or production availability.
 
+Model-backed planner budget recovery was separately validated on current
+`main` with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_objective_adapters.py -q
+```
+
+Result: **18 passed, 0 failed**. A simulated LLM rate-limit exception now
+produces an immutable `released` compute reconciliation with zero billable
+cost, leaving no unreconciled reservation for a later retry. This is local
+failure-path evidence; it does not establish live provider billing accuracy.
+
 ## Current-tree install-to-restart acceptance
 
 The current main branch has a separate, broader acceptance scenario. It is not
