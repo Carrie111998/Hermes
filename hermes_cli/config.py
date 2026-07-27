@@ -2772,6 +2772,10 @@ DEFAULT_CONFIG = {
         "mode": "smart",
         "timeout": 300,
         "cron_mode": "deny",
+        # Interactive Discord views (exec approval, slash confirmation,
+        # update prompt, and clarify choices) use this separate timeout.
+        # The adapter clamps it to Discord's supported 30–900s range.
+        "discord_prompt_timeout": 300,
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
         # SYSTEM prompt (trusted channel) as additional rules — e.g.

@@ -496,6 +496,25 @@ class TestSchemaValidation:
         assert "✓ Set" in out
         assert "not a recognized config key" in out
 
+    def test_discord_prompt_timeout_is_a_recognized_integer_key(
+        self, _isolated_hermes_home, capsys
+    ):
+        """The Discord adapter's supported timeout must be in the CLI schema."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["approvals"]["discord_prompt_timeout"] == 300
+
+        set_config_value("approvals.discord_prompt_timeout", "120")
+
+        out = capsys.readouterr().out
+        assert "✓ Set approvals.discord_prompt_timeout = 120" in out
+        assert "not a recognized config key" not in out
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["approvals"]["discord_prompt_timeout"] == 120
+        assert isinstance(saved["approvals"]["discord_prompt_timeout"], int)
+
     def test_platforms_container_is_accepted(self, _isolated_hermes_home, capsys):
         """``platforms.<name>.<field>`` is a valid current shape: gateway/
         config.py resolves a top-level ``platforms`` map in addition to the
