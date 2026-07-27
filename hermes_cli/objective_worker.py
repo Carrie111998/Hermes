@@ -298,6 +298,35 @@ def worker_health(
     return result
 
 
+def reconcile_stale_workers(
+    conn: sqlite3.Connection,
+    *,
+    stale_after_seconds: int = 60,
+) -> list[str]:
+    """Persistently stop workers whose heartbeat lease has expired."""
+    if stale_after_seconds <= 0:
+        raise ValueError("stale worker threshold must be positive")
+    ensure_schema(conn)
+    cutoff = int(time.time()) - stale_after_seconds
+    rows = conn.execute(
+        "SELECT id FROM objective_workers "
+        "WHERE status='running' AND heartbeat_at<? ORDER BY id",
+        (cutoff,),
+    ).fetchall()
+    if not rows:
+        return []
+    now = int(time.time())
+    worker_ids = [str(row["id"]) for row in rows]
+    with conn:
+        conn.executemany(
+            "UPDATE objective_workers SET status='stale', heartbeat_at=?, "
+            "stopped_at=?, stop_reason='heartbeat_stale' "
+            "WHERE id=? AND status='running'",
+            [(now, now, worker_id) for worker_id in worker_ids],
+        )
+    return worker_ids
+
+
 def run_forever(
     *,
     db_path: Optional[Path] = None,
@@ -360,6 +389,10 @@ def run_forever(
         "runtime_drift_blocked",
     }
     with objectives_db.connect_closing(db_path) as conn:
+        reconcile_stale_workers(
+            conn,
+            stale_after_seconds=max(60, int(interval_seconds * 3)),
+        )
         worker_id = register_worker(conn)
         try:
             with WorkerHeartbeatKeeper(conn, worker_id):

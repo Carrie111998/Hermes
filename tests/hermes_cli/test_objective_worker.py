@@ -21,6 +21,22 @@ def test_worker_schema_read_preserves_active_transaction(tmp_path):
     conn.rollback()
 
 
+def test_stale_worker_reconciliation_persists_stop_state(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    worker_id = objective_worker.register_worker(conn, worker_id="stale-worker")
+    conn.execute(
+        "UPDATE objective_workers SET heartbeat_at=1 WHERE id=?", (worker_id,)
+    )
+    conn.commit()
+    assert objective_worker.reconcile_stale_workers(conn, stale_after_seconds=10) == [
+        worker_id
+    ]
+    row = conn.execute(
+        "SELECT status,stop_reason FROM objective_workers WHERE id=?", (worker_id,)
+    ).fetchone()
+    assert tuple(row) == ("stale", "heartbeat_stale")
+
+
 def test_supervised_worker_persists_cycle_and_graceful_stop(tmp_path):
     path = tmp_path / "authority.db"
     calls = []

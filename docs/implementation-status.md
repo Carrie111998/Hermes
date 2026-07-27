@@ -47,6 +47,8 @@
   invoking provider side effects.
 - Standalone objective workers fail closed and stop durably when autonomy is
   disabled or runtime/security/integrity gates block execution.
+- Supervisor startup reconciles expired worker heartbeats into durable `stale`
+  stop states instead of leaving dead workers marked `running`.
 - Optional fail-closed runtime drift detection with immutable human-accepted
   baselines for the charter, authority schema, Python runtime, and dependency
   lock/package identity.
