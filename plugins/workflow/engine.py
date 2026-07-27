@@ -3427,6 +3427,9 @@ class WorkflowEngine:
                                         if upstream_state.kanban_card_id:
                                             pending.discard(reviewer_for)
                                         print(f"   ⏸  {nid} stays blocked — waiting for {reviewer_for} to re-block pending review")
+                                        # Go back to layer 0 so the review
+                                        # waiting loop can re-engage.
+                                        layer_idx = 0
                                     else:
                                         state.status = "blocked"
                                         state.error = f"Reviewer blocked (technical): {body[:100]}"
