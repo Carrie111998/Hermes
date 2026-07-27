@@ -1,0 +1,114 @@
+{
+  "packet_schema": "review_readiness_packet.v7",
+  "generated_at": "2026-07-27T15:52:47Z",
+  "original_request_ref": "STATE: Sol re-review after needs_changes on SOL-FD-001..005; accepted finding IDs: SOL-AC2-LOCK-SCOPE, SOL-AC2-TICK-ERROR-SURFACE; GATE: adversarial-review L2; WORKTREE: flash-dispatch-sol-repair-v1",
+  "risk_tier": "L2",
+  "l2_trigger_ids": [
+    "multi_or_unknown_blast_radius"
+  ],
+  "re_review_of": {
+    "prior_packet": "review_readiness_packet.v6.json",
+    "prior_sol_decision": "needs_changes",
+    "prior_delegation_id": "deleg_fd20833f",
+    "accepted_finding_ids": [
+      "SOL-AC2-LOCK-SCOPE",
+      "SOL-AC2-TICK-ERROR-SURFACE"
+    ]
+  },
+  "objective": "Repair only the two Sol-accepted AC-2 findings: (1) reconcile tick-recording guarantee with lock-loser no-DB-write contract; (2) surface tick_error on production CLI dispatch output. Do not expand scope.",
+  "deliverable": "Commit 6a73143 plus this v7 packet; Sol re-reviews only accepted finding IDs and directly affected contracts.",
+  "acceptance_criteria": {
+    "AC-R1": {
+      "description": "SOL-AC2-LOCK-SCOPE: docs/contracts state tick recording applies only to lock-acquired passes; lock losers return skipped_locked with zero dispatcher_ticks rows; focused lock regression proves no tick INSERT.",
+      "criterion_evidence_refs": ["E-1", "E-2", "E-3"],
+      "criterion_negative_path_refs": ["N-R1"]
+    },
+    "AC-R2": {
+      "description": "SOL-AC2-TICK-ERROR-SURFACE: CLI JSON includes tick_error and skipped_locked; human output prints non-null tick_error; _finalize_tick sets tick_error when record fails without durable row.",
+      "criterion_evidence_refs": ["E-1", "E-2", "E-3"],
+      "criterion_negative_path_refs": ["N-R2"]
+    },
+    "AC-R3": {
+      "description": "Prior green suites still pass under scripts/run_tests.sh (no regression outside accepted findings).",
+      "criterion_evidence_refs": ["E-1"],
+      "criterion_negative_path_refs": []
+    }
+  },
+  "non_goals": [
+    "Live activation, merge, deploy, publication",
+    "Re-litigating AC-3/AC-4/AC-1 non_findings from first Sol pass",
+    "Changing single-writer lock semantics to force loser DB writes"
+  ],
+  "artifact_refs": {
+    "hermes_cli/kanban_db.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/hermes_cli/kanban_db.py",
+      "sha256": "2f8310268d8fd78eaba790cd8e3a5f7276f55d98c4dbb1d0a2f020727efec7d0",
+      "head_commit": "6a7314367f477860767fd25faff0c36b1da158fe"
+    },
+    "hermes_cli/kanban.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/hermes_cli/kanban.py",
+      "sha256": "03ddbe8ddc1f92c57df608a88e62df1ec50c7399a56209ca8270e7fa0b6effde",
+      "head_commit": "6a7314367f477860767fd25faff0c36b1da158fe"
+    },
+    "tests/hermes_cli/test_kanban_dispatch_lock.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_dispatch_lock.py",
+      "sha256": "63db1a85e6d8ba893f32c3b88ecca7a8d569720591b46ce0a5afa8f52557e65d",
+      "head_commit": "6a7314367f477860767fd25faff0c36b1da158fe"
+    },
+    "tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py",
+      "sha256": "dd29c00c217c44be263485d978860d1b81801b96c719e390d921d95c475752d9",
+      "head_commit": "6a7314367f477860767fd25faff0c36b1da158fe"
+    }
+  },
+  "evidence_refs": {
+    "E-1": {
+      "command": "bash scripts/run_tests.sh tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_core_functionality.py -q",
+      "executed_at": "2026-07-27T15:52:47Z",
+      "exit_code": 0,
+      "result": "538 tests passed, 0 failed (includes lock + CLI tick_error regressions)",
+      "freshness": "post 6a73143 repair"
+    },
+    "E-2": {
+      "command": "git show --stat 6a73143",
+      "executed_at": "2026-07-27T15:52:47Z",
+      "exit_code": 0,
+      "result": "fix(routing): scope tick guarantee + surface tick_error on CLI (Sol AC-2); 4 files, +102/-7",
+      "freshness": "repair commit"
+    },
+    "E-3": {
+      "command": "sha256sum hermes_cli/kanban_db.py hermes_cli/kanban.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py",
+      "executed_at": "2026-07-27T15:52:47Z",
+      "exit_code": 0,
+      "result": "digests in artifact_refs",
+      "freshness": "current workspace"
+    }
+  },
+  "criterion_evidence_refs": {
+    "AC-R1": ["E-1", "E-2", "E-3"],
+    "AC-R2": ["E-1", "E-2", "E-3"],
+    "AC-R3": ["E-1"]
+  },
+  "criterion_negative_path_refs": {
+    "N-R1": "test_held_lock_skips_the_tick_without_writes asserts skipped_locked and COUNT(dispatcher_ticks)=0 while lock held.",
+    "N-R2": "test_finalize_tick_sets_tick_error_on_record_failure forces _record_dispatcher_tick raise; CLI JSON/human tests assert tick_error is visible without claiming healthy silence."
+  },
+  "attack_surface_menu": [
+    "lock-loser no-write vs tick durability contract",
+    "operator-visible tick write failure",
+    "regression of prior AC-3/AC-4 non_findings (out of re-review scope unless directly broken)"
+  ],
+  "coverage_gaps": [
+    "Gateway embedded dispatcher log path does not newly print tick_error (CLI + asdict dashboard path covered; gateway only logs spawn counts).",
+    "No live dual-dispatcher production soak."
+  ],
+  "field_presence_check": {
+    "status": "PASS",
+    "checked_at": "2026-07-27T15:52:47Z",
+    "missing_fields": [],
+    "unresolvable_refs": [],
+    "digest_check": "PASS",
+    "freshness_check": "PASS",
+    "note": "Re-review packet scoped to accepted Sol finding IDs only."
+  }
+}
