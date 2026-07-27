@@ -78,6 +78,26 @@ def test_unreact_does_not_require_emoji():
     assert adapter.calls == [("remove", "+15551234567", None)]
 
 
+def test_reaction_authorization_is_bound_to_resolved_payload():
+    adapter = _FakePhotonAdapter()
+    with patch("gateway.run._gateway_runner_ref", lambda: _runner_with(adapter)), \
+         patch("tools.send_message_tool._authorize_message_action") as auth:
+        result = _call(
+            {"action": "react", "target": "photon:+15551234567", "emoji": "👍"}
+        )
+    assert result["success"] is True
+    auth.assert_called_once_with(
+        "message.react",
+        {
+            "operation": "react",
+            "platform": "photon",
+            "chat_id": "+15551234567",
+            "message_id": None,
+            "emoji": "👍",
+        },
+    )
+
+
 def test_react_unsupported_platform_adapter():
     adapter = _NoReactionAdapter()
     with patch("gateway.run._gateway_runner_ref", lambda: _runner_with(adapter)):

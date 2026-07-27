@@ -90,3 +90,34 @@ def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
         force_document=False,
     )
 
+
+def test_send_message_authorization_is_bound_to_exact_resolved_payload() -> None:
+    ntfy_platform = Platform("ntfy")
+    ntfy_cfg = SimpleNamespace(enabled=True, token=None, extra={"topic": "in"})
+    config = SimpleNamespace(
+        platforms={ntfy_platform: ntfy_cfg},
+        get_home_channel=lambda _platform: None,
+    )
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.interrupt.is_interrupted", return_value=False), \
+         patch("model_tools._run_async", side_effect=_run_async_immediately), \
+         patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+         patch("tools.send_message_tool._authorize_message_action") as auth:
+        result = json.loads(send_message_tool({
+            "action": "send", "target": "ntfy:in", "message": "exact body",
+        }))
+
+    assert result["success"] is True
+    auth.assert_called_once_with(
+        "message.send",
+        {
+            "operation": "send",
+            "platform": "ntfy",
+            "chat_id": "in",
+            "thread_id": None,
+            "message": "exact body",
+            "media_files": [],
+            "force_document": False,
+        },
+    )

@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,20 @@ from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
+
+
+def _authorize_message_action(capability: str, scope: dict) -> None:
+    """Require a permit bound to the exact outbound message action."""
+    resource = "message-action:" + hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    authorize_worker_action(
+        capability=capability,
+        system=scope["platform"],
+        target_resource=resource,
+    )
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
@@ -283,13 +298,7 @@ def _handle_react(args, remove=False):
             else "'target' is required when action='unreact'"
         )
 
-    from hermes_cli.workforce_delegation import authorize_worker_action
     platform_name = target.split(":", 1)[0].strip().lower()
-    authorize_worker_action(
-        capability="message.react",
-        system=platform_name,
-        target_resource=target,
-    )
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
@@ -326,6 +335,20 @@ def _handle_react(args, remove=False):
                 f"Use '{platform_name}:chat_id'."
             )
         chat_id = home.chat_id
+
+    try:
+        _authorize_message_action(
+            "message.unreact" if remove else "message.react",
+            {
+                "operation": "unreact" if remove else "react",
+                "platform": platform_name,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "emoji": None if remove else emoji,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"Reaction authorization denied: {exc}")
 
     runner = None
     try:
@@ -370,13 +393,7 @@ def _handle_send(args):
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
-    from hermes_cli.workforce_delegation import authorize_worker_action
     platform_name = target.split(":", 1)[0].strip().lower()
-    authorize_worker_action(
-        capability="message.send",
-        system=platform_name,
-        target_resource=target,
-    )
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
@@ -500,6 +517,22 @@ def _handle_send(args):
             if _resolve_err:
                 return json.dumps(_resolve_err)
             chat_id = _resolved
+
+    try:
+        _authorize_message_action(
+            "message.send",
+            {
+                "operation": "send",
+                "platform": platform_name,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "message": cleaned_message,
+                "media_files": media_files,
+                "force_document": force_document_attachments,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"Message authorization denied: {exc}")
 
     try:
         from model_tools import _run_async
