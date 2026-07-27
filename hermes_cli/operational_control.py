@@ -584,6 +584,13 @@ def resolve_intervention(
         from hermes_cli import objectives_db
 
         objective_id = str(row["objective_id"] or "")
+        decision_basis = str(
+            evidence.get("reason") or evidence.get("decision_basis") or ""
+        ).strip()
+        if len(decision_basis) < 8:
+            raise ValueError(
+                "objective reaffirmation requires a substantive decision basis"
+            )
         objective = objectives_db.reaffirm_objective(
             conn,
             objective_id,

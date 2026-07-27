@@ -1085,6 +1085,14 @@ def test_stale_objective_intent_blocks_until_reaffirmed(tmp_path):
     assert db.get_objective(conn, objective.id).status == "blocked"
     handoff = operational_control.list_interventions(conn)[0]
     assert handoff["category"] == "objective_reaffirmation_required"
+    with pytest.raises(ValueError, match="substantive decision basis"):
+        operational_control.resolve_intervention(
+            conn,
+            handoff["id"],
+            option_id="reaffirm",
+            actor="human:advisor",
+            evidence={"reason": "ok"},
+        )
     operational_control.resolve_intervention(
         conn,
         handoff["id"],
