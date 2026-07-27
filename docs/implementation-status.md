@@ -106,6 +106,8 @@ acceptance evidence.
   fingerprints; unbound legacy relationships fail closed on replay.
 - FTE/contractor hiring decision retries carry an immutable request fingerprint
   over the organization, staffing case, policy, and evaluator identity.
+- Budget reservation retries are bound to the original account, objective,
+  action, amount, and currency before an existing spend authorization is reused.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -181,7 +183,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`0e22898814e8b2d61345e6c1088031a0856d6481` passed 6 Founder/CEO E2E tests, 48
+`c9a151ab9ec3588336aecd0ff99ccc1d773bb3fc` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -192,6 +194,7 @@ It also passed the procurement decision replay regression: 8 tests.
 It also passed the metered usage and billing regression: 8 tests.
 It also passed the objective portfolio relationship regression: 7 tests.
 It also passed the hiring policy regression: 13 tests.
+It also passed the finance reservation regression: 21 tests.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,

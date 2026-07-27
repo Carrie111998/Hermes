@@ -242,3 +242,6 @@ recorded.
 - `0e22898814e8b2d61345e6c1088031a0856d6481` — bound FTE/contractor hiring
   decision retries to the original organization, staffing case, policy, and
   evaluator identity, rejecting idempotency-key drift.
+- `c9a151ab9ec3588336aecd0ff99ccc1d773bb3fc` — bound budget reservation
+  retries to the original account, objective, action, amount, and currency,
+  rejecting rebinding of an existing spend authorization.
