@@ -834,6 +834,22 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    expected_run_id = _worker_run_id(tid)
+    try:
+        _authorize_kanban_mutation(
+            "heartbeat",
+            {
+                "operation": "heartbeat",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+                "note": note,
+                "claim_lock": claim_lock,
+                "expected_run_id": expected_run_id,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_heartbeat authorization denied: {exc}")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -842,14 +858,13 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             # (see _default_spawn in kanban_db.py); falling back to the
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
             kb.heartbeat_claim(conn, tid, claimer=claim_lock)
 
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
             )
             if not ok:
                 return tool_error(

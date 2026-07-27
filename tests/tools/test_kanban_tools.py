@@ -864,6 +864,23 @@ def test_heartbeat_happy_path(worker_env):
     assert d["ok"] is True
 
 
+def test_heartbeat_authorization_binds_lease_context(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_authorize_kanban_mutation",
+        lambda operation, scope: calls.append((operation, scope)),
+    )
+    out = kt._handle_heartbeat({"note": "progress"})
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "heartbeat"
+    assert scope["task_id"] == worker_env
+    assert scope["note"] == "progress"
+    assert scope["board"] == "default"
+
+
 def test_heartbeat_without_note(worker_env):
     """note is optional."""
     from tools import kanban_tools as kt
