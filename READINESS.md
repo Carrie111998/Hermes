@@ -274,6 +274,17 @@ This proves the local authenticated-ingress contract; it does not establish a
 live webhook provider, production signature key management, or public network
 availability.
 
+At current-main commit `281fcab7a6`, the acceptance added an explicit durable
+replanning assertion. Its run reported:
+
+```text
+{"phase": "run", "objective": "verified", "effects": 1, "scheduled_events": 1, "plan_versions": 2}
+```
+
+The `plan_versions: 2` result demonstrates that the scheduled event generated
+a new persisted plan version before verification; it is not merely a second
+call against an in-memory plan.
+
 Current-main workforce coordination evidence at commit `d44d0ad47f` was run
 with:
 

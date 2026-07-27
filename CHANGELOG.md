@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The current-tree acceptance now asserts that event-driven CEO progress creates
+  at least two durable plan versions, proving replanning rather than repeated
+  execution of one in-memory plan.
 - The current-tree acceptance now admits its initial objective through an
   authenticated, freshness-checked external event subscription with durable
   idempotent routing before CEO execution begins.
