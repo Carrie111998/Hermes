@@ -28,6 +28,7 @@ these paths see no behavioural change.
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import inspect
 import json
@@ -40,7 +41,7 @@ import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.context_engine import (
     automatic_compaction_status_message,
@@ -282,6 +283,154 @@ class CompressionCommitFence:
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
         self._lock.release()
+
+
+# Defaults for the in-agent (non-hygiene) progress-aware compress_context wrap.
+# Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
+DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
+DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+
+
+def resolve_context_compression_timeouts(
+    compression_cfg: Optional[dict] = None,
+) -> Tuple[float, float]:
+    """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
+
+    ``idle_timeout_seconds <= 0`` disables the owned progress-aware wrapper.
+    The ceiling is clamped to at least one idle window when the idle budget
+    is positive, matching gateway hygiene semantics.
+    """
+    idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
+    ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    cfg = compression_cfg
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            raw = load_config()
+            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
+            cfg = maybe if isinstance(maybe, dict) else {}
+        except Exception:
+            cfg = {}
+    if isinstance(cfg, dict):
+        raw_idle = cfg.get("context_timeout_seconds")
+        if raw_idle is not None:
+            try:
+                parsed = float(raw_idle)
+                # Explicit 0/negative disables; positive values win.
+                idle = parsed
+            except (TypeError, ValueError):
+                pass
+        raw_ceiling = cfg.get("context_total_ceiling_seconds")
+        if raw_ceiling is not None:
+            try:
+                parsed = float(raw_ceiling)
+                if parsed > 0:
+                    ceiling = parsed
+            except (TypeError, ValueError):
+                pass
+    if idle > 0:
+        ceiling = max(ceiling, idle)
+    return idle, ceiling
+
+
+def run_compress_context_with_progress_timeout(
+    *,
+    worker: Callable[[CompressionCommitFence], Tuple[list, str]],
+    messages: list,
+    system_prompt_fallback: str,
+    idle_timeout_seconds: float,
+    total_ceiling_seconds: float,
+    on_timeout: Optional[Callable[[float, float, float], None]] = None,
+) -> Tuple[list, str]:
+    """Run ``worker(fence)`` under a sync progress-aware timeout.
+
+    The idle budget is inactivity-based (same idea as gateway session hygiene):
+    streamed summary progress via :meth:`CompressionCommitFence.touch_progress`
+    extends the wait. A hard ceiling still bounds a degenerate trickle stream.
+
+    When cancellation wins before the commit boundary, returns
+    ``(messages, system_prompt_fallback)`` immediately and leaves the worker
+    thread detached — the fence prevents a late commit from mutating session
+    state. When the worker already entered the commit boundary, waits for that
+    commit to finish and returns its result.
+    """
+    if idle_timeout_seconds <= 0:
+        raise ValueError(
+            "run_compress_context_with_progress_timeout requires "
+            "idle_timeout_seconds > 0; call compress_context directly to disable"
+        )
+
+    fence = CompressionCommitFence()
+    ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
+    idle = float(idle_timeout_seconds)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="compress-ctx-timeout",
+    )
+    future = executor.submit(worker, fence)
+    wait_started = time.monotonic()
+    try:
+        while True:
+            waited = time.monotonic() - wait_started
+            remaining_ceiling = ceiling - waited
+            if remaining_ceiling <= 0:
+                break
+            wait_slice = min(idle, remaining_ceiling)
+            try:
+                result = future.result(timeout=wait_slice)
+                executor.shutdown(wait=False)
+                return result
+            except concurrent.futures.TimeoutError:
+                waited = time.monotonic() - wait_started
+                since_progress = fence.seconds_since_progress()
+                if since_progress < idle and waited < ceiling:
+                    logger.info(
+                        "Context compression still streaming after %.0fs "
+                        "(last progress %.1fs ago) — extending wait "
+                        "(ceiling %.0fs)",
+                        waited,
+                        since_progress,
+                        ceiling,
+                    )
+                    continue
+                break
+
+        cancelled: Optional[bool] = None
+        while cancelled is None:
+            cancelled = fence.try_cancel_before_commit()
+            if cancelled is None:
+                time.sleep(0.001)
+        if not cancelled:
+            result = future.result()
+            executor.shutdown(wait=False)
+            return result
+
+        waited = time.monotonic() - wait_started
+        since_progress = fence.seconds_since_progress()
+        if on_timeout is not None:
+            try:
+                on_timeout(idle, waited, since_progress)
+            except Exception:
+                logger.debug(
+                    "compress_context timeout callback failed",
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                "Context compression made no progress for %.1fs "
+                "(total wait %.1fs, ceiling %.1fs); continuing without "
+                "compression",
+                since_progress,
+                waited,
+                ceiling,
+            )
+        # Detach the worker: fence cancel won, so a late commit cannot land.
+        executor.shutdown(wait=False)
+        return messages, system_prompt_fallback
+    except BaseException:
+        executor.shutdown(wait=False)
+        raise
 
 
 def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
