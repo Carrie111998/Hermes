@@ -45,6 +45,7 @@ import { useComposerUrlDialog } from './hooks/use-composer-url-dialog'
 import { useComposerVoice } from './hooks/use-composer-voice'
 import { useSlashCompletions } from './hooks/use-slash-completions'
 import { useSessionStatusPresence } from './hooks/use-status-presence'
+import { saveQueuedEditFromEditor } from './queue-edit-save'
 import { QueuePanel } from './queue-panel'
 import {
   composerPlainText,
@@ -353,6 +354,13 @@ export function ChatBar({
       flushEditorToDraft(editor)
     })
   }
+
+  const handleQueuedEditSave = () =>
+    saveQueuedEditFromEditor({
+      editor: editorRef.current,
+      exitQueuedEdit,
+      flushEditorToDraft
+    })
 
   useEffect(
     () => () => {
@@ -1092,7 +1100,7 @@ export function ChatBar({
                       </Button>
                       <Button
                         className="h-6 rounded-md px-2 text-[0.68rem]"
-                        onClick={() => exitQueuedEdit('save')}
+                        onClick={handleQueuedEditSave}
                         type="button"
                       >
                         {t.common.save}
