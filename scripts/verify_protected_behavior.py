@@ -98,6 +98,13 @@ def _unfix_crash_completion(src: str) -> str:
     return _sub(src, "        and not _crashed" + chr(10), "")
 
 
+def _unscrub_steer_markers(src: str) -> str:
+    """Upstream drops the scrub; forged operator authority returns."""
+    return _sub(src,
+                "    wrapped = _scrub_steer_markers(_maybe_wrap_untrusted(name, content))",
+                "    wrapped = _maybe_wrap_untrusted(name, content)")
+
+
 SCENARIOS: List[Scenario] = [
     Scenario("drop-user_message-kwarg",
              "upstream refactors the hook call; feedback-gate silently stops firing",
@@ -129,6 +136,9 @@ SCENARIOS: List[Scenario] = [
     Scenario("unfix-crash-completion",
              "merge drops the crash exclusion; cron marks crashed jobs ok again",
              REPO / "agent" / "turn_finalizer.py", _unfix_crash_completion),
+    Scenario("unscrub-steer-markers",
+             "merge drops the scrub; tool output can forge operator authority again",
+             REPO / "agent" / "tool_dispatch_helpers.py", _unscrub_steer_markers),
 ]
 
 
