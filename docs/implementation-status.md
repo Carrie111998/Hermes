@@ -13,7 +13,8 @@
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
 - Optional fail-closed runtime drift detection with immutable human-accepted
-  baselines for the charter, authority schema, and Python runtime.
+  baselines for the charter, authority schema, Python runtime, and dependency
+  lock/package identity.
 - Canonical Charterforge Python distribution/namespace/CLI plus migration
   aliases.
 

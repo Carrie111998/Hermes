@@ -11,7 +11,7 @@ def _charter(**security):
     }
 
 
-def test_human_baseline_is_stable_and_detects_charter_drift(tmp_path):
+def test_human_baseline_is_stable_and_detects_charter_drift(tmp_path, monkeypatch):
     conn = objectives_db.connect(tmp_path / "authority.db")
     charter = _charter()
     baseline_id = runtime_drift.accept_baseline(
@@ -40,6 +40,20 @@ def test_human_baseline_is_stable_and_detects_charter_drift(tmp_path):
     )
     assert drifted.status == "drifted"
     assert "charter" in drifted.differences
+
+    monkeypatch.setattr(
+        runtime_drift,
+        "_deployment_fingerprint",
+        lambda: {"package": "hermes-agent", "version": "tampered", "manifests": {}},
+    )
+    package_drift = runtime_drift.check(
+        conn,
+        organization_id="org_1",
+        charter=charter,
+        require_baseline=True,
+    )
+    assert package_drift.status == "drifted"
+    assert "deployment" in package_drift.differences
 
 
 def test_rebaseline_requires_human_reason_and_does_not_mutate_history(tmp_path):
@@ -96,4 +110,3 @@ def test_required_missing_baseline_pauses_autonomy_and_escalates(tmp_path):
     assert operational_control.autonomy_state(conn)["mode"] == "paused"
     interventions = operational_control.list_interventions(conn)
     assert interventions[0]["category"] == "runtime_drift_detected"
-

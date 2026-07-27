@@ -9,12 +9,14 @@ is paused until a human explicitly accepts a new baseline.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import platform
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from hermes_cli.audit_redaction import sanitize
@@ -84,6 +86,21 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> list[dict[str, str]]:
     ]
 
 
+def _deployment_fingerprint() -> dict[str, Any]:
+    """Capture package identity and lock manifests without reading secrets."""
+    root = Path(__file__).resolve().parents[1]
+    manifests: dict[str, str] = {}
+    for name in ("pyproject.toml", "uv.lock", "requirements.txt"):
+        path = root / name
+        if path.is_file():
+            manifests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    try:
+        version = importlib.metadata.version("hermes-agent")
+    except importlib.metadata.PackageNotFoundError:
+        version = "source-checkout"
+    return {"package": "hermes-agent", "version": version, "manifests": manifests}
+
+
 def fingerprint(
     conn: sqlite3.Connection,
     *,
@@ -104,6 +121,7 @@ def fingerprint(
         "charter": safe_charter,
         "schema": _schema_fingerprint(conn),
         "python": platform.python_version(),
+        "deployment": _deployment_fingerprint(),
     }
     value["sha256"] = _sha256(_canonical(value))
     return value
@@ -178,7 +196,9 @@ def check(
     expected_unsigned = dict(expected)
     expected_unsigned.pop("sha256", None)
     differences = tuple(
-        key for key in ("charter", "schema", "python", "organization_id")
+        key for key in (
+            "charter", "schema", "python", "deployment", "organization_id"
+        )
         if expected.get(key) != current.get(key)
     )
     if expected.get("sha256") != _sha256(_canonical(expected_unsigned)):
