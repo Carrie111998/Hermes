@@ -5,6 +5,8 @@
 - Persistent governed objective/event runtime and explicit lifecycle state.
 - Permit issuance is bound to the current immutable plan version; superseded
   actions cannot regain execution authority.
+- Permit consumption rejects permits whose policy version is stale for the
+  active runtime.
 - Founder/CEO organization bootstrap and versioned mandate.
 - Advisor-by-default authority policy.
 - Exact solo-founder and employee delegation grants.

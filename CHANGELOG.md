@@ -41,6 +41,8 @@ Hermes Agent history remains available in Git.
 - External objective-event routing now rejects evidence without an adapter
   validation marker.
 - Permit issuance now rejects actions from superseded plan versions.
+- Permit consumption now rejects unexpired permits issued under a stale policy
+  version.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.

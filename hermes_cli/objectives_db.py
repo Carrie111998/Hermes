@@ -1041,6 +1041,7 @@ def consume_permit(
     action_id: str,
     payload: Mapping[str, Any],
     executor: str,
+    current_policy_version: Optional[str] = None,
 ) -> None:
     with conn:
         permit = conn.execute("SELECT * FROM permits WHERE id = ?", (permit_id,)).fetchone()
@@ -1056,6 +1057,11 @@ def consume_permit(
             raise PermitError("permit has expired")
         if permit["issued_to"] != executor:
             raise PermitError("permit was issued to a different executor")
+        if (
+            current_policy_version is not None
+            and str(permit["policy_version"]) != str(current_policy_version)
+        ):
+            raise PermitError("permit policy version is stale")
         if permit["payload_sha256"] != payload_sha256(payload):
             raise PermitError("execution payload does not match permitted payload")
         updated = conn.execute(

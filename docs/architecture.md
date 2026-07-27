@@ -20,6 +20,8 @@ engine, executor, verifier, or ledger.
 Permits are bound to the current immutable plan version. Replanning makes
 older proposed actions ineligible for new permits, so stale authority cannot
 be revived after the CEO has changed course.
+Permit consumption also checks the active runtime policy version; changing
+policy invalidates unconsumed permits issued under the prior version.
 
 ## Runtime components
 

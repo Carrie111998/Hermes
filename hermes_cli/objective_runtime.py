@@ -648,6 +648,7 @@ class ObjectiveRuntime:
                             action_id=action_id,
                             payload=action.payload,
                             executor=self.executor.identity,
+                            current_policy_version=self.policy_version,
                         )
                         permit = self.conn.execute(
                             "SELECT * FROM permits WHERE id=?",
@@ -1472,6 +1473,7 @@ class ObjectiveRuntime:
                         action_id=action_id,
                         payload=action.payload,
                         executor=self.executor.identity,
+                        current_policy_version=self.policy_version,
                     )
                     execute_governed = getattr(
                         self.executor, "execute_governed", None
