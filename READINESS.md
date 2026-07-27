@@ -381,6 +381,33 @@ evidence, not a jurisdiction-wide tax determination or filing authorization.
 
 Image ID: `sha256:ee59306e2257eb3e2a4267d5146dfa996bba75d36a78d4a51a7b580d4875d278`.
 
+## Latest current-tree acceptance record
+
+The complete acceptance command was rerun from commit `d1cd322ffa` on
+2026-07-27 with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result:
+
+```text
+{"phase": "prepare", "initial_readiness": "blocked"}
+{"phase": "prepare", "ready": true, "runtime_active": false}
+{"phase": "run", "objective": "verified", "effects": 1, "scheduled_events": 1, "plan_versions": 2}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}
+{"phase": "stop", "autonomy": "paused", "generation": 2, "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+The resulting local image manifest was
+`sha256:2c0a6169eade11f87005dd89e4482dfa77e213ba16366c04a167b5c6d0a8f73d`.
+This is deterministic local-provider evidence; production providers,
+high-availability deployment, and legal/compliance readiness remain open.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

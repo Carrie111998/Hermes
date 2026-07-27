@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reran the complete current-tree install-to-master-stop acceptance on the
+  current branch, including scheduled replanning, uncertain provider
+  read-back, inbound tax-bearing settlement, and durable autonomy revocation;
+  the deterministic local-provider boundary passed with zero duplicate effects.
 - Interrupted idempotent action recovery now has an explicit authority-store
   restart regression: after a worker crash with an uncertain provider effect,
   a fresh runtime connection resumes reconciliation without replanning or

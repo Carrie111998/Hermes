@@ -182,3 +182,28 @@ provider recovery acceptance: PASS
 Image ID: `sha256:ee59306e2257eb3e2a4267d5146dfa996bba75d36a78d4a51a7b580d4875d278`.
 This is a deterministic local provider boundary, not live payment-provider
 evidence.
+
+## Latest acceptance record
+
+The complete current-tree acceptance was rerun from commit
+`d1cd322ffa985582aa48ec7cd844b77bbe3d4659` on 2026-07-27 with:
+
+```bash
+scripts/run_agentic_acceptance.sh
+```
+
+It passed install, blocked-to-ready bootstrap, scheduled CEO progress,
+replanning, normal restart recovery, uncertain outbound provider read-back,
+inbound receivable settlement with tax liability, and durable master stop:
+
+```text
+{"phase": "run", "objective": "verified", "effects": 1, "scheduled_events": 1, "plan_versions": 2}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}
+{"phase": "stop", "autonomy": "paused", "generation": 2, "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+The local image manifest was
+`sha256:2c0a6169eade11f87005dd89e4482dfa77e213ba16366c04a167b5c6d0a8f73d`.
+The providers remain deterministic local test adapters; this is not live
+payment, email, or production deployment evidence.
