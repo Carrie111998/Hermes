@@ -416,6 +416,47 @@ def test_business_accepts_payment_only_after_provider_readback(treasury):
         )
 
 
+def test_treasury_idempotency_rejects_entry_parameter_drift(treasury):
+    conn, account = treasury
+    first = finance_db.record_entry(
+        conn,
+        account_id=account,
+        kind="customer_payment",
+        amount_minor=250,
+        currency="USD",
+        idempotency_key="ledger-retry-1",
+        objective_id="obj-1",
+        action_id="act-1",
+        external_reference="provider-1",
+        evidence={"source": "test"},
+    )
+    assert finance_db.record_entry(
+        conn,
+        account_id=account,
+        kind="customer_payment",
+        amount_minor=250,
+        currency="USD",
+        idempotency_key="ledger-retry-1",
+        objective_id="obj-1",
+        action_id="act-1",
+        external_reference="provider-1",
+        evidence={"source": "replay"},
+    ) == first
+    with pytest.raises(finance_db.BudgetError, match="different entry parameters"):
+        finance_db.record_entry(
+            conn,
+            account_id=account,
+            kind="customer_payment",
+            amount_minor=251,
+            currency="USD",
+            idempotency_key="ledger-retry-1",
+            objective_id="obj-1",
+            action_id="act-1",
+            external_reference="provider-1",
+            evidence={"source": "drift"},
+        )
+
+
 def test_tax_bearing_invoice_accrues_tax_and_revenue_separately(treasury):
     conn, account = treasury
     service = PaymentService(conn, {"fake": FakeRail()})

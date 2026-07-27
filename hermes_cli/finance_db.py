@@ -253,10 +253,25 @@ def record_entry(
     if account["currency"] != currency.upper():
         raise BudgetError("ledger currency does not match treasury account")
     existing = conn.execute(
-        "SELECT id FROM treasury_entries WHERE idempotency_key = ?",
+        "SELECT * FROM treasury_entries WHERE idempotency_key = ?",
         (idempotency_key,),
     ).fetchone()
     if existing is not None:
+        if any(
+            actual != expected
+            for actual, expected in (
+                (str(existing["account_id"]), str(account_id)),
+                (str(existing["kind"]), str(kind)),
+                (int(existing["amount_minor"]), int(amount_minor)),
+                (str(existing["currency"]), str(currency).upper()),
+                (existing["objective_id"], objective_id),
+                (existing["action_id"], action_id),
+                (existing["external_reference"], external_reference),
+            )
+        ):
+            raise BudgetError(
+                "ledger idempotency key was reused with different entry parameters"
+            )
         return str(existing["id"])
     if amount_minor < 0:
         spendable = available_balance(conn, account_id)
