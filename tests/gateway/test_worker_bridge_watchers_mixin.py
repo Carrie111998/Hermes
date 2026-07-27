@@ -90,9 +90,6 @@ STATUSES = frozenset(DEFAULT_STATUSES)
 _PENDING_STEP_8 = {
     "test_selects_only_created_and_queued": "plan gives this watcher `created`; shipped design reserves created->queued in GatewayWorkerTaskDispatcherMixin",
     "test_requeued_retry_is_dispatchable": "fixture seeds the retry task as `created`, which this watcher deliberately does not own",
-    "test_free_slots_counts_live_leases": "count_free_global_slots is not leases-backed yet",
-    "test_stale_lease_pid_frees_capacity": "count_free_global_slots is not leases-backed yet",
-    "test_free_slots_never_negative": "count_free_global_slots is not leases-backed yet",
     "test_format_alert_text_failures_first_with_instructions": "auto-dispatch-aware alert wording not implemented",
     "test_format_alert_text_includes_pending_section": "auto-dispatch-aware alert wording not implemented",
     "test_format_alert_text_pending_only_nudge": "auto-dispatch-aware alert wording not implemented",
@@ -103,8 +100,6 @@ _PENDING_STEP_8 = {
     "test_claim_marks_task_and_returns_snapshot": "runtime key is gateway_dispatch_claim, not dispatch_claim",
     "test_release_leaves_row_alone_if_live_pid_took_over": "runtime key is gateway_dispatch_claim, not dispatch_claim",
     "test_auto_dispatch_spawns_and_audits": "spawn/audit semantics differ from the plan",
-    "test_capacity_limits_spawn_budget": "spawn/audit semantics differ from the plan",
-    "test_zero_free_slots_spawns_nothing_and_audits_no_capacity": "spawn/audit semantics differ from the plan",
     "test_spawn_exception_does_not_corrupt_task": "spawn/audit semantics differ from the plan",
     "test_skip_audit_deduped_until_reason_changes": "skip-audit dedup not implemented",
 }

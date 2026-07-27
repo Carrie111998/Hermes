@@ -548,6 +548,23 @@ def release_dispatch_claim(
         conn.close()
 
 
+def _live_global_lease_count(conn: sqlite3.Connection) -> Optional[int]:
+    """Global capacity slots held by a process that is still alive.
+
+    ``leases`` is the orchestrator's own capacity ledger: start_task acquires
+    ("global", maximum_concurrency) before running anything, and reclaims slots
+    whose pid is dead. Returns None on a bridge.db predating the table, so
+    callers can fall back rather than silently reporting unlimited capacity.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT pid FROM leases WHERE scope = 'global'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    return sum(1 for row in rows if _pid_alive(row["pid"]))
+
+
 def count_free_global_slots(db_path: Path, maximum_concurrency: int) -> int:
     if not db_path.exists():
         return 0
@@ -558,7 +575,19 @@ def count_free_global_slots(db_path: Path, maximum_concurrency: int) -> int:
             f"SELECT COUNT(*) AS count FROM tasks WHERE status IN ({placeholders})",
             ACTIVE_STATUSES,
         ).fetchone()
-        return max(0, int(maximum_concurrency) - int(row["count"] if row else 0))
+        consumed = int(row["count"] if row else 0)
+
+        # Two independent views of the same capacity, and each catches what the
+        # other misses. A task row stuck in `running` because its runner was
+        # killed consumes capacity forever — the lease self-heals via pid
+        # liveness. A live lease whose task row has already moved on is real
+        # capacity the status count no longer sees. Take whichever says MORE is
+        # consumed: this gate fails closed, and over-reporting free slots is the
+        # failure that overruns concurrency.
+        leased = _live_global_lease_count(conn)
+        if leased is not None:
+            consumed = max(consumed, leased)
+        return max(0, int(maximum_concurrency) - consumed)
     finally:
         conn.close()
 
