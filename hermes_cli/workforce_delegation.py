@@ -265,7 +265,7 @@ def create_grant(
     ):
         raise DelegationError("task skill exceeds delegator authority")
     action_row = conn.execute(
-        "SELECT payload_json FROM candidate_actions WHERE id=?", (action_id,)
+        "SELECT action_type,payload_json FROM candidate_actions WHERE id=?", (action_id,)
     ).fetchone()
     if action_row is None:
         raise DelegationError("employee task grant action is missing")
@@ -276,38 +276,67 @@ def create_grant(
     }
     if not resource_scope["system"] or not resource_scope["target_resource"]:
         raise DelegationError("task grant requires an exact resource scope")
+    if budget_minor < 0:
+        raise DelegationError("task budget cannot be negative")
     parent_grant_id = None
     if parent_grants:
+        def parent_bounds_child(row: sqlite3.Row) -> bool:
+            if str(row["objective_id"]) != objective_id:
+                return False
+            parent_action = conn.execute(
+                "SELECT action_type FROM candidate_actions WHERE id=?",
+                (row["action_id"],),
+            ).fetchone()
+            if (
+                parent_action is None
+                or str(parent_action["action_type"])
+                != str(action_row["action_type"])
+            ):
+                return False
+            return (
+                set(requested_capabilities).issubset(
+                    set(json.loads(row["capabilities_json"] or "[]"))
+                )
+                and set(requested_systems).issubset(
+                    set(json.loads(row["systems_json"] or "[]"))
+                )
+                and "all" not in requested_toolsets
+                and set(requested_toolsets).issubset(
+                    set(json.loads(row["toolsets_json"] or "[]"))
+                )
+                and set(requested_skills).issubset(
+                    set(json.loads(row["skills_json"] or "[]"))
+                )
+                and json.loads(row["resource_scope_json"] or "{}").get("system")
+                == resource_scope["system"]
+                and json.loads(row["resource_scope_json"] or "{}").get(
+                    "target_resource"
+                )
+                == resource_scope["target_resource"]
+                and expires_at <= int(row["expires_at"])
+                and budget_minor <= int(row["budget_minor"])
+            )
+
         matching_parent_grants = [
-            row
-            for row in parent_grants
-            if set(requested_capabilities).issubset(
-                set(json.loads(row["capabilities_json"] or "[]"))
-            )
-            and set(requested_systems).issubset(
-                set(json.loads(row["systems_json"] or "[]"))
-            )
-            and "all" not in requested_toolsets
-            and set(requested_toolsets).issubset(
-                set(json.loads(row["toolsets_json"] or "[]"))
-            )
-            and set(requested_skills).issubset(
-                set(json.loads(row["skills_json"] or "[]"))
-            )
-            and json.loads(row["resource_scope_json"] or "{}").get("system")
-            == resource_scope["system"]
-            and json.loads(row["resource_scope_json"] or "{}").get(
-                "target_resource"
-            )
-            == resource_scope["target_resource"]
-            and expires_at <= int(row["expires_at"])
-            and budget_minor <= int(row["budget_minor"])
+            row for row in parent_grants if parent_bounds_child(row)
         ]
         if not matching_parent_grants:
             raise DelegationError("child grant exceeds parent grant")
         parent_grant_id = str(matching_parent_grants[0]["id"])
-    if budget_minor < 0:
-        raise DelegationError("task budget cannot be negative")
+        parent_allocated = int(
+            conn.execute(
+                """SELECT COALESCE(SUM(budget_minor),0) AS n
+                     FROM employee_task_grants
+                    WHERE parent_grant_id=? AND expires_at>?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM employee_task_grant_revocations r
+                           WHERE r.grant_id=employee_task_grants.id
+                      )""",
+                (parent_grant_id, now),
+            ).fetchone()["n"]
+        )
+        if parent_allocated + budget_minor > int(matching_parent_grants[0]["budget_minor"]):
+            raise DelegationError("child grants exceed parent grant budget")
     mandate_budget = mandate["budget_minor"]
     if mandate_budget is not None:
         allocated = int(
@@ -583,6 +612,23 @@ def verify_grants(conn: sqlite3.Connection, organization_id: str) -> bool:
                 row["manager_employee_id"]
             ):
                 return False
+            if str(parent["objective_id"]) != str(row["objective_id"]):
+                return False
+            parent_action = conn.execute(
+                "SELECT action_type FROM candidate_actions WHERE id=?",
+                (parent["action_id"],),
+            ).fetchone()
+            child_action = conn.execute(
+                "SELECT action_type FROM candidate_actions WHERE id=?",
+                (row["action_id"],),
+            ).fetchone()
+            if (
+                parent_action is None
+                or child_action is None
+                or str(parent_action["action_type"])
+                != str(child_action["action_type"])
+            ):
+                return False
             if is_revoked(conn, str(parent["id"])):
                 return False
             if int(row["expires_at"]) > int(parent["expires_at"]):
@@ -608,6 +654,20 @@ def verify_grants(conn: sqlite3.Connection, organization_id: str) -> bool:
             if json.loads(row["resource_scope_json"] or "{}") != json.loads(
                 parent["resource_scope_json"] or "{}"
             ):
+                return False
+            child_budget = int(
+                conn.execute(
+                    """SELECT COALESCE(SUM(budget_minor),0) AS n
+                         FROM employee_task_grants
+                        WHERE parent_grant_id=? AND expires_at>?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM employee_task_grant_revocations r
+                               WHERE r.grant_id=employee_task_grants.id
+                          )""",
+                    (parent["id"], int(time.time())),
+                ).fetchone()["n"]
+            )
+            if child_budget > int(parent["budget_minor"]):
                 return False
         lineage = conn.execute(
             """SELECT objective.organization_id AS objective_org,

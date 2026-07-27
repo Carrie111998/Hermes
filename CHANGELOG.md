@@ -38,6 +38,9 @@
 - Delegated grants now persist an immutable `parent_grant_id`; authority
   verification can prove the exact parent authorization chain instead of
   inferring it from aggregate mandate fields.
+- Parent-grant delegation is now bounded to the same objective and action
+  type, with cumulative child-budget accounting so repeated sub-delegation
+  cannot exceed the parent grant ceiling.
 - Revocation checks now traverse the parent-grant chain and fail closed when
   any ancestor is revoked or the chain is cyclic, fencing descendant workers
   and result handoffs immediately.

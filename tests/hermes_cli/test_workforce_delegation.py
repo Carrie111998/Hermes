@@ -305,6 +305,97 @@ def test_subordinate_cannot_subdelegate_without_parent_grant(tmp_path, monkeypat
             expires_at=int(time.time()) + 1_800,
         )
 
+    plan_id = conn.execute(
+        "SELECT id FROM plans WHERE objective_id=? ORDER BY version DESC LIMIT 1",
+        (objective_id,),
+    ).fetchone()["id"]
+    parent_action = objectives_db.propose_action(
+        conn,
+        objective_id=objective_id,
+        plan_id=plan_id,
+        action_type="web.read",
+        payload={"system": "web", "target_resource": "default"},
+        expected_outcome="bounded delegated research",
+        required_capability="web.read",
+        verification_method="web.read.completed",
+        risk_class="low",
+        reversible=True,
+        proposed_by=f"employee:{ceo_id}",
+    )
+    parent_id, created = workforce_delegation.create_grant(
+        conn,
+        organization_id=organization_id,
+        objective_id=objective_id,
+        action_id=parent_action,
+        manager_employee_id=ceo_id,
+        assignee_profile="morgan-manager",
+        title="Delegate research",
+        body="Delegate only the bounded research task.",
+        capabilities=["web.read"],
+        systems=["web"],
+        toolsets=["web"],
+        skills=["research"],
+        budget_minor=60,
+        expires_at=int(time.time()) + 1_800,
+    )
+    assert created is True
+    child_action = objectives_db.propose_action(
+        conn,
+        objective_id=objective_id,
+        plan_id=plan_id,
+        action_type="web.read",
+        payload={"system": "web", "target_resource": "default"},
+        expected_outcome="child research",
+        required_capability="web.read",
+        verification_method="web.read.completed",
+        risk_class="low",
+        reversible=True,
+        proposed_by=f"employee:{manager2_id}",
+    )
+    child_values = dict(
+        organization_id=organization_id,
+        objective_id=objective_id,
+        action_id=child_action,
+        manager_employee_id=manager2_id,
+        assignee_profile="bea-research",
+        title="Perform research",
+        body="Perform only the bounded research task.",
+        capabilities=["web.read"],
+        systems=["web"],
+        toolsets=["web"],
+        skills=["research"],
+        expires_at=int(time.time()) + 1_800,
+    )
+    child_id, created = workforce_delegation.create_grant(
+        conn, budget_minor=40, **child_values
+    )
+    assert created is True
+    assert conn.execute(
+        "SELECT parent_grant_id FROM employee_task_grants WHERE id=?",
+        (child_id,),
+    ).fetchone()["parent_grant_id"] == parent_id
+
+    second_action = objectives_db.propose_action(
+        conn,
+        objective_id=objective_id,
+        plan_id=plan_id,
+        action_type="web.read",
+        payload={"system": "web", "target_resource": "default"},
+        expected_outcome="second child research",
+        required_capability="web.read",
+        verification_method="web.read.completed",
+        risk_class="low",
+        reversible=True,
+        proposed_by=f"employee:{manager2_id}",
+    )
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="parent grant budget"
+    ):
+        second_values = {**child_values, "action_id": second_action}
+        workforce_delegation.create_grant(
+            conn, budget_minor=30, **second_values
+        )
+
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
