@@ -53,6 +53,23 @@ from agent.interrupt_compat import request_hard_interrupt
 logger = logging.getLogger(__name__)
 
 
+def _close_late_session_db_fds(future: "concurrent.futures.Future") -> None:
+    """Done-callback: retrieve and close a SessionDB that completed after its timeout.
+
+    When ``run_job``'s SessionDB init times out, the worker thread is abandoned
+    and the future's eventual result would leak SQLite FDs for the process
+    lifetime. This callback is attached to that future so that if/when the
+    constructor completes, the SessionDB (and its open .db / WAL / SHM handles)
+    are immediately closed.
+    """
+    try:
+        db = future.result(timeout=60)
+        if db is not None:
+            db.close()
+    except Exception:
+        pass
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -2942,8 +2959,19 @@ def run_job(
 
         if _session_db_timeout > 0:
             _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _session_db_future = _session_db_pool.submit(SessionDB)
             try:
-                _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
+                _session_db = _session_db_future.result(timeout=_session_db_timeout)
+            except concurrent.futures.TimeoutError:
+                # The worker is abandoned (shutdown below doesn't wait). If
+                # SessionDB() later completes inside it, the future's result
+                # would be orphaned and its SQLite FDs (.db, WAL, SHM) would
+                # leak until process exit. Register a done callback that
+                # retrieves and closes any eventual late result.
+                _session_db_future.add_done_callback(
+                    lambda _f: _close_late_session_db_fds(_f)
+                )
+                raise
             finally:
                 # Don't wait for a wedged connect() to unwind — abandon the
                 # worker thread (same pattern as the agent inactivity timeout
