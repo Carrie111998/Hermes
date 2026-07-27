@@ -1154,8 +1154,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Check plugin hooks for block/modify directives before executing.
         _block_msg: Optional[str] = None
+        _block_error_type = "plugin_block"
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
+            _block_error_type = "tool_scope_block"
         else:
             try:
                 from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
