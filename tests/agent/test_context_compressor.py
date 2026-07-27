@@ -2453,7 +2453,7 @@ class TestCompressWithClient:
         )
 
         # Detected as a summary despite the prefix not being at the start.
-        assert ContextCompressor._is_context_summary_content(merged) is True
+        assert ContextCompressor.classify_summary_content(merged) is not None
         # Stripping yields only the real summary body — no wrapper, no stale
         # tail content, no prefix, no end marker.
         body = ContextCompressor._strip_summary_prefix(merged)
@@ -2461,7 +2461,7 @@ class TestCompressWithClient:
 
         # Standalone (non-merged) summaries still work unchanged.
         standalone = SUMMARY_PREFIX + "\nSTANDALONE_BODY\n\n" + _SUMMARY_END_MARKER
-        assert ContextCompressor._is_context_summary_content(standalone) is True
+        assert ContextCompressor.classify_summary_content(standalone) is not None
         assert ContextCompressor._strip_summary_prefix(standalone) == "STANDALONE_BODY"
 
     def test_double_collision_user_head_assistant_tail(self):
