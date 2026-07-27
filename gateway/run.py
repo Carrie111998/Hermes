@@ -14002,7 +14002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "message": message_text[:1000],
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -14248,9 +14248,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
+            # NOTE: truncated to 4000 chars (not 500) to support telegram-mirror
+            # hook which forwards the full response to Telegram (4096 char limit).
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
-                "response": (response or "")[:500],
+                "response": (response or "")[:4000],
             })
             
             # Check for pending process watchers (check_interval on background processes)
