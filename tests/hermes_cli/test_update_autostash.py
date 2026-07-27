@@ -25,13 +25,13 @@ def _patch_managed_uv(request):
 
     # resolve_uv delegates to shutil.which("uv") so that test patches
     # on shutil.which flow through naturally.
-    def _fake_resolve_uv():
+    def _fake_resolve_uv(**kwargs):
         return shutil.which("uv")
 
-    def _fake_ensure_uv():
+    def _fake_ensure_uv(**kwargs):
         return shutil.which("uv")
 
-    def _fake_update_managed_uv():
+    def _fake_update_managed_uv(**kwargs):
         return None  # never actually self-update in tests
 
     with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
@@ -218,12 +218,13 @@ def test_restore_stashed_changes_keeps_going_when_stash_entry_cannot_be_resolved
     restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc1234", prompt_user=False)
 
     assert restored is True
-    assert calls[0] == (["git", "stash", "apply", "abc1234"], {"cwd": tmp_path, "capture_output": True, "text": True})
-    assert calls[1] == (["git", "diff", "--name-only", "--diff-filter=U"], {"cwd": tmp_path, "capture_output": True, "text": True})
+    _utf8 = {"encoding": "utf-8", "errors": "replace"}
+    assert calls[0] == (["git", "stash", "apply", "abc1234"], {"cwd": tmp_path, "capture_output": True, "text": True, **_utf8})
+    assert calls[1] == (["git", "diff", "--name-only", "--diff-filter=U"], {"cwd": tmp_path, "capture_output": True, "text": True, **_utf8})
     assert calls[2][0] == [
         "git", "update-ref", "refs/hermes/autostash/abc1234", "abc1234",
     ]
-    assert calls[3] == (["git", "stash", "list", "--format=%gd %H"], {"cwd": tmp_path, "capture_output": True, "text": True, "check": True})
+    assert calls[3] == (["git", "stash", "list", "--format=%gd %H"], {"cwd": tmp_path, "capture_output": True, "text": True, **_utf8, "check": True})
     out = capsys.readouterr().out
     assert "couldn't find the stash entry to drop" in out
     assert "stash was left in place" in out
@@ -523,6 +524,94 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
     install_cmds = [c for c in recorded if "pip" in c and "install" in c]
     assert len(install_cmds) == 1
     assert ".[all]" in install_cmds[0]
+
+
+def test_refresh_active_memory_provider_dependencies_reinstalls_active_provider(monkeypatch):
+    """#53272/#70636: update must re-run the active provider's dep install."""
+    recorded = []
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": {"provider": "mem0"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.memory_setup._install_dependencies",
+        lambda provider_name, force=False: recorded.append((provider_name, force)),
+    )
+
+    hermes_main._refresh_active_memory_provider_dependencies()
+
+    assert recorded == [("mem0", True)]
+
+
+@pytest.mark.parametrize(
+    "memory_cfg",
+    [
+        {},                                          # no provider configured
+        {"provider": ""},                            # empty provider
+        {"provider": "default"},                     # built-in store
+        {"provider": "mem0", "enabled": False},      # memory disabled
+    ],
+)
+def test_refresh_active_memory_provider_dependencies_skips_inactive(monkeypatch, memory_cfg):
+    recorded = []
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": memory_cfg},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.memory_setup._install_dependencies",
+        lambda provider_name, force=False: recorded.append((provider_name, force)),
+    )
+
+    hermes_main._refresh_active_memory_provider_dependencies()
+
+    assert recorded == []
+
+
+def test_refresh_active_memory_provider_dependencies_never_raises(monkeypatch):
+    """A provider install failure must not block the rest of the update."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": {"provider": "hindsight"}},
+    )
+
+    def boom(provider_name, force=False):
+        raise RuntimeError("pip exploded")
+
+    monkeypatch.setattr("hermes_cli.memory_setup._install_dependencies", boom)
+
+    hermes_main._refresh_active_memory_provider_dependencies()  # must not raise
+
+
+def test_cmd_update_refreshes_active_memory_provider_dependencies(monkeypatch, tmp_path):
+    """The git-pull update path must invoke the memory-provider refresh."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "_is_termux_env", lambda env=None: False)
+
+    refresh_calls = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_refresh_active_memory_provider_dependencies",
+        lambda: refresh_calls.append(True),
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert refresh_calls == [True]
 
 
 def test_install_with_optional_fallback_honors_custom_group(monkeypatch):
