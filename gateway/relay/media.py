@@ -91,7 +91,11 @@ class RelayMediaClient:
 
     def is_relay_media_url(self, url: str) -> bool:
         """Is ``url`` a connector re-host reference (needs our bearer to GET)?"""
-        return "/relay/media/" in (url or "")
+        if not url or not self._base_url:
+            return False
+        # Must be on the same origin and under /relay/media/ path as our base URL
+        prefix = f"{self._base_url.rstrip('/')}/relay/media/"
+        return url.startswith(prefix)
 
     async def upload(
         self,

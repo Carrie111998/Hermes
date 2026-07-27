@@ -270,6 +270,13 @@ def test_client_recognizes_rehost_urls():
     c = RelayMediaClient("https://c.example", "gw1", "sec")
     assert c.is_relay_media_url("https://c.example/relay/media/abc") is True
     assert c.is_relay_media_url("https://cdn.discordapp.com/a/b.png") is False
+    # Must reject different-origin URLs even with matching path segment
+    assert c.is_relay_media_url("https://evil.example/relay/media/abc") is False
+    assert c.is_relay_media_url("https://cdn.example/files/relay/media/photo.png") is False
+    # Must reject subdomain matching
+    assert c.is_relay_media_url("https://evil.c.example/relay/media/abc") is False
+    # Must reject empty URLs
+    assert c.is_relay_media_url("") is False
 
 
 @pytest.mark.asyncio
