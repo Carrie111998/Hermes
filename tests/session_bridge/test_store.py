@@ -7561,7 +7561,8 @@ def test_sidebar_claims_are_ordered_bounded_and_serialize_active_batches_at_rest
         )
     expected = _rows(
         db,
-        "SELECT id FROM session_sidebar_jobs ORDER BY eligible_at, id LIMIT 2",
+        "SELECT id FROM session_sidebar_jobs "
+        "ORDER BY eligible_at DESC, id DESC LIMIT 2",
     )
 
     claimed = store.claim_sidebar_jobs(now=200.0, limit=2)
@@ -7612,6 +7613,120 @@ def test_sidebar_claim_prioritizes_ready_retry_before_older_pending(db) -> None:
     assert store.get_sidebar_job_for_source(pending.source_session_id)["state"] == (
         SidebarJobState.PENDING.value
     )
+
+
+def test_sidebar_pending_claims_three_newest_then_oldest(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "fresh-token-1",
+            "fresh-token-2",
+            "fresh-token-3",
+            "oldest-token",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidates = [
+        _sidebar_candidate(
+            db,
+            native_id=f"lane-{eligible_at}",
+            eligible_at=float(eligible_at),
+        )
+        for eligible_at in (10, 20, 30, 40, 50)
+    ]
+    for candidate in candidates:
+        store.enqueue_sidebar_job(candidate)
+
+    claimed = store.claim_sidebar_jobs(now=100.0, limit=4)
+
+    assert [job["source_session_id"] for job in claimed] == [
+        candidates[4].source_session_id,
+        candidates[3].source_session_id,
+        candidates[2].source_session_id,
+        candidates[0].source_session_id,
+    ]
+    assert [job["lease_token"] for job in claimed] == [
+        "fresh-token-1",
+        "fresh-token-2",
+        "fresh-token-3",
+        "oldest-token",
+    ]
+
+
+def test_sidebar_pending_claim_lane_survives_store_restart(tmp_path) -> None:
+    path = tmp_path / "sidebar-pending-lane.db"
+    first_db = SessionDB(path)
+    try:
+        first = SessionBridgeStore(
+            first_db,
+            sidebar_token_factory=_token_factory("first-token", "second-token"),
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        candidates = [
+            _sidebar_candidate(
+                first_db,
+                native_id=f"restart-lane-{eligible_at}",
+                eligible_at=float(eligible_at),
+            )
+            for eligible_at in (10, 20, 30, 40, 50)
+        ]
+        for candidate in candidates:
+            first.enqueue_sidebar_job(candidate)
+        initial = first.claim_sidebar_jobs(now=100.0, limit=2)
+        assert [job["source_session_id"] for job in initial] == [
+            candidates[4].source_session_id,
+            candidates[3].source_session_id,
+        ]
+        for index, job in enumerate(initial):
+            first.commit_sidebar_job(
+                lease_token=job["lease_token"],
+                codex_thread_id=f"restart-thread-{index}",
+                now=110.0 + index,
+            )
+    finally:
+        first_db.close()
+
+    reopened_db = SessionDB(path)
+    try:
+        reopened = SessionBridgeStore(
+            reopened_db,
+            sidebar_token_factory=_token_factory("third-token", "oldest-token"),
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+
+        continued = reopened.claim_sidebar_jobs(now=120.0, limit=2)
+
+        assert [job["source_session_id"] for job in continued] == [
+            candidates[2].source_session_id,
+            candidates[0].source_session_id,
+        ]
+    finally:
+        reopened_db.close()
+
+
+def test_sidebar_pending_claim_lane_rolls_back_with_failed_batch(db) -> None:
+    failing = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("duplicate-token", "duplicate-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    older = _sidebar_candidate(db, native_id="rollback-older", eligible_at=10.0)
+    newer = _sidebar_candidate(db, native_id="rollback-newer", eligible_at=20.0)
+    failing.enqueue_sidebar_job(older)
+    failing.enqueue_sidebar_job(newer)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        failing.claim_sidebar_jobs(now=100.0, limit=2)
+
+    assert failing.get_state("session-bridge:sidebar:pending-lane:v1") is None
+    assert failing.sidebar_job_counts()[SidebarJobState.PENDING.value] == 2
+    recovered = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("recovered-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    claim = recovered.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    assert claim["source_session_id"] == newer.source_session_id
 
 
 @pytest.mark.parametrize("limit", [0, 11, True, 1.5])
@@ -7912,7 +8027,11 @@ def test_sidebar_create_reservation_cutover_quarantines_expired_legacy_lease_onc
         native_id="cutover-expired",
         eligible_at=90.0,
     )
-    pristine = _sidebar_candidate(db, native_id="cutover-pristine")
+    pristine = _sidebar_candidate(
+        db,
+        native_id="cutover-pristine",
+        eligible_at=80.0,
+    )
     legacy_job = store.enqueue_sidebar_job(legacy)
     pristine_job = store.enqueue_sidebar_job(pristine)
     store.claim_sidebar_jobs(now=100.0, limit=1)

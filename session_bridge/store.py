@@ -74,6 +74,8 @@ _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY = (
     "session-bridge:sidebar:create-reservation-cutover:v1"
 )
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
+_SIDEBAR_PENDING_LANE_STATE_KEY = "session-bridge:sidebar:pending-lane:v1"
+_SIDEBAR_FRESH_BURST = 3
 _SIDEBAR_HYDRATION_LEASE_SECONDS = 300
 _SIDEBAR_HYDRATION_LEASE_KEY = b"session-sidebar-hydration-lease-v1"
 _SIDEBAR_HYDRATION_COMPLETION_KEY = b"session-sidebar-hydration-completion-v1"
@@ -5272,7 +5274,7 @@ class SessionBridgeStore:
                 """SELECT * FROM session_sidebar_jobs
                    WHERE state IN (?, ?) AND next_attempt_at <= ?
                    ORDER BY CASE WHEN state = ? THEN 0 ELSE 1 END,
-                            eligible_at, id
+                            next_attempt_at, eligible_at, id
                    LIMIT ?""",
                 (
                     SidebarJobState.PENDING.value,
@@ -5282,12 +5284,11 @@ class SessionBridgeStore:
                     _SIDEBAR_CLAIM_SCAN_LIMIT,
                 ),
             ).fetchall()
-            validated: list[tuple[dict[str, Any], Provider]] = []
             found_invalid = False
             for raw_row in due:
                 row = dict(raw_row)
                 try:
-                    provider = _validated_sidebar_job_provider(row)
+                    _validated_sidebar_job_provider(row)
                 except ValueError:
                     conn.execute(
                         """UPDATE session_sidebar_jobs
@@ -5302,15 +5303,61 @@ class SessionBridgeStore:
                         ),
                     )
                     found_invalid = True
-                    continue
-                validated.append((row, provider))
             if found_invalid:
                 return []
 
+            lane_row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (_SIDEBAR_PENDING_LANE_STATE_KEY,),
+            ).fetchone()
+            fresh_claims = 0
+            if lane_row is not None:
+                try:
+                    lane_state = json.loads(lane_row["value_json"])
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise ValueError("invalid sidebar pending lane state") from exc
+                if (
+                    not isinstance(lane_state, dict)
+                    or set(lane_state) != {
+                        "version",
+                        "fresh_claims_since_oldest",
+                    }
+                    or lane_state.get("version") != 1
+                    or type(lane_state.get("fresh_claims_since_oldest")) is not int
+                    or not 0
+                    <= lane_state["fresh_claims_since_oldest"]
+                    <= _SIDEBAR_FRESH_BURST
+                ):
+                    raise ValueError("invalid sidebar pending lane state")
+                fresh_claims = lane_state["fresh_claims_since_oldest"]
+
             claimed: list[dict[str, Any]] = []
-            for row, provider in validated:
-                if len(claimed) >= limit:
+            while len(claimed) < limit:
+                raw_row = conn.execute(
+                    """SELECT * FROM session_sidebar_jobs
+                       WHERE state = ? AND next_attempt_at <= ?
+                       ORDER BY next_attempt_at, eligible_at, id
+                       LIMIT 1""",
+                    (SidebarJobState.RETRY.value, claim_time),
+                ).fetchone()
+                pending_claim = raw_row is None
+                if pending_claim:
+                    pending_order = (
+                        "eligible_at, id"
+                        if fresh_claims == _SIDEBAR_FRESH_BURST
+                        else "eligible_at DESC, id DESC"
+                    )
+                    raw_row = conn.execute(
+                        f"""SELECT * FROM session_sidebar_jobs
+                            WHERE state = ? AND next_attempt_at <= ?
+                            ORDER BY {pending_order}
+                            LIMIT 1""",
+                        (SidebarJobState.PENDING.value, claim_time),
+                    ).fetchone()
+                if raw_row is None:
                     break
+                row = dict(raw_row)
+                provider = _validated_sidebar_job_provider(row)
                 lease_token, lease_digest = self._new_sidebar_lease(conn)
                 lease_expires_at = claim_time + lease_seconds
                 cursor = conn.execute(
@@ -5339,6 +5386,34 @@ class SessionBridgeStore:
                 claimed_row["provider"] = provider.value
                 claimed_row["lease_token"] = lease_token
                 claimed.append(claimed_row)
+                if pending_claim:
+                    fresh_claims = (
+                        0
+                        if fresh_claims == _SIDEBAR_FRESH_BURST
+                        else fresh_claims + 1
+                    )
+                    lane_json = json.dumps(
+                        {
+                            "version": 1,
+                            "fresh_claims_since_oldest": fresh_claims,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    conn.execute(
+                        """INSERT INTO session_bridge_state (
+                               key, value_json, updated_at
+                           ) VALUES (?, ?, ?)
+                           ON CONFLICT(key) DO UPDATE SET
+                               value_json = excluded.value_json,
+                               updated_at = excluded.updated_at""",
+                        (
+                            _SIDEBAR_PENDING_LANE_STATE_KEY,
+                            lane_json,
+                            claim_time,
+                        ),
+                    )
             return claimed
 
         return self.db._execute_write(_write)
