@@ -1308,6 +1308,32 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production CDP endpoint isolation or external authorization.
 
+## Desktop computer-use authority evidence (5129992928)
+
+The desktop `computer_use` tool now requires an exact capability such as
+`computer.click`, `computer.type`, or `computer.capture` against
+`desktop-session:<session>`. Governed workers use this control-plane permit as
+their authority; interactive approval remains available only for ungoverned
+interactive sessions. A requested follow-up capture also requires its own
+capture capability.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/computer_use/tool.py tests/tools/test_computer_use.py
+uv run --extra dev pytest -q \
+  tests/tools/test_computer_use.py \
+  tests/tools/test_computer_use_delivery_ladder.py \
+  tests/tools/test_computer_use_capture_routing.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **256 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:952b29d98e5189ff92e10891bc127f1e49258512cd281b7b4a143f1622941660`.
+This remains deterministic local-provider evidence and does not establish
+production desktop-driver isolation or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

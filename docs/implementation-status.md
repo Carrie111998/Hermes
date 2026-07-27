@@ -33,6 +33,9 @@ acceptance evidence.
   typing, evaluation, screenshot, or other browser authority.
 - Raw CDP access is also governed: each call is bound to the exact CDP method,
   browser session, and optional target/frame resource.
+- Desktop computer-use actions are governed per operation and desktop session;
+  detached workers cannot obtain UI authority from an interactive approval
+  callback or an unrestricted computer-use toolset.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,

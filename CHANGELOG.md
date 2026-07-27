@@ -45,6 +45,9 @@
 - Raw `browser_cdp` escape-hatch calls now require an exact `browser.cdp`
   permit bound to the worker session, CDP method, and optional target/frame;
   direct CDP access cannot bypass the governed browser surface.
+- Desktop `computer_use` actions now require exact `computer.<operation>`
+  permits bound to a desktop session. Governed workers use the permit as their
+  execution authority instead of relying on an ambient interactive approval.
 - Grant admission now requires the delegator employee and mandate to be
   active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority
