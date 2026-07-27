@@ -1386,6 +1386,29 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production scheduler deployment or external authorization.
 
+## Governed fan-out delegation evidence (9f78b3544c)
+
+The legacy `delegate_task` fan-out path now fails closed for governed workers
+unless the control plane authorizes `work.delegate` against a resource derived
+from the exact goal/context/tasks/role payload. This prevents a subordinate
+from spawning an unrecorded child merely by inheriting a broad toolset. The
+normal interactive path remains compatible because it has no execution
+contract.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/delegate_tool.py tests/tools/test_delegate.py
+uv run --extra dev pytest -q tests/tools/test_delegate.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **160 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:017f64f455339e8e8ff0c190739650e4f0c7d7691f3be0f1e0b1963464d16274`.
+This remains deterministic local-provider evidence and does not establish
+production multi-agent deployment or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

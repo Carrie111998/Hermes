@@ -55,6 +55,9 @@
 - Cron scheduler mutations (`create`, `update`, `pause`, `resume`, `remove`,
   and immediate run) now require operation-specific permits bound to the exact
   scheduled job, or the exact creation identity before a job exists.
+- Governed workers can no longer use the legacy conversational `delegate_task`
+  fan-out path without a workforce permit bound to the exact delegation
+  payload; ordinary interactive delegation remains unchanged.
 - Grant admission now requires the delegator employee and mandate to be
   active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority
