@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import multiprocessing
 import os
 import re
 import stat
@@ -111,20 +112,22 @@ class TurnFileMutationVerifier:
         *,
         resolve_backend: Optional[Callable[[str], Tuple[str, str, str]]] = None,
         now_fn: Callable[[], float] = time.monotonic,
+        use_subprocess_fingerprint: bool = True,
     ) -> None:
         self._resolve_backend = resolve_backend or _default_resolve_backend
         self._now_fn = now_fn
+        self._use_subprocess_fingerprint = use_subprocess_fingerprint
         self._budget = TurnObservationBudget()
         self._ledger: Dict[Tuple[str, str, str, str, str], LedgerEntry] = {}
         self._lock = threading.Lock()
-        self._active_workers: Set[int] = set()
+        self._active_worker_pids: Set[int] = set()
         self._pre_dispatch_baselines: Dict[Tuple[str, str], Optional[ContentFingerprint]] = {}
 
     def reset_turn(self, generation: int = 0) -> None:
         with self._lock:
             self._budget = TurnObservationBudget(generation=generation)
             self._ledger.clear()
-            self._active_workers.clear()
+            self._active_worker_pids.clear()
             self._pre_dispatch_baselines.clear()
 
     def prepare_mutation_dispatch(
@@ -151,6 +154,11 @@ class TurnFileMutationVerifier:
 
     def clear_turn(self) -> None:
         self.reset_turn(0)
+
+    @property
+    def active_worker_pids(self) -> Set[int]:
+        with self._lock:
+            return set(self._active_worker_pids)
 
     @property
     def generation(self) -> int:
@@ -358,7 +366,9 @@ class TurnFileMutationVerifier:
         fp, read_bytes = _stable_local_fingerprint(
             resolved,
             deadline=self._now_fn() + OBSERVATION_TIMEOUT_S,
-            active_workers=self._active_workers,
+            active_worker_pids=self._active_worker_pids,
+            use_subprocess=self._use_subprocess_fingerprint,
+            pid_lock=self._lock,
         )
         with self._lock:
             self._budget.snapshot_bytes += read_bytes
@@ -463,7 +473,104 @@ def _stable_local_fingerprint(
     path: Path,
     *,
     deadline: float,
-    active_workers: Set[int],
+    active_worker_pids: Set[int],
+    use_subprocess: bool = True,
+    pid_lock: Optional[threading.Lock] = None,
+) -> Tuple[Optional[ContentFingerprint], int]:
+    if time.monotonic() > deadline:
+        return None, 0
+    if use_subprocess:
+        return _stable_local_fingerprint_subprocess(
+            path,
+            deadline=deadline,
+            active_worker_pids=active_worker_pids,
+            pid_lock=pid_lock,
+        )
+    return _stable_local_fingerprint_inprocess(path, deadline=deadline)
+
+
+def _mp_fingerprint_worker(path_str: str, out_q: "multiprocessing.queues.Queue") -> None:
+    try:
+        fp, read_bytes = _stable_local_fingerprint_inprocess(
+            Path(path_str),
+            deadline=time.monotonic() + OBSERVATION_TIMEOUT_S,
+        )
+    except Exception:
+        out_q.put((None, 0))
+        return
+    if fp is None:
+        out_q.put((None, read_bytes))
+        return
+    out_q.put(
+        (
+            (fp.size, fp.digest, fp.mtime_ns, fp.inode),
+            read_bytes,
+        )
+    )
+
+
+def _stable_local_fingerprint_subprocess(
+    path: Path,
+    *,
+    deadline: float,
+    active_worker_pids: Set[int],
+    pid_lock: Optional[threading.Lock],
+) -> Tuple[Optional[ContentFingerprint], int]:
+    remaining = max(0.05, deadline - time.monotonic())
+    ctx = multiprocessing.get_context("spawn")
+    out_q = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_mp_fingerprint_worker,
+        args=(str(path), out_q),
+        daemon=True,
+    )
+    payload = None
+    read_bytes = 0
+    proc.start()
+    if pid_lock is not None:
+        with pid_lock:
+            active_worker_pids.add(proc.pid)
+    try:
+        proc.join(timeout=remaining)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=0.5)
+            return None, 0
+        if not out_q.empty():
+            payload, read_bytes = out_q.get_nowait()
+        else:
+            return None, 0
+    finally:
+        if pid_lock is not None:
+            with pid_lock:
+                active_worker_pids.discard(proc.pid)
+        try:
+            proc.close()
+        except Exception:
+            pass
+        try:
+            out_q.close()
+            out_q.join_thread()
+        except Exception:
+            pass
+    if payload is None:
+        return None, read_bytes
+    size, digest, mtime_ns, inode = payload
+    return (
+        ContentFingerprint(
+            size=size,
+            digest=digest,
+            mtime_ns=mtime_ns,
+            inode=inode,
+        ),
+        read_bytes,
+    )
+
+
+def _stable_local_fingerprint_inprocess(
+    path: Path,
+    *,
+    deadline: float,
 ) -> Tuple[Optional[ContentFingerprint], int]:
     if time.monotonic() > deadline:
         return None, 0
@@ -477,18 +584,35 @@ def _stable_local_fingerprint(
         return None, 0
     if st.st_size > MAX_SINGLE_FILE_BYTES:
         return None, 0
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: Optional[int] = None
     try:
-        st_open = os.stat(path, follow_symlinks=True)
+        fd = os.open(path, flags)
+        st_open = os.fstat(fd)
     except OSError:
+        if fd is not None:
+            os.close(fd)
         return None, 0
     if not stat.S_ISREG(st_open.st_mode):
+        os.close(fd)
         return None, 0
     if st_open.st_size > MAX_SINGLE_FILE_BYTES:
+        os.close(fd)
+        return None, 0
+    if st.st_ino != st_open.st_ino or getattr(st, "st_dev", None) != getattr(st_open, "st_dev", None):
+        os.close(fd)
         return None, 0
     read_bytes = 0
     h = hashlib.sha256()
+    open_ino = st_open.st_ino
+    open_dev = getattr(st_open, "st_dev", None)
+    open_size = st_open.st_size
+    open_mtime = st_open.st_mtime_ns
     try:
-        with open(path, "rb") as fh:
+        with os.fdopen(fd, "rb") as fh:
+            fd = None
             while True:
                 if time.monotonic() > deadline:
                     return None, read_bytes
@@ -497,13 +621,23 @@ def _stable_local_fingerprint(
                     break
                 read_bytes += len(chunk)
                 h.update(chunk)
-        st_after = os.stat(path, follow_symlinks=True)
+    except OSError:
+        return None, read_bytes
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        st_after = os.stat(path, follow_symlinks=False)
     except OSError:
         return None, read_bytes
     if (
-        st_after.st_size != st_open.st_size
-        or st_after.st_mtime_ns != st_open.st_mtime_ns
-        or st_after.st_ino != st_open.st_ino
+        st_after.st_size != open_size
+        or st_after.st_mtime_ns != open_mtime
+        or st_after.st_ino != open_ino
+        or getattr(st_after, "st_dev", None) != open_dev
     ):
         return None, read_bytes
     return (

@@ -12,6 +12,7 @@ from agent.file_mutation_verifier import (
     TurnFileMutationVerifier,
     _path_allowed_for_observation,
     format_failure_footer,
+    sync_legacy_failed_state,
 )
 from run_agent import AIAgent, _extract_file_mutation_targets
 
@@ -234,7 +235,7 @@ class TestPreDispatchBaseline:
         monkeypatch.chdir(tmp_path)
         target = tmp_path / "partial.py"
         target.write_text("baseline\n", encoding="utf-8")
-        verifier = TurnFileMutationVerifier()
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
         verifier.reset_turn(1)
         verifier.prepare_mutation_dispatch(
             tool_name="write_file",
@@ -257,7 +258,7 @@ class TestPreDispatchBaseline:
         monkeypatch.chdir(tmp_path)
         target = tmp_path / "partial.py"
         target.write_text("baseline\n", encoding="utf-8")
-        verifier = TurnFileMutationVerifier()
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
         verifier.reset_turn(1)
         verifier.prepare_mutation_dispatch(
             tool_name="write_file",
@@ -312,3 +313,149 @@ class TestRecoveredThenFailedAgain:
         assert any(k.endswith("flip.py") for k in agent._turn_failed_file_mutations)
         key = next(k for k in agent._turn_failed_file_mutations if k.endswith("flip.py"))
         assert "second failure" in agent._turn_failed_file_mutations[key]["error_preview"]
+
+
+def _slow_fingerprint_worker(path_str, out_q):
+    import time
+
+    time.sleep(5)
+    out_q.put((None, 0))
+
+
+class TestFailsafeObservation:
+    def test_subprocess_timeout_leaves_no_live_workers(self, tmp_path, monkeypatch):
+        import agent.file_mutation_verifier as fmv
+
+        target = tmp_path / "slow.bin"
+        target.write_bytes(b"abc")
+
+        monkeypatch.setattr(fmv, "_mp_fingerprint_worker", _slow_fingerprint_worker)
+        monkeypatch.setattr(fmv, "OBSERVATION_TIMEOUT_S", 0.15)
+
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=True)
+        verifier.reset_turn(1)
+        monkeypatch.chdir(tmp_path)
+        fp = verifier._capture_baseline("slow.bin", "default", turn_generation=1)
+        assert fp is None
+        assert verifier.active_worker_pids == set()
+
+    def test_symlink_is_not_observable(self, tmp_path):
+        import os
+        import time
+
+        from agent.file_mutation_verifier import _stable_local_fingerprint_inprocess
+
+        if os.name == "nt":
+            pytest.skip("symlink lstat guard is POSIX-focused in this test")
+        real = tmp_path / "real.txt"
+        real.write_text("data\n", encoding="utf-8")
+        link = tmp_path / "link.txt"
+        link.symlink_to(real)
+        fp, _ = _stable_local_fingerprint_inprocess(
+            link, deadline=time.monotonic() + 5.0,
+        )
+        assert fp is None
+
+    def test_torn_read_rejected(self, tmp_path, monkeypatch):
+        import time
+
+        from agent.file_mutation_verifier import _stable_local_fingerprint_inprocess
+
+        target = tmp_path / "torn.txt"
+        target.write_text("stable\n", encoding="utf-8")
+        real_stat = target.stat()
+
+        def _unstable_stat(path, *, follow_symlinks=True):
+            if not follow_symlinks:
+                raise OSError("simulated torn read")
+            return real_stat
+
+        monkeypatch.setattr(__import__("os"), "stat", _unstable_stat)
+        fp, _ = _stable_local_fingerprint_inprocess(
+            target, deadline=time.monotonic() + 5.0,
+        )
+        assert fp is None
+
+    def test_posix_dialect_preserves_backslash_identity(self):
+        verifier = TurnFileMutationVerifier(
+            resolve_backend=lambda _tid: ("local", "host", "posix"),
+        )
+        a = verifier._identity_for_path("dir\\file.py", "default")
+        b = verifier._identity_for_path("dir/file.py", "default")
+        assert a is not None and b is not None
+        assert a.path != b.path
+
+    def test_ssh_backend_never_local_clears(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "remote.py"
+        target.write_text("a\n", encoding="utf-8")
+        verifier = TurnFileMutationVerifier(
+            resolve_backend=lambda _tid: ("ssh", "SSHSession", "posix"),
+            use_subprocess_fingerprint=False,
+        )
+        verifier.reset_turn(1)
+        verifier.record_tool_outcome(
+            tool_name="write_file",
+            effective_args={"path": "remote.py", "content": "b\n"},
+            effective_task_id="default",
+            raw_result=json.dumps({"error": "fail"}),
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=True,
+            turn_generation=1,
+        )
+        target.write_text("b\n", encoding="utf-8")
+        verifier.reconcile_content_transitions(task_id="default")
+        assert "remote.py" in verifier.finalize_failed_dict()
+
+
+class TestRegistryDispatchAuthority:
+    def test_handle_function_call_middleware_short_circuit_not_dispatched(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.chdir(tmp_path)
+
+        def _short_circuit(name, args, execute, **kwargs):
+            return json.dumps({"success": True, "bytes_written": 12})
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            _short_circuit,
+        )
+        from model_tools import (
+            begin_tool_registry_dispatch_tracking,
+            end_tool_registry_dispatch_tracking,
+            handle_function_call,
+            tool_registry_was_dispatched,
+        )
+
+        token = begin_tool_registry_dispatch_tracking()
+        try:
+            handle_function_call(
+                "write_file",
+                {"path": "never.txt", "content": "x"},
+                task_id="default",
+                skip_pre_tool_call_hook=True,
+            )
+            dispatched = tool_registry_was_dispatched()
+        finally:
+            end_tool_registry_dispatch_tracking(token)
+        assert not dispatched
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "a.txt", "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "first"}),
+            is_error=True,
+            raw_result=json.dumps({"error": "first"}),
+            dispatch=DispatchTriState.DISPATCHED.value,
+        )
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": "never.txt", "content": "x"},
+            json.dumps({"success": True, "bytes_written": 12}),
+            is_error=False,
+            dispatch=DispatchTriState.NOT_DISPATCHED.value,
+        )
+        sync_legacy_failed_state(agent)
+        assert any(k.endswith("a.txt") for k in agent._turn_failed_file_mutations)

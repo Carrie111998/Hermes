@@ -683,7 +683,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     results = [None] * num_tools
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
-            results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
+            results[i] = (name, args, block_result, 0.0, True, True, False, middleware_trace)
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
@@ -720,21 +720,33 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
+        _registry_dispatched = False
         try:
             try:
-                _prepare_file_mutation_dispatch(
-                    agent, function_name, function_args, effective_task_id,
+                from model_tools import (
+                    begin_tool_registry_dispatch_tracking,
+                    end_tool_registry_dispatch_tracking,
+                    tool_registry_was_dispatched,
                 )
-                result = agent._invoke_tool(
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                    tool_call.id,
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                    skip_tool_request_middleware=True,
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+
+                _dispatch_token = begin_tool_registry_dispatch_tracking()
+                try:
+                    _prepare_file_mutation_dispatch(
+                        agent, function_name, function_args, effective_task_id,
+                    )
+                    result = agent._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                        skip_tool_request_middleware=True,
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
+                finally:
+                    _registry_dispatched = tool_registry_was_dispatched()
+                    end_tool_registry_dispatch_tracking(_dispatch_token)
             except KeyboardInterrupt:
                 try:
                     agent.interrupt("keyboard interrupt")
@@ -751,7 +763,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
-                results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
+                results[index] = (function_name, function_args, result, duration, True, False, False, middleware_trace)
                 return
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
@@ -762,7 +774,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
-            results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
+            results[index] = (
+                function_name,
+                function_args,
+                result,
+                duration,
+                is_error,
+                False,
+                _registry_dispatched,
+                middleware_trace,
+            )
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
@@ -1037,7 +1058,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 effective_task_id=effective_task_id,
             )
         else:
-            function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            function_name, function_args, function_result, tool_duration, is_error, blocked, registry_dispatched, middleware_trace = r
             progress_function_name = function_name
             if blocked:
                 effect_disposition = "none"
@@ -1067,7 +1088,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 model_result=function_result,
                 is_error=is_error,
                 blocked=blocked,
-                registry_dispatched=True,
+                registry_dispatched=registry_dispatched,
                 result_missing=False,
                 effective_task_id=effective_task_id,
             )
@@ -1377,6 +1398,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool start callback error: {cb_err}")
 
+        _registry_dispatched = False
+
         # Checkpoint: snapshot working dir before file-mutating tools
         if not _execution_blocked and function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
             try:
@@ -1675,23 +1698,35 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=agent._print_fn)
                 spinner.start()
             _spinner_result = None
+            _registry_dispatched = False
             try:
-                _prepare_file_mutation_dispatch(
-                    agent, function_name, function_args, effective_task_id,
+                from model_tools import (
+                    begin_tool_registry_dispatch_tracking,
+                    end_tool_registry_dispatch_tracking,
+                    tool_registry_was_dispatched,
                 )
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+
+                _dispatch_token = begin_tool_registry_dispatch_tracking()
+                try:
+                    _prepare_file_mutation_dispatch(
+                        agent, function_name, function_args, effective_task_id,
+                    )
+                    function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
+                finally:
+                    _registry_dispatched = tool_registry_was_dispatched()
+                    end_tool_registry_dispatch_tracking(_dispatch_token)
                 _spinner_result = function_result
             except KeyboardInterrupt:
                 function_result = _emit_cancelled_terminal_post_tool_call(
@@ -1721,22 +1756,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
-                _prepare_file_mutation_dispatch(
-                    agent, function_name, function_args, effective_task_id,
+                from model_tools import (
+                    begin_tool_registry_dispatch_tracking,
+                    end_tool_registry_dispatch_tracking,
+                    tool_registry_was_dispatched,
                 )
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+
+                _dispatch_token = begin_tool_registry_dispatch_tracking()
+                try:
+                    _prepare_file_mutation_dispatch(
+                        agent, function_name, function_args, effective_task_id,
+                    )
+                    function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
+                finally:
+                    _registry_dispatched = tool_registry_was_dispatched()
+                    end_tool_registry_dispatch_tracking(_dispatch_token)
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
                     agent,
@@ -1822,7 +1868,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     model_result=function_result,
                     is_error=_is_error_result,
                     blocked=_execution_blocked,
-                    registry_dispatched=True,
+                    registry_dispatched=_registry_dispatched,
                     result_missing=False,
                     effective_task_id=effective_task_id,
                 )
