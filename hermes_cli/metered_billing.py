@@ -89,9 +89,23 @@ def record_usage(
         raise ValueError("usage requires positive quantity and source evidence")
     ensure_schema(conn)
     existing = conn.execute(
-        "SELECT id FROM usage_events WHERE idempotency_key = ?", (idempotency_key,)
+        "SELECT * FROM usage_events WHERE idempotency_key = ?", (idempotency_key,)
     ).fetchone()
     if existing:
+        expected_evidence = json.dumps(evidence, sort_keys=True)
+        if (
+            str(existing["meter_id"]) != meter_id
+            or str(existing["customer_id"]) != customer_id
+            or int(existing["quantity"]) != quantity
+            or str(existing["evidence_json"]) != expected_evidence
+            or (
+                occurred_at is not None
+                and int(existing["occurred_at"]) != int(occurred_at)
+            )
+        ):
+            raise ValueError(
+                "usage idempotency key was reused with different event parameters"
+            )
         return str(existing["id"])
     meter = conn.execute(
         "SELECT status FROM billing_meters WHERE id = ?", (meter_id,)
