@@ -97,6 +97,50 @@ class ClassifiedError:
         return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
 
 
+def provider_failure_user_message(reason: "FailoverReason | str | None") -> str:
+    """Return a short provider failure suitable for a human-facing chat UI.
+
+    Provider exception bodies belong in logs: they are noisy, inconsistent,
+    and can contain account or request details.  Surfaces that already know
+    the classified failure reason should use this copy instead of forwarding
+    the raw exception string.
+    """
+    value = reason.value if isinstance(reason, FailoverReason) else str(reason or "").strip().lower()
+
+    if value in {FailoverReason.auth.value, FailoverReason.auth_permanent.value}:
+        return (
+            "⚠️ Provider authentication failed. Check the configured credentials; "
+            "raw provider details are in the gateway logs."
+        )
+    if value == FailoverReason.billing.value:
+        return (
+            "⚠️ Provider billing or credits are exhausted. Check the configured "
+            "account; raw provider details are in the gateway logs."
+        )
+    if value in {FailoverReason.rate_limit.value, FailoverReason.upstream_rate_limit.value}:
+        return (
+            "⏱️ The model provider is rate-limiting requests. "
+            "Please wait a moment and try again."
+        )
+    if value == FailoverReason.model_not_found.value:
+        return (
+            "⚠️ The configured model is unavailable from this provider. Check the "
+            "model selection; raw provider details are in the gateway logs."
+        )
+    if value in {
+        FailoverReason.content_policy_blocked.value,
+        FailoverReason.provider_policy_blocked.value,
+    }:
+        return (
+            "⚠️ The model provider rejected the request. I kept the raw provider "
+            "error out of chat; check gateway logs for details or try rephrasing."
+        )
+    return (
+        "⚠️ The model provider failed after retries. I kept raw provider details "
+        "out of chat; check gateway logs for diagnostics."
+    )
+
+
 
 # ── Provider-specific patterns ──────────────────────────────────────────
 

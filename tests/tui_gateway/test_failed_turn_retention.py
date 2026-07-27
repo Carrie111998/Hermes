@@ -171,6 +171,70 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     assert session["running"] is False
 
 
+def test_classified_provider_error_keeps_raw_detail_out_of_replay(
+    emits, turn_env
+):
+    raw_detail = "HTTP 401: Missing Authentication header for account abc"
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {
+            "final_response": raw_detail,
+            "error": raw_detail,
+            "failed": True,
+            "failure_reason": "auth",
+        },
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    payload = _events(emits, "message.complete")[0]
+    expected = (
+        "⚠️ Provider authentication failed. Check the configured credentials; "
+        "raw provider details are in the gateway logs."
+    )
+    assert payload["status"] == "error"
+    assert payload["text"] == expected
+    assert payload["error"] == expected
+    assert raw_detail not in str(payload)
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["error"] == expected
+    assert raw_detail not in str(snapshot)
+
+
+def test_non_auth_failure_keeps_actionable_final_response(emits, turn_env):
+    guidance = (
+        "API call failed after 3 retries: connection lost\n\n"
+        "Try writing large files in smaller sections."
+    )
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {
+            "final_response": guidance,
+            "error": "connection lost",
+            "failed": True,
+            "failure_reason": "timeout",
+        },
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    payload = _events(emits, "message.complete")[0]
+    assert payload["text"] == guidance
+    assert payload["error"] == "connection lost"
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["error"] == "connection lost"
+
+
 def test_completed_turn_still_clears_inflight(emits, turn_env):
     agent = types.SimpleNamespace(
         session_id="session-key",

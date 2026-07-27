@@ -1050,3 +1050,21 @@ class TestExpandedOverflowPatterns:
 
 
 
+def test_provider_failure_user_message_keeps_raw_auth_detail_out_of_chat():
+    from agent.error_classifier import provider_failure_user_message
+
+    message = provider_failure_user_message(FailoverReason.auth)
+
+    assert message == (
+        "⚠️ Provider authentication failed. Check the configured credentials; "
+        "raw provider details are in the gateway logs."
+    )
+
+
+def test_provider_failure_user_message_distinguishes_billing_from_auth():
+    from agent.error_classifier import provider_failure_user_message
+
+    message = provider_failure_user_message(FailoverReason.billing)
+
+    assert "billing or credits are exhausted" in message
+    assert "authentication failed" not in message

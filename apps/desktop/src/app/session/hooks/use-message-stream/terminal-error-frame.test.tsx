@@ -84,6 +84,7 @@ describe('terminal error message.complete frames', () => {
 
     const bubble = lastAssistant()
     expect(bubble?.error).toBe('invalid model slug')
+    expect(chatMessageText(bubble!)).toBe('invalid model slug')
     expect(getState().busy).toBe(false)
     expect(getState().awaitingResponse).toBe(false)
   })

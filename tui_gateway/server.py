@@ -9316,6 +9316,8 @@ def _run_prompt_submit(
 
             last_reasoning = None
             status_note = None
+            failure_reason = None
+            sanitized_provider_failure = False
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
                     with session["history_lock"]:
@@ -9359,6 +9361,19 @@ def _run_prompt_submit(
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                failure_reason = result.get("failure_reason")
+                sanitized_provider_failure = (
+                    status == "error"
+                    and failure_reason in {"auth", "auth_permanent"}
+                )
+                if sanitized_provider_failure:
+                    # Human-facing desktop/TUI surfaces should not receive raw
+                    # authentication exception bodies. Other classified
+                    # failures can carry useful recovery guidance in
+                    # final_response, so keep those intact.
+                    from agent.error_classifier import provider_failure_user_message
+
+                    raw = provider_failure_user_message(failure_reason)
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty
@@ -9412,13 +9427,15 @@ def _run_prompt_submit(
                     # inflight payload is the only carrier of the failure.
                     _fail_inflight_turn(
                         session,
-                        result.get("error") if isinstance(result, dict) else raw,
+                        raw if sanitized_provider_failure else (
+                            result.get("error") if isinstance(result, dict) else raw
+                        ),
                     )
                     turn_error_retained = True
                 else:
                     _clear_inflight_turn(session)
             if status == "error":
-                payload["error"] = str(
+                payload["error"] = raw if sanitized_provider_failure else str(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
