@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from agent.usage_pricing import (
@@ -636,3 +637,110 @@ def test_deepseek_v4_flash_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $0.14/M + 500K output × $0.28/M = $0.14 + $0.14 = $0.28
     assert float(result.amount_usd) == 0.28
+
+
+def test_deepseek_peak_hour_multiplier_peak_window_1(monkeypatch) -> None:
+    """Peak window 1 (01:00-04:00 UTC) applies 2x multiplier."""
+    from agent.usage_pricing import _deepseek_peak_hour_multiplier
+
+    for hour in (1, 2, 3, 4):
+        peak_time = datetime(2026, 7, 27, hour, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            "agent.usage_pricing._UTC_NOW",
+            lambda: peak_time,
+        )
+        result = _deepseek_peak_hour_multiplier()
+        assert float(result) == 2.0, f"hour={hour} should be peak"
+
+
+def test_deepseek_peak_hour_multiplier_peak_window_2(monkeypatch) -> None:
+    """Peak window 2 (06:00-10:00 UTC) applies 2x multiplier."""
+    from agent.usage_pricing import _deepseek_peak_hour_multiplier
+
+    for hour in range(6, 11):
+        peak_time = datetime(2026, 7, 27, hour, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            "agent.usage_pricing._UTC_NOW",
+            lambda: peak_time,
+        )
+        result = _deepseek_peak_hour_multiplier()
+        assert float(result) == 2.0, f"hour={hour} should be peak"
+
+
+def test_deepseek_peak_hour_multiplier_off_peak(monkeypatch) -> None:
+    """Off-peak hours apply 1x (standard) multiplier."""
+    from agent.usage_pricing import _deepseek_peak_hour_multiplier
+
+    for hour in (0, 5, 11, 12, 14, 18, 22, 23):
+        off_peak_time = datetime(2026, 7, 27, hour, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            "agent.usage_pricing._UTC_NOW",
+            lambda: off_peak_time,
+        )
+        result = _deepseek_peak_hour_multiplier()
+        assert float(result) == 1.0, f"hour={hour} should be off-peak"
+
+
+def test_estimate_usage_cost_deepseek_peak_hour_applies_multiplier(monkeypatch) -> None:
+    """Estimate for deepseek provider doubles during a peak hour."""
+    peak_time = datetime(2026, 7, 27, 2, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "agent.usage_pricing._UTC_NOW",
+        lambda: peak_time,
+    )
+
+    result = estimate_usage_cost(
+        "deepseek-v4-flash",
+        CanonicalUsage(input_tokens=1000000, output_tokens=500000),
+        provider="deepseek",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # Standard: 1M input × $0.14/M + 500K output × $0.28/M = $0.28
+    # Peak: $0.28 × 2 = $0.56
+    assert float(result.amount_usd) == 0.56
+    assert any("peak-hour" in n for n in result.notes)
+
+
+def test_estimate_usage_cost_deepseek_off_peak_standard_rate(monkeypatch) -> None:
+    """Estimate for deepseek provider uses standard rate during off-peak."""
+    off_peak_time = datetime(2026, 7, 27, 11, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "agent.usage_pricing._UTC_NOW",
+        lambda: off_peak_time,
+    )
+
+    result = estimate_usage_cost(
+        "deepseek-v4-flash",
+        CanonicalUsage(input_tokens=1000000, output_tokens=500000),
+        provider="deepseek",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # Standard: 1M input × $0.14/M + 500K output × $0.28/M = $0.28
+    assert float(result.amount_usd) == 0.28
+    assert not any("peak-hour" in n for n in result.notes)
+
+
+def test_estimate_usage_cost_non_deepseek_not_affected_by_peak_hour(monkeypatch) -> None:
+    """Non-DeepSeek providers are NOT affected by peak-hour multiplier."""
+    peak_time = datetime(2026, 7, 27, 2, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "agent.usage_pricing._UTC_NOW",
+        lambda: peak_time,
+    )
+
+    result = estimate_usage_cost(
+        "gpt-4o",
+        CanonicalUsage(input_tokens=1000000, output_tokens=500000),
+        provider="openai",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M input × $2.50/M + 500K output × $10.00/M = $2.50 + $5.00 = $7.50
+    # (no multiplier should be applied for non-deepseek providers)
+    assert float(result.amount_usd) == 7.50
+    assert not any("peak-hour" in n for n in result.notes)

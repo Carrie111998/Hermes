@@ -100,6 +100,21 @@ class CostResult:
 _UTC_NOW = lambda: datetime.now(timezone.utc)
 
 
+def _deepseek_peak_hour_multiplier() -> Decimal:
+    """Return the peak-hour rate multiplier for DeepSeek pricing.
+
+    DeepSeek announced peak-hour pricing on 2026-07-26 with 2x rate multiplier
+    during these daily windows (UTC):
+      - 01:00 – 04:00  (hours 1, 2, 3, 4)
+      - 06:00 – 10:00  (hours 6, 7, 8, 9, 10)
+    All other hours: standard rate (1.0x).
+    """
+    hour = _UTC_NOW().hour
+    if (1 <= hour < 5) or (6 <= hour < 11):
+        return Decimal("2")
+    return Decimal("1")
+
+
 # Official docs snapshot entries. Models whose published pricing and cache
 # semantics are stable enough to encode exactly.
 _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
@@ -1257,6 +1272,14 @@ def estimate_usage_cost(
         amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
     if entry.request_cost is not None and usage.request_count:
         amount += Decimal(usage.request_count) * entry.request_cost
+
+    # DeepSeek peak-hour pricing: 2x multiplier during peak windows (01:00-04:00
+    # and 06:00-10:00 UTC daily). Announcement: DeepSeek 2026-07-26.
+    if route.provider == "deepseek":
+        peak_mult = _deepseek_peak_hour_multiplier()
+        if peak_mult > 1:
+            amount *= peak_mult
+            notes.append(f"DeepSeek peak-hour pricing ({peak_mult}x multiplier)")
 
     status: CostStatus = "estimated"
     label = f"~${amount:.2f}"
