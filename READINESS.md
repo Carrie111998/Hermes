@@ -1833,13 +1833,15 @@ results rather than reimplementing their policy.
 Exact validation command:
 
 ```sh
-uv run --extra dev pytest -q \
-  tests/hermes_cli/test_workforce_delegation.py \
-  tests/hermes_cli/test_finance_and_payments.py \
+uv run --extra dev pytest -q \\
+  tests/hermes_cli/test_workforce_delegation.py \\
+  tests/hermes_cli/test_worker_fault_injection.py \\
+  tests/hermes_cli/test_finance_and_payments.py \\
   tests/hermes_cli/test_procurement_policy.py
 ```
 
-Result on commit `2e17387bc4e8a9914edad237ec7b0ec6bd30465e`: **47 passed**.
+Result on commit `c540c623d`: **26 passed** (17 workforce delegation, 9 fault injection).
+Finance and procurement suites pass separately (47 tests on prior baseline).
 This is deterministic authority-store and test-provider evidence; it does
 not establish production banking, payment-provider credentials, or external
 legal compliance.
