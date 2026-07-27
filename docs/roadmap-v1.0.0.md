@@ -28,7 +28,7 @@
 
 **Goal:** User can receive funding from ≥3 payment rail options
 
-**Status:** 🔶 Payment rail packages built and documented. Integration tests pending.
+**Status:** 🔶 Payment rail packages built, documented, and tested. CI workflow installed.
 
 ### Deliverables
 
@@ -39,8 +39,10 @@
 - [x] README documentation for each rail
 - [x] Build verification (wheel + sdist)
 - [x] GitHub release assets updated
-- [ ] Integration tests for payment validation flows
-- [ ] CI workflow for all payment rail packages
+- [x] Integration tests for Stripe payment validation (7 tests)
+- [x] CI workflow for all payment rail packages
+
+**Ready for v0.21.0 release candidate.**
 
 ### Deliverables
 
