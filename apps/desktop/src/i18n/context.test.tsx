@@ -14,6 +14,12 @@ function LanguageProbe({ target = 'zh' }: { target?: Locale }) {
       <p data-testid="locale">{locale}</p>
       <p data-testid="label">{t.language.label}</p>
       <p data-testid="save">{t.common.save}</p>
+      <p data-testid="update-ready">{t.notifications.updateReadyMessage(2)}</p>
+      <p data-testid="web-search-selected">{t.settings.toolsets.webCapabilitySelectedMessage('SearchCo', 'search')}</p>
+      <p data-testid="web-extract-selected">
+        {t.settings.toolsets.webCapabilitySelectedMessage('ExtractCo', 'extract')}
+      </p>
+      <p data-testid="default-dir-updated">{t.settings.sessions.defaultDirUpdated}</p>
       <p data-testid="loading">{String(isLoadingConfig)}</p>
       <p data-testid="saving">{String(isSavingLocale)}</p>
       <p data-testid="save-error">{saveError?.message ?? ''}</p>
@@ -133,6 +139,52 @@ describe('I18nProvider', () => {
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
+  it('loads es from a regional display.language config value', async () => {
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({ display: { language: 'es-MX' } }),
+      saveConfig: vi.fn()
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+    expect(screen.getByTestId('locale').textContent).toBe('es')
+    expect(screen.getByTestId('save').textContent).toBe('Guardar')
+    expect(screen.getByTestId('update-ready').textContent).toBe('2 cambios nuevos disponibles.')
+    expect(configClient.saveConfig).not.toHaveBeenCalled()
+  })
+
+  it('renders Spanish web capability success messages without English enum values', () => {
+    render(
+      <I18nProvider configClient={null} initialLocale="es">
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    expect(screen.getByTestId('web-search-selected').textContent).toBe(
+      'SearchCo ahora se encarga de las búsquedas web.'
+    )
+    expect(screen.getByTestId('web-extract-selected').textContent).toBe(
+      'ExtractCo ahora se encarga de la extracción de contenido web.'
+    )
+  })
+
+  it('tells Spanish users that a new chat is required after changing the default project directory', () => {
+    render(
+      <I18nProvider configClient={null} initialLocale="es">
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    expect(screen.getByTestId('default-dir-updated').textContent).toBe(
+      'Directorio de proyecto predeterminado actualizado; inicia un chat nuevo (Ctrl/⌘+N) para que el cambio surta efecto.'
+    )
+  })
+
   it('does not overwrite unsupported configured languages', async () => {
     const configClient: I18nConfigClient = {
       getConfig: vi.fn().mockResolvedValue({ display: { language: 'de' } }),
@@ -225,6 +277,33 @@ describe('I18nProvider', () => {
     await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
     expect(document.documentElement.dir).toBe('ltr')
     expect(document.documentElement.lang).toBe('en')
+  })
+
+  it('saves Spanish as canonical es in display.language', async () => {
+    const saveConfig = vi.fn().mockResolvedValue({ ok: true })
+
+    const configClient: I18nConfigClient = {
+      getConfig: vi
+        .fn()
+        .mockResolvedValueOnce({ display: { language: 'en' } })
+        .mockResolvedValueOnce({ display: { language: 'en', skin: 'mono' } }),
+      saveConfig
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe target="es" />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+    fireEvent.click(screen.getByRole('button', { name: 'switch' }))
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
+
+    expect(saveConfig).toHaveBeenCalledWith({ display: { language: 'es', skin: 'mono' } })
+    expect(screen.getByTestId('locale').textContent).toBe('es')
+    expect(screen.getByTestId('label').textContent).toBe('Idioma')
+    expect(screen.getByTestId('update-ready').textContent).toBe('2 cambios nuevos disponibles.')
   })
 
   it('rolls back the visible locale when saving fails', async () => {
