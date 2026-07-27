@@ -18748,6 +18748,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.pin_peer_name",
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
+        "honcho.observation",
     )
     _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
 
@@ -18779,6 +18780,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
+                "honcho.observation": (
+                    bool(hcfg.user_observe_me),
+                    bool(hcfg.user_observe_others),
+                    bool(hcfg.ai_observe_me),
+                    bool(hcfg.ai_observe_others),
+                ),
             }
             cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
             return dict(values)

@@ -358,6 +358,7 @@ class TestExtractCacheBustingConfig:
                 "honcho.pin_peer_name": True,
                 "honcho.runtime_peer_prefix": "tg_",
                 "honcho.user_peer_aliases": [("123", "eri")],
+                "honcho.observation": (True, False, True, True),
             }
 
         monkeypatch.setattr(GatewayRunner, "_extract_honcho_cache_busting_config", _fake)
@@ -367,6 +368,7 @@ class TestExtractCacheBustingConfig:
         assert calls == [True]
         assert out["honcho.peer_name"] == "eri"
         assert out["honcho.user_peer_aliases"] == [("123", "eri")]
+        assert out["honcho.observation"] == (True, False, True, True)
 
     def test_memory_provider_change_busts_signature(self, monkeypatch):
         """Switching memory.provider must itself change the cache-busting
@@ -404,6 +406,10 @@ class TestExtractCacheBustingConfig:
             pin_peer_name = False
             runtime_peer_prefix = "tg_"
             user_peer_aliases = {"123": "eri"}
+            user_observe_me = True
+            user_observe_others = False
+            ai_observe_me = True
+            ai_observe_others = True
 
             @classmethod
             def from_global_config(cls, config_path=None):
@@ -422,6 +428,7 @@ class TestExtractCacheBustingConfig:
 
         assert first == second
         assert first["honcho.user_peer_aliases"] == [("123", "eri")]
+        assert first["honcho.observation"] == (True, False, True, True)
         assert parse_calls == [config_path]
 
         config_path.write_text("{\n  \"changed\": true\n}")

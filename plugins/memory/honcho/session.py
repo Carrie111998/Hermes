@@ -209,11 +209,14 @@ class HonchoSessionManager:
 
             session.add_peers([(user_peer, user_config), (assistant_peer, ai_config)])
 
-            # Sync back: server-side config (set via Honcho UI) wins over
-            # local defaults. Read the effective config after add_peers.
-            # Note: observation booleans are manager-scoped, not per-session.
-            # Last session init wins. Fine for CLI; gateway should scope per-session.
-            try:
+            if self._config is not None and self._config.observation_explicit:
+                # add_peers() preserves existing session-peer settings. Apply
+                # explicit local settings so config edits update old sessions.
+                session.set_peer_configuration(user_peer, user_config)
+                session.set_peer_configuration(assistant_peer, ai_config)
+            else:
+                # Without an explicit local policy, retain server-managed values.
+                # Note: these booleans are manager-scoped, not per-session.
                 server_user = session.get_peer_configuration(user_peer)
                 server_ai = session.get_peer_configuration(assistant_peer)
                 if server_user.observe_me is not None:
@@ -229,11 +232,9 @@ class HonchoSessionManager:
                     self._user_observe_me, self._user_observe_others,
                     self._ai_observe_me, self._ai_observe_others,
                 )
-            except Exception as e:
-                logger.debug("Honcho get_peer_configuration failed (using local config): %s", e)
         except Exception as e:
             logger.warning(
-                "Honcho session '%s' add_peers failed (non-fatal): %s",
+                "Honcho session '%s' peer configuration failed (non-fatal): %s",
                 session_id, e,
             )
 

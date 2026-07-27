@@ -601,6 +601,7 @@ class TestObservationModeMigration:
         }))
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.observation_mode == "unified"
+        assert cfg.observation_explicit is False
 
     def test_new_config_defaults_to_directional(self, tmp_path):
         """Config with no host block and no credentials → 'directional' (new default)."""
@@ -608,6 +609,7 @@ class TestObservationModeMigration:
         cfg_file.write_text(json.dumps({}))
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.observation_mode == "directional"
+        assert cfg.observation_explicit is False
 
     def test_explicit_directional_respected(self, tmp_path):
         """Existing config with explicit observationMode → uses what's set."""
@@ -618,6 +620,7 @@ class TestObservationModeMigration:
         }))
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.observation_mode == "directional"
+        assert cfg.observation_explicit is True
 
     def test_explicit_unified_respected(self, tmp_path):
         """Existing config with explicit observationMode unified → stays unified."""
@@ -629,6 +632,7 @@ class TestObservationModeMigration:
         }))
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.observation_mode == "unified"
+        assert cfg.observation_explicit is True
 
     def test_granular_observation_overrides_preset(self, tmp_path):
         """Explicit observation object overrides both preset and migration default."""
@@ -650,6 +654,7 @@ class TestObservationModeMigration:
         assert cfg.user_observe_others is False
         assert cfg.ai_observe_me is False
         assert cfg.ai_observe_others is True
+        assert cfg.observation_explicit is True
 
 
 class TestGetHonchoClient:

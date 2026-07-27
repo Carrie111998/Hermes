@@ -6,6 +6,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from plugins.memory.honcho.client import HonchoClientConfig
 from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
@@ -97,6 +98,66 @@ class TestHonchoSession:
         original = session.updated_at
         session.clear()
         assert session.updated_at >= original
+
+
+class TestSessionPeerObservationConfig:
+    def test_explicit_local_config_updates_existing_session(self):
+        cfg = HonchoClientConfig(
+            observation_explicit=True,
+            user_observe_me=True,
+            user_observe_others=False,
+            ai_observe_me=True,
+            ai_observe_others=True,
+        )
+        mgr = HonchoSessionManager(config=cfg)
+        honcho = MagicMock()
+        remote_session = honcho.session.return_value
+        remote_session.context.return_value = SimpleNamespace(messages=[])
+        user_peer = MagicMock()
+        assistant_peer = MagicMock()
+
+        with patch.object(
+            HonchoSessionManager,
+            "honcho",
+            new_callable=lambda: property(lambda self: honcho),
+        ):
+            mgr._get_or_create_honcho_session("session", user_peer, assistant_peer)
+
+        assert remote_session.set_peer_configuration.call_count == 2
+        user_call, ai_call = remote_session.set_peer_configuration.call_args_list
+        assert user_call.args[0] is user_peer
+        assert user_call.args[1].observe_me is True
+        assert user_call.args[1].observe_others is False
+        assert ai_call.args[0] is assistant_peer
+        assert ai_call.args[1].observe_me is True
+        assert ai_call.args[1].observe_others is True
+        remote_session.get_peer_configuration.assert_not_called()
+
+    def test_unspecified_local_config_uses_server_values(self):
+        cfg = HonchoClientConfig(observation_explicit=False)
+        mgr = HonchoSessionManager(config=cfg)
+        honcho = MagicMock()
+        remote_session = honcho.session.return_value
+        remote_session.context.return_value = SimpleNamespace(messages=[])
+        remote_session.get_peer_configuration.side_effect = [
+            SimpleNamespace(observe_me=False, observe_others=True),
+            SimpleNamespace(observe_me=True, observe_others=False),
+        ]
+
+        with patch.object(
+            HonchoSessionManager,
+            "honcho",
+            new_callable=lambda: property(lambda self: honcho),
+        ):
+            mgr._get_or_create_honcho_session("session", MagicMock(), MagicMock())
+
+        remote_session.set_peer_configuration.assert_not_called()
+        assert (
+            mgr._user_observe_me,
+            mgr._user_observe_others,
+            mgr._ai_observe_me,
+            mgr._ai_observe_others,
+        ) == (False, True, True, False)
 
 
 # ---------------------------------------------------------------------------
