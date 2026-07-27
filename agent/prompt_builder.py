@@ -1006,6 +1006,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
+    env = None
     try:
         config = _get_env_config()
         # Build the environment the same way tools/terminal_tool.py does for a
@@ -1039,7 +1040,10 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
+                # This is a one-command introspection probe, not a user
+                # workspace. It must never inherit the long-lived default
+                # container contract or survive as a bridge-network sleeper.
+                "container_persistent": False,
                 "modal_mode": config.get("modal_mode", "auto"),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
@@ -1047,8 +1051,8 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_env": config.get("docker_env", {}),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_extra_args": config.get("docker_extra_args", []),
-                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                "docker_persist_across_processes": False,
+                "docker_orphan_reaper": False,
             }
 
         env = _create_environment(
@@ -1082,6 +1086,17 @@ def _probe_remote_backend(env_type: str) -> str | None:
         logger.debug("Backend probe failed: %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        if env is not None:
+            try:
+                cleanup = getattr(env, "cleanup", None)
+                if callable(cleanup):
+                    cleanup()
+            except Exception as e:
+                # Prompt construction must remain best-effort. The ephemeral
+                # config above is the primary lifecycle guarantee; cleanup
+                # failures are diagnostics, not prompt failures.
+                logger.debug("Backend probe cleanup failed: %s", e)
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}

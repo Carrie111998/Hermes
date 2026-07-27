@@ -1330,6 +1330,8 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
 
         class _FakeEnv:
+            cleaned = False
+
             def execute(self, cmd, timeout=None):
                 return {
                     "returncode": 0,
@@ -1339,11 +1341,16 @@ class TestEnvironmentHints:
                     ),
                 }
 
+            def cleanup(self):
+                self.cleaned = True
+
         created = {}
 
         def _fake_create_environment(*, env_type, **kwargs):
             created["env_type"] = env_type
-            return _FakeEnv()
+            created["container_config"] = kwargs["container_config"]
+            created["env"] = _FakeEnv()
+            return created["env"]
 
         # Patch the REAL factory in tools.terminal_tool — the probe imports it
         # locally, so the import itself must succeed (the bug was here).
@@ -1355,6 +1362,36 @@ class TestEnvironmentHints:
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
+        assert created["container_config"]["container_persistent"] is False
+        assert created["container_config"]["docker_persist_across_processes"] is False
+        assert created["container_config"]["docker_orphan_reaper"] is False
+        assert created["env"].cleaned is True
+
+    def test_probe_remote_backend_cleans_up_after_execute_failure(self, monkeypatch):
+        import agent.prompt_builder as _pb
+        import tools.terminal_tool as _tt
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        class _FailingEnv:
+            cleaned = False
+
+            def execute(self, cmd, timeout=None):
+                raise TimeoutError("probe timed out")
+
+            def cleanup(self):
+                self.cleaned = True
+
+        env = _FailingEnv()
+        monkeypatch.setattr(
+            _tt,
+            "_create_environment",
+            lambda **kwargs: env,
+        )
+
+        assert _pb._probe_remote_backend("docker") is None
+        assert env.cleaned is True
 
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
@@ -1704,5 +1741,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
