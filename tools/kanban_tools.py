@@ -525,6 +525,21 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
     board = args.get("board")
     try:
+        _authorize_kanban_mutation(
+            "list",
+            {
+                "operation": "list",
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+                "assignee": assignee,
+                "status": status,
+                "tenant": tenant,
+                "include_archived": include_archived,
+                "limit": limit,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_list authorization denied: {exc}")
+    try:
         kb, conn = _connect(board=board)
         try:
             # Match CLI list: dependencies that cleared since the last
@@ -1526,6 +1541,17 @@ def _handle_unblock(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     board = args.get("board")
+    try:
+        _authorize_kanban_mutation(
+            "unblock",
+            {
+                "operation": "unblock",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_unblock authorization denied: {exc}")
     try:
         kb, conn = _connect(board=board)
         try:
