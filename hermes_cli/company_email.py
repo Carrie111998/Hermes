@@ -234,8 +234,30 @@ def record_send(
     message_id = str(response.get("message_id") or "")
     if not message_id:
         raise CompanyEmailError("AgentMail send response omitted message_id")
-    operation_id = f"email_{uuid.uuid4().hex}"
     recipients = sorted(str(item).strip().lower() for item in payload["to"])
+    recipients_json = json.dumps(recipients, separators=(",", ":"))
+    subject_sha256 = hashlib.sha256(str(payload["subject"]).encode()).hexdigest()
+    body_sha256 = hashlib.sha256(str(payload["text"]).encode()).hexdigest()
+    existing = conn.execute(
+        """SELECT * FROM company_email_operations
+            WHERE idempotency_key=?""",
+        (payload["idempotency_key"],),
+    ).fetchone()
+    if existing is not None:
+        if (
+            str(existing["organization_id"]) != organization_id
+            or str(existing["objective_id"]) != objective_id
+            or str(existing["action_id"]) != action_id
+            or str(existing["inbox_id"]) != inbox_id
+            or str(existing["recipients_json"]) != recipients_json
+            or str(existing["subject_sha256"]) != subject_sha256
+            or str(existing["body_sha256"]) != body_sha256
+        ):
+            raise CompanyEmailError(
+                "email idempotency key was reused with different send parameters"
+            )
+        return str(existing["id"])
+    operation_id = f"email_{uuid.uuid4().hex}"
     with conn:
         conn.execute(
             """INSERT INTO company_email_operations
@@ -247,9 +269,9 @@ def record_send(
                 operation_id, organization_id, objective_id, action_id,
                 "agentmail", inbox_id,
                 message_id, response.get("thread_id"),
-                json.dumps(recipients, separators=(",", ":")),
-                hashlib.sha256(str(payload["subject"]).encode()).hexdigest(),
-                hashlib.sha256(str(payload["text"]).encode()).hexdigest(),
+                recipients_json,
+                subject_sha256,
+                body_sha256,
                 payload["idempotency_key"], "sent",
                 json.dumps(dict(response), separators=(",", ":"), sort_keys=True),
                 int(time.time()),

@@ -177,6 +177,25 @@ def test_governed_email_send_has_provider_readback_and_immutable_lineage(tmp_pat
     assert row["organization_id"] == organization_id
     assert row["message_id"] == "msg_1"
     assert "Thank you" not in row["provider_evidence_json"]
+    assert company_email.record_send(
+        conn,
+        organization_id=organization_id,
+        objective_id="objective_1",
+        action_id="action_1",
+        inbox_id="ceo@agentmail.to",
+        payload=payload,
+        response={"message_id": "msg_1", "thread_id": "thread_1"},
+    ) == row["id"]
+    with pytest.raises(company_email.CompanyEmailError, match="different send parameters"):
+        company_email.record_send(
+            conn,
+            organization_id=organization_id,
+            objective_id="objective_1",
+            action_id="action_1",
+            inbox_id="ceo@agentmail.to",
+            payload={**payload, "text": "changed"},
+            response={"message_id": "msg_1"},
+        )
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         conn.execute(
             "UPDATE company_email_operations SET status='failed' WHERE id=?",
