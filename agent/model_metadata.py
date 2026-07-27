@@ -1846,7 +1846,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
                 models_list = data.get("data", [])
                 for m in models_list:
                     if _model_id_matches(m.get("id", ""), model):
-                        ctx = m.get("max_model_len") or m.get("context_length") or m.get("max_tokens") or m.get("max_input_tokens")
+                        ctx = m.get("max_model_len") or m.get("max_input_tokens") or m.get("context_length") or m.get("max_tokens")
                         if ctx and isinstance(ctx, (int, float)):
                             return int(ctx)
     except Exception:
