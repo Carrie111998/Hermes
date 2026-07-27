@@ -7063,6 +7063,95 @@ def test_sidebar_hydration_inventory_requires_recent_exact_visible_lineage(
     ]
 
 
+def test_sidebar_hydration_inventory_excludes_tasks_visible_before_signed_cutover(
+    db,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 100.0,
+        sidebar_token_factory=_token_factory(
+            "inventory-pre-cutover-token",
+            "inventory-post-cutover-token",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    pre_cutover = _sidebar_candidate(
+        db,
+        native_id="inventory-pre-cutover",
+        eligible_at=90.0,
+    )
+    post_cutover = _sidebar_candidate(
+        db,
+        native_id="inventory-post-cutover",
+        eligible_at=80.0,
+    )
+
+    store.enqueue_sidebar_job(pre_cutover)
+    pre_claim = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.commit_sidebar_job(
+        lease_token=str(pre_claim["lease_token"]),
+        codex_thread_id="inventory-pre-cutover-thread",
+        now=300.0,
+    )
+
+    store.enqueue_sidebar_job(post_cutover)
+    post_claim = store.claim_sidebar_jobs(now=450.0, limit=1)[0]
+    store.commit_sidebar_job(
+        lease_token=str(post_claim["lease_token"]),
+        codex_thread_id="inventory-post-cutover-thread",
+        now=600.0,
+    )
+
+    for index, (candidate, thread_id) in enumerate(
+        (
+            (pre_cutover, "inventory-pre-cutover-thread"),
+            (post_cutover, "inventory-post-cutover-thread"),
+        )
+    ):
+        target_id = _seed_sidebar_codex_target(store, candidate, thread_id)
+        store.create_link(
+            SessionLink(
+                id=f"inventory-cutover-link-{index}",
+                from_session_id=candidate.source_session_id,
+                to_session_id=target_id,
+                relation=Relation.MIRRORS,
+                bridge_id=candidate.bridge_id,
+                source_cursor=None,
+                source_hash=None,
+                created_at=700.0 + index,
+            )
+        )
+
+    store.set_state(
+        "session-bridge:sidebar:create-reservation-cutover:v1",
+        {
+            "version": 1,
+            "applied_at": 500.0,
+            "quarantined_job_ids": [],
+        },
+    )
+
+    inventory = store.list_sidebar_hydration_candidates(
+        now=1_000.0,
+        backfill_days=1,
+        limit=100,
+    )
+
+    post_job = store.get_sidebar_job_for_source(post_cutover.source_session_id)
+    assert post_job is not None
+    assert post_job["created_at"] < 500.0
+    assert inventory == [
+        {
+            "job_id": post_job["id"],
+            "source_session_id": post_cutover.source_session_id,
+            "bridge_id": post_cutover.bridge_id,
+            "codex_thread_id": post_job["codex_thread_id"],
+            "eligible_at": post_cutover.eligible_at,
+            "visible_at": post_job["visible_at"],
+        }
+    ]
+
+
 def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) -> None:
     store, candidate = _visible_sidebar_for_hydration(
         db,

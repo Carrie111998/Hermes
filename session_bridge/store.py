@@ -7716,6 +7716,22 @@ class SessionBridgeStore:
                 "hydration inventory cursor job ID",
             )
 
+        reservation_cutover = self.get_state(
+            _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY
+        )
+        signed_registration_sql = ""
+        signed_registration_at: float | None = None
+        if reservation_cutover is not None:
+            if reservation_cutover.get("version") != 1:
+                raise ValueError(
+                    "sidebar create reservation cutover state has an invalid version"
+                )
+            signed_registration_at = _finite_number(
+                reservation_cutover.get("applied_at"),
+                "sidebar create reservation cutover time",
+            )
+            signed_registration_sql = " AND job.visible_at >= ?"
+
         cutoff = checked_at - backfill_days * 86_400.0
         pagination_sql = ""
         parameters: list[object] = [
@@ -7727,6 +7743,8 @@ class SessionBridgeStore:
             SidebarJobState.VISIBLE.value,
             cutoff,
         ]
+        if signed_registration_at is not None:
+            parameters.append(signed_registration_at)
         if cursor_time is not None and cursor_job is not None:
             pagination_sql = (
                 " AND (job.visible_at > ?"
@@ -7765,6 +7783,7 @@ class SessionBridgeStore:
                      WHERE job.state = ?
                        AND job.eligible_at >= ?
                        AND hydration.id IS NULL
+                       {signed_registration_sql}
                        {pagination_sql}
                   ORDER BY job.visible_at, job.id
                      LIMIT ?""",
