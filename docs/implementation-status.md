@@ -94,6 +94,8 @@ acceptance evidence.
   a rail can be authorized.
 - Payment-provider assessments also reject evidence already expired at
   admission; only currently valid assessments can enter the authorization set.
+- Provider assessments require non-empty auditable provider, jurisdiction, and
+  registry-reference fields before entering the authorization set.
 - Standalone workers enforce the configured deployment role and live worker
   registration even when an embedding supplies a callback; callback injection
   cannot bypass supervised-host boundaries.
@@ -155,8 +157,8 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`a498499a0273adb8d849474e5c461bdf0dd27443` passed 6 Founder/CEO E2E tests, 47
-objective service/runtime/worker tests, and 20 finance/attribution tests,
+`2caf2de7ed8941d6a542cb38bfbee1afee338bb4` passed 6 Founder/CEO E2E tests, 48
+objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
 boundary or broaden the inventory coverage claim.

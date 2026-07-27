@@ -185,9 +185,11 @@ recorded.
   that were already expired at admission.
 - `a498499a0273adb8d849474e5c461bdf0dd27443` — enforced standalone worker
   deployment-role and live-host checks even for injected callbacks.
+- `2caf2de7ed8941d6a542cb38bfbee1afee338bb4` — required auditable provider,
+  jurisdiction, and registry-reference fields for payment assessments.
 - Current-main focused acceptance rerun at baseline
-  `a498499a0273adb8d849474e5c461bdf0dd27443`: 6 Founder/CEO E2E tests, 47
-  objective service/runtime/worker tests, and 20 finance/attribution tests
+  `2caf2de7ed8941d6a542cb38bfbee1afee338bb4`: 6 Founder/CEO E2E tests, 48
+  objective service/runtime/worker tests, and 21 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
 - The containing documentation/control-boundary commit also adds proposal-time
