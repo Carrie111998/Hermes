@@ -24,6 +24,7 @@
   credential-redacted ingress envelopes.
 - External event routing now requires an explicit adapter-validated
   authentication marker before waking objectives.
+- External subscriptions and schedules no longer wake terminal objectives.
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
 - Standalone objective workers fail closed and stop durably when autonomy is

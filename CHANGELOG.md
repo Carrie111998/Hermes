@@ -45,6 +45,8 @@ Hermes Agent history remains available in Git.
   version.
 - Metered invoices now calculate optional tax only from an active,
   organization-owned jurisdiction-matched tax rule and record the gross intent.
+- External subscriptions now skip terminal objectives, preventing stale goals
+  from being reactivated by late events.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.

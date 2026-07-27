@@ -256,9 +256,14 @@ def route_external_event(
                 ),
             }
     rows = conn.execute(
-        """SELECT objective_id FROM objective_event_subscriptions
-           WHERE organization_id=? AND source_type=? AND event_type=?
-             AND status='active' ORDER BY objective_id""",
+        """SELECT s.objective_id FROM objective_event_subscriptions s
+           JOIN objectives o ON o.id=s.objective_id
+           WHERE s.organization_id=? AND s.source_type=? AND s.event_type=?
+             AND s.status='active'
+             AND o.status NOT IN (
+               'closed','cancelled','expired','abandoned','superseded','verified'
+             )
+           ORDER BY s.objective_id""",
         (organization_id, source_type, event_type),
     ).fetchall()
     event_ids = []

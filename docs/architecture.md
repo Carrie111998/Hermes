@@ -48,6 +48,10 @@ organizational, objective, approval, compliance, and execution state is stored
 in structured databases. External state changes are accepted only after
 read-back or deterministic verification.
 
+External subscriptions and schedules join the objective lifecycle before
+emitting wake events. Terminal objectives are never reactivated by late
+external deliveries or missed schedule intervals.
+
 Housekeeping repairs a narrowly defined failure window: if an accepted or
 planned objective has no pending or processing inbox event, it emits one
 versioned reconciliation wake. The versioned dedupe key makes this safe across

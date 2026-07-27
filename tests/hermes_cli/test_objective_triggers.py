@@ -1,9 +1,12 @@
+import time
+
 import pytest
 
 from hermes_cli import (
     objective_triggers,
     objectives_db,
     organization_db,
+    verification_evidence,
 )
 
 
@@ -109,6 +112,38 @@ def test_external_event_with_unvalidated_evidence_is_rejected(company):
             payload={"lead_id": "lead-unvalidated"},
             authentication_evidence={"method": "provider_hmac"},
         )
+
+
+def test_external_events_do_not_wake_terminal_objectives(company):
+    conn, organization_id, objective_id = company
+    objective_triggers.subscribe(
+        conn, organization_id=organization_id, objective_id=objective_id,
+        source_type="crm", event_type="lead.changed",
+    )
+    plan_id = objectives_db.create_plan(
+        conn, objective_id, assumptions=[], tasks=[], dependencies=[], risks=[], created_by="ceo"
+    )
+    objectives_db.transition_objective(conn, objective_id, "planned", actor="ceo")
+    objectives_db.transition_objective(conn, objective_id, "authorized", actor="ceo")
+    objectives_db.transition_objective(conn, objective_id, "executing", actor="ceo")
+    objectives_db.transition_objective(conn, objective_id, "completed", actor="ceo")
+    objectives_db.record_verification(
+        conn, objective_id=objective_id, plan_id=plan_id, verifier="test",
+        method="fixture", verdict="pass",
+        evidence=verification_evidence.build(
+            observer="test", source_kind="deterministic_check",
+            source_reference="fixture", facts={"ok": True}, observed_at=int(time.time()),
+        ),
+    )
+    objectives_db.transition_objective(conn, objective_id, "verified", actor="ceo")
+    result = objective_triggers.route_external_event(
+        conn, organization_id=organization_id, source_type="crm",
+        event_type="lead.changed", source_reference="terminal-lead-1",
+        payload={"lead_id": "terminal-lead-1"},
+        authentication_evidence={"verified": True},
+    )
+    assert result == []
+    assert conn.execute("SELECT COUNT(*) FROM objective_inbox").fetchone()[0] == 0
 
 
 def test_external_receipt_redacts_credential_like_ingress_fields(company):
