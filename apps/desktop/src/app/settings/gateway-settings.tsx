@@ -5,7 +5,15 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip } from '@/components/ui/tooltip'
-import type { DesktopAuthProvider, DesktopCloudAgent, DesktopCloudOrg, DesktopConnectionProbeResult } from '@/global'
+import type {
+  DesktopAuthProvider,
+  DesktopCloudAgent,
+  DesktopCloudOrg,
+  DesktopConnectionConfigInput,
+  DesktopConnectionProbeResult,
+  DesktopRemoteTransportInput,
+  DesktopRemoteTransportMode
+} from '@/global'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import {
@@ -36,13 +44,18 @@ type ProbeStatus = 'idle' | 'probing' | 'done' | 'error'
 // Hermes Cloud discovery lifecycle for the cloud-mode panel.
 type CloudDiscoverStatus = 'idle' | 'loading' | 'done' | 'error'
 
+const DEFAULT_LOCAL_MTLS_PROXY_URL = 'http://127.0.0.1:19119'
+
 interface GatewaySettingsState {
   envOverride: boolean
   mode: Mode
   remoteAuthMode: AuthMode
+  remoteEffectiveUrl?: string
   remoteOauthConnected: boolean
+  remotePublicUrl?: string
   remoteTokenPreview: string | null
   remoteTokenSet: boolean
+  remoteTransportMode?: DesktopRemoteTransportMode
   remoteUrl: string
   cloudOrg: string
   sshHost: string
@@ -58,9 +71,12 @@ const EMPTY_STATE: GatewaySettingsState = {
   envOverride: false,
   mode: 'local',
   remoteAuthMode: 'token',
+  remoteEffectiveUrl: DEFAULT_LOCAL_MTLS_PROXY_URL,
   remoteOauthConnected: false,
+  remotePublicUrl: '',
   remoteTokenPreview: null,
   remoteTokenSet: false,
+  remoteTransportMode: 'direct',
   remoteUrl: '',
   cloudOrg: '',
   sshHost: '',
@@ -144,7 +160,11 @@ function ScopeChip({ active, label, onSelect }: { active: boolean; label: string
 // card: the outer title/intro, the "Save for next restart" action, and the
 // Diagnostics row are redundant there (the card owns its header + a single
 // reconnect action), so only the connection controls render.
-export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {}) {
+interface GatewaySettingsProps {
+  embedded?: boolean
+}
+
+export function GatewaySettings({ embedded = false }: GatewaySettingsProps = {}) {
   const { t } = useI18n()
   const g = t.settings.gateway
   const [loading, setLoading] = useState(true)
@@ -249,10 +269,27 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   }, [scope])
 
   // Debounced probe of the entered remote URL. Only runs in remote mode with a
-  // syntactically plausible URL. The probe result drives whether we render the
-  // OAuth login button or the session-token entry box. The effective auth mode
-  // prefers a fresh probe result over the saved value.
+  // syntactically plausible public URL. The probe uses the effective URL when a
+  // local mTLS proxy transport is selected, while the public URL remains the
+  // user-facing gateway identity.
   const trimmedUrl = state.remoteUrl.trim()
+  const transportMode = state.remoteTransportMode ?? 'direct'
+
+  const trimmedEffectiveUrl = (
+    transportMode === 'local_mtls_proxy'
+      ? state.remoteEffectiveUrl || DEFAULT_LOCAL_MTLS_PROXY_URL
+      : trimmedUrl
+  ).trim()
+
+  const transportPayload = useMemo<DesktopRemoteTransportInput>(
+    () => ({
+      remoteEffectiveUrl: trimmedEffectiveUrl,
+      remotePublicUrl: trimmedUrl,
+      remoteTransportMode: transportMode,
+      remoteUrl: trimmedUrl
+    }),
+    [scope, state.mode, transportMode, trimmedEffectiveUrl, trimmedUrl]
+  )
 
   // The dashboardUrl of the currently-connected cloud instance (the saved
   // cloud connection's remoteUrl), normalized for comparison against each
@@ -269,7 +306,13 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     Boolean(connectedCloudUrl && agent.dashboardUrl && normalizeCloudUrl(agent.dashboardUrl) === connectedCloudUrl)
 
   useEffect(() => {
-    if (state.mode !== 'remote' || !trimmedUrl || !/^https?:\/\//i.test(trimmedUrl)) {
+    if (
+      state.mode !== 'remote' ||
+      !trimmedUrl ||
+      !trimmedEffectiveUrl ||
+      !/^https?:\/\//i.test(trimmedUrl) ||
+      !/^https?:\/\//i.test(trimmedEffectiveUrl)
+    ) {
       setProbeStatus('idle')
       setProbe(null)
 
@@ -287,7 +330,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
     const timer = setTimeout(() => {
       desktop
-        .probeConnectionConfig(trimmedUrl)
+        .probeConnectionConfig(transportPayload)
         .then(result => {
           if (seq !== probeSeq.current) {
             return
@@ -307,7 +350,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     }, 500)
 
     return () => clearTimeout(timer)
-  }, [state.mode, trimmedUrl])
+  }, [state.mode, transportPayload, trimmedEffectiveUrl, trimmedUrl])
 
   // Effective auth mode: a reachable probe wins; otherwise fall back to the
   // saved config's mode so a re-open of settings doesn't flicker.
@@ -417,7 +460,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   const oauthConnected = state.remoteOauthConnected
 
   const canUseRemote = useMemo(() => {
-    if (!trimmedUrl) {
+    if (!trimmedUrl || !trimmedEffectiveUrl) {
       return false
     }
 
@@ -426,14 +469,14 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     }
 
     return Boolean(remoteToken.trim()) || state.remoteTokenSet
-  }, [authMode, oauthConnected, remoteToken, state.remoteTokenSet, trimmedUrl])
+  }, [authMode, oauthConnected, remoteToken, state.remoteTokenSet, trimmedEffectiveUrl, trimmedUrl])
 
-  const payload = () => ({
+  const payload = (): DesktopConnectionConfigInput => ({
+    ...transportPayload,
     mode: state.mode,
     profile: scope ?? undefined,
     remoteAuthMode: authMode,
     remoteToken: authMode === 'token' ? remoteToken.trim() || undefined : undefined,
-    remoteUrl: trimmedUrl,
     sshHost: state.sshHost.trim(),
     sshUser: state.sshUser.trim() || undefined,
     sshPort: state.sshPort,
@@ -511,7 +554,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   const signIn = async () => {
     const seq = ++signingSeq.current
 
-    if (!trimmedUrl) {
+    if (!trimmedUrl || !trimmedEffectiveUrl) {
       notify({ kind: 'warning', title: g.incompleteTitle, message: g.enterUrlFirst })
 
       return
@@ -523,10 +566,10 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
       // Save (don't apply/restart) so the login window has a URL to use and the
       // oauth mode is persisted, without yet flipping the live connection.
       const saved = await window.hermesDesktop.saveConnectionConfig({
+        ...transportPayload,
         mode: state.mode,
         profile: scope ?? undefined,
-        remoteAuthMode: 'oauth',
-        remoteUrl: trimmedUrl
+        remoteAuthMode: 'oauth'
       })
 
       if (seq !== signingSeq.current) {
@@ -535,7 +578,9 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
       acceptSavedConfig(saved)
 
-      const result = await window.hermesDesktop.oauthLoginConnectionConfig(trimmedUrl)
+      const result = await window.hermesDesktop.oauthLoginConnectionConfig({
+        ...transportPayload
+      })
 
       if (seq !== signingSeq.current) {
         return
@@ -568,7 +613,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     setSigningIn(true)
 
     try {
-      await window.hermesDesktop.oauthLogoutConnectionConfig(trimmedUrl || undefined)
+      await window.hermesDesktop.oauthLogoutConnectionConfig(transportPayload)
       const refreshed = await window.hermesDesktop.getConnectionConfig(scope)
 
       if (seq !== signingSeq.current) {
@@ -960,18 +1005,25 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
     try {
       const result = await window.hermesDesktop.testConnectionConfig({
+        ...transportPayload,
         mode: 'remote',
         profile: scope ?? undefined,
         remoteAuthMode: authMode,
-        remoteToken: authMode === 'token' ? remoteToken.trim() || undefined : undefined,
-        remoteUrl: trimmedUrl
+        remoteToken: authMode === 'token' ? remoteToken.trim() || undefined : undefined
       })
 
       if (seq !== sshTestSeq.current) {
         return
       }
 
-      const message = g.connectedTo(result.baseUrl || trimmedUrl, result.version ?? undefined)
+      const message =
+        result.transportMode === 'local_mtls_proxy' && result.publicUrl
+          ? g.connectedToViaProxy(
+              result.publicUrl,
+              result.effectiveUrl ?? result.baseUrl ?? trimmedUrl,
+              result.version ?? undefined
+            )
+          : g.connectedTo(result.baseUrl || trimmedUrl, result.version ?? undefined)
       setLastTest(message)
       notify({ kind: 'success', title: g.reachableTitle, message })
     } catch (err) {
@@ -1241,7 +1293,13 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
               <Input
                 className={cn('h-8', CONTROL_TEXT)}
                 disabled={state.envOverride}
-                onChange={event => setState(current => ({ ...current, remoteUrl: event.target.value }))}
+                onChange={event =>
+                  setState(current => ({
+                    ...current,
+                    remotePublicUrl: event.target.value,
+                    remoteUrl: event.target.value
+                  }))
+                }
                 placeholder="https://gateway.example.com/hermes"
                 value={state.remoteUrl}
               />
@@ -1249,6 +1307,83 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
             description={g.remoteUrlDesc}
             title={g.remoteUrlTitle}
           />
+
+          <ListRow
+            action={
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  className={cn(
+                    'border',
+                    transportMode === 'direct'
+                      ? 'border-(--ui-stroke-secondary) bg-(--ui-bg-tertiary) text-(--ui-text-primary)'
+                      : 'border-(--ui-stroke-tertiary)'
+                  )}
+                  disabled={state.envOverride}
+                  onClick={() =>
+                    setState(current => ({
+                      ...current,
+                      remoteEffectiveUrl: current.remoteUrl,
+                      remoteTransportMode: 'direct'
+                    }))
+                  }
+                  size="sm"
+                  variant={transportMode === 'direct' ? 'textStrong' : 'outline'}
+                >
+                  {transportMode === 'direct' ? <Check className="size-3" /> : null}
+                  {g.transportDirect}
+                </Button>
+                <Button
+                  className={cn(
+                    'border',
+                    transportMode === 'local_mtls_proxy'
+                      ? 'border-(--ui-stroke-secondary) bg-(--ui-bg-tertiary) text-(--ui-text-primary)'
+                      : 'border-(--ui-stroke-tertiary)'
+                  )}
+                  disabled={state.envOverride}
+                  onClick={() =>
+                    setState(current => {
+                      const currentEffective = (current.remoteEffectiveUrl || '').trim()
+                      const currentPublic = (current.remoteUrl || current.remotePublicUrl || '').trim()
+
+                      const nextEffective =
+                        !currentEffective || currentEffective === currentPublic
+                          ? DEFAULT_LOCAL_MTLS_PROXY_URL
+                          : currentEffective
+
+                      return {
+                        ...current,
+                        remoteEffectiveUrl: nextEffective,
+                        remoteTransportMode: 'local_mtls_proxy'
+                      }
+                    })
+                  }
+                  size="sm"
+                  variant={transportMode === 'local_mtls_proxy' ? 'textStrong' : 'outline'}
+                >
+                  {transportMode === 'local_mtls_proxy' ? <Check className="size-3" /> : null}
+                  {g.transportLocalMtlsProxy}
+                </Button>
+              </div>
+            }
+            description={g.transportDesc}
+            title={g.transportTitle}
+          />
+
+          {transportMode === 'local_mtls_proxy' ? (
+            <ListRow
+              action={
+                <Input
+                  className={cn('h-8 font-mono', CONTROL_TEXT)}
+                  disabled={state.envOverride}
+                  onChange={event => setState(current => ({ ...current, remoteEffectiveUrl: event.target.value }))}
+                  placeholder={DEFAULT_LOCAL_MTLS_PROXY_URL}
+                  value={state.remoteEffectiveUrl || DEFAULT_LOCAL_MTLS_PROXY_URL}
+                />
+              }
+              description={g.effectiveUrlDesc}
+              title={g.effectiveUrlTitle}
+            />
+          ) : null}
 
           {state.mode === 'remote' && probeStatus === 'probing' ? (
             <div className="flex items-center gap-2 py-3 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
@@ -1279,7 +1414,10 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
                     </Button>
                   </div>
                 ) : (
-                  <Button disabled={signingIn || state.envOverride || !trimmedUrl} onClick={() => void signIn()}>
+                  <Button
+                    disabled={signingIn || state.envOverride || !trimmedUrl || !trimmedEffectiveUrl}
+                    onClick={() => void signIn()}
+                  >
                     {signingIn ? <Loader2 className="animate-spin" /> : <LogIn />}
                     {isPasswordProvider ? g.signIn : g.signInWith(providerLabel)}
                   </Button>

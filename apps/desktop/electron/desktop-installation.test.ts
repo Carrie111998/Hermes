@@ -95,11 +95,17 @@ test('loadOrCreateInstallationId replaces a malformed destination without a repa
     assert.equal(fs.existsSync(`${filePath}.lock`), false)
   }))
 
-test('sshOwnershipId is stable, scoped, and does not disclose the UUID', () => {
+test('sshOwnershipId is stable, scoped by endpoint, and does not disclose the UUID', () => {
   const global = sshOwnershipId(ID_A, '')
+  const boxA = sshOwnershipId(ID_A, 'worker', { host: 'Box-A.example', user: 'alice', port: 22 })
+
   assert.match(global, /^[0-9a-f]{32}$/)
   assert.equal(global, sshOwnershipId(ID_A, ''))
+  assert.equal(boxA, sshOwnershipId(ID_A, 'worker', { host: 'box-a.example', user: 'alice' }))
   assert.notEqual(global, sshOwnershipId(ID_A, 'worker'))
+  assert.notEqual(boxA, sshOwnershipId(ID_A, 'worker', { host: 'box-b.example', user: 'alice', port: 22 }))
+  assert.notEqual(boxA, sshOwnershipId(ID_A, 'worker', { host: 'box-a.example', user: 'bob', port: 22 }))
+  assert.notEqual(boxA, sshOwnershipId(ID_A, 'worker', { host: 'box-a.example', user: 'alice', port: 2222 }))
   assert.ok(!global.includes(ID_A.slice(0, 8)))
   assert.throws(() => sshOwnershipId('bad', ''))
 })

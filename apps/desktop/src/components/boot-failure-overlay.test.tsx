@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
 import { $desktopOnboarding } from '@/store/onboarding'
@@ -96,6 +96,63 @@ describe('BootFailureOverlay', () => {
       expect(screen.getByRole('button', { name: /use local gateway/i })).toBeTruthy()
     } finally {
       restore()
+    }
+  })
+
+  it('uses the effective transport for remote reauth while keeping the public identity in UI state', async () => {
+    const transport = {
+      remoteUrl: 'https://gateway.example.com',
+      remotePublicUrl: 'https://gateway.example.com',
+      remoteEffectiveUrl: 'http://127.0.0.1:19119',
+      remoteTransportMode: 'local_mtls_proxy'
+    }
+    const desktop = {
+      getRecentLogs: vi.fn(async () => ({ lines: [] })),
+      getConnectionConfig: vi.fn(async () => ({
+        ...remoteToken,
+        mode: 'remote',
+        remoteAuthMode: 'oauth',
+        remoteOauthConnected: false,
+        ...transport
+      })),
+      probeConnectionConfig: vi.fn(async () => ({
+        baseUrl: transport.remoteEffectiveUrl,
+        effectiveUrl: transport.remoteEffectiveUrl,
+        publicUrl: transport.remotePublicUrl,
+        reachable: true,
+        authMode: 'oauth',
+        providers: [{ name: 'nous', displayName: 'Nous Research', supportsPassword: false }],
+        transportMode: transport.remoteTransportMode,
+        version: null,
+        error: null
+      })),
+      oauthLogoutConnectionConfig: vi.fn(async () => ({ ok: true, connected: false })),
+      oauthLoginConnectionConfig: vi.fn(async () => ({
+        ok: true,
+        baseUrl: transport.remoteEffectiveUrl,
+        effectiveUrl: transport.remoteEffectiveUrl,
+        publicUrl: transport.remotePublicUrl,
+        transportMode: transport.remoteTransportMode,
+        connected: false
+      }))
+    }
+    const original = window.hermesDesktop
+
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: desktop })
+
+    try {
+      render(<BootFailureOverlay />)
+
+      const signIn = await screen.findByRole('button', { name: /sign out (?:&|and) sign in/i })
+      await waitFor(() => expect(desktop.probeConnectionConfig).toHaveBeenCalledWith(transport))
+
+      expect(screen.getByText(/sign in with nous research/i)).toBeTruthy()
+
+      fireEvent.click(signIn)
+      await waitFor(() => expect(desktop.oauthLogoutConnectionConfig).toHaveBeenCalledWith(transport))
+      expect(desktop.oauthLoginConnectionConfig).toHaveBeenCalledWith(transport)
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: original })
     }
   })
 })

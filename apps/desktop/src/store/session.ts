@@ -84,7 +84,11 @@ function workspaceCwdKey(connection: HermesConnection | null = $connection.get()
     return WORKSPACE_CWD_KEY
   }
 
-  const base = encodeURIComponent(connection.baseUrl || 'remote')
+  const remoteIdentity =
+    connection.remoteKind === 'ssh' && connection.remoteIdentity
+      ? connection.remoteIdentity
+      : connection.publicUrl || connection.baseUrl
+  const base = encodeURIComponent(remoteIdentity || 'remote')
   const profile = encodeURIComponent(connection.profile || 'default')
 
   return `${WORKSPACE_CWD_KEY}.remote.${base}.${profile}`

@@ -23,23 +23,36 @@ import {
   cookiesHaveLiveSession,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  effectiveAppliedConnectionMode,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   isGatewayAuthRejection,
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
+  normalizeRemoteTransport,
   normalizeSshConfig,
   normAuthMode,
+  normTransportMode,
+  OAUTH_SESSION_PARTITION,
+  oauthPartitionIdentity,
+  oauthSessionPartitionForIdentity,
   pathWithGlobalRemoteProfile,
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
+  REMOTE_TRANSPORT_MODES,
+  remoteAuthIdentity,
+  remoteEffectiveUrl,
+  remotePublicUrl,
   resolveAuthMode,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
+  sanitizeStoredConnectionConfig,
   savedProfileSsh,
-  tokenPreview
+  tokenPreview,
+  TRANSPORT_DIRECT,
+  TRANSPORT_LOCAL_MTLS_PROXY
 } from './connection-config'
 
 // --- connectionScopeKey / normAuthMode ---
@@ -71,6 +84,357 @@ test('modeIsRemoteLike is true for remote and cloud, false otherwise', () => {
   assert.equal(modeIsRemoteLike('weird'), false)
 })
 
+test('normTransportMode accepts direct and local mTLS proxy only', () => {
+  assert.deepEqual(REMOTE_TRANSPORT_MODES, [TRANSPORT_DIRECT, TRANSPORT_LOCAL_MTLS_PROXY])
+  assert.equal(normTransportMode('direct'), 'direct')
+  assert.equal(normTransportMode('local_mtls_proxy'), 'local_mtls_proxy')
+  assert.equal(normTransportMode(undefined), 'direct')
+  assert.equal(normTransportMode('weird'), 'direct')
+})
+
+// --- remote transport normalization ---
+
+test('normalizeRemoteTransport maps legacy url to public and effective direct transport', () => {
+  assert.deepEqual(normalizeRemoteTransport({ url: ' https://gw.example.com/hermes/ ' }), {
+    url: 'https://gw.example.com/hermes',
+    publicUrl: 'https://gw.example.com/hermes',
+    effectiveUrl: 'https://gw.example.com/hermes',
+    transportMode: 'direct'
+  })
+})
+
+test('normalizeRemoteTransport preserves public identity while using a loopback effective URL', () => {
+  assert.deepEqual(
+    normalizeRemoteTransport({
+      publicUrl: 'https://gateway.example.com/',
+      effectiveUrl: 'http://127.0.0.1:19119/',
+      transportMode: 'local_mtls_proxy'
+    }),
+    {
+      url: 'https://gateway.example.com',
+      publicUrl: 'https://gateway.example.com',
+      effectiveUrl: 'http://127.0.0.1:19119',
+      transportMode: 'local_mtls_proxy'
+    }
+  )
+})
+
+test('normalizeRemoteTransport rejects loopback public identity for local proxy mode', () => {
+  assert.throws(
+    () =>
+      normalizeRemoteTransport({
+        publicUrl: 'http://127.0.0.1:19119',
+        effectiveUrl: 'http://127.0.0.1:19119',
+        transportMode: 'local_mtls_proxy'
+      }),
+    /public URL must not be a loopback/i
+  )
+  assert.throws(
+    () =>
+      normalizeRemoteTransport({
+        publicUrl: 'https://localhost:19119',
+        effectiveUrl: 'http://127.0.0.1:19119',
+        transportMode: 'local_mtls_proxy'
+      }),
+    /must not be a loopback/i
+  )
+})
+
+test('normalizeRemoteTransport accepts HTTP public URLs for local proxy mode when public is non-loopback', () => {
+  assert.deepEqual(
+    normalizeRemoteTransport({
+      publicUrl: 'http://gateway.example.com/hermes',
+      effectiveUrl: 'http://127.0.0.1:19119',
+      transportMode: 'local_mtls_proxy'
+    }),
+    {
+      url: 'http://gateway.example.com/hermes',
+      publicUrl: 'http://gateway.example.com/hermes',
+      effectiveUrl: 'http://127.0.0.1:19119',
+      transportMode: 'local_mtls_proxy'
+    }
+  )
+})
+
+test('normalizeRemoteTransport forces direct transport effective URL to public URL', () => {
+  assert.deepEqual(
+    normalizeRemoteTransport({
+      publicUrl: 'http://localhost:9119',
+      effectiveUrl: 'http://127.0.0.1:19119',
+      transportMode: 'direct'
+    }),
+    {
+      url: 'http://localhost:9119',
+      publicUrl: 'http://localhost:9119',
+      effectiveUrl: 'http://localhost:9119',
+      transportMode: 'direct'
+    }
+  )
+})
+
+test('normalizeRemoteTransport treats unknown transport modes as direct and drops split effective URLs', () => {
+  assert.deepEqual(
+    normalizeRemoteTransport({
+      publicUrl: 'https://gateway.example.com',
+      effectiveUrl: 'http://127.0.0.1:19119',
+      transportMode: 'future_proxy'
+    }),
+    {
+      url: 'https://gateway.example.com',
+      publicUrl: 'https://gateway.example.com',
+      effectiveUrl: 'https://gateway.example.com',
+      transportMode: 'direct'
+    }
+  )
+})
+
+test('normalizeRemoteTransport rejects local proxy mode without a loopback effective URL', () => {
+  assert.throws(
+    () =>
+      normalizeRemoteTransport({
+        publicUrl: 'https://gateway.example.com',
+        transportMode: 'local_mtls_proxy'
+      }),
+    /local proxy URL is required/i
+  )
+  assert.throws(
+    () =>
+      normalizeRemoteTransport({
+        publicUrl: 'https://gateway.example.com',
+        effectiveUrl: 'https://other.example.com',
+        transportMode: 'local_mtls_proxy'
+      }),
+    /local proxy URL must be a loopback/i
+  )
+})
+
+test('normalizeRemoteTransport handles localhost boundaries precisely', () => {
+  for (const effectiveUrl of [
+    'http://localhost:19119',
+    'http://foo.localhost:19119',
+    'http://127.0.0.1:19119',
+    'http://127.1:19119',
+    'http://2130706433:19119',
+    'http://[::1]:19119',
+    'http://[::ffff:127.0.0.1]:19119'
+  ]) {
+    assert.equal(
+      normalizeRemoteTransport({
+        publicUrl: 'https://gateway.example.com',
+        effectiveUrl,
+        transportMode: 'local_mtls_proxy'
+      }).effectiveUrl.startsWith('http://'),
+      true
+    )
+  }
+
+  assert.deepEqual(
+    normalizeRemoteTransport({
+      publicUrl: 'https://localhost.example.com',
+      effectiveUrl: 'http://127.0.0.1:19119',
+      transportMode: 'local_mtls_proxy'
+    }).publicUrl,
+    'https://localhost.example.com'
+  )
+
+  assert.throws(
+    () =>
+      normalizeRemoteTransport({
+        publicUrl: 'https://foo.localhost',
+        effectiveUrl: 'http://127.0.0.1:19119',
+        transportMode: 'local_mtls_proxy'
+      }),
+    /public URL must not be a loopback/i
+  )
+})
+
+test('normalizeRemoteTransport rejects userinfo and 0.0.0.0 dial targets', () => {
+  assert.throws(() => normalizeRemoteTransport({ url: 'https://user:pass@gateway.example.com' }), /username or password/i)
+  assert.throws(() => normalizeRemoteTransport({ url: 'http://0.0.0.0:9119' }), /0\.0\.0\.0/i)
+  assert.throws(
+    () =>
+      normalizeRemoteTransport({
+        publicUrl: 'https://gateway.example.com',
+        effectiveUrl: 'http://0.0.0.0:19119',
+        transportMode: 'local_mtls_proxy'
+      }),
+    /0\.0\.0\.0/i
+  )
+})
+
+test('normalizeRemoteTransport falls back effective URL to public URL', () => {
+  assert.deepEqual(normalizeRemoteTransport({ publicUrl: 'https://gw.example.com' }), {
+    url: 'https://gw.example.com',
+    publicUrl: 'https://gw.example.com',
+    effectiveUrl: 'https://gw.example.com',
+    transportMode: 'direct'
+  })
+})
+
+test('remotePublicUrl and remoteEffectiveUrl expose the split transport URLs', () => {
+  const block = {
+    publicUrl: 'https://public.example.com',
+    effectiveUrl: 'http://127.0.0.1:19119',
+    transportMode: 'local_mtls_proxy'
+  }
+
+  assert.equal(remotePublicUrl(block), 'https://public.example.com')
+  assert.equal(remoteEffectiveUrl(block), 'http://127.0.0.1:19119')
+})
+
+test('remote auth identity uses public URL while network can use the effective URL', () => {
+  const proxied = {
+    publicUrl: 'https://agent-a.example.com',
+    effectiveUrl: 'http://127.0.0.1:19119',
+    transportMode: 'local_mtls_proxy'
+  }
+
+  assert.equal(remoteAuthIdentity(proxied), 'https://agent-a.example.com')
+  assert.equal(oauthPartitionIdentity(proxied), 'https://agent-a.example.com')
+  assert.equal(remoteEffectiveUrl(proxied), 'http://127.0.0.1:19119')
+
+  const direct = {
+    publicUrl: 'https://agent-b.example.com',
+    effectiveUrl: 'http://127.0.0.1:19119',
+    transportMode: 'direct'
+  }
+
+  assert.equal(remoteAuthIdentity(direct), 'https://agent-b.example.com')
+  assert.equal(oauthPartitionIdentity(direct), null)
+  assert.equal(remoteEffectiveUrl(direct), 'https://agent-b.example.com')
+})
+
+test('proxied oauth gateways isolate credentials by public identity while sharing one network URL', () => {
+  const agentA = {
+    publicUrl: 'https://agent-a.example.com',
+    effectiveUrl: 'http://127.0.0.1:19119',
+    transportMode: 'local_mtls_proxy'
+  }
+  const agentB = {
+    publicUrl: 'https://agent-b.example.com',
+    effectiveUrl: 'http://127.0.0.1:19119',
+    transportMode: 'local_mtls_proxy'
+  }
+
+  assert.equal(remoteEffectiveUrl(agentA), 'http://127.0.0.1:19119')
+  assert.equal(remoteEffectiveUrl(agentB), 'http://127.0.0.1:19119')
+  assert.notEqual(remoteAuthIdentity(agentA), remoteAuthIdentity(agentB))
+  assert.notEqual(oauthPartitionIdentity(agentA), oauthPartitionIdentity(agentB))
+  assert.notEqual(
+    oauthSessionPartitionForIdentity(oauthPartitionIdentity(agentA)),
+    oauthSessionPartitionForIdentity(oauthPartitionIdentity(agentB))
+  )
+})
+
+test('oauth session partition keys normalize public identity and keep the legacy default partition', () => {
+  assert.equal(oauthSessionPartitionForIdentity(null), OAUTH_SESSION_PARTITION)
+  assert.equal(
+    oauthSessionPartitionForIdentity(' https://agent-a.example.com/hermes/ '),
+    oauthSessionPartitionForIdentity('https://agent-a.example.com/hermes')
+  )
+  assert.notEqual(
+    oauthSessionPartitionForIdentity('https://agent-a.example.com/hermes'),
+    oauthSessionPartitionForIdentity('https://agent-b.example.com/hermes')
+  )
+})
+
+// --- stored config sanitization ---
+
+test('sanitizeStoredConnectionConfig preserves active global SSH config through cold read', () => {
+  const config = sanitizeStoredConnectionConfig({
+    mode: 'ssh',
+    remote: {
+      mode: 'ssh',
+      host: 'alice@[2001:db8::1]:2222',
+      keyPath: ' /tmp/fake-hermes-key ',
+      remoteHermesPath: ' ~/bin/hermes ',
+      token: { encrypted: true, value: 'ciphertext' },
+      url: 'https://should-not-survive.example.com'
+    }
+  })
+
+  assert.deepEqual(config, {
+    mode: 'ssh',
+    remote: {
+      mode: 'ssh',
+      host: '2001:db8::1',
+      user: 'alice',
+      port: 2222,
+      keyPath: '/tmp/fake-hermes-key',
+      remoteHermesPath: '~/bin/hermes',
+      token: { encrypted: true, value: 'ciphertext' }
+    },
+    profiles: {}
+  })
+})
+
+test('sanitizeStoredConnectionConfig preserves inactive global SSH drafts in local mode', () => {
+  const config = sanitizeStoredConnectionConfig({
+    mode: 'local',
+    remote: {
+      mode: 'ssh',
+      host: 'build.example.com',
+      user: 'runner',
+      port: 2200,
+      keyPath: '/tmp/fake-build-key',
+      remoteHermesPath: '/opt/hermes',
+      org: 'should-drop'
+    }
+  })
+
+  assert.deepEqual(config, {
+    mode: 'local',
+    remote: {
+      mode: 'ssh',
+      host: 'build.example.com',
+      user: 'runner',
+      port: 2200,
+      keyPath: '/tmp/fake-build-key',
+      remoteHermesPath: '/opt/hermes'
+    },
+    profiles: {}
+  })
+})
+
+test('sanitizeStoredConnectionConfig preserves saved per-profile SSH drafts through cold read', () => {
+  const config = sanitizeStoredConnectionConfig({
+    mode: 'remote',
+    remote: { url: 'https://global.example.com', authMode: 'oauth', org: 'team-a' },
+    profiles: {
+      coder: {
+        mode: 'local',
+        savedSsh: {
+          mode: 'ssh',
+          host: 'coder@example.com:2222',
+          keyPath: '/tmp/fake-coder-key'
+        }
+      },
+      'bad name': {
+        mode: 'ssh',
+        host: 'ignored.example.com'
+      }
+    }
+  })
+
+  assert.deepEqual(config.profiles, {
+    coder: {
+      authMode: 'token',
+      effectiveUrl: '',
+      mode: 'local',
+      publicUrl: '',
+      savedSsh: {
+        mode: 'ssh',
+        host: 'example.com',
+        user: 'coder',
+        port: 2222,
+        keyPath: '/tmp/fake-coder-key'
+      },
+      transportMode: 'direct',
+      url: ''
+    }
+  })
+})
+
 // --- profileRemoteOverride ---
 
 test('profileRemoteOverride returns null when no profile is given', () => {
@@ -100,8 +464,34 @@ test('profileRemoteOverride returns the per-profile remote with defaulted auth m
 
   assert.deepEqual(profileRemoteOverride(config, 'coder'), {
     url: 'https://coder.example.com/hermes',
+    publicUrl: 'https://coder.example.com/hermes',
+    effectiveUrl: 'https://coder.example.com/hermes',
+    transportMode: 'direct',
     authMode: 'token',
     token: { value: 'sek' }
+  })
+})
+
+test('profileRemoteOverride preserves split remote transport metadata', () => {
+  const config = {
+    profiles: {
+      coder: {
+        mode: 'remote',
+        publicUrl: 'https://public.example.com',
+        effectiveUrl: 'http://127.0.0.1:19119',
+        transportMode: 'local_mtls_proxy',
+        authMode: 'oauth'
+      }
+    }
+  }
+
+  assert.deepEqual(profileRemoteOverride(config, 'coder'), {
+    url: 'https://public.example.com',
+    publicUrl: 'https://public.example.com',
+    effectiveUrl: 'http://127.0.0.1:19119',
+    transportMode: 'local_mtls_proxy',
+    authMode: 'oauth',
+    token: undefined
   })
 })
 
@@ -121,6 +511,9 @@ test('profileRemoteOverride treats a cloud entry as a remote override', () => {
 
   assert.deepEqual(profileRemoteOverride(config, 'coder'), {
     url: 'https://agent-1.agents.nousresearch.com',
+    publicUrl: 'https://agent-1.agents.nousresearch.com',
+    effectiveUrl: 'https://agent-1.agents.nousresearch.com',
+    transportMode: 'direct',
     authMode: 'oauth',
     token: undefined
   })
@@ -143,6 +536,54 @@ test('SSH remains separate from URL-shaped remote modes', () => {
     port: 2222,
     keyPath: '/key'
   })
+})
+
+test('effectiveAppliedConnectionMode uses active named profile remote mode over global local mode', () => {
+  const config = {
+    mode: 'local',
+    remote: {},
+    profiles: {
+      coder: { mode: 'remote', url: 'https://coder.example.com/hermes', authMode: 'oauth' }
+    }
+  }
+
+  assert.equal(effectiveAppliedConnectionMode(config, 'coder'), 'remote')
+})
+
+test('effectiveAppliedConnectionMode uses active named profile cloud mode over global local mode', () => {
+  const config = {
+    mode: 'local',
+    remote: {},
+    profiles: {
+      coder: { mode: 'cloud', url: 'https://agent-1.agents.nousresearch.com', authMode: 'oauth' }
+    }
+  }
+
+  assert.equal(effectiveAppliedConnectionMode(config, 'coder'), 'cloud')
+})
+
+test('effectiveAppliedConnectionMode uses active named profile SSH mode over global local mode', () => {
+  const config = {
+    mode: 'local',
+    remote: {},
+    profiles: {
+      coder: { mode: 'ssh', host: 'alice@box:2222', keyPath: '/key' }
+    }
+  }
+
+  assert.equal(effectiveAppliedConnectionMode(config, 'coder'), 'ssh')
+})
+
+test('effectiveAppliedConnectionMode keeps an active named local profile local when global mode is local', () => {
+  const config = {
+    mode: 'local',
+    remote: {},
+    profiles: {
+      coder: { mode: 'local', savedSsh: { mode: 'ssh', host: 'saved-box' } }
+    }
+  }
+
+  assert.equal(effectiveAppliedConnectionMode(config, 'coder'), 'local')
 })
 
 test('normalizeSshConfig handles IPv6 and strict port bounds', () => {

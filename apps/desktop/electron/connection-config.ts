@@ -1,3 +1,5 @@
+import crypto from 'node:crypto'
+
 /**
  * connection-config.ts
  *
@@ -45,6 +47,11 @@ const RT_COOKIE_VARIANTS = ['__Host-hermes_session_rt', '__Secure-hermes_session
 // cookies above. `privy-token` is the access token (the required signal);
 // variants cover the secured-prefix forms and the older `privy-session` name.
 const PRIVY_SESSION_COOKIE_VARIANTS = ['__Host-privy-token', '__Secure-privy-token', 'privy-token', 'privy-session']
+const TRANSPORT_DIRECT = 'direct'
+const TRANSPORT_LOCAL_MTLS_PROXY = 'local_mtls_proxy'
+const REMOTE_TRANSPORT_MODES = [TRANSPORT_DIRECT, TRANSPORT_LOCAL_MTLS_PROXY]
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const OAUTH_SESSION_PARTITION = 'persist:hermes-remote-oauth'
 
 function normalizeRemoteBaseUrl(rawUrl) {
   const value = String(rawUrl || '').trim()
@@ -65,11 +72,102 @@ function normalizeRemoteBaseUrl(rawUrl) {
     throw new Error(`Remote gateway URL must be http:// or https://, got ${parsed.protocol}`)
   }
 
+  if (parsed.username || parsed.password) {
+    throw new Error('Remote gateway URL must not include a username or password.')
+  }
+
+  if (parsed.hostname === '0.0.0.0') {
+    throw new Error('Remote gateway URL must not use 0.0.0.0; use a reachable host instead.')
+  }
+
   parsed.hash = ''
   parsed.search = ''
   parsed.pathname = parsed.pathname.replace(/\/+$/, '')
 
   return parsed.toString().replace(/\/+$/, '')
+}
+
+function normTransportMode(mode) {
+  return REMOTE_TRANSPORT_MODES.includes(mode) ? mode : TRANSPORT_DIRECT
+}
+
+function isLoopbackHostname(hostname) {
+  const host = String(hostname || '')
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host.startsWith('127.')) {
+    return true
+  }
+
+  if (host.startsWith('::ffff:')) {
+    const mapped = host.slice('::ffff:'.length)
+
+    if (mapped.startsWith('127.')) {
+      return true
+    }
+
+    const parts = mapped.split(':')
+
+    if (parts.length === 2) {
+      const high = Number.parseInt(parts[0], 16)
+
+      return Number.isInteger(high) && high >= 0x7f00 && high <= 0x7fff
+    }
+  }
+
+  return false
+}
+
+function assertLocalMtlsProxyUrls(publicUrl, effectiveUrl) {
+  if (!publicUrl) {
+    throw new Error('Remote gateway public URL is required when using a local mTLS proxy.')
+  }
+
+  if (!effectiveUrl) {
+    throw new Error('Remote gateway local proxy URL is required when using a local mTLS proxy.')
+  }
+
+  const publicParsed = new URL(publicUrl)
+  const effectiveParsed = new URL(effectiveUrl)
+
+  if (isLoopbackHostname(publicParsed.hostname)) {
+    throw new Error('Remote gateway public URL must not be a loopback address when using a local mTLS proxy.')
+  }
+
+  if (!isLoopbackHostname(effectiveParsed.hostname)) {
+    throw new Error('Remote gateway local proxy URL must be a loopback address when using a local mTLS proxy.')
+  }
+}
+
+function normalizeRemoteTransport(raw: unknown = {}) {
+  const block: Record<string, unknown> = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+  const transportMode = normTransportMode(block.transportMode)
+  const legacyUrl = String(block.url || '').trim()
+  const rawPublicUrl = String(block.publicUrl || legacyUrl).trim()
+  const rawEffectiveUrl = String(block.effectiveUrl || (transportMode === TRANSPORT_DIRECT ? '' : legacyUrl)).trim()
+  const publicUrl = rawPublicUrl ? normalizeRemoteBaseUrl(rawPublicUrl) : ''
+  const effectiveUrl =
+    transportMode === TRANSPORT_DIRECT ? publicUrl : rawEffectiveUrl ? normalizeRemoteBaseUrl(rawEffectiveUrl) : ''
+
+  if (transportMode === TRANSPORT_LOCAL_MTLS_PROXY) {
+    assertLocalMtlsProxyUrls(publicUrl, effectiveUrl)
+  }
+
+  return {
+    url: publicUrl,
+    publicUrl,
+    effectiveUrl,
+    transportMode
+  }
+}
+
+function remotePublicUrl(remote) {
+  return normalizeRemoteTransport(remote).publicUrl
+}
+
+function remoteEffectiveUrl(remote) {
+  return normalizeRemoteTransport(remote).effectiveUrl
 }
 
 function buildGatewayWsUrl(baseUrl, token) {
@@ -296,6 +394,23 @@ function profileHasRemoteConnection(config, profile) {
   return Boolean(profileRemoteOverride(config, profile) || profileSshOverride(config, profile))
 }
 
+function effectiveAppliedConnectionMode(config, profile) {
+  if (profileSshOverride(config, profile)) {
+    return 'ssh'
+  }
+
+  if (profileRemoteOverride(config, profile)) {
+    const key = connectionScopeKey(profile)
+    const mode = key ? config?.profiles?.[key]?.mode : null
+
+    return mode === 'cloud' ? 'cloud' : 'remote'
+  }
+
+  const mode = config?.mode
+
+  return mode === 'ssh' ? 'ssh' : modeIsRemoteLike(mode) ? mode : 'local'
+}
+
 function localProfileEntry(existing) {
   const ssh = normalizeSshConfig(existing) || normalizeSshConfig(existing?.savedSsh)
 
@@ -330,8 +445,9 @@ function hostLabelFromBaseUrl(baseUrl) {
  *
  * The config may carry a `profiles` map keyed by name; an entry counts as an
  * override only with a remote-like `mode` (remote or cloud) and a non-empty
- * `url`. Pure: `token` is the raw stored secret; main.ts decrypts it. Returns
- * `{ url, authMode, token } | null`.
+ * public/effective URL. Pure: `token` is the raw stored secret; main.ts decrypts
+ * it. Returns
+ * `{ url, publicUrl, effectiveUrl, transportMode, authMode, token } | null`.
  */
 function profileRemoteOverride(config, profile) {
   const key = connectionScopeKey(profile)
@@ -341,13 +457,159 @@ function profileRemoteOverride(config, profile) {
     return null
   }
 
-  const url = String(entry.url || '').trim()
+  const transport = normalizeRemoteTransport(entry)
 
-  if (!url) {
+  if (!transport.publicUrl && !transport.effectiveUrl) {
     return null
   }
 
-  return { url, authMode: normAuthMode(entry.authMode), token: entry.token }
+  return {
+    ...transport,
+    authMode: normAuthMode(entry.authMode),
+    token: entry.token
+  }
+}
+
+function preserveStoredSecret(out, entry) {
+  if (entry?.token && typeof entry.token === 'object') {
+    out.token = entry.token
+  }
+
+  return out
+}
+
+function sanitizeStoredRemoteBlock(raw) {
+  const block = raw && typeof raw === 'object' ? raw : {}
+  const transport = normalizeRemoteTransport(block)
+  const cleaned: any = {
+    ...transport,
+    authMode: normAuthMode((block as any).authMode)
+  }
+
+  preserveStoredSecret(cleaned, block)
+
+  const org = String((block as any).org || '').trim()
+
+  if (org) {
+    cleaned.org = org
+  }
+
+  return cleaned
+}
+
+function sanitizeStoredConnectionProfiles(raw: Record<string, any>) {
+  if (!raw || typeof raw !== 'object') {
+    return {}
+  }
+
+  const out = {}
+
+  for (const [name, entry] of Object.entries(raw)) {
+    if (!entry || typeof entry !== 'object') {
+      continue
+    }
+
+    if (name !== 'default' && !PROFILE_NAME_RE.test(name)) {
+      continue
+    }
+
+    if (entry.mode === 'ssh') {
+      const ssh = normalizeSshConfig(entry)
+
+      if (ssh) {
+        out[name] = preserveStoredSecret(ssh, entry)
+      }
+
+      continue
+    }
+
+    const mode = modeIsRemoteLike(entry.mode) ? entry.mode : 'local'
+    let cleaned: any
+
+    try {
+      cleaned = { mode, ...sanitizeStoredRemoteBlock(entry) }
+    } catch {
+      continue
+    }
+
+    if (mode === 'local') {
+      const savedSsh = normalizeSshConfig(entry.savedSsh)
+
+      if (savedSsh) {
+        cleaned.savedSsh = savedSsh
+      }
+    }
+
+    if (mode !== 'cloud') {
+      delete cleaned.org
+    }
+
+    out[name] = cleaned
+  }
+
+  return out
+}
+
+function sanitizeStoredConnectionConfig(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return { mode: 'local', remote: {}, profiles: {} }
+  }
+
+  const mode = parsed.mode === 'ssh' ? 'ssh' : modeIsRemoteLike(parsed.mode) ? parsed.mode : 'local'
+  const rawRemote = parsed.remote && typeof parsed.remote === 'object' ? parsed.remote : {}
+  let remote: any = {}
+
+  try {
+    if (mode === 'ssh') {
+      const ssh = normalizeSshConfig({ mode: 'ssh', ...rawRemote })
+
+      remote = ssh ? preserveStoredSecret(ssh, rawRemote) : {}
+    } else if (mode === 'local') {
+      const savedSsh = normalizeSshConfig(rawRemote)
+
+      remote = savedSsh ? preserveStoredSecret(savedSsh, rawRemote) : sanitizeStoredRemoteBlock(rawRemote)
+      delete remote.org
+    } else {
+      remote = sanitizeStoredRemoteBlock(rawRemote)
+
+      if (mode !== 'cloud') {
+        delete remote.org
+      }
+    }
+  } catch {
+    remote = {}
+  }
+
+  return {
+    mode,
+    remote,
+    profiles: sanitizeStoredConnectionProfiles(parsed.profiles)
+  }
+}
+
+function remoteAuthIdentity(remote) {
+  const transport = normalizeRemoteTransport(remote)
+
+  return transport.publicUrl || transport.effectiveUrl
+}
+
+function oauthPartitionIdentity(remote) {
+  const transport = normalizeRemoteTransport(remote)
+
+  return transport.transportMode === TRANSPORT_LOCAL_MTLS_PROXY ? transport.publicUrl : null
+}
+
+function oauthSessionPartitionForIdentity(identityUrl?: null | string) {
+  const raw = String(identityUrl || '').trim()
+
+  if (!raw) {
+    return OAUTH_SESSION_PARTITION
+  }
+
+  const normalized = normalizeRemoteBaseUrl(raw)
+  const digest = crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 24)
+
+  return `${OAUTH_SESSION_PARTITION}-${digest}`
 }
 
 /**
@@ -491,6 +753,7 @@ export {
   cookiesHaveLiveSession,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  effectiveAppliedConnectionMode,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
@@ -498,16 +761,30 @@ export {
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
+  normalizeRemoteTransport,
   normalizeSshConfig,
   normAuthMode,
+  normTransportMode,
+  OAUTH_SESSION_PARTITION,
+  oauthPartitionIdentity,
+  oauthSessionPartitionForIdentity,
   pathWithGlobalRemoteProfile,
   PRIVY_SESSION_COOKIE_VARIANTS,
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
+  REMOTE_TRANSPORT_MODES,
+  remoteAuthIdentity,
+  remoteEffectiveUrl,
+  remotePublicUrl,
   resolveAuthMode,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
+  sanitizeStoredConnectionConfig,
+  sanitizeStoredConnectionProfiles,
+  sanitizeStoredRemoteBlock,
   savedProfileSsh,
-  tokenPreview
+  tokenPreview,
+  TRANSPORT_DIRECT,
+  TRANSPORT_LOCAL_MTLS_PROXY
 }

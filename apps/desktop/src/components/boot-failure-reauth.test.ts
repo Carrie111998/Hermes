@@ -7,6 +7,7 @@ import {
   isRemoteConfig,
   isRemoteReauthError,
   isRemoteReauthFailure,
+  remoteTransportPayload,
   signInLabel,
   sshFailureMessage
 } from './boot-failure-reauth'
@@ -159,18 +160,66 @@ describe('deriveProviderShape', () => {
 
 describe('signInLabel', () => {
   it('password gateway gets the plain "Sign in to remote gateway" copy', () => {
-    expect(signInLabel({ url: 'x', isPassword: true, providerLabel: 'Username & Password' })).toBe(
-      'Sign in to remote gateway'
-    )
+    expect(
+      signInLabel({
+        url: 'x',
+        transport: { remoteUrl: 'x' },
+        isPassword: true,
+        providerLabel: 'Username & Password'
+      })
+    ).toBe('Sign in to remote gateway')
   })
 
   it('OAuth gateway names the provider', () => {
-    expect(signInLabel({ url: 'x', isPassword: false, providerLabel: 'Nous Research' })).toBe(
-      'Sign in with Nous Research'
-    )
+    expect(
+      signInLabel({
+        url: 'x',
+        transport: { remoteUrl: 'x' },
+        isPassword: false,
+        providerLabel: 'Nous Research'
+      })
+    ).toBe('Sign in with Nous Research')
   })
 
   it('null reauth falls back to the generic provider phrase', () => {
     expect(signInLabel(null)).toBe('Sign in with your identity provider')
+  })
+})
+
+describe('remoteTransportPayload', () => {
+  it('keeps public identity while routing local proxy transport through the effective URL', () => {
+    expect(
+      remoteTransportPayload(
+        config({
+          remoteUrl: 'https://gateway.example.com',
+          remotePublicUrl: 'https://gateway.example.com',
+          remoteEffectiveUrl: 'http://127.0.0.1:19119',
+          remoteTransportMode: 'local_mtls_proxy'
+        })
+      )
+    ).toEqual({
+      remoteUrl: 'https://gateway.example.com',
+      remotePublicUrl: 'https://gateway.example.com',
+      remoteEffectiveUrl: 'http://127.0.0.1:19119',
+      remoteTransportMode: 'local_mtls_proxy'
+    })
+  })
+
+  it('forces direct transport to use the public URL as the effective URL', () => {
+    expect(
+      remoteTransportPayload(
+        config({
+          remoteUrl: 'http://localhost:9119',
+          remotePublicUrl: 'http://localhost:9119',
+          remoteEffectiveUrl: 'http://127.0.0.1:19119',
+          remoteTransportMode: 'direct'
+        })
+      )
+    ).toEqual({
+      remoteUrl: 'http://localhost:9119',
+      remotePublicUrl: 'http://localhost:9119',
+      remoteEffectiveUrl: 'http://localhost:9119',
+      remoteTransportMode: 'direct'
+    })
   })
 })

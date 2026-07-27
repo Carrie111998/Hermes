@@ -28,6 +28,31 @@ import {
   publishSessionState
 } from './session-states'
 
+function ensureLocalStorage() {
+  if (window.localStorage) {
+    return
+  }
+
+  const values = new Map<string, string>()
+  const storage = {
+    clear: () => values.clear(),
+    getItem: (key: string) => values.get(String(key)) ?? null,
+    key: (index: number) => Array.from(values.keys())[index] ?? null,
+    get length() {
+      return values.size
+    },
+    removeItem: (key: string) => void values.delete(String(key)),
+    setItem: (key: string, value: string) => void values.set(String(key), String(value))
+  }
+
+  Object.defineProperty(window, 'localStorage', { configurable: true, value: storage })
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage })
+}
+
+beforeEach(() => {
+  ensureLocalStorage()
+})
+
 const session = (over: Partial<SessionInfo>): SessionInfo => ({
   archived: false,
   cwd: null,
@@ -216,6 +241,9 @@ describe('workspaceCwdForNewSession', () => {
     window.localStorage.removeItem('hermes.desktop.workspace-cwd')
     window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-a.default')
     window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-b.default')
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.https%3A%2F%2Fagent-a.example.com.default')
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.https%3A%2F%2Fagent-b.example.com.default')
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.ssh%3Aalice%40box.example.com%3A2222.default')
   })
 
   it('prefers the configured default over the sticky remembered workspace', () => {
@@ -273,6 +301,59 @@ describe('workspaceCwdForNewSession', () => {
     // never reads the remote keys (nor inherits the sticky local workspace).
     $connection.set(null)
     expect(workspaceCwdForNewSession()).toBe('')
+  })
+
+  it('keys proxied URL remotes by public URL, not the shared loopback effective URL', () => {
+    $connection.set({
+      baseUrl: 'http://127.0.0.1:19119',
+      mode: 'remote',
+      publicUrl: 'https://agent-a.example.com',
+      transportMode: 'local_mtls_proxy'
+    } as never)
+
+    setCurrentCwd('/agent-a/project')
+    expect(workspaceCwdForNewSession()).toBe('/agent-a/project')
+
+    $connection.set({
+      baseUrl: 'http://127.0.0.1:19119',
+      mode: 'remote',
+      publicUrl: 'https://agent-b.example.com',
+      transportMode: 'local_mtls_proxy'
+    } as never)
+    expect(workspaceCwdForNewSession()).toBe('')
+
+    setCurrentCwd('/agent-b/project')
+    expect(workspaceCwdForNewSession()).toBe('/agent-b/project')
+
+    $connection.set({
+      baseUrl: 'http://127.0.0.1:19119',
+      mode: 'remote',
+      publicUrl: 'https://agent-a.example.com',
+      transportMode: 'local_mtls_proxy'
+    } as never)
+    expect(workspaceCwdForNewSession()).toBe('/agent-a/project')
+  })
+
+  it('keys SSH remotes by remote identity before URL transport fields', () => {
+    $connection.set({
+      baseUrl: 'http://127.0.0.1:19119',
+      mode: 'remote',
+      publicUrl: 'https://proxy.example.com',
+      remoteIdentity: 'ssh:alice@box.example.com:2222',
+      remoteKind: 'ssh'
+    } as never)
+
+    setCurrentCwd('/ssh/project')
+    expect(workspaceCwdForNewSession()).toBe('/ssh/project')
+
+    $connection.set({
+      baseUrl: 'http://127.0.0.1:19119',
+      mode: 'remote',
+      publicUrl: 'https://other-proxy.example.com',
+      remoteIdentity: 'ssh:alice@box.example.com:2222',
+      remoteKind: 'ssh'
+    } as never)
+    expect(workspaceCwdForNewSession()).toBe('/ssh/project')
   })
 })
 

@@ -17,6 +17,19 @@ function sshConfigFingerprint(scope, config) {
     .digest('hex')
 }
 
+function sshWorkspaceIdentity(scope, config) {
+  const host = String(config?.host || '').trim()
+
+  if (!host) {
+    throw new Error('SSH workspace identity requires a host.')
+  }
+
+  const parts = [scope, host.toLowerCase(), config?.user || '', config?.port || 22]
+  const digest = crypto.createHash('sha256').update(JSON.stringify(parts.map(value => String(value ?? '')))).digest('hex')
+
+  return `ssh:${digest}`
+}
+
 function createBootstrapCoordinator() {
   const active = new Set<any>()
   const pending = new Map<string, any>()
@@ -127,4 +140,4 @@ function createBootstrapCoordinator() {
   return { active, cancel, cancelAll, cancelAndWait, forceCleanupAll, pending, promises, start }
 }
 
-export { createBootstrapCoordinator, sshConfigFingerprint }
+export { createBootstrapCoordinator, sshConfigFingerprint, sshWorkspaceIdentity }

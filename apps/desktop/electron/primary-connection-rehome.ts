@@ -6,6 +6,10 @@ export interface PrimaryConnectionRehomeOptions {
   teardownPrimaryBackend: (options: { soft: boolean }) => Promise<void>
 }
 
+function isNonLocalPrimaryMode(mode: string): boolean {
+  return mode === 'remote' || mode === 'cloud' || mode === 'ssh'
+}
+
 // Production seam shared by the connection-config IPC handler and the
 // first-run integration test. A remote apply that resumes the active setup
 // gate must keep that connection attempt alive; ordinary mode changes tear the
@@ -19,7 +23,7 @@ export async function rehomePrimaryConnection({
 }: PrimaryConnectionRehomeOptions): Promise<{ resumedFirstRunRemote: boolean }> {
   let resumedFirstRunRemote = false
 
-  if (mode === 'remote') {
+  if (isNonLocalPrimaryMode(mode)) {
     resumedFirstRunRemote = resumeFirstRunRemote()
     clearLocalBootstrapFailure()
   }
