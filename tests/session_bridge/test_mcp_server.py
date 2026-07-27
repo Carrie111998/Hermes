@@ -2102,6 +2102,7 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "last_visible_task_id",
         "recent_error_codes",
         "delivery_latency_seconds",
+        "hydration",
     }
     assert sidebar["eligible_by_provider"] == {"claude": 1, "hermes": 0}
     assert sidebar["counts"]["sidebar_pending"] == 1
@@ -2126,6 +2127,64 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "p95": None,
         "p99": None,
     }
+
+
+def test_session_status_exposes_only_sanitized_hydration_observability(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    private = "C:/private/source.jsonl secret-preview"
+    monkeypatch.setattr(
+        store,
+        "sidebar_hydration_status",
+        lambda now: {
+            "counts": {
+                "hydration_pending": 2,
+                "hydration_leased": 1,
+                "hydration_retry": 3,
+                "hydration_visible": 4,
+                "hydration_failed": 5,
+                "hostile": 99,
+            },
+            "oldest_pending_age_seconds": 42.5,
+            "recent_error_codes": ["hydration_send_ambiguous", private],
+            "lease_token": "must-not-leak",
+            "hydration_marker": "must-not-leak",
+            "preview": private,
+        },
+    )
+    config = BridgeConfig(
+        sidebar=SidebarConfig(legacy_hydration_enabled=True),
+    )
+
+    with _test_client(
+        _create_test_app(db, store, coordinator, config=config)
+    ) as client:
+        status = _call_tool(client, "session_status", {})
+
+    hydration = status["sidebar"]["hydration"]
+    assert hydration == {
+        "enabled": True,
+        "counts": {
+            "hydration_pending": 2,
+            "hydration_leased": 1,
+            "hydration_retry": 3,
+            "hydration_visible": 4,
+            "hydration_failed": 5,
+        },
+        "oldest_pending_age_seconds": 42.5,
+        "recent_error_codes": ["hydration_send_ambiguous"],
+    }
+    rendered = json.dumps(status)
+    assert "lease_token" not in rendered
+    assert "hydration_marker" not in rendered
+    assert private not in rendered
 
 
 def test_sidebar_status_preserves_both_fixed_terminal_resolution_codes() -> None:

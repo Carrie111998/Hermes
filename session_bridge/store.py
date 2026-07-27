@@ -7829,10 +7829,38 @@ class SessionBridgeStore:
                     SidebarHydrationState.RETRY.value,
                 ),
             ).fetchone()
+            oldest = conn.execute(
+                """SELECT MIN(next_attempt_at) AS actionable_at
+                     FROM session_sidebar_hydration_jobs
+                    WHERE state IN (?, ?)""",
+                (
+                    SidebarHydrationState.PENDING.value,
+                    SidebarHydrationState.RETRY.value,
+                ),
+            ).fetchone()
+            error_rows = conn.execute(
+                """SELECT error_code
+                     FROM session_sidebar_hydration_jobs
+                    WHERE error_code IS NOT NULL
+                    ORDER BY updated_at DESC, id DESC LIMIT 10"""
+            ).fetchall()
+        oldest_at = oldest["actionable_at"] if oldest is not None else None
+        recent_codes: list[str] = []
+        allowed_codes = HYDRATION_RETRYABLE_ERRORS | HYDRATION_FATAL_ERRORS
+        for row in error_rows:
+            code = row["error_code"]
+            if code in allowed_codes and code not in recent_codes:
+                recent_codes.append(code)
         return {
             "counts": counts,
             "active_lease": active is not None,
             "reserved_reconciliation": int(reserved_reconciliation["count"]),
+            "oldest_pending_age_seconds": (
+                max(0.0, checked_at - float(oldest_at))
+                if oldest_at is not None
+                else None
+            ),
+            "recent_error_codes": recent_codes,
         }
 
     def ensure_sidebar_lineage(

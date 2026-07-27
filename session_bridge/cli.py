@@ -76,18 +76,22 @@ from .mirror import (
 )
 from .models import (
     BridgeMarkerPayload,
+    HydrationMarkerPayload,
     MirrorJobState,
     Provider,
+    SidebarHydrationState,
     SidebarJobState,
     encode_bridge_marker,
 )
 from .claude_skill import install_claude_skill
 from .sidebar import (
     SidebarCandidate,
+    encode_hydration_marker,
     sidebar_bridge_id,
     sidebar_create_recovery_key,
     sidebar_idempotency_key,
 )
+from .preview import build_session_preview
 from .sidebar_skill import install_sidebar_skill
 from .sidebar_executor import (
     CodexAppServerSidebarDelivery,
@@ -95,6 +99,8 @@ from .sidebar_executor import (
     SidebarExecutor,
 )
 from .store import (
+    HYDRATION_FATAL_ERRORS,
+    HYDRATION_RETRYABLE_ERRORS,
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_PRECREATE_RESOLUTION_CODE,
     SIDEBAR_RETRYABLE_ERRORS,
@@ -546,6 +552,16 @@ class _Backend(Protocol):
         self, *, days: int, limit: int, apply: bool
     ) -> Mapping[str, Any]: ...
     def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]: ...
+    def set_sidebar_readable_preview(self, *, enabled: bool) -> Mapping[str, Any]: ...
+    def set_sidebar_hydration(self, *, enabled: bool) -> Mapping[str, Any]: ...
+    def sidebar_hydration_seed(
+        self,
+        *,
+        source_session_id: str,
+        codex_thread_id: str,
+        confirmation: str,
+    ) -> Mapping[str, Any]: ...
+    def sidebar_hydration_status(self) -> Mapping[str, Any]: ...
     def sidebar_run_once(self) -> Mapping[str, Any]: ...
     def sidebar_retry_bound(
         self,
@@ -921,6 +937,169 @@ class ProductionBackend:
             "enabled": self.config.sidebar.enabled,
             "continuous": persisted_continuous,
         }
+
+    def set_sidebar_readable_preview(self, *, enabled: bool) -> Mapping[str, Any]:
+        persisted = self._set_sidebar_feature_flag(
+            "readable_preview_enabled",
+            enabled=enabled,
+        )
+        return {"readable_preview_enabled": persisted}
+
+    def set_sidebar_hydration(self, *, enabled: bool) -> Mapping[str, Any]:
+        persisted = self._set_sidebar_feature_flag(
+            "legacy_hydration_enabled",
+            enabled=enabled,
+        )
+        return {"legacy_hydration_enabled": persisted}
+
+    def _set_sidebar_feature_flag(self, key: str, *, enabled: bool) -> bool:
+        if (
+            key not in {"readable_preview_enabled", "legacy_hydration_enabled"}
+            or type(enabled) is not bool
+        ):
+            raise ConfigurationFailure("invalid_sidebar_feature_mode")
+        from hermes_cli.config import ConfigPersistenceRejected, mutate_config
+
+        def _mutate(document: dict[str, Any]) -> None:
+            session_bridge = document.setdefault("session_bridge", {})
+            if not isinstance(session_bridge, dict):
+                raise ConfigurationFailure("invalid_session_bridge_config")
+            sidebar = session_bridge.setdefault("sidebar", {})
+            if not isinstance(sidebar, dict):
+                raise ConfigurationFailure("invalid_sidebar_config")
+            sidebar[key] = enabled
+
+        try:
+            persisted = mutate_config(
+                _mutate,
+                preserve_keys={("session_bridge", "sidebar", key)},
+            )
+        except ConfigPersistenceRejected as exc:
+            raise ConfigurationFailure("config_persistence_rejected") from exc
+        persisted_bridge = persisted.get("session_bridge")
+        persisted_sidebar = (
+            persisted_bridge.get("sidebar")
+            if isinstance(persisted_bridge, dict)
+            else None
+        )
+        value = (
+            persisted_sidebar.get(key)
+            if isinstance(persisted_sidebar, dict)
+            else None
+        )
+        if type(value) is not bool or value is not enabled:
+            raise ConfigurationFailure("sidebar_feature_not_persisted")
+        self.config = replace(
+            self.config,
+            sidebar=replace(self.config.sidebar, **{key: value}),
+        )
+        return value
+
+    def sidebar_hydration_seed(
+        self,
+        *,
+        source_session_id: str,
+        codex_thread_id: str,
+        confirmation: str,
+    ) -> Mapping[str, Any]:
+        if confirmation != "HYDRATE_EXACT_EXISTING_TASK":
+            raise RolloutGateBlocked("sidebar_hydration_confirmation_required")
+        store = self._require_store()
+        job = store.get_sidebar_job_for_source(source_session_id)
+        if (
+            job is None
+            or job.get("state") != SidebarJobState.VISIBLE.value
+            or job.get("codex_thread_id") != codex_thread_id
+        ):
+            raise RolloutGateBlocked("sidebar_hydration_target_mismatch")
+        bridge_id = str(job.get("bridge_id") or "")
+        with store.db._lock:
+            conn = store.db._conn
+            assert conn is not None
+            lineage = conn.execute(
+                """SELECT 1
+                     FROM session_links AS link
+                     JOIN external_sessions AS target
+                       ON target.session_id = link.to_session_id
+                    WHERE link.bridge_id = ?
+                      AND link.from_session_id = ?
+                      AND link.relation = ?
+                      AND target.provider = ?
+                      AND target.native_id = ?
+                      AND target.origin_bridge_id = ?
+                    LIMIT 1""",
+                (
+                    bridge_id,
+                    source_session_id,
+                    "mirrors",
+                    Provider.CODEX.value,
+                    codex_thread_id,
+                    bridge_id,
+                ),
+            ).fetchone()
+        if lineage is None:
+            raise RolloutGateBlocked("sidebar_hydration_lineage_mismatch")
+
+        candidate = store.get_sidebar_candidate_for_delivery(source_session_id)
+        snapshot = store.get_sidebar_preview_source(source_session_id)
+        if (
+            candidate.bridge_id != bridge_id
+            or snapshot.get("source_session_id") != source_session_id
+            or snapshot.get("provider") != candidate.provider.value
+        ):
+            raise RolloutGateBlocked("sidebar_hydration_source_mismatch")
+        preview = build_session_preview(
+            source_session_id=source_session_id,
+            source_cursor=str(snapshot["source_cursor"]),
+            source_hash=str(snapshot["source_hash"]),
+            title=cast(str | None, snapshot.get("title")),
+            provider=candidate.provider.value,
+            cwd=candidate.cwd,
+            captured_at=float(snapshot["captured_at"]),
+            messages=cast(Sequence[Mapping[str, Any]], snapshot["messages"]),
+            git_root=candidate.git_root,
+            git_branch=candidate.git_branch,
+            git_head=candidate.git_head,
+            worktree_id=candidate.worktree_id,
+            budget_chars=self.config.sidebar.preview_budget_chars,
+        )
+        marker = encode_hydration_marker(
+            HydrationMarkerPayload(
+                bridge_id=bridge_id,
+                codex_thread_id=codex_thread_id,
+                preview_digest=preview.digest,
+                preview_version=preview.version,
+                source_cursor=preview.source_cursor,
+                source_hash=preview.source_hash,
+                source_session_id=source_session_id,
+            ),
+            resolve_marker_key(),
+        )
+        seeded = store.seed_sidebar_hydration_job(
+            source_session_id=source_session_id,
+            bridge_id=bridge_id,
+            codex_thread_id=codex_thread_id,
+            source_cursor=preview.source_cursor,
+            source_hash=preview.source_hash,
+            preview_version=preview.version,
+            preview_digest=preview.digest,
+            hydration_marker=marker,
+            now=time.time(),
+        )
+        return {
+            "job_id": seeded["id"],
+            "source_session_id": seeded["source_session_id"],
+            "codex_thread_id": seeded["codex_thread_id"],
+            "state": seeded["state"],
+            "preview_version": int(seeded["preview_version"]),
+            "preview_digest": seeded["preview_digest"],
+        }
+
+    def sidebar_hydration_status(self) -> Mapping[str, Any]:
+        return _public_sidebar_hydration_status(
+            self._require_store().sidebar_hydration_status(time.time()),
+            enabled=self.config.sidebar.legacy_hydration_enabled,
+        )
 
     def sidebar_run_once(self) -> Mapping[str, Any]:
         if not self.config.sidebar.enabled:
@@ -2659,6 +2838,46 @@ def build_parser() -> argparse.ArgumentParser:
     sidebar_continuous_mode.add_argument("--enable", action="store_true")
     sidebar_continuous_mode.add_argument("--disable", action="store_true")
 
+    sidebar_readable = commands.add_parser(
+        "sidebar-readable-preview",
+        help="persist readable previews for future sidebar registrations",
+    )
+    sidebar_readable_mode = sidebar_readable.add_mutually_exclusive_group(required=True)
+    sidebar_readable_mode.add_argument("--enable", action="store_true")
+    sidebar_readable_mode.add_argument("--disable", action="store_true")
+
+    sidebar_hydration = commands.add_parser(
+        "sidebar-hydration",
+        help="persist the exact-task legacy hydration gate",
+    )
+    sidebar_hydration_mode = sidebar_hydration.add_mutually_exclusive_group(
+        required=True
+    )
+    sidebar_hydration_mode.add_argument("--enable", action="store_true")
+    sidebar_hydration_mode.add_argument("--disable", action="store_true")
+
+    sidebar_hydration_seed = commands.add_parser(
+        "sidebar-hydration-seed",
+        help="seed one exact existing linked task for in-place hydration",
+    )
+    sidebar_hydration_seed.add_argument("--source-session-id", required=True)
+    sidebar_hydration_seed.add_argument(
+        "--codex-thread-id",
+        type=_sidebar_terminal_thread_id,
+        required=True,
+    )
+    sidebar_hydration_seed.add_argument(
+        "--confirm",
+        choices=("HYDRATE_EXACT_EXISTING_TASK",),
+        required=True,
+    )
+
+    sidebar_hydration_status = commands.add_parser(
+        "sidebar-hydration-status",
+        help="show sanitized in-place hydration status",
+    )
+    sidebar_hydration_status.add_argument("--json", action="store_true")
+
     commands.add_parser(
         "sidebar-run-once",
         help="process at most one native sidebar delivery job",
@@ -2896,6 +3115,30 @@ def main(
             return EXIT_DEGRADED if int(payload.get("failed", 0)) else EXIT_OK
         if args.command == "sidebar-continuous":
             payload = dict(backend.set_sidebar_continuous(enabled=bool(args.enable)))
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "sidebar-readable-preview":
+            payload = dict(
+                backend.set_sidebar_readable_preview(enabled=bool(args.enable))
+            )
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "sidebar-hydration":
+            payload = dict(backend.set_sidebar_hydration(enabled=bool(args.enable)))
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "sidebar-hydration-seed":
+            payload = dict(
+                backend.sidebar_hydration_seed(
+                    source_session_id=args.source_session_id,
+                    codex_thread_id=args.codex_thread_id,
+                    confirmation=args.confirm,
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "sidebar-hydration-status":
+            payload = dict(backend.sidebar_hydration_status())
             _emit(payload)
             return EXIT_OK
         if args.command == "sidebar-run-once":
@@ -3686,6 +3929,36 @@ def _public_sidebar_execution_result(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ProviderDegraded("invalid_sidebar_execution_result")
         result["error_code"] = error_code
     return result
+
+
+def _public_sidebar_hydration_status(
+    raw: Mapping[str, Any],
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    raw_counts = raw.get("counts")
+    counts = raw_counts if isinstance(raw_counts, Mapping) else {}
+    raw_codes = raw.get("recent_error_codes")
+    allowed_codes = HYDRATION_RETRYABLE_ERRORS | HYDRATION_FATAL_ERRORS
+    return {
+        "enabled": enabled is True,
+        "counts": {
+            state.value: _status_count(counts.get(state.value, 0))
+            for state in SidebarHydrationState
+        },
+        "oldest_pending_age_seconds": _optional_status_number(
+            raw.get("oldest_pending_age_seconds")
+        ),
+        "recent_error_codes": (
+            [
+                code
+                for code in raw_codes
+                if isinstance(code, str) and code in allowed_codes
+            ][:10]
+            if isinstance(raw_codes, list)
+            else []
+        ),
+    }
 
 
 def _public_sidebar_bound_retry_result(raw: Mapping[str, Any]) -> dict[str, Any]:

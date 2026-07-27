@@ -39,6 +39,7 @@ from session_bridge.cli import (
     _run_continuous_visibility_worker,
     _claude_characterization_open_work_allowed,
     _sync_claude_characterization_records,
+    build_parser,
     main,
 )
 from session_bridge.codex_adapter import SidebarThreadVerifier
@@ -56,6 +57,8 @@ from session_bridge.models import (
     OriginKind,
     ProjectedMessage,
     Provider,
+    Relation,
+    SessionLink,
     SessionProjection,
     SidebarJobState,
     encode_bridge_marker,
@@ -141,6 +144,20 @@ class FakeBackend:
             "state": "sidebar_retry",
         }
     )
+    sidebar_hydration_status_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "counts": {
+                "hydration_pending": 1,
+                "hydration_leased": 0,
+                "hydration_retry": 0,
+                "hydration_visible": 0,
+                "hydration_failed": 0,
+            },
+            "oldest_pending_age_seconds": 12.5,
+            "recent_error_codes": ["hydration_send_ambiguous"],
+        }
+    )
     claude_visibility_payload: dict[str, Any] = field(
         default_factory=lambda: {
             "enabled": False,
@@ -204,6 +221,40 @@ class FakeBackend:
     def set_sidebar_continuous(self, *, enabled: bool) -> dict[str, Any]:
         self.calls.append(("set_sidebar_continuous", enabled))
         return {"enabled": enabled, "continuous": enabled}
+
+    def set_sidebar_readable_preview(self, *, enabled: bool) -> dict[str, Any]:
+        self.calls.append(("set_sidebar_readable_preview", enabled))
+        return {"readable_preview_enabled": enabled}
+
+    def set_sidebar_hydration(self, *, enabled: bool) -> dict[str, Any]:
+        self.calls.append(("set_sidebar_hydration", enabled))
+        return {"legacy_hydration_enabled": enabled}
+
+    def sidebar_hydration_seed(
+        self,
+        *,
+        source_session_id: str,
+        codex_thread_id: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_hydration_seed",
+            source_session_id,
+            codex_thread_id,
+            confirmation,
+        ))
+        return {
+            "job_id": "sidebar-hydration:" + "b" * 64,
+            "source_session_id": source_session_id,
+            "codex_thread_id": codex_thread_id,
+            "state": "hydration_pending",
+            "preview_version": 1,
+            "preview_digest": "a" * 64,
+        }
+
+    def sidebar_hydration_status(self) -> dict[str, Any]:
+        self.calls.append(("sidebar_hydration_status",))
+        return dict(self.sidebar_hydration_status_payload)
 
     def sidebar_run_once(self) -> dict[str, Any]:
         self.calls.append(("sidebar_run_once",))
@@ -493,6 +544,225 @@ def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
     assert not any(
         call[0] in {"apply_backfill", "apply_mirror"} for call in backend.calls
     )
+
+
+def test_sidebar_readable_hydration_commands_are_explicit_and_never_schedule(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+    source_id = "claude:2a786924-8093-4a9f-a371-6e27ca66be32"
+    thread_id = "019f8927-8012-77d0-beb0-4cd5f8cc21f9"
+
+    assert _run(["sidebar-readable-preview", "--enable"], backend) == 0
+    assert _json_output(capsys) == {"readable_preview_enabled": True}
+    assert _run(["sidebar-readable-preview", "--disable"], backend) == 0
+    assert _json_output(capsys) == {"readable_preview_enabled": False}
+    assert _run(["sidebar-hydration", "--enable"], backend) == 0
+    assert _json_output(capsys) == {"legacy_hydration_enabled": True}
+    assert (
+        _run(
+            [
+                "sidebar-hydration-seed",
+                "--source-session-id",
+                source_id,
+                "--codex-thread-id",
+                thread_id,
+                "--confirm",
+                "HYDRATE_EXACT_EXISTING_TASK",
+            ],
+            backend,
+        )
+        == 0
+    )
+    seed = _json_output(capsys)
+    assert set(seed) == {
+        "job_id",
+        "source_session_id",
+        "codex_thread_id",
+        "state",
+        "preview_version",
+        "preview_digest",
+    }
+    assert _run(["sidebar-hydration-status"], backend) == 0
+    status = _json_output(capsys)
+    assert status == backend.sidebar_hydration_status_payload
+
+    assert backend.calls == [
+        ("set_sidebar_readable_preview", True),
+        ("close",),
+        ("set_sidebar_readable_preview", False),
+        ("close",),
+        ("set_sidebar_hydration", True),
+        ("close",),
+        (
+            "sidebar_hydration_seed",
+            source_id,
+            thread_id,
+            "HYDRATE_EXACT_EXISTING_TASK",
+        ),
+        ("close",),
+        ("sidebar_hydration_status",),
+        ("close",),
+    ]
+    assert not any("automation" in str(call).casefold() for call in backend.calls)
+
+
+def test_sidebar_hydration_seed_requires_exact_confirmation_and_has_no_bulk_mode(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+    parser = build_parser()
+    action = next(
+        action
+        for action in parser._subparsers._group_actions[0].choices[
+            "sidebar-hydration-seed"
+        ]._actions
+        if action.dest == "confirm"
+    )
+
+    assert action.required is True
+    assert action.choices == ("HYDRATE_EXACT_EXISTING_TASK",)
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "sidebar-hydration-seed",
+            "--source-session-id",
+            "claude:source",
+            "--codex-thread-id",
+            "thread-1",
+            "--all",
+            "--confirm",
+            "HYDRATE_EXACT_EXISTING_TASK",
+        ])
+    assert capsys.readouterr().out == ""
+    assert backend.calls == []
+
+
+def test_production_sidebar_hydration_seed_requires_one_exact_visible_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    thread_id = "019f8927-8012-77d0-beb0-4cd5f8cc21f9"
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: "exact-hydration-seed-lease",
+    )
+    store.upsert_projection(
+        SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id="exact-hydration-source",
+            title="Exact hydration source",
+            cwd=str(tmp_path),
+            started_at=900.0,
+            last_active=950.0,
+            messages=(
+                ProjectedMessage(
+                    native_event_id="exact-hydration-message",
+                    ordinal=0,
+                    role="user",
+                    content="Restore the readable session history",
+                    timestamp=950.0,
+                ),
+            ),
+            native_cursor="cursor-exact-hydration",
+            native_hash="hash-exact-hydration",
+        )
+    )
+    source_id = "claude:exact-hydration-source"
+    bridge_id = sidebar_bridge_id(source_id)
+    candidate = SidebarCandidate(
+        source_session_id=source_id,
+        provider=Provider.CLAUDE,
+        bridge_id=bridge_id,
+        title="[Claude] Exact hydration source",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=950.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=now, limit=1)[0]
+    store.commit_sidebar_job(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=now + 1,
+    )
+    store.upsert_projection(
+        SessionProjection(
+            provider=Provider.CODEX,
+            native_id=thread_id,
+            title="[Claude] Exact hydration source",
+            cwd=str(tmp_path),
+            started_at=950.0,
+            last_active=951.0,
+            messages=(
+                ProjectedMessage(
+                    native_event_id="registration",
+                    ordinal=0,
+                    role="user",
+                    content="signed registration",
+                    timestamp=951.0,
+                ),
+            ),
+            native_cursor="target-cursor",
+            native_hash="target-hash",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=bridge_id,
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="exact-hydration-link",
+            from_session_id=source_id,
+            to_session_id=f"codex:{thread_id}",
+            relation=Relation.MIRRORS,
+            bridge_id=bridge_id,
+            source_cursor=None,
+            source_hash=None,
+            created_at=now + 2,
+        )
+    )
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(preview_budget_chars=24_000))
+    )
+    backend._store = store
+    backend._catalog = object()  # type: ignore[assignment]
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+
+    seeded = backend.sidebar_hydration_seed(
+        source_session_id=source_id,
+        codex_thread_id=thread_id,
+        confirmation="HYDRATE_EXACT_EXISTING_TASK",
+    )
+
+    assert set(seeded) == {
+        "job_id",
+        "source_session_id",
+        "codex_thread_id",
+        "state",
+        "preview_version",
+        "preview_digest",
+    }
+    assert seeded["source_session_id"] == source_id
+    assert seeded["codex_thread_id"] == thread_id
+    assert seeded["state"] == "hydration_pending"
+    with pytest.raises(RolloutGateBlocked, match="target_mismatch"):
+        backend.sidebar_hydration_seed(
+            source_session_id=source_id,
+            codex_thread_id="different-thread",
+            confirmation="HYDRATE_EXACT_EXISTING_TASK",
+        )
+    with pytest.raises(RolloutGateBlocked, match="confirmation"):
+        backend.sidebar_hydration_seed(
+            source_session_id=source_id,
+            codex_thread_id=thread_id,
+            confirmation="",
+        )
+    backend.close()
 
 
 @pytest.mark.parametrize(
@@ -2482,6 +2752,54 @@ def test_sidebar_continuous_preserves_unrelated_hermes_config(
             {("session_bridge", "sidebar", "continuous")},
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "key"),
+    (
+        ("set_sidebar_readable_preview", "readable_preview_enabled"),
+        ("set_sidebar_hydration", "legacy_hydration_enabled"),
+    ),
+)
+def test_sidebar_readable_feature_flags_persist_only_the_exact_leaf(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    key: str,
+) -> None:
+    loaded = {
+        "theme": "midnight",
+        "session_bridge": {
+            "sidebar": {
+                "enabled": True,
+                "continuous": False,
+                "backfill_days": 30,
+            },
+            "future_key": {"keep": "exactly"},
+        },
+    }
+    saved: list[tuple[dict[str, Any], set[tuple[str, ...]] | None]] = []
+
+    def mutate_config(mutator, **kwargs):
+        value = json.loads(json.dumps(loaded))
+        mutator(value)
+        saved.append((value, kwargs.get("preserve_keys")))
+        return value
+
+    monkeypatch.setattr("hermes_cli.config.mutate_config", mutate_config)
+    backend = ProductionBackend(BridgeConfig())
+
+    result = getattr(backend, method_name)(enabled=True)
+
+    assert result == {key: True}
+    assert saved[0][0]["session_bridge"]["sidebar"] == {
+        "enabled": True,
+        "continuous": False,
+        "backfill_days": 30,
+        key: True,
+    }
+    assert saved[0][0]["session_bridge"]["future_key"] == {"keep": "exactly"}
+    assert saved[0][0]["theme"] == "midnight"
+    assert saved[0][1] == {("session_bridge", "sidebar", key)}
 
 
 def test_claude_visibility_continuous_preserves_unrelated_config_and_enabled_flag(

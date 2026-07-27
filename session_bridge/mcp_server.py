@@ -33,6 +33,7 @@ from .models import (
     HydrationMarkerPayload,
     MirrorJobState,
     Provider,
+    SidebarHydrationState,
     SidebarJobState,
     encode_bridge_marker,
 )
@@ -384,10 +385,20 @@ def create_app(
         health = health_method() if callable(health_method) else {"running": False}
         catalog_status = await asyncio.to_thread(catalog.status)
         sidebar_status = await asyncio.to_thread(store.sidebar_delivery_status)
+        hydration_status = await asyncio.to_thread(
+            store.sidebar_hydration_status,
+            time.time(),
+        )
         sidebar_status["last_visible_task_id"] = redact_codex_thread_id(
             sidebar_status.get("last_visible_task_id")
         )
-        return _status_payload(health, catalog_status, sidebar_status)
+        return _status_payload(
+            health,
+            catalog_status,
+            sidebar_status,
+            hydration_status,
+            hydration_enabled=config.sidebar.legacy_hydration_enabled,
+        )
 
     @mcp.tool()
     async def session_claude_visibility_status() -> dict[str, Any]:
@@ -1266,11 +1277,19 @@ def _status_payload(
     raw_health: object,
     raw_catalog: object,
     raw_sidebar: object,
+    raw_hydration: object,
+    *,
+    hydration_enabled: bool,
 ) -> dict[str, Any]:
+    sidebar = _sidebar_status(raw_sidebar)
+    sidebar["hydration"] = _hydration_status(
+        raw_hydration,
+        enabled=hydration_enabled,
+    )
     return {
         "health": _health_status(raw_health),
         "catalog": _catalog_status(raw_catalog),
-        "sidebar": _sidebar_status(raw_sidebar),
+        "sidebar": sidebar,
     }
 
 
@@ -1519,6 +1538,31 @@ def _sidebar_status(value: object) -> dict[str, Any]:
             percentile: _finite_status_number(latency_values.get(percentile))
             for percentile in ("p50", "p95", "p99")
         },
+    }
+
+
+def _hydration_status(value: object, *, enabled: bool) -> dict[str, Any]:
+    source = _status_mapping(value)
+    raw_counts = _status_mapping(source.get("counts"))
+    recent = source.get("recent_error_codes")
+    return {
+        "enabled": enabled is True,
+        "counts": {
+            state.value: _nonnegative_status_int(raw_counts.get(state.value), 0)
+            for state in SidebarHydrationState
+        },
+        "oldest_pending_age_seconds": _finite_status_number(
+            source.get("oldest_pending_age_seconds")
+        ),
+        "recent_error_codes": (
+            [
+                code
+                for code in _fixed_status_codes(list(recent))
+                if code in HYDRATION_RETRYABLE_ERRORS | HYDRATION_FATAL_ERRORS
+            ]
+            if isinstance(recent, (list, tuple))
+            else []
+        ),
     }
 
 
