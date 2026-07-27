@@ -1397,7 +1397,24 @@ def restore_primary_runtime(agent) -> bool:
 
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
+
+    Set ``agent.sticky_fallback: true`` (config key: ``agent.sticky_fallback``)
+    to opt out of this and keep an activated fallback for the rest of the
+    session instead of reverting on the next turn.
     """
+    if agent._fallback_activated:
+        try:
+            from hermes_cli.config import cfg_get, load_config_readonly
+
+            sticky = cfg_get(load_config_readonly(), "agent", "sticky_fallback", default=False)
+        except Exception:
+            sticky = False
+        if sticky:
+            # Leave _fallback_activated/_fallback_index untouched so the
+            # fallback stays live and _try_activate_fallback() can still
+            # advance the chain if this fallback also fails.
+            return False
+
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
