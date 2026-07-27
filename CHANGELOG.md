@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Web search and extraction permits now bind the complete provider request,
+  including query or URL plus result limit, output format, and character limit;
+  a worker cannot broaden quota or change returned content under one grant.
 - Terminal execution permits now bind the exact command, resolved working
   directory, backend, timeout, background/PTY mode, task identity, and
   notification/watch settings; a command grant cannot be replayed with a

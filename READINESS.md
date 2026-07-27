@@ -1558,6 +1558,32 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production shell credentials, sandbox deployment, or external authorization.
 
+## Web provider authority evidence (7fdf1f6eb9)
+
+Web provider permits now use hashed resources for the complete request. Search
+binds the query and result limit; extraction binds each normalized URL, output
+format, and character limit. A subordinate cannot reuse a request grant to
+increase provider usage or alter the returned representation.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/web_tools.py
+uv run --extra dev pytest -q \
+  tests/tools/test_web_providers.py \
+  tests/tools/test_web_tools_config.py \
+  tests/tools/test_web_extract_robustness.py \
+  tests/tools/test_web_tools_dict_urls.py \
+  tests/tools/test_web_tools_truncate.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **104 web regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:82af4423a67717d4cee7aa7cc38e5ff13144ee767a3a8c8b3d8c631f49c2c8ef`.
+This remains deterministic local-provider evidence and does not establish
+production search/extraction credentials, quotas, or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
