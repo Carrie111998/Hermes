@@ -33,6 +33,10 @@ acceptance evidence.
   same parent budget repeatedly.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
+- Bootstrapped organization actor checks reject unknown employee identities;
+  the only compatibility alias is `employee:ceo`, which resolves to the
+  active CEO of the objective's organization. Legacy `__unscoped__` objective
+  stores remain explicitly outside the organization identity boundary.
 - Registered action payload schemas and temporal observation windows are
   validated before permit admission and again at the final execution boundary.
 - Runtime construction rejects self-supervising verifier identities; verifier

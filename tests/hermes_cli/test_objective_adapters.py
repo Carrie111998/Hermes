@@ -129,6 +129,49 @@ def test_model_failure_releases_durable_compute_reservation(monkeypatch, tmp_pat
     assert "llm_call_failed" in reconciliation["evidence_json"]
 
 
+def test_unknown_employee_actor_cannot_propose_in_bootstrapped_org(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    organization_id, _ = organization_db.bootstrap_solo_founder(
+        conn,
+        organization_name="Actor Boundary Company",
+        purpose="Reject unknown employee identities",
+        profile_name="default",
+        charter={},
+    )
+    objective = objectives_db.create_objective(
+        conn,
+        organization_id=organization_id,
+        desired_outcome="Test actor scope",
+        originator="employee:ceo",
+        permitted_systems=["web"],
+    )
+    objectives_db.transition_objective(conn, objective.id, "accepted", actor="employee:ceo")
+    objectives_db.transition_objective(conn, objective.id, "planned", actor="employee:ceo")
+    plan_id = objectives_db.create_plan(
+        conn,
+        objective.id,
+        assumptions=[],
+        tasks=[],
+        dependencies=[],
+        risks=[],
+        created_by="employee:ceo",
+    )
+    with pytest.raises(objectives_db.ObjectiveStateError, match="not authorized"):
+        objectives_db.propose_action(
+            conn,
+            objective_id=objective.id,
+            plan_id=plan_id,
+            action_type="web.read",
+            payload={"system": "web", "target_resource": "public"},
+            expected_outcome="read completes",
+            required_capability="web.read",
+            verification_method="web.read.completed",
+            risk_class="low",
+            reversible=True,
+            proposed_by="employee:not-a-real-employee",
+        )
+
+
 def test_planner_cannot_invent_action_surface(monkeypatch):
     monkeypatch.setattr(
         "agent.auxiliary_client.call_llm",

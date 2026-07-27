@@ -41,6 +41,10 @@
 - Parent-grant delegation is now bounded to the same objective and action
   type, with cumulative child-budget accounting so repeated sub-delegation
   cannot exceed the parent grant ceiling.
+- Bootstrapped organization actor authorization now rejects unknown
+  `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
+  only to the active CEO in the objective's organization, while legacy
+  `__unscoped__` objective stores retain their explicit compatibility path.
 - Revocation checks now traverse the parent-grant chain and fail closed when
   any ancestor is revoked or the chain is cyclic, fencing descendant workers
   and result handoffs immediately.

@@ -624,7 +624,7 @@ def test_crash_after_verification_commits_recovery_without_reverification(
 
 def test_runtime_claims_only_active_ceo_organization_events(tmp_path):
     conn = db.connect(tmp_path / "authority.db")
-    active_organization_id, _ = organization_db.bootstrap_solo_founder(
+    active_organization_id, active_ceo_id = organization_db.bootstrap_solo_founder(
         conn,
         organization_name="Active Company",
         purpose="Operate the active company",
@@ -667,6 +667,7 @@ def test_runtime_claims_only_active_ceo_organization_events(tmp_path):
         available_at=2,
     )
     executor = Executor()
+    executor.identity = f"employee:{active_ceo_id}"
     loop = runtime.ObjectiveRuntime(
         conn,
         planner=Planner([action()]),
@@ -903,10 +904,12 @@ def test_final_business_root_stays_active_until_successor_exists(tmp_path):
         "allowed_capabilities": ["crm.write", "objectives.create"],
         "allowed_systems": ["crm", "objectives"],
     }
+    executor = Executor()
+    executor.identity = f"employee:{organization_db.active_ceo(conn)['id']}"
     loop = runtime.ObjectiveRuntime(
         conn,
         planner=Planner([action()]),
-        executor=Executor(),
+        executor=executor,
         verifier=Verifier(),
         charter=governed_charter,
         policy_version="charter-v1",
@@ -941,10 +944,12 @@ def test_final_root_without_successor_authority_escalates_instead_of_closing(
         **charter(),
         "operating_cadence": {"enabled": True},
     }
+    executor = Executor()
+    executor.identity = f"employee:{organization_db.active_ceo(conn)['id']}"
     loop = runtime.ObjectiveRuntime(
         conn,
         planner=Planner([action()]),
-        executor=Executor(),
+        executor=executor,
         verifier=Verifier(),
         charter=governed_charter,
         policy_version="charter-v1",
