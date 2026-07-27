@@ -65,6 +65,17 @@ def test_held_lock_skips_the_tick_without_writes(conn):
     assert result.skipped_locked is True
     assert result.spawned == []
     assert spawn_calls == [], "spawn_fn must not run while the tick is locked out"
+    # AC-2 scoped contract: lock losers do not record a dispatcher_ticks row.
+    # The holder's progress is the only durable tick; skipped_locked is the
+    # explicit exclusion from the tick-recording guarantee.
+    tick_count = conn.execute(
+        "SELECT COUNT(*) FROM dispatcher_ticks WHERE board = 'default'"
+    ).fetchone()[0]
+    assert tick_count == 0, (
+        "lock-contention loser must not INSERT dispatcher_ticks "
+        f"(found {tick_count} row(s))"
+    )
+    assert result.tick_error is None
 
 
 def test_lock_releases_so_next_tick_runs(conn):

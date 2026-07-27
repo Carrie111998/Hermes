@@ -2499,7 +2499,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
-        print(json.dumps({
+        payload = {
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -2517,7 +2517,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
-        }, indent=2))
+            "skipped_locked": bool(res.skipped_locked),
+            "tick_error": res.tick_error,
+        }
+        print(json.dumps(payload, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
@@ -2553,6 +2556,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_locked:
+        print(
+            "Skipped (board dispatch lock held by another process — "
+            "no tick recorded this pass)"
+        )
+    if res.tick_error:
+        print(
+            f"Tick recording failed (dispatch completed, tick not durable): "
+            f"{res.tick_error}"
         )
     return 0
 

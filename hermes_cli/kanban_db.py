@@ -4119,10 +4119,13 @@ def _finalize_tick(
 ) -> "DispatchResult":
     """Record a dispatcher tick and return result.
 
-    Every non-dry_run dispatch pass records a tick.  Write failures are
-    surfaced via ``result.tick_error`` so callers can log them and
+    Every lock-acquired, non-dry_run dispatch pass records a tick
+    (SOL-FD-003).  Lock-contention losers never enter this helper: they
+    return ``DispatchResult(skipped_locked=True)`` with no DB writes so
+    the single-writer guard stays intact (issue #35240).  Write failures
+    are surfaced via ``result.tick_error`` so callers can log them and
     downstream telemetry can tell "tick happened, recording failed" from
-    "tick did not happen at all" (SOL-FD-003).
+    "tick did not happen at all".
 
     After a successful record, prunes expired ``dispatcher_ticks`` rows
     for this board only (SOL-FD-005).  Prune failures are non-fatal —
@@ -8625,8 +8628,11 @@ def dispatch_once(
     managed gateway and a shell-spawned orphan that escaped the service
     cgroup — can never run a reclaim/spawn/write tick concurrently and
     race on WAL frames. The losing dispatcher returns an empty
-    ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
-    the holder is already making progress on the same board.
+    ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes
+    (including no ``dispatcher_ticks`` row); the holder is already making
+    progress on the same board and is the only process that records the
+    tick. Tick-recording guarantees therefore apply only to lock-acquired
+    passes that reach :func:`_finalize_tick`.
 
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the

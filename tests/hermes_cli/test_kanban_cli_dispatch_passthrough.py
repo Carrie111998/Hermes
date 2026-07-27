@@ -116,6 +116,71 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
         )
 
 
+def test_cli_dispatch_json_surfaces_tick_error(isolated_kanban_home, monkeypatch, capsys):
+    """Production CLI JSON must expose tick_error so write failures are not silent."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+
+    def fake_dispatch_once(conn, **kwargs):
+        return kanban_db.DispatchResult(tick_error="simulated tick insert failure")
+
+    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=True)
+    rc = kb_cli._cmd_dispatch(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = __import__("json").loads(out)
+    assert payload["tick_error"] == "simulated tick insert failure"
+    assert payload["skipped_locked"] is False
+
+
+def test_cli_dispatch_human_surfaces_tick_error(isolated_kanban_home, monkeypatch, capsys):
+    """Human dispatch output must print non-null tick_error."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kw: kanban_db.DispatchResult(tick_error="boom-write"),
+    )
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
+    rc = kb_cli._cmd_dispatch(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Tick recording failed" in out
+    assert "boom-write" in out
+
+
+def test_finalize_tick_sets_tick_error_on_record_failure(isolated_kanban_home):
+    """_finalize_tick assigns tick_error when INSERT fails; dispatch still returns."""
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        result = kb.DispatchResult()
+        original = kb._record_dispatcher_tick
+
+        def boom(*a, **k):
+            raise RuntimeError("forced tick insert failure")
+
+        kb._record_dispatcher_tick = boom
+        try:
+            out = kb._finalize_tick(conn, "default", int(__import__("time").time()), False, result)
+        finally:
+            kb._record_dispatcher_tick = original
+        assert out is result
+        assert out.tick_error == "forced tick insert failure"
+        # No durable tick row.
+        n = conn.execute("SELECT COUNT(*) FROM dispatcher_ticks").fetchone()[0]
+        assert n == 0
+    finally:
+        conn.close()
+
+
 def test_kanban_swarm_uses_existing_humanizer_skill():
     """#29415: kanban_swarm.py used to hardcode skills=['avoid-ai-writing'],
     a skill that doesn't exist in any registry — synthesizer workers
