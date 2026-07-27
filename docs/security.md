@@ -12,6 +12,11 @@ Credentials must not enter prompts, task grants, audit exports, or authority
 records. Payment integration is non-custodial: providers hold instruments and
 funds; Charterforge stores opaque references and verified state.
 
+The optional Stripe package follows this boundary: it uses an in-memory HTTP
+client, sends the secret only to Stripe, and records no raw card or bank data.
+Its outbound implementation is deliberately limited to explicitly identified
+Connected Accounts and fails closed for arbitrary payees.
+
 Terminal execution can use inherited local, Docker, SSH, Singularity, Modal,
 or Daytona backends. A local terminal is not a sandbox. Production operators
 must select an isolation backend and appropriate egress/secrets controls for
@@ -45,4 +50,3 @@ The compliance catalog helps track CAN-SPAM, CASL, GDPR, the EU AI Act, SOX,
 PCI DSS, PIPEDA, RPAA, FINTRAC, and other regimes. Catalog presence is not an
 applicability conclusion. Qualified legal, tax, privacy, security, or
 accounting review is still required where the facts demand it.
-

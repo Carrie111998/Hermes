@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added the optional standalone `charterforge-stripe-rail` package for
+  idempotent inbound Checkout Sessions, provider read-back verification, and
+  narrowly scoped Connected Account outbound payments. The core runtime does
+  not install or enable it automatically.
+
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.
 

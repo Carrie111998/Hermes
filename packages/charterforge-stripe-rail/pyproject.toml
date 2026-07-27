@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77,<83"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "charterforge-stripe-rail"
+version = "0.1.0"
+description = "Optional non-custodial Stripe payment rail for Charterforge"
+requires-python = ">=3.11,<3.14"
+dependencies = ["httpx>=0.28,<0.29", "charterforge>=0.19.0"]
+
+[project.entry-points."charterforge.inbound_payment_rails"]
+stripe = "charterforge_stripe_rail:StripeRail"
+
+[project.entry-points."charterforge.outbound_payment_rails"]
+stripe = "charterforge_stripe_rail:StripeRail"

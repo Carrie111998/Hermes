@@ -21,8 +21,11 @@
 - Event scheduling is implemented in-process; Kafka/RabbitMQ are not bundled.
 - The inherited UI and internal code still contain legacy identifiers where
   changing them would break migration or require a separate subsystem rewrite.
-- Payment-rail contracts are implemented, but live settlement requires a
-  separately installed/configured provider and current provider assessment.
+- The optional `packages/charterforge-stripe-rail` package provides a concrete
+  HTTP Stripe Checkout/read-back rail and a narrowly scoped Connected Account
+  outbound path. It is not installed by the core runtime; live settlement
+  still requires separate installation, credentials, provider assessment, and
+  jurisdictional compliance evidence.
 - AgentMail configuration exists; provider availability and plan terms are
   external facts.
 - Compliance tracking exists; legal applicability is not autonomously proven.
