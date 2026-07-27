@@ -1929,6 +1929,7 @@ def _verified_sidebar_projection(
             thread_id=projection.native_id,
             source_session_id=expected.source_session_id,
             bridge_id=expected.bridge_id,
+            projection=projection,
         )
     if related:
         codes = {

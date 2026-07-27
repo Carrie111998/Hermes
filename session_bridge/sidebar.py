@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import hashlib
 import hmac
@@ -101,6 +101,11 @@ class VerifiedSidebarThread:
     thread_id: str
     source_session_id: str
     bridge_id: str
+    projection: SessionProjection | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 class SidebarInitialPromptKind(StrEnum):

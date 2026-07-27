@@ -14,7 +14,7 @@ from typing import Any, Callable, Literal, Mapping, Protocol, cast
 from agent.transports.codex_app_server import CodexAppServerError
 
 from .codex_adapter import SidebarThreadVerifier, SidebarVerificationError
-from .models import BridgeMarkerPayload, Provider, encode_bridge_marker
+from .models import BridgeMarkerPayload, OriginKind, Provider, encode_bridge_marker
 from .preview import build_session_preview
 from .sidebar import (
     SidebarCandidate,
@@ -1192,6 +1192,19 @@ class SidebarExecutor:
                 error_code="source_identity_mismatch",
             )
 
+        if verified.projection is not None:
+            try:
+                self._store.upsert_projection(verified.projection)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                return self._settle(
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    thread_id=thread_id,
+                    error_code=_store_error_code(exc),
+                )
+
         if not self._has_budget(operation_deadline, lease_expires_at):
             return self._settle(
                 job_id=job_id,
@@ -1441,9 +1454,19 @@ class SidebarExecutor:
 def _matches_expected(
     verified: VerifiedSidebarThread, expected: BridgeMarkerPayload
 ) -> bool:
+    projection = verified.projection
     return (
         verified.source_session_id == expected.source_session_id
         and verified.bridge_id == expected.bridge_id
+        and (
+            projection is None
+            or (
+                projection.provider is Provider.CODEX
+                and projection.native_id == verified.thread_id
+                and projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+                and projection.origin_bridge_id == expected.bridge_id
+            )
+        )
     )
 
 

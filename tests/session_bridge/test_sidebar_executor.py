@@ -12,7 +12,13 @@ import pytest
 
 from agent.transports.codex_app_server import CodexAppServerError
 import session_bridge.sidebar_executor as sidebar_executor_module
-from session_bridge.models import BridgeMarkerPayload, Provider, encode_bridge_marker
+from session_bridge.models import (
+    BridgeMarkerPayload,
+    OriginKind,
+    Provider,
+    SessionProjection,
+    encode_bridge_marker,
+)
 from session_bridge.codex_adapter import SidebarThreadVerifier
 from session_bridge.sidebar import (
     SidebarCandidate,
@@ -1203,6 +1209,10 @@ class FakeStore:
             "updated_at": now,
         }
 
+    def upsert_projection(self, projection: SessionProjection) -> object:
+        self.events.append(("index", projection.native_id))
+        return object()
+
     def fail_sidebar_job(
         self,
         *,
@@ -1233,11 +1243,13 @@ class FakeVerifier:
         find_result: VerifiedSidebarThread | None = None,
         recovery_result: str | None = None,
         recovery_error: Exception | None = None,
+        projection: SessionProjection | None = None,
     ) -> None:
         self.events = events
         self.find_result = find_result
         self.recovery_result = recovery_result
         self.recovery_error = recovery_error
+        self.projection = projection
 
     def find_by_marker(
         self, expected: BridgeMarkerPayload
@@ -1265,6 +1277,7 @@ class FakeVerifier:
             thread_id=thread_id,
             source_session_id=expected.source_session_id,
             bridge_id=expected.bridge_id,
+            projection=self.projection,
         )
 
 
@@ -1419,6 +1432,40 @@ def test_recovered_exact_id_is_verified_renamed_and_committed_without_create() -
         "commit",
     ]
     assert events[3][3] is False
+
+
+def test_verified_projection_is_indexed_before_lineage_commit() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    native = FakeNative(events)
+    projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id=THREAD_1,
+        title="[Claude] Indexed before commit",
+        cwd="C:/source",
+        started_at=90.0,
+        last_active=100.0,
+        messages=(),
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=sidebar_bridge_id(SOURCE_1),
+    )
+    verifier = FakeVerifier(events, projection=projection)
+
+    result = _executor(store, verifier, native, clock).run_once()
+
+    assert result.status == "visible"
+    assert [event[0] for event in events] == [
+        "claim",
+        "candidate",
+        "bind",
+        "register",
+        "read",
+        "verify",
+        "index",
+        "rename",
+        "commit",
+    ]
 
 
 def test_idle_cycle_records_broker_heartbeat_under_the_executor_lock() -> None:

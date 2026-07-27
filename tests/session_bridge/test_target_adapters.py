@@ -530,6 +530,10 @@ def test_sidebar_thread_verifier_reads_only_exact_authenticated_thread() -> None
         source_session_id="claude:source-1",
         bridge_id="bridge-1",
     )
+    assert verified.projection is not None
+    assert verified.projection.native_id == CODEX_ID
+    assert verified.projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+    assert verified.projection.origin_bridge_id == "bridge-1"
     assert [method for method, _, _ in client.calls] == [
         "thread/read",
         "thread/read",
