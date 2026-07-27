@@ -170,6 +170,7 @@ def prepare() -> None:
     try:
         initial = business.build_business_readiness(conn)
         assert initial["state"] == "unconfigured", initial
+        print(json.dumps({"phase": "prepare", "initial_readiness": "blocked"}))
     finally:
         conn.close()
 
