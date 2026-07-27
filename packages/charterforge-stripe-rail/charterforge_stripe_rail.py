@@ -28,11 +28,8 @@ class StripeRail(PaymentRail):
         )
 
     def _request(self, method: str, path: str, *, data: Mapping[str, Any] | None = None,
-                 idempotency_key: str | None = None,
-                 connected_account_id: str | None = None) -> dict[str, Any]:
+                 idempotency_key: str | None = None) -> dict[str, Any]:
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
-        if connected_account_id:
-            headers["Stripe-Account"] = connected_account_id
         response = self._client.request(method, path, data=data, headers=headers)
         response.raise_for_status()
         payload = response.json()
@@ -82,7 +79,8 @@ class StripeRail(PaymentRail):
         return self._payment(payload, amount_minor=amount_minor, currency=currency)
 
     def get_payment(self, reference: str) -> ProviderPayment:
-        payload = self._request("GET", f"/v1/checkout/sessions/{reference}")
+        endpoint = "payment_intents" if reference.startswith("pi_") else "checkout/sessions"
+        payload = self._request("GET", f"/v1/{endpoint}/{reference}")
         return self._payment(payload)
 
     def send_payment(self, *, amount_minor: int, currency: str,
@@ -102,11 +100,11 @@ class StripeRail(PaymentRail):
             "confirm": "true",
             "off_session": "true",
             "description": purpose,
+            "transfer_data[destination]": str(connected),
         }
         payload = self._request(
             "POST", "/v1/payment_intents", data=data,
             idempotency_key=idempotency_key,
-            connected_account_id=str(connected),
         )
         status = str(payload.get("status", "unknown"))
         return ProviderPayment(

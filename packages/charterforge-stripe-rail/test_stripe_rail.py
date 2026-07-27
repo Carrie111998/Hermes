@@ -32,9 +32,14 @@ def test_inbound_checkout_is_idempotent_and_readback_maps_paid():
     assert requests[0].headers["Authorization"] == "Bearer sk_test"
 
 
-def test_outbound_requires_connected_account_and_uses_scoped_header():
+def test_outbound_requires_connected_account_and_readback_uses_payment_intent():
     def handler(request):
-        assert request.headers["Stripe-Account"] == "acct_1"
+        if request.method == "GET":
+            assert request.url.path == "/v1/payment_intents/pi_1"
+            return httpx.Response(200, json={
+                "id": "pi_1", "status": "succeeded", "amount": 100,
+                "currency": "usd",
+            })
         return httpx.Response(200, json={"id": "pi_1", "status": "succeeded"})
 
     rail = StripeRail(api_key="sk_test", transport=httpx.MockTransport(handler))
@@ -50,3 +55,4 @@ def test_outbound_requires_connected_account_and_uses_scoped_header():
     )
     assert payment.reference == "pi_1"
     assert payment.status == "succeeded"
+    assert rail.get_payment(payment.reference).amount_minor == 100
