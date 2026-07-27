@@ -149,6 +149,51 @@ class TestSecondaryProfileSkipsMissingCredential:
         assert connected == 1
 
     @pytest.mark.asyncio
+    async def test_default_profile_token_in_process_env_is_not_borrowed(
+        self, monkeypatch, caplog
+    ):
+        """The guard must not accept a credential that is only in ``os.environ``.
+
+        This loop runs outside ``_profile_runtime_scope``, and that scope does
+        not mutate ``os.environ`` — so a token sitting in the process env is the
+        DEFAULT profile's, not this profile's. Borrowing it would start a second
+        gateway session on the default profile's bot identity, with inbound
+        landing on whichever connection won the race: a quieter, worse version
+        of the bug this suite exists to prevent.
+
+        Cross-PR guard: #68746 adds an ``os.environ`` fallback (and an in-place
+        ``platform_config.token`` backfill) to the shared
+        ``_platform_has_bot_credential``. That is correct for the paths acting
+        on the default profile's behalf and wrong here, which is why this call
+        site uses ``_profile_config_has_bot_credential``. If anyone repoints it
+        at the shared helper, this test fails.
+        """
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+
+        monkeypatch.setenv(PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD], "default-profile-bot-token")
+
+        profile_cfg = GatewayConfig(multiplex_profiles=True)
+        discord_cfg = PlatformConfig(enabled=True, token=None)
+        profile_cfg.platforms[Platform.DISCORD] = discord_cfg
+        _patch_profile_cfg(monkeypatch, profile_cfg)
+
+        runner = _make_runner(connect_succeeds=False)
+        created: list = []
+        runner._create_adapter = lambda p, pc: created.append(p) or MagicMock()
+
+        with caplog.at_level(logging.INFO, logger="gateway.run"):
+            connected = await runner._start_one_profile_adapters(
+                "mentor", Path("/nonexistent"), {}
+            )
+
+        assert created == [], "the default profile's env token is not this profile's"
+        assert connected == 0
+        assert "Skipping discord on profile 'mentor'" in caplog.text
+        # A backfilling helper would leave the borrowed token on a config object
+        # we go on to keep in _profile_adapters.
+        assert discord_cfg.token is None, "guard must not write env tokens onto the config"
+
+    @pytest.mark.asyncio
     async def test_non_token_platform_is_unaffected(self, monkeypatch):
         """Platforms outside PLATFORM_TOKEN_ENV_NAMES must never be skipped here."""
         from gateway.config import PLATFORM_TOKEN_ENV_NAMES
@@ -169,3 +214,53 @@ class TestSecondaryProfileSkipsMissingCredential:
 
         assert created == [Platform.SIGNAL], "signal authenticates via its own session"
         assert connected == 1
+
+
+class TestProfileConfigHasBotCredential:
+    """Unit-level contract for the profile-scoped predicate.
+
+    Kept separate from the shared ``_platform_has_bot_credential`` because the
+    two answer different questions: that one may consult the process env on the
+    default profile's behalf, this one must never do so.
+    """
+
+    def test_reads_token_from_config(self):
+        from gateway.run import _profile_config_has_bot_credential
+
+        assert _profile_config_has_bot_credential(
+            Platform.DISCORD, PlatformConfig(enabled=True, token="own-token")
+        ) is True
+
+    def test_api_key_counts_as_a_credential(self):
+        from gateway.run import _profile_config_has_bot_credential
+
+        assert _profile_config_has_bot_credential(
+            Platform.DISCORD, PlatformConfig(enabled=True, token=None, api_key="k")
+        ) is True
+
+    @pytest.mark.parametrize("empty", [None, "", "   "])
+    def test_missing_credential_is_false(self, empty):
+        from gateway.run import _profile_config_has_bot_credential
+
+        assert _profile_config_has_bot_credential(
+            Platform.DISCORD, PlatformConfig(enabled=True, token=empty)
+        ) is False
+
+    def test_non_token_platform_always_true(self):
+        from gateway.run import _profile_config_has_bot_credential
+
+        assert _profile_config_has_bot_credential(
+            Platform.SIGNAL, PlatformConfig(enabled=True, token=None)
+        ) is True
+
+    def test_ignores_process_env_and_does_not_mutate(self, monkeypatch):
+        """The whole reason this predicate exists — see the call site in
+        ``_start_one_profile_adapters``."""
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+        from gateway.run import _profile_config_has_bot_credential
+
+        monkeypatch.setenv(PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD], "default-profile-bot-token")
+        cfg = PlatformConfig(enabled=True, token=None)
+
+        assert _profile_config_has_bot_credential(Platform.DISCORD, cfg) is False
+        assert cfg.token is None

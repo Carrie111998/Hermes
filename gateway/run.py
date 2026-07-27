@@ -1840,6 +1840,47 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     return False
 
 
+def _profile_config_has_bot_credential(
+    platform: "Platform", platform_config: "PlatformConfig"
+) -> bool:
+    """Like :func:`_platform_has_bot_credential`, but answers strictly from
+    ``platform_config`` — never from the process environment.
+
+    Separate from the shared helper on purpose. The two look interchangeable
+    today, but they answer different questions and only this one is safe for a
+    secondary multiplexed profile:
+
+    - The shared helper runs on the DEFAULT profile's behalf (startup guard,
+      reconnect queue). There, ``os.environ`` holds that profile's own secrets,
+      so consulting it is legitimate — and #68746 proposes doing exactly that,
+      backfilling a late-resolving token from a secret source onto the config.
+    - This one runs for a SECONDARY profile, outside ``_profile_runtime_scope``
+      (which deliberately does not mutate ``os.environ``). A token visible in
+      the process env therefore belongs to the DEFAULT profile, not to this
+      one. Accepting it would connect a routes-only profile using the default
+      profile's bot identity — two gateway sessions on one token, with inbound
+      landing on whichever won the race. Worse, a helper that backfills the
+      value onto the config leaves that borrowed token on a config object we
+      keep in ``_profile_adapters``.
+
+    So this call site must not route through the shared helper, no matter how
+    the shared helper evolves. Keep it reading config fields only.
+    """
+    from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+
+    # Same established semantics as the shared helper: platforms that do not
+    # authenticate via PlatformConfig.token are never skipped here (Signal
+    # session paths, port-binding HTTP adapters), and api_key counts as a
+    # credential for adapters that take it as primary.
+    if platform not in PLATFORM_TOKEN_ENV_NAMES:
+        return True
+    for field in ("token", "api_key"):
+        value = getattr(platform_config, field, None) or ""
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
@@ -10237,16 +10278,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # "No bot token configured" plus "✗ <platform> failed to connect
             # (profile: <name>)" on every start, and cannot ever succeed.
             #
-            # This asks about THIS profile's config snapshot only. A credential
-            # visible in the process env is not this profile's — the default
-            # profile's tokens live there, and _profile_runtime_scope
-            # deliberately does not mutate os.environ. So if
-            # _platform_has_bot_credential ever gains a raw-os.environ fallback
-            # (see PR #68746, which adds one for the reconnect path), this call
-            # must keep resolving through the profile's secret scope instead, or
-            # every routes-only profile starts connecting the default profile's
-            # bot again.
-            if not _platform_has_bot_credential(platform, platform_config):
+            # Deliberately _profile_config_has_bot_credential and not the
+            # shared _platform_has_bot_credential: this must ask about THIS
+            # profile's config snapshot only. A credential visible in the
+            # process env is not this profile's — the default profile's tokens
+            # live there, and _profile_runtime_scope does not mutate os.environ
+            # — so a helper that consults env would make every routes-only
+            # profile connect the default profile's bot. See that helper's
+            # docstring for why the two are kept apart.
+            if not _profile_config_has_bot_credential(platform, platform_config):
                 logger.info(
                     "Skipping %s on profile '%s': no bot credential in this "
                     "profile's secrets. Inbound for this profile arrives on the "
