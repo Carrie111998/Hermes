@@ -124,6 +124,48 @@ async def test_authorized_user_processed_normally():
 
 
 @pytest.mark.asyncio
+async def test_owner_message_mirrored_into_bot_chat_is_ignored():
+    """Private-topic mirrors addressed to the bot must not start an agent turn."""
+    adapter = _make_adapter(allow_from=["111"])
+
+    build_called = False
+    original_build = adapter._build_message_event
+
+    def track_build(*a, **kw):
+        nonlocal build_called
+        build_called = True
+        return original_build(*a, **kw)
+
+    adapter._build_message_event = track_build
+
+    update = SimpleNamespace(
+        update_id=1,
+        message=_make_message(
+            from_user_id=111,
+            chat_id=adapter._bot.id,
+            chat_type="private",
+        ),
+        effective_message=None,
+    )
+
+    await adapter._handle_text_message(update, SimpleNamespace())
+
+    assert build_called is False, "bot-chat mirror should be ignored before event building"
+
+
+def test_owner_message_in_owner_chat_is_not_filtered_as_own_message():
+    """A canonical owner DM must remain processable after mirror filtering."""
+    adapter = _make_adapter(allow_from=["111"])
+    message = _make_message(
+        from_user_id=111,
+        chat_id=111,
+        chat_type="private",
+    )
+
+    assert adapter._is_own_message(message) is False
+
+
+@pytest.mark.asyncio
 async def test_channel_post_passes_auth():
     """Messages with no from_user (channel posts) should pass user-level auth."""
     adapter = _make_adapter(allow_from=["111"])

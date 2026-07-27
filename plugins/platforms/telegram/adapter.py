@@ -8459,19 +8459,30 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
 
     def _is_own_message(self, message: Message) -> bool:
-        """Return True when the message was sent by this bot itself.
+        """Return True when the message was sent by or mirrored to this bot.
 
         In some Telegram environments (groups, supergroups where the bot can
         see its own messages), getUpdates returns the bot's own outgoing
         messages as updates.  These must be filtered out so they are not
-        counted as incoming unread messages in the Hermes inbox.
+        counted as incoming unread messages in the Hermes inbox. Private-topic
+        mode can also mirror an owner-authored message into a chat whose ID is
+        the bot's own ID; that envelope is not a routable user conversation.
         """
         if not self._bot:
             return False
+        bot_id = getattr(self._bot, "id", None)
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None) if chat else None
+        if bot_id is not None and chat_id is not None and bot_id == chat_id:
+            logger.debug(
+                "[Telegram] Ignoring message mirrored into bot's own chat "
+                "(chat_id=%s)",
+                chat_id,
+            )
+            return True
         from_user = getattr(message, "from_user", None)
         if from_user is None:
             return False
-        bot_id = getattr(self._bot, "id", None)
         user_id = getattr(from_user, "id", None)
         return bot_id is not None and user_id is not None and bot_id == user_id
 
