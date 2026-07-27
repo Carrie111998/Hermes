@@ -13,6 +13,8 @@ acceptance evidence.
   actions cannot regain execution authority.
 - Permit consumption rejects permits whose policy version is stale for the
   active runtime.
+- `business payment-rails --check` provides a read-only non-zero health signal
+  when a discovered inbound or outbound rail lacks credential readiness.
 - Permit resource scope is derived from the immutable action payload; an
   explicitly supplied target must match exactly, preventing path/resource
   retargeting between authorization and execution.

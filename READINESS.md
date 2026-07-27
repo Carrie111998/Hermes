@@ -548,6 +548,19 @@ python3 -m pytest tests/hermes_cli/test_accounting_db.py tests/hermes_cli/test_f
 Result: **31 passed, 0 failed**. Tax calculations use only the current
 supersession leaf, and amended-rate lineage remains immutable.
 
+Payment rail readiness signaling was validated on current `main` (`b363524267ceee902c58ef012b885431c163e80d`) with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_business_bootstrap_command.py \
+  tests/hermes_cli/test_finance_and_payments.py
+```
+
+Result: **37 passed, 0 failed**. The new `business payment-rails --check`
+contract returns non-zero for unavailable discovered rails while remaining
+read-only; payment intent idempotency, provider read-back, and accounting
+settlement remain covered by the same regression.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
