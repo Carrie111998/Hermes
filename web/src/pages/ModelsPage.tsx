@@ -39,6 +39,7 @@ import {
   CardTitle,
 } from "@nous-research/ui/ui/components/card";
 import { Badge } from "@nous-research/ui/ui/components/badge";
+import { Switch } from "@nous-research/ui/ui/components/switch";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { usePageHeader } from "@/contexts/usePageHeader";
@@ -805,6 +806,8 @@ function MoaModelsModal({
       aggregator: draft.aggregator,
       reference_temperature: draft.reference_temperature,
       aggregator_temperature: draft.aggregator_temperature,
+      reference_timeout: draft.reference_timeout,
+      degraded_reference_policy: draft.degraded_reference_policy,
       max_tokens: draft.max_tokens,
       enabled: draft.enabled,
     };
@@ -934,8 +937,22 @@ function MoaModelsModal({
             {preset.reference_models.map((slot, index) => (
               <div
                 key={`${selected}-${slot.provider}-${slot.model}-${index}`}
-                className="flex items-center gap-2 border border-border/50 bg-muted/20 px-3 py-2"
+                className={cn(
+                  "flex items-center gap-2 border border-border/50 bg-muted/20 px-3 py-2",
+                  slot.enabled === false && "opacity-60",
+                )}
               >
+                <Switch
+                  checked={slot.enabled !== false}
+                  onCheckedChange={(checked) =>
+                    updateSelectedPreset((prev) => ({
+                      ...prev,
+                      reference_models: prev.reference_models.map((s, i) =>
+                        i === index ? { ...s, enabled: checked === true } : s,
+                      ),
+                    }))
+                  }
+                />
                 <div className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">
                   {slotLabel(slot)}
                 </div>
@@ -969,7 +986,10 @@ function MoaModelsModal({
               onClick={() =>
                 updateSelectedPreset((prev) => ({
                   ...prev,
-                  reference_models: [...prev.reference_models, prev.aggregator],
+                  reference_models: [
+                    ...prev.reference_models,
+                    { ...prev.aggregator, enabled: true },
+                  ],
                 }))
               }
             >
@@ -1024,7 +1044,7 @@ function MoaModelsModal({
               return {
                 ...prev,
                 reference_models: prev.reference_models.map((slot, i) =>
-                  i === picker.index ? { provider, model } : slot,
+                  i === picker.index ? { ...slot, provider, model } : slot,
                 ),
               };
             });

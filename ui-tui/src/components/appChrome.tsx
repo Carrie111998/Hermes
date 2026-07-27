@@ -473,6 +473,7 @@ export function StatusRule(props: StatusRuleProps) {
 
 export function StatusRuleView({
   battery,
+  focusView,
   cwdLabel,
   cols,
   busy,
@@ -505,7 +506,7 @@ export function StatusRuleView({
   // (`12k tok`) and the visual fill bar is dropped entirely.
   const ctxLabel = usage.context_max
     ? segs.compactCtx
-      ? `${fmtK(usage.context_used ?? 0)} tok`
+      ? `${fmtK(usage.context_used ?? 0)} ${i18n.t('usage.tokensShort')}`
       : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
     : usage.total > 0
       ? `${fmtK(usage.total)} ${i18n.t('usage.tokensShort')}`
@@ -519,9 +520,9 @@ export function StatusRuleView({
   const bgText = `${bgCount} ${i18n.t('background.short')}`
 
   const voiceLabel = voiceRecording
-    ? '● REC'
+    ? `● ${i18n.t('voice.recordingShort')}`
     : voiceProcessing
-      ? '◉ STT'
+      ? `◉ ${i18n.t('voice.transcribingShort')}`
       : i18n.t('voice.idle', { state: voiceEnabled ? i18n.t('voice.on') : i18n.t('voice.off') }) +
         (voiceTts ? ' [tts]' : '')
 
@@ -623,6 +624,11 @@ export function StatusRuleView({
   // so it consumes tail budget LAST and drops first on a narrow terminal.
   const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
 
+  // Focus-view badge. Pinned (not tail-budgeted) on purpose: the whole point of
+  // the indicator is that the user can never be in reduced-output mode without
+  // seeing it, so it must not drop off a narrow terminal.
+  const showFocus = !!focusView
+
   const handleSessionCountClick = (event: { stopImmediatePropagation?: () => void }) => {
     event.stopImmediatePropagation?.()
     onSessionCountClick?.()
@@ -687,6 +693,12 @@ export function StatusRuleView({
             </Text>
           ) : null}
         </Box>
+        {showFocus ? (
+          <Box flexDirection="row" flexShrink={0}>
+            <Text color={t.color.muted}>{' │ '}</Text>
+            <Text color={t.color.warn}>◉ {i18n.t('focus.badge')}</Text>
+          </Box>
+        ) : null}
         {showBar ? (
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
@@ -865,6 +877,8 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
 
 interface StatusRuleProps {
   battery?: BatteryInfo | null
+  // Focus view (/focus) badge — display-only reduced-output indicator.
+  focusView?: boolean
   bgCount: number
   lastTurnEndedAt?: null | number
   liveSessionCount: number

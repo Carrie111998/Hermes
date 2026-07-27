@@ -9,6 +9,9 @@ export type GatewaySkin = HermesSkin
 
 export interface GatewayCompletionItem {
   display: string
+  /** Completion class, set by the gateway. `skill` covers skill commands and
+   *  skill bundles — the only kind offered for an inline `/skill` reference. */
+  kind?: string
   meta?: string
   meta_key?: string
   meta_vars?: Record<string, string | number>
@@ -17,6 +20,8 @@ export interface GatewayCompletionItem {
 
 export interface GatewayTranscriptMessage {
   context?: string
+  display_kind?: string
+  display_metadata?: Record<string, unknown>
   name?: string
   role: 'assistant' | 'system' | 'tool' | 'user'
   text?: string
@@ -79,6 +84,8 @@ export interface ConfigDisplayConfig {
   bell_on_complete?: boolean
   busy_input_mode?: string
   details_mode?: string
+  /** Focus view (/focus) — display-only reduced-output mode. */
+  focus_view?: boolean
   inline_diffs?: boolean
   language?: string
   mouse_tracking?: boolean | null | number | string
@@ -586,7 +593,16 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
-  | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
+  | {
+      payload?: {
+        kind?: string
+        text?: string
+        text_key?: string
+        text_vars?: Record<string, string | number>
+      }
+      session_id?: string
+      type: 'status.update'
+    }
   | {
       payload?: {
         id?: string
@@ -594,6 +610,8 @@ export type GatewayEvent =
         kind?: 'sticky' | 'ttl'
         level?: 'error' | 'info' | 'success' | 'warn'
         text?: string
+        text_key?: string
+        text_vars?: Record<string, string | number>
         ttl_ms?: null | number
       }
       session_id?: string
@@ -631,6 +649,16 @@ export type GatewayEvent =
       type: 'moa.reference'
     }
   | { payload?: { aggregator?: string }; session_id?: string; type: 'moa.aggregating' }
+  | {
+      payload?: { label?: string; refs_done?: number; refs_total?: number }
+      session_id?: string
+      type: 'moa.progress'
+    }
+  | {
+      payload?: { aggregator?: string; phase?: string; refs_done?: number; refs_total?: number }
+      session_id?: string
+      type: 'moa.phase'
+    }
   | { payload: { name?: string; preview?: string }; session_id?: string; type: 'tool.progress' }
   | { payload: { name?: string }; session_id?: string; type: 'tool.generating' }
   | {

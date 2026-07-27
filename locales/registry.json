@@ -16,7 +16,8 @@
     "ga": { "name": "Gaeilge", "triggerLabel": "Gaeilge" },
     "pt": { "name": "Português", "triggerLabel": "Português" },
     "ru": { "name": "Русский", "triggerLabel": "Русский" },
-    "hu": { "name": "Magyar", "triggerLabel": "Magyar" }
+    "hu": { "name": "Magyar", "triggerLabel": "Magyar" },
+    "ar": { "name": "العربية", "triggerLabel": "العربية", "direction": "rtl" }
   },
   "aliases": {
     "english": "en",
@@ -82,7 +83,9 @@
     "ru-ru": "ru",
     "hungarian": "hu",
     "magyar": "hu",
-    "hu-hu": "hu"
+    "hu-hu": "hu",
+    "arabic": "ar",
+    "العربية": "ar"
   },
   "compatibilityAliases": {
     "zh-cn": "zh",
@@ -90,6 +93,11 @@
     "zh-sg": "zh",
     "zh-tw": "zh-hant",
     "zh-hk": "zh-hant",
-    "zh-mo": "zh-hant"
+    "zh-mo": "zh-hant",
+    "ar-sa": "ar",
+    "ar-eg": "ar",
+    "ar-ae": "ar",
+    "ar-ma": "ar",
+    "ar-dz": "ar"
   }
 }

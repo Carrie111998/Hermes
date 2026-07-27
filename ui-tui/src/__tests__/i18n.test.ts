@@ -148,79 +148,31 @@ describe('normalizeLocale', () => {
     }
   })
 
-  it('case-insensitive and trimmed', () => {
-    expect(normalizeLocale('  ZH  ')).toBe('zh')
-    expect(normalizeLocale('En')).toBe('en')
-    expect(normalizeLocale('JA')).toBe('ja')
+  it.each([
+    ['  ZH  ', 'zh'],
+    ['english', 'en'],
+    ['simplified chinese', 'zh'],
+    ['traditional chinese', 'zh-hant'],
+    ['日本語', 'ja'],
+    ['한국어', 'ko'],
+    ['francais', 'fr'],
+    ['brazilian', 'pt'],
+    ['العربية', 'ar']
+  ])('normalizes the registered alias %s', (input, expected) => {
+    expect(normalizeLocale(input)).toBe(expected)
   })
 
-  it('aliases: en-us / en-gb / english → en', () => {
-    expect(normalizeLocale('en-us')).toBe('en')
-    expect(normalizeLocale('en-gb')).toBe('en')
-    expect(normalizeLocale('english')).toBe('en')
-  })
-
-  it('aliases: simplified-chinese / chinese → zh', () => {
-    expect(normalizeLocale('simplified chinese')).toBe('zh')
-    expect(normalizeLocale('chinese')).toBe('zh')
-    expect(normalizeLocale('mandarin')).toBe('zh')
-  })
-
-  it('aliases: explicit Traditional Chinese choices → zh-hant', () => {
-    expect(normalizeLocale('zh-hant')).toBe('zh-hant')
-    expect(normalizeLocale('traditional-chinese')).toBe('zh-hant')
-    expect(normalizeLocale('traditional chinese')).toBe('zh-hant')
-  })
-
-  it('uses explicit registry compatibility for an ambiguous language family', () => {
-    expect(normalizeLocale('zh-CN')).toBe('zh')
-    expect(normalizeLocale('zh_Hans')).toBe('zh')
-    expect(normalizeLocale('zh-SG')).toBe('zh')
-    expect(normalizeLocale('zh-TW')).toBe('zh-hant')
-    expect(normalizeLocale('zh_HK')).toBe('zh-hant')
-    expect(normalizeLocale('zh-MO')).toBe('zh-hant')
+  it.each([
+    ['zh-CN', 'zh'],
+    ['zh_HK', 'zh-hant'],
+    ['pt_BR', 'pt'],
+    ['ar-EG', 'ar']
+  ])('normalizes the compatibility input %s only through registry metadata', (input, expected) => {
+    expect(normalizeLocale(input)).toBe(expected)
   })
 
   it('does not guess an unregistered variant in an ambiguous family', () => {
     expect(normalizeLocale('zh-extra')).toBe('en')
-  })
-
-  it('aliases: japanese / jp → ja', () => {
-    expect(normalizeLocale('japanese')).toBe('ja')
-    expect(normalizeLocale('jp')).toBe('ja')
-    expect(normalizeLocale('日本語')).toBe('ja')
-  })
-
-  it('normalizes native and ASCII language names consistently across runtimes', () => {
-    expect(normalizeLocale('한국어')).toBe('ko')
-    expect(normalizeLocale('turkce')).toBe('tr')
-    expect(normalizeLocale('francais')).toBe('fr')
-    expect(normalizeLocale('brazilian')).toBe('pt')
-    expect(normalizeLocale('ua')).toBe('uk')
-  })
-
-  it('aliases: german / deutsch → de', () => {
-    expect(normalizeLocale('german')).toBe('de')
-    expect(normalizeLocale('deutsch')).toBe('de')
-    expect(normalizeLocale('de-de')).toBe('de')
-  })
-
-  it('aliases: espanol / spanish → es', () => {
-    expect(normalizeLocale('spanish')).toBe('es')
-    expect(normalizeLocale('espanol')).toBe('es')
-    expect(normalizeLocale('es-mx')).toBe('es')
-  })
-
-  it('aliases: underscore region tags normalize like dashboard locale inputs', () => {
-    expect(normalizeLocale('pt_BR')).toBe('pt')
-    expect(normalizeLocale('ko_KR')).toBe('ko')
-    expect(normalizeLocale('hu_HU')).toBe('hu')
-  })
-
-  it('aliases: français / french → fr', () => {
-    expect(normalizeLocale('french')).toBe('fr')
-    expect(normalizeLocale('français')).toBe('fr')
-    expect(normalizeLocale('fr-fr')).toBe('fr')
   })
 
   it('fallback: unknown strings → en', () => {

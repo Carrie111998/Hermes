@@ -6,6 +6,7 @@ export interface LocaleMetadata {
   name: string
   triggerLabel: string
   intlTag?: string
+  direction?: 'ltr' | 'rtl'
 }
 
 const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key)
@@ -17,6 +18,11 @@ export const LOCALE_METADATA = registry.locales as Record<Locale, LocaleMetadata
 /** BCP-47 tag for Intl APIs; language-specific compatibility stays in the registry. */
 export function localeIntlTag(locale: Locale): string {
   return LOCALE_METADATA[locale].intlTag ?? locale
+}
+
+/** Document direction is presentation metadata, not a locale-specific UI branch. */
+export function localeDirection(locale: Locale): 'ltr' | 'rtl' {
+  return LOCALE_METADATA[locale].direction ?? 'ltr'
 }
 
 const isLocale = (value: string): value is Locale => hasOwn(registry.locales, value)

@@ -7,6 +7,8 @@ import {
   type ReactNode,
 } from "react";
 
+import { localeDirection } from "@hermes/shared/locale-registry";
+
 import type { Locale } from "./types";
 import {
   I18nContext,
@@ -60,6 +62,12 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     },
     [applyLocale, locale],
   );
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.documentElement.lang = locale;
+    document.documentElement.dir = localeDirection(locale);
+  }, [locale]);
 
   const syncConfiguredLocale = useCallback(async () => {
     if (!syncActiveRef.current || syncInFlightRef.current) return;

@@ -2,6 +2,7 @@ import { DEFAULT_LOCALE, normalizeLocaleInput } from '@hermes/shared/locale-regi
 import { createContext, type ReactNode, useContext, useMemo } from 'react'
 
 import { af } from './af.js'
+import { ar } from './ar.js'
 import { de } from './de.js'
 import { en, type TranslationKey, type TuiLocaleOverlay } from './en.js'
 import { es } from './es.js'
@@ -40,7 +41,8 @@ const OVERLAYS: Record<Locale, TuiLocaleOverlay> = {
   ga,
   pt,
   ru,
-  hu
+  hu,
+  ar
 }
 
 /** Resolve a partial locale overlay into a complete runtime pack. */
@@ -90,11 +92,16 @@ export const translate = (locale: Locale, key: TranslationKey, vars?: Record<str
 }
 
 /** Resolve an optional, data-driven catalog id with an English wire fallback. */
-export const translateOptional = (locale: Locale, key: string, fallback: string) => {
+export const translateOptional = (
+  locale: Locale,
+  key: string,
+  fallback: string,
+  vars?: Record<string, string | number>
+) => {
   const pack = getPack(locale)
   const value = pack.catalog[key] ?? en.catalog[key]
 
-  return value == null ? fallback : interpolate(value)
+  return interpolate(value == null ? fallback : value, vars)
 }
 
 export const translateSlashDescription = (locale: Locale, id: string | undefined, fallback: string) =>

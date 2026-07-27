@@ -34,7 +34,9 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
@@ -351,6 +353,13 @@ def build_turn_context(
     """
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
+
+    # Recover a session rotated by another path before binding log/turn ids or
+    # copying client-supplied history. Everything in this turn must consistently
+    # belong to the canonical child, including observability metadata.
+    recovered_history = recover_rotated_compression_session(agent)
+    if recovered_history is not None:
+        conversation_history = recovered_history
 
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
@@ -705,6 +714,8 @@ def build_turn_context(
     # issue #27405 (a few very large messages slipping past the count gate).
     _preflight_compressed = False
     _preflight_compression_blocked = False
+    agent._turn_received_provider_response = False
+    agent._turn_preflight_display_snapshot = None
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
@@ -717,6 +728,21 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
+        # getattr guard: minimal compressor doubles (SimpleNamespace in the
+        # engine-preflight tests) and plugin context engines lack this
+        # ContextCompressor-only method — absence means no snapshot, and the
+        # finalizer's rollback stays disarmed for the turn (display-only).
+        _snapshot_fn = getattr(
+            _compressor, "snapshot_preflight_display_tokens", None
+        )
+        if callable(_snapshot_fn):
+            _snapshot_val = _snapshot_fn()
+            # Type pin: MagicMock compressors return truthy Mock objects —
+            # only a real int snapshot may arm the interrupted-turn rollback.
+            if isinstance(_snapshot_val, int) and not isinstance(
+                _snapshot_val, bool
+            ):
+                agent._turn_preflight_display_snapshot = _snapshot_val
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",
@@ -750,6 +776,8 @@ def build_turn_context(
             lambda: None,
         )()
 
+        _should_compress_now = False
+        _compress_block_reason = None
         if _preflight_deferred:
             logger.info(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
@@ -765,14 +793,42 @@ def build_turn_context(
                 int(_compression_cooldown.get("remaining_seconds", 0.0)),
                 agent.session_id or "none",
             )
+            if _preflight_tokens >= _compressor.threshold_tokens:
+                # Context is over threshold but compression is blocked by the
+                # summary-LLM cooldown — surface a warning (see block below).
+                _cooldown_secs = _compression_cooldown.get("remaining_seconds", 0.0)
+                _compress_block_reason = f"cooldown:{_cooldown_secs:.0f}"
         elif _codex_native_auto:
             logger.info(
                 "Skipping Hermes preflight compression for codex app-server "
                 "(mode=%s); Hermes will not start thread compaction here.",
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
-        elif _compressor.should_compress(_preflight_tokens):
+        else:
+            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            if not _should_compress_now:
+                # Context is over threshold but compression is blocked
+                # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
+                # for the human-readable reason so we can surface a warning below.
+                # getattr guard: minimal compressor doubles (SimpleNamespace in
+                # the engine-preflight tests) and older plugin engines lack the
+                # method — absence means no block reason, no warning.
+                _info = getattr(_compressor, "should_compress_info", None)
+                if callable(_info):
+                    try:
+                        _compress_block_reason = _info(_preflight_tokens)[1]
+                    except Exception:
+                        _compress_block_reason = None
+        if _should_compress_now:
             _preflight_compressed = True
+            # Compression is actually running (block cleared / was never
+            # blocked) — reset the dedup so a future blocked-over-threshold
+            # turn can warn again. Real session boundary.
+            # getattr guard: test doubles built via object.__new__ lack the
+            # method (gateway test-double pitfall) — treat absence as no-op.
+            _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+            if callable(_clear_warn):
+                _clear_warn()
             logger.info(
                 "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
                 f"{_preflight_tokens:,}",
@@ -803,10 +859,29 @@ def build_turn_context(
             for _pass in range(_max_preflight_passes):
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
+                _preflight_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
+                if (
+                    messages is _preflight_input
+                    and compression_skipped_due_to_lock(agent)
+                ):
+                    # #69870 lock-skip: another path holds this session's
+                    # compression lock, so the pass no-oped. That is a
+                    # temporary DEFER, not proof the transcript cannot
+                    # compress — do NOT arm the insufficient-progress
+                    # blocker (the loop's error handlers must keep their
+                    # provider-proven retry budget) and stop preflight
+                    # passes for this turn; the lock winner is shrinking
+                    # the same session concurrently.
+                    logger.info(
+                        "Preflight compression deferred: compression lock "
+                        "held by another path (session %s)",
+                        agent.session_id or "none",
+                    )
+                    break
                 # Re-estimate now so size-only compression (same row count,
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
@@ -844,7 +919,36 @@ def build_turn_context(
                         f"{_preflight_tokens:,}",
                     )
                     break
+        elif _compress_block_reason:
+            # Context is already over the compression threshold, but compression
+            # is blocked (summary LLM cooldown or anti-thrashing). Without a
+            # signal the session keeps growing until the model silently stops
+            # answering — the conversation hits the hard provider token limit
+            # with no explanation. Surface a deduped warning so the user can
+            # take action (/new or /compress) instead of hitting a silent hang.
+            agent._warn_context_overflow_blocked(
+                _compress_block_reason,
+                _preflight_tokens,
+                _compressor.threshold_tokens,
+            )
         else:
+            # Sub-threshold and unblocked — allow the overflow warning to fire
+            # again next time the context is over threshold but blocked.
+            # getattr guard: test doubles built via object.__new__ lack the
+            # method (gateway test-double pitfall) — treat absence as no-op.
+            _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+            if callable(_clear_warn):
+                _clear_warn()
+            # Engine maintenance only when NO skip-branch fired: a failure
+            # cooldown, deferred estimate, or codex-native route must keep
+            # the engine hook un-consulted (#20316 contract — the cooldown
+            # exists precisely because compression recently failed).
+            if _compression_cooldown or _preflight_deferred or _codex_native_auto:
+                _engine_preflight = None
+            else:
+                _engine_preflight = getattr(
+                    _compressor, "should_compress_preflight", None
+                )
             # ── Engine-driven sub-threshold preflight maintenance (#20316) ──
             # None of the threshold-path branches fired (not deferred, no
             # failure cooldown, not codex-native, and should_compress() said
@@ -866,9 +970,7 @@ def build_turn_context(
             # must neither set nor clear ``_preflight_compression_blocked``
             # (#64382) — and being in the ``else`` arm it can never run after
             # the threshold loop has proven a retry ineffective.
-            _engine_preflight = getattr(
-                _compressor, "should_compress_preflight", None
-            )
+            # (resolved above, gated on no skip-branch having fired)
             _wants_engine_preflight = False
             if callable(_engine_preflight):
                 try:

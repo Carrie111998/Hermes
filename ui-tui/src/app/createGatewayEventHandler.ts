@@ -13,7 +13,7 @@ import type {
   GatewaySkin,
   SessionMostRecentResponse
 } from '../gatewayTypes.js'
-import { normalizeLocale, translate, type TranslationKey } from '../i18n/index.js'
+import { normalizeLocale, translate, translateOptional, type TranslationKey } from '../i18n/index.js'
 import { billingDialogCopy } from '../lib/billingDialog.js'
 import { relativeLuminance } from '../lib/color.js'
 import { isTodoDone } from '../lib/liveProgress.js'
@@ -777,15 +777,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (!p?.text) {
           return
         }
+        const text = p.text_key ? translateOptional(getUiState().locale, p.text_key, p.text, p.text_vars) : p.text
 
         if (p.kind === 'goal') {
-          sys(p.text)
+          sys(text)
 
-          const brief = p.text.startsWith('✓')
+          const brief = text.startsWith('✓')
             ? '✓ goal complete'
-            : p.text.startsWith('↻')
+            : text.startsWith('↻')
               ? '↻ goal continuing'
-              : p.text.startsWith('⏸')
+              : text.startsWith('⏸')
                 ? '⏸ goal paused'
                 : 'ready'
 
@@ -795,10 +796,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        setStatus(p.text)
+        setStatus(text)
 
         if (p.kind === 'compressing') {
-          sys(p.text)
+          sys(text)
 
           return
         }
@@ -807,10 +808,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        if (turnController.lastStatusNote !== p.text) {
-          turnController.lastStatusNote = p.text
+        if (turnController.lastStatusNote !== text) {
+          turnController.lastStatusNote = text
           turnController.pushActivity(
-            p.text,
+            text,
             p.kind === 'error' ? 'error' : p.kind === 'warn' || p.kind === 'approval' ? 'warn' : 'info'
           )
         }
@@ -830,13 +831,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (!p?.text) {
           return
         }
+        const text = p.text_key ? translateOptional(getUiState().locale, p.text_key, p.text, p.text_vars) : p.text
 
         turnController.showNotice({
           id: p.id,
           key: p.key,
           kind: p.kind ?? 'sticky',
           level: p.level ?? 'info',
-          text: p.text,
+          text,
           ttl_ms: p.ttl_ms ?? null
         })
 
@@ -1016,6 +1018,32 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'moa.aggregating':
         // Spinner/status transition only — the aggregator's response follows
         // through the normal message stream. No committed transcript entry.
+        return
+
+      case 'moa.progress':
+        // Live fan-out progress — one activity line, replaced in place as each
+        // reference completes ("MoA: refs 2/3"), so the user sees movement
+        // during the (potentially long) reference phase without transcript spam.
+        if (typeof ev.payload?.refs_done === 'number' && typeof ev.payload?.refs_total === 'number') {
+          turnController.pushActivity(
+            ti('activity.moaReferences', {
+              done: ev.payload.refs_done,
+              total: ev.payload.refs_total
+            }),
+            'info',
+            'MoA'
+          )
+        }
+
+        return
+
+      case 'moa.phase':
+        // Phase transition — currently only phase="aggregator" (fan-out done,
+        // aggregator acting). Swap the progress line for aggregator copy.
+        if (ev.payload?.phase === 'aggregator') {
+          turnController.pushActivity(ti('activity.moaAggregating'), 'info', 'MoA')
+        }
+
         return
 
       case 'tool.progress':

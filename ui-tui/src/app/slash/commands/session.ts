@@ -313,7 +313,7 @@ export const sessionCommands: SlashCommand[] = [
         .then(
           ctx.guarded<SessionCompressResponse>(r => {
             if (Array.isArray(r.messages)) {
-              const rows = toTranscriptMessages(r.messages)
+              const rows = toTranscriptMessages(r.messages, ctx.ui.locale)
 
               ctx.transcript.setHistoryItems(r.info ? [introMsg(r.info), ...rows] : rows)
             }
@@ -632,23 +632,18 @@ export const sessionCommands: SlashCommand[] = [
     name: 'reasoning',
     run: (arg, ctx) => {
       if (!arg) {
-        return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning', session_id: ctx.sid })
-          .then(
-            ctx.guarded<ConfigGetValueResponse>(
-              r =>
-                r.value &&
-                ctx.transcript.sys(
-                  translate(ctx.ui.locale, 'sys.reasoningCurrent', {
-                    value: r.value,
-                    display: translate(
-                      ctx.ui.locale,
-                      REASONING_DISPLAY_KEYS[r.display === 'show' ? 'show' : 'hide']
-                    )
-                  })
-                )
-            )
+        return ctx.gateway.rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning', session_id: ctx.sid }).then(
+          ctx.guarded<ConfigGetValueResponse>(
+            r =>
+              r.value &&
+              ctx.transcript.sys(
+                translate(ctx.ui.locale, 'sys.reasoningCurrent', {
+                  value: r.value,
+                  display: translate(ctx.ui.locale, REASONING_DISPLAY_KEYS[r.display === 'show' ? 'show' : 'hide'])
+                })
+              )
           )
+        )
       }
 
       ctx.gateway.rpc<ConfigSetResponse>('config.set', reasoningConfigPayload(arg, ctx.sid ?? '')).then(

@@ -628,6 +628,44 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    help: 'toggle focus view — show only your prompt and the final response [on|off|status]',
+    name: 'focus',
+    run: (arg, ctx) => {
+      const mode = arg.trim().toLowerCase()
+      const current = ctx.ui.focusView
+
+      // `/focus status` reports without writing, matching the CLI surface.
+      if (mode === 'status' || mode === 'show' || mode === '?') {
+        return ctx.transcript.sys(
+          current
+            ? translate(ctx.ui.locale, 'focus.statusOn')
+            : translate(ctx.ui.locale, 'focus.statusOff')
+        )
+      }
+
+      const next = flagFromArg(mode, current)
+
+      if (next === null) {
+        return ctx.transcript.sys(translate(ctx.ui.locale, 'sys.usageFocus'))
+      }
+
+      // Display-only: Python owns the tool_progress stash/restore so /focus off
+      // returns to whatever /verbose mode the user had. Optimistically patch the
+      // badge so the status bar flips on the same frame.
+      patchUiState({ focusView: next })
+      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'focus', value: next ? 'on' : 'off' }).catch(() => {})
+
+      queueMicrotask(() =>
+        ctx.transcript.sys(
+          next
+            ? translate(ctx.ui.locale, 'focus.enabled')
+            : translate(ctx.ui.locale, 'focus.disabled')
+        )
+      )
+    }
+  },
+
+  {
     aliases: ['sb'],
     name: 'statusbar',
     run: (arg, ctx) => {

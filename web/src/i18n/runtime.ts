@@ -13,6 +13,7 @@ import {
   type ConfigRevisionResponse,
 } from "../lib/api";
 import { af } from "./af";
+import { ar } from "./ar";
 import { de } from "./de";
 import { en } from "./en";
 import { es } from "./es";
@@ -47,6 +48,7 @@ const TRANSLATIONS: Record<Locale, TranslationOverlay> = {
   pt,
   ru,
   hu,
+  ar,
 };
 
 const missingOverlay = LOCALES.find((locale) => !TRANSLATIONS[locale]);
