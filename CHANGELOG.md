@@ -300,3 +300,5 @@ recorded.
   transactions during circuit-breaker schema checks.
 - `9442db2154771cc84298c8d984050e471d5c2554` — preserved active authority
   transactions during compliance schema checks.
+- `6e955798d2fd3f7844628d7e9b571fb6c3e42c33` — preserved active authority
+  transactions during company-email schema checks.

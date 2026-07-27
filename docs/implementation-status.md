@@ -69,6 +69,8 @@ acceptance evidence.
   of implicitly committing permit or ledger state.
 - Compliance schema checks preserve active authority transactions while
   admitting obligations, applicability, and control evidence.
+- Company-email schema checks preserve active authority transactions before
+  suppression, send, and provider-readback records are written.
 - Portfolio child/successor admission and employee grant/revocation admission
   serialize budget and authority checks across concurrent local workers.
 - External action handlers recheck the autonomy kill-switch immediately before
@@ -199,7 +201,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`9442db2154771cc84298c8d984050e471d5c2554` passed 6 Founder/CEO E2E tests, 48
+`6e955798d2fd3f7844628d7e9b571fb6c3e42c33` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -220,6 +222,8 @@ The circuit-breaker recovery-probe regression passed 3 tests, including
 single-probe admission and expired-probe reclamation.
 The compliance regression passed 7 tests, including append-only evidence and
 schema transaction preservation.
+The company-email regression passed 5 tests, including schema transaction
+preservation and provider read-back behavior.
 The broader current-main regression command across resource budgets, company
 email, approvals, operational control, hiring, portfolio, accounting,
 procurement, metered billing, and usage billing passed **76 tests, 0 failed**.
