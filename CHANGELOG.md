@@ -165,6 +165,8 @@ recorded.
 - Local Docker image build and supervised-entrypoint bootstrap/status
   persistence smoke passed at the current main; registry publication and
   production deployment remain unreleased.
+- The complete Docker restart regression now passes against the built image,
+  including stale PID cleanup and live gateway auto-start after restart.
 
 - `757408d82884afd60651762715c3ef00446bc0c0` — recorded the release
   readiness evidence documentation.

@@ -86,3 +86,18 @@ these artifacts.
   `recovery_blocked` result; repair or replace the known-good authority
   snapshot/storage and resolve the recovery intervention before resuming
   autonomy.
+
+## Container restart evidence
+
+With Docker image `charterforge:agentic-smoke` built from current main, the
+complete restart regression was executed with:
+
+```bash
+HERMES_TEST_IMAGE=charterforge:agentic-smoke uv run pytest -q \
+  tests/docker/test_container_restart.py
+```
+
+Result: **4 passed, 0 failed** in 72.18 seconds. The suite exercises named
+profile registration, intentional stopped-state preservation, stale PID cleanup,
+and live gateway auto-start after a real Docker restart. This is local restart
+evidence, not a disaster-recovery or high-availability drill.

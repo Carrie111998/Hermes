@@ -84,7 +84,7 @@ determination until a newer evidence commit is recorded.
 ## Post-boundary evidence on current main
 
 The exact acceptance command set was rerun against current `main` at baseline
-commit `30c28abbc996b61214a274f21bea2decb281677e`. This is a separate,
+commit `10cea9fc07`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
@@ -120,6 +120,10 @@ tag above.
   passed across four `docker run --rm` invocations using a mounted state
   directory, with stable organization/objective IDs. Image digest:
   `sha256:5448ca6ad296a7bf1678f5ae5c8c9d8b14d84592d2c7828c7fd050769b1ff1dd`.
+- Container restart regression: `HERMES_TEST_IMAGE=charterforge:agentic-smoke
+  uv run pytest -q tests/docker/test_container_restart.py` — **4 passed, 0
+  failed** in 72.18 seconds, covering stopped-state preservation, stale PID
+  cleanup, profile reconciliation, and live gateway auto-start after restart.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 
