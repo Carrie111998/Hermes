@@ -805,6 +805,23 @@ image digest was `sha256:5f905c0b55bc7b3866e935f78d0d8c0cb138a2d04aaea1e1a4a9c29
 This is controlled local-provider evidence, not proof of production provider
 credentials, corporate readiness, or legal/compliance certification.
 
+After the hierarchical delegation budget and objective-boundary hardening, the
+same acceptance was rerun on current `main` commit
+`41646c5a4f86df36cd86b98dde303ab7e2b09f2f` with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result: **current-tree agentic acceptance: PASS**. The bounded CEO loop,
+process-separated subordinate handoff, uncertain provider read-back,
+inbound tax-bearing settlement, durable restart recovery, and master-stop
+fencing all passed with zero duplicate effects. The acceptance image digest
+was `sha256:1e5c0a9bc9bfa110a8c98581f55c6f960f1c2cd3d5d5e4bdbe78792148cc2e16`.
+This remains deterministic local-provider evidence; it does not establish
+production provider credentials, corporate readiness, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
