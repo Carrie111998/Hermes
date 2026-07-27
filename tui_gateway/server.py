@@ -2242,7 +2242,12 @@ def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
     # The worktree ROOT, not the common repo root: folding worktrees together
     # here is exactly what hides the move we're looking for.
     landed = _git_repo_root_for_cwd(resolved)
-    if not landed or landed == _git_repo_root_for_cwd(current):
+    current_root = _git_repo_root_for_cwd(current)
+
+    # Don't migrate from a non-git workspace to a git directory: the agent
+    # may have entered a repo temporarily to read a file or run a command,
+    # which is a browsing visit, not a workspace relocation.
+    if not landed or not current_root or landed == current_root:
         return False
 
     session["cwd"] = resolved
