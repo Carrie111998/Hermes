@@ -288,3 +288,5 @@ recorded.
   permit issuance before execution authority is minted.
 - `bf5202b9bca5c2cb098bb9bc38d27342a91b2e4a` — refreshed current-main release
   evidence and semantic-release documentation posture.
+- `a36c4c746260fc4add0115c93f5deffc3d175a88` — rejected applicability and
+  obligation records for unknown or retired compliance regimes.
