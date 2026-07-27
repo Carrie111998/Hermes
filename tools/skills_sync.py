@@ -410,7 +410,36 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
     }
 
 
-def _find_installed_skill_dir_by_name(skill_dir_name: str) -> Optional[Path]:
+def _build_skill_name_index() -> dict[str, Path]:
+    """Build {skill_dir_name: skill_dir_path} index from SKILLS_DIR in one pass.
+
+    Returns an empty dict when SKILLS_DIR does not exist or contains no skills.
+    When the SAME name appears under multiple directories the first encountered
+    wins (deterministic within a single rglob order); callers that need strict
+    uniqueness should validate after-the-fact.
+    """
+    if not SKILLS_DIR.exists():
+        return {}
+    idx: dict[str, Path] = {}
+    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        candidate = skill_md.parent
+        name = candidate.name
+        if name in idx:
+            continue  # first-win: keep the earliest match
+        # Never reach outside the skills tree (symlinked/external dirs).
+        try:
+            candidate.resolve().relative_to(SKILLS_DIR.resolve())
+        except (OSError, ValueError):
+            continue
+        idx[name] = candidate
+    return idx
+
+
+def _find_installed_skill_dir_by_name(
+    skill_dir_name: str, *, index: Optional[dict[str, Path]] = None
+) -> Optional[Path]:
     """Locate an installed skill directory by its directory name.
 
     Used only as a fallback when the repo-derived install path doesn't exist in
@@ -419,9 +448,18 @@ def _find_installed_skill_dir_by_name(skill_dir_name: str) -> Optional[Path]:
     skills sharing a directory name give us no basis to pick one, and guessing
     would write provenance onto the wrong skill. The caller still verifies a
     byte-identical content hash before recording anything.
+
+    When *index* is provided it MUST be a name→dir dict from
+    ``_build_skill_name_index()``; the lookup is O(1).  Without an index the
+    function falls back to a full ``SKILLS_DIR.rglob`` scan (O(N) and SLOW on
+    large trees — prefer the index path in hot loops).
     """
     if not skill_dir_name or not SKILLS_DIR.exists():
         return None
+    if index is not None:
+        return index.get(skill_dir_name)
+    # Slow fallback: full rglob scan. Only kept for callers that can't
+    # cheaply pre-build an index (e.g. one-off CLI repair commands).
     matches: List[Path] = []
     for skill_md in SKILLS_DIR.rglob("SKILL.md"):
         if is_excluded_skill_path(skill_md):
@@ -467,6 +505,11 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
 
     backfilled: List[str] = []
     changed = False
+    # Build skill-name→dir index ONCE instead of a full rglob per fallback
+    # (O(N + |optional|) instead of O(N × |optional|)). On large trees (e.g.
+    # node_modules under wenyan-mcp) a single rglob can take ~2 s; doing it
+    # ~100 times adds minutes of silent startup.
+    name_index: Optional[dict[str, Path]] = None
     for skill_md in sorted(optional_dir.rglob("SKILL.md")):
         if is_excluded_skill_path(skill_md):
             continue
@@ -486,7 +529,11 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
             # silently skips them forever. Fall back to a unique
             # same-directory-name match anywhere in the tree, then still
             # require a byte-identical hash below before claiming provenance.
-            dest = _find_installed_skill_dir_by_name(src.name)
+            # Lazy-build the name index on first fallback hit, then reuse
+            # for every subsequent fallback in this backfill pass.
+            if name_index is None:
+                name_index = _build_skill_name_index()
+            dest = _find_installed_skill_dir_by_name(src.name, index=name_index)
             if dest is None:
                 continue
             try:
