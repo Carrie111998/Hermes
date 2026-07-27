@@ -130,6 +130,10 @@ def test_business_readiness_reports_authoritative_runtime_blockers(monkeypatch):
             }],
         },
     )
+    monkeypatch.setattr(
+        "hermes_cli.business_security.evaluate_security_readiness",
+        lambda _config: type("Readiness", (), {"ready": True, "violations": ()})(),
+    )
     readiness = business.build_business_readiness(sqlite3.connect(":memory:"))
     assert readiness["ready"] is False
     assert readiness["state"] == "blocked"
@@ -161,6 +165,10 @@ def test_business_readiness_blocks_declared_payments_without_ready_rail(monkeypa
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"agentic": {"allowed_capabilities": ["payments.receive"]}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.business_security.evaluate_security_readiness",
+        lambda _config: type("Readiness", (), {"ready": True, "violations": ()})(),
     )
     monkeypatch.setattr(
         "hermes_cli.payments.payment_rail_status",

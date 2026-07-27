@@ -15,6 +15,8 @@
   codes and no implicit autonomy or provider side effects.
 - Readiness now fails closed when a charter declares inbound or outbound
   payment capabilities without a credential-ready rail in that direction.
+- Readiness now surfaces the worker's deterministic security-readiness
+  violations directly, before a supervisor is started.
 
 ## 0.19.0-agentic-foundation — 2026-07-27
 

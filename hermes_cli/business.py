@@ -423,7 +423,21 @@ def build_business_readiness(conn) -> dict:
     blockers: list[dict[str, Any]] = []
     from hermes_cli.config import load_config
 
-    charter = load_config().get("agentic") or {}
+    config = load_config()
+    charter = config.get("agentic") or {}
+
+    from hermes_cli.business_security import evaluate_security_readiness
+
+    security_readiness = evaluate_security_readiness(config)
+    if not security_readiness.ready:
+        blockers.append(
+            {
+                "code": "security_readiness_blocked",
+                "summary": "Security readiness checks block autonomous operation",
+                "violations": list(security_readiness.violations),
+                "authority_boundary": "No action was attempted",
+            }
+        )
     autonomy = snapshot.get("autonomy") or {}
     if autonomy.get("mode") != "autonomous":
         blockers.append(

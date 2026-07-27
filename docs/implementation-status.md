@@ -194,6 +194,9 @@ acceptance evidence.
   blockers. It also blocks a charter that declares payment capabilities when
   no credential-ready rail exists for the required direction. It does not
   certify external providers or legal/compliance status.
+- The readiness projection includes the same deterministic security-readiness
+  violations used by the worker, including isolation, secret-manager, redaction,
+  and non-custodial payment-policy failures, with an explicit no-action boundary.
 - A current-tree container smoke also proves cross-container bootstrap and
   worker-status persistence against one temporary volume. With no approved
   isolation backend or external secret manager, the worker stopped
