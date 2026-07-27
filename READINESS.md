@@ -84,7 +84,7 @@ determination until a newer evidence commit is recorded.
 ## Post-boundary evidence on current main
 
 The exact acceptance command set was rerun against current `main` at baseline
-commit `8e299933377355651be18c334a467b25537b1a1d`. This is a separate,
+commit `30c28abbc996b61214a274f21bea2decb281677e`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
@@ -110,6 +110,11 @@ tag above.
 - Compliance supersession lineage regression: **9 passed, 0 failed**.
 - Packaging artifact regression: **2 passed, 0 failed**.
 - Combined governed-runtime and packaging command: **84 passed, 0 failed**.
+- Bootstrap/operator regression additions: **6 passed, 0 failed**.
+- Expanded current-main validation command: **90 passed, 0 failed**.
+- Non-interactive bootstrap smoke: two consecutive bootstrap invocations
+  returned identical organization/objective IDs, and `business status` reported
+  configured state from the persistent directory.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 

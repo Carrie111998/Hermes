@@ -205,7 +205,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`8e299933377355651be18c334a467b25537b1a1d` passed 6 Founder/CEO E2E tests, 48
+`30c28abbc996b61214a274f21bea2decb281677e` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -233,6 +233,10 @@ same-scope validation, and current-authority selection.
 The packaging artifact regression passed 2 tests for wheel and sdist creation;
 an isolated dependency-backed wheel install also launched `charterforge
 --version` successfully. The combined command passed 84 tests, 0 failed.
+The bootstrap/operator regression additions passed 6 tests. The expanded
+current-main validation command passed 90 tests, 0 failed. A real temporary
+state-directory smoke ran the non-interactive bootstrap twice, observed stable
+IDs, and confirmed configured business status after the second run.
 The broader current-main regression command across resource budgets, company
 email, approvals, operational control, hiring, portfolio, accounting,
 procurement, metered billing, and usage billing passed **76 tests, 0 failed**.
