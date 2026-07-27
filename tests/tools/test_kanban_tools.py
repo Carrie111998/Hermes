@@ -185,6 +185,25 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_show_authorization_binds_exact_task_and_board(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_authorize_kanban_mutation",
+        lambda operation, scope: calls.append((operation, scope)),
+    )
+    out = kt._handle_show({})
+    assert "task" in json.loads(out)
+    operation, scope = calls[0]
+    assert operation == "show"
+    assert scope == {
+        "operation": "show",
+        "task_id": worker_env,
+        "board": "default",
+    }
+
+
 def test_show_explicit_task_id(worker_env):
     """Peek at a different task than the one in env."""
     from hermes_cli import kanban_db as kb
@@ -2858,6 +2877,22 @@ def test_attachments_lists_uploaded_files(worker_env):
     assert names == ["a.txt", "b.txt"]
     sizes = {a["filename"]: a["size"] for a in d["attachments"]}
     assert sizes == {"a.txt": 3, "b.txt": 4}
+
+
+def test_attachments_authorization_binds_exact_task_and_board(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_authorize_kanban_mutation",
+        lambda operation, scope: calls.append((operation, scope)),
+    )
+    out = kt._handle_attachments({})
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "attachments"
+    assert scope["task_id"] == worker_env
+    assert scope["board"] == "default"
 
 
 def test_attachments_unknown_task_errors(worker_env):

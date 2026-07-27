@@ -423,6 +423,17 @@ def _handle_show(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
+        _authorize_kanban_mutation(
+            "show",
+            {
+                "operation": "show",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_show authorization denied: {exc}")
+    try:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
@@ -1187,6 +1198,17 @@ def _handle_attachments(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    try:
+        _authorize_kanban_mutation(
+            "attachments",
+            {
+                "operation": "attachments",
+                "task_id": str(tid),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_attachments authorization denied: {exc}")
     try:
         kb, conn = _connect(board=board)
         try:
