@@ -4843,6 +4843,14 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        # One idempotency key per logical send, threaded through every retry
+        # attempt AND the reply→create fallback. If attempt 1 succeeds
+        # server-side but the response is lost (client timeout, network drop),
+        # attempt 2 arrives with the same uuid_value and Feishu dedupes it.
+        # uuid5(payload) is deterministic across attempts for the same content;
+        # the API treats duplicate uuid_values within a short window as the
+        # same logical message and returns the original message_id.
+        stable_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, payload).hex
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
@@ -4853,6 +4861,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     payload=payload,
                     reply_to=active_reply_to,
                     metadata=metadata,
+                    uuid_value=stable_uuid,
                 )
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat.
@@ -4882,6 +4891,7 @@ class FeishuAdapter(BasePlatformAdapter):
                             payload=payload,
                             reply_to=None,
                             metadata=metadata,
+                            uuid_value=stable_uuid,
                         )
                 return response
             except Exception as exc:
