@@ -99,7 +99,7 @@ DDGS_LOCKED_DISTRIBUTIONS = {
     "anyio": "4.12.1",
     "brotli": "1.2.0",
     "certifi": "2026.5.20",
-    "click": "8.3.1",
+    "click": "8.4.2",
     "ddgs": "9.14.4",
     "fake-useragent": "2.2.0",
     "h11": "0.16.0",
