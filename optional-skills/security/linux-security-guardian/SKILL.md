@@ -58,7 +58,16 @@ Before running any checks, collect the environment baseline:
 uname -a
 cat /etc/os-release
 
-# Uptime & load — spikes may indicate compromise
+# Package manager detection (Debian/Ubuntu -> apt, RHEL/CentOS -> dnf/yum)
+apt --version >/dev/null 2>&1 && echo "package_manager=apt"
+dpkg --version >/dev/null 2>&1 && echo "dpkg=available"
+
+# Firewall detection
+ufw status >/dev/null 2>&1 && echo "firewall=ufw"
+firewall-cmd --state 2>/dev/null && echo "firewall=firewalld"
+sudo -n iptables -L -n 2>/dev/null | head -3 >/dev/null && echo "firewall=iptables"
+
+# Uptime & load
 uptime
 
 # Who is logged in
@@ -69,10 +78,12 @@ sudo -n true 2>/dev/null && echo "has_sudo" || echo "no_sudo"
 ```
 
 From the output:
-- Note the distro/version (check against Debian/Ubuntu assumption)
-- Record `has_sudo` or `no_sudo` — this gates which Phase 2 checks are possible
+- Record `package_manager` and `firewall` — these select the audit command variants below
+- **Debian/Ubuntu (apt + ufw)**: Use the default commands shown in each section
+- **RHEL/CentOS (dnf/yum + firewalld)**: Swap `apt` -> `dnf`, `ufw` -> `firewall-cmd`; see "Alternatives" at the end of Phase 2
+- Record `has_sudo` or `no_sudo` — gates which checks are possible
 
-Report the environment to the user before proceeding.
+Report the detected package manager and firewall type to the user before proceeding.
 
 ---
 
@@ -125,7 +136,9 @@ Pass conditions:
 ```bash
 # C6: Firewall active (9 pts)
 ufw status 2>/dev/null || echo "not-installed"
-# Also check iptables if ufw absent:
+# RHEL/CentOS alternative:
+firewall-cmd --state 2>/dev/null || echo "firewalld-not-running"
+# Fallback if neither:
 sudo -n iptables -L -n 2>/dev/null | head -5 || echo "no-iptables-access"
 
 # C7: Minimal open ports (9 pts)
@@ -153,6 +166,8 @@ If the user marks any as unexpected, record a fail.
 ```bash
 # C9: Security updates (5 pts)
 apt list --upgradable 2>/dev/null | grep -i security | wc -l
+# RHEL/CentOS alternative:
+dnf updateinfo list security 2>/dev/null | grep -c "security" || echo "0"
 
 # C10: Shadow permissions (5 pts)
 stat -c '%a' /etc/shadow 2>/dev/null
@@ -200,6 +215,8 @@ systemctl is-active fail2ban 2>/dev/null
 
 # C17: Auto-updates (3 pts)
 dpkg -l unattended-upgrades 2>/dev/null | grep -c '^ii'
+# RHEL/CentOS alternative:
+rpm -q --quiet dnf-automatic 2>/dev/null && echo "1" || echo "0"
 
 # C18: Logging (3 pts)
 systemctl is-active rsyslog 2>/dev/null || journalctl -n 1 2>/dev/null | wc -l
@@ -211,6 +228,17 @@ Pass conditions:
 | C16 fail2ban | Output is `active` |
 | C17 Auto-updates | ≥ 1 (package installed) |
 | C18 Logging | Service active OR journalctl has output |
+
+### 2.6 Alternatives for Non-Debian/Ubuntu
+
+| Check | Debian/Ubuntu (default) | RHEL/CentOS |
+|-------|------------------------|-------------|
+| C6 Firewall | `ufw status` | `firewall-cmd --state` |
+| C7 Open ports | `ss -tlnp` | `ss -tlnp` (same) |
+| C9 Updates | `apt list --upgradable \| grep security` | `dnf updateinfo list security` |
+| C17 Auto-updates | `dpkg -l unattended-upgrades` | `rpm -q dnf-automatic` |
+
+When the user's distro is **not** Debian/Ubuntu, map to the RHEL/CentOS column. For other distros (Arch, Fedora, etc.), use the equivalent native tool (e.g. `pacman -Qe` for Arch).
 
 ---
 
