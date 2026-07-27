@@ -1409,6 +1409,27 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production multi-agent deployment or external authorization.
 
+## Discord action authority evidence (044a6bce9c)
+
+Discord and Discord-admin handlers now authorize each action before REST
+dispatch. The permit uses a `discord.<action>` capability and a hash of every
+supplied guild, channel, user, role, message, query, pagination, and thread
+parameter, preventing replay against a different external target.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/discord_tool.py tests/tools/test_discord_tool.py
+uv run --extra dev pytest -q tests/tools/test_discord_tool.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **101 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:2d56357d5ad2a5727ffd99e61e8a8bbf66eefce3408c0099d4d547590adcbaec`.
+This remains deterministic local-provider evidence and does not establish
+production Discord credentials, permissions, or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

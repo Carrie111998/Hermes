@@ -43,6 +43,9 @@ acceptance evidence.
 - Governed worker fan-out delegation is bound to an exact hashed delegation
   payload and `work.delegate` permit; it cannot manufacture a child outside the
   workforce grant hierarchy.
+- Discord platform and administration actions are governed per action and
+  exact payload target before REST dispatch; interactive sessions remain
+  compatible when no execution contract is present.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,
