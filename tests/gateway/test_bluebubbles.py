@@ -1088,7 +1088,9 @@ class TestBlueBubblesChatGuidAllowlist:
         assert handled[0].source.chat_id == self.APPROVED_DM
 
     @pytest.mark.asyncio
-    async def test_absent_setting_preserves_stock_behavior(self, monkeypatch):
+    async def test_absent_setting_preserves_stock_top_level_guid_fallback(
+        self, monkeypatch
+    ):
         monkeypatch.delenv("BLUEBUBBLES_ALLOWED_CHAT_GUIDS", raising=False)
         adapter = _make_adapter(monkeypatch, send_read_receipts=False)
         assert adapter._allowed_chat_guids is None
@@ -1098,12 +1100,51 @@ class TestBlueBubblesChatGuidAllowlist:
             handled.append(event)
 
         monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        payload = {
+            "type": "new-message",
+            "guid": "legacy-chat-id",
+            "data": {
+                "text": "legacy top-level chat guid",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+            },
+        }
         response = await adapter._handle_webhook(
-            _FakeBlueBubblesRequest(self._group_payload(self.UNAPPROVED_GROUP))
+            _FakeBlueBubblesRequest(payload)
         )
         await asyncio.sleep(0)
         assert response.status == 200
         assert len(handled) == 1
+        assert handled[0].source.chat_id == "legacy-chat-id"
+
+    @pytest.mark.asyncio
+    async def test_configured_setting_rejects_ambiguous_top_level_guid(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(
+            monkeypatch,
+            allowed_chat_guids=["legacy-chat-id"],
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        payload = {
+            "type": "new-message",
+            "guid": "legacy-chat-id",
+            "data": {
+                "text": "ambiguous top-level guid",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+            },
+        }
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+        assert response.status == 200
+        assert handled == []
 
     @pytest.mark.asyncio
     async def test_explicitly_empty_setting_denies_all(self, monkeypatch):

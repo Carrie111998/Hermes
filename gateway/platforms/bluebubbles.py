@@ -268,21 +268,26 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def _extract_inbound_chat_guid(
         self, record: Dict[str, Any], payload: Dict[str, Any]
     ) -> Optional[str]:
-        """Resolve chat GUID from a webhook record before side effects."""
+        """Resolve chat GUID from a webhook record before side effects.
+
+        Preserve the stock resolver exactly when the allowlist setting is
+        absent, including its legacy top-level ``payload.guid`` fallback. When
+        the gate is configured, avoid treating a message UUID as a chat GUID:
+        prefer nested ``chats[]`` data and accept the legacy fallback only
+        when it has the service/direction/target shape.
+        """
         chat_guid = self._value(
             record.get("chatGuid"),
             payload.get("chatGuid"),
             record.get("chat_guid"),
             payload.get("chat_guid"),
-            # Prefer nested chats[] over top-level payload guid, which is often
-            # the *message* guid rather than the chat guid.
-            None,
+            payload.get("guid") if self._allowed_chat_guids is None else None,
         )
         if not chat_guid:
             _chats = record.get("chats") or []
             if _chats and isinstance(_chats[0], dict):
                 chat_guid = _chats[0].get("guid") or _chats[0].get("chatGuid")
-        if not chat_guid:
+        if not chat_guid and self._allowed_chat_guids is not None:
             # Last resort: only accept payload.guid when it looks like a chat
             # guid (service;direction;target), not a message UUID.
             candidate = self._value(payload.get("guid"), record.get("guid"))
