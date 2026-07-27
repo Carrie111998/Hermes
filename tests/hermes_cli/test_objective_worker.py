@@ -46,6 +46,25 @@ def test_worker_exits_when_autonomy_is_paused(tmp_path):
     assert worker["stop_reason"] == "autonomy_paused"
 
 
+def test_worker_exits_when_autonomy_is_disabled(tmp_path):
+    path = tmp_path / "authority.db"
+    calls = []
+
+    def tick():
+        calls.append(True)
+        return SimpleNamespace(status="disabled")
+
+    assert objective_worker.run_forever(
+        db_path=path, interval_seconds=900, tick=tick, max_cycles=10
+    ) == 0
+    conn = objectives_db.connect(path)
+    worker = objective_worker.worker_health(conn)[0]
+    assert calls == [True]
+    assert worker["status"] == "stopped"
+    assert worker["last_cycle_status"] == "disabled"
+    assert worker["stop_reason"] == "runtime_blocked:disabled"
+
+
 def test_worker_exits_when_autonomy_is_revoked_during_failure(tmp_path):
     path = tmp_path / "authority.db"
     calls = []

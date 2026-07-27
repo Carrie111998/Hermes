@@ -16,6 +16,8 @@
   credential-redacted ingress envelopes.
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
+- Standalone objective workers fail closed and stop durably when autonomy is
+  disabled or runtime/security/integrity gates block execution.
 - Optional fail-closed runtime drift detection with immutable human-accepted
   baselines for the charter, authority schema, Python runtime, and dependency
   lock/package identity.

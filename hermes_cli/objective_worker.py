@@ -345,6 +345,15 @@ def run_forever(
             pass
     cycles = 0
     exit_code = 0
+    fail_closed_statuses = {
+        "paused",
+        "disabled",
+        "security_blocked",
+        "configuration_blocked",
+        "runtime_host_blocked",
+        "integrity_blocked",
+        "runtime_drift_blocked",
+    }
     with objectives_db.connect_closing(db_path) as conn:
         worker_id = register_worker(conn)
         try:
@@ -360,8 +369,12 @@ def run_forever(
                         consecutive_failures = heartbeat(
                             conn, worker_id, cycle_status=status
                         )
-                        if status == "paused":
-                            shutdown_reason = "autonomy_paused"
+                        if status in fail_closed_statuses:
+                            shutdown_reason = (
+                                "autonomy_paused"
+                                if status == "paused"
+                                else f"runtime_blocked:{status}"
+                            )
                             break
                     except Exception as exc:
                         consecutive_failures = heartbeat(

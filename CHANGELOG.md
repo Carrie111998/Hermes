@@ -34,6 +34,8 @@ Hermes Agent history remains available in Git.
   immutable allocations prevent duplicate billing.
 - Metered-invoice recovery now permits only same-intent allocation replay and
   rejects idempotency-key amount drift.
+- Standalone objective workers now stop durably on disabled autonomy and
+  fail-closed runtime, security, configuration, integrity, or drift gates.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.
