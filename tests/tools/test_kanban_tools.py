@@ -183,6 +183,7 @@ def test_task_scoped_claude_roles_expose_both_agent_memory_tools(
         "kanban_agent_memory_recall",
         "kanban_agent_memory_write",
     } <= names
+    assert "kanban_resolve" not in names
 
 
 def test_review_target_is_visible_only_to_task_scoped_reviewer(

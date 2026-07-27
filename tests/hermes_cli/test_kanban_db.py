@@ -4555,6 +4555,50 @@ def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypat
     assert row["status"] == "running"
 
 
+def test_spawn_one_v2_stamps_runtime_identity_before_spawn(
+    kanban_home, tmp_path, monkeypatch
+):
+    """The event-driven v2 path stamps the same executor facts as polling."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-stamps-runtime"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    stamped: list[str] = []
+
+    def stamp(_conn, task):
+        stamped.append(task.id)
+        return {
+            "profile": "developer",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+        }
+
+    monkeypatch.setattr(kb, "_stamp_run_executor_identity", stamp)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        pid = kb._spawn_one_v2(
+            conn,
+            tid,
+            board=board,
+            spawn_fn=lambda _task, _workspace, board=None: 4242,
+        )
+
+    assert pid == 4242
+    assert stamped == [tid]
+
+
 def test_spawn_one_v2_failure_clears_running_flag(kanban_home, tmp_path, monkeypatch):
     """R3 fix: claim_task sets running=1 at claim time (R1), and a failed
     spawn now goes through _record_task_failure (via _record_spawn_failure),
@@ -7139,6 +7183,148 @@ def test_review_independence_uses_canonical_provider_not_worker_alias(
         ][-1]
     assert rejected.payload["writer_agent"] == "openai-codex"
     assert rejected.payload["reviewer_agent"] == "openai-codex"
+
+
+def test_review_rejects_partial_canonical_executor_identity(
+    kanban_home, monkeypatch
+):
+    """A stamped reviewer must not compare against a legacy writer alias."""
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Partial canonical reviewer identity",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        writer = kb.claim_task(conn, tid, board="prod")
+        assert writer is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Legacy unstamped development run.",
+            metadata={
+                "ai_provenance": {
+                    "writer": {"agent": "legacy-writer-alias"}
+                }
+            },
+            expected_run_id=writer.current_run_id,
+            board="prod",
+            product_role_assignees={"tester": "tester"},
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='review', status='review', "
+            "assignee='reviewer' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        reviewer = kb.claim_review_task(conn, tid)
+        assert reviewer is not None
+        _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            reviewer,
+            provider="claude-cli",
+            model="claude-opus-5",
+            effort="high",
+        )
+
+        with pytest.raises(
+            kb.ProductProvenanceError,
+            match="canonical writer and reviewer executor identities",
+        ):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Must not compare canonical identity with an alias.",
+                metadata={
+                    "ai_provenance": {
+                        "reviewer": {
+                            "agent": "claude-cli",
+                            "verdict": "approved",
+                        }
+                    }
+                },
+                expected_run_id=reviewer.current_run_id,
+                board="prod",
+            )
+
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == "review"
+    assert task.status == "running"
+
+
+def test_runtime_identity_uses_effective_per_model_cli_effort(
+    kanban_home, monkeypatch, tmp_path
+):
+    """Canonical effort matches override resolution and CLI clamping."""
+    import hermes_cli.config as config_module
+    import hermes_cli.profiles as profiles_module
+
+    profile_home = tmp_path / "reviewer-profile"
+    profile_home.mkdir()
+    monkeypatch.setattr(
+        profiles_module, "resolve_profile_env", lambda _profile: profile_home
+    )
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "claude-cli",
+                "default": "claude-opus-5",
+            },
+            "agent": {
+                "reasoning_effort": "high",
+                "reasoning_overrides": {"claude-opus-5": "ultra"},
+            },
+        },
+    )
+    task = types.SimpleNamespace(
+        assignee="reviewer",
+        provider_override=None,
+        model_override=None,
+    )
+
+    identity = kb._resolve_worker_runtime_identity(task)
+
+    assert identity is not None
+    assert identity["provider"] == "claude-cli"
+    assert identity["model"] == "claude-opus-5"
+    assert identity["effort"] == "max"
+
+
+def test_strict_product_run_requires_canonical_runtime_identity(
+    kanban_home, monkeypatch
+):
+    """Governed product dispatch fails closed when identity is unresolved."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Governed identity required",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        with kb.authorized_governance_write():
+            conn.execute(
+                "UPDATE board_governance "
+                "SET qualification_required=1 WHERE id=1"
+            )
+        conn.commit()
+        monkeypatch.setattr(
+            kb, "_resolve_worker_runtime_identity", lambda _task: None
+        )
+
+        with pytest.raises(
+            kb.WorkerRuntimeIdentityError,
+            match="explicit provider, model, and effective effort",
+        ):
+            kb._stamp_run_executor_identity(conn, claimed)
 
 
 def test_product_human_block_routes_to_hermes_preflight_before_blocked(kanban_home):

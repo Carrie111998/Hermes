@@ -3378,7 +3378,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_RESOLVE_SCHEMA,
     handler=_handle_resolve,
-    check_fn=_check_agent_memory_worker_mode,
+    check_fn=_check_resolver_mode,
     emoji="🧭",
 )
 

@@ -2702,9 +2702,51 @@ def _validate_product_ai_provenance(
             raise ProductProvenanceError(reason, task_id, step)
         return
     if step == "review":
+        task = get_task(conn, task_id)
+        current_run = (
+            get_run(conn, task.current_run_id)
+            if task is not None and task.current_run_id is not None
+            else None
+        )
+        reviewer_executor = _executor_from_run_metadata(
+            current_run.metadata if current_run is not None else None
+        )
+        writer_executor = _latest_product_step_executor(
+            conn, task_id, "development"
+        )
+        if (reviewer_executor is None) != (writer_executor is None):
+            writer_provider = (
+                writer_executor["provider"]
+                if writer_executor is not None
+                else None
+            )
+            reviewer_provider = (
+                reviewer_executor["provider"]
+                if reviewer_executor is not None
+                else None
+            )
+            reason = (
+                "Review completion rejected: canonical writer and reviewer "
+                "executor identities are both required when either dispatched "
+                "run is canonically stamped; Hermes will not compare a trusted "
+                "runtime identity with a worker-authored alias."
+            )
+            _record_product_provenance_rejection(
+                conn,
+                task_id,
+                step_key=step,
+                reason=reason,
+                writer_agent=writer_provider,
+                reviewer_agent=reviewer_provider,
+            )
+            raise ProductProvenanceError(reason, task_id, step)
+
         reviewer = _reviewer_agent_from_metadata(metadata)
         supplied_writer = _writer_agent_from_metadata(metadata)
         writer = supplied_writer or _latest_product_writer_agent(conn, task_id)
+        if reviewer_executor is not None and writer_executor is not None:
+            reviewer = reviewer_executor["provider"]
+            writer = writer_executor["provider"]
         missing: list[str] = []
         if not reviewer:
             missing.append("ai_provenance.reviewer.agent")
@@ -13036,6 +13078,10 @@ class ReviewTargetPreparationError(RuntimeError):
     """Reviewer input could not be pinned safely before worker launch."""
 
 
+class WorkerRuntimeIdentityError(RuntimeError):
+    """A governed worker runtime could not be identified canonically."""
+
+
 def _review_git_output(workspace: Path, *args: str) -> str:
     git_executable = shutil.which("git")
     if git_executable is None:
@@ -13230,6 +13276,16 @@ def _spawn_one_v2(
     if claimed is None:
         # Already claimed (or no longer ready) -- the CAS fire-once
         # guarantee: nothing to do on this or any later pass.
+        return None
+    try:
+        _stamp_run_executor_identity(conn, claimed)
+    except WorkerRuntimeIdentityError as exc:
+        _record_spawn_failure(
+            conn,
+            claimed.id,
+            str(exc),
+            failure_limit=failure_limit,
+        )
         return None
     _record_hermes_predelegation_recall(conn, claimed)
     try:
@@ -15496,7 +15552,18 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
-        _stamp_run_executor_identity(conn, claimed)
+        try:
+            _stamp_run_executor_identity(conn, claimed)
+        except WorkerRuntimeIdentityError as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                str(exc),
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _record_hermes_predelegation_recall(conn, claimed)
         try:
             resolved_branch_name = None
@@ -15595,7 +15662,18 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
-        _stamp_run_executor_identity(conn, claimed)
+        try:
+            _stamp_run_executor_identity(conn, claimed)
+        except WorkerRuntimeIdentityError as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                str(exc),
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _record_hermes_predelegation_recall(conn, claimed)
         try:
             resolved_branch_name = None
@@ -15914,6 +15992,7 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
         return None
     try:
         from hermes_constants import (
+            resolve_reasoning_config,
             reset_hermes_home_override,
             set_hermes_home_override,
         )
@@ -15930,19 +16009,34 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
         model_config = config.get("model")
         if not isinstance(model_config, dict):
             model_config = {"default": model_config}
-        agent_config = config.get("agent")
-        if not isinstance(agent_config, dict):
-            agent_config = {}
         provider = str(
             task.provider_override or model_config.get("provider") or ""
-        ).strip()
+        ).strip().lower()
         model = str(
             task.model_override
             or model_config.get("default")
             or model_config.get("model")
             or ""
         ).strip()
-        effort = str(agent_config.get("reasoning_effort") or "").strip().lower()
+        reasoning_config = resolve_reasoning_config(config, model)
+        if provider in {"claude-cli", "codex-cli"}:
+            from agent.cli_emulated_provider import resolve_cli_effort
+
+            effort = resolve_cli_effort(provider, reasoning_config)
+        elif (
+            isinstance(reasoning_config, dict)
+            and reasoning_config.get("enabled") is False
+        ):
+            effort = "none"
+        elif isinstance(reasoning_config, dict):
+            configured_effort = reasoning_config.get("effort")
+            effort = (
+                configured_effort.strip().lower()
+                if isinstance(configured_effort, str)
+                else None
+            )
+        else:
+            effort = None
         if not provider or provider == "auto" or not model or not effort:
             return None
         return {
@@ -15975,6 +16069,19 @@ def _stamp_run_executor_identity(
         return None
     identity = _resolve_worker_runtime_identity(task)
     if identity is None:
+        governance = conn.execute(
+            "SELECT qualification_required "
+            "FROM board_governance WHERE id=1"
+        ).fetchone()
+        if (
+            task.workflow_template_id == "product"
+            and governance is not None
+            and int(governance["qualification_required"]) == 1
+        ):
+            raise WorkerRuntimeIdentityError(
+                "Governed product dispatch requires an explicit provider, "
+                "model, and effective effort for the selected worker profile."
+            )
         return None
     run = get_run(conn, task.current_run_id)
     if run is None or run.ended_at is not None:

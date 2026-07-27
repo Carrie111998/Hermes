@@ -1046,6 +1046,19 @@ def _assert_dispatch_records_hermes_recall_before_spawn(
 ) -> None:
     board, _vault = _configured_product_board(tmp_path, monkeypatch)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_runtime_identity",
+        lambda task: {
+            "profile": task.assignee,
+            "provider": "test-provider",
+            "model": "test-model",
+            "effort": "high",
+            "surface": "hermes-primary",
+            "source": "dispatcher",
+            "version": 1,
+        },
+    )
     observed = []
 
     with kb.connect(board=board) as conn:
@@ -1096,6 +1109,19 @@ def test_unavailable_hermes_recall_queues_incident_and_still_spawns(
     )
     outbox = tmp_path / "outbox"
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_runtime_identity",
+        lambda task: {
+            "profile": task.assignee,
+            "provider": "test-provider",
+            "model": "test-model",
+            "effort": "high",
+            "surface": "hermes-primary",
+            "source": "dispatcher",
+            "version": 1,
+        },
+    )
     observed = []
     with kb.connect(board=board) as conn:
         task_id = _qualified_task(
