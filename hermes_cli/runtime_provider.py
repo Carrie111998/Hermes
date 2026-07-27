@@ -1064,10 +1064,26 @@ def _resolve_named_custom_runtime(
     if not custom_provider:
         return None
 
-    base_url = (
-        (explicit_base_url or "").strip()
-        or custom_provider.get("base_url", "")
-    ).rstrip("/")
+    configured_base_url = str(custom_provider.get("base_url", "") or "").strip().rstrip("/")
+    explicit_clean = (explicit_base_url or "").strip().rstrip("/")
+
+    # When an alias/runtime override supplies a different endpoint, do not
+    # resolve under this named provider identity — its api_key/key_env (and
+    # credential-bearing extra_headers) are scoped to the configured host.
+    # Fall through to bare-custom endpoint-scoped resolution instead
+    # (exact pool match + host-gated / host-derived keys).
+    if explicit_clean and (
+        not configured_base_url
+        or _normalize_base_url_for_match(explicit_clean)
+        != _normalize_base_url_for_match(configured_base_url)
+    ):
+        return _resolve_named_custom_runtime(
+            requested_provider="custom",
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_clean,
+        )
+
+    base_url = (explicit_clean or configured_base_url).rstrip("/")
     if not base_url:
         return None
 

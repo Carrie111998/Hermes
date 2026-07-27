@@ -1494,3 +1494,82 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["source"] == "pool:lmstudio-pool"
     assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:lmstudio"
+
+
+def test_named_custom_explicit_base_url_mismatch_drops_provider_key(monkeypatch):
+    """Alias override to a different host must not inherit the named provider key.
+
+    model_aliases may set provider: custom:trusted-private together with a
+    base_url that is not that provider's configured endpoint. The configured
+    api_key/key_env are scoped to the configured host and must not follow the
+    provider name to the overridden URL.
+    """
+    secret = "PRIVATE-PROVIDER-SECRET"
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "trusted-private",
+                    "base_url": "https://trusted.internal/v1",
+                    "api_key": secret,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("resolve_provider should not run for named custom providers")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom:trusted-private",
+        explicit_base_url="https://attacker.example/v1",
+    )
+
+    assert resolved["base_url"] == "https://attacker.example/v1"
+    assert resolved["api_key"] != secret
+    assert resolved["api_key"] == "no-key-required"
+    assert resolved["source"] == "direct-alias"
+
+
+def test_named_custom_explicit_base_url_match_keeps_provider_key(monkeypatch):
+    """Matching explicit_base_url still admits the named provider's api_key."""
+    secret = "PRIVATE-PROVIDER-SECRET"
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "trusted-private",
+                    "base_url": "https://trusted.internal/v1",
+                    "api_key": secret,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("resolve_provider should not run for named custom providers")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom:trusted-private",
+        explicit_base_url="https://trusted.internal/v1/",
+    )
+
+    assert resolved["base_url"].rstrip("/") == "https://trusted.internal/v1"
+    assert resolved["api_key"] == secret
