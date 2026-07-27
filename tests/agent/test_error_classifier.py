@@ -1,5 +1,7 @@
 """Tests for agent.error_classifier — structured API error classification."""
 
+import httpx
+import openai
 import pytest
 from agent.error_classifier import (
     ClassifiedError,
@@ -58,6 +60,7 @@ class TestFailoverReason:
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
+            "entitlement",
             "invalid_encrypted_content",
             "multimodal_tool_content_unsupported",
             "provider_policy_blocked",
@@ -231,6 +234,65 @@ class TestClassifyApiError:
     """End-to-end classification tests."""
 
     # ── Auth errors ──
+
+    @pytest.mark.parametrize("message", [
+        "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+        "  THE  'gpt-5.6-sol'  MODEL IS NOT SUPPORTED WHEN USING CODEX WITH A CHATGPT ACCOUNT.  ",
+    ])
+    def test_400_exact_chatgpt_account_model_rejection_is_entitlement(self, message):
+        result = classify_api_error(MockAPIError(message, status_code=400))
+        assert result.reason == FailoverReason.entitlement
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_400_openai_sdk_flat_detail_model_rejection_is_entitlement(self):
+        detail = (
+            "The 'gpt-5.6-sol' model is not supported when using Codex "
+            "with a ChatGPT account."
+        )
+        response = httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://chatgpt.com/backend-api/codex/responses"
+            ),
+        )
+        error = openai.BadRequestError(
+            f"Error code: 400 - {{'detail': {detail!r}}}",
+            response=response,
+            body={"detail": detail},
+        )
+
+        result = classify_api_error(
+            error,
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+        )
+
+        assert result.reason == FailoverReason.entitlement
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    @pytest.mark.parametrize("message", [
+        "Bad request",
+        "prefix The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+        "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account. suffix",
+    ])
+    def test_400_nonexact_chatgpt_account_text_remains_format_error(self, message):
+        result = classify_api_error(MockAPIError(message, status_code=400))
+        assert result.reason == FailoverReason.format_error
+
+    def test_400_structured_replay_code_beats_chatgpt_account_text(self):
+        result = classify_api_error(MockAPIError(
+            "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+            status_code=400,
+            body={"error": {"code": "invalid_encrypted_content"}},
+        ))
+        assert result.reason == FailoverReason.invalid_encrypted_content
+
+    def test_401_429_and_503_keep_existing_classifications(self):
+        assert classify_api_error(MockAPIError("Unauthorized", status_code=401)).reason == FailoverReason.auth
+        assert classify_api_error(MockAPIError("Too Many Requests", status_code=429)).reason == FailoverReason.rate_limit
+        assert classify_api_error(MockAPIError("Service Unavailable", status_code=503)).reason == FailoverReason.overloaded
 
     def test_401_classified_as_auth(self):
         e = MockAPIError("Unauthorized", status_code=401)
@@ -2169,4 +2231,3 @@ class Test408RequestTimeout:
         assert result.retryable is False
         assert result.should_fallback is True
         assert result.should_compress is False
-
