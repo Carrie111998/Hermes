@@ -41,9 +41,11 @@ class CustomProfile(ProviderProfile):
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).
         #
         #   - disabled  → extra_body.think = False (Ollama's thinking-off flag)
-        #   - enabled + effort set → TOP-LEVEL reasoning_effort string, the
-        #     format GLM-5.2/ARK and other OpenAI-compatible reasoning APIs
-        #     expect (GLM documents "high" and "max"; "max" is its default).
+        #   - enabled + effort set → extra_body.reasoning_effort string.
+        #     Placed in extra_body instead of top-level because custom
+        #     providers are heterogeneous — LiteLLM proxies and similar
+        #     endpoints reject unknown top-level parameters with HTTP 400
+        #     (#72649).
         #   - enabled + no effort  → omit both, so the endpoint applies its own
         #     server-side default (do NOT force a level the user didn't pick).
         #
@@ -64,7 +66,7 @@ class CustomProfile(ProviderProfile):
                 top_level["reasoning_effort"] = "none"
                 extra_body["think"] = False
             elif _effort:
-                top_level["reasoning_effort"] = _effort
+                extra_body["reasoning_effort"] = _effort
 
         return extra_body, top_level
 
