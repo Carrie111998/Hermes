@@ -5218,8 +5218,28 @@ def _quarantine_nous_pool_entries(
     error: AuthError,
     *,
     reason: str,
+    dead_refresh_token: Optional[str],
 ) -> bool:
-    """Remove singleton-seeded Nous pool entries that contain dead OAuth state."""
+    """Remove singleton-seeded Nous pool entries that carry the dead OAuth chain.
+
+    Callers reach here when ``dead_refresh_token`` has just failed terminally.
+    What must be reclaimed is every *other* copy of that same dead chain —
+    singleton-seeded entries are re-seeded from ``providers.nous``, so a copy
+    left behind would keep re-driving the doomed refresh.
+
+    Matching on the refresh token rather than on ``source`` alone is what makes
+    that precise.  A pool routinely holds entries on *different* chains: an old
+    ``manual:device_code`` entry stranded on a revoked lineage alongside a
+    ``device_code`` entry seeded from a freshly re-authed singleton.  Removing
+    by source alone destroyed the healthy entry whenever the stale one failed,
+    leaving nothing selectable.  See ``CredentialPool._quarantine_dead_chain``,
+    the in-memory twin of this function.
+
+    ``dead_refresh_token`` is keyword-only and has no default deliberately: the
+    defect was an unstated assumption about *which* chain died, so every call
+    site is made to name it.  ``None``/``""`` means no chain was identified, and
+    reclaims only entries that themselves carry no refresh token.
+    """
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         return False
@@ -5227,11 +5247,16 @@ def _quarantine_nous_pool_entries(
     if not isinstance(entries, list):
         return False
 
+    dead_refresh = str(dead_refresh_token or "").strip()
     retained = []
     removed = False
     singleton_sources = {NOUS_DEVICE_CODE_SOURCE, f"manual:{NOUS_DEVICE_CODE_SOURCE}"}
     for entry in entries:
-        if isinstance(entry, dict) and entry.get("source") in singleton_sources:
+        if (
+            isinstance(entry, dict)
+            and entry.get("source") in singleton_sources
+            and str(entry.get("refresh_token") or "").strip() == dead_refresh
+        ):
             removed = True
             continue
         retained.append(entry)
@@ -5539,6 +5564,7 @@ def resolve_nous_access_token(
                             auth_store,
                             exc,
                             reason="managed_access_token_refresh_failure",
+                            dead_refresh_token=refresh_token,
                         )
                         _save_provider_state_to_source(auth_store, "nous", state, state_source_path)
                     raise
@@ -5993,6 +6019,7 @@ def resolve_nous_runtime_credentials(
                                     auth_store,
                                     exc,
                                     reason="runtime_access_refresh_failure",
+                                    dead_refresh_token=refresh_token,
                                 )
                                 _persist_state("terminal_runtime_access_refresh_failure")
                             raise

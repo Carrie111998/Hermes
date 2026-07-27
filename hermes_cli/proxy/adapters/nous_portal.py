@@ -108,6 +108,11 @@ class NousPortalAdapter(UpstreamAdapter):
                 )
             except AuthError as exc:
                 if _is_terminal_nous_refresh_error(exc):
+                    # Capture the chain that just died BEFORE quarantining the
+                    # singleton — _quarantine_nous_oauth_state pops
+                    # refresh_token off `state`, so reading it inside
+                    # _save_state would see nothing and spare no pool entry.
+                    dead_refresh_token = state.get("refresh_token")
                     _quarantine_nous_oauth_state(
                         state,
                         exc,
@@ -117,6 +122,7 @@ class NousPortalAdapter(UpstreamAdapter):
                         state,
                         quarantine_error=exc,
                         quarantine_reason="proxy_refresh_failure",
+                        quarantine_refresh_token=dead_refresh_token,
                     )
                 raise RuntimeError(
                     f"Failed to refresh Nous Portal credentials: {exc}"
@@ -178,6 +184,7 @@ class NousPortalAdapter(UpstreamAdapter):
         *,
         quarantine_error: Optional[AuthError] = None,
         quarantine_reason: Optional[str] = None,
+        quarantine_refresh_token: Optional[str] = None,
     ) -> None:
         try:
             with _auth_store_lock():
@@ -187,6 +194,7 @@ class NousPortalAdapter(UpstreamAdapter):
                         store,
                         quarantine_error,
                         reason=quarantine_reason,
+                        dead_refresh_token=quarantine_refresh_token,
                     )
                 providers = store.setdefault("providers", {})
                 providers["nous"] = state

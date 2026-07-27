@@ -1581,6 +1581,7 @@ class CredentialPool:
                                     auth_store,
                                     exc,
                                     reason="credential_pool_refresh_failure",
+                                    dead_refresh_token=entry_refresh,
                                 )
                                 _save_provider_state(auth_store, "nous", state)
                                 _save_auth_store(auth_store)

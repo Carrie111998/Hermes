@@ -977,6 +977,134 @@ def test_managed_access_token_refresh_failure_quarantines_tokens(
     assert refresh_calls == ["refresh-old"]
 
 
+def _seed_nous_pool(hermes_home: Path, entries: list[dict]) -> None:
+    """Write ``credential_pool.nous`` into an auth.json built by _setup_nous_auth."""
+    auth_path = hermes_home / "auth.json"
+    payload = json.loads(auth_path.read_text())
+    payload.setdefault("credential_pool", {})["nous"] = entries
+    auth_path.write_text(json.dumps(payload, indent=2))
+
+
+def _two_chain_nous_pool() -> list[dict]:
+    """A pool holding one entry per refresh chain.
+
+    ``singleton-seeded`` was seeded from ``providers.nous`` and therefore
+    carries the chain that dies in these tests.  ``other-chain`` is a manual
+    entry on a *different*, still-valid lineage — the shape that a stale manual
+    entry plus a post-relogin reseed produces.  Only the first is dead.
+    """
+    live_jwt = _invoke_jwt(seconds=3600)
+    return [
+        {
+            "id": "singleton-seeded",
+            "source": "device_code",
+            "auth_type": "oauth",
+            "priority": 0,
+            "access_token": "access-old",
+            "refresh_token": "dead-refresh-chain",
+            "agent_key": "dead-agent-key",
+            "portal_base_url": "https://portal.example.com",
+            "inference_base_url": "https://inference.example.com/v1",
+            "scope": "inference:invoke",
+        },
+        {
+            "id": "other-chain",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 3,
+            "access_token": live_jwt,
+            "refresh_token": "live-refresh-chain",
+            "agent_key": live_jwt,
+            "agent_key_expires_at": _future_iso(3600),
+            "expires_at": _future_iso(3600),
+            "portal_base_url": "https://portal.example.com",
+            "inference_base_url": "https://inference.example.com/v1",
+            "scope": "inference:invoke",
+        },
+    ]
+
+
+def test_managed_access_token_refresh_failure_keeps_other_chain_pool_entry(
+    tmp_path, monkeypatch, shared_store_env,
+):
+    """Store-side half of the ungated quarantine, on ``resolve_nous_access_token``.
+
+    ``_quarantine_nous_pool_entries`` drops every singleton-sourced entry by
+    ``source`` string alone.  A terminal failure of the singleton's chain
+    therefore also destroys a ``manual:device_code`` entry sitting on a
+    *different*, still-valid chain — a credential nothing proved dead, and one
+    the pool cannot re-seed because it did not come from ``providers.nous``.
+
+    Unlike the ``agent/credential_pool.py`` call site (whose follow-up
+    ``_persist`` rewrites the correctly-retained in-memory entries back over the
+    store), this path has no such repair: the entry is gone for real.
+    """
+    from hermes_cli import auth as auth_mod
+
+    hermes_home = tmp_path / "hermes"
+    _setup_nous_auth(hermes_home, refresh_token="dead-refresh-chain")
+    _seed_nous_pool(hermes_home, _two_chain_nous_pool())
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _terminal_refresh_failure(*, client, portal_base_url, client_id, refresh_token):
+        raise AuthError(
+            "Invalid refresh token",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "_refresh_access_token", _terminal_refresh_failure)
+
+    with pytest.raises(AuthError, match="Invalid refresh token"):
+        auth_mod.resolve_nous_access_token()
+
+    payload = json.loads((hermes_home / "auth.json").read_text())
+    surviving = [entry["id"] for entry in payload["credential_pool"]["nous"]]
+    # The dead chain is reclaimed...
+    assert "singleton-seeded" not in surviving
+    # ...and only the dead chain.
+    assert surviving == ["other-chain"]
+
+
+def test_runtime_refresh_failure_keeps_other_chain_pool_entry(
+    tmp_path, monkeypatch, shared_store_env,
+):
+    """Same store-side over-deletion on ``resolve_nous_runtime_credentials``.
+
+    This is the call site the proxy adapter and every agent runtime path reach,
+    so it is the widest exposure of the ungated removal.
+    """
+    from hermes_cli import auth as auth_mod
+
+    hermes_home = tmp_path / "hermes"
+    _setup_nous_auth(
+        hermes_home,
+        access_token="access-old",
+        refresh_token="dead-refresh-chain",
+    )
+    _seed_nous_pool(hermes_home, _two_chain_nous_pool())
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _terminal_refresh_failure(*, client, portal_base_url, client_id, refresh_token):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "_refresh_access_token", _terminal_refresh_failure)
+
+    with pytest.raises(AuthError, match="Refresh session has been revoked"):
+        auth_mod.resolve_nous_runtime_credentials()
+
+    payload = json.loads((hermes_home / "auth.json").read_text())
+    surviving = [entry["id"] for entry in payload["credential_pool"]["nous"]]
+    assert "singleton-seeded" not in surviving
+    assert surviving == ["other-chain"]
+
+
 def test_unusable_access_token_refresh_uses_latest_rotated_refresh_token(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_nous_auth(

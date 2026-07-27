@@ -259,6 +259,73 @@ def test_nous_adapter_quarantines_terminal_refresh_failure(tmp_path, monkeypatch
     assert stored.get("credential_pool", {}).get("nous") == []
 
 
+def test_nous_adapter_quarantine_keeps_other_chain_pool_entry(tmp_path, monkeypatch):
+    """The adapter's quarantine must reclaim the dead chain only.
+
+    ``_quarantine_nous_pool_entries`` drops every singleton-sourced entry by
+    ``source`` string alone, so a terminal failure of the singleton's chain also
+    destroys a ``manual:device_code`` entry on a *different*, still-valid chain.
+    Nothing here repairs that: unlike the ``agent/credential_pool.py`` call site,
+    there is no follow-up ``_persist`` of correctly-retained in-memory entries.
+
+    Ordering matters on this path — ``_quarantine_nous_oauth_state`` pops
+    ``refresh_token`` off ``state`` *before* ``_save_state`` runs, so the dead
+    chain has to be captured before that call, not read back out of ``state``.
+    """
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "nous": {
+                "access_token": "access-tok",
+                "refresh_token": "dead-refresh-chain",
+                "agent_key": "stale-agent-key",
+            },
+        },
+        "credential_pool": {
+            "nous": [
+                {
+                    "id": "singleton-seeded",
+                    "source": "device_code",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "access_token": "access-tok",
+                    "refresh_token": "dead-refresh-chain",
+                },
+                {
+                    "id": "other-chain",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "priority": 3,
+                    "access_token": "live-access-tok",
+                    "refresh_token": "live-refresh-chain",
+                },
+            ],
+        },
+    }))
+
+    with patch(
+        "hermes_cli.proxy.adapters.nous_portal.resolve_nous_runtime_credentials",
+        side_effect=AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        ),
+    ):
+        adapter = NousPortalAdapter()
+        with pytest.raises(RuntimeError, match="Refresh session has been revoked"):
+            adapter.get_credential()
+
+    stored = json.loads(auth_path.read_text())
+    surviving = [entry["id"] for entry in stored["credential_pool"]["nous"]]
+    assert "singleton-seeded" not in surviving
+    assert surviving == ["other-chain"]
+
+
 def test_nous_adapter_get_credential_raises_when_no_jwt_returned(tmp_path, monkeypatch):
     """If the refresh helper succeeds but produces no JWT, we surface a clear error."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
