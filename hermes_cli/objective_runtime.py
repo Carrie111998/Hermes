@@ -953,6 +953,21 @@ class ObjectiveRuntime:
                 f"objective is terminal: {objective.status}",
             )
         if objective.status == "proposed":
+            self._raise_advisor_handoff(
+                objective_id=objective_id,
+                category="objective_acceptance_required",
+                summary="Objective is proposed but has not been accepted into the operating portfolio",
+                context={
+                    "objective_status": objective.status,
+                    "originator": objective.originator,
+                    "desired_outcome": objective.desired_outcome,
+                    "event_type": str(event["event_type"]),
+                },
+                options=[
+                    {"id": "accept", "label": "Accept objective into the operating portfolio"},
+                    {"id": "abandon", "label": "Abandon the proposed objective"},
+                ],
+            )
             return CycleOutcome(
                 str(event["id"]),
                 objective_id,

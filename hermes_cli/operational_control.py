@@ -545,6 +545,39 @@ def resolve_intervention(
             )
             emitted_objective_event = True
     if (
+        row["category"] == "objective_acceptance_required"
+        and option_id == "accept"
+    ):
+        from hermes_cli import objectives_db
+
+        objective_id = str(row["objective_id"] or "")
+        if not objective_id:
+            raise ValueError("objective acceptance intervention has no objective")
+        objective = objectives_db.get_objective(conn, objective_id)
+        if objective.status != "proposed":
+            raise ValueError(
+                "objective acceptance requires the objective to remain proposed"
+            )
+        objectives_db.transition_objective(
+            conn,
+            objective_id,
+            "accepted",
+            actor=actor,
+            reason=f"advisor accepted objective via intervention {intervention_id}",
+        )
+        objectives_db.enqueue_objective_event(
+            conn,
+            objective_id=objective_id,
+            event_type="objective.accepted",
+            payload={
+                "intervention_id": intervention_id,
+                "advisor": actor,
+                "evidence": dict(evidence),
+            },
+            dedupe_key=f"objective-accepted:{objective_id}:{intervention_id}",
+        )
+        emitted_objective_event = True
+    if (
         row["category"] == "authority_insufficient"
         and option_id == "approve_exact_action"
     ):

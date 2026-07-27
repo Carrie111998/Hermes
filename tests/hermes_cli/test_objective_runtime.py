@@ -1006,6 +1006,53 @@ def test_no_admissible_action_creates_one_deduplicated_advisor_handoff(tmp_path)
     conn.close()
 
 
+def test_proposed_objective_creates_acceptance_handoff(tmp_path):
+    conn = db.connect(tmp_path / "authority.db")
+    objective = db.create_objective(
+        conn,
+        desired_outcome="Accept only with explicit evidence",
+        originator="external:advisor",
+    )
+    event_id = db.enqueue_objective_event(
+        conn,
+        objective_id=objective.id,
+        event_type="objective.proposed",
+        payload={"source": "advisor"},
+    )
+    loop = runtime.ObjectiveRuntime(
+        conn,
+        planner=Planner([]),
+        executor=Executor(),
+        verifier=Verifier(),
+        charter=charter(),
+        policy_version="charter-v1",
+        runtime_id="runtime-proposed-acceptance",
+    )
+
+    outcome = loop.tick()
+
+    assert outcome.event_id == event_id
+    assert outcome.status == "escalated"
+    handoffs = operational_control.list_interventions(conn)
+    assert len(handoffs) == 1
+    assert handoffs[0]["category"] == "objective_acceptance_required"
+    assert db.get_objective(conn, objective.id).status == "proposed"
+
+    operational_control.resolve_intervention(
+        conn,
+        handoffs[0]["id"],
+        option_id="accept",
+        actor="human:advisor",
+        evidence={"accepted_scope": "initial operating portfolio"},
+    )
+    assert db.get_objective(conn, objective.id).status == "accepted"
+    wake = conn.execute(
+        "SELECT event_type,status FROM objective_inbox "
+        "WHERE objective_id=? AND event_type='objective.accepted'",
+        (objective.id,),
+    ).fetchone()
+    assert tuple(wake) == ("objective.accepted", "pending")
+
 def test_inconclusive_action_verification_creates_evidence_handoff(tmp_path):
     conn = db.connect(tmp_path / "authority.db")
     objective = accepted_objective(conn)
