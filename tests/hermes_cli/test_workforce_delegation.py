@@ -557,6 +557,28 @@ def test_parent_grant_revocation_fences_descendant_grant(tmp_path, monkeypatch):
     assert workforce_delegation.is_revoked(conn, child_id) is True
 
 
+def test_master_pause_revokes_employee_grants_and_fences_result_handoff(
+    tmp_path, monkeypatch
+):
+    company = _company(tmp_path, monkeypatch)
+    conn = company[0]
+    ids = company[1:]
+    grant_id, _ = _grant(conn, ids)
+    workforce_delegation.bind_task(
+        conn, grant_id=grant_id, task_id="task_pause_fence", board="default"
+    )
+    from hermes_cli import operational_control
+
+    operational_control.set_autonomy_mode(
+        conn, mode="paused", actor="owner", reason="emergency stop"
+    )
+    assert workforce_delegation.is_revoked(conn, grant_id) is True
+    with pytest.raises(operational_control.AutonomyRevokedError):
+        workforce_delegation.validate_task_result_authority(
+            conn, "task_pause_fence"
+        )
+
+
 def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
     tmp_path, monkeypatch
 ):

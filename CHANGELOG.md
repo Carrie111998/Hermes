@@ -58,6 +58,9 @@
 - Permit actor-scope checks now tolerate legacy objective-only databases without
   crashing during migration; fully bootstrapped stores continue to enforce the
   employee organization/status boundary.
+- Master pause/manual mode now revokes active employee grants and blocks both
+  subordinate launch and result handoff, preventing workers already in flight
+  from continuing after an autonomy stop.
 - Delegation grants now persist the exact action resource scope and reject a
   Kanban binding to a different board; legacy grants without a scope fail closed
   until reissued under a current action contract.

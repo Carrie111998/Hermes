@@ -46,6 +46,9 @@ Legacy objective-only stores without an employee identity table retain a
 non-crashing compatibility path; freshly bootstrapped agentic stores always
 initialize the employee authority boundary before autonomous execution.
 
+The master pause/manual kill switch revokes active employee grants and fences
+worker launch and result handoff through the autonomy generation boundary.
+
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
 records. Payment integration is non-custodial: providers hold instruments and

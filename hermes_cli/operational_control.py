@@ -155,6 +155,23 @@ def set_autonomy_mode(
             actor=actor,
             reason=f"autonomy changed to {mode}: {reason}",
         )
+        grant_table = conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='employee_task_grants'"""
+        ).fetchone()
+        if grant_table is not None:
+            from hermes_cli import workforce_delegation
+
+            organizations = conn.execute(
+                "SELECT DISTINCT organization_id FROM employee_task_grants"
+            ).fetchall()
+            for organization in organizations:
+                workforce_delegation.revoke_active_grants(
+                    conn,
+                    organization_id=str(organization["organization_id"]),
+                    actor=actor,
+                    reason=f"autonomy changed to {mode}: {reason}",
+                )
     return int(autonomy_state(conn)["generation"])
 
 

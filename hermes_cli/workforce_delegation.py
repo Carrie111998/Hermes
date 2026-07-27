@@ -661,8 +661,10 @@ def validate_worker_launch(
     from pathlib import Path
 
     from hermes_cli import kanban_db, objectives_db
+    from hermes_cli import operational_control
 
     with objectives_db.connect_closing(Path(authority_path)) as conn:
+        operational_control.assert_autonomous(conn)
         grant = grant_for_task(conn, task_id)
         if grant is None or str(grant["id"]) != grant_id:
             raise DelegationError("worker task does not match its execution contract")
@@ -733,6 +735,9 @@ def validate_task_result_authority(
     conn: sqlite3.Connection, task_id: str
 ) -> dict[str, Any]:
     """Require the employee and exact mandate to remain live at handoff time."""
+    from hermes_cli import operational_control
+
+    operational_control.assert_autonomous(conn)
     grant = grant_for_task(conn, task_id)
     if grant is None:
         raise DelegationError("delegated task has no authoritative employee grant")
