@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The current-tree acceptance now admits its initial objective through an
+  authenticated, freshness-checked external event subscription with durable
+  idempotent routing before CEO execution begins.
 - The workforce E2E now proves a subordinate employee worker can launch under
   an exact CEO-issued mandate, return a completed task, and feed that result
   back into the CEO objective inbox for governed planning.

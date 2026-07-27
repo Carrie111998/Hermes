@@ -38,6 +38,9 @@ acceptance evidence.
 - Workforce acceptance now covers the complete delegated-worker handoff:
   hierarchy-bound mandate, exact launch contract, subordinate completion, and
   durable `kanban.task.done` wake-up for CEO planning.
+- The current-tree acceptance routes its initial objective through the typed,
+  authenticated external-event boundary, including freshness evidence and
+  source-reference idempotency, before the CEO worker acts.
 - Planner/provider rate-limit failures are classified explicitly, persisted in
   the durable event retry state with bounded backoff, honor SDK attributes,
   `Retry-After`, and rate-limit reset headers, and recover on a later tick

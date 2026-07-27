@@ -253,6 +253,27 @@ The resulting image manifest was
 `scheduled_events: 1` is evidence of a durable autonomous wake-up, not proof
 of an always-on production scheduler or external event-provider availability.
 
+At current-main commit `2941d5083f`, the initial acceptance objective was also
+admitted through the authenticated external-event boundary rather than a
+direct inbox insert. The same run passed with the following event and recovery
+output:
+
+```text
+{"phase": "prepare", "initial_readiness": "blocked"}
+{"phase": "prepare", "ready": true, "runtime_active": false}
+{"phase": "run", "objective": "verified", "effects": 1, "scheduled_events": 1}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1}
+current-tree agentic acceptance: PASS
+```
+
+The resulting image manifest was
+`sha256:c001af7f15f7550276281d4faf8bfb8e63d228fc487a69883288b05952ea4004`.
+This proves the local authenticated-ingress contract; it does not establish a
+live webhook provider, production signature key management, or public network
+availability.
+
 Current-main workforce coordination evidence at commit `d44d0ad47f` was run
 with:
 
