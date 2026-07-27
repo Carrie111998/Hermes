@@ -1292,8 +1292,18 @@ class ProductionBackend:
         try:
             hydration = self._require_sidebar_hydration_executor().run_once()
             if hydration.status != "idle":
+                self._require_store().record_sidebar_recovery_progress(
+                    lane="hydration",
+                    status=hydration.status,
+                    now=time.time(),
+                )
                 return {"lane": "hydration", **asdict(hydration)}
             registration = self._require_sidebar_executor().run_once()
+            self._require_store().record_sidebar_recovery_progress(
+                lane="registration",
+                status=registration.status,
+                now=time.time(),
+            )
             return {"lane": "registration", **asdict(registration)}
         except (ConfigurationFailure, RolloutGateBlocked):
             raise
@@ -4138,6 +4148,40 @@ def _public_sidebar_status(
     )
     raw_latency = raw.get("delivery_latency_seconds")
     latency = raw_latency if isinstance(raw_latency, Mapping) else {}
+    raw_scheduler = raw.get("scheduler")
+    if raw_scheduler is None:
+        scheduler: Mapping[str, Any] = {}
+    elif isinstance(raw_scheduler, Mapping):
+        scheduler = raw_scheduler
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    fresh_claims = scheduler.get("fresh_claims_since_oldest", 0)
+    next_lane = scheduler.get("next_lane", "fresh")
+    if (
+        type(fresh_claims) is not int
+        or not 0 <= fresh_claims <= 3
+        or next_lane not in {"fresh", "oldest"}
+        or next_lane != ("oldest" if fresh_claims == 3 else "fresh")
+    ):
+        raise ConfigurationFailure("invalid_sidebar_status")
+    raw_recovery = raw.get("recovery")
+    if raw_recovery is None:
+        recovery: Mapping[str, Any] = {}
+    elif isinstance(raw_recovery, Mapping):
+        recovery = raw_recovery
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    recovery_lane = recovery.get("lane")
+    recovery_status = recovery.get("status")
+    recovery_at = _optional_status_number(recovery.get("last_cycle_at"))
+    if (
+        recovery_lane not in {None, "hydration", "registration"}
+        or recovery_status
+        not in {None, "idle", "visible", "retry", "failed", "unsettled"}
+        or (recovery_lane is None) != (recovery_status is None)
+        or (recovery_lane is None) != (recovery_at is None)
+    ):
+        raise ConfigurationFailure("invalid_sidebar_status")
     task_id = raw.get("last_visible_task_id")
     return {
         "healthy": not degraded_reasons,
@@ -4169,6 +4213,15 @@ def _public_sidebar_status(
         "delivery_latency_seconds": {
             percentile: _optional_status_number(latency.get(percentile))
             for percentile in ("p50", "p95", "p99")
+        },
+        "scheduler": {
+            "fresh_claims_since_oldest": fresh_claims,
+            "next_lane": next_lane,
+        },
+        "recovery": {
+            "lane": recovery_lane,
+            "status": recovery_status,
+            "last_cycle_at": recovery_at,
         },
     }
 
@@ -4203,6 +4256,10 @@ def _public_sidebar_hydration_status(
         },
         "oldest_pending_age_seconds": _optional_status_number(
             raw.get("oldest_pending_age_seconds")
+        ),
+        "active_lease": raw.get("active_lease") is True,
+        "reserved_reconciliation": _status_count(
+            raw.get("reserved_reconciliation", 0)
         ),
         "recent_error_codes": (
             [

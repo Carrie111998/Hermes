@@ -1497,6 +1497,29 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         and "sidebar_terminal_resolution_ledger_invalid" not in execution_blockers
     ):
         execution_blockers.append("sidebar_terminal_resolution_ledger_invalid")
+    scheduler_source = _status_mapping(source.get("scheduler"))
+    fresh_claims = _nonnegative_status_int(
+        scheduler_source.get("fresh_claims_since_oldest"),
+        0,
+    )
+    if fresh_claims > 3:
+        fresh_claims = 0
+    expected_lane = "oldest" if fresh_claims == 3 else "fresh"
+    next_lane = scheduler_source.get("next_lane")
+    if next_lane != expected_lane:
+        next_lane = expected_lane
+    recovery_source = _status_mapping(source.get("recovery"))
+    recovery_lane = recovery_source.get("lane")
+    recovery_status = recovery_source.get("status")
+    recovery_at = _finite_status_number(recovery_source.get("last_cycle_at"))
+    if (
+        recovery_lane not in {"hydration", "registration"}
+        or recovery_status not in {"idle", "visible", "retry", "failed", "unsettled"}
+        or recovery_at is None
+    ):
+        recovery_lane = None
+        recovery_status = None
+        recovery_at = None
     return {
         "eligible_by_provider": {
             provider: _nonnegative_status_int(provider_counts.get(provider), 0)
@@ -1538,6 +1561,15 @@ def _sidebar_status(value: object) -> dict[str, Any]:
             percentile: _finite_status_number(latency_values.get(percentile))
             for percentile in ("p50", "p95", "p99")
         },
+        "scheduler": {
+            "fresh_claims_since_oldest": fresh_claims,
+            "next_lane": next_lane,
+        },
+        "recovery": {
+            "lane": recovery_lane,
+            "status": recovery_status,
+            "last_cycle_at": recovery_at,
+        },
     }
 
 
@@ -1553,6 +1585,11 @@ def _hydration_status(value: object, *, enabled: bool) -> dict[str, Any]:
         },
         "oldest_pending_age_seconds": _finite_status_number(
             source.get("oldest_pending_age_seconds")
+        ),
+        "active_lease": source.get("active_lease") is True,
+        "reserved_reconciliation": _nonnegative_status_int(
+            source.get("reserved_reconciliation"),
+            0,
         ),
         "recent_error_codes": (
             [

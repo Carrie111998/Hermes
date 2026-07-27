@@ -2995,6 +2995,15 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
         "last_visible_task_id": "019f-secret-thread-identifier",
         "recent_error_codes": ["broker_time_budget"],
         "delivery_latency_seconds": {"p50": 1.0, "p95": 2.0, "p99": 2.0},
+        "scheduler": {
+            "fresh_claims_since_oldest": 3,
+            "next_lane": "oldest",
+        },
+        "recovery": {
+            "lane": "hydration",
+            "status": "visible",
+            "last_cycle_at": 999.0,
+        },
     })
 
     status = backend.sidebar_status()
@@ -3007,9 +3016,53 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
     ]
     expected_tag = hashlib.sha256(b"019f-secret-thread-identifier").hexdigest()[:16]
     assert status["last_visible_task_id"] == f"task:{expected_tag}"
+    assert status["scheduler"] == {
+        "fresh_claims_since_oldest": 3,
+        "next_lane": "oldest",
+    }
+    assert status["recovery"] == {
+        "lane": "hydration",
+        "status": "visible",
+        "last_cycle_at": 999.0,
+    }
     assert "019f-secret-thread-identifier" not in rendered
     assert "lease_token" not in rendered
     assert "marker" not in rendered
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"scheduler": {"fresh_claims_since_oldest": 4, "next_lane": "fresh"}},
+        {"scheduler": {"fresh_claims_since_oldest": 0, "next_lane": "secret"}},
+        {"recovery": {"lane": "secret", "status": "idle", "last_cycle_at": 1.0}},
+        {
+            "recovery": {
+                "lane": "hydration",
+                "status": "secret",
+                "last_cycle_at": 1.0,
+            }
+        },
+    ),
+)
+def test_sidebar_status_rejects_invalid_scheduler_or_recovery_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 0},
+        "counts": {},
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+        **payload,
+    })
+
+    with pytest.raises(ConfigurationFailure, match="invalid_sidebar_status"):
+        backend.sidebar_status()
 
 
 @pytest.mark.parametrize(
@@ -5136,10 +5189,15 @@ def test_production_sidebar_recovery_once_prioritizes_hydration_then_registratio
         BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
     )
     calls: list[str] = []
+    progress: list[dict[str, object]] = []
     hydration_results = iter((
         SidebarHydrationExecutionResult(status="visible"),
         SidebarHydrationExecutionResult(status="idle"),
     ))
+
+    class Store:
+        def record_sidebar_recovery_progress(self, **value: object) -> None:
+            progress.append(value)
 
     class HydrationExecutor:
         def run_once(self) -> SidebarHydrationExecutionResult:
@@ -5162,6 +5220,8 @@ def test_production_sidebar_recovery_once_prioritizes_hydration_then_registratio
         "_require_sidebar_executor",
         lambda: RegistrationExecutor(),
     )
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
 
     first = backend.run_sidebar_recovery_once()
     second = backend.run_sidebar_recovery_once()
@@ -5180,6 +5240,10 @@ def test_production_sidebar_recovery_once_prioritizes_hydration_then_registratio
         "error_code": None,
     }
     assert calls == ["hydration", "hydration", "registration"]
+    assert progress == [
+        {"lane": "hydration", "status": "visible", "now": 1_000.0},
+        {"lane": "registration", "status": "idle", "now": 1_000.0},
+    ]
 
 
 def test_production_serve_owns_one_internal_sidebar_recovery_thread(

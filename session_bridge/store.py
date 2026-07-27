@@ -75,6 +75,9 @@ _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY = (
 )
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _SIDEBAR_PENDING_LANE_STATE_KEY = "session-bridge:sidebar:pending-lane:v1"
+_SIDEBAR_RECOVERY_PROGRESS_STATE_KEY = (
+    "session-bridge:sidebar:recovery-progress:v1"
+)
 _SIDEBAR_FRESH_BURST = 3
 _SIDEBAR_HYDRATION_LEASE_SECONDS = 300
 _SIDEBAR_HYDRATION_LEASE_KEY = b"session-sidebar-hydration-lease-v1"
@@ -7167,6 +7170,50 @@ class SessionBridgeStore:
 
         self.db._execute_write(_write)
 
+    def record_sidebar_recovery_progress(
+        self,
+        *,
+        lane: str,
+        status: str,
+        now: float,
+    ) -> None:
+        if lane not in {"hydration", "registration"}:
+            raise ValueError("invalid sidebar recovery lane")
+        if status not in {"idle", "visible", "retry", "failed", "unsettled"}:
+            raise ValueError("invalid sidebar recovery status")
+        cycle_at = _finite_number(now, "sidebar recovery cycle time")
+        if cycle_at < 0:
+            raise ValueError("invalid sidebar recovery cycle time")
+        value_json = json.dumps(
+            {
+                "version": 1,
+                "lane": lane,
+                "status": status,
+                "at": cycle_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        updated_at = _finite_number(self._clock(), "current time")
+
+        def _write(conn) -> None:
+            conn.execute(
+                """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value_json = excluded.value_json,
+                       updated_at = excluded.updated_at""",
+                (
+                    _SIDEBAR_RECOVERY_PROGRESS_STATE_KEY,
+                    value_json,
+                    updated_at,
+                ),
+            )
+
+        self.db._execute_write(_write)
+
     def sidebar_delivery_status(self, *, now: float | None = None) -> dict[str, Any]:
         status_time = _finite_number(self._clock() if now is None else now, "now")
         counts = self.sidebar_job_counts()
@@ -7257,6 +7304,40 @@ class SessionBridgeStore:
         heartbeat_at = heartbeat.get("at") if isinstance(heartbeat, Mapping) else None
         if not isinstance(heartbeat_at, (int, float)) or isinstance(heartbeat_at, bool):
             heartbeat_at = None
+        pending_lane = self.get_state(_SIDEBAR_PENDING_LANE_STATE_KEY)
+        fresh_claims = 0
+        if pending_lane is not None:
+            if (
+                set(pending_lane) != {"version", "fresh_claims_since_oldest"}
+                or pending_lane.get("version") != 1
+                or type(pending_lane.get("fresh_claims_since_oldest")) is not int
+                or not 0
+                <= pending_lane["fresh_claims_since_oldest"]
+                <= _SIDEBAR_FRESH_BURST
+            ):
+                raise ValueError("invalid sidebar pending lane state")
+            fresh_claims = pending_lane["fresh_claims_since_oldest"]
+        recovery_progress = self.get_state(_SIDEBAR_RECOVERY_PROGRESS_STATE_KEY)
+        recovery_lane: str | None = None
+        recovery_status: str | None = None
+        recovery_at: float | None = None
+        if recovery_progress is not None:
+            if (
+                set(recovery_progress) != {"version", "lane", "status", "at"}
+                or recovery_progress.get("version") != 1
+                or recovery_progress.get("lane")
+                not in {"hydration", "registration"}
+                or recovery_progress.get("status")
+                not in {"idle", "visible", "retry", "failed", "unsettled"}
+                or not isinstance(recovery_progress.get("at"), (int, float))
+                or isinstance(recovery_progress.get("at"), bool)
+                or not math.isfinite(float(recovery_progress["at"]))
+                or float(recovery_progress["at"]) < 0
+            ):
+                raise ValueError("invalid sidebar recovery progress state")
+            recovery_lane = recovery_progress["lane"]
+            recovery_status = recovery_progress["status"]
+            recovery_at = float(recovery_progress["at"])
         allowed_codes = SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
         recent_codes: list[str] = []
         for row in error_rows:
@@ -7294,6 +7375,19 @@ class SessionBridgeStore:
                 "p50": _nearest_rank_percentile(latencies, 0.50),
                 "p95": _nearest_rank_percentile(latencies, 0.95),
                 "p99": _nearest_rank_percentile(latencies, 0.99),
+            },
+            "scheduler": {
+                "fresh_claims_since_oldest": fresh_claims,
+                "next_lane": (
+                    "oldest"
+                    if fresh_claims == _SIDEBAR_FRESH_BURST
+                    else "fresh"
+                ),
+            },
+            "recovery": {
+                "lane": recovery_lane,
+                "status": recovery_status,
+                "last_cycle_at": recovery_at,
             },
         }
 

@@ -2102,6 +2102,8 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "last_visible_task_id",
         "recent_error_codes",
         "delivery_latency_seconds",
+        "scheduler",
+        "recovery",
         "hydration",
     }
     assert sidebar["eligible_by_provider"] == {"claude": 1, "hermes": 0}
@@ -2126,6 +2128,15 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "p50": None,
         "p95": None,
         "p99": None,
+    }
+    assert sidebar["scheduler"] == {
+        "fresh_claims_since_oldest": 0,
+        "next_lane": "fresh",
+    }
+    assert sidebar["recovery"] == {
+        "lane": None,
+        "status": None,
+        "last_cycle_at": None,
     }
 
 
@@ -2153,6 +2164,8 @@ def test_session_status_exposes_only_sanitized_hydration_observability(
                 "hostile": 99,
             },
             "oldest_pending_age_seconds": 42.5,
+            "active_lease": True,
+            "reserved_reconciliation": 2,
             "recent_error_codes": ["hydration_send_ambiguous", private],
             "lease_token": "must-not-leak",
             "hydration_marker": "must-not-leak",
@@ -2179,6 +2192,8 @@ def test_session_status_exposes_only_sanitized_hydration_observability(
             "hydration_failed": 5,
         },
         "oldest_pending_age_seconds": 42.5,
+        "active_lease": True,
+        "reserved_reconciliation": 2,
         "recent_error_codes": ["hydration_send_ambiguous"],
     }
     rendered = json.dumps(status)

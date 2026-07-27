@@ -7409,6 +7409,63 @@ def test_sidebar_delivery_status_reports_exclusions_without_degradation(db) -> N
     }
 
 
+def test_sidebar_delivery_status_reports_scheduler_and_recovery_progress(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 150.0,
+        sidebar_token_factory=_token_factory("observability-lease"),
+    )
+    candidate = _sidebar_candidate(db, native_id="observability-source")
+    store.enqueue_sidebar_job(candidate)
+
+    assert len(store.claim_sidebar_jobs(now=125.0, limit=1)) == 1
+    store.record_sidebar_recovery_progress(
+        lane="hydration",
+        status="visible",
+        now=140.0,
+    )
+
+    status = store.sidebar_delivery_status(now=150.0)
+
+    assert status["scheduler"] == {
+        "fresh_claims_since_oldest": 1,
+        "next_lane": "fresh",
+    }
+    assert status["recovery"] == {
+        "lane": "hydration",
+        "status": "visible",
+        "last_cycle_at": 140.0,
+    }
+    rendered = json.dumps(status, sort_keys=True)
+    assert "observability-source" not in rendered
+    assert "observability-lease" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("lane", "status"),
+    (
+        ("unknown", "idle"),
+        ("hydration", "unknown"),
+        ("registration\nsecret", "visible"),
+    ),
+)
+def test_sidebar_recovery_progress_rejects_unfixed_values(
+    db,
+    lane: str,
+    status: str,
+) -> None:
+    store = SessionBridgeStore(db)
+
+    with pytest.raises(ValueError, match="sidebar recovery"):
+        store.record_sidebar_recovery_progress(
+            lane=lane,
+            status=status,
+            now=125.0,
+        )
+
+    assert store.get_state("session-bridge:sidebar:recovery-progress:v1") is None
+
+
 def test_sidebar_exclusion_replay_fails_closed_on_corrupted_digest(db) -> None:
     store = SessionBridgeStore(db)
     candidate = _sidebar_candidate(db, native_id="corrupt-exclusion")
