@@ -6039,6 +6039,63 @@ def _decide_turn_image_mode(agent: Any) -> tuple[str, Optional[str]]:
         return "text", f"image routing decision failed ({type(exc).__name__}: {exc})"
 
 
+def _image_routing_notice(sid: str, reason: str) -> None:
+    """Tell the user this turn's image was reduced to a text description.
+
+    Emitted as ``kind: "image_routing"`` rather than ``"process"``: the
+    desktop consumes ``"process"`` only to re-sync background-process state
+    and never reads the payload text, so the #66829 reporter saw no
+    explanation at all. Both drivers render this kind — the Ink TUI on its
+    status line, the desktop as a persistent system message beside the answer.
+    """
+    _emit(
+        "status.update",
+        sid,
+        {"kind": "image_routing", "text": f"⚠ Image sent as a text description — {reason}."},
+    )
+
+
+def _build_run_message(sid: str, agent: Any, prompt: str, images: list[str]) -> Any:
+    """Build the turn payload, routing attached images natively or as text.
+
+    "native" → pass pixels to the main model as OpenAI-style content parts
+    (adapters translate for Anthropic/Gemini/Bedrock/etc.). "text" → pre-analyze
+    with vision_analyze and prepend the description. See agent/image_routing.py
+    for the full decision table. Every path that ends in text when the user
+    attached an image emits a notice first, so the downgrade is never silent.
+    """
+    if not images:
+        return prompt
+
+    mode, downgrade = _decide_turn_image_mode(agent)
+    if downgrade:
+        _image_routing_notice(sid, downgrade)
+
+    if mode != "native":
+        return _enrich_with_attached_images(prompt, images)
+
+    try:
+        from agent.image_routing import build_native_content_parts
+
+        parts, skipped = build_native_content_parts(prompt, images)
+        if skipped:
+            print(
+                f"[tui_gateway] native image attachment skipped {len(skipped)} unreadable path(s)",
+                file=sys.stderr,
+            )
+        if any(p.get("type") == "image_url" for p in parts):
+            return parts
+        _image_routing_notice(sid, "no readable image data for native attachment")
+        return _enrich_with_attached_images(prompt, images)
+    except Exception as exc:
+        print(
+            f"[tui_gateway] native attach failed, falling back to text: {exc}",
+            file=sys.stderr,
+        )
+        _image_routing_notice(sid, f"native attachment failed ({type(exc).__name__})")
+        return _enrich_with_attached_images(prompt, images)
+
+
 def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     """Pre-analyze attached images via vision and prepend descriptions to user text."""
     import asyncio, json as _json
@@ -11818,60 +11875,7 @@ def _run_prompt_submit(
             # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
             # "text"   → pre-analyze with vision_analyze and prepend the text.
             # See agent/image_routing.py for the full decision table.
-            run_message: Any = prompt
-            if images:
-                _mode, _downgrade = _decide_turn_image_mode(agent)
-                if _downgrade:
-                    _emit(
-                        "status.update",
-                        sid,
-                        {
-                            "kind": "process",
-                            "text": f"⚠ Image sent as a text description — {_downgrade}.",
-                        },
-                    )
-
-                if _mode == "native":
-                    try:
-                        from agent.image_routing import build_native_content_parts
-
-                        _parts, _skipped = build_native_content_parts(
-                            prompt,
-                            images,
-                        )
-                        if _skipped:
-                            print(
-                                f"[tui_gateway] native image attachment skipped {len(_skipped)} unreadable path(s)",
-                                file=sys.stderr,
-                            )
-                        if any(p.get("type") == "image_url" for p in _parts):
-                            run_message = _parts
-                        else:
-                            _emit(
-                                "status.update",
-                                sid,
-                                {
-                                    "kind": "process",
-                                    "text": "⚠ Image sent as a text description — no readable image data for native attachment.",
-                                },
-                            )
-                            run_message = _enrich_with_attached_images(prompt, images)
-                    except Exception as _img_exc:
-                        print(
-                            f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
-                            file=sys.stderr,
-                        )
-                        _emit(
-                            "status.update",
-                            sid,
-                            {
-                                "kind": "process",
-                                "text": f"⚠ Image sent as a text description — native attachment failed ({type(_img_exc).__name__}).",
-                            },
-                        )
-                        run_message = _enrich_with_attached_images(prompt, images)
-                else:
-                    run_message = _enrich_with_attached_images(prompt, images)
+            run_message: Any = _build_run_message(sid, agent, prompt, images)
 
             # Streaming TTS: voice-mode replies are spoken sentence-by-sentence
             # as tokens arrive (CLI parity) instead of after the full turn.
