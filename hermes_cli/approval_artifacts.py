@@ -326,6 +326,7 @@ def validate_for_action(
     *,
     artifact_id: str,
     action_id: str,
+    organization_id: str,
     policy_version: str,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
@@ -353,7 +354,10 @@ def validate_for_action(
         raise ApprovalArtifactError("approved action is no longer proposed")
     if _hash(_action_material(action)) != row["action_contract_sha256"]:
         raise ApprovalArtifactError("approved action contract changed")
-    if _hash(_objective_scope(conn, str(action["objective_id"]))) != row[
+    objective_scope = _objective_scope(conn, str(action["objective_id"]))
+    if objective_scope["organization_id"] != organization_id:
+        raise ApprovalArtifactError("approval organization binding is inconsistent")
+    if _hash(objective_scope) != row[
         "objective_scope_sha256"
     ]:
         raise ApprovalArtifactError("approved objective authority scope changed")

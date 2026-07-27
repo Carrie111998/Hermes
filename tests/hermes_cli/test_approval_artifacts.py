@@ -139,6 +139,7 @@ def test_artifact_binds_exact_action_scope_policy_and_evidence(tmp_path):
         conn,
         artifact_id=artifact_id,
         action_id=action_id,
+        organization_id=organization_id,
         policy_version="charter-v1",
         now=now,
     )
@@ -147,12 +148,25 @@ def test_artifact_binds_exact_action_scope_policy_and_evidence(tmp_path):
     assert artifact["approval_evidence_sha256"]
     with pytest.raises(
         approval_artifacts.ApprovalArtifactError,
+        match="organization binding",
+    ):
+        approval_artifacts.validate_for_action(
+            conn,
+            artifact_id=artifact_id,
+            action_id=action_id,
+            organization_id="organization_other",
+            policy_version="charter-v1",
+            now=now,
+        )
+    with pytest.raises(
+        approval_artifacts.ApprovalArtifactError,
         match="policy version",
     ):
         approval_artifacts.validate_for_action(
             conn,
             artifact_id=artifact_id,
             action_id=action_id,
+            organization_id=organization_id,
             policy_version="charter-v2",
             now=now,
         )
@@ -168,6 +182,7 @@ def test_artifact_binds_exact_action_scope_policy_and_evidence(tmp_path):
             conn,
             artifact_id=artifact_id,
             action_id=action_id,
+            organization_id=organization_id,
             policy_version="charter-v1",
             now=now,
         )
@@ -229,6 +244,7 @@ def test_exact_approval_materializes_one_permit_then_consumes_on_execution(tmp_p
             conn,
             artifact_id=artifact_id,
             action_id=action_id,
+            organization_id=organization_id,
             policy_version="charter-v1",
         )
     conn.close()
@@ -417,6 +433,7 @@ def test_stale_state_and_cross_action_replay_are_rejected(tmp_path):
             conn,
             artifact_id=artifact_id,
             action_id=other_action_id,
+            organization_id=organization_id,
             policy_version="charter-v1",
         )
 

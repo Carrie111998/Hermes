@@ -353,6 +353,7 @@ def evaluate_and_record(
             conn,
             artifact_id=approval_artifact_id,
             action_id=action_id,
+            organization_id=str(objective["organization_id"]),
             policy_version=policy_version,
         )
     decision = evaluate_action(
