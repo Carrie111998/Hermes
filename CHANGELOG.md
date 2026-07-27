@@ -260,3 +260,5 @@ recorded.
 - `cb0e8b7cdf43aa3aa2383821eb2a91794da8965c` — converged identical payment
   provider readbacks to one immutable observation while preserving distinct
   rows for actual provider-state changes.
+- `ac8b60da5ea510c6bcf6a4c68b73787d6c7cf0d9` — bound quarantined external-content release to the intervention
+  organization, with cross-tenant release regression coverage.
