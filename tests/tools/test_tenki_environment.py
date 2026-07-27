@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import sys
 import threading
 import time
@@ -1336,3 +1337,74 @@ def test_exec_survives_cancel_clearing_sandbox_mid_operation(monkeypatch, tmp_pa
     env._sandbox = None
     with pytest.raises(RuntimeError, match="torn down"):
         env._exec_raw("echo ok", timeout=5)
+
+
+def _tenki_env_for_upload_race(monkeypatch, tmp_path, task_id):
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    return TenkiEnvironment(task_id=task_id)
+
+
+def test_tenki_upload_targets_one_sandbox_when_cancel_races(monkeypatch, tmp_path):
+    """cancel() nulls self._sandbox, so re-reading it per call could send the
+    mkdir and the upload of a single file to two different sandboxes (or to
+    None). Both must run against one captured reference."""
+    env = _tenki_env_for_upload_race(monkeypatch, tmp_path, "upload-race")
+    original = env._sandbox
+    created_before = len(_FakeSandboxFactory.created_kwargs)
+
+    orig_mkdir = original.fs.mkdir
+
+    def mkdir_and_teardown(*args, **kwargs):
+        env._sandbox = None  # what cancel() does concurrently
+        return orig_mkdir(*args, **kwargs)
+
+    monkeypatch.setattr(original.fs, "mkdir", mkdir_and_teardown)
+
+    host_file = tmp_path / "skill.md"
+    host_file.write_text("content", encoding="utf-8")
+    env._tenki_upload(str(host_file), "/home/tenki/.hermes/skills/skill.md")
+
+    assert len(_FakeSandboxFactory.created_kwargs) == created_before
+    assert original.fs.mkdir_calls, "mkdir ran on the captured sandbox"
+    assert original.fs.upload_calls[-1] == (
+        str(host_file),
+        "/home/tenki/.hermes/skills/skill.md",
+    )
+
+
+def test_tenki_bulk_upload_targets_one_sandbox_when_cancel_races(monkeypatch, tmp_path):
+    """Same single-capture rule for the bulk flow: mkdir, tar upload, untar and
+    the cleanup rm must all land on one sandbox, or the tar gets extracted
+    somewhere other than where it was uploaded."""
+    env = _tenki_env_for_upload_race(monkeypatch, tmp_path, "bulk-upload-race")
+    original = env._sandbox
+    created_before = len(_FakeSandboxFactory.created_kwargs)
+
+    orig_exec = original.exec
+
+    def exec_and_teardown(*args, **kwargs):
+        env._sandbox = None  # cancel() lands during the mkdir
+        return orig_exec(*args, **kwargs)
+
+    monkeypatch.setattr(original, "exec", exec_and_teardown)
+
+    host_file = tmp_path / "skill.md"
+    host_file.write_text("content", encoding="utf-8")
+    env._tenki_bulk_upload([(str(host_file), "/home/tenki/.hermes/skills/skill.md")])
+
+    assert len(_FakeSandboxFactory.created_kwargs) == created_before
+    remote_tar = original.fs.upload_calls[-1][1]
+    commands = [call[0][-1] for call in original.exec_calls]
+    assert any(cmd.startswith("mkdir ") for cmd in commands)
+    # The untar and the cleanup both reference the tar this sandbox received.
+    assert any(f"tar xf {shlex.quote(remote_tar)}" in cmd for cmd in commands)
+    assert any(f"rm -f {shlex.quote(remote_tar)}" in cmd for cmd in commands)
