@@ -1,68 +1,74 @@
-name: Payment rail packages
+name: Payment Rails
 
 on:
   push:
     branches: [main]
     paths:
       - 'packages/charterforge-stripe-rail/**'
+      - 'packages/charterforge-nevermined-rail/**'
+      - 'packages/charterforge-circle-rail/**'
+      - 'tests/payment_rails/**'
       - '.github/workflows/payment-rails.yml'
   pull_request:
+    branches: [main]
     paths:
       - 'packages/charterforge-stripe-rail/**'
+      - 'packages/charterforge-nevermined-rail/**'
+      - 'packages/charterforge-circle-rail/**'
+      - 'tests/payment_rails/**'
       - '.github/workflows/payment-rails.yml'
-  workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
-  build-stripe-rail:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    strategy:
+      matrix:
+        rail: [stripe, nevermined, circle]
+    
     steps:
-      - name: Check out source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          version: latest
-          python-version: '3.13'
-
-      - name: Build the main charterforge wheel (dependency)
+          version: "0.8.0"
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Build main charterforge wheel
         run: |
-          uv build --wheel --out-dir dist-main
-          echo "MAIN_WHEEL=$(find dist-main -name '*.whl -print -quit')" >> $GITHUB_ENV
-
-      - name: Build Stripe rail wheel
+          uv build --wheel --sdist --out-dir dist
+          uv build --wheel --sdist --out-dir dist-${{ matrix.rail }} packages/charterforge-${{ matrix.rail }}-rail
+      
+      - name: Install rail + dependencies
         run: |
-          cd packages/charterforge-stripe-rail
-          uv build --wheel --sdist --out-dir ../../dist-stripe
-
-      - name: Install and verify Stripe rail
+          python -m venv /tmp/test-venv
+          /tmp/test-venv/bin/pip install dist/charterforge-0.*-py3-none-any.whl
+          /tmp/test-venv/bin/pip install dist-${{ matrix.rail }}/charterforge_${{ matrix.rail }}_rail-*-py3-none-any.whl
+      
+      - name: Verify entry points
         run: |
-          uv venv /tmp/stripe-rail-venv --python 3.13
-          # Install main package first (dependency)
-          uv pip install \
-            --python /tmp/stripe-rail-venv/bin/python \
-            dist-main/*.whl
-          # Install Stripe rail
-          uv pip install \
-            --python /tmp/stripe-rail-venv/bin/python \
-            dist-stripe/*.whl
-          # Verify entry points are registered
-          /tmp/stripe-rail-venv/bin/python -c "
-          from hermes_cli import payments
-          inbound = payments.load_inbound_payment_rails()
-          outbound = payments.load_outbound_payment_rails()
-          print(f'Inbound rails: {list(inbound.keys())}')
-          print(f'Outbound rails: {list(outbound.keys())}')
+          /tmp/test-venv/bin/python -c "
+          from importlib.metadata import entry_points
+          eps = entry_points(group='charterforge.inbound_payment_rails')
+          rail_eps = [ep for ep in eps if '${{ matrix.rail }}' in ep.name]
+          assert len(rail_eps) >= 1, 'Entry point not found'
+          cls = rail_eps[0].load()
+          print(f'✓ {cls.__name__} entry point works')
           "
+      
+      - name: Run integration tests (Stripe only)
+        if: matrix.rail == 'stripe'
+        run: |
+          /tmp/test-venv/bin/pip install pytest httpx
+          /tmp/test-venv/bin/python -m pytest -q tests/payment_rails/test_stripe_rail.py
 
-      - name: Upload Stripe rail artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: charterforge-stripe-rail-${{ github.sha }}
-          path: dist-stripe/
-          if-no-files-found: error
-          retention-days: 14
+  matrix-complete:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: All rails built successfully
+        run: echo "✓ All payment rail packages built and tested"
