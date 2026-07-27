@@ -738,7 +738,12 @@ def test_grace_press_fails_closed_without_trusted_atomic_backend(
 
 def test_snapshot_refs_require_stable_page_and_bind_duplicate_nodes(
     monkeypatch,
+    tmp_path,
 ):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn)
     live_url = "https://example.com/form"
     identity = f"{live_url}|100.0"
     snapshot = {
@@ -747,14 +752,19 @@ def test_snapshot_refs_require_stable_page_and_bind_duplicate_nodes(
             "refs": {},
         }
     }
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_execution")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
     monkeypatch.setattr(
         browser_tool,
         "_snapshot_ax_nodes",
-        lambda *_args: [
-            {"backend_node_id": 10, "role": "textbox", "name": "Answer"},
-            {"backend_node_id": 11, "role": "textbox", "name": "Answer"},
-        ],
+        lambda *_args: (
+            [
+                {"backend_node_id": 10, "role": "textbox", "name": "Answer"},
+                {"backend_node_id": 11, "role": "textbox", "name": "Answer"},
+            ],
+            None,
+        ),
     )
     monkeypatch.setattr(
         browser_tool,
@@ -767,6 +777,7 @@ def test_snapshot_refs_require_stable_page_and_bind_duplicate_nodes(
     context = browser_tool._snapshot_ref_contexts["browser-1"]
     assert context["refs"]["e1"]["backend_node_id"] == 10
     assert context["refs"]["e2"]["backend_node_id"] == 11
+    assert snapshot["data"]["guarded_refs_available"] is True
 
     monkeypatch.setattr(
         browser_tool,
@@ -775,6 +786,186 @@ def test_snapshot_refs_require_stable_page_and_bind_duplicate_nodes(
     )
     browser_tool._remember_snapshot_refs("browser-1", snapshot, identity)
     assert "browser-1" not in browser_tool._snapshot_ref_contexts
+    assert snapshot["data"]["refs"] == {}
+    assert snapshot["data"]["guarded_refs_available"] is False
+    assert "page identity changed" in snapshot["data"]["guarded_ref_error"]
+
+
+def test_guarded_snapshot_scrubs_native_refs_when_ax_capture_fails(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn)
+    live_url = "https://www.facebook.com/marketplace/item/915975414881937"
+    identity = f"{live_url}|100.0"
+    snapshot = {
+        "data": {
+            "url": live_url,
+            "refs": {"e29": {"role": "button", "name": "Share"}},
+            "snapshot": '- button "Share" [ref=e29]',
+        }
+    }
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(
+        browser_tool,
+        "_snapshot_ax_nodes",
+        lambda *_args: ([], "CDP supervisor is unavailable for this browser session"),
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_page_identity",
+        lambda *_args: (live_url, identity, None),
+    )
+
+    error = browser_tool._remember_snapshot_refs(
+        "browser-marketplace",
+        snapshot,
+        identity,
+    )
+
+    assert error == "CDP supervisor is unavailable for this browser session"
+    assert snapshot["data"]["refs"] == {}
+    assert snapshot["data"]["guarded_refs_available"] is False
+    assert snapshot["data"]["guarded_ref_error"] == error
+    assert "[ref=e29]" not in snapshot["data"]["snapshot"]
+    assert "Do not attempt browser_click" in snapshot["data"]["snapshot"]
+    assert "browser-marketplace" not in browser_tool._snapshot_ref_contexts
+
+
+def test_guarded_snapshot_reports_url_mismatch_without_exposing_refs(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn)
+    snapshot_url = "https://www.facebook.com/marketplace/item/915975414881937"
+    live_url = f"{snapshot_url}?ref=share_attachment"
+    identity = f"{live_url}|100.0"
+    snapshot = {
+        "data": {
+            "url": snapshot_url,
+            "refs": {"e29": {"role": "button", "name": "Share"}},
+            "snapshot": '- button "Share" [ref=e29]',
+        }
+    }
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(
+        browser_tool,
+        "_snapshot_ax_nodes",
+        lambda *_args: (
+            [{"backend_node_id": 29, "role": "button", "name": "Share"}],
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_page_identity",
+        lambda *_args: (live_url, identity, None),
+    )
+
+    error = browser_tool._remember_snapshot_refs(
+        "browser-marketplace",
+        snapshot,
+        identity,
+    )
+
+    assert error == "snapshot URL did not match the live page URL"
+    assert snapshot["data"]["refs"] == {}
+    assert "[ref=e29]" not in snapshot["data"]["snapshot"]
+
+
+def test_guarded_snapshot_with_only_static_ax_nodes_returns_error(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn)
+    live_url = "https://www.facebook.com/marketplace/item/915975414881937"
+    identity = f"{live_url}|100.0"
+    snapshot = {
+        "data": {
+            "url": live_url,
+            "refs": {"e29": {"role": "button", "name": "Share"}},
+            "snapshot": '- button "Share" [ref=e29]',
+        }
+    }
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(
+        browser_tool,
+        "_snapshot_ax_nodes",
+        lambda *_args: (
+            [{"backend_node_id": 29, "role": "StaticText", "name": "Share"}],
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_page_identity",
+        lambda *_args: (live_url, identity, None),
+    )
+
+    error = browser_tool._remember_snapshot_refs(
+        "browser-marketplace",
+        snapshot,
+        identity,
+    )
+
+    assert error == (
+        "Accessibility tree contained no supported interactive controls"
+    )
+    assert snapshot["data"]["refs"] == {}
+    assert snapshot["data"]["guarded_refs_available"] is False
+
+
+def test_ordinary_kanban_snapshot_keeps_native_refs(monkeypatch, tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ordinary browser task",
+            body="not a Grace Loop execution contract",
+            assignee="default",
+        )
+    snapshot = {
+        "data": {
+            "url": "https://example.com",
+            "refs": {"e1": {"role": "button", "name": "Continue"}},
+            "snapshot": '- button "Continue" [ref=e1]',
+        }
+    }
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setattr(
+        browser_tool,
+        "_snapshot_ax_nodes",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("ordinary tasks must not require guarded AX capture")
+        ),
+    )
+
+    error = browser_tool._remember_snapshot_refs(
+        "browser-ordinary",
+        snapshot,
+        None,
+    )
+
+    assert error is None
+    assert snapshot["data"]["refs"]["e1"]["name"] == "Continue"
+    assert "[ref=e1]" in snapshot["data"]["snapshot"]
 
 
 def test_grace_ref_click_rejects_stale_snapshot_before_eval(

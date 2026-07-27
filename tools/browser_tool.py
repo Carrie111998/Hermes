@@ -2690,20 +2690,28 @@ _GUARDED_INTERACTIVE_ROLES = frozenset({
 })
 
 
-def _snapshot_ax_nodes(browser_task_id: str) -> list[dict[str, Any]]:
+def _snapshot_ax_nodes(
+    browser_task_id: str,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Capture one AX tree whose nodes become both refs and DOM bindings."""
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
         supervisor = SUPERVISOR_REGISTRY.get(browser_task_id)
         if supervisor is None:
-            return []
+            return [], "CDP supervisor is unavailable for this browser session"
         result = supervisor.call_page_cdp("Accessibility.getFullAXTree")
         if not result.get("ok"):
-            return []
+            return [], (
+                "Accessibility.getFullAXTree failed: "
+                f"{result.get('error') or 'unknown CDP error'}"
+            )
         nodes = result.get("result", {}).get("nodes", [])
-    except Exception:
-        return []
+    except Exception as exc:
+        return [], (
+            "Accessibility tree capture raised "
+            f"{type(exc).__name__}: {exc}"
+        )
     captured: list[dict[str, Any]] = []
     for node in nodes:
         if not isinstance(node, Mapping) or node.get("ignored"):
@@ -2717,38 +2725,114 @@ def _snapshot_ax_nodes(browser_task_id: str) -> list[dict[str, Any]]:
                 "role": str(role).strip(),
                 "name": str(name or "").strip(),
             })
-    return captured
+    if not captured:
+        return [], "Accessibility tree contained no bindable backend nodes"
+    return captured, None
+
+
+def _invalidate_guarded_snapshot(
+    browser_task_id: str,
+    snapshot_result: Mapping[str, Any],
+    reason: str,
+) -> str:
+    """Remove native refs when no task/run-bound AX capability was created."""
+    with _snapshot_ref_lock:
+        _snapshot_ref_contexts.pop(browser_task_id, None)
+    data = snapshot_result.get("data")
+    if isinstance(data, dict):
+        data["refs"] = {}
+        data["guarded_refs_available"] = False
+        data["guarded_ref_error"] = reason
+        snapshot_text = re.sub(
+            r"\s*\[ref=e[0-9]+\]",
+            "",
+            str(data.get("snapshot") or ""),
+        ).rstrip()
+        data["snapshot"] = (
+            snapshot_text
+            + "\n\nGuarded refs unavailable: "
+            + reason
+            + ". Do not attempt browser_click/browser_type with refs from "
+            "this snapshot."
+        ).strip()
+    logger.warning(
+        "guarded snapshot refs unavailable task=%s run=%s browser=%s reason=%s",
+        os.environ.get("HERMES_KANBAN_TASK", "").strip() or "<none>",
+        _kanban_worker_run_id(),
+        browser_task_id,
+        reason,
+    )
+    return reason
 
 
 def _remember_snapshot_refs(
     browser_task_id: str,
     snapshot_result: Mapping[str, Any],
     before_identity: Optional[str],
-) -> None:
+) -> Optional[str]:
     """Replace Grace refs with one atomically captured AX-tree binding."""
     kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     if not kanban_task_id:
-        return
+        return None
+    try:
+        from hermes_cli import kanban_db as _kanban_db
+
+        with _kanban_db.connect_closing() as scope_conn:
+            guarded_execution = _kanban_db.is_grace_execution_task(
+                scope_conn,
+                kanban_task_id,
+            )
+    except Exception as exc:
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            "Grace execution scope check failed: "
+            f"{type(exc).__name__}: {exc}",
+        )
+    if not guarded_execution:
+        return None
     data = snapshot_result.get("data")
-    ax_nodes = _snapshot_ax_nodes(browser_task_id)
+    ax_nodes, ax_error = _snapshot_ax_nodes(browser_task_id)
     current_url, after_identity, identity_error = _browser_page_identity(
         browser_task_id,
     )
-    if (
-        not before_identity
-        or identity_error
-        or before_identity != after_identity
-        or not isinstance(data, dict)
-        or not ax_nodes
-    ):
-        with _snapshot_ref_lock:
-            _snapshot_ref_contexts.pop(browser_task_id, None)
-        return
+    if not before_identity:
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            "pre-snapshot page identity was unavailable",
+        )
+    if identity_error:
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            f"post-snapshot page identity failed: {identity_error}",
+        )
+    if before_identity != after_identity:
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            "page identity changed while the snapshot was captured",
+        )
+    if not isinstance(data, dict):
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            "snapshot backend returned no structured data",
+        )
+    if ax_error or not ax_nodes:
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            ax_error or "Accessibility tree returned no bindable nodes",
+        )
     snapshot_url = str(data.get("origin") or data.get("url") or "")
     if snapshot_url and snapshot_url != current_url:
-        with _snapshot_ref_lock:
-            _snapshot_ref_contexts.pop(browser_task_id, None)
-        return
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            "snapshot URL did not match the live page URL",
+        )
     original_snapshot = str(data.get("snapshot") or "")
     normalized_refs: dict[str, dict[str, Any]] = {}
     snapshot_lines: list[str] = []
@@ -2766,31 +2850,37 @@ def _remember_snapshot_refs(
             snapshot_lines.append(
                 f"- {role} {json.dumps(name, ensure_ascii=False)} [ref={ref}]"
             )
+    if not normalized_refs:
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            "Accessibility tree contained no supported interactive controls",
+        )
     with _snapshot_ref_lock:
-        if normalized_refs:
-            _snapshot_ref_contexts[browser_task_id] = {
-                "page_identity": after_identity,
-                "kanban_task_id": kanban_task_id,
-                "kanban_run_id": _kanban_worker_run_id(),
-                "refs": normalized_refs,
-            }
-            data["refs"] = {
-                ref: {"role": meta["role"], "name": meta["name"]}
-                for ref, meta in normalized_refs.items()
-            }
-            original_without_refs = re.sub(
-                r"\s*\[ref=e[0-9]+\]",
-                "",
-                original_snapshot,
-            )
-            data["snapshot"] = (
-                original_without_refs.rstrip()
-                + "\n\nGuarded interactive controls:\n"
-                + "\n".join(snapshot_lines)
-            ).strip()
-            data["url"] = current_url
-        else:
-            _snapshot_ref_contexts.pop(browser_task_id, None)
+        _snapshot_ref_contexts[browser_task_id] = {
+            "page_identity": after_identity,
+            "kanban_task_id": kanban_task_id,
+            "kanban_run_id": _kanban_worker_run_id(),
+            "refs": normalized_refs,
+        }
+        data["refs"] = {
+            ref: {"role": meta["role"], "name": meta["name"]}
+            for ref, meta in normalized_refs.items()
+        }
+        original_without_refs = re.sub(
+            r"\s*\[ref=e[0-9]+\]",
+            "",
+            original_snapshot,
+        )
+        data["snapshot"] = (
+            original_without_refs.rstrip()
+            + "\n\nGuarded interactive controls:\n"
+            + "\n".join(snapshot_lines)
+        ).strip()
+        data["url"] = current_url
+        data["guarded_refs_available"] = True
+        data.pop("guarded_ref_error", None)
+    return None
 
 
 def _snapshot_ref_metadata(
@@ -3570,6 +3660,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                     snapshot_text = _truncate_snapshot(snapshot_text)
                 response["snapshot"] = snapshot_text
                 response["element_count"] = len(refs) if refs else 0
+                if "guarded_refs_available" in snap_data:
+                    response["guarded_refs_available"] = bool(
+                        snap_data["guarded_refs_available"]
+                    )
+                if snap_data.get("guarded_ref_error"):
+                    response["guarded_ref_error"] = snap_data[
+                        "guarded_ref_error"
+                    ]
                 if snap_result.get("fallback_warning") and not response.get("fallback_warning"):
                     _copy_fallback_warning(response, snap_result)
         except Exception as e:
@@ -3661,6 +3759,12 @@ def browser_snapshot(
             "snapshot": snapshot_text,
             "element_count": len(refs) if refs else 0
         }
+        if "guarded_refs_available" in data:
+            response["guarded_refs_available"] = bool(
+                data["guarded_refs_available"]
+            )
+        if data.get("guarded_ref_error"):
+            response["guarded_ref_error"] = data["guarded_ref_error"]
         _copy_fallback_warning(response, result)
 
         # Merge supervisor state (pending dialogs + frame tree) when a CDP
