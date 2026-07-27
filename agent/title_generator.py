@@ -143,11 +143,16 @@ def generate_title(
     ]
 
     try:
+        # Use the provider's default temperature instead of forcing 0.3.
+        # Some models (e.g. GPT-5.6) only accept their server-side default
+        # and reject explicit temperature values, causing the daemon title
+        # thread to fail with "Unsupported value: 'temperature'".
+        # See: #72351, #51083, #51157
         response = call_llm(
             task="title_generation",
             messages=messages,
             max_tokens=500,
-            temperature=0.3,
+            temperature=None,
             timeout=timeout,
             main_runtime=main_runtime,
         )
