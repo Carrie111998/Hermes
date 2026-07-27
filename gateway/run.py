@@ -18509,14 +18509,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         elapsed = f", {_elapsed:.1f}s"
                 except (TypeError, ValueError):
                     pass
-            status_icon = "\u2705" if exit_code == 0 else "\u274c"
             if exit_code == 0:
                 succeeded += 1
             else:
                 failed += 1
 
             lines.append(
-                f"\n{status_icon} {session_id}: "
+                f"\n  {session_id}: "
                 f"exit_code={exit_code}, reason={reason}{elapsed}"
             )
             output = str(evt.get("output") or "").strip()
@@ -18528,7 +18527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         omitted = len(entries) - len(shown)
         if omitted:
             lines.append(
-                f"\n\u2026 and {omitted} more completion(s); inspect "
+                f"\n… and {omitted} more completion(s); inspect "
                 "them with the process tool if they affect the conclusion."
             )
 
@@ -18536,9 +18535,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if succeeded + failed > 1:
             parts = []
             if succeeded:
-                parts.append(f"{succeeded} succeeded \u2705")
+                parts.append(f"{succeeded} succeeded")
             if failed:
-                parts.append(f"{failed} failed \u274c")
+                parts.append(f"{failed} failed")
             lines.append(f"\nSummary: {', '.join(parts)}.")
 
         lines.append(

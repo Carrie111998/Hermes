@@ -951,10 +951,6 @@ def test_batch_message_format_includes_exit_codes_and_summary():
     assert "exit_code=0" in text
     assert "exit_code=1" in text
 
-    # Must include visual status indicators
-    assert "\u2705" in text
-    assert "\u274c" in text
-
     # Must include aggregate summary
     assert "Summary:" in text
     assert "2 succeeded" in text
