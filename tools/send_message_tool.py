@@ -283,6 +283,14 @@ def _handle_react(args, remove=False):
             else "'target' is required when action='unreact'"
         )
 
+    from hermes_cli.workforce_delegation import authorize_worker_action
+    platform_name = target.split(":", 1)[0].strip().lower()
+    authorize_worker_action(
+        capability="message.react",
+        system=platform_name,
+        target_resource=target,
+    )
+
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
     target_ref = parts[1].strip() if len(parts) > 1 else None
@@ -361,6 +369,14 @@ def _handle_send(args):
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+
+    from hermes_cli.workforce_delegation import authorize_worker_action
+    platform_name = target.split(":", 1)[0].strip().lower()
+    authorize_worker_action(
+        capability="message.send",
+        system=platform_name,
+        target_resource=target,
+    )
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()

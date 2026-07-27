@@ -64,6 +64,9 @@ acceptance evidence.
   arbitrary external destinations.
 - Governed browser navigation is similarly bound to an exact URL resource;
   browser availability is not treated as destination authority.
+- Governed outbound messaging and reactions are bound to the exact platform
+  and target resource, preventing a communication toolset from authorizing
+  arbitrary recipients or channels.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;
