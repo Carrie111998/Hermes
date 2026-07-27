@@ -12,9 +12,9 @@ Covers the three moving pieces:
 
 Regression target: the "Ben Eng llm-wiki" session where grok-4.1-fast
 batched parallel patches, half failed, and the model summarised the
-turn claiming every file was edited.  This verifier makes over-claiming
-structurally impossible past the model: the user always sees the real
-list of files that did NOT change.
+turn claiming every file was edited. The verifier makes those unresolved
+tracked failures visible after the model response; callers must still verify
+the current file state when another tool may have changed the target.
 """
 
 from __future__ import annotations
@@ -313,6 +313,35 @@ class TestFormatFooter:
         assert "/tmp/a.md" in out
         assert "Could not find old_string" in out
         assert "git status" in out  # user-actionable hint
+
+    def test_terminal_recovery_does_not_claim_target_was_unchanged(self):
+        """An untracked terminal write makes absolute unchanged wording unsafe."""
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {
+                "mode": "replace",
+                "path": "/tmp/a.md",
+                "old_string": "old",
+                "new_string": "new",
+            },
+            json.dumps({"error": "write denied"}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "terminal",
+            {"command": "python -c 'write /tmp/a.md'"},
+            json.dumps({"exit_code": 0}),
+            is_error=False,
+        )
+
+        out = agent._format_file_mutation_failure_footer(
+            agent._turn_failed_file_mutations,
+        )
+
+        assert "unresolved file-mutation failure" in out
+        assert "verify the intended final state" in out
+        assert "were NOT modified" not in out
 
     def test_truncation_at_10_entries(self):
         failed = {
