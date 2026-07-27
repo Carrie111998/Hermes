@@ -876,6 +876,7 @@ def create_plan(
 ) -> str:
     with conn:
         objective = get_objective(conn, objective_id)
+        _assert_employee_actor_scope(conn, objective_id, created_by)
         if objective.status not in {"accepted", "planned", "executing", "blocked"}:
             raise ObjectiveStateError(
                 f"cannot plan objective while status is {objective.status}"
@@ -950,6 +951,7 @@ def propose_action(
     compensation: Optional[Mapping[str, Any]] = None,
 ) -> str:
     objective = get_objective(conn, objective_id)
+    _assert_employee_actor_scope(conn, objective_id, proposed_by)
     if objective.status not in {"planned", "authorized", "executing", "blocked"}:
         raise ObjectiveStateError(
             f"cannot propose an action while objective status is {objective.status}"
