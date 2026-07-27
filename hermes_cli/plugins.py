@@ -2182,14 +2182,15 @@ def _get_pre_tool_call_directive_details(
             continue
         # "modify" action — transform tool_input before dispatch.
         # Processed before the block/approve gate so modify directives
-        # are visible even when a later hook blocks. First modifier wins
-        # (shallow merge over original args).
+        # are visible even when a later hook blocks. Hooks accumulate:
+        # each modify directive shallow-merges its keys into one
+        # accumulated dict built from the original args on first hit.
         if result.get("action") == "modify":
             partial = result.get("args")
             if isinstance(partial, dict) and partial:
-                merged = dict(args) if isinstance(args, dict) else {}
-                merged.update(partial)
-                modified_args = merged
+                if modified_args is None:
+                    modified_args = dict(args) if isinstance(args, dict) else {}
+                modified_args.update(partial)
             continue
         action = result.get("action")
         if action not in ("block", "approve"):

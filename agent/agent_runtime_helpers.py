@@ -2492,6 +2492,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
             block_message, modified_args = _dispatch_pre_tool_call_hooks(
                 function_name, function_args, task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                middleware_trace=list(_tool_middleware_trace),
             )
             if modified_args is not None:
                 function_args = modified_args
