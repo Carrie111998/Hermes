@@ -644,3 +644,40 @@ def test_fake_runner_composition_matches_the_real_runner():
             f"the real runner does not compose {mixin.__name__}, but the test "
             f"double does — the suite is testing a class that does not exist"
         )
+
+
+# ── 31. first-party code must actually live in this checkout ─────────────────
+
+def test_no_first_party_module_loads_from_outside_this_worktree():
+    """A module missing from the tree must fail here, not resolve elsewhere.
+
+    The venv installs hermes editable, and that finder resolves a first-party
+    module from whichever checkout it was built against. So a file that exists
+    in a sibling worktree but NOT in this one still imports, the suite goes
+    green, and the breakage only appears on a fresh clone or a CI runner — i.e.
+    exactly when someone updates.
+
+    That is not hypothetical: gateway/worker_bridge_watchers.py imported
+    gateway.stage_successors for an entire audit while the module existed only
+    in the other worktree. Every gateway test passed.
+    """
+    import gateway.run  # noqa: F401  — pulls in the whole watcher/dispatch graph
+    import agent.turn_finalizer  # noqa: F401
+    import tools.delegate_tool  # noqa: F401
+
+    strays = []
+    for name, module in sorted(sys.modules.items()):
+        if name.split(".")[0] not in {"gateway", "agent", "tools", "hermes_cli"}:
+            continue
+        origin = getattr(module, "__file__", None)
+        if not origin:
+            continue
+        resolved = Path(origin).resolve()
+        if REPO not in resolved.parents:
+            strays.append(f"{name} -> {resolved}")
+
+    assert not strays, (
+        "first-party modules loaded from outside this checkout — they are "
+        "missing here and the editable install is masking it; a clean clone "
+        "will fail at import:\n  " + "\n  ".join(strays)
+    )

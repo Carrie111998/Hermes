@@ -62,6 +62,10 @@ PROTECTED_FILES = [
     "tools/delegate_tool.py",
     "tools/daemon_pool.py",
     "gateway/worker_bridge_watchers.py",
+    # Recovered from an uncommitted main-worktree state (8b8d73fbe). It exists
+    # nowhere upstream, so an update that drops it takes the whole stage
+    # successor pipeline with it AND breaks `import gateway.run` outright.
+    "gateway/stage_successors.py",
     # Carries local auto-dispatch and failure-successor work (2484ec0a0,
     # 6cd47d16e, d4f3806a0) and is the ONE file that actually conflicted in the
     # 2026-07-27 rehearsal against 114 upstream commits.
@@ -77,6 +81,13 @@ REGRESSION_SUITES = [
     "tests/tools/test_delegate_batch_cancellation.py",
     "tests/tools/test_daemon_pool.py",
     "tests/gateway/test_worker_bridge_alert_handoff.py",
+    # Step-8 guards: dependency, retry, pause, capacity, claim/release and the
+    # dispatch audit trail. An upstream change to the watcher that keeps the
+    # module importable can still silently drop a guard.
+    "tests/gateway/test_worker_bridge_watchers_mixin.py",
+    "tests/gateway/test_worker_bridge_watchers.py",
+    "tests/gateway/test_worker_bridge_watcher_wiring.py",
+    "tests/gateway/test_stage_successors.py",
 ]
 
 
