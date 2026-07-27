@@ -57,10 +57,10 @@ All integration/E2E work uses a temporary `HERMES_HOME`, isolated fake adapters/
 
 ## Contract-slice evidence — 2026-07-27
 
-- `tests/agent/test_dynamic_orchestration.py`: 144 passed, 0 failed, inclusive inside the clean broad sweep.
-- `tests/agent`: 6,835 passed; 1 failure outside this diff in `test_copilot_acp_client.py::test_run_prompt_preserves_real_home_when_profile_home_available`; `test_context_compressor.py` exceeded 300s on the first attempt and passed 214/214 on retry.
+- `tests/agent/test_dynamic_orchestration.py`: 144 passed, 0 failed, inclusive inside the broad sweep.
+- `tests/agent`: 6,835 passed; 1 failure outside this diff in `test_copilot_acp_client.py::test_run_prompt_preserves_real_home_when_profile_home_available`; `test_context_compressor.py` exceeded 300s in the broad sweep and exceeded 600s on an isolated retry in the rebased snapshot.
 - Ruff, `py_compile`, and `git diff --check`: passed.
 - Gitleaks 8.30.1, verified against the official SHA-256 and run against the patch: 0 findings.
-- Independent review found incomplete IDNA endpoint canonicalization; the finding was reproduced and fixed together with equivalent IPv6 normalization and `route-v1` fixtures.
-- Final independent-context review (`gpt-5.6-terra`): PASS, 144/144, hashes preserved, no HIGH/MEDIUM. Cross-family attestation remains unavailable because no eligible independent cross-family route was available; T505/T506-equivalent rollout gates remain open.
+- Independent Kimi review found incomplete IDNA endpoint canonicalization; the finding was reproduced and fixed together with equivalent IPv6 normalization and `route-v1` fixtures.
+- Final cross-family attestation remains unavailable: Claude Max weekly limit, Kimi route/quota exhaustion, incorrect GLM resolver routing, and an incomplete `gpt-5.6-terra` review session that emitted no verdict. No incomplete session is counted as PASS.
 - This slice is pure contract/domain code. It does not implement `CredentialPool.snapshot_for_capacity()`, production `CapacityView`, persistent reservation ledger, circuit breakers, legacy resolver projection, runtime wiring, shadow mode, canary, rollout, or rollback E2E; therefore no task above is marked complete yet.
