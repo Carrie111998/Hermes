@@ -125,6 +125,9 @@ async def test_queue_and_steer_active_replies_use_gateway_locale():
 @pytest.mark.asyncio
 async def test_shutdown_notification_uses_gateway_locale():
     runner, adapter = make_restart_runner()
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = runner.session_store
+    runner._async_session_store._ensure_loaded = AsyncMock()
     source = make_restart_source(chat_id="789")
     session_key = build_session_key(source)
     runner._running_agents = {session_key: MagicMock()}
