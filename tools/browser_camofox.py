@@ -36,6 +36,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
 
+from agent.redact import redact_tool_error
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
@@ -75,7 +76,7 @@ def _get_command_timeout() -> int:
         if val is not None:
             result = max(int(val), 5)  # floor at 5s
     except Exception as exc:
-        logger.debug("Could not read browser.command_timeout: %s", exc)
+        logger.debug("Could not read browser.command_timeout: %s", redact_tool_error(exc))
     _cached_cmd_timeout = result
     return result
 
@@ -167,7 +168,10 @@ def _get_camofox_config() -> Dict[str, Any]:
     try:
         camofox_cfg = load_config().get("browser", {}).get("camofox", {})
     except Exception as exc:
-        logger.warning("camofox config check failed, defaulting to disabled: %s", exc)
+        logger.warning(
+            "camofox config check failed, defaulting to disabled: %s",
+            redact_tool_error(exc),
+        )
         return {}
     return camofox_cfg if isinstance(camofox_cfg, dict) else {}
 
@@ -330,7 +334,11 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     try:
         tabs = _get("/tabs", params={"userId": session["user_id"]}, timeout=5).get("tabs", [])
     except Exception as exc:
-        logger.debug("Camofox tab adoption failed for %s: %s", session.get("user_id"), exc)
+        logger.debug(
+            "Camofox tab adoption failed for %s: %s",
+            session.get("user_id"),
+            redact_tool_error(exc),
+        )
         return session
 
     if not isinstance(tabs, list) or not tabs:
