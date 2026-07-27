@@ -20,13 +20,8 @@ import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { ChevronDown, ChevronRight } from '@/lib/icons'
 import { isProviderReady, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
-import {
-  currentPickerSelection,
-  displayModelName,
-  modelDisplayParts,
-  reasoningEffortLabel
-} from '@/lib/model-status-label'
-import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
+import { currentPickerSelection, displayModelName, modelDisplayParts } from '@/lib/model-status-label'
+import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $modelPresets, applyModelPreset, modelPresetKey } from '@/store/model-presets'

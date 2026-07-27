@@ -92,9 +92,6 @@ const isFastTier = (tier: unknown): boolean =>
       .toLowerCase()
   )
 
-// Reuse the composer's effort labels.
-const effortLabelKey = (v: string) => v as 'high' | 'low' | 'max' | 'medium' | 'minimal' | 'ultra' | 'xhigh'
-
 // Mirrors `_AUX_TASK_SLOTS` in hermes_cli/web_server.py. Friendly labels and
 // hints make the assignments readable; raw task keys (vision, mcp, …) are
 // opaque to most users.
@@ -801,8 +798,8 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             {setupIsLocalAgent
               ? selectedProviderRow.warning || `${selectedProviderRow.name} requires its local agent prerequisite.`
               : selectedProviderRow?.auth_type === 'api_key'
-              ? `${selectedProviderRow?.name} needs an API key — set it up to choose a model.`
-              : `${selectedProviderRow?.name} signs in through your browser — Hermes runs the flow for you.`}
+                ? `${selectedProviderRow?.name} needs an API key — set it up to choose a model.`
+                : `${selectedProviderRow?.name} signs in through your browser — Hermes runs the flow for you.`}
           </p>
         )}
         {config && mainModel && (reasoningSupported || fastSupported) && (
