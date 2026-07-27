@@ -1198,6 +1198,27 @@ This remains deterministic local-provider evidence and does not establish
 production filesystem access, provider credentials, or legal/compliance
 certification.
 
+The governed code-execution boundary was validated on current `main` commit
+`1e7531b7d170547cc4cffe902ca15db361e4b4e9` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_agentic_business_e2e.py \
+  tests/tools/test_file_tools.py \
+  tests/tools/test_code_execution.py
+uv run --extra dev ruff check tools/code_execution_tool.py scripts/delegation_process_acceptance.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **151 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The subordinate's read-only grant rejected arbitrary Python before
+the script could open `/etc/passwd`. The acceptance image manifest digest was
+`sha256:5ac03bb27defaa3a648413dba1453c111a310a00f9f1b8341c86c78cf0eb6760`.
+This remains deterministic local-provider evidence and does not establish
+production code-execution isolation, provider credentials, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

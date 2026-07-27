@@ -80,6 +80,9 @@ acceptance evidence.
 - File search and enumeration are separately governed by exact
   `file.search`/canonical-root authority; a single-file read grant cannot
   expand into a search surface.
+- Arbitrary Python execution is separately governed by `code.execute` and an
+  exact script digest; ordinary file or terminal authority cannot escalate
+  into direct `open()` access.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

@@ -100,6 +100,11 @@
   directory enumeration or content search.
 - The process-separated acceptance now records rejection of unauthorized file
   search in addition to direct writes and patch replacement.
+- Governed `execute_code` now requires an explicit `code.execute` capability
+  bound to the exact SHA-256 script resource before any child process or
+  sandbox dispatch; file and terminal grants do not imply arbitrary Python.
+- The process-separated acceptance now proves ungranted code execution is
+  rejected before it can open a host file.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy
