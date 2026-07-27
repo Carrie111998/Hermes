@@ -4404,6 +4404,29 @@ class TestRegisterMcpServers:
 
         _servers.pop("srv", None)
 
+    def test_skips_already_connecting_servers(self):
+        """A server name already in _server_connecting is not re-spawned.
+
+        Regression for #72818: concurrent register_mcp_servers() calls can
+        both see the name absent from _servers but neither checks
+        _server_connecting, resulting in duplicate stdio processes.
+        """
+        from tools.mcp_tool import register_mcp_servers, _server_connecting, _lock
+
+        with _lock:
+            _server_connecting.add("connecting")
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=[]), \
+                 patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
+                result = register_mcp_servers({"connecting": {"command": "test"}})
+            assert result == []
+            mock_run.assert_not_called()
+        finally:
+            with _lock:
+                _server_connecting.discard("connecting")
+
+
 
 # ---------------------------------------------------------------------------
 # Tests for parallel tool call support (port from openai/codex#17667)
