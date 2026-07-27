@@ -375,6 +375,35 @@ async def test_check_session_stalls_retries_after_send_failure():
 
 
 @pytest.mark.asyncio
+async def test_check_session_stalls_retries_after_soft_send_failure():
+    class _SoftFailThenOk(_FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def send(self, chat_id, content, metadata=None):
+            from gateway.platforms.base import SendResult
+
+            self.calls += 1
+            if self.calls == 1:
+                return SendResult(success=False, error="chat not found")
+            await super().send(chat_id, content, metadata=metadata)
+            return SendResult(success=True)
+
+    adapter = _SoftFailThenOk()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:soft"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 0
+    assert session_key not in runner._session_stall_notified
+    assert await runner._check_session_stalls(60) == 1
+    assert runner._session_stall_notified.get(session_key) is True
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_check_session_stalls_renotifies_after_resume_then_restall():
     adapter = _FakeAdapter()
     runner = _runner_for_stall(adapter)

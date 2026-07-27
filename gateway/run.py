@@ -9301,11 +9301,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source is not None and hasattr(self, "_thread_metadata_for_source")
                     else None
                 )
-                await adapter.send(
+                result = await adapter.send(
                     str(chat_id),
                     format_session_stall_notification(idle_seconds),
                     metadata=metadata,
                 )
+                # Adapters often return SendResult(success=False) instead of raising.
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.warning(
+                        "Session stall notify failed for %s: %s",
+                        session_key,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    continue  # do not latch; retry next tick
                 sent += 1
                 notified_map[session_key] = True
             except Exception as exc:
