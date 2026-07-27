@@ -176,6 +176,7 @@ def enqueue_as_objective_data(
     return objectives_db.enqueue_objective_event(
         conn,
         objective_id=objective_id,
+        organization_id=organization_id,
         event_type=f"external.{source_type}",
         payload=envelope,
         dedupe_key=f"external:{organization_id}:{item['content_sha256']}",

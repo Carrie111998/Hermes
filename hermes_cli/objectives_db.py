@@ -1422,6 +1422,7 @@ def enqueue_objective_event(
     conn: sqlite3.Connection,
     *,
     objective_id: str,
+    organization_id: Optional[str] = None,
     event_type: str,
     payload: Any,
     available_at: Optional[int] = None,
@@ -1430,7 +1431,12 @@ def enqueue_objective_event(
     """Append a durable wakeup event, idempotently when ``dedupe_key`` is set."""
     from hermes_cli.objective_event_policy import classify
 
-    get_objective(conn, objective_id)
+    objective = get_objective(conn, objective_id)
+    if (
+        organization_id is not None
+        and objective.organization_id != organization_id
+    ):
+        raise ValueError("objective event organization does not match objective")
     if not event_type.strip():
         raise ValueError("event_type must not be empty")
     event_id = _new_id("evt")

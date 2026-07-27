@@ -348,6 +348,7 @@ def route_external_event(
         event_ids.append(objectives_db.enqueue_objective_event(
             conn,
             objective_id=row["objective_id"],
+            organization_id=organization_id,
             event_type=f"{source_type}.{event_type}",
             payload=envelope,
             dedupe_key=(
@@ -470,6 +471,7 @@ def dispatch_due(
         event_id = objectives_db.enqueue_objective_event(
             conn,
             objective_id=row["objective_id"],
+            organization_id=str(row["organization_id"]),
             event_type=row["event_type"],
             payload={
                 "schedule_id": row["id"],
