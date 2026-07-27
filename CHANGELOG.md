@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The workforce E2E now proves a subordinate employee worker can launch under
+  an exact CEO-issued mandate, return a completed task, and feed that result
+  back into the CEO objective inbox for governed planning.
 - The current-tree acceptance now includes a durable scheduled wake event,
   proving the CEO worker can initiate the next governed cycle without a human
   dispatch.

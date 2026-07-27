@@ -35,6 +35,9 @@ acceptance evidence.
 - The same acceptance also dispatches a due durable schedule and verifies that
   the CEO worker advances the objective from that event without turn-by-turn
   operator input.
+- Workforce acceptance now covers the complete delegated-worker handoff:
+  hierarchy-bound mandate, exact launch contract, subordinate completion, and
+  durable `kanban.task.done` wake-up for CEO planning.
 - Planner/provider rate-limit failures are classified explicitly, persisted in
   the durable event retry state with bounded backoff, honor SDK attributes,
   `Retry-After`, and rate-limit reset headers, and recover on a later tick

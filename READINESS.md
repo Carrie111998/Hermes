@@ -253,6 +253,20 @@ The resulting image manifest was
 `scheduled_events: 1` is evidence of a durable autonomous wake-up, not proof
 of an always-on production scheduler or external event-provider availability.
 
+Current-main workforce coordination evidence at commit `d44d0ad47f` was run
+with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_agentic_business_e2e.py \
+  tests/hermes_cli/test_workforce_delegation.py -q
+```
+
+Result: **17 passed, 0 failed**. This covers CEO hiring and hierarchical
+mandate provisioning, exact employee-worker launch validation, subordinate
+task completion, and the durable task-result event accepted back into CEO
+planning. It is local coordination evidence, not proof of a production worker
+fleet or external workforce platform.
+
 ## Interrupted provider-action evidence
 
 The current tree also proves the ambiguous mid-flight payment case. At commit
