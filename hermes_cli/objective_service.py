@@ -271,6 +271,19 @@ def tick_once(
         try:
             runtime_deployment.assert_current_runtime(conn, charter)
         except runtime_deployment.RuntimeDeploymentError as exc:
+            _raise_readiness_intervention(
+                conn,
+                organization_id=str(ceo["organization_id"]),
+                category="runtime_host_mismatch",
+                summary="The configured runtime host cannot execute this worker",
+                context={"error": str(exc), "authority_boundary": "No action was attempted"},
+                options=[
+                    {"id": "select_host", "label": "Select an admissible runtime host"},
+                    {"id": "restart", "label": "Restart under the configured host"},
+                    {"id": "manual", "label": "Remain in manual operation"},
+                ],
+                dedupe_key=f"readiness:runtime-host-mismatch:{ceo['organization_id']}",
+            )
             return CycleOutcome(None, None, "runtime_host_blocked", str(exc))
         integrity = authority_integrity.enforce_preflight(
             conn,
@@ -474,6 +487,19 @@ def tick_once(
                 str(item["reason"]),
             )
         if not runtime.planner.action_types:
+            _raise_readiness_intervention(
+                conn,
+                organization_id=str(ceo["organization_id"]),
+                category="runtime_no_action_contract",
+                summary="The charter admits no registered governed action contract",
+                context={"authority_boundary": "No plan or external action was attempted"},
+                options=[
+                    {"id": "configure", "label": "Configure a governed action contract"},
+                    {"id": "narrow_charter", "label": "Narrow or disable autonomous operation"},
+                    {"id": "manual", "label": "Remain in manual operation"},
+                ],
+                dedupe_key=f"readiness:no-action-contract:{ceo['organization_id']}",
+            )
             return CycleOutcome(
                 None,
                 None,

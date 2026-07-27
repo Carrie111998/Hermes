@@ -65,6 +65,8 @@
   authority, unavailable governed capabilities, and objectives without an
   admissible success verifier; unreachable objectives are blocked before any
   plan or external action is attempted.
+- Runtime-host mismatches and charters with no registered action contracts also
+  persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted
   baselines for the charter, authority schema, Python runtime, and dependency
   lock/package identity.

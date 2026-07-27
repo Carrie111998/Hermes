@@ -44,6 +44,8 @@
   transactions on already-initialized stores.
 - Outcome attribution reconciliation now uses the same guarded payment schema
   initialization path.
+- Runtime-host mismatches and empty action-contract charters now create durable
+  advisor handoffs before autonomous operation stops.
 - Hardened durable runtime ledgers so schema checks preserve active authority
   transactions across finance, accounting, payments, compliance, approvals,
   event ingress, billing, commitments, metrics, worker state, and audit
