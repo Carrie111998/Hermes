@@ -165,6 +165,32 @@ def load_payment_rails() -> dict[str, PaymentRail]:
     return discovered
 
 
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Initialize payment tables without releasing an active authority transaction."""
+    if conn.in_transaction:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(payment_intents)")
+        }
+        readback = conn.execute(
+            """SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='payment_provider_readbacks'"""
+        ).fetchone()
+        if {"tax_minor", "tax_rule_id"}.issubset(columns) and readback is not None:
+            return
+    conn.executescript(SCHEMA_SQL)
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(payment_intents)")
+    }
+    if "tax_minor" not in columns:
+        conn.execute(
+            "ALTER TABLE payment_intents ADD COLUMN tax_minor INTEGER NOT NULL DEFAULT 0"
+        )
+    if "tax_rule_id" not in columns:
+        conn.execute("ALTER TABLE payment_intents ADD COLUMN tax_rule_id TEXT")
+
+
 class PaymentService:
     def __init__(
         self,
@@ -181,16 +207,7 @@ class PaymentService:
         finance_db.ensure_schema(conn)
         payment_controls.ensure_schema(conn)
         compliance_db.ensure_schema(conn)
-        conn.executescript(SCHEMA_SQL)
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(payment_intents)")
-        }
-        if "tax_minor" not in columns:
-            conn.execute(
-                "ALTER TABLE payment_intents ADD COLUMN tax_minor INTEGER NOT NULL DEFAULT 0"
-            )
-        if "tax_rule_id" not in columns:
-            conn.execute("ALTER TABLE payment_intents ADD COLUMN tax_rule_id TEXT")
+        ensure_schema(conn)
 
     def create_receivable(
         self,

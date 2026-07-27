@@ -20,6 +20,8 @@
 - Outbound spend controls atomically reserve per-instrument daily velocity
   before provider calls and retain pending holds until read-back settles or
   releases them.
+- Payment and metered-billing schema initialization preserves active authority
+  transactions when the durable tables already exist.
 - Immutable usage-event metering and exact-event metered invoicing with
   idempotent allocation guards against duplicate billing.
 - Metered-invoice verification independently reconciles the exact usage-event

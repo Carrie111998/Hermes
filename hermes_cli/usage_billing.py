@@ -58,7 +58,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # and reconciliation tooling).
     from hermes_cli import payments
 
-    conn.executescript(payments.SCHEMA_SQL)
+    payments.ensure_schema(conn)
+    if conn.in_transaction:
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if {
+            "agentic_usage_events",
+            "agentic_usage_invoice_allocations",
+        }.issubset(tables):
+            return
     conn.executescript(SCHEMA_SQL)
 
 

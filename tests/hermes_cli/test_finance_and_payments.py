@@ -6,7 +6,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from hermes_cli import accounting_db, compliance_db, finance_db, payment_controls
+from hermes_cli import (
+    accounting_db,
+    compliance_db,
+    finance_db,
+    payment_controls,
+    usage_billing,
+)
 from hermes_cli import objectives_db
 from hermes_cli.payments import PaymentRail, PaymentService, ProviderPayment
 
@@ -31,6 +37,17 @@ def test_payment_control_schema_read_preserves_active_transaction(tmp_path):
     payment_controls.ensure_schema(conn)
     conn.execute("BEGIN IMMEDIATE")
     payment_controls.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
+def test_payment_and_metering_schema_reads_preserve_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    PaymentService(conn, {})
+    usage_billing.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    PaymentService(conn, {})
+    usage_billing.ensure_schema(conn)
     assert conn.in_transaction is True
     conn.rollback()
 
