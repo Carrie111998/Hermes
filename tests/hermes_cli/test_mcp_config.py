@@ -363,6 +363,49 @@ class TestEnvVarInterpolation:
         assert _env_ref_name("API_KEY") == "API_KEY"
         assert _env_ref_name(" env:API_KEY ") == "API_KEY"
 
+    def test_escape_only_changes_behavior_when_requested(self, monkeypatch):
+        monkeypatch.setenv("AUTH_HEADER", "Bearer test-token")
+        from tools.mcp_tool import _interpolate_env_vars
+
+        value = "$${AUTH_HEADER}"
+        assert _interpolate_env_vars(value) == "$Bearer test-token"
+        assert _interpolate_env_vars(value, unescape=True) == "${AUTH_HEADER}"
+
+    def test_server_config_unescapes_explicit_child_reference(self, monkeypatch):
+        monkeypatch.setenv("AUTH_HEADER", "Bearer test-token")
+        monkeypatch.setenv("RESOURCE_ID", "project-42")
+        from tools.mcp_tool import _interpolate_mcp_server_config
+
+        result = _interpolate_mcp_server_config({
+            "command": "npx",
+            "args": [
+                "mcp-remote",
+                "--header",
+                "Authorization:$${AUTH_HEADER}",
+                "--resource",
+                "${RESOURCE_ID}",
+            ],
+            "env": {
+                "AUTH_HEADER": "${AUTH_HEADER}",
+            },
+        })
+
+        assert result["args"][2] == "Authorization:${AUTH_HEADER}"
+        assert result["args"][4] == "project-42"
+        assert result["env"]["AUTH_HEADER"] == "Bearer test-token"
+
+    def test_server_config_keeps_unescaped_interpolation(self, monkeypatch):
+        monkeypatch.setenv("AUTH_HEADER", "Bearer test-token")
+        from tools.mcp_tool import _interpolate_mcp_server_config
+
+        result = _interpolate_mcp_server_config({
+            "args": ["Authorization:${AUTH_HEADER}"],
+            "env": {"AUTH_HEADER": "${AUTH_HEADER}"},
+        })
+
+        assert result["args"] == ["Authorization:Bearer test-token"]
+        assert result["env"]["AUTH_HEADER"] == "Bearer test-token"
+
 
 # ---------------------------------------------------------------------------
 # Tests: probe-path env resolution (#37792)
@@ -383,6 +426,19 @@ class TestProbeEnvResolution:
             "headers": {"Authorization": "Bearer ${MCP_N8N_API_KEY}"},
         })
         assert resolved["headers"]["Authorization"] == "Bearer jwt-token-xyz"
+
+    def test_resolve_unescapes_stdio_child_env_reference(self, monkeypatch):
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        monkeypatch.setenv("AUTH_HEADER", "Bearer test-token")
+        resolved = _resolve_mcp_server_config({
+            "command": "npx",
+            "args": ["--header", "Authorization:$${AUTH_HEADER}"],
+            "env": {"AUTH_HEADER": "${AUTH_HEADER}"},
+        })
+
+        assert resolved["args"][1] == "Authorization:${AUTH_HEADER}"
+        assert resolved["env"]["AUTH_HEADER"] == "Bearer test-token"
 
     def test_active_secret_scope_does_not_load_dotenv_into_process_env(
         self, tmp_path, monkeypatch
