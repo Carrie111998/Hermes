@@ -760,6 +760,17 @@ Result: **37 passed, 0 failed**. Employee, worker, and runtime identities are
 rejected when attempting to resolve an open intervention; explicitly
 identified human advisor identities remain the resolution boundary.
 
+Organization-scoped intervention isolation was additionally validated on
+current `main` commit `bd1cbb3c406609504d281a94d61e21740bc56d46` with:
+
+```sh
+uv run --extra dev pytest -q tests/hermes_cli/test_operational_control.py
+```
+
+Result: **10 passed, 0 failed**. Scope-free resolution is rejected for
+organization-bound interventions; only explicitly unscoped control records
+retain that path.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
