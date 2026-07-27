@@ -276,7 +276,7 @@ test('host-target: host build/Release IS staged for a matching target', () => {
   }
 })
 
-test.skipIf(process.platform === 'win32')(
+test(
   'host-target: staged node-pty resolves an already-unpacked helper and preserves executable helpers',
   async () => {
     const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
@@ -296,8 +296,16 @@ test.skipIf(process.platform === 'win32')(
       fs.writeFileSync(join(buildReleaseDir, 'spawn-helper'), 'build helper')
       fs.chmodSync(join(prebuildDir, 'spawn-helper'), 0o644)
       fs.chmodSync(join(buildReleaseDir, 'spawn-helper'), 0o644)
+      const chmodCalls = []
 
-      stageNodePtyInto(srcRoot, destRoot, { platform: process.platform, arch: process.arch })
+      stageNodePtyInto(srcRoot, destRoot, {
+        platform: process.platform,
+        arch: process.arch,
+        chmod: (filePath, mode) => {
+          chmodCalls.push([filePath, mode])
+          fs.chmodSync(filePath, mode)
+        }
+      })
 
       const stagedUnixTerminalUrl = pathToFileURL(join(destRoot, 'lib', 'unixTerminal.js'))
       stagedUnixTerminalUrl.searchParams.set('t', String(Date.now()))
@@ -325,11 +333,18 @@ test.skipIf(process.platform === 'win32')(
         stagedUnixTerminal.resolveHelper(nodeModulesUnpackedHelper),
         nodeModulesUnpackedHelper
       )
-      assert.equal(
-        fs.statSync(join(destRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper')).mode & 0o777,
-        0o755
-      )
-      assert.equal(fs.statSync(join(destRoot, 'build', 'Release', 'spawn-helper')).mode & 0o777, 0o755)
+      assert.deepEqual(chmodCalls, [
+        [join(destRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'), 0o755],
+        [join(destRoot, 'build', 'Release', 'spawn-helper'), 0o755]
+      ])
+
+      if (process.platform !== 'win32') {
+        assert.equal(
+          fs.statSync(join(destRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper')).mode & 0o777,
+          0o755
+        )
+        assert.equal(fs.statSync(join(destRoot, 'build', 'Release', 'spawn-helper')).mode & 0o777, 0o755)
+      }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true })
     }

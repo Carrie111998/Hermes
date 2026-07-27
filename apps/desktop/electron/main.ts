@@ -172,8 +172,10 @@ import {
   SshConnection
 } from './ssh-connection'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
+import { writeActivationFailureReceipt, writeActivationReceipt } from './update-activation-receipt'
+import { pathsReferToSameLocation, verifyFirstBootReadiness } from './update-activation-verification'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
-import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
+import { writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
 import {
   buildRelaunchScript,
@@ -185,7 +187,8 @@ import {
   sandboxPreflight
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
-import { spawnUpdaterProcess } from './updater-process'
+import { requireUpdateGateCompletion, waitForUpdateGate } from './update-wait'
+import { spawnUpdaterProcess, spawnUpdaterProcessChecked } from './updater-process'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
   computeWindowOptions,
@@ -201,6 +204,11 @@ import {
   getVenvSitePackagesEntries,
   resolveVenvHermesCommand
 } from './windows-hermes-path'
+import {
+  buildWindowsLockTimeoutMessage,
+  collectWindowsLockOwnerCandidates,
+  formatWindowsLockOwnerCandidate
+} from './windows-lock-owner-diagnostics'
 import {
   buildWindowsInteractiveCommand,
   connectWindowsRemote,
@@ -1685,8 +1693,6 @@ function directoryExists(filePath) {
 // How long we'll park the launch waiting for a live update to finish before
 // giving up and starting the backend anyway (belt-and-suspenders alongside the
 // marker's own age ceiling; covers a stuck-but-alive updater).
-const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
-const UPDATE_WAIT_POLL_MS = 1000
 // How long the desktop lingers on the "updating, don't reopen" overlay after
 // spawning the detached updater, before it quits to release the venv shim. The
 // old 600ms was long enough to register the child process but far too short for
@@ -1698,34 +1704,21 @@ const UPDATE_HANDOFF_DWELL_MS = 2500
 
 // Block until no live update is in progress (or we hit the wait timeout).
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
-// rather than a frozen splash. Returns true if it parked at all.
+// rather than a frozen splash, and returns an explicit terminal receipt.
 async function waitForUpdateToFinish() {
-  let marker = readLiveUpdateMarker(HERMES_HOME)
+  const receipt = await waitForUpdateGate(HERMES_HOME, {
+    log: message => rememberLog(`[updates] ${message}`),
+    onProgress: () =>
+      advanceBootProgress(
+        'backend.update-wait',
+        'An update is finishing — Hermes will start automatically when it completes…',
+        12
+      )
+  })
 
-  if (!marker) {
-    return false
-  }
+  requireUpdateGateCompletion(receipt)
 
-  rememberLog(`[updates] update in progress (pid=${marker.pid}); deferring backend start until it finishes`)
-  const deadline = Date.now() + UPDATE_WAIT_TIMEOUT_MS
-
-  while (marker && Date.now() < deadline) {
-    await advanceBootProgress(
-      'backend.update-wait',
-      'An update is finishing — Hermes will start automatically when it completes…',
-      12
-    )
-    await new Promise(r => setTimeout(r, UPDATE_WAIT_POLL_MS))
-    marker = readLiveUpdateMarker(HERMES_HOME)
-  }
-
-  if (marker) {
-    rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
-  } else {
-    rememberLog('[updates] update finished; proceeding with backend start')
-  }
-
-  return true
+  return receipt
 }
 
 function unpackedPathFor(filePath) {
@@ -2721,11 +2714,17 @@ async function releaseBackendLock(updateRoot, tag) {
   // imports broken (the July 2026 brotlicffi/_sodium.pyd incidents). Failing
   // the update loudly and keeping the app running is strictly better than a
   // bricked install that needs manual venv surgery.
-  rememberLog(
-    `[${tag}] venv shim still locked after 15s; aborting hand-off (something outside this app holds the venv)`
-  )
+  const lockOwnerCandidates = collectWindowsLockOwnerCandidates(path.join(updateRoot, 'venv'), new Set(pids))
 
-  return { unlocked: false }
+  if (lockOwnerCandidates.length === 0) {
+    rememberLog(`[${tag}] venv shim still locked after 15s; aborting hand-off (lock owner unavailable)`)
+  } else {
+    for (const candidate of lockOwnerCandidates) {
+      rememberLog(`[${tag}] venv lock candidate: ${formatWindowsLockOwnerCandidate(candidate)}`)
+    }
+  }
+
+  return { unlocked: false, lockOwnerCandidates }
 }
 
 // applyUpdates — hand off to the installer's --update flow, then exit.
@@ -2829,9 +2828,7 @@ async function applyUpdates(opts = {}) {
       // guarantees a half-updated venv — abort loudly instead and let the
       // user close the holder and retry. Restart our own backend so the app
       // keeps working after the failed attempt.
-      const message =
-        'Update aborted: another process is holding the Hermes install open ' +
-        '(a second Hermes window or a terminal running hermes?). Close it and retry.'
+      const message = buildWindowsLockTimeoutMessage(lock.lockOwnerCandidates ?? [])
 
       emitUpdateProgress({ stage: 'error', message, percent: null })
       startHermes().catch(() => {})
@@ -2841,7 +2838,7 @@ async function applyUpdates(opts = {}) {
 
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
-    const child = spawnUpdaterProcess(updater, updaterArgs, {
+    const spawnReceipt = await spawnUpdaterProcessChecked(updater, updaterArgs, {
       cwd: HERMES_HOME,
       env: {
         ...process.env,
@@ -2851,6 +2848,17 @@ async function applyUpdates(opts = {}) {
       detached: true,
       stdio: 'ignore'
     })
+
+    if (spawnReceipt.ok === false) {
+      const message = `Update aborted: the updater could not start (${spawnReceipt.error}).`
+
+      emitUpdateProgress({ stage: 'error', message, error: spawnReceipt.stage, percent: null })
+      startHermes().catch(() => {})
+
+      return { ok: false, error: message, receipt: spawnReceipt }
+    }
+
+    const child = spawnReceipt.child
 
     // Write the update-in-progress marker IMMEDIATELY — before the 2.5s
     // quit dwell. The Tauri updater won't write its own marker for several
@@ -8297,15 +8305,74 @@ async function startHermes() {
     }
 
     const baseUrl = `http://127.0.0.1:${port}`
-    await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
-    await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
+    await advanceBootProgress('backend.wait', 'Verifying Hermes backend and WebSocket readiness', 90)
+    let authToken = token
+
+    const firstBootReceipt = await verifyFirstBootReadiness({
+      waitForHttp: async () => {
+        await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
+        authToken = await adoptServedDashboardToken(baseUrl, token, {
+          childAlive: () => hermesProcess.exitCode === null && !hermesProcess.killed,
+          rememberLog
+        })
+      },
+      probeWebSocket: () =>
+        probeGatewayWebSocket(`ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`, {
+          WebSocketImpl: globalThis.WebSocket
+        }),
+      verifyProfile: async () => {
+        const status = (await fetchJson(`${baseUrl}/api/status`, authToken)) as { hermes_home?: string }
+        let stickyProfile: string | null = null
+
+        try {
+          const value = fs.readFileSync(path.join(HERMES_HOME, 'active_profile'), 'utf8').trim().toLowerCase()
+          stickyProfile = PROFILE_NAME_RE.test(value) ? value : null
+        } catch {
+          // No sticky profile means the default profile home.
+        }
+
+        const expectedProfile = activeProfile || stickyProfile
+        const expectedHome = expectedProfile ? path.join(HERMES_HOME, 'profiles', expectedProfile) : HERMES_HOME
+        const servedHome = status.hermes_home ? path.resolve(status.hermes_home) : ''
+        const matches = Boolean(servedHome) && pathsReferToSameLocation(servedHome, expectedHome, IS_WINDOWS)
+
+        return {
+          ok: matches,
+          profile: expectedProfile,
+          reason: matches
+            ? undefined
+            : `expected profile home ${path.resolve(expectedHome)}, received ${servedHome || 'unknown'}`
+        }
+      }
+    })
+
+    if (firstBootReceipt.ok === false) {
+      const failureReceipt = writeActivationFailureReceipt(
+        path.join(HERMES_HOME, 'updates', 'activation-receipt.json'),
+        {
+          error: firstBootReceipt.error,
+          httpReady: firstBootReceipt.httpReady,
+          websocketReady: firstBootReceipt.websocketReady,
+          rollbackState: 'not-attempted'
+        }
+      )
+
+      rememberLog(`[updates] activation failed: ${JSON.stringify(failureReceipt)}`)
+      throw new Error(`Hermes first-boot verification failed: ${firstBootReceipt.error}`)
+    }
+
+    const activationReceipt = writeActivationReceipt(
+      path.join(HERMES_HOME, 'updates', 'activation-receipt.json'),
+      {
+        httpReady: firstBootReceipt.httpReady,
+        websocketReady: firstBootReceipt.websocketReady,
+        profile: firstBootReceipt.profile
+      }
+    )
+
     backendReady = true
     backendStartFailure = null
-
-    const authToken = await adoptServedDashboardToken(baseUrl, token, {
-      childAlive: () => hermesProcess.exitCode === null && !hermesProcess.killed,
-      rememberLog
-    })
+    rememberLog(`[updates] verified activation: ${JSON.stringify(activationReceipt)}`)
 
     updateBootProgress({
       phase: 'backend.ready',

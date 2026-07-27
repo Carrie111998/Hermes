@@ -29,8 +29,8 @@ const here = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(here, '..')
 const require = createRequire(import.meta.url)
 
-function makeExecutable(filePath) {
-  chmodSync(filePath, 0o755)
+function makeExecutable(filePath, chmod = chmodSync) {
+  chmod(filePath, 0o755)
 }
 
 function patchUnixTerminalAsarPaths(destRoot) {
@@ -91,7 +91,7 @@ function copyGlobByExt(srcDir, destDir, extensions) {
  * Directories are copied wholesale to also cover any nested native
  * payload (e.g. a conpty/ subfolder some build layouts produce).
  */
-function copyBuildRelease(srcDir, destDir) {
+function copyBuildRelease(srcDir, destDir, chmod = chmodSync) {
   if (!existsSync(srcDir)) return
   mkdirSync(destDir, { recursive: true })
   for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
@@ -103,7 +103,7 @@ function copyBuildRelease(srcDir, destDir) {
       const destFile = join(destDir, entry.name)
       cpSync(join(srcDir, entry.name), destFile)
       if (entry.name === 'spawn-helper') {
-        makeExecutable(destFile)
+        makeExecutable(destFile, chmod)
       }
     }
   }
@@ -237,7 +237,11 @@ function validateStagedBinaries(destRoot, targetPlatform) {
  *      modules; build on the target platform or provide a prebuild).
  * 4. Validate every staged `.node` file's binary platform matches the target.
  */
-export function stageNodePtyInto(srcRoot, destRoot, { platform = process.platform, arch = process.arch } = {}) {
+export function stageNodePtyInto(
+  srcRoot,
+  destRoot,
+  { platform = process.platform, arch = process.arch, chmod = chmodSync } = {}
+) {
   const hostMatch = platform === process.platform && arch === process.arch
 
   rmSync(destRoot, { recursive: true, force: true })
@@ -271,7 +275,7 @@ export function stageNodePtyInto(srcRoot, destRoot, { platform = process.platfor
       if (entry.name === 'spawn-helper') {
         const destFile = join(destPrebuild, entry.name)
         cpSync(join(prebuildDir, entry.name), destFile)
-        makeExecutable(destFile)
+        makeExecutable(destFile, chmod)
       }
     }
   }
@@ -285,7 +289,7 @@ export function stageNodePtyInto(srcRoot, destRoot, { platform = process.platfor
   // app that crashes the first time a terminal is spawned.
   if (hostMatch) {
     const buildReleaseDir = join(srcRoot, 'build/Release')
-    copyBuildRelease(buildReleaseDir, join(destRoot, 'build/Release'))
+    copyBuildRelease(buildReleaseDir, join(destRoot, 'build/Release'), chmod)
   }
 
   // Check whether a native binary for this target was staged.
@@ -333,7 +337,7 @@ export function stageNodePtyInto(srcRoot, destRoot, { platform = process.platfor
     }
     // Re-copy build/Release after electron-rebuild populated it.
     const buildReleaseDir = join(srcRoot, 'build/Release')
-    copyBuildRelease(buildReleaseDir, join(destRoot, 'build/Release'))
+    copyBuildRelease(buildReleaseDir, join(destRoot, 'build/Release'), chmod)
   }
 
   // Validate every staged .node binary matches the target platform.
