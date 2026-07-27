@@ -65,6 +65,21 @@ When a message arrives from any platform:
    - Otherwise → create `AIAgent` instance and run conversation
 4. **Response** is sent back through the platform adapter
 
+`BasePlatformAdapter.handle_message()` also returns a
+`MessageDispatchDisposition`. `BACKGROUND_STARTED` and `PENDING_QUEUED`
+transfer completion ownership to a background turn; `STEERED` and
+`SYNC_HANDLED` finish synchronously; `REJECTED` means no turn accepted the
+event. Integrations must use this structured result rather than infer
+lifecycle ownership from response text or the presence of an active session.
+`REJECTED` events expose `dispatch_reject_reason` metadata so integrations can
+distinguish `permission_denied`, `transport_unavailable`, `queue_full`, and
+`dispatch_start_failed`. Queued follow-up turns run the normal
+`on_processing_start` / `on_processing_complete` hooks at their recursive turn
+boundary so platform request context follows the queued `MessageEvent`.
+Busy acknowledgments that are actually sent carry
+`gateway_notice_kind=busy_ack` and the effective `busy_input_mode` in send
+metadata.
+
 ### Session Key Format
 
 Session keys encode the full routing context:

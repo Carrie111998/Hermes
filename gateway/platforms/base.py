@@ -1897,6 +1897,16 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+class MessageDispatchDisposition(Enum):
+    """Ownership of an inbound message after ``handle_message`` returns."""
+
+    BACKGROUND_STARTED = "background_started"
+    PENDING_QUEUED = "pending_queued"
+    STEERED = "steered"
+    SYNC_HANDLED = "sync_handled"
+    REJECTED = "rejected"
+
+
 @dataclass
 class MessageEvent:
     """
@@ -1970,6 +1980,15 @@ class MessageEvent:
     # consume via ``event.metadata.get(...)`` and must not rely on any
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Set by the gateway branch that actually accepted, queued, steered, or
+    # rejected this event. Platform integrations use it to transfer response
+    # lifecycle ownership without parsing user-visible text.
+    dispatch_disposition: Optional[MessageDispatchDisposition] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -5128,7 +5147,7 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(self, event: MessageEvent) -> MessageDispatchDisposition:
         """
         Process an incoming message.
         
@@ -5137,7 +5156,9 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
-            return
+            event.metadata.setdefault("dispatch_reject_reason", "transport_unavailable")
+            event.dispatch_disposition = MessageDispatchDisposition.REJECTED
+            return event.dispatch_disposition
 
         coerce_plaintext_gateway_command(event)
 
@@ -5190,7 +5211,14 @@ class BasePlatformAdapter(ABC):
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
-                    return
+                        event.metadata.setdefault("dispatch_reject_reason", "dispatch_start_failed")
+                        event.dispatch_disposition = MessageDispatchDisposition.REJECTED
+                        return event.dispatch_disposition
+                    event.dispatch_disposition = (
+                        event.dispatch_disposition
+                        or MessageDispatchDisposition.SYNC_HANDLED
+                    )
+                    return event.dispatch_disposition
 
                 # Other bypass commands (/approve, /deny, /status,
                 # /background, /restart) just need direct dispatch — they
@@ -5218,7 +5246,14 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
-                return
+                    event.metadata.setdefault("dispatch_reject_reason", "dispatch_start_failed")
+                    event.dispatch_disposition = MessageDispatchDisposition.REJECTED
+                    return event.dispatch_disposition
+                event.dispatch_disposition = (
+                    event.dispatch_disposition
+                    or MessageDispatchDisposition.SYNC_HANDLED
+                )
+                return event.dispatch_disposition
 
             # Clarify reply bypass: if the agent is blocked on a
             # clarify_tool call, the next non-command message in this
@@ -5274,14 +5309,32 @@ class BasePlatformAdapter(ABC):
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
                         )
-                    return
+                        event.metadata.setdefault("dispatch_reject_reason", "dispatch_start_failed")
+                        event.dispatch_disposition = MessageDispatchDisposition.REJECTED
+                        return event.dispatch_disposition
+                    event.dispatch_disposition = (
+                        event.dispatch_disposition
+                        or MessageDispatchDisposition.SYNC_HANDLED
+                    )
+                    return event.dispatch_disposition
 
             if self._busy_session_handler is not None:
                 try:
-                    if await self._busy_session_handler(event, session_key):
-                        return
+                    busy_result = await self._busy_session_handler(event, session_key)
+                    if isinstance(busy_result, MessageDispatchDisposition):
+                        event.dispatch_disposition = busy_result
+                        return busy_result
+                    if busy_result:
+                        event.dispatch_disposition = (
+                            event.dispatch_disposition
+                            or MessageDispatchDisposition.SYNC_HANDLED
+                        )
+                        return event.dispatch_disposition
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+                    event.metadata.setdefault("dispatch_reject_reason", "dispatch_start_failed")
+                    event.dispatch_disposition = MessageDispatchDisposition.REJECTED
+                    return event.dispatch_disposition
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
@@ -5289,7 +5342,8 @@ class BasePlatformAdapter(ABC):
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 merge_pending_message_event(self._pending_messages, session_key, event)
-                return  # Don't interrupt now - will run after current task completes
+                event.dispatch_disposition = MessageDispatchDisposition.PENDING_QUEUED
+                return event.dispatch_disposition
 
             if self._is_queue_text_debounce_candidate(event):
                 logger.debug(
@@ -5313,7 +5367,8 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 )
-            return  # Don't process now - will be handled after current task finishes
+            event.dispatch_disposition = MessageDispatchDisposition.PENDING_QUEUED
+            return event.dispatch_disposition
         
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task
@@ -5322,7 +5377,15 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        started = self._start_session_processing(event, session_key)
+        event.dispatch_disposition = (
+            MessageDispatchDisposition.BACKGROUND_STARTED
+            if started
+            else MessageDispatchDisposition.REJECTED
+        )
+        if not started:
+            event.metadata.setdefault("dispatch_reject_reason", "dispatch_start_failed")
+        return event.dispatch_disposition
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -5356,6 +5419,8 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        lifecycle_completed = False
+        lifecycle_transferred = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -5400,10 +5465,15 @@ class BasePlatformAdapter(ABC):
             )
         
         try:
-            await self._run_processing_hook("on_processing_start", event)
+            if not getattr(event, "_processing_lifecycle_started", False):
+                await self._run_processing_hook("on_processing_start", event)
+                setattr(event, "_processing_lifecycle_started", True)
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            lifecycle_transferred = bool(
+                getattr(event, "_processing_lifecycle_transferred", False)
+            )
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5806,13 +5876,25 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            # A running GatewayRunner can accept this event into its own
+            # pending queue after the platform task has already started. The
+            # queued turn owns the eventual completion hook and pending drain.
+            if lifecycle_transferred:
+                return
+
+            # A late dispatch rejection is a processing failure even when the
+            # handler had no user-visible response to deliver.
+            processing_ok = (
+                False
+                if event.dispatch_disposition is MessageDispatchDisposition.REJECTED
+                else (delivery_succeeded if delivery_attempted else not bool(response))
+            )
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            lifecycle_completed = True
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -5863,10 +5945,14 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
-            await self._run_processing_hook("on_processing_complete", event, outcome)
+            if not lifecycle_completed and not lifecycle_transferred:
+                await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            if not lifecycle_completed and not lifecycle_transferred:
+                await self._run_processing_hook(
+                    "on_processing_complete", event, ProcessingOutcome.FAILURE
+                )
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
@@ -5908,7 +5994,9 @@ class BasePlatformAdapter(ABC):
                 "_hermes_run_generation",
                 None,
             )
-            if hasattr(self, "pop_post_delivery_callback"):
+            if lifecycle_transferred:
+                _post_cb = None
+            elif hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
                     session_key,
                     generation=_callback_generation,
@@ -5936,7 +6024,8 @@ class BasePlatformAdapter(ABC):
             )
             # Final drain/release boundary: force-flush any timer that missed
             # the in-band drain before deciding whether the guard can clear.
-            await self._flush_text_debounce_now(session_key)
+            if not lifecycle_transferred:
+                await self._flush_text_debounce_now(session_key)
             # Late-arrival drain: a message may have arrived during the
             # cleanup awaits above (typing_task cancel, stop_typing).  Such
             # messages passed the Level-1 guard (entry still live, Event
@@ -5944,7 +6033,11 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = (
+                None
+                if lifecycle_transferred
+                else self._pending_messages.pop(session_key, None)
+            )
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)

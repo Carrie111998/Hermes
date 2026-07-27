@@ -19,6 +19,34 @@ def _make_config(**extra):
     return PlatformConfig(enabled=True, extra=extra)
 
 
+@pytest.mark.asyncio
+async def test_handle_message_returns_base_dispatch_disposition():
+    from gateway.platforms.base import (
+        BasePlatformAdapter,
+        MessageDispatchDisposition,
+        MessageEvent,
+    )
+    from gateway.platforms.qqbot import QQAdapter
+
+    adapter = object.__new__(QQAdapter)
+    adapter._last_msg_id = {}
+    event = MessageEvent(
+        text="hello",
+        source=mock.MagicMock(chat_id="chat-1"),
+        message_id="message-1",
+    )
+
+    with mock.patch.object(
+        BasePlatformAdapter,
+        "handle_message",
+        mock.AsyncMock(return_value=MessageDispatchDisposition.PENDING_QUEUED),
+    ):
+        result = await QQAdapter.handle_message(adapter, event)
+
+    assert result is MessageDispatchDisposition.PENDING_QUEUED
+    assert adapter._last_msg_id == {"chat-1": "message-1"}
+
+
 # ---------------------------------------------------------------------------
 # check_qq_requirements
 # ---------------------------------------------------------------------------

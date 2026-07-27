@@ -25,6 +25,7 @@ sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
 from gateway.platforms.base import (
+    MessageDispatchDisposition,
     MessageEvent,
     MessageType,
     Platform,
@@ -198,9 +199,12 @@ class TestBusySessionAck:
         result = await runner._handle_active_session_busy_message(event, sk)
 
         assert result is True  # handled
+        assert event.dispatch_disposition is MessageDispatchDisposition.PENDING_QUEUED
         # Verify ack was sent
         adapter._send_with_retry.assert_called_once()
         call_kwargs = adapter._send_with_retry.call_args
+        assert call_kwargs.kwargs["metadata"]["gateway_notice_kind"] == "busy_ack"
+        assert call_kwargs.kwargs["metadata"]["busy_input_mode"] == "interrupt"
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         if not content and call_kwargs.args:
             # positional args
@@ -231,6 +235,7 @@ class TestBusySessionAck:
 
         agent.redirect.assert_called_once_with("No, use Postgres")
         agent.interrupt.assert_not_called()
+        assert event.dispatch_disposition is MessageDispatchDisposition.STEERED
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
         assert "Redirected current run" in content
@@ -256,8 +261,50 @@ class TestBusySessionAck:
         assert await runner._handle_active_session_busy_message(event, sk) is True
 
         agent.redirect.assert_not_called()
+        assert event.dispatch_disposition is MessageDispatchDisposition.PENDING_QUEUED
         assert adapter._pending_messages[sk] is event
         assert adapter._pending_messages[sk].media_urls == event.media_urls
+
+    @pytest.mark.asyncio
+    async def test_queue_cap_rejects_without_interrupt_or_busy_ack(self):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+        event = _make_event(text="must not be dropped")
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+        adapter._pending_messages[sk] = _make_event(text="head")
+        runner._queued_events = {
+            sk: [
+                _make_event(text=f"queued-{index}")
+                for index in range(runner._BUSY_QUEUE_MAX_PENDING - 1)
+            ]
+        }
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        assert event.dispatch_disposition is MessageDispatchDisposition.REJECTED
+        assert event.metadata["dispatch_reject_reason"] == "queue_full"
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_busy_message_reports_permission_denied(self):
+        runner, _sentinel = _make_runner()
+        runner._is_user_authorized = lambda _source: False
+        event = _make_event(text="not allowed")
+
+        result = await runner._handle_active_session_busy_message(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert result is True
+        assert event.dispatch_disposition is MessageDispatchDisposition.REJECTED
+        assert event.metadata["dispatch_reject_reason"] == "permission_denied"
 
     @pytest.mark.asyncio
     async def test_queue_mode_suppresses_interrupt_and_updates_ack(self):
@@ -276,6 +323,7 @@ class TestBusySessionAck:
         with patch("gateway.run.merge_pending_message_event"):
             await runner._handle_active_session_busy_message(event, sk)
 
+        assert event.dispatch_disposition is MessageDispatchDisposition.PENDING_QUEUED
         # VERIFY: Agent was NOT interrupted
         agent.interrupt.assert_not_called()
 
@@ -335,6 +383,7 @@ class TestBusySessionAck:
         with patch("gateway.run.merge_pending_message_event") as mock_merge:
             await runner._handle_active_session_busy_message(event, sk)
 
+        assert event.dispatch_disposition is MessageDispatchDisposition.STEERED
         # VERIFY: Agent was steered, NOT interrupted
         agent.steer.assert_called_once_with("also check the tests")
         agent.interrupt.assert_not_called()
@@ -346,6 +395,8 @@ class TestBusySessionAck:
         adapter._send_with_retry.assert_called_once()
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
+        assert call_kwargs.kwargs["metadata"]["gateway_notice_kind"] == "busy_ack"
+        assert call_kwargs.kwargs["metadata"]["busy_input_mode"] == "steer"
         assert "Steered" in content or "steer" in content.lower()
         assert "Interrupting" not in content
 
@@ -375,6 +426,7 @@ class TestBusySessionAck:
 
         await runner._handle_active_session_busy_message(event, sk)
 
+        assert event.dispatch_disposition is MessageDispatchDisposition.STEERED
         agent.steer.assert_called_once_with("also check the tests")
         agent.interrupt.assert_not_called()
         adapter._send_with_retry.assert_not_called()
@@ -655,8 +707,11 @@ class TestBusySessionAck:
         assert "10 min" in content  # elapsed
 
     @pytest.mark.asyncio
-    async def test_telegram_omits_status_detail_by_default(self):
+    async def test_telegram_omits_status_detail_by_default(self, monkeypatch):
         """Telegram busy acks stay concise unless busy_ack_detail is enabled."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()

@@ -419,12 +419,16 @@ class TestBusyInputModeQueueFifo:
         session_key = "telegram:user:cap"
 
         cap = GatewayRunner._BUSY_QUEUE_MAX_PENDING
+        accepted = []
         for i in range(cap + 5):
-            runner._queue_or_replace_pending_event(
-                session_key, self._text_event(f"msg-{i:03d}")
+            accepted.append(
+                runner._queue_or_replace_pending_event(
+                    session_key, self._text_event(f"msg-{i:03d}")
+                )
             )
 
         # Exactly ``cap`` follow-ups retained (head + cap-1 in overflow).
+        assert accepted == [True] * cap + [False] * 5
         assert runner._queue_depth(session_key, adapter=adapter) == cap
         assert adapter._pending_messages[session_key].text == "msg-000"
         # The last accepted overflow item is msg-{cap-1}.
