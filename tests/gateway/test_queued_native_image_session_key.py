@@ -5,9 +5,16 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from unittest.mock import AsyncMock
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
 from gateway.session import SessionSource
 
 
@@ -21,6 +28,7 @@ class CaptureAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
         self.sent = []
         self.typing = []
+        self.processing_hooks = []
 
     async def connect(self) -> bool:
         return True
@@ -48,6 +56,16 @@ class CaptureAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
 
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        self.processing_hooks.append(("start", event.message_id, None))
+
+    async def on_processing_complete(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        self.processing_hooks.append(("complete", event.message_id, outcome))
+
 
 class CaptureQueuedNativeImageAgent:
     calls = []
@@ -62,6 +80,20 @@ class CaptureQueuedNativeImageAgent:
             "final_response": f"done-{len(type(self).calls)}",
             "messages": [],
             "api_calls": 1,
+        }
+
+
+class SequencedQueuedAgent(CaptureQueuedNativeImageAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls.append(message)
+        call_number = len(type(self).calls)
+        return {
+            "final_response": f"done-{call_number}",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": call_number == 2,
+            "interrupt_message": "third" if call_number == 2 else None,
+            "history_offset": 0,
         }
 
 
@@ -149,3 +181,122 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+    assert adapter.processing_hooks == [
+        ("start", "queued-1", None),
+        ("complete", "queued-1", ProcessingOutcome.SUCCESS),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queued_preprocessing_early_return_still_completes_lifecycle(monkeypatch, tmp_path):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._prepare_inbound_message_text = AsyncMock(return_value=None)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm")
+    session_key = "agent:main:telegram:dm:chat-1"
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="@blocked",
+        source=source,
+        message_id="queued-blocked",
+    )
+
+    result = await runner._run_agent(
+        message="first",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done-1"
+    assert adapter.processing_hooks == [
+        ("start", "queued-blocked", None),
+        ("complete", "queued-blocked", ProcessingOutcome.SUCCESS),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queued_preprocessing_exception_completes_failure(monkeypatch, tmp_path):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._prepare_inbound_message_text = AsyncMock(side_effect=RuntimeError("prepare failed"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm")
+    session_key = "agent:main:telegram:dm:chat-1"
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="queued",
+        source=source,
+        message_id="queued-error",
+    )
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        await runner._run_agent(
+            message="first",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+        )
+
+    assert adapter.processing_hooks == [
+        ("start", "queued-error", None),
+        ("complete", "queued-error", ProcessingOutcome.FAILURE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_nested_queued_turn_uses_its_own_cancelled_outcome(monkeypatch, tmp_path):
+    SequencedQueuedAgent.calls = []
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = SequencedQueuedAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._queued_events = {}
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm")
+    session_key = "agent:main:telegram:dm:chat-1"
+    second = MessageEvent(text="second", source=source, message_id="queued-2")
+    third = MessageEvent(text="third", source=source, message_id="queued-3")
+    runner._enqueue_fifo(session_key, second, adapter)
+    runner._enqueue_fifo(session_key, third, adapter)
+
+    result = await runner._run_agent(
+        message="first",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done-3"
+    assert adapter.processing_hooks == [
+        ("start", "queued-2", None),
+        ("start", "queued-3", None),
+        ("complete", "queued-3", ProcessingOutcome.SUCCESS),
+        ("complete", "queued-2", ProcessingOutcome.CANCELLED),
+    ]

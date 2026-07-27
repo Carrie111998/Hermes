@@ -2203,8 +2203,10 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MessageDispatchDisposition,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -3239,6 +3241,17 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+_DIRECT_TURN_OUTCOME_KEY = "_hermes_direct_turn_outcome"
+
+
+def _processing_outcome_for_agent_result(result: dict) -> ProcessingOutcome:
+    if result.get("interrupted"):
+        return ProcessingOutcome.CANCELLED
+    if result.get("failed"):
+        return ProcessingOutcome.FAILURE
+    return ProcessingOutcome.SUCCESS
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -3259,15 +3272,19 @@ def _preserve_queued_followup_history_offset(
     if not isinstance(current_result, dict):
         return followup_result
 
+    merged = dict(followup_result)
+    direct_outcome = current_result.get(_DIRECT_TURN_OUTCOME_KEY)
+    if direct_outcome is not None:
+        # The caller needs the direct recursive turn's result, not the
+        # deepest queued descendant's result, to close that event's lifecycle.
+        merged[_DIRECT_TURN_OUTCOME_KEY] = direct_outcome
+
     current_offset = current_result.get("history_offset")
     followup_offset = followup_result.get("history_offset")
-    if not isinstance(current_offset, int):
-        return followup_result
-    if isinstance(followup_offset, int) and followup_offset <= current_offset:
-        return followup_result
-
-    merged = dict(followup_result)
-    merged["history_offset"] = current_offset
+    if isinstance(current_offset, int) and (
+        not isinstance(followup_offset, int) or followup_offset > current_offset
+    ):
+        merged["history_offset"] = current_offset
     return merged
 
 
@@ -5187,13 +5204,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            queued_event.metadata.setdefault("dispatch_reject_reason", "transport_unavailable")
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
-            return
+            queued_event.metadata.setdefault("dispatch_reject_reason", "transport_unavailable")
+            return False
         queued_events = getattr(self, "_queued_events", None)
         if queued_events is None:
             queued_events = {}
@@ -5202,6 +5221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queued_events.setdefault(session_key, []).append(queued_event)
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self,
@@ -6121,10 +6141,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            event.metadata.setdefault("dispatch_reject_reason", "transport_unavailable")
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -6148,25 +6169,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+            event.metadata.setdefault("dispatch_reject_reason", "queue_full")
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+    def _transfer_processing_lifecycle_to_queue(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: bool = False,
+        adapter_drain: bool = False,
+    ) -> bool:
+        """Queue an already-started platform event without closing its lifecycle.
+
+        This covers the narrow PRIORITY race where the platform adapter did
+        not see an active-session guard, started background processing, and
+        the GatewayRunner then discovered that the same session already had a
+        running agent. The current adapter task has already emitted
+        ``on_processing_start``; the queued turn must emit the single matching
+        completion after it actually runs.
+        """
+        if merge_text:
+            adapter = self._adapter_for_source(event.source)
+            if adapter is None:
+                event.metadata.setdefault(
+                    "dispatch_reject_reason",
+                    "transport_unavailable",
+                )
+                queued = False
+            else:
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=True,
+                )
+                queued = True
+        else:
+            queued = self._queue_or_replace_pending_event(session_key, event)
+        if not queued:
+            event.dispatch_disposition = MessageDispatchDisposition.REJECTED
+            return False
+        event.dispatch_disposition = MessageDispatchDisposition.PENDING_QUEUED
+        setattr(event, "_processing_lifecycle_transferred", True)
+        if adapter_drain:
+            setattr(event, "_processing_lifecycle_requires_adapter_drain", True)
+        return True
+
+    async def _handle_active_session_busy_message(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        def handled(disposition: MessageDispatchDisposition) -> bool:
+            event.dispatch_disposition = disposition
+            return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
         if not self._is_user_authorized(event.source):
+            event.metadata.setdefault("dispatch_reject_reason", "permission_denied")
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -6175,21 +6250,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source.platform.value if event.source.platform else "unknown",
                 session_key,
             )
-            return True  # handled (silently dropped); do not fall through
+            return handled(MessageDispatchDisposition.REJECTED)
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self._adapter_for_source(event.source)
             if not adapter:
-                return True
+                event.metadata.setdefault("dispatch_reject_reason", "transport_unavailable")
+                return handled(MessageDispatchDisposition.REJECTED)
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
+                if not self._queue_or_replace_pending_event(session_key, event):
+                    return handled(MessageDispatchDisposition.REJECTED)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                disposition = MessageDispatchDisposition.PENDING_QUEUED
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                disposition = MessageDispatchDisposition.SYNC_HANDLED
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -6203,7 +6282,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 metadata=thread_meta,
             )
-            return True
+            return handled(disposition)
 
         # --- Approval response routing (#46866) ---
         # When the agent is blocked waiting for a dangerous-command approval,
@@ -6272,7 +6351,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 reply_to=_anchor,
                                 metadata=self._thread_metadata_for_source(event.source, _anchor),
                             )
-                    return True
+                    return handled(MessageDispatchDisposition.SYNC_HANDLED)
         except Exception:
             logger.warning(
                 "Plain-text approval routing failed for session %s; "
@@ -6397,12 +6476,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn (#43066 sub-bug 2). The FIFO path gives each text its own
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
-        if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+        if (
+            not steered
+            and not redirected
+            and not self._queue_or_replace_pending_event(session_key, event)
+        ):
+            return handled(MessageDispatchDisposition.REJECTED)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
         is_redirect_mode = effective_mode == "interrupt" and redirected
+        disposition = (
+            MessageDispatchDisposition.STEERED
+            if steered or redirected
+            else MessageDispatchDisposition.PENDING_QUEUED
+        )
 
         # If not in queue/steer mode, interrupt the running agent immediately.
         # This aborts in-flight tool calls and causes the agent loop to exit
@@ -6436,7 +6524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
         if not busy_ack_enabled:
             logger.debug("Busy ack suppressed for session %s", session_key)
-            return True  # input still processed, just no ack sent
+            return handled(disposition)
 
         # Debounce before consulting config-heavy display settings. Rapid
         # follow-ups should be processed but should not trigger another config
@@ -6445,7 +6533,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
+            return handled(disposition)
 
         from gateway.display_config import resolve_display_setting
         platform_key = _platform_config_key(event.source.platform)
@@ -6469,7 +6557,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if not steer_ack_enabled:
                 logger.debug("Busy steer ack suppressed for session %s", session_key)
-                return True
+                return handled(disposition)
 
         self._busy_ack_ts[session_key] = now
 
@@ -6569,7 +6657,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
         reply_anchor = self._reply_anchor_for_event(event)
-        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
+        thread_meta.update(
+            {
+                "gateway_notice_kind": "busy_ack",
+                "busy_input_mode": effective_mode,
+            }
+        )
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -6586,7 +6680,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
-        return True
+        return handled(disposition)
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
@@ -11424,29 +11518,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # fields silently lost the attachment when the queued turn ran.
                 has_media = bool(getattr(event, "media_urls", None))
                 if not queued_text and not has_media:
+                    event.dispatch_disposition = MessageDispatchDisposition.SYNC_HANDLED
                     return "Usage: /queue <prompt>"
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    queued_event = MessageEvent(
+                    queued_event = dataclasses.replace(
+                        event,
                         text=queued_text,
                         message_type=event.message_type if has_media else MessageType.TEXT,
-                        source=event.source,
-                        raw_message=event.raw_message,
-                        message_id=event.message_id,
-                        media_urls=list(getattr(event, "media_urls", []) or []),
-                        media_types=list(getattr(event, "media_types", []) or []),
-                        reply_to_message_id=event.reply_to_message_id,
-                        reply_to_text=event.reply_to_text,
-                        reply_to_author_id=event.reply_to_author_id,
-                        reply_to_author_name=event.reply_to_author_name,
-                        reply_to_is_own_message=event.reply_to_is_own_message,
-                        auto_skill=event.auto_skill,
-                        channel_prompt=event.channel_prompt,
-                        channel_context=event.channel_context,
-                        internal=event.internal,
-                        timestamp=event.timestamp,
+                        dispatch_disposition=None,
                     )
-                    self._enqueue_fifo(_quick_key, queued_event, adapter)
+                    queued = self._enqueue_fifo(_quick_key, queued_event, adapter)
+                else:
+                    event.metadata.setdefault("dispatch_reject_reason", "transport_unavailable")
+                    queued = False
+                if not queued and adapter:
+                    event.metadata.setdefault(
+                        "dispatch_reject_reason",
+                        queued_event.metadata.get(
+                            "dispatch_reject_reason",
+                            "transport_unavailable",
+                        ),
+                    )
+                event.dispatch_disposition = (
+                    MessageDispatchDisposition.PENDING_QUEUED
+                    if queued
+                    else MessageDispatchDisposition.REJECTED
+                )
+                if not queued:
+                    return "Could not queue the next turn."
                 depth = self._queue_depth(_quick_key, adapter=self._adapter_for_source(source))
                 if depth <= 1:
                     return "Queued for the next turn."
@@ -11460,44 +11560,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "steer":
                 steer_text = event.get_command_args().strip()
                 if not steer_text:
+                    event.dispatch_disposition = MessageDispatchDisposition.SYNC_HANDLED
                     return "Usage: /steer <prompt>"
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent is _AGENT_PENDING_SENTINEL:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
-                    adapter = self._adapter_for_source(source)
-                    if adapter:
-                        queued_event = MessageEvent(
-                            text=steer_text,
-                            message_type=MessageType.TEXT,
-                            source=event.source,
-                            message_id=event.message_id,
-                            channel_prompt=event.channel_prompt,
-                            channel_context=event.channel_context,
+                    queued_event = dataclasses.replace(
+                        event,
+                        text=steer_text,
+                        message_type=MessageType.TEXT,
+                        dispatch_disposition=None,
+                    )
+                    queued = self._queue_or_replace_pending_event(_quick_key, queued_event)
+                    if not queued:
+                        event.metadata.setdefault(
+                            "dispatch_reject_reason",
+                            queued_event.metadata.get(
+                                "dispatch_reject_reason",
+                                "transport_unavailable",
+                            ),
                         )
-                        adapter._pending_messages[_quick_key] = queued_event
+                    event.dispatch_disposition = (
+                        MessageDispatchDisposition.PENDING_QUEUED
+                        if queued
+                        else MessageDispatchDisposition.REJECTED
+                    )
+                    if not queued:
+                        return "Could not queue /steer while the agent starts."
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
                         accepted = running_agent.steer(steer_text)
                     except Exception as exc:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
+                        event.dispatch_disposition = MessageDispatchDisposition.SYNC_HANDLED
                         return f"⚠️ Steer failed: {exc}"
                     if accepted:
+                        event.dispatch_disposition = MessageDispatchDisposition.STEERED
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
+                    event.dispatch_disposition = MessageDispatchDisposition.SYNC_HANDLED
                     return "Steer rejected (empty payload)."
                 # Running agent is missing or lacks steer() — fall back to queue.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    queued_event = MessageEvent(
-                        text=steer_text,
-                        message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        channel_prompt=event.channel_prompt,
-                        channel_context=event.channel_context,
+                queued_event = dataclasses.replace(
+                    event,
+                    text=steer_text,
+                    message_type=MessageType.TEXT,
+                    dispatch_disposition=None,
+                )
+                queued = self._queue_or_replace_pending_event(_quick_key, queued_event)
+                if not queued:
+                    event.metadata.setdefault(
+                        "dispatch_reject_reason",
+                        queued_event.metadata.get(
+                            "dispatch_reject_reason",
+                            "transport_unavailable",
+                        ),
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                event.dispatch_disposition = (
+                    MessageDispatchDisposition.PENDING_QUEUED
+                    if queued
+                    else MessageDispatchDisposition.REJECTED
+                )
+                if not queued:
+                    return "Could not queue /steer fallback."
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -11613,15 +11739,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                self._transfer_processing_lifecycle_to_queue(_quick_key, event)
                 return None
 
             _telegram_followup_grace = float(
                 os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
             )
             _started_at = self._running_agents_ts.get(_quick_key, 0)
+            running_agent = self._running_agents.get(_quick_key)
+            agent_is_pending = running_agent is _AGENT_PENDING_SENTINEL
             if (
                 source.platform == Platform.TELEGRAM
                 and event.message_type == MessageType.TEXT
@@ -11634,21 +11760,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     time.time() - _started_at,
                     _quick_key,
                 )
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    if self._busy_input_mode == "queue":
-                        self._enqueue_fifo(_quick_key, event, adapter)
-                    else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        )
+                self._transfer_processing_lifecycle_to_queue(
+                    _quick_key,
+                    event,
+                    merge_text=(
+                        self._busy_input_mode != "queue"
+                        and not agent_is_pending
+                    ),
+                    adapter_drain=agent_is_pending,
+                )
                 return None
 
-            running_agent = self._running_agents.get(_quick_key)
-            if running_agent is _AGENT_PENDING_SENTINEL:
+            if agent_is_pending:
                 # Agent is being set up but not ready yet.
                 if event.get_command() == "stop":
                     # Force-clean the sentinel so the session is unlocked.
@@ -11657,18 +11780,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                self._transfer_processing_lifecycle_to_queue(
+                    _quick_key,
+                    event,
+                    adapter_drain=True,
+                )
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    if not self._transfer_processing_lifecycle_to_queue(_quick_key, event):
+                        return "Could not queue the next turn while the gateway is draining."
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if self._queue_during_drain_enabled()
@@ -11676,7 +11797,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                self._transfer_processing_lifecycle_to_queue(_quick_key, event)
                 return None
             if self._busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
@@ -11698,9 +11819,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         steered = False
                 if steered:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
+                    event.dispatch_disposition = MessageDispatchDisposition.STEERED
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                self._transfer_processing_lifecycle_to_queue(_quick_key, event)
                 return None
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
@@ -11716,7 +11838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                self._transfer_processing_lifecycle_to_queue(_quick_key, event)
                 return None
             # #56391 — Compression protection (PRIORITY path). Same
             # rationale as ``_handle_active_session_busy_message``: context
@@ -11732,7 +11854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because context compression is in flight (#56391)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                self._transfer_processing_lifecycle_to_queue(_quick_key, event)
                 return None
             # Text-only corrections redirect the live turn (preserving
             # displayed context) when the runtime supports it; media/voice and
@@ -11748,6 +11870,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     if running_agent.redirect((event.text or "").strip()):
                         logger.debug("PRIORITY redirect for session %s", _quick_key)
+                        event.dispatch_disposition = MessageDispatchDisposition.STEERED
                         return None
                 except Exception as exc:
                     logger.warning(
@@ -11756,6 +11879,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc,
                     )
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
+            if not self._transfer_processing_lifecycle_to_queue(_quick_key, event):
+                return None
             _interrupt_text = event.text
             _media_urls = getattr(event, "media_urls", None) or []
             if self._pending_event_audio_paths(event):
@@ -23324,6 +23449,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
+            if isinstance(result, dict):
+                result[_DIRECT_TURN_OUTCOME_KEY] = (
+                    _processing_outcome_for_agent_result(result).value
+                )
             adapter = self._adapter_for_source(source)
             
             # Get pending message from adapter.
@@ -23531,86 +23660,105 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
 
-                updated_history = result.get("messages", history)
-                next_source = source
-                next_message = pending
-                next_message_id = None
-                next_channel_prompt = None
-                next_session_key = session_key
-                if pending_event is not None:
-                    next_source = getattr(pending_event, "source", None) or source
-                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
-                        logger.info(
-                            "Discarding stale goal continuation for session %s — goal is no longer active",
-                            session_key or "?",
+                followup_outcome = ProcessingOutcome.FAILURE
+                if pending_event is not None and not getattr(
+                    pending_event, "_processing_lifecycle_started", False
+                ):
+                    await adapter._run_processing_hook("on_processing_start", pending_event)
+                    setattr(pending_event, "_processing_lifecycle_started", True)
+                try:
+                    updated_history = result.get("messages", history)
+                    next_source = source
+                    next_message = pending
+                    next_message_id = None
+                    next_channel_prompt = None
+                    next_session_key = session_key
+                    if pending_event is not None:
+                        next_source = getattr(pending_event, "source", None) or source
+                        if self._is_goal_continuation_event(
+                            pending_event
+                        ) and not self._goal_still_active_for_session(session_id):
+                            logger.info(
+                                "Discarding stale goal continuation for session %s — goal is no longer active",
+                                session_key or "?",
+                            )
+                            followup_outcome = ProcessingOutcome.CANCELLED
+                            return result
+                        # Resolve the follow-up's session key BEFORE preparing
+                        # inbound text so native-image buffering uses the same
+                        # key as the recursive turn that consumes it.
+                        try:
+                            next_session_key = self._session_key_for_source(next_source)
+                        except Exception:
+                            logger.debug(
+                                "Queued follow-up session-key resolution failed; reusing %s",
+                                session_key or "?",
+                                exc_info=True,
+                            )
+                        next_message = await self._prepare_profile_scoped_inbound_message_text(
+                            event=pending_event,
+                            source=next_source,
+                            history=updated_history,
+                            session_key=next_session_key,
                         )
-                        return result
-                    # Resolve the follow-up's session key BEFORE preparing the
-                    # inbound text: _prepare_inbound_message_text buffers native
-                    # image paths under the key it is given, and the recursive
-                    # _run_agent below consumes them under next_session_key.
-                    # The write and consume keys must match or the images drop.
-                    try:
-                        next_session_key = self._session_key_for_source(next_source)
-                    except Exception:
-                        logger.debug(
-                            "Queued follow-up session-key resolution failed; reusing %s",
-                            session_key or "?",
-                            exc_info=True,
+                        if next_message is None:
+                            followup_outcome = ProcessingOutcome.SUCCESS
+                            return result
+                        next_message_id = self._reply_anchor_for_event(pending_event)
+                        next_channel_prompt = getattr(
+                            pending_event, "channel_prompt", None
                         )
-                    next_message = await self._prepare_profile_scoped_inbound_message_text(
-                        event=pending_event,
-                        source=next_source,
-                        history=updated_history,
-                        session_key=next_session_key,
+
+                    # Restart typing indicator so the user sees activity while
+                    # the follow-up turn runs.
+                    _followup_adapter = self._adapter_for_source(source)
+                    if _followup_adapter:
+                        try:
+                            await _followup_adapter.send_typing(
+                                source.chat_id,
+                                metadata=_status_thread_metadata,
+                            )
+                        except Exception:
+                            pass
+
+                    # Re-baseline the cached agent's message_count snapshot
+                    # before recursing into the in-band queued follow-up.
+                    await self._refresh_agent_cache_message_count(
+                        session_key, session_id
                     )
-                    if next_message is None:
-                        return result
-                    next_message_id = self._reply_anchor_for_event(pending_event)
-                    next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
-                # Restart typing indicator so the user sees activity while
-                # the follow-up turn runs.  The outer _process_message_background
-                # typing task is still alive but may be stale.
-                _followup_adapter = self._adapter_for_source(source)
-                if _followup_adapter:
-                    try:
-                        await _followup_adapter.send_typing(
-                            source.chat_id,
-                            metadata=_status_thread_metadata,
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                    )
+                    direct_outcome = followup_result.get(_DIRECT_TURN_OUTCOME_KEY)
+                    if direct_outcome is not None:
+                        followup_outcome = ProcessingOutcome(direct_outcome)
+                    else:
+                        followup_outcome = _processing_outcome_for_agent_result(
+                            followup_result
                         )
-                    except Exception:
-                        pass
-
-                # Re-baseline the cached agent's message_count snapshot before
-                # recursing into the in-band queued (/queue) follow-up turn.
-                # The first turn has completed and flushed its own user +
-                # assistant rows to the SessionDB, so the cross-process
-                # coherence guard (#45966) — which this recursive _run_agent
-                # call re-enters — would otherwise see the grown on-disk count
-                # against the stale build-time snapshot and rebuild the agent
-                # on THIS process's OWN writes, destroying the prompt-cache
-                # prefix #46237 was merged to preserve.  The existing
-                # re-baseline in _handle_message_with_agent only runs after the
-                # whole _run_agent chain unwinds — too late for the in-band
-                # follow-up.  Use the same (session_key, session_id) the
-                # recursive call runs under so the snapshot matches exactly
-                # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
-
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                )
-                return _preserve_queued_followup_history_offset(result, followup_result)
+                    return _preserve_queued_followup_history_offset(
+                        result, followup_result
+                    )
+                except asyncio.CancelledError:
+                    followup_outcome = ProcessingOutcome.CANCELLED
+                    raise
+                finally:
+                    if pending_event is not None:
+                        await adapter._run_processing_hook(
+                            "on_processing_complete",
+                            pending_event,
+                            followup_outcome,
+                        )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:

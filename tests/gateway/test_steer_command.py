@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageDispatchDisposition, MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -101,10 +101,12 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
     running_agent.steer.return_value = True
     runner._running_agents[sk] = running_agent
 
-    result = await runner._handle_message(_make_event("/steer also check auth.log"))
+    event = _make_event("/steer also check auth.log")
+    result = await runner._handle_message(event)
 
     # The handler replied with a confirmation
     assert result is not None
+    assert event.dispatch_disposition is MessageDispatchDisposition.STEERED
     assert "steer" in result.lower() or "queued" in result.lower()
     # The agent's steer() was called with the payload (prefix stripped)
     running_agent.steer.assert_called_once_with("also check auth.log")
@@ -141,11 +143,14 @@ async def test_steer_with_pending_sentinel_falls_back_to_queue():
     sk = build_session_key(_make_source())
     runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
 
-    result = await runner._handle_message(
-        _make_event("/steer wait up", channel_context="[Thread context]\nAlice: earlier request")
+    event = _make_event(
+        "/steer wait up",
+        channel_context="[Thread context]\nAlice: earlier request",
     )
+    result = await runner._handle_message(event)
 
     assert result is not None
+    assert event.dispatch_disposition is MessageDispatchDisposition.PENDING_QUEUED
     assert "queued" in result.lower() or "starting" in result.lower()
     # The fallback put the full turn payload into the adapter's pending queue.
     assert sk in adapter._pending_messages
@@ -168,11 +173,14 @@ async def test_steer_agent_without_steer_method_falls_back():
     running_agent = MagicMock(spec=[])
     runner._running_agents[sk] = running_agent
 
-    result = await runner._handle_message(
-        _make_event("/steer fallback", channel_context="[Thread context]\nAlice: earlier request")
+    event = _make_event(
+        "/steer fallback",
+        channel_context="[Thread context]\nAlice: earlier request",
     )
+    result = await runner._handle_message(event)
 
     assert result is not None
+    assert event.dispatch_disposition is MessageDispatchDisposition.PENDING_QUEUED
     # Must mention queueing since steer wasn't available
     assert "queued" in result.lower()
     assert sk in adapter._pending_messages
@@ -194,9 +202,11 @@ async def test_steer_rejected_payload_returns_rejection_message():
     running_agent.steer.return_value = False
     runner._running_agents[sk] = running_agent
 
-    result = await runner._handle_message(_make_event("/steer hello"))
+    event = _make_event("/steer hello")
+    result = await runner._handle_message(event)
 
     assert result is not None
+    assert event.dispatch_disposition is MessageDispatchDisposition.SYNC_HANDLED
     assert "rejected" in result.lower() or "empty" in result.lower()
 
 

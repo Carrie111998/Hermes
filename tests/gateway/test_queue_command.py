@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageDispatchDisposition, MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -97,6 +97,7 @@ async def test_queue_text_only_queues_and_does_not_interrupt():
     result = await runner._handle_message(event)
 
     assert result is not None and "queued" in result.lower()
+    assert event.dispatch_disposition is MessageDispatchDisposition.PENDING_QUEUED
     running_agent.interrupt.assert_not_called()
     assert sk in adapter._pending_messages
     queued = adapter._pending_messages[sk]
@@ -203,6 +204,7 @@ async def test_queue_no_text_no_media_returns_usage():
     result = await runner._handle_message(event)
 
     assert result is not None and "Usage" in result
+    assert event.dispatch_disposition is MessageDispatchDisposition.SYNC_HANDLED
     assert adapter._pending_messages == {}
 
 

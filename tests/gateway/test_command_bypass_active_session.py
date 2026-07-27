@@ -17,7 +17,12 @@ import asyncio
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageDispatchDisposition,
+    MessageEvent,
+    MessageType,
+)
 from gateway.session import SessionSource, build_session_key
 
 
@@ -74,6 +79,40 @@ def _session_key(chat_id="12345"):
         platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"
     )
     return build_session_key(source)
+
+
+@pytest.mark.asyncio
+async def test_new_message_reports_background_lifecycle_owner():
+    adapter = _make_adapter()
+    adapter._start_session_processing = lambda _event, _session_key: True
+
+    result = await adapter.handle_message(_make_event("hello"))
+
+    assert result is MessageDispatchDisposition.BACKGROUND_STARTED
+
+
+@pytest.mark.asyncio
+async def test_failed_background_start_is_rejected():
+    adapter = _make_adapter()
+    adapter._start_session_processing = lambda _event, _session_key: False
+    event = _make_event("hello")
+
+    result = await adapter.handle_message(event)
+
+    assert result is MessageDispatchDisposition.REJECTED
+    assert event.metadata["dispatch_reject_reason"] == "dispatch_start_failed"
+
+
+@pytest.mark.asyncio
+async def test_missing_message_handler_reports_transport_unavailable():
+    adapter = _make_adapter()
+    adapter._message_handler = None
+    event = _make_event("hello")
+
+    result = await adapter.handle_message(event)
+
+    assert result is MessageDispatchDisposition.REJECTED
+    assert event.metadata["dispatch_reject_reason"] == "transport_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +194,9 @@ class TestCommandBypassActiveSession:
         sk = _session_key()
         adapter._active_sessions[sk] = asyncio.Event()
 
-        await adapter.handle_message(_make_event("/status"))
+        result = await adapter.handle_message(_make_event("/status"))
 
+        assert result is MessageDispatchDisposition.SYNC_HANDLED
         assert sk not in adapter._pending_messages
         assert any("handled:status" in r for r in adapter.sent_responses)
 
