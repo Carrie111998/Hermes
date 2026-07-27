@@ -278,3 +278,5 @@ recorded.
   recording to the organization executing the governed action.
 - `1799f65aebbc28e195e631a4f1dd9200cfd73ecb` — completed organization
   propagation across all governed verification paths.
+- `70ad7a0bbca351573c4b202e5ee80665866c1d3d` — bound external and scheduled
+  objective wakeups to their organization at enqueue time.
