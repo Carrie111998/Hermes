@@ -1,6 +1,5 @@
 import { QueryClient } from '@tanstack/react-query'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
-import { atom } from 'nanostores'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -8,27 +7,17 @@ import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 
-// Hoisted mocks — vi.mock factories run before static imports, so mutable
-// state must be declared with vi.hoisted() to survive the hoisting order.
-const { cwdFollowMock, cwdAtom } = vi.hoisted(() => ({
-  cwdFollowMock: vi.fn<(_: string) => Promise<void>>(async () => undefined),
-  cwdAtom: atom('')
+// Only mock @/store/projects — @/store/session is imported for real so
+// $currentCwd is a proper nanostores atom with .get() / .set() / .subscribe().
+const mocks = vi.hoisted(() => ({
+  cwdFollowMock: vi.fn<(_: string) => Promise<void>>(async () => undefined)
 }))
 
 vi.mock('@/store/projects', () => ({
-  followActiveSessionCwd: cwdFollowMock
+  followActiveSessionCwd: mocks.cwdFollowMock
 }))
 
-vi.mock('@/store/session', async () => {
-  const actual = await vi.importActual('@/store/session')
-
-  return {
-    ...actual,
-    $currentCwd: cwdAtom
-  }
-})
-
-import { setCurrentModel, setCurrentProvider } from '@/store/session'
+import { $currentCwd, setCurrentModel, setCurrentProvider } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
 import { useMessageStream } from './index'
@@ -181,8 +170,8 @@ describe('message.complete sidebar refresh coalescing', () => {
 
 describe('session.info cwd-follow guard', () => {
   beforeEach(() => {
-    cwdFollowMock.mockReset()
-    cwdAtom.set('')
+    mocks.cwdFollowMock.mockReset()
+    $currentCwd.set('')
   })
 
   it('does not follow the cwd on the first session.info after reconnect (initial learn)', async () => {
@@ -191,17 +180,17 @@ describe('session.info cwd-follow guard', () => {
     // Initial payload — cwd goes from '' to a real path. Must NOT follow.
     await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/foo' })
 
-    expect(cwdFollowMock).not.toHaveBeenCalled()
+    expect(mocks.cwdFollowMock).not.toHaveBeenCalled()
   })
 
   it('follows the cwd on a genuine move (non-empty → different non-empty)', async () => {
-    cwdAtom.set('/Users/test/projects/foo')
+    $currentCwd.set('/Users/test/projects/foo')
 
     await mountStream()
 
     // Genuine move — cwd changes from one non-empty path to another. Must follow.
     await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/bar' })
 
-    expect(cwdFollowMock).toHaveBeenCalledWith('/Users/test/projects/bar')
+    expect(mocks.cwdFollowMock).toHaveBeenCalledWith('/Users/test/projects/bar')
   })
 })
