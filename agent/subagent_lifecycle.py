@@ -23,7 +23,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from typing import Any, Callable, Mapping, Optional
 
 
-PUBLIC_CONTRACT_VERSION = 2
+PUBLIC_CONTRACT_VERSION = 3
 _MAX_GOAL_CHARS = 16_000
 _MAX_CONTEXT_CHARS = 32_000
 _MAX_METADATA_BYTES = 8_192
@@ -95,6 +95,27 @@ class SubagentHandle:
 
 
 @dataclasses.dataclass(frozen=True)
+class SubagentCompletionHandle:
+    """Opaque authority for one manually produced durable completion."""
+
+    contract_version: int
+    delegation_id: str
+    parent_session_id: Optional[str]
+    created_at: float
+    capability: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SubagentCompletionHandle":
+        try:
+            return cls(**dict(value))
+        except (TypeError, ValueError) as exc:
+            raise SubagentLifecycleError("Malformed completion handle.") from exc
+
+
+@dataclasses.dataclass(frozen=True)
 class SubagentStatus:
     handle: SubagentHandle
     state: SubagentState
@@ -158,6 +179,9 @@ class _Record:
         default=None, repr=False, compare=False
     )
     last_progress_monotonic: Optional[float] = None
+    delivery_route: Mapping[str, Any] = dataclasses.field(
+        default_factory=dict, repr=False, compare=False
+    )
 
 
 class _Registry:
@@ -212,6 +236,166 @@ class SubagentLifecycleService:
     def contract_version(self) -> int:
         """Return the exact public lifecycle contract implemented by this host."""
         return PUBLIC_CONTRACT_VERSION
+
+    @staticmethod
+    def _capture_delivery_route(parent: Any) -> dict[str, Any]:
+        """Capture the current durable outbox route without retaining prompt data."""
+        parent_session_id = str(getattr(parent, "session_id", "") or "") or None
+        try:
+            from tools.approval import get_current_session_key
+
+            session_key = get_current_session_key(default="")
+        except Exception:
+            session_key = ""
+        origin_ui_session_id = ""
+        try:
+            from gateway.session_context import (
+                async_delivery_supported,
+                get_session_env,
+            )
+
+            origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+            async_supported = bool(async_delivery_supported())
+        except Exception:
+            async_supported = True
+            origin_ui_session_id = ""
+        if parent_session_id:
+            session_key = parent_session_id
+        from tools.async_delegation import _current_origin_session_id
+
+        origin_session_id = _current_origin_session_id()
+        return {
+            "session_key": session_key,
+            "parent_session_id": parent_session_id,
+            "origin_ui_session_id": origin_ui_session_id,
+            "origin_session_id": origin_session_id,
+            "deliverable": async_supported or bool(origin_session_id),
+        }
+
+    def register_completion_delivery(
+        self,
+        *,
+        goal: str,
+        context: Optional[str] = None,
+        role: str = "leaf",
+        model: Optional[str] = None,
+        toolsets: Optional[tuple[str, ...]] = None,
+    ) -> SubagentCompletionHandle:
+        """Capture the current origin and register one durable manual producer.
+
+        Plugins use this for work whose real terminal is outside the child
+        runner. Completion later enters the same claim/retry/restore queue as
+        ``delegate_task`` and remains pinned to this captured origin even after
+        an unrelated conversation becomes active.
+        """
+        parent = self._parent_agent_resolver()
+        if parent is None:
+            raise SubagentLifecycleError(
+                "No active Hermes parent session is available."
+            )
+        self._validate_completion_registration(
+            goal=goal,
+            context=context,
+            role=role,
+            model=model,
+            toolsets=toolsets,
+        )
+        route = self._capture_delivery_route(parent)
+        parent_session_id = route["parent_session_id"]
+        if not route["deliverable"]:
+            raise SubagentLifecycleError(
+                "This session cannot receive a detached durable completion."
+            )
+
+        from tools.async_delegation import register_external_delegation
+
+        receipt = register_external_delegation(
+            goal=goal,
+            context=context,
+            toolsets=list(toolsets) if toolsets else None,
+            role=role,
+            model=model,
+            session_key=str(route["session_key"] or ""),
+            parent_session_id=parent_session_id,
+            origin_ui_session_id=str(route["origin_ui_session_id"] or ""),
+            origin_session_id=str(route["origin_session_id"] or ""),
+        )
+        delegation_id = str(receipt.get("delegation_id") or "")
+        if receipt.get("status") != "registered" or not delegation_id:
+            raise SubagentLifecycleError("Completion delivery registration failed.")
+        created_at = time.time()
+        return SubagentCompletionHandle(
+            contract_version=PUBLIC_CONTRACT_VERSION,
+            delegation_id=delegation_id,
+            parent_session_id=parent_session_id,
+            created_at=created_at,
+            capability=self._completion_capability(
+                delegation_id, parent_session_id, created_at
+            ),
+        )
+
+    def publish_completion(
+        self,
+        handle: SubagentCompletionHandle,
+        *,
+        status: str,
+        summary: Optional[str],
+        error: Optional[str] = None,
+        api_calls: int = 0,
+        duration_seconds: Optional[float] = None,
+        exit_reason: Optional[str] = None,
+    ) -> bool:
+        """Persist and enqueue one completion; duplicate publication is false."""
+        self._validate_completion_handle(handle)
+        if status not in {"completed", "error", "interrupted", "cancelled", "unknown"}:
+            raise SubagentLifecycleError("Unsupported completion status.")
+        for name, value in (
+            ("summary", summary),
+            ("error", error),
+            ("exit_reason", exit_reason),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or len(value) > _MAX_RESULT_CHARS
+            ):
+                raise SubagentLifecycleError(
+                    f"{name} must be a string of at most {_MAX_RESULT_CHARS} characters."
+                )
+        if (
+            not isinstance(api_calls, int)
+            or isinstance(api_calls, bool)
+            or api_calls < 0
+        ):
+            raise SubagentLifecycleError("api_calls must be a non-negative integer.")
+        if duration_seconds is not None and (
+            not isinstance(duration_seconds, (int, float))
+            or isinstance(duration_seconds, bool)
+            or not math.isfinite(float(duration_seconds))
+            or duration_seconds < 0
+        ):
+            raise SubagentLifecycleError(
+                "duration_seconds must be finite and non-negative."
+            )
+
+        from tools.async_delegation import complete_external_delegation
+
+        return complete_external_delegation(
+            handle.delegation_id,
+            status=status,
+            summary=summary,
+            error=error,
+            api_calls=api_calls,
+            duration_seconds=None
+            if duration_seconds is None
+            else float(duration_seconds),
+            exit_reason=exit_reason,
+        )
+
+    def discard_completion_delivery(self, handle: SubagentCompletionHandle) -> bool:
+        """Discard a registration only while it is still uncompleted."""
+        self._validate_completion_handle(handle)
+        from tools.async_delegation import discard_external_delegation
+
+        return discard_external_delegation(handle.delegation_id)
 
     def launch(self, request: SubagentLaunchRequest) -> SubagentHandle:
         parent = self._parent_agent_resolver()
@@ -282,6 +466,7 @@ class SubagentLifecycleService:
             agent=child,
             parent_agent=parent if request.on_terminal is not None else None,
             on_terminal=request.on_terminal,
+            delivery_route=self._capture_delivery_route(parent),
         )
         # Attach only after every public handle/record field is safely constructed.
         # The value is absent from prompts, model config, metadata, and repr output.
@@ -426,6 +611,72 @@ class SubagentLifecycleService:
             return None
         return getattr(agent, _PRIVATE_CONTEXT_ATTR, None)
 
+    def publish_notification(
+        self,
+        summary: str,
+        *,
+        dedupe_key: str,
+        priority: bool = False,
+    ) -> bool:
+        """Durably enqueue one bounded child milestone pinned to its origin."""
+        if not isinstance(summary, str):
+            raise SubagentLifecycleError("Progress summary must be a string.")
+        clean = " ".join(summary.split())
+        if not clean or len(clean) > _MAX_PROGRESS_CHARS:
+            raise SubagentLifecycleError(
+                "Progress summary must contain 1 to 500 visible characters."
+            )
+        if not isinstance(dedupe_key, str) or not 1 <= len(dedupe_key) <= 200:
+            raise SubagentLifecycleError("dedupe_key must contain 1 to 200 characters.")
+        if not isinstance(priority, bool):
+            raise SubagentLifecycleError("priority must be a boolean.")
+        agent = get_active_subagent_parent()
+        subagent_id = str(getattr(agent, "_subagent_id", "") or "")
+        if not subagent_id:
+            return False
+        now = time.monotonic()
+        with _REGISTRY.lock:
+            record = _REGISTRY.records.get(subagent_id)
+            if (
+                record is None
+                or record.agent is not agent
+                or record.state not in {SubagentState.STARTING, SubagentState.RUNNING}
+            ):
+                return False
+            if (
+                not priority
+                and record.last_progress_monotonic is not None
+                and now - record.last_progress_monotonic
+                < _MIN_PROGRESS_INTERVAL_SECONDS
+            ):
+                return False
+            route = dict(record.delivery_route)
+            model = record.handle.model
+        if not route.get("deliverable"):
+            return False
+        try:
+            from tools.async_delegation import publish_external_notification
+
+            accepted = publish_external_notification(
+                summary=clean,
+                dedupe_key=dedupe_key,
+                session_key=str(route.get("session_key") or ""),
+                parent_session_id=route.get("parent_session_id"),
+                origin_ui_session_id=str(route.get("origin_ui_session_id") or ""),
+                origin_session_id=str(route.get("origin_session_id") or ""),
+                model=model,
+            )
+        except Exception:
+            logger.debug("Durable subagent notification failed", exc_info=True)
+            return False
+        if not accepted:
+            return False
+        with _REGISTRY.lock:
+            current = _REGISTRY.records.get(subagent_id)
+            if current is record:
+                current.last_progress_monotonic = now
+        return True
+
     def publish_progress(self, summary: str, *, priority: bool = False) -> bool:
         """Relay one bounded child milestone to its origin display callback.
 
@@ -465,7 +716,7 @@ class SubagentLifecycleService:
                 return False
             record.last_progress_monotonic = now
         try:
-            callback("subagent_progress", clean)
+            callback("subagent.progress", clean)
         except Exception:
             logger.debug("Subagent progress callback failed", exc_info=True)
             return False
@@ -634,6 +885,67 @@ class SubagentLifecycleService:
     ) -> str:
         value = f"{subagent_id}|{parent_session_id or ''}|{created_at:.6f}".encode()
         return hmac.new(_SECRET, value, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _completion_capability(
+        delegation_id: str, parent_session_id: Optional[str], created_at: float
+    ) -> str:
+        value = (
+            f"completion|{delegation_id}|{parent_session_id or ''}|{created_at:.6f}"
+        ).encode()
+        return hmac.new(_SECRET, value, hashlib.sha256).hexdigest()
+
+    @classmethod
+    def _validate_completion_handle(cls, handle: SubagentCompletionHandle) -> None:
+        if (
+            not isinstance(handle, SubagentCompletionHandle)
+            or handle.contract_version != PUBLIC_CONTRACT_VERSION
+            or not isinstance(handle.delegation_id, str)
+            or not handle.delegation_id.startswith("deleg_")
+            or len(handle.delegation_id) > 120
+            or not isinstance(handle.created_at, (int, float))
+            or not math.isfinite(float(handle.created_at))
+            or not isinstance(handle.capability, str)
+        ):
+            raise SubagentLifecycleError("Malformed completion handle.")
+        expected = cls._completion_capability(
+            handle.delegation_id, handle.parent_session_id, float(handle.created_at)
+        )
+        if not hmac.compare_digest(handle.capability, expected):
+            raise SubagentLifecycleError("Invalid completion handle capability.")
+
+    @staticmethod
+    def _validate_completion_registration(
+        *,
+        goal: str,
+        context: Optional[str],
+        role: str,
+        model: Optional[str],
+        toolsets: Optional[tuple[str, ...]],
+    ) -> None:
+        if not isinstance(goal, str) or not goal.strip() or len(goal) > _MAX_GOAL_CHARS:
+            raise SubagentLifecycleError(
+                "goal must be a non-empty string of at most 16000 characters."
+            )
+        if context is not None and (
+            not isinstance(context, str) or len(context) > _MAX_CONTEXT_CHARS
+        ):
+            raise SubagentLifecycleError(
+                "context must be a string of at most 32000 characters."
+            )
+        if role not in {"leaf", "orchestrator"}:
+            raise SubagentLifecycleError("role must be 'leaf' or 'orchestrator'.")
+        if model is not None and (not isinstance(model, str) or len(model) > 500):
+            raise SubagentLifecycleError(
+                "model must be a string of at most 500 characters."
+            )
+        if toolsets is not None and (
+            not isinstance(toolsets, tuple)
+            or any(not isinstance(item, str) or not item for item in toolsets)
+        ):
+            raise SubagentLifecycleError(
+                "toolsets must be a tuple of non-empty strings."
+            )
 
     @staticmethod
     def _validate_request(request: SubagentLaunchRequest, parent: Any) -> None:

@@ -351,9 +351,103 @@ def test_publish_progress_is_bounded_rate_limited_and_priority_can_bypass(monkey
     assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
     assert receipts == [True, False, True]
     assert [call[0] for call in relayed] == [
-        ("subagent_progress", "first milestone"),
-        ("subagent_progress", "owner gate"),
+        ("subagent.progress", "first milestone"),
+        ("subagent.progress", "owner gate"),
     ]
+
+
+def test_durable_notification_is_origin_routed_idempotent_and_restorable(
+    tmp_path, monkeypatch
+):
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported", lambda: True
+    )
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    receipts = []
+    publish_finished = threading.Event()
+    publish_errors = []
+    original_publish = ad.publish_external_notification
+
+    def observable_publish(**kwargs):
+        try:
+            return original_publish(**kwargs)
+        except Exception as exc:
+            publish_errors.append(repr(exc))
+            raise
+
+    monkeypatch.setattr(ad, "publish_external_notification", observable_publish)
+    current_parent = {
+        "value": SimpleNamespace(
+            session_id="origin-milestone", enabled_toolsets=["file"]
+        )
+    }
+    service = SubagentLifecycleService(lambda: current_parent["value"])
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent",
+        lambda **_kwargs: FakeChild("sa-durable-milestone"),
+    )
+
+    def run(_index, _goal, running_child, _parent):
+        with bind_subagent_parent(running_child):
+            current_parent["value"] = SimpleNamespace(
+                session_id="unrelated-current-turn", enabled_toolsets=["file"]
+            )
+            receipts.append(
+                service.publish_notification(
+                    "safe durable milestone",
+                    dedupe_key="native-job:cursor-7",
+                    priority=True,
+                )
+            )
+            receipts.append(
+                service.publish_notification(
+                    "safe durable milestone",
+                    dedupe_key="native-job:cursor-7",
+                    priority=True,
+                )
+            )
+            current_parent["value"] = SimpleNamespace(
+                session_id="origin-milestone", enabled_toolsets=["file"]
+            )
+            publish_finished.set()
+        return {
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", run)
+    try:
+        handle = service.launch(
+            SubagentLaunchRequest(goal="private child prompt sentinel")
+        )
+        assert publish_finished.wait(1)
+        assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
+        assert receipts == [True, True], publish_errors
+        assert ad.active_count() == 0
+        event = process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "safe durable milestone"
+        assert event["parent_session_id"] == "origin-milestone"
+        assert event["session_key"] == "origin-milestone"
+        assert process_registry.completion_queue.empty()
+        durable = ad.get_durable_delegation(event["delegation_id"])
+        assert durable["state"] == "completed"
+        assert durable["delivery_state"] == "pending"
+        assert "private child prompt sentinel" not in str(durable)
+        restored = __import__("queue").Queue()
+        assert ad.restore_undelivered_completions(restored) == 1
+        assert restored.get_nowait()["delegation_id"] == event["delegation_id"]
+        assert restored.empty()
+    finally:
+        ad._reset_for_tests()
 
 
 def test_terminal_callback_can_relaunch_on_same_parent_without_active_turn(monkeypatch):
@@ -406,3 +500,119 @@ def test_terminal_callback_can_relaunch_on_same_parent_without_active_turn(monke
     assert second.subagent_id != first.subagent_id
     assert second.parent_session_id == first.parent_session_id
     assert service.wait(second, timeout_seconds=1).state is SubagentState.SUCCEEDED
+
+
+def test_manual_completion_delivery_is_durable_routed_and_exactly_once(
+    tmp_path, monkeypatch
+):
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    try:
+        current_parent = {
+            "value": SimpleNamespace(
+                session_id="origin-delivery", enabled_toolsets=["file"]
+            )
+        }
+        service = SubagentLifecycleService(lambda: current_parent["value"])
+        delivery = service.register_completion_delivery(
+            goal="deliver one native terminal",
+            context="bounded public context",
+            role="leaf",
+            model="test-model",
+            toolsets=("file",),
+        )
+        assert ad.active_count() == 1
+
+        # A different conversation/turn can become active before the producer ends;
+        # the terminal must retain the origin captured at registration time.
+        current_parent["value"] = SimpleNamespace(
+            session_id="unrelated-current-turn", enabled_toolsets=["file"]
+        )
+        assert (
+            service.publish_completion(
+                delivery,
+                status="completed",
+                summary="native terminal result",
+                api_calls=2,
+                duration_seconds=1.25,
+            )
+            is True
+        )
+        assert (
+            service.publish_completion(
+                delivery,
+                status="completed",
+                summary="duplicate must not enqueue",
+            )
+            is False
+        )
+        assert ad.active_count() == 0
+
+        event = process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "native terminal result"
+        assert event["parent_session_id"] == "origin-delivery"
+        assert event["session_key"] == "origin-delivery"
+        assert process_registry.completion_queue.empty()
+
+        durable = ad.get_durable_delegation(delivery.delegation_id)
+        assert durable["state"] == "completed"
+        assert durable["delivery_state"] == "pending"
+
+        restored = __import__("queue").Queue()
+        assert ad.restore_undelivered_completions(restored) == 1
+        assert restored.get_nowait()["delegation_id"] == delivery.delegation_id
+        assert restored.empty()
+    finally:
+        ad._reset_for_tests()
+
+
+def test_manual_completion_delivery_discard_removes_only_running_registration(
+    tmp_path, monkeypatch
+):
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    try:
+        parent = SimpleNamespace(session_id="origin-discard", enabled_toolsets=["file"])
+        service = SubagentLifecycleService(lambda: parent)
+        handle = service.register_completion_delivery(goal="external work")
+        assert ad.active_count() == 1
+        assert service.discard_completion_delivery(handle) is True
+        assert service.discard_completion_delivery(handle) is False
+        assert ad.active_count() == 0
+        assert ad.get_durable_delegation(handle.delegation_id) is None
+        assert process_registry.completion_queue.empty()
+    finally:
+        ad._reset_for_tests()
+
+
+def test_manual_completion_delivery_fails_closed_without_a_routable_session(
+    tmp_path, monkeypatch
+):
+    from gateway import session_context
+    from tools import async_delegation as ad
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: False)
+    monkeypatch.setattr(ad, "_current_origin_session_id", lambda: "")
+    ad._reset_for_tests()
+    try:
+        parent = SimpleNamespace(session_id="finite-worker", enabled_toolsets=["file"])
+        service = SubagentLifecycleService(lambda: parent)
+        with pytest.raises(
+            SubagentLifecycleError,
+            match="cannot receive a detached durable completion",
+        ):
+            service.register_completion_delivery(goal="unroutable external work")
+        assert ad.active_count() == 0
+    finally:
+        ad._reset_for_tests()
