@@ -133,6 +133,30 @@ class TestDetectToolFailureStructured:
         is_failure, _ = _detect_tool_failure("web_search", result)
         assert is_failure is False
 
+    def test_nested_null_error_is_not_failure(self):
+        result = json.dumps({
+            "results": [{
+                "url": "https://example.com",
+                "title": "Example Domain",
+                "content": "ok",
+                "error": None,
+            }]
+        })
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
+    def test_nested_real_error_is_failure_with_message(self):
+        result = json.dumps({
+            "results": [{
+                "url": "https://broken.example",
+                "content": "",
+                "error": "reader timed out",
+            }]
+        })
+        assert _detect_tool_failure("web_extract", result) == (
+            True,
+            " [reader timed out]",
+        )
+
 
 class TestGetCuteToolMessageFailureSuffix:
     """End-to-end: failure suffix is appended by get_cute_tool_message."""
