@@ -1,7 +1,9 @@
 /**
- * Unit tests for the pure window-state geometry helpers. These cover the logic
- * that protects the user: garbage rejection, off-screen fallback, oversized
- * clamping, and the debounce that collapses mid-drag write storms.
+ * Unit tests for the pure window-state helpers. These cover the logic that
+ * protects the user: garbage rejection, off-screen fallback, oversized
+ * clamping, the debounce that collapses mid-drag write storms, and the
+ * destroyed-window guards that keep a window torn down mid-boot from throwing
+ * out of the ready payload.
  */
 
 import assert from 'node:assert/strict'
@@ -13,10 +15,13 @@ import {
   debounce,
   DEFAULT_HEIGHT,
   DEFAULT_WIDTH,
+  isWindowLive,
   MIN_HEIGHT,
   MIN_WIDTH,
   onScreen,
-  sanitizeWindowState
+  sanitizeWindowState,
+  windowButtonPosition,
+  windowChromeState
 } from './window-state'
 
 // A single 1920×1080 monitor (work area trimmed for the taskbar).
@@ -154,4 +159,90 @@ test('debounce.flush runs now and cancels the pending timer', () => {
   assert.equal(calls, 1)
 
   vi.useRealTimers()
+})
+
+// ─── destroyed-window guards ───────────────────────────────────────────────
+
+const FALLBACK_BUTTON_POSITION = { x: 24, y: 10 }
+
+// A window that is up: every accessor answers normally.
+const liveWindow = () => ({
+  isDestroyed: () => false,
+  isFullScreen: () => true,
+  isMinimized: () => false,
+  isVisible: () => true,
+  getWindowButtonPosition: () => ({ x: 12, y: 6 })
+})
+
+// What Electron actually hands back after destroy(): the JS wrapper survives and
+// still exposes every method, but the native binding behind each one throws.
+// This is the shape that produced #38468 — `win?.isFullScreen?.()` finds the
+// method, invokes it, and the TypeError escapes getWindowState().
+const destroyedWindow = () => {
+  const destroyed = () => {
+    throw new TypeError('Object has been destroyed')
+  }
+
+  return {
+    isDestroyed: () => true,
+    isFullScreen: destroyed,
+    isMinimized: destroyed,
+    isVisible: destroyed,
+    getWindowButtonPosition: destroyed
+  }
+}
+
+test('isWindowLive is true only for a window that answers isDestroyed() false', () => {
+  assert.equal(isWindowLive(liveWindow()), true)
+  assert.equal(isWindowLive(destroyedWindow()), false)
+  assert.equal(isWindowLive(undefined), false)
+  assert.equal(isWindowLive(null), false)
+  // No isDestroyed() to probe (a plain stand-in) — treat as not live rather than
+  // assuming the rest of the surface is safe to call.
+  assert.equal(isWindowLive({}), false)
+})
+
+test('windowChromeState passes a live window through unchanged', () => {
+  assert.deepEqual(windowChromeState(liveWindow()), {
+    isFullscreen: true,
+    isMinimized: false,
+    isVisible: true
+  })
+})
+
+test('windowChromeState reports all-false for an absent or partial window', () => {
+  const allFalse = { isFullscreen: false, isMinimized: false, isVisible: false }
+
+  assert.deepEqual(windowChromeState(undefined), allFalse)
+  assert.deepEqual(windowChromeState(null), allFalse)
+  assert.deepEqual(windowChromeState({}), allFalse)
+})
+
+test('windowChromeState reports all-false for a destroyed window instead of throwing', () => {
+  // Regression for #38468: "Desktop boot failed: Object has been destroyed at
+  // getWindowState()". A destroyed window must degrade, not crash the boot
+  // payload it is spread into.
+  assert.deepEqual(windowChromeState(destroyedWindow()), {
+    isFullscreen: false,
+    isMinimized: false,
+    isVisible: false
+  })
+})
+
+test('windowButtonPosition passes a live window through unchanged', () => {
+  assert.deepEqual(windowButtonPosition(liveWindow(), FALLBACK_BUTTON_POSITION), { x: 12, y: 6 })
+})
+
+test('windowButtonPosition falls back for absent, partial, and destroyed windows', () => {
+  assert.equal(windowButtonPosition(undefined, FALLBACK_BUTTON_POSITION), FALLBACK_BUTTON_POSITION)
+  assert.equal(windowButtonPosition(null, FALLBACK_BUTTON_POSITION), FALLBACK_BUTTON_POSITION)
+  assert.equal(windowButtonPosition({}, FALLBACK_BUTTON_POSITION), FALLBACK_BUTTON_POSITION)
+  assert.equal(windowButtonPosition(destroyedWindow(), FALLBACK_BUTTON_POSITION), FALLBACK_BUTTON_POSITION)
+})
+
+test('windowButtonPosition keeps the pre-guard fallback for a live window with no position', () => {
+  // Preserves the old `|| WINDOW_BUTTON_POSITION` behaviour on platforms where
+  // the window has no traffic lights to report.
+  const noPosition = { ...liveWindow(), getWindowButtonPosition: () => undefined }
+  assert.equal(windowButtonPosition(noPosition, FALLBACK_BUTTON_POSITION), FALLBACK_BUTTON_POSITION)
 })

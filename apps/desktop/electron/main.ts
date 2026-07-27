@@ -182,9 +182,12 @@ import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-market
 import {
   computeWindowOptions,
   debounce,
+  isWindowLive,
   sanitizeWindowState,
   MIN_HEIGHT as WINDOW_MIN_HEIGHT,
-  MIN_WIDTH as WINDOW_MIN_WIDTH
+  MIN_WIDTH as WINDOW_MIN_WIDTH,
+  windowButtonPosition,
+  windowChromeState
 } from './window-state'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 import {
@@ -4929,18 +4932,23 @@ function getWindowButtonPosition() {
     return null
   }
 
-  return mainWindow?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
+  // `mainWindow?.` is not enough: mainWindow is only cleared on 'closed', which
+  // fires after destroy(), so the wrapper stays truthy for a window whose native
+  // side is already gone and calling through it throws.
+  return windowButtonPosition(mainWindow, WINDOW_BUTTON_POSITION)
 }
 
 function getNativeOverlayWidth() {
   return computeNativeOverlayWidth({ isWindows: IS_WINDOWS, isWsl: IS_WSL, isMac: IS_MAC })
 }
 
+// Spread into the ready/IPC payloads the renderer boots on, so a throw here is
+// what surfaces as "Desktop boot failed: Object has been destroyed" (#38468).
+// windowChromeState() reports the same three booleans a live window always
+// reported, and all-false for one that is absent or already destroyed.
 function getWindowState(win = mainWindow) {
   return {
-    isFullscreen: Boolean(win?.isFullScreen?.()),
-    isMinimized: Boolean(win?.isMinimized?.()),
-    isVisible: Boolean(win?.isVisible?.()),
+    ...windowChromeState(win),
     nativeOverlayWidth: getNativeOverlayWidth(),
     windowButtonPosition: getWindowButtonPosition()
   }
@@ -9574,7 +9582,13 @@ ipcMain.handle('hermes:profile:set', async (_event, name) => {
   // new HERMES_HOME. Pool backends keep their own homes, so only the primary
   // is torn down.
   await teardownPrimaryBackendAndWait()
-  mainWindow?.reload()
+
+  // Same destroyed-window hazard as getWindowState(): the teardown is awaited,
+  // so the window can be gone by the time we get here and `?.` would still call
+  // reload() on the dead wrapper.
+  if (isWindowLive(mainWindow)) {
+    mainWindow.reload()
+  }
 
   return { profile: next }
 })
