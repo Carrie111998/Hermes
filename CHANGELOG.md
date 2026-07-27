@@ -290,3 +290,5 @@ recorded.
   evidence and semantic-release documentation posture.
 - `a36c4c746260fc4add0115c93f5deffc3d175a88` — rejected applicability and
   obligation records for unknown or retired compliance regimes.
+- `540b1f1054461929f6d749d1420290204e740c3e` — rejected already-expired
+  compliance control evidence at admission time.

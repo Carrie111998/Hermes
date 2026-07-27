@@ -215,6 +215,8 @@ email, approvals, operational control, hiring, portfolio, accounting,
 procurement, metered billing, and usage billing passed **76 tests, 0 failed**.
 Compliance registry admission regressions passed 8 tests, including rejection
 of unknown and retired regimes.
+Control-evidence admission now rejects stale expiry and passed the compliance
+regression suite.
 Business-commitment fulfillment is organization-bound and passed its focused
 regression, including cross-tenant rejection.
 Tax filing and payment mutations are organization-bound and passed the
