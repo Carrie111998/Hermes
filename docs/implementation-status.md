@@ -15,6 +15,9 @@ acceptance evidence.
   active runtime.
 - `business payment-rails --check` provides a read-only non-zero health signal
   when a discovered inbound or outbound rail lacks credential readiness.
+- Independent artifact/container CI validates the isolated installer, image
+  startup, and both Linux and Windows Compose deployment definitions; registry
+  publication remains intentionally separate.
 - Permit resource scope is derived from the immutable action payload; an
   explicitly supplied target must match exactly, preventing path/resource
   retargeting between authorization and execution.
