@@ -111,6 +111,13 @@ def _ungate_plus_refspec_push(src: str) -> str:
     return _sub(src, target, "")
 
 
+def _unprotect_env_writes(src: str) -> str:
+    """Upstream drops the write-side .env check; secrets clobberable again."""
+    target = next(l for l in src.split(chr(10))
+                  if "_BLOCKED_PROJECT_ENV_BASENAMES" in l and "basename" in l)
+    return _sub(src, target, "    if False:")
+
+
 SCENARIOS: List[Scenario] = [
     Scenario("drop-user_message-kwarg",
              "upstream refactors the hook call; feedback-gate silently stops firing",
@@ -148,6 +155,9 @@ SCENARIOS: List[Scenario] = [
     Scenario("ungate-plus-refspec-push",
              "merge drops the +refspec pattern; force push auto-approves again",
              REPO / "tools" / "approval.py", _ungate_plus_refspec_push),
+    Scenario("unprotect-env-writes",
+             "merge drops the .env write check; live credentials clobberable again",
+             REPO / "agent" / "file_safety.py", _unprotect_env_writes),
 ]
 
 

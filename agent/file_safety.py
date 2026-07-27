@@ -103,6 +103,16 @@ def _classify_write_denial(path: str) -> Optional[str]:
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
+    # A project .env is read-blocked (get_read_block_error) but was never
+    # write-blocked, so the agent could not READ your secrets but could silently
+    # REPLACE them. "add a STRIPE_KEY to .env" naturally becomes a single
+    # write_file(".env", "STRIPE_KEY=...") that overwrites DATABASE_URL, live
+    # keys and OAuth secrets with one line — while the identical `echo > .env`
+    # in the terminal tool is classified dangerous and gated. Same set, same
+    # answer, both directions.
+    if os.path.basename(resolved).lower() in _BLOCKED_PROJECT_ENV_BASENAMES:
+        return "credential"
+
     if resolved in build_write_denied_paths(home):
         return "credential"
     for prefix in build_write_denied_prefixes(home):

@@ -384,3 +384,25 @@ def test_force_push_gated_including_plus_refspec():
     assert flagged("git push -f origin main")
     assert flagged("git push origin +main"), "the +refspec spelling is ungated again"
     assert not flagged("git push origin main"), "ordinary push must not be gated"
+
+
+# ── 12. .env must be write-protected, not only read-protected (H-25) ─────────
+
+def test_project_env_is_write_denied_not_only_read_denied():
+    """The asymmetry was the bug: the agent could not READ your .env but could
+    silently REPLACE it, destroying live credentials with no prompt."""
+    import tempfile
+    from agent.file_safety import _classify_write_denial, get_read_block_error
+
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, ".env")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("DATABASE_URL=postgres://real\n")
+
+    assert bool(get_read_block_error(p)), "read protection regressed"
+    assert bool(_classify_write_denial(p)), "write protection regressed — .env is clobberable"
+    # templates must stay writable or the agent routes around the gate
+    tmpl = os.path.join(d, ".env.example")
+    with open(tmpl, "w", encoding="utf-8") as fh:
+        fh.write("X=1\n")
+    assert _classify_write_denial(tmpl) is None
