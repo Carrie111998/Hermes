@@ -104,7 +104,14 @@ def test_dispatch_selection_is_queued_only_and_does_not_own_created(tmp_path):
     assert [task["task_id"] for task in eligible] == ["task-queued"]
     assert all(task["task_id"] != "task-created" for task in eligible + skipped)
     assert claim_task_for_dispatch(db_path, "task-created") is None
-    assert claim_task_for_dispatch(db_path, "task-queued") == {}
+    # A claim on a queued task succeeds and returns the restore snapshot. This
+    # used to assert `== {}` — the bare pre-claim runtime, which happens to be
+    # empty for this fixture. The snapshot now carries status as well, because
+    # release_dispatch_claim has to put the row back as it was and runtime alone
+    # cannot say what status to restore. The contract this test is named for —
+    # queued-only, never owns `created` — is unchanged above.
+    snapshot = claim_task_for_dispatch(db_path, "task-queued")
+    assert snapshot == {"status": "queued", "runtime": {}}
 
 
 def test_cursor_startup_baseline_never_replays_backlog(tmp_path):

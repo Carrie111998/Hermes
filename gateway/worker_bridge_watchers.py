@@ -75,6 +75,11 @@ _STATUS_SKIP_REASONS = {
 _DEP_SATISFIED_STATUSES = ("succeeded", "accepted")
 
 _DISPATCH_CLAIM_TTL_SECONDS = 120.0
+# Runtime key marking a task claimed by one gateway process for dispatch.
+_DISPATCH_CLAIM_KEY = "dispatch_claim"
+# Pre-rename spelling, still honoured on read so an upgrade cannot double
+# dispatch a task claimed moments before it. Never written.
+_LEGACY_DISPATCH_CLAIM_KEY = "gateway_dispatch_claim"
 def resolve_bridge_db_path() -> Path:
     """Locate the worker bridge SQLite store."""
     from hermes_constants import get_hermes_home
@@ -496,7 +501,13 @@ def _dependencies_satisfied(conn: Any, spec: dict) -> bool:
 
 
 def _dispatch_claim_is_live(runtime: dict) -> bool:
-    claim = runtime.get("gateway_dispatch_claim")
+    claim = runtime.get(_DISPATCH_CLAIM_KEY)
+    if not isinstance(claim, dict):
+        # Rows claimed by a pre-rename gateway. Read-only compatibility: without
+        # it, an upgrade lands mid-claim and the next tick sees an unclaimed
+        # task and dispatches a second runner. Only ever read, never written, so
+        # it ages out with the 120 s TTL.
+        claim = runtime.get(_LEGACY_DISPATCH_CLAIM_KEY)
     if not isinstance(claim, dict):
         return False
     try:
@@ -523,28 +534,65 @@ def claim_task_for_dispatch(db_path: Path, task_id: str) -> Optional[dict]:
             conn.rollback()
             return None
         claimed = dict(original)
-        claimed["gateway_dispatch_claim"] = {"pid": os.getpid(), "at": time.time()}
+        claimed[_DISPATCH_CLAIM_KEY] = {"pid": os.getpid(), "at": time.time()}
         conn.execute(
             "UPDATE tasks SET runtime=?, updated_at=? "
             "WHERE task_id=? AND status='queued'",
             (json.dumps(claimed, sort_keys=True), time.time(), task_id),
         )
         conn.commit()
-        return original
+        # Snapshot carries the status too: release has to restore the row as it
+        # was, and runtime alone cannot say what status to put back.
+        return {"status": row["status"], "runtime": original}
     finally:
         conn.close()
 
 
 def release_dispatch_claim(
-    db_path: Path, task_id: str, original: dict
+    db_path: Path, task_id: str, original: Optional[dict]
 ) -> None:
+    """Undo a claim, unless a real runner has since taken the task.
+
+    Called when the spawn failed, so the claim must not be left behind. But
+    "spawn raised" does not mean "nothing started" — a runner can stamp its pid
+    and then have the call fail. Blindly restoring the snapshot in that window
+    erased a live runner's pid and left the task looking unclaimed to the next
+    tick, which is how one task gets two runners.
+    """
+    if not original or not db_path.exists():
+        return
+    snapshot_runtime = original.get("runtime")
+    if not isinstance(snapshot_runtime, dict):
+        return
     conn = _connect_readwrite(db_path)
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status, runtime FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return
+        current = _decode_json(row["runtime"])
+        if current.get("pid") and _pid_alive(current["pid"]):
+            conn.rollback()
+            return
         conn.execute(
-            "UPDATE tasks SET runtime=?, updated_at=? WHERE task_id=?",
-            (json.dumps(original, sort_keys=True), time.time(), task_id),
+            "UPDATE tasks SET status=?, runtime=?, updated_at=? WHERE task_id=?",
+            (
+                original.get("status", row["status"]),
+                json.dumps(snapshot_runtime, sort_keys=True),
+                time.time(),
+                task_id,
+            ),
         )
         conn.commit()
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        logger.warning("worker dispatch claim release failed", exc_info=True)
     finally:
         conn.close()
 
