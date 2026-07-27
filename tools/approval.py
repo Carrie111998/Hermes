@@ -2347,6 +2347,13 @@ def detect_dangerous_command(
     return (False, None, None)
 
 
+def _detect_dangerous_command_for_env(command: str, env_type: str):
+    """Preserve the local call contract; opt out only for other PID namespaces."""
+    if env_type == "local":
+        return detect_dangerous_command(command)
+    return detect_dangerous_command(command, protect_local_pid=False)
+
+
 # =========================================================================
 # Per-session approval state (thread-safe)
 # =========================================================================
@@ -3366,8 +3373,8 @@ def check_dangerous_command(command: str, env_type: str,
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    is_dangerous, pattern_key, description = detect_dangerous_command(
-        command, protect_local_pid=env_type == "local"
+    is_dangerous, pattern_key, description = _detect_dangerous_command_for_env(
+        command, env_type
     )
     if not is_dangerous:
         return {"approved": True, "message": None}
@@ -3691,8 +3698,8 @@ def check_all_command_guards(command: str, env_type: str,
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
-                is_dangerous, _pk, description = detect_dangerous_command(
-                    command, protect_local_pid=env_type == "local"
+                is_dangerous, _pk, description = _detect_dangerous_command_for_env(
+                    command, env_type
                 )
                 if is_dangerous:
                     return {
@@ -3799,8 +3806,8 @@ def check_all_command_guards(command: str, env_type: str,
         # else: tirith_fail_open is True — allow as before (tirith_result stays "allow")
 
     # Dangerous command check (detection only, no approval)
-    is_dangerous, pattern_key, description = detect_dangerous_command(
-        command, protect_local_pid=env_type == "local"
+    is_dangerous, pattern_key, description = _detect_dangerous_command_for_env(
+        command, env_type
     )
 
     # --- Phase 2: Decide ---
