@@ -266,6 +266,15 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   precedente de lote 13, idéntico a la doc en inglés) en `browser.md`/
   `extending-the-dashboard.md`. 13 headings cambiaron, ninguno con anchor interno real.
   Build limpio: 98/98 warnings idénticos a la baseline.
+- Lote 6 (auto-aprobado, este commit): `user-guide/messaging/` (28 archivos). Cumplió
+  las 7 condiciones → aplicado, auditado, commiteado y pusheado sin pausa. Sin
+  `Nous Research`, sin falsos positivos de familia de modelos. Advisory
+  `GHSA-3vpc-7q5r-276h` en `telegram.md` repunta al repo fork automáticamente vía
+  regla 0 (mismo tradeoff que G5 lote 6). 28 headings cambiaron (patrón repetido
+  "配置 Hermes"/"Hermes 的行为方式" en cada doc de plataforma), ninguno con anchor
+  interno real. Cosmético `signal-cli link -n "HermesAgent"` → `"IYARI"` (mismo
+  precedente que G5 lote 6, camelCase sin word-boundary que el script no toca solo).
+  Build limpio: 98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 
