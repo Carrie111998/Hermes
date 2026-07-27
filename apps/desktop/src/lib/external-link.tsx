@@ -12,12 +12,18 @@ const titleSubs = new Map<string, Set<(value: string) => void>>()
 const URL_RE =
   /(?:https?:\/\/|www\.)[^\s<>"'`]+[^\s<>"'`.,;:!?)]|[a-z0-9](?:[a-z0-9-]*\.)+[a-z]{2,}(?:\/[^\s<>"'`.,;:!?)]*)?/gi
 
+// Explicit-scheme / www. URLs only — no bare-domain matching. Used where the
+// surrounding text is full of filename-shaped tokens (e.g. `agent.log`,
+// `errors.log` in a /debug report) that the bare-domain branch of URL_RE would
+// otherwise mistake for domains and linkify.
+const EXPLICIT_URL_RE = /(?:https?:\/\/|www\.)[^\s<>"'`]+[^\s<>"'`.,;:!?)]/gi
+
 const DOMAIN_RE = /^(?:www\.)?[a-z0-9](?:[a-z0-9-]*\.)+[a-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?$/i
 const SKIP_PROTO_RE = /^(?:file|data|mailto|javascript|blob|chrome|about|hermes):/i
 const LOCAL_HOST_RE = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?$/i
 
 const ERROR_TITLE_RE =
-  /\b(?:access denied|attention required|captcha|error|forbidden|just a moment|request blocked|too many requests)\b/i
+  /\b(?:access denied|attention required|captcha|error|forbidden|just a moment|not found|request blocked|too many requests)\b/i
 
 export function normalizeExternalUrl(value: string): string {
   const trimmed = value.trim()
@@ -209,14 +215,14 @@ export function ExternalLink({
   className,
   href,
   onClick,
-  showExternalIcon = true,
+  showExternalIcon = false,
   ...rest
 }: ExternalLinkProps) {
   const target = normalizeExternalUrl(href)
 
   return (
     <a
-      className={cn('font-semibold text-foreground underline underline-offset-4 decoration-current/20', className)}
+      className={cn('link-chip font-semibold', className)}
       href={target}
       onClick={event => {
         event.stopPropagation()
@@ -245,10 +251,13 @@ interface PrettyLinkProps extends Omit<ComponentProps<'a'>, 'href' | 'target'> {
   fallbackLabel?: string
 }
 
+// Title resolution is a fallback, not an override. Both props carry authored
+// text — chat markdown passes `fallbackLabel` — so either one skips the fetch.
 export function PrettyLink({ className, fallbackLabel, href, label, ...rest }: PrettyLinkProps) {
   const target = useMemo(() => normalizeExternalUrl(href), [href])
-  const fetched = useLinkTitle(label ? null : target)
-  const display = fetched || label?.trim() || fallbackLabel?.trim() || urlSlugTitleLabel(target)
+  const authoredLabel = label?.trim() || fallbackLabel?.trim()
+  const fetched = useLinkTitle(authoredLabel ? null : target)
+  const display = authoredLabel || fetched || urlSlugTitleLabel(target)
 
   return (
     <ExternalLink className={cn('wrap-break-word', className)} href={target} title={target} {...rest}>
@@ -261,13 +270,14 @@ interface LinkifiedTextProps {
   className?: string
   text: string
   pretty?: boolean
+  explicitOnly?: boolean
 }
 
-export function LinkifiedText({ className, pretty = true, text }: LinkifiedTextProps) {
+export function LinkifiedText({ className, explicitOnly = false, pretty = true, text }: LinkifiedTextProps) {
   const nodes: ReactNode[] = []
   let cursor = 0
 
-  for (const match of text.matchAll(URL_RE)) {
+  for (const match of text.matchAll(explicitOnly ? EXPLICIT_URL_RE : URL_RE)) {
     const raw = match[0]
     const url = normalizeExternalUrl(raw)
     const index = match.index ?? 0
