@@ -3048,6 +3048,93 @@ async def get_health():
     }
 
 
+@app.get("/api/business/status")
+def get_business_status(request: Request, profile: Optional[str] = None):
+    """Read-only Business OS projection for the supporting dashboard view."""
+    _require_token(request)
+    from hermes_cli.business import build_business_snapshot
+    from hermes_cli.objectives_db import connect_closing
+
+    if (profile or "").strip():
+        with _profile_scope(profile):
+            with connect_closing() as conn:
+                return build_business_snapshot(conn)
+    with connect_closing() as conn:
+        return build_business_snapshot(conn)
+
+
+class BusinessAutonomyRequest(BaseModel):
+    mode: str
+    reason: str
+
+
+class BusinessInterventionResolutionRequest(BaseModel):
+    option_id: str
+    evidence: dict
+
+
+@app.post("/api/business/autonomy")
+def set_business_autonomy(
+    payload: BusinessAutonomyRequest,
+    request: Request,
+    profile: Optional[str] = None,
+):
+    """Authenticated master autonomy control for the operator dashboard."""
+    _require_token(request)
+    from hermes_cli import operational_control
+    from hermes_cli.objectives_db import connect_closing
+
+    def apply():
+        with connect_closing() as conn:
+            operational_control.set_autonomy_mode(
+                conn,
+                mode=payload.mode,
+                actor="human:dashboard",
+                reason=payload.reason,
+            )
+            return operational_control.autonomy_state(conn)
+
+    if (profile or "").strip():
+        with _profile_scope(profile):
+            return apply()
+    return apply()
+
+
+@app.post("/api/business/interventions/{intervention_id}/resolve")
+def resolve_business_intervention(
+    intervention_id: str,
+    payload: BusinessInterventionResolutionRequest,
+    request: Request,
+    profile: Optional[str] = None,
+):
+    """Resolve an advisor handoff only through one of its recorded choices."""
+    _require_token(request)
+    from hermes_cli import operational_control
+    from hermes_cli.objectives_db import connect_closing
+
+    def apply():
+        with connect_closing() as conn:
+            from hermes_cli import organization_db
+
+            ceo = organization_db.active_ceo(conn)
+            if ceo is None:
+                raise HTTPException(status_code=409, detail="business is not initialized")
+            operational_control.resolve_intervention(
+                conn,
+                intervention_id,
+                option_id=payload.option_id,
+                actor="human:dashboard",
+                evidence=payload.evidence,
+                organization_id=ceo["organization_id"],
+            )
+            return {"ok": True}
+
+    if (profile or "").strip():
+        with _profile_scope(profile):
+            return apply()
+    return apply()
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None

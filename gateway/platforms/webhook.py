@@ -240,6 +240,45 @@ class WebhookAdapter(BasePlatformAdapter):
                     f"INSECURE_NO_AUTH is for local testing only. "
                     f"Refusing to start to prevent accidental exposure."
                 )
+            if route.get("objective_organization_id"):
+                governed_source = route.get("objective_source_type")
+                if governed_source not in {"agentmail", "metric_observation"}:
+                    raise ValueError(
+                        f"[webhook] Route '{name}' has unsupported governed "
+                        "objective_source_type"
+                    )
+                if (
+                    governed_source == "agentmail"
+                    and not str(route.get("objective_inbox_id") or "").strip()
+                ):
+                    raise ValueError(
+                        f"[webhook] Route '{name}' must bind objective_inbox_id"
+                    )
+                if governed_source == "metric_observation":
+                    if not str(route.get("metric_id") or "").strip():
+                        raise ValueError(
+                            f"[webhook] Route '{name}' must bind metric_id"
+                        )
+                    if not str(route.get("metric_verifier") or "").strip():
+                        raise ValueError(
+                            f"[webhook] Route '{name}' must bind metric_verifier"
+                        )
+                    if int(
+                        route.get("metric_max_event_age_seconds", 86400)
+                    ) <= 0:
+                        raise ValueError(
+                            f"[webhook] Route '{name}' metric age limit "
+                            "must be positive"
+                        )
+                if route.get("objective_only", True) is not True:
+                    raise ValueError(
+                        f"[webhook] Route '{name}' must use objective_only=true"
+                    )
+                if route.get("script") or route.get("skills"):
+                    raise ValueError(
+                        f"[webhook] Route '{name}' cannot execute scripts or "
+                        "skills before governed content quarantine"
+                    )
             # deliver_only routes bypass the agent — the POST body becomes a
             # direct push notification via the configured delivery target.
             # Validate up-front so misconfiguration surfaces at startup rather
@@ -624,6 +663,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
                 )
+        authenticated_payload = json.loads(json.dumps(payload))
 
         # Check event type filter
         event_type = (
@@ -659,6 +699,14 @@ class WebhookAdapter(BasePlatformAdapter):
                     "reason": "filter",
                     "route": route_name,
                 }
+            )
+
+        if route_config.get("objective_organization_id") and (
+            route_config.get("script") or route_config.get("skills")
+        ):
+            return web.json_response(
+                {"error": "Governed objective routes cannot run scripts or skills"},
+                status=422,
             )
 
         if route_config.get("script"):
@@ -727,11 +775,17 @@ class WebhookAdapter(BasePlatformAdapter):
                 request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
             ),
         )
+        objective_org = str(
+            route_config.get("objective_organization_id") or ""
+        ).strip()
 
         # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
+        # Conversational routes use a process-local optimization. Governed
+        # objective routes deliberately bypass it: their adapter transaction
+        # is the authoritative idempotency boundary, so a failure before commit
+        # must remain retryable and a gateway restart must not alter semantics.
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        if not objective_org and not self._record_delivery_id(delivery_id, now):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -739,6 +793,105 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
             )
+
+        # Governed objective ingestion is separate from prompt rendering. The
+        # exact signature-bound payload is normalized into typed business data;
+        # email body text crosses the external-content quarantine boundary and
+        # is never injected as a synthetic user instruction.
+        if objective_org:
+            governed_source = route_config.get("objective_source_type")
+            db_path = None
+            if profile:
+                from hermes_cli.profiles import get_profile_dir
+
+                db_path = get_profile_dir(profile) / "objectives.db"
+            if governed_source == "agentmail":
+                expected_inbox = str(
+                    route_config.get("objective_inbox_id") or ""
+                ).strip()
+                if not expected_inbox:
+                    return web.json_response(
+                        {"error": "Governed AgentMail route is missing inbox binding"},
+                        status=422,
+                    )
+                try:
+                    from hermes_cli import agentmail_events, objectives_db
+
+                    with objectives_db.connect_closing(db_path) as authority:
+                        objective_event_ids = (
+                            agentmail_events.route_authenticated_event(
+                                authority,
+                                organization_id=objective_org,
+                                expected_inbox_id=expected_inbox,
+                                payload=authenticated_payload,
+                                svix_id=request.headers.get("svix-id", ""),
+                                svix_timestamp=request.headers.get(
+                                    "svix-timestamp", ""
+                                ),
+                            )
+                        )
+                except agentmail_events.AgentMailEventError as exc:
+                    logger.warning(
+                        "[webhook] Rejected governed AgentMail event: %s", exc
+                    )
+                    return web.json_response({"error": str(exc)}, status=422)
+                governed_result = {
+                    "objective_event_ids": objective_event_ids
+                }
+            elif governed_source == "metric_observation":
+                try:
+                    from hermes_cli import metric_events, objectives_db
+
+                    with objectives_db.connect_closing(db_path) as authority:
+                        governed_result = (
+                            metric_events.ingest_authenticated_observation(
+                                authority,
+                                organization_id=objective_org,
+                                expected_metric_id=str(route_config["metric_id"]),
+                                expected_verifier=str(
+                                    route_config["metric_verifier"]
+                                ),
+                                payload=authenticated_payload,
+                                delivery_id=delivery_id,
+                                route_name=route_name,
+                                authentication_evidence={
+                                    "method": "webhook_hmac",
+                                    "signature_version": (
+                                        "v2"
+                                        if request.headers.get(
+                                            "X-Webhook-Signature-V2"
+                                        )
+                                        else "v1"
+                                    ),
+                                    "signed_timestamp": request.headers.get(
+                                        "X-Webhook-Timestamp"
+                                    ),
+                                },
+                                max_event_age_seconds=int(
+                                    route_config.get(
+                                        "metric_max_event_age_seconds", 86400
+                                    )
+                                ),
+                            )
+                        )
+                except metric_events.MetricEventError as exc:
+                    logger.warning(
+                        "[webhook] Rejected governed metric event: %s", exc
+                    )
+                    return web.json_response({"error": str(exc)}, status=422)
+            else:
+                return web.json_response(
+                    {"error": "Unsupported governed objective source"}, status=422
+                )
+            if route_config.get("objective_only", True):
+                return web.json_response(
+                    {
+                        "status": "accepted",
+                        "delivery_id": delivery_id,
+                        **governed_result,
+                    },
+                    status=202,
+                )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we

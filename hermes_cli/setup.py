@@ -12,12 +12,14 @@ Config files are stored in ~/.hermes/ for easy access.
 """
 
 import importlib.util
+import json
 import logging
 import os
 import re
 import shutil
 import sys
 import copy
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -1673,6 +1675,460 @@ def setup_agent_settings(config: dict):
     save_config(config)
 
 
+def _parse_csv_values(raw: str) -> list[str]:
+    """Normalize a comma-separated setup answer into stable unique values."""
+    seen: set[str] = set()
+    values: list[str] = []
+    for item in raw.split(","):
+        value = item.strip()
+        if value and value not in seen:
+            seen.add(value)
+            values.append(value)
+    return values
+
+
+def _validate_initial_mandate(mandate: dict) -> None:
+    required_text = ("organization_name", "purpose", "desired_outcome")
+    if any(not str(mandate.get(key) or "").strip() for key in required_text):
+        raise ValueError(
+            "business name, purpose, and initial desired outcome are required"
+        )
+    if not list(mandate.get("success_criteria") or []) or not list(
+        mandate.get("termination_conditions") or []
+    ):
+        raise ValueError(
+            "initial objective requires success criteria and stop conditions"
+        )
+    for criterion in mandate.get("success_criteria") or []:
+        if (
+            not isinstance(criterion, dict)
+            or not str(criterion.get("verifier") or "").strip()
+            or not isinstance(criterion.get("params", {}), dict)
+        ):
+            raise ValueError(
+                "each success criterion must be an object with verifier and params"
+            )
+    if int(mandate.get("duration_days") or 0) <= 0:
+        raise ValueError("initial objective duration must be positive")
+
+
+def setup_agentic_settings(config: dict):
+    """Establish the standing operating charter for agentic business operation."""
+    from hermes_cli.objective_policy import validate_charter
+
+    print_header("Agentic Operating Charter")
+    print_info("This determines when Hermes may act without waiting for approval.")
+    print_info("The recommended mode treats the human operator as an advisor.")
+    print_info("Actions outside the charter still stop and escalate.")
+    print()
+
+    current = copy.deepcopy(DEFAULT_CONFIG["agentic"])
+    existing = config.get("agentic")
+    if isinstance(existing, dict):
+        current.update(existing)
+
+    modes = [
+        "Autonomous — operator advises; in-charter actions proceed automatically (recommended)",
+        "Supervised — high-risk actions require approval",
+        "Approval required — every consequential action waits for approval",
+        "Disabled — keep Hermes turn-driven",
+    ]
+    current_mode = str(current.get("operating_mode", "autonomous"))
+    default_mode = {
+        "autonomous": 0,
+        "supervised": 1,
+        "approval_required": 2,
+    }.get(current_mode, 3 if not current.get("enabled") else 0)
+    selected = prompt_choice("Agentic operating mode:", modes, default_mode)
+
+    if selected == 3:
+        current["enabled"] = False
+        config["agentic"] = current
+        save_config(config)
+        print_info("Agentic operation disabled. Configure later with `hermes setup agentic`.")
+        return
+
+    mode = ("autonomous", "supervised", "approval_required")[selected]
+    current["enabled"] = True
+    current["operating_mode"] = mode
+    current["operator_role"] = "advisor" if mode == "autonomous" else "approver"
+
+    runtime_hosts = [
+        "Gateway service — run the CEO loop inside the supervised Hermes gateway (recommended)",
+        "Standalone worker — run `hermes objectives worker` under an external supervisor",
+        "Either — permit both supervised host types during migration",
+    ]
+    current_host = str(current.get("runtime_host", "gateway"))
+    host_idx = prompt_choice(
+        "Where will the autonomous CEO runtime be supervised?",
+        runtime_hosts,
+        {"gateway": 0, "standalone": 1, "either": 2}.get(current_host, 0),
+    )
+    current["runtime_host"] = ("gateway", "standalone", "either")[host_idx]
+
+    print()
+    print_info("Capabilities are explicit verbs such as crm.write or email.send.")
+    capabilities = prompt(
+        "Allowed capabilities (comma-separated)",
+        ",".join(current.get("allowed_capabilities") or []),
+    )
+    systems = prompt(
+        "Allowed systems (comma-separated)",
+        ",".join(current.get("allowed_systems") or []),
+    )
+    forbidden = prompt(
+        "Always-forbidden capabilities (comma-separated)",
+        ",".join(current.get("forbidden_capabilities") or []),
+    )
+    current["allowed_capabilities"] = _parse_csv_values(capabilities)
+    current["allowed_systems"] = _parse_csv_values(systems)
+    current["forbidden_capabilities"] = _parse_csv_values(forbidden)
+    email_config = (
+        current.setdefault("communications", {})
+        .setdefault("email", copy.deepcopy(
+            DEFAULT_CONFIG["agentic"]["communications"]["email"]
+        ))
+    )
+    if "email.send" in current["allowed_capabilities"]:
+        email_config["inbox_id"] = prompt(
+            "AgentMail company inbox ID (blank keeps email execution blocked)",
+            str(email_config.get("inbox_id") or ""),
+        ).strip()
+
+    risks = ["low", "medium", "high", "critical"]
+    current_risk = str(current.get("max_autonomous_risk", "low"))
+    risk_idx = prompt_choice(
+        "Maximum risk Hermes may authorize autonomously:",
+        [risk.title() for risk in risks],
+        risks.index(current_risk) if current_risk in risks else 0,
+    )
+    current["max_autonomous_risk"] = risks[risk_idx]
+
+    irreversible_idx = prompt_choice(
+        "May Hermes autonomously perform irreversible actions?",
+        ["No (recommended)", "Yes, when otherwise inside the charter"],
+        1 if current.get("allow_irreversible") else 0,
+    )
+    current["allow_irreversible"] = irreversible_idx == 1
+
+    spend_raw = prompt(
+        "Maximum spend per autonomous action (minor currency units; 0 = no spend)",
+        str(current.get("max_action_spend_minor", 0)),
+    )
+    capital_raw = prompt(
+        "Initial business capital (minor currency units; minimum 1000 = $10.00)",
+        str(current.get("finance", {}).get("initial_capital_minor", 1000)),
+    )
+    entity_raw = prompt(
+        "Legal entity type (or unconfigured to keep regulated actions blocked)",
+        str(
+            current.get("finance", {})
+            .get("tax_profile", {})
+            .get("legal_entity_type", "unconfigured")
+        ),
+    ).strip()
+    jurisdiction_raw = prompt(
+        "Primary tax jurisdiction code (blank if not yet determined)",
+        ",".join(
+            current.get("finance", {})
+            .get("tax_profile", {})
+            .get("jurisdictions", [])
+        ),
+    )
+    ttl_raw = prompt(
+        "Execution permit lifetime in seconds",
+        str(current.get("permit_ttl_seconds", 300)),
+    )
+    mandate = copy.deepcopy(
+        current.get("initial_mandate")
+        or DEFAULT_CONFIG["agentic"]["initial_mandate"]
+    )
+    organization_name = prompt(
+        "Business name",
+        str(mandate.get("organization_name") or "Hermes Business"),
+    ).strip()
+    purpose = prompt(
+        "Business purpose",
+        str(mandate.get("purpose") or ""),
+    ).strip()
+    desired_outcome = prompt(
+        "Initial objective desired outcome",
+        str(mandate.get("desired_outcome") or ""),
+    ).strip()
+    print_info(
+        "Built-in success verifiers: accounting.revenue_at_least, "
+        "accounting.books_balanced, kanban.all_delegated_tasks_completed."
+    )
+    success_raw = prompt(
+        "Initial objective success criteria (JSON verifier contracts)",
+        json.dumps(mandate.get("success_criteria") or [], separators=(",", ":")),
+    )
+    termination_raw = prompt(
+        "Initial objective stop conditions (comma-separated)",
+        ",".join(mandate.get("termination_conditions") or []),
+    )
+    duration_raw = prompt(
+        "Initial objective maximum duration in days",
+        str(mandate.get("duration_days", 365)),
+    )
+    try:
+        current["max_action_spend_minor"] = max(0, int(spend_raw))
+    except ValueError:
+        print_warning("Invalid spend limit; keeping the previous value.")
+    current.setdefault("finance", dict(DEFAULT_CONFIG["agentic"]["finance"]))
+    current["finance"].setdefault(
+        "tax_profile",
+        copy.deepcopy(DEFAULT_CONFIG["agentic"]["finance"]["tax_profile"]),
+    )
+    try:
+        initial_capital = int(capital_raw)
+        if initial_capital < 1000:
+            raise ValueError
+        current["finance"]["initial_capital_minor"] = initial_capital
+    except ValueError:
+        print_warning("Initial capital must be at least 1000; keeping the previous value.")
+    current["finance"]["tax_profile"]["legal_entity_type"] = (
+        entity_raw or "unconfigured"
+    )
+    current["finance"]["tax_profile"]["jurisdictions"] = _parse_csv_values(
+        jurisdiction_raw
+    )
+    try:
+        current["permit_ttl_seconds"] = max(1, int(ttl_raw))
+    except ValueError:
+        print_warning("Invalid permit lifetime; keeping the previous value.")
+    try:
+        success_criteria = json.loads(success_raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "initial objective success criteria must be valid JSON"
+        ) from exc
+    if not isinstance(success_criteria, list):
+        raise ValueError("initial objective success criteria must be a JSON list")
+    termination_conditions = _parse_csv_values(termination_raw)
+    try:
+        duration_days = int(duration_raw)
+    except ValueError as exc:
+        raise ValueError("initial objective duration must be an integer") from exc
+    current["initial_mandate"] = {
+        "organization_name": organization_name,
+        "purpose": purpose,
+        "desired_outcome": desired_outcome,
+        "success_criteria": success_criteria,
+        "termination_conditions": termination_conditions,
+        "duration_days": duration_days,
+    }
+    _validate_initial_mandate(current["initial_mandate"])
+
+    validate_charter(current)
+    config["agentic"] = current
+    _bootstrap_agentic_business(current)
+    save_config(config)
+    print_success(f"Agentic charter enabled in {mode} mode.")
+    if mode == "autonomous":
+        print_info("The operator is advisory; only exceptions require intervention.")
+    if current["runtime_host"] == "gateway":
+        print_info(
+            "Runtime contract: install and start `hermes gateway`; its supervised "
+            "process hosts the autonomous CEO loop."
+        )
+    elif current["runtime_host"] == "standalone":
+        print_info(
+            "Runtime contract: supervise `hermes objectives worker` with systemd, "
+            "s6, Docker, launchd, or an equivalent process manager."
+        )
+    else:
+        print_info(
+            "Runtime contract: either registered gateway or standalone worker is "
+            "admissible; durable event claims still serialize work."
+        )
+    if not current["allowed_capabilities"] or not current["allowed_systems"]:
+        print_warning(
+            "The charter currently grants no operational authority. "
+            "Hermes will escalate actions until capabilities and systems are added."
+        )
+    if "email.send" in current["allowed_capabilities"]:
+        if "agentmail" not in current["allowed_systems"]:
+            print_warning(
+                "email.send requires the agentmail system in this charter."
+            )
+        if not email_config.get("inbox_id"):
+            print_warning(
+                "AgentMail inbox is not configured; governed email stays blocked."
+            )
+        print_info(
+            "Inject AGENTMAIL_API_KEY through the configured external secret "
+            "manager; Hermes does not store it in config.yaml."
+        )
+    if (
+        current["finance"]["tax_profile"]["legal_entity_type"] == "unconfigured"
+        or not current["finance"]["tax_profile"]["jurisdictions"]
+    ):
+        print_warning(
+            "Tax profile is incomplete. Hermes will keep tax-sensitive sales, "
+            "payroll, filings, and distributions blocked pending advisor evidence."
+        )
+
+
+def _bootstrap_agentic_business(charter: dict) -> tuple[str, str]:
+    """Create the solo-founder organization, books, and initial cash account."""
+    from hermes_cli import (
+        authority_integrity,
+        authority_recovery,
+        compliance_db,
+        finance_db,
+        organization_db,
+    )
+    from hermes_cli import objective_triggers, objectives_db
+    from hermes_cli.objectives_db import connect_closing
+    from hermes_cli.profiles import get_active_profile_name
+
+    mandate = charter.get("initial_mandate") or {}
+    _validate_initial_mandate(mandate)
+    cadence = charter.get("operating_cadence") or {}
+    cadence_enabled = bool(cadence.get("enabled", True))
+    cadence_interval_hours = int(cadence.get("interval_hours", 24))
+    if cadence_enabled and cadence_interval_hours <= 0:
+        raise ValueError(
+            "agentic operating cadence interval_hours must be positive"
+        )
+    with connect_closing() as conn:
+        organization_id, ceo_id = organization_db.bootstrap_solo_founder(
+            conn,
+            organization_name=str(
+                mandate.get("organization_name") or "Hermes Business"
+            ),
+            purpose=str(mandate.get("purpose") or ""),
+            profile_name=get_active_profile_name() or "default",
+            charter=charter,
+        )
+        authority_integrity.accept_policy_baseline(
+            conn,
+            organization_id=organization_id,
+            policy=charter,
+            actor="human_operator:setup",
+            reason="agentic charter accepted during setup",
+        )
+        finance = charter.get("finance", {})
+        currency = str(finance.get("base_currency", "USD"))
+        account_id = finance_db.create_treasury_account(
+            conn, organization_id=organization_id, currency=currency
+        )
+        finance_db.seed_initial_capital(
+            conn,
+            account_id=account_id,
+            amount_minor=int(finance.get("initial_capital_minor", 1000)),
+            currency=currency,
+            actor="human_operator",
+        )
+        tax_profile = finance.get("tax_profile", {})
+        jurisdictions = list(tax_profile.get("jurisdictions") or [])
+        entity_type = str(tax_profile.get("legal_entity_type", "unconfigured"))
+        if jurisdictions and entity_type != "unconfigured":
+            compliance_db.configure_profile(
+                conn,
+                organization_id=organization_id,
+                legal_entity_type=entity_type,
+                home_jurisdiction=str(jurisdictions[0]),
+                custody_model="non_custodial",
+            )
+        existing = conn.execute(
+            """SELECT id,status FROM objectives
+               WHERE organization_id=? AND originator='initial_setup'
+               ORDER BY created_at,id LIMIT 1""",
+            (organization_id,),
+        ).fetchone()
+        if existing is None:
+            duration_days = int(mandate.get("duration_days") or 365)
+            objective = objectives_db.create_objective(
+                conn,
+                organization_id=organization_id,
+                desired_outcome=str(mandate.get("desired_outcome") or ""),
+                originator="initial_setup",
+                owner=f"employee:{ceo_id}",
+                constraints=[
+                    "strict budget adherence",
+                    "build or FOSS before paid procurement",
+                    "human operator is advisory unless charter requires approval",
+                ],
+                authority_scope={
+                    "capabilities": list(charter.get("allowed_capabilities") or []),
+                    "max_autonomous_risk": charter.get("max_autonomous_risk"),
+                },
+                success_criteria=list(mandate.get("success_criteria") or []),
+                termination_conditions=list(
+                    mandate.get("termination_conditions") or []
+                ),
+                permitted_systems=list(charter.get("allowed_systems") or []),
+                prohibited_actions=list(
+                    charter.get("forbidden_capabilities") or []
+                ),
+                max_spend_minor=int(finance.get("initial_capital_minor", 1000)),
+                currency=currency,
+                expires_at=int(time.time()) + duration_days * 86400,
+            )
+            objective_id = objective.id
+        else:
+            objective_id = str(existing["id"])
+        objective = objectives_db.get_objective(conn, objective_id)
+        if objective.status == "proposed":
+            objectives_db.transition_objective(
+                conn, objective_id, "accepted", actor="initial_setup"
+            )
+        objectives_db.enqueue_objective_event(
+            conn,
+            objective_id=objective_id,
+            event_type="objective.accepted",
+            payload={"source": "agentic_setup", "organization_id": organization_id},
+            dedupe_key=f"initial-objective:{organization_id}",
+        )
+        if cadence_enabled:
+            interval_seconds = cadence_interval_hours * 3600
+            objective_triggers.create_schedule(
+                conn,
+                organization_id=organization_id,
+                objective_id=objective_id,
+                event_type="ceo.operating_review",
+                interval_seconds=interval_seconds,
+                next_fire_at=int(time.time()) + interval_seconds,
+                payload={
+                    "purpose": "review business state and select the next admissible work",
+                    "review": [
+                        "objective_portfolio",
+                        "financial_runway",
+                        "operating_results",
+                        "customer_and_market_signals",
+                        "risk_and_compliance",
+                        "workforce_capacity",
+                    ],
+                },
+                idempotency_key=f"ceo-operating-cadence:{organization_id}:{objective_id}",
+            )
+        recovery = charter.get("recovery") or {}
+        if bool(recovery.get("enabled", True)):
+            posture = authority_integrity.run_preflight(
+                conn,
+                organization_id=organization_id,
+                policy=charter,
+            )
+            if not posture.ready:
+                raise RuntimeError(
+                    "initial authority integrity verification failed: "
+                    + ", ".join(posture.checks["failed_checks"])
+                )
+            authority_recovery.maybe_snapshot(
+                conn,
+                organization_id=organization_id,
+                interval_seconds=max(
+                    60, int(recovery.get("snapshot_interval_seconds", 86400))
+                ),
+                retention_count=max(
+                    1, int(recovery.get("retention_count", 7))
+                ),
+            )
+        return organization_id, objective_id
+
+
 # =============================================================================
 # Section 4: Messaging Platforms (Gateway)
 # =============================================================================
@@ -2630,6 +3086,7 @@ SETUP_SECTIONS = [
     ("gateway", "Messaging Platforms (Gateway)", setup_gateway),
     ("tools", "Tools", setup_tools),
     ("agent", "Agent Settings", setup_agent_settings),
+    ("agentic", "Agentic Operating Charter", setup_agentic_settings),
 ]
 
 
@@ -2728,6 +3185,7 @@ def run_setup_wizard(args):
       hermes setup gateway   — just messaging platforms
       hermes setup tools     — just tool configuration
       hermes setup agent     — just agent settings
+      hermes setup agentic   — autonomous operating charter
     """
     from hermes_cli.config import is_managed, managed_error
     if is_managed():
@@ -2934,6 +3392,7 @@ def run_setup_wizard(args):
     # Tune later with `hermes setup agent`.
     if not is_existing:
         _apply_default_agent_settings(config)
+        setup_agentic_settings(config)
 
     # Section 4: Messaging Platforms
     if not (migration_ran and _skip_configured_section(config, "gateway", "Messaging Platforms")):
@@ -2996,6 +3455,7 @@ def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):
 
     # Step 3: Apply defaults for everything else
     _apply_default_agent_settings(config)
+    setup_agentic_settings(config)
 
     save_config(config)
 

@@ -16581,6 +16581,17 @@ def main(
     
     # Handle single query mode
     if query or image:
+        if os.environ.get("HERMES_EXECUTION_CONTRACT_ID"):
+            try:
+                from hermes_cli.workforce_delegation import validate_worker_launch
+
+                validate_worker_launch()
+            except Exception as exc:
+                print(
+                    f"Employee task authorization failed: {exc}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:

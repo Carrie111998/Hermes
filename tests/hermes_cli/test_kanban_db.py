@@ -3134,6 +3134,7 @@ class TestSharedBoardPaths:
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            execution_contract_id="taskgrant_test",
         )
         kb._default_spawn(task, str(tmp_path / "ws"))
 
@@ -3144,6 +3145,10 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_EXECUTION_CONTRACT_ID"] == "taskgrant_test"
+        assert env["HERMES_BUSINESS_AUTHORITY_DB"] == str(
+            (default_home / "objectives.db").resolve()
+        )
 
 
 # ---------------------------------------------------------------------------

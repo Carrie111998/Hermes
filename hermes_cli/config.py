@@ -1805,6 +1805,18 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Governed objective planner. Produces typed plan/action proposals for
+        # objective_runtime; deterministic policy still authorizes and
+        # independent verifiers still decide whether reality changed.
+        "objective_planner": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
         # building over hundreds of candidate skills). "auto" = use main chat
@@ -2453,6 +2465,158 @@ DEFAULT_CONFIG = {
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
+    },
+
+    # Governed agentic operation. Initial setup must explicitly enable this
+    # section and establish the standing charter before Hermes may issue its
+    # own execution permits. The normal operating model is autonomous:
+    # humans advise and change policy; only out-of-charter actions escalate.
+    "agentic": {
+        "enabled": False,
+        # autonomous | supervised | approval_required
+        "operating_mode": "autonomous",
+        "operator_role": "advisor",
+        "policy_version": "charter-v1",
+        "allowed_capabilities": [],
+        "forbidden_capabilities": [],
+        "allowed_systems": [],
+        "approval_required_capabilities": [],
+        "max_autonomous_risk": "low",
+        "allow_irreversible": False,
+        "max_action_spend_minor": 0,
+        "permit_ttl_seconds": 300,
+        "runtime_interval_seconds": 15,
+        "event_claim_ttl_seconds": 300,
+        # gateway | standalone | either
+        "runtime_host": "gateway",
+        "operating_cadence": {
+            # A newly bootstrapped CEO must continue reviewing the business
+            # without the operator manually creating a cron schedule.
+            "enabled": True,
+            "interval_hours": 24,
+        },
+        "resource_lease_ttl_seconds": 300,
+        "authority_store": {
+            # SQLite safely coordinates workers on one host. Multi-host
+            # operation fails closed until a transactional shared backend is
+            # configured; Hermes never silently degrades to a local database.
+            "backend": "sqlite",
+            "deployment_scope": "single_host",
+        },
+        "recovery": {
+            # Known-good snapshots are verified before retention and restore.
+            # Restoration is always human-authorized and resumes paused.
+            "enabled": True,
+            "snapshot_interval_seconds": 86400,
+            "retention_count": 7,
+        },
+        "commitments": {
+            # Customer/vendor promises are durable authority state, not chat memory.
+            "deadline_horizon_days": 7,
+        },
+        "action_approvals": {
+            "default_ttl_seconds": 900,
+            "maximum_ttl_seconds": 3600,
+        },
+        "resource_limits": {
+            "max_cycles_per_objective": 100,
+            "max_actions_per_cycle": 1,
+            "max_actions_per_objective": 500,
+            "max_input_tokens_per_objective": 2_000_000,
+            "max_output_tokens_per_objective": 500_000,
+            "max_compute_cost_minor_per_objective": 1_000,
+            "max_compute_cost_minor_per_organization": 1_000,
+            # Conservative amount reserved before every CEO planner call.
+            # Failed, invalid, or interrupted calls retain the reservation.
+            "planner_call_compute_reservation_minor": 10,
+            "compute_reconciliation_grace_seconds": 86_400,
+        },
+        "retry_policy": {
+            "max_attempts": 3,
+            "base_backoff_seconds": 15,
+            "max_backoff_seconds": 900,
+        },
+        "initial_mandate": {
+            "organization_name": "Hermes Business",
+            "purpose": "",
+            "desired_outcome": "",
+            "success_criteria": [],
+            "termination_conditions": [],
+            "duration_days": 365,
+        },
+        "security": {
+            "enforce_isolated_execution": True,
+            "allowed_terminal_backends": [
+                "docker", "modal", "daytona", "singularity"
+            ],
+            "require_external_secret_manager": True,
+            "require_idempotency_key_for_external_actions": True,
+            "require_fresh_state_for_external_actions": True,
+            "require_compensation_for_reversible_actions": True,
+            "quarantine_untrusted_instructions": True,
+            "circuit_breaker_failure_threshold": 3,
+            "circuit_breaker_cooldown_seconds": 900,
+        },
+        "organization": {
+            # Hermes begins as the only employee (CEO / solo founder).
+            # Hiring requires deterministic evidence evaluated by
+            # hermes_cli.hiring_policy; a planner's preference is insufficient.
+            "solo_founder": True,
+            "minimum_backlog": 5,
+            "minimum_sustained_cycles": 3,
+            "minimum_blocked_objectives": 1,
+            "allow_separation_of_duty_hires": True,
+            "require_linked_objective": True,
+            "max_direct_reports_per_manager": 7,
+            "max_active_objectives": 25,
+            "allow_contractors": True,
+            "fte_duration_threshold_cycles": 12,
+            "max_contract_duration_cycles": 12,
+        },
+        "finance": {
+            "base_currency": "USD",
+            "initial_capital_minor": 1000,
+            "accounting_basis": "accrual",
+            "strict_budget_enforcement": True,
+            "tax_fail_closed": True,
+            "tax_profile": {
+                "legal_entity_type": "unconfigured",
+                "jurisdictions": [],
+                "fiscal_year_end_month": 12,
+            },
+            "payments": {
+                "custody_model": "non_custodial",
+                "inbound_providers": [],
+                "outbound_providers": [],
+                "machine_protocols": ["mpp", "x402"],
+                "require_provider_registry_evidence": True,
+                "require_aml_and_sanctions_screening": True,
+                "store_raw_financial_credentials": False,
+            },
+        },
+        "communications": {
+            "email": {
+                "provider": "agentmail",
+                "plan": "free",
+                "inbox_id": "",
+                "bootstrap_skill": "official/email/agentmail",
+                "procurement_review_at_basis_points": 8000,
+                "limits": {
+                    "inboxes": 3,
+                    "emails_month": 3000,
+                    "emails_day": 100,
+                    "storage_mb": 3072,
+                    "webhook_endpoints": 2,
+                },
+            },
+        },
+        "compliance": {
+            "require_action_context": True,
+            "fail_closed_on_unknown_applicability": True,
+            "regime_review_interval_days": 30,
+            "applicability_review_interval_days": 90,
+            "deadline_horizon_days": 30,
+        },
     },
 
     # Mixture of Agents — named presets used by /moa. A preset is an execution

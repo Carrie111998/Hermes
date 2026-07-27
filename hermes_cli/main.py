@@ -4531,6 +4531,20 @@ def cmd_project(args):
     return projects_command(args)
 
 
+def cmd_objectives(args):
+    """Govern durable objectives, plans, actions, permits, and evidence."""
+    from hermes_cli.objectives import objectives_command
+
+    return objectives_command(args)
+
+
+def cmd_business(args):
+    """Inspect and operate the governed business financial surface."""
+    from hermes_cli.business import business_command
+
+    return business_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -15304,6 +15318,20 @@ def main():
 
     project_parser = _build_project_parser(subparsers)
     project_parser.set_defaults(func=cmd_project)
+
+    # =========================================================================
+    # objectives command — governed long-running operational state
+    # =========================================================================
+    from hermes_cli.objectives import build_parser as _build_objectives_parser
+
+    objectives_parser = _build_objectives_parser(subparsers)
+    objectives_parser.set_defaults(func=cmd_objectives)
+
+    # business command — organization, accounting, budgets, and payment rails
+    from hermes_cli.business import build_parser as _build_business_parser
+
+    business_parser = _build_business_parser(subparsers)
+    business_parser.set_defaults(func=cmd_business)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management

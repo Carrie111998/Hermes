@@ -831,10 +831,23 @@ def read_profile_meta(profile_dir: Path) -> dict:
         return {"description": "", "description_auto": False}
     if not isinstance(data, dict):
         return {"description": "", "description_auto": False}
-    return {
+    result = {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
     }
+    for key in (
+        "organization_id",
+        "employee_id",
+        "manager_employee_id",
+        "corporate_level",
+        "employment_class",
+        "mandate_id",
+        "mandate_version",
+        "mandate_expires_at",
+    ):
+        if key in data:
+            result[key] = data[key]
+    return result
 
 
 def write_profile_meta(
@@ -842,6 +855,14 @@ def write_profile_meta(
     *,
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
+    organization_id: Optional[str] = None,
+    employee_id: Optional[str] = None,
+    manager_employee_id: Optional[str] = None,
+    corporate_level: Optional[str] = None,
+    employment_class: Optional[str] = None,
+    mandate_id: Optional[str] = None,
+    mandate_version: Optional[int] = None,
+    mandate_expires_at: Optional[int] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -866,6 +887,19 @@ def write_profile_meta(
         existing["description"] = description.strip()
     if description_auto is not None:
         existing["description_auto"] = bool(description_auto)
+    metadata = {
+        "organization_id": organization_id,
+        "employee_id": employee_id,
+        "manager_employee_id": manager_employee_id,
+        "corporate_level": corporate_level,
+        "employment_class": employment_class,
+        "mandate_id": mandate_id,
+        "mandate_version": mandate_version,
+        "mandate_expires_at": mandate_expires_at,
+    }
+    for key, value in metadata.items():
+        if value is not None:
+            existing[key] = value
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(existing, f, sort_keys=False, default_flow_style=False)
 

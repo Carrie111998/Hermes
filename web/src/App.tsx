@@ -21,6 +21,7 @@ import {
 import {
   Activity,
   BarChart3,
+  Building2,
   BookOpen,
   Clock,
   Code,
@@ -79,6 +80,7 @@ import FilesPage from "@/pages/FilesPage";
 import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
+import BusinessPage from "@/pages/BusinessPage";
 import ModelsPage from "@/pages/ModelsPage";
 import CronPage from "@/pages/CronPage";
 import ProfilesPage from "@/pages/ProfilesPage";
@@ -135,6 +137,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/sessions": SessionsPage,
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
+  "/business": BusinessPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
   "/cron": CronPage,
@@ -174,6 +177,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Analytics",
     icon: BarChart3,
   },
+  { path: "/business", label: "Business", icon: Building2 },
   {
     path: "/models",
     labelKey: "models",
@@ -203,6 +207,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
 const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   Activity,
   BarChart3,
+  Building2,
   Clock,
   Cpu,
   FileText,

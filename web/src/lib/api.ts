@@ -65,6 +65,7 @@ export function getManagementProfile(): string {
 // themselves — is machine-global or self-scoped and must NOT be rewritten.
 const PROFILE_SCOPED_PREFIXES = [
   "/api/status",
+  "/api/business",
   "/api/gateway",
   "/api/analytics",
   "/api/skills",
@@ -304,9 +305,278 @@ function appendProfileParam(url: string, profile?: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
 }
 
+export interface BusinessObjective {
+  id: string;
+  desired_outcome: string;
+  status: string;
+  owner?: string | null;
+  updated_at: number;
+}
+
+export interface BusinessStatusResponse {
+  configured: boolean;
+  reason?: string;
+  organization?: {
+    id: string;
+    name: string;
+    purpose: string;
+    base_currency: string;
+    operator_role: string;
+  };
+  ceo?: {
+    id: string;
+    display_name: string;
+    title: string;
+    status: string;
+  };
+  organization_chart?: Array<{
+    id: string;
+    display_name: string;
+    title: string;
+    level: string;
+    status: string;
+    depth: number;
+  }>;
+  objectives: BusinessObjective[];
+  exceptions: Array<{
+    kind: string;
+    objective_id: string;
+    summary: string;
+    reason: string;
+  }>;
+  pending_events?: number;
+  event_queue?: {
+    pending: number;
+    high_priority: number;
+    overdue: number;
+    oldest_age_seconds: number | null;
+    admission_policy: string;
+  };
+  treasury?: {
+    currency: string;
+    balance_minor: number;
+    reserved_minor: number;
+    available_minor: number;
+  };
+  accounting?: {
+    balance_sheet: {
+      assets_minor: number;
+      liabilities_minor: number;
+      equity_before_current_earnings_minor: number;
+      current_earnings_minor: number;
+      balanced: boolean;
+    };
+    profit_and_loss: {
+      revenue_minor: number;
+      expenses_minor: number;
+      net_income_minor: number;
+    };
+    tax_liability_minor: number;
+  };
+  decision_memo?: {
+    headline: string;
+    decisions_required: number;
+    objective_status_counts: Record<string, number>;
+    generated_from: string;
+  };
+  autonomy?: {
+    mode: "autonomous" | "paused" | "manual";
+    generation: number;
+    reason?: string | null;
+    changed_by: string;
+    changed_at: number;
+  };
+  interventions?: Array<{
+    id: string;
+    objective_id?: string | null;
+    action_id?: string | null;
+    category: string;
+    summary: string;
+    context: Record<string, unknown>;
+    options: Array<{ id: string; label: string }>;
+    status: string;
+    created_at: number;
+  }>;
+  workers?: Array<{
+    id: string;
+    role: string;
+    pid: number;
+    status: string;
+    effective_status: string;
+    healthy: boolean;
+    heartbeat_age_seconds: number;
+    last_cycle_status?: string | null;
+    last_error?: string | null;
+  }>;
+  triggers?: {
+    subscriptions: Array<{
+      id: string;
+      objective_id: string;
+      source_type: string;
+      event_type: string;
+      status: string;
+    }>;
+    schedules: Array<{
+      id: string;
+      objective_id: string;
+      event_type: string;
+      interval_seconds: number;
+      next_fire_at: number;
+      status: string;
+    }>;
+  };
+  maintenance?: {
+    last_checked_at: number;
+    last_change_run_id?: string | null;
+    last_summary: {
+      expired_objectives: string[];
+      revoked_permits: string[];
+      released_reservations: string[];
+      suspended_employees: string[];
+      disabled_triggers: number;
+    };
+  } | null;
+  authority_integrity?: {
+    id: string;
+    checked_at: number;
+    status: "ready" | "failed";
+    policy_baseline_id?: string | null;
+    expected_policy_sha256?: string | null;
+    observed_policy_sha256: string;
+    evidence_sha256: string;
+    checks: Record<string, boolean | number | string[]>;
+  } | null;
+  authority_recovery?: {
+    snapshot_count: number;
+    all_snapshots_valid: boolean;
+    latest_snapshot: {
+      snapshot_id: string;
+      created_at: number;
+      valid: boolean;
+      database_sha256: string;
+      integrity_run_id: string;
+      audit_sequence: number;
+    } | null;
+    latest_recovery_event: {
+      id: string;
+      event_type: string;
+      snapshot_id: string;
+      created_at: number;
+    } | null;
+  };
+  commitments?: {
+    open_count: number;
+    breached_count: number;
+    limit: number;
+    counterparty_details_included: false;
+    open: Array<{
+      id: string;
+      objective_id: string;
+      kind: string;
+      title: string;
+      due_at: number;
+      grace_seconds: number;
+      required_verifier: string;
+      financial_exposure_minor: number;
+      currency?: string | null;
+      status: "active" | "breached";
+      overdue: boolean;
+      eligible_fulfillment_evidence: Array<{
+        verification_id: string;
+        method: string;
+        action_id?: string | null;
+        evidence_sha256: string;
+        created_at: number;
+      }>;
+    }>;
+  };
+  approvals?: {
+    pending_count: number;
+    evidence_included: false;
+    limit: number;
+    artifacts: Array<{
+      id: string;
+      objective_id: string;
+      action_id: string;
+      capability: string;
+      target_system: string;
+      target_resource?: string | null;
+      estimated_cost_minor: number;
+      currency?: string | null;
+      policy_version: string;
+      approved_by: string;
+      approved_at: number;
+      expires_at: number;
+      status: "issued" | "materialized" | "consumed" | "revoked" | "expired";
+      consumed_at?: number | null;
+      consumed_by_permit_id?: string | null;
+    }>;
+  };
+  strategy_measurement?: {
+    metrics: Array<{
+      id: string;
+      metric_key: string;
+      name: string;
+      unit: string;
+      preferred_direction: "increase" | "decrease" | "maintain";
+      source_system: string;
+      latest_observation: {
+        id: string;
+        value_scaled: number;
+        scale: number;
+        observed_at: number;
+        evidence_sha256: string;
+      } | null;
+    }>;
+    targets: Array<{
+      id: string;
+      objective_id: string;
+      metric_id: string;
+      comparator: "gte" | "lte";
+      target_scaled: number;
+      scale: number;
+      status: string;
+      next_review_at: number;
+      max_observation_age_seconds: number;
+    }>;
+    experiments: Array<{
+      id: string;
+      objective_id: string;
+      name: string;
+      hypothesis: string;
+      metric_id: string;
+      status: string;
+      ends_at: number;
+      max_spend_minor: number;
+      currency?: string | null;
+    }>;
+  };
+}
+
 export const api = {
   buildWsUrl,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  getBusinessStatus: () =>
+    fetchJSON<BusinessStatusResponse>("/api/business/status"),
+  setBusinessAutonomy: (mode: "autonomous" | "paused" | "manual", reason: string) =>
+    fetchJSON<BusinessStatusResponse["autonomy"]>("/api/business/autonomy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, reason }),
+    }),
+  resolveBusinessIntervention: (
+    interventionId: string,
+    optionId: string,
+    evidence: Record<string, unknown>,
+  ) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/business/interventions/${encodeURIComponent(interventionId)}/resolve`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ option_id: optionId, evidence }),
+      },
+    ),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *

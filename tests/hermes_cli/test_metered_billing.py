@@ -1,0 +1,45 @@
+import sqlite3
+
+from hermes_cli import metered_billing
+
+
+def test_subcent_usage_accumulates_without_rounding_loss():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    meter = metered_billing.create_meter(
+        conn,
+        organization_id="org_1",
+        name="inference-token",
+        currency="USD",
+        unit_price_microminor=250_000,
+        unit_name="token",
+    )
+    for index in range(3):
+        metered_billing.record_usage(
+            conn,
+            meter_id=meter,
+            customer_id="customer_1",
+            quantity=1,
+            idempotency_key=f"request-{index}",
+            evidence={"request_id": f"request-{index}"},
+            occurred_at=10,
+        )
+    first = metered_billing.close_usage_window(
+        conn, meter_id=meter, customer_id="customer_1", through_at=10
+    )
+    assert first["amount_minor"] == 0
+    assert first["carry_microminor"] == 750_000
+    metered_billing.record_usage(
+        conn,
+        meter_id=meter,
+        customer_id="customer_1",
+        quantity=1,
+        idempotency_key="request-3",
+        evidence={"request_id": "request-3"},
+        occurred_at=11,
+    )
+    second = metered_billing.close_usage_window(
+        conn, meter_id=meter, customer_id="customer_1", through_at=11
+    )
+    assert second["amount_minor"] == 1
+    assert second["carry_microminor"] == 0
