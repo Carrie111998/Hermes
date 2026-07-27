@@ -128,3 +128,42 @@ Tracked separately in `profiles/aletheon/AUDIT_STATUS.md`; they live in the
 hermes-home repo, not this one, and upstream never touches them. The
 delegation-guard lease store, compaction-guard/feedback-gate kwarg fixes,
 `cfg_get` corrections and profile-path fixes are all in that repo.
+
+## XFAIL disposition
+
+`tests/gateway/test_worker_bridge_watchers_mixin.py` carries **19 non-strict
+xfails**, all with precise per-test reasons. Verified 2026-07-27: **19 xfailed,
+0 XPASS** — none is secretly passing.
+
+They are the specification for an in-progress feature ("Step 8"), and they split
+into two genuinely different kinds:
+
+**Unfinished work** — will XPASS when Step 8 lands, which the CI `xpass-guard`
+job now detects:
+`test_free_slots_*` / `test_stale_lease_pid_frees_capacity` (slot counting is
+not leases-backed yet), the six `*alert_text*` / `*nudge*` cases
+(auto-dispatch-aware wording), the four `*auto_dispatch*` / `*capacity*` /
+`*spawn*` cases, and `test_skip_audit_deduped_until_reason_changes`.
+
+**Provably invalid specification** — the plan was superseded for stated
+correctness reasons, so these should be *revised or removed* rather than
+implemented:
+
+| Test | Why the spec is wrong |
+|---|---|
+| `test_selects_only_created_and_queued` | the plan gives this watcher `created`, but the shipped design reserves `created -> queued` in `GatewayWorkerTaskDispatcherMixin`; letting both select `created` races two watchers for one task |
+| `test_requeued_retry_is_dispatchable` | same root cause — the fixture seeds `created`, which this watcher deliberately does not own |
+| `test_claim_marks_task_and_returns_snapshot` | expects `dispatch_claim`; the runtime key is `gateway_dispatch_claim` and is already persisted in live `bridge.db` rows — renaming orphans in-flight claims |
+| `test_release_leaves_row_alone_if_live_pid_took_over` | same key-rename problem |
+
+**Deliberately not changed by this audit.** They belong to the Step-8
+workstream, they are non-strict (cannot fail CI), their reasons are precise, and
+`gateway/run.py` — the one file that conflicted in the upstream rehearsal — is
+the same area a concurrent session is editing. Unilaterally deleting another
+workstream's specification tests would destroy information, which is the failure
+mode this whole ledger exists to prevent. The four invalid ones are flagged here
+for their owner.
+
+Also fixed at HEAD: `FakeRunner` did not compose `GatewayWorkerBridgeUltraMixin`
+while the production code calls `_ultra_route_transitions`, so 2 tests failed on
+a clean checkout. Now 58 passed, 19 xfailed, 0 failed.

@@ -149,7 +149,7 @@ jobs:
       - name: An XFAIL that starts passing is unfinished work, not a pass
         run: |
           set -euo pipefail
-          out=$(python -m pytest tests/contract/ evals/behavioral/ -q -rX 2>&1) || true
+          out=$(python -m pytest tests/contract/ evals/behavioral/ tests/gateway/test_worker_bridge_watchers_mixin.py -q -rX 2>&1) || true
           echo "$out" | tail -10
           if echo "$out" | grep -q "XPASS"; then
             echo "::error::an XFAIL is now passing — resolve the specification"; exit 1

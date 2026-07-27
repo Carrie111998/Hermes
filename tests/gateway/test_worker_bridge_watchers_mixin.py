@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.worker_bridge_ultra import GatewayWorkerBridgeUltraMixin
 from gateway.worker_bridge_watchers import (  # noqa: F401 — see _PENDING_STEP_8
     DEFAULT_AUTO_DISPATCH_ENABLED,
     DEFAULT_MAX_TASKS_PER_CYCLE,
@@ -424,7 +425,7 @@ class FakeSessionStore:
         return list(self._entries)
 
 
-class FakeRunner(GatewayWorkerBridgeWatchersMixin):
+class FakeRunner(GatewayWorkerBridgeUltraMixin, GatewayWorkerBridgeWatchersMixin):
     def __init__(self, adapter, config=None, session_store=None):
         self._running = True
         self.adapters = {FakePlatform(): adapter}
