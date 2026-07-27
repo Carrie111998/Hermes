@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
+import gateway.ultrastudio_skill_routing as routing_module
 from gateway.ultrastudio_skill_routing import (
+    discover_skill_metadata,
     format_allowed_skills,
     workflow_routing,
 )
@@ -61,6 +65,73 @@ def test_allowed_skill_index_orders_specific_routes_before_fallbacks():
     assert "applies=specific one; specific two; specific three" in prompt
     assert "not=not specific" in prompt
     assert "- helper: Supporting guidance." in prompt
+
+
+@pytest.fixture
+def skill_discovery(tmp_path, monkeypatch):
+    """One skill root with one SKILL.md, instrumented scan counters."""
+    import agent.skill_utils as skill_utils
+    import tools.skills_tool as skills_tool
+
+    root = tmp_path / "skills"
+    (root / "demo").mkdir(parents=True)
+    (root / "demo" / "SKILL.md").write_text("---\nname: demo\n---\nbody\n", encoding="utf-8")
+
+    calls = {"find": 0, "parse": 0}
+
+    def fake_find_all_skills(**_kwargs):
+        calls["find"] += 1
+        return [{"name": "demo", "description": "Demo skill.", "category": "creative"}]
+
+    def fake_parse_frontmatter(_text):
+        calls["parse"] += 1
+        return (
+            {
+                "name": "demo",
+                "routing": {"priority": 5, "triggers": ["a", "b", "c"], "negative": ["d"]},
+            },
+            "",
+        )
+
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", root)
+    monkeypatch.setattr(skills_tool, "_find_all_skills", fake_find_all_skills)
+    monkeypatch.setattr(skills_tool, "_parse_frontmatter", fake_parse_frontmatter)
+    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [])
+    monkeypatch.setattr(routing_module, "_CACHE_KEY", None)
+    monkeypatch.setattr(routing_module, "_CACHE_RESULT", [])
+    return root, calls
+
+
+def test_discovery_cache_hit_returns_cached_result_without_rescan(skill_discovery):
+    _root, calls = skill_discovery
+    first = discover_skill_metadata()
+    assert calls == {"find": 1, "parse": 1}
+    assert first == [{
+        "name": "demo",
+        "description": "Demo skill.",
+        "category": "creative",
+        "routing": {"priority": 5, "triggers": ["a", "b", "c"], "negative": ["d"]},
+    }]
+
+    second = discover_skill_metadata()
+    assert second == first
+    assert calls == {"find": 1, "parse": 1}
+
+    # The cache hands out copies: caller-side mutation must not leak back.
+    second.append({"name": "junk"})
+    assert discover_skill_metadata() == first
+    assert calls == {"find": 1, "parse": 1}
+
+
+def test_discovery_cache_invalidates_when_root_mtime_changes(skill_discovery):
+    root, calls = skill_discovery
+    discover_skill_metadata()
+    assert calls == {"find": 1, "parse": 1}
+
+    stat = root.stat()
+    os.utime(root, (stat.st_atime + 10, stat.st_mtime + 10))
+    discover_skill_metadata()
+    assert calls == {"find": 2, "parse": 2}
 
 
 def test_allowed_skill_index_fails_closed_for_missing_or_unroutable_workflow():

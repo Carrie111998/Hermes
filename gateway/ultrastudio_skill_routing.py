@@ -3,15 +3,47 @@
 from __future__ import annotations
 
 import logging
+import threading
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Process-level cache for discover_skill_metadata: the skill catalog changes
+# rarely, while every Runtime run rebuilds the routing index (directory walk
+# plus one file read per skill). The key is each skill root's (path, mtime):
+# creating, removing, or renaming a skill directory bumps the root's mtime
+# and invalidates the cache automatically. Editing a SKILL.md in place does
+# not touch the root mtime; such edits are picked up on the next root-level
+# directory change or process restart.
+_CACHE_LOCK = threading.Lock()
+_CACHE_KEY: tuple[tuple[str, float], ...] | None = None
+_CACHE_RESULT: list[dict[str, Any]] = []
+
+
+def _roots_signature(roots: list[Path]) -> tuple[tuple[str, float], ...]:
+    signature: list[tuple[str, float]] = []
+    for root in roots:
+        try:
+            mtime = root.stat().st_mtime
+        except OSError:
+            mtime = -1.0
+        signature.append((str(root), mtime))
+    return tuple(signature)
+
 
 def discover_skill_metadata() -> list[dict[str, Any]]:
     """Add trusted routing frontmatter to Hermes' already-filtered skill index."""
+    global _CACHE_KEY, _CACHE_RESULT
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
     from tools.skills_tool import SKILLS_DIR, _find_all_skills, _parse_frontmatter
+
+    roots = [SKILLS_DIR] if SKILLS_DIR.exists() else []
+    roots.extend(get_external_skills_dirs())
+    signature = _roots_signature(roots)
+    with _CACHE_LOCK:
+        if _CACHE_KEY == signature:
+            return list(_CACHE_RESULT)
 
     skills = _find_all_skills()
     by_name = {
@@ -21,8 +53,6 @@ def discover_skill_metadata() -> list[dict[str, Any]]:
     }
     wanted = set(by_name)
     seen: set[str] = set()
-    roots = [SKILLS_DIR] if SKILLS_DIR.exists() else []
-    roots.extend(get_external_skills_dirs())
     for root in roots:
         for skill_md in iter_skill_index_files(root, "SKILL.md"):
             try:
@@ -39,7 +69,11 @@ def discover_skill_metadata() -> list[dict[str, Any]]:
             routing = frontmatter.get("routing")
             if isinstance(routing, dict):
                 by_name[name] = {**by_name[name], "routing": routing}
-    return list(by_name.values())
+    result = list(by_name.values())
+    with _CACHE_LOCK:
+        _CACHE_KEY = signature
+        _CACHE_RESULT = result
+    return list(result)
 
 
 def workflow_routing(item: dict[str, Any]) -> tuple[int, list[str], list[str]]:
