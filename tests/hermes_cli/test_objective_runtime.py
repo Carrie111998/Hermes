@@ -1054,6 +1054,57 @@ def test_proposed_objective_creates_acceptance_handoff(tmp_path):
     assert tuple(wake) == ("objective.accepted", "pending")
 
 
+def test_ceo_originated_objective_is_accepted_without_advisor_dispatch(tmp_path):
+    conn = db.connect(tmp_path / "authority.db")
+    organization_id, _ = organization_db.bootstrap_solo_founder(
+        conn,
+        organization_name="Autonomous Company",
+        purpose="Operate without routine human dispatch",
+        profile_name="default",
+        charter=charter(),
+    )
+    objective = db.create_objective(
+        conn,
+        organization_id=organization_id,
+        desired_outcome="Advance the next CEO-owned operating milestone",
+        originator="employee:ceo",
+        permitted_systems=["crm"],
+        success_criteria=["CRM read-back matches expected stage"],
+    )
+    db.enqueue_objective_event(
+        conn,
+        objective_id=objective.id,
+        event_type="objective.proposed",
+        payload={"source": "ceo"},
+    )
+    loop = runtime.ObjectiveRuntime(
+        conn,
+        planner=Planner([]),
+        executor=Executor(),
+        verifier=Verifier(),
+        charter=charter(),
+        policy_version="charter-v1",
+        runtime_id="runtime-ceo-acceptance",
+    )
+
+    outcome = loop.tick()
+
+    assert outcome.status != "escalated"
+    assert db.get_objective(conn, objective.id).status != "proposed"
+    assert not [
+        item for item in operational_control.list_interventions(conn)
+        if item["category"] == "objective_acceptance_required"
+    ]
+    accepted = conn.execute(
+        """SELECT actor,payload_json FROM objective_events
+           WHERE objective_id=? AND kind='transitioned' AND next_status='accepted'""",
+        (objective.id,),
+    ).fetchone()
+    assert accepted is not None
+    assert accepted["actor"] == "runtime-ceo-acceptance"
+    assert "standing organizational authority" in accepted["payload_json"]
+
+
 def test_stale_objective_intent_blocks_until_reaffirmed(tmp_path):
     conn = db.connect(tmp_path / "authority.db")
     objective = accepted_objective(conn)

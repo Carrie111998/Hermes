@@ -8,6 +8,7 @@ authoritative state transitions and policy enforcement stay deterministic.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -986,27 +987,58 @@ class ObjectiveRuntime:
                 f"objective is terminal: {objective.status}",
             )
         if objective.status == "proposed":
-            self._raise_advisor_handoff(
-                objective_id=objective_id,
-                category="objective_acceptance_required",
-                summary="Objective is proposed but has not been accepted into the operating portfolio",
-                context={
-                    "objective_status": objective.status,
-                    "originator": objective.originator,
-                    "desired_outcome": objective.desired_outcome,
-                    "event_type": str(event["event_type"]),
-                },
-                options=[
-                    {"id": "accept", "label": "Accept objective into the operating portfolio"},
-                    {"id": "abandon", "label": "Abandon the proposed objective"},
-                ],
-            )
-            return CycleOutcome(
-                str(event["id"]),
-                objective_id,
-                "escalated",
-                "objective has not been accepted",
-            )
+            # The Founder/CEO owns objective creation. A CEO-originated
+            # objective inside the active organization's authority scope does
+            # not require the advisor to dispatch the next routine turn; the
+            # lifecycle transition itself is durable acceptance evidence.
+            try:
+                ceo = organization_db.active_ceo(self.conn)
+            except sqlite3.OperationalError:
+                # Unscoped/unit-test stores may not carry organization
+                # authority tables; they must retain the external acceptance
+                # handoff rather than turning a missing table into a retry.
+                ceo = None
+            ceo_ids = {
+                "employee:ceo",
+                f"employee:{ceo['id']}" if ceo is not None else "",
+            }
+            if (
+                objective.originator in ceo_ids
+                and ceo is not None
+                and objective.organization_id == str(ceo["organization_id"])
+            ):
+                db.transition_objective(
+                    self.conn,
+                    objective_id,
+                    "accepted",
+                    actor=self.runtime_id,
+                    reason=(
+                        "Founder/CEO-originated objective accepted under standing "
+                        "organizational authority"
+                    ),
+                )
+            else:
+                self._raise_advisor_handoff(
+                    objective_id=objective_id,
+                    category="objective_acceptance_required",
+                    summary="Objective is proposed but has not been accepted into the operating portfolio",
+                    context={
+                        "objective_status": objective.status,
+                        "originator": objective.originator,
+                        "desired_outcome": objective.desired_outcome,
+                        "event_type": str(event["event_type"]),
+                    },
+                    options=[
+                        {"id": "accept", "label": "Accept objective into the operating portfolio"},
+                        {"id": "abandon", "label": "Abandon the proposed objective"},
+                    ],
+                )
+                return CycleOutcome(
+                    str(event["id"]),
+                    objective_id,
+                    "escalated",
+                    "objective has not been accepted",
+                )
         recovered = self._recover_incomplete_execution(event)
         if recovered is not None:
             return recovered
