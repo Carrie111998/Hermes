@@ -467,7 +467,6 @@ def _find_installed_skill_dir_by_name(
         candidate = skill_md.parent
         if candidate.name != skill_dir_name:
             continue
-        # Never reach outside the skills tree (symlinked/external dirs).
         try:
             candidate.resolve().relative_to(SKILLS_DIR.resolve())
         except (OSError, ValueError):
