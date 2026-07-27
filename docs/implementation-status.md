@@ -67,6 +67,8 @@ acceptance evidence.
   concurrent probes fail closed and an expired probe can be reclaimed safely.
 - Circuit-breaker schema checks preserve active authority transactions instead
   of implicitly committing permit or ledger state.
+- Compliance schema checks preserve active authority transactions while
+  admitting obligations, applicability, and control evidence.
 - Portfolio child/successor admission and employee grant/revocation admission
   serialize budget and authority checks across concurrent local workers.
 - External action handlers recheck the autonomy kill-switch immediately before
@@ -197,7 +199,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`971ea3dfb4a49d92191acee57dbc0308d343828e` passed 6 Founder/CEO E2E tests, 48
+`9442db2154771cc84298c8d984050e471d5c2554` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -216,6 +218,8 @@ It also passed the compute-reconciliation regression: 9 tests.
 The finance suite also passed the payment readback convergence regression: 21 tests.
 The circuit-breaker recovery-probe regression passed 3 tests, including
 single-probe admission and expired-probe reclamation.
+The compliance regression passed 7 tests, including append-only evidence and
+schema transaction preservation.
 The broader current-main regression command across resource budgets, company
 email, approvals, operational control, hiring, portfolio, accounting,
 procurement, metered billing, and usage billing passed **76 tests, 0 failed**.

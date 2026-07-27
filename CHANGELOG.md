@@ -298,3 +298,5 @@ recorded.
   recovery probes with a durable half-open lease and safe expiry reclamation.
 - `971ea3dfb4a49d92191acee57dbc0308d343828e` — preserved active authority
   transactions during circuit-breaker schema checks.
+- `9442db2154771cc84298c8d984050e471d5c2554` — preserved active authority
+  transactions during compliance schema checks.
