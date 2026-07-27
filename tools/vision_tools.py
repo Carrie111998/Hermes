@@ -1733,6 +1733,28 @@ async def video_analyze_tool(
             }
         ]
 
+        # Fallback: some OpenAI-compatible providers (OpenRouter, Ollama
+        # Cloud, etc.) accept image_url blocks but reject video_url blocks
+        # with a 400.  Build an image_url variant so we can retry without
+        # re-encoding.
+        _image_url_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": user_prompt,
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": video_data_url,
+                        },
+                    },
+                ],
+            }
+        ]
+
         vision_timeout = 180.0
         vision_temperature = 0.1
         try:
@@ -1758,8 +1780,28 @@ async def video_analyze_tool(
         if model:
             call_kwargs["model"] = model
 
-        response = await async_call_llm(**call_kwargs)
-        analysis = extract_content_or_reasoning(response)
+        try:
+            response = await async_call_llm(**call_kwargs)
+            analysis = extract_content_or_reasoning(response)
+        except Exception as first_err:
+            # Fallback: retry with image_url type if the provider rejects
+            # video_url (common for OpenAI-compatible providers that accept
+            # image_url but not video_url content blocks).
+            _err_lower = str(first_err).lower()
+            _video_format_hints = (
+                "invalid message", "video_url", "video input",
+                "not support video", "unrecognized request",
+                "invalid content", "unsupported content",
+            )
+            if any(hint in _err_lower for hint in _video_format_hints):
+                logger.info(
+                    "video_url rejected by provider, retrying with image_url fallback"
+                )
+                call_kwargs["messages"] = _image_url_messages
+                response = await async_call_llm(**call_kwargs)
+                analysis = extract_content_or_reasoning(response)
+            else:
+                raise
 
         if not analysis:
             logger.warning("Empty video response, retrying once")
@@ -1797,11 +1839,12 @@ async def video_analyze_tool(
             "does not support", "not support video",
             "content_policy", "multimodal",
             "unrecognized request argument", "video input",
-            "video_url",
+            "video_url", "image_url",
         )):
             analysis = (
                 f"The model does not support video analysis or the request was "
-                f"rejected. Ensure you're using a video-capable model "
+                f"rejected (tried both video_url and image_url formats). "
+                f"Ensure you're using a video-capable model "
                 f"(e.g. google/gemini-2.5-flash). Error: {e}"
             )
         elif any(hint in err_str for hint in (
