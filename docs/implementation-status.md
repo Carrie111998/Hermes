@@ -137,6 +137,13 @@ external ingress and scheduling, billing, tax/accounting, staffing/workforce,
 runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
+A separate post-boundary rerun at baseline commit
+`327eea42608fad5567f2e89b42b81cc487384563` passed 6 Founder/CEO E2E tests, 42
+objective service/runtime/worker tests, and 18 finance/attribution tests,
+plus selected module compilation and `git diff --check`. This supports the
+bounded tested runtime on current `main`; it does not change the tagged release
+boundary or broaden the inventory coverage claim.
+
 The following historical focused regression results are contextual evidence,
 not additional claims that the current release boundary covered every listed
 surface. Their commit pins and reconstructability status are recorded in

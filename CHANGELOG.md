@@ -167,6 +167,11 @@ recorded.
   durable provider read-back or failed/cancelled settlement evidence.
 - `e5ee81ded0b18b53453fc15570fafce231bdef75` — clarified release evidence,
   coverage scope, and the test-provider boundary.
+- Current-main focused acceptance rerun at baseline
+  `327eea42608fad5567f2e89b42b81cc487384563`: 6 Founder/CEO E2E tests, 42
+  objective service/runtime/worker tests, and 18 finance/attribution tests
+  passed; compilation and diff checks passed. This is post-boundary evidence,
+  not a release-tag move.
 - The containing documentation/control-boundary commit also adds proposal-time
   validation of registered action payload schemas and temporal preconditions;
   its SHA is the final commit that contains this changelog entry.

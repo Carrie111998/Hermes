@@ -81,6 +81,27 @@ The current `main` branch is intentionally ahead of this tagged evidence
 commit. Its additional commits are Unreleased and do not inherit this PASS
 determination until a newer evidence commit is recorded.
 
+## Post-boundary evidence on current main
+
+The exact acceptance command set was rerun against current `main` at baseline
+commit `327eea42608fad5567f2e89b42b81cc487384563`. This is a separate,
+post-boundary evidence run; it does not move or rewrite the immutable release
+tag above.
+
+- Founder/CEO E2E: **6 passed, 0 failed**.
+- Objective service/runtime/worker sweep: **42 passed, 0 failed** across 3
+  files.
+- Finance and outcome-attribution sweep: **18 passed, 0 failed** across 2
+  files.
+- Selected runtime compilation: completed successfully.
+- `git diff --check`: completed successfully.
+
+This current-main run supports the same **controlled Founder/CEO runtime
+acceptance PASS** for the bounded tested surface, while production autonomous
+business operation remains **NOT READY**. The exact commands are the same as
+the command block above; the baseline SHA and results are the authoritative
+post-boundary record.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
