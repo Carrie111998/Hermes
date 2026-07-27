@@ -588,6 +588,19 @@ Result: **29 passed, 0 failed**. The evidence confirms immutable applicability,
 obligation, control, and payment-provider records; explicit supersession
 lineage; fail-closed action admission; and readiness payment-profile gates.
 
+Abrupt worker-death and ingress restart recovery were validated on current
+`main` (`bd0af992f11278450a431d7dafe9e46211224e1b`) with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_objective_worker.py \
+  tests/hermes_cli/test_agentic_runtime_ingress_e2e.py
+```
+
+Result: **17 passed, 0 failed**. The tests cover stale heartbeat fencing,
+supervisor stop/circuit behavior, authenticated event persistence across worker
+restart, and verified objective completion after the restart.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
