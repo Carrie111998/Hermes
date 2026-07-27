@@ -4,6 +4,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -62,8 +63,9 @@ def test_faster_whisper_is_not_a_base_dependency():
 # authz in middleware/endpoints that gate on ``request.url``. Starlette is a
 # transitive dep (fastapi in [web]; sse-starlette/mcp in [mcp]/[computer-use]/
 # [dev]) so we pin it directly in every extra that exposes a server surface and
-# enforce the floor in both pyproject and the committed lockfile.
-_STARLETTE_CVE_FLOOR = (1, 0, 1)
+# enforce the current reviewed floor in both pyproject and the committed
+# lockfile.
+_STARLETTE_CVE_FLOOR = (1, 3, 1)
 _UPDATE_DOWNGRADE_GUARD_FLOORS = {
     # `hermes update` reinstalls exact pins from pyproject/lazy_deps. These
     # reviewed CVE pins must not slide back to stale versions that downgrade
@@ -74,33 +76,44 @@ _UPDATE_DOWNGRADE_GUARD_FLOORS = {
 }
 
 
-def _version_tuple(spec: str) -> tuple[int, ...]:
-    # "1.0.1" -> (1, 0, 1); tolerant of pre/post suffixes by truncating.
-    head = spec.split("+", 1)[0]
-    parts = []
-    for chunk in head.split("."):
-        digits = "".join(ch for ch in chunk if ch.isdigit())
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts)
+def _version_below_floor(version: str, floor: tuple[int, ...]) -> bool:
+    """Compare dependency versions with PEP 440 prerelease semantics."""
+    return Version(version) < Version(".".join(map(str, floor)))
 
 
-def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
-    """Every extra that declares Starlette must pin a patched (>=1.0.1) version.
+def test_security_floor_comparison_rejects_prereleases() -> None:
+    assert _version_below_floor("1.3.1rc1", (1, 3, 1))
 
-    Regression guard for #35067 / CVE-2026-48710. A future edit that drops the
+
+def test_starlette_pinned_above_current_security_floor_in_pyproject():
+    """Core and every server extra must exact-pin patched Starlette.
+
+    Regression guard for #35067 and #72108. A future edit that drops the
     pin (re-exposing the unbounded transitive ``starlette>=0.27`` from mcp /
-    ``>=0.40.0`` from fastapi) or pins a pre-1.0.1 version fails here instead of
-    shipping a Host-header auth-bypass to dashboard / MCP-HTTP users.
+    ``>=0.40.0`` from fastapi) or pins a pre-1.3.1 version fails here instead of
+    shipping a known-vulnerable server dependency to dashboard / MCP users.
     """
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core = data["project"]["dependencies"]
     extras = data["project"]["optional-dependencies"]
+
+    expected = f"starlette=={'.'.join(map(str, _STARLETTE_CVE_FLOOR))}"
+    assert expected in core, (
+        "core dependencies must exact-pin the Starlette security floor because "
+        "core FastAPI installs otherwise admit a stale vulnerable transitive"
+    )
 
     found = {}
     for extra, specs in extras.items():
         for spec in specs:
-            name = spec.split("==", 1)[0].split(">", 1)[0].split("<", 1)[0].split("[", 1)[0].strip()
+            name = (
+                spec
+                .split("==", 1)[0]
+                .split(">", 1)[0]
+                .split("<", 1)[0]
+                .split("[", 1)[0]
+                .strip()
+            )
             if name.lower() == "starlette":
                 assert "==" in spec, f"[{extra}] must exact-pin starlette, got {spec!r}"
                 ver = spec.split("==", 1)[1].split(";", 1)[0].strip()
@@ -109,44 +122,40 @@ def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
     # The four server-surface extras must each carry the direct pin.
     for extra in ("web", "mcp", "computer-use", "dev"):
         assert extra in found, (
-            f"[{extra}] no longer pins starlette directly — CVE-2026-48710 "
-            f"regression risk (mcp/fastapi pull it transitively with no upper bound)"
+            f"[{extra}] no longer pins starlette directly — security regression "
+            f"risk (mcp/fastapi pull it transitively with no upper bound)"
         )
 
     for extra, ver in found.items():
-        assert _version_tuple(ver) >= _STARLETTE_CVE_FLOOR, (
-            f"[{extra}] pins starlette=={ver}, below the CVE-2026-48710 fix "
-            f"floor {'.'.join(map(str, _STARLETTE_CVE_FLOOR))}"
+        assert not _version_below_floor(ver, _STARLETTE_CVE_FLOOR), (
+            f"[{extra}] pins starlette=={ver}, below the current security floor "
+            f"{'.'.join(map(str, _STARLETTE_CVE_FLOOR))}"
         )
 
 
-def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
-    """The committed uv.lock must resolve starlette to a patched version.
+def test_locked_dependencies_clear_issue_72108_high_advisories():
+    """The hash-verified install must retain every #72108 security floor."""
+    minimums = {
+        "cryptography": (48, 0, 1),
+        "httplib2": (0, 32, 0),
+        "mcp": (1, 28, 1),
+        "pillow": (12, 3, 0),
+        "pyasn1": (0, 6, 4),
+        "python-multipart": (0, 0, 32),
+        "starlette": _STARLETTE_CVE_FLOOR,
+    }
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked: dict[str, list[str]] = {}
+    for package in lock["package"]:
+        locked.setdefault(package["name"].lower(), []).append(package["version"])
 
-    pyproject pins protect the declared extras, but the lockfile is what
-    hash-verified installs (``uv sync --locked``) actually pull. Assert the
-    resolved version is >= the CVE-2026-48710 fix floor so a stale-lock
-    regression can't ship a vulnerable Starlette to users.
-    """
-    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
-    versions = []
-    in_starlette = False
-    for line in lock.splitlines():
-        if line.startswith("[[package]]"):
-            in_starlette = False
-        elif line.strip() == 'name = "starlette"':
-            in_starlette = True
-        elif in_starlette and line.startswith("version = "):
-            versions.append(line.split("=", 1)[1].strip().strip('"'))
-            in_starlette = False
-
-    assert versions, "starlette not found in uv.lock"
-    for ver in versions:
-        assert _version_tuple(ver) >= _STARLETTE_CVE_FLOOR, (
-            f"uv.lock resolves starlette=={ver}, below the CVE-2026-48710 fix "
-            f"floor {'.'.join(map(str, _STARLETTE_CVE_FLOOR))} — regenerate the "
-            f"lockfile after bumping the pin"
-        )
+    for package, floor in minimums.items():
+        assert package in locked, f"{package} not found in uv.lock"
+        for version in locked[package]:
+            assert not _version_below_floor(version, floor), (
+                f"uv.lock resolves {package}=={version}, "
+                f"below the #72108 security floor {'.'.join(map(str, floor))}"
+            )
 
 
 def test_update_cve_pins_do_not_downgrade_reviewed_current_versions():
@@ -163,7 +172,7 @@ def test_update_cve_pins_do_not_downgrade_reviewed_current_versions():
         assert versions, f"{package} is no longer exact-pinned; update this guard"
         below_floor = sorted(
             version for version in versions
-            if _version_tuple(version) < floor
+            if _version_below_floor(version, floor)
         )
         assert not below_floor, (
             f"{package} exact pin(s) {below_floor} are below the reviewed "
@@ -174,7 +183,7 @@ def test_update_cve_pins_do_not_downgrade_reviewed_current_versions():
         assert locked_versions, f"{package} is missing from uv.lock"
         locked_below_floor = sorted(
             version for version in locked_versions
-            if _version_tuple(version) < floor
+            if _version_below_floor(version, floor)
         )
         assert not locked_below_floor, (
             f"uv.lock resolves {package} version(s) {locked_below_floor} below "
@@ -313,8 +322,10 @@ def _lazy_deps_by_feature():
     tree = ast.parse(src)
     for node in ast.walk(tree):
         targets = (
-            node.targets if isinstance(node, ast.Assign)
-            else [node.target] if isinstance(node, ast.AnnAssign)
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, ast.AnnAssign)
             else []
         )
         if not any(isinstance(t, ast.Name) and t.id == "LAZY_DEPS" for t in targets):
@@ -330,7 +341,9 @@ def _lazy_deps_by_feature():
                 for sub in ast.walk(value)
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
             ]
-        assert by_feature, "could not extract features from LAZY_DEPS — AST parser drifted"
+        assert by_feature, (
+            "could not extract features from LAZY_DEPS — AST parser drifted"
+        )
         return by_feature
     raise AssertionError("LAZY_DEPS dict literal not found in tools/lazy_deps.py")
 
@@ -358,7 +371,54 @@ _REQUIRED_SECURITY_PINS = {
         "platform.matrix",
         "platform.teams",
     },
+    # google-api-python-client admits old httplib2 releases. Both the unlocked
+    # google extra and the lazy Workspace installer must carry the patched
+    # decompression-bound floor directly.
+    "httplib2": {
+        "skill.google_workspace",
+    },
+    # google-auth's pyasn1-modules dependency admits old pyasn1 releases.
+    # Workspace and Vertex must repair the stale transitive on unlocked and
+    # lazy install paths instead of relying on uv.lock alone.
+    "pyasn1": {
+        "skill.google_workspace",
+        "provider.vertex",
+    },
 }
+
+_REQUIRED_EXTRA_SECURITY_PINS = {
+    "httplib2": {
+        "google",
+    },
+    "pyasn1": {
+        "google",
+        "vertex",
+    },
+}
+
+
+def test_security_pins_present_in_google_extras():
+    """Unlocked Google extras must directly carry their transitive floors."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = data["project"]["optional-dependencies"]
+    all_pins = _pins_from_specs(_pyproject_pinned_specs())
+
+    problems = []
+    for pkg, required_extras in _REQUIRED_EXTRA_SECURITY_PINS.items():
+        canon = _canonical(pkg)
+        expected = all_pins.get(canon)
+        assert expected, f"{pkg} has no exact pin in pyproject.toml"
+        for extra in sorted(required_extras):
+            got = _pins_from_specs(extras[extra]).get(canon)
+            if got != expected:
+                problems.append(
+                    f"{extra}: {pkg}="
+                    f"{sorted(got) if got else 'MISSING'}, expected {sorted(expected)}"
+                )
+    assert not problems, (
+        "a Google extra is missing a transitive security floor:\n  "
+        + "\n  ".join(problems)
+    )
 
 
 def test_security_pins_present_in_mirrored_lazy_features():

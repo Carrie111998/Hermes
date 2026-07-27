@@ -174,11 +174,12 @@ class TestBuildOAuthAuth:
         auth = build_oauth_auth("test", "https://example.com/mcp")
         assert isinstance(auth, OAuthClientProvider)
 
-    def test_returns_none_without_sdk(self, monkeypatch):
+    def test_returns_none_without_sdk(self, monkeypatch, caplog):
         import tools.mcp_oauth as mod
         monkeypatch.setattr(mod, "_OAUTH_AVAILABLE", False)
         result = build_oauth_auth("test", "https://example.com")
         assert result is None
+        assert "pip install 'mcp==1.28.1'" in caplog.text
 
     def test_pre_registered_client_id_stored(self, tmp_path, monkeypatch):
         try:
