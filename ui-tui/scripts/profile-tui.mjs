@@ -95,7 +95,12 @@ async function main() {
   const stdout = new Sink()
   const stdin = { isTTY: true, setRawMode: noop, on: noop, off: noop, resume: noop, pause: noop }
   const text = Array.from({ length: Number(process.env.LINES || 1200) }, (_, i) => `stream line ${i} ${'x'.repeat(90)}`).join('\n')
-  const inst = render(React.createElement(AppLayout, baseProps('')), { stdout, stdin, stderr: stdout, debug: false, exitOnCtrlC: false })
+  // render() (@hermes/ink's wrappedRender) is async — awaiting it was missing here,
+  // so `inst` was an unresolved Promise and every call below silently failed with
+  // "inst.rerender is not a function", swallowed because render() had already
+  // patched console.error to redirect into the (fake, discarded) Ink UI by the
+  // time the outer catch tried to log it.
+  const inst = await render(React.createElement(AppLayout, baseProps('')), { stdout, stdin, stderr: stdout, debug: false, exitOnCtrlC: false })
 
   await post('Profiler.enable')
   await post('HeapProfiler.enable')
