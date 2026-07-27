@@ -1473,7 +1473,7 @@ def _merge_disk_cooldown_state(
     disk_entry: Optional[Dict[str, Any]],
     provider_id: str,
 ) -> Dict[str, Any]:
-    """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
+    """Keep newer on-disk cooldown/quarantine and Codex chain over stale memory.
 
     ``write_credential_pool`` callers persist an in-memory snapshot that may
     predate another process marking the same credential exhausted or dead
@@ -1484,6 +1484,13 @@ def _merge_disk_cooldown_state(
     marker, or an EXHAUSTED cooldown that has not yet expired.  Expired
     cooldowns are not resurrected, so the pool's own expiry-clear (which
     resets ``last_status_at`` to None) is never overridden.
+
+    For singleton-seeded Codex OAuth rows, also retain an on-disk token chain
+    with a strictly newer ``last_refresh``. Codex refresh tokens are single-use;
+    allowing any stale whole-pool snapshot to restore the older refresh token
+    would make the next process replay an already consumed grant. For every
+    Codex row, the same recency rule preserves a newer persisted quota-refresh
+    failure marker so a stale snapshot cannot disable the cross-process throttle.
     """
     if not isinstance(disk_entry, dict):
         return entry
@@ -1497,6 +1504,51 @@ def _merge_disk_cooldown_state(
         )
 
         disk_status = disk_entry.get("last_status")
+        if (
+            provider_id == "openai-codex"
+            and entry.get("source") == "device_code"
+            and disk_entry.get("source") == "device_code"
+        ):
+            disk_refresh_at = (
+                _parse_absolute_timestamp(disk_entry.get("last_refresh")) or 0.0
+            )
+            memory_refresh_at = (
+                _parse_absolute_timestamp(entry.get("last_refresh")) or 0.0
+            )
+            if disk_refresh_at > memory_refresh_at:
+                # OAuth refresh tokens are single-use. A stale full-pool
+                # snapshot must never roll a newer persisted chain back after
+                # another process reauthenticated or refreshed it.
+                entry = dict(entry)
+                for token_field in (
+                    "access_token",
+                    "refresh_token",
+                    "last_refresh",
+                ):
+                    disk_value = disk_entry.get(token_field)
+                    if disk_value not in (None, ""):
+                        entry[token_field] = disk_value
+        if provider_id == "openai-codex":
+            disk_failure_at = (
+                _parse_absolute_timestamp(
+                    disk_entry.get(_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD)
+                )
+                or 0.0
+            )
+            memory_failure_at = (
+                _parse_absolute_timestamp(
+                    entry.get(_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD)
+                )
+                or 0.0
+            )
+            if disk_failure_at > memory_failure_at:
+                entry = dict(entry)
+                entry[_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD] = disk_entry.get(
+                    _CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD
+                )
+                entry[_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD] = disk_entry.get(
+                    _CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD
+                )
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
             return entry
         # A token change means the caller re-authed/refreshed this entry and
@@ -3589,6 +3641,8 @@ def _sync_codex_pool_entries(
         entry["last_error_reason"] = None
         entry["last_error_message"] = None
         entry["last_error_reset_at"] = None
+        entry.pop(_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD, None)
+        entry.pop(_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD, None)
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
@@ -3913,7 +3967,10 @@ def resolve_codex_runtime_credentials(
                 logger.info(
                     "Codex quota restored upstream — clearing stale pool cooldown(s)."
                 )
-                clear_codex_pool_quota_cooldowns()
+                clear_codex_pool_quota_cooldowns(
+                    probe_token,
+                    include_global_fallback=True,
+                )
                 pool_token = _pool_codex_access_token()
                 if pool_token:
                     base_url = (
@@ -4011,11 +4068,40 @@ def _is_codex_rate_limit_shaped(
     )
 
 
+def _parse_codex_reset_at(value: Any) -> Optional[float]:
+    """Normalize persisted Codex reset timestamps to Unix seconds."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric <= 0:
+            return None
+        return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            numeric = float(raw)
+        except ValueError:
+            numeric = None
+        if numeric is not None:
+            return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 # Throttle for the live Codex quota probe below.  The probe runs on the hot
 # credential-selection path while the pool is exhausted, so without a floor a
 # busy gateway would hammer the usage endpoint on every model/auxiliary call.
 CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
+_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD = "quota_probe_refresh_failure_at"
+_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD = "quota_probe_refresh_failure_chain"
 _codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
+_codex_quota_refresh_failure_cache: Dict[str, float] = {}
 _codex_quota_probe_lock = threading.Lock()
 
 
@@ -4125,8 +4211,10 @@ def _probe_codex_quota_restored(
     return result
 
 
-def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
-    """Clear rate-limit cooldowns on persisted openai-codex pool entries.
+def _clear_codex_pool_quota_cooldowns_in_store(
+    access_token: Optional[str], target_path: Path
+) -> int:
+    """Clear matching Codex cooldowns in one explicitly owned store.
 
     Called after the upstream quota is KNOWN to be restored (a successful
     ``/usage reset`` redemption, or a positive live probe) so auth.json stops
@@ -4143,8 +4231,8 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     """
     cleared = 0
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _auth_store_lock(target_path=target_path):
+            auth_store = _load_auth_store(target_path)
             pool = auth_store.get("credential_pool")
             entries = pool.get("openai-codex") if isinstance(pool, dict) else None
             if not isinstance(entries, list):
@@ -4170,45 +4258,48 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
                 entry["last_error_reset_at"] = None
                 cleared += 1
             if cleared:
-                _save_auth_store(auth_store)
+                _save_auth_store(auth_store, target_path)
     except Exception:
         logger.debug("Failed to clear Codex pool quota cooldowns", exc_info=True)
     return cleared
 
 
+def clear_codex_pool_quota_cooldowns(
+    access_token: Optional[str] = None,
+    *,
+    include_global_fallback: bool = False,
+) -> int:
+    """Clear verified Codex quota cooldowns in active and optional owner fallback.
+
+    By default this preserves the historical active-store-only behavior. Quota
+    probes pass ``include_global_fallback=True`` because their selected pool row
+    may have been read from the profile's global-root fallback.
+    """
+    try:
+        paths = (
+            _codex_pool_owner_paths()
+            if include_global_fallback
+            else [_auth_file_path()]
+        )
+    except Exception:
+        logger.debug("Failed to resolve Codex cooldown owner", exc_info=True)
+        return 0
+
+    cleared = 0
+    for target_path in paths:
+        count = _clear_codex_pool_quota_cooldowns_in_store(
+            access_token, target_path
+        )
+        cleared += count
+        if access_token and count:
+            break
+    return cleared
+
+
 def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     """Return metadata for a pool-only Codex credential in quota cooldown."""
-    def _parse_reset_at(value: Any) -> Optional[float]:
-        if value is None or value == "":
-            return None
-        if isinstance(value, (int, float)):
-            numeric = float(value)
-            if numeric <= 0:
-                return None
-            return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
-        if isinstance(value, str):
-            raw = value.strip()
-            if not raw:
-                return None
-            try:
-                numeric = float(raw)
-            except ValueError:
-                numeric = None
-            if numeric is not None:
-                return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
-            try:
-                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                return None
-        return None
-
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            return None
-        entries = pool.get("openai-codex")
+        entries: Any = read_credential_pool("openai-codex")
         if not isinstance(entries, list):
             return None
         now = time.time()
@@ -4234,7 +4325,7 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
             )
             if not is_rate_limited:
                 continue
-            reset_at = _parse_reset_at(entry.get("last_error_reset_at"))
+            reset_at = _parse_codex_reset_at(entry.get("last_error_reset_at"))
             if reset_at is not None and reset_at <= now:
                 continue
             return {
@@ -4252,9 +4343,32 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     return None
 
 
-def _refresh_codex_pool_token_for_quota_probe(
+def _codex_pool_owner_paths() -> List[Path]:
+    """Return write-capable auth-store candidates for a Codex pool row.
+
+    Profile entries shadow global entries, so the active store is always
+    checked first.  The global path is included only when it is distinct and
+    pytest's real-home seat belt permits it.
+    """
+    active_path = _auth_file_path()
+    paths = [active_path]
+    global_path = _global_auth_file_path()
+    if global_path is None or _same_path(active_path, global_path):
+        return paths
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env and _same_path(
+            global_path, Path(real_home_env) / ".hermes" / "auth.json"
+        ):
+            return paths
+    paths.append(global_path)
+    return paths
+
+
+def _refresh_codex_pool_token_for_quota_probe_in_store(
     rate_limit_status: Dict[str, Any],
-) -> Dict[str, Any]:
+    target_path: Path,
+) -> Optional[Dict[str, Any]]:
     """Persist a usable probe token while preserving its quota cooldown.
 
     A persisted 429 may outlive the access token that originally received it.
@@ -4267,7 +4381,7 @@ def _refresh_codex_pool_token_for_quota_probe(
     """
     result = dict(rate_limit_status)
     stale_token = str(result.get("access_token") or "").strip()
-    if not stale_token or not _codex_access_token_is_expiring(stale_token, 0):
+    if not stale_token:
         return result
 
     entry_id = str(result.get("id") or "").strip()
@@ -4278,12 +4392,12 @@ def _refresh_codex_pool_token_for_quota_probe(
         # Serialize the complete single-use lifecycle: re-read the latest row,
         # exchange its refresh token, then atomically save the replacement
         # before another process can load and reuse the consumed token.
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _auth_store_lock(target_path=target_path):
+            auth_store = _load_auth_store(target_path)
             pool = auth_store.get("credential_pool")
             entries = pool.get("openai-codex") if isinstance(pool, dict) else None
             if not isinstance(entries, list):
-                return result
+                return None
 
             entry = next(
                 (
@@ -4295,13 +4409,48 @@ def _refresh_codex_pool_token_for_quota_probe(
                 None,
             )
             if not isinstance(entry, dict):
-                return result
+                return None
             if entry.get("last_status") != "exhausted" or not _is_codex_rate_limit_shaped(
                 entry.get("last_error_code"),
                 entry.get("last_error_reason"),
                 entry.get("last_error_message"),
             ):
                 return result
+
+            if entry.get("source") == "device_code":
+                providers = auth_store.get("providers")
+                state = (
+                    providers.get("openai-codex")
+                    if isinstance(providers, dict)
+                    else None
+                )
+                tokens = state.get("tokens") if isinstance(state, dict) else None
+                if isinstance(tokens, dict):
+                    canonical_access = str(tokens.get("access_token") or "").strip()
+                    canonical_refresh = str(tokens.get("refresh_token") or "").strip()
+                    canonical_last_refresh = (
+                        state.get("last_refresh") if isinstance(state, dict) else None
+                    )
+                    canonical_changed = False
+                    if canonical_access and canonical_access != str(
+                        entry.get("access_token") or ""
+                    ).strip():
+                        entry["access_token"] = canonical_access
+                        canonical_changed = True
+                    if canonical_refresh and canonical_refresh != str(
+                        entry.get("refresh_token") or ""
+                    ).strip():
+                        entry["refresh_token"] = canonical_refresh
+                        canonical_changed = True
+                    if canonical_last_refresh and canonical_last_refresh != entry.get(
+                        "last_refresh"
+                    ):
+                        entry["last_refresh"] = canonical_last_refresh
+                        canonical_changed = True
+                    if canonical_changed:
+                        # Persist only token metadata; the exhausted/reset
+                        # fields remain frozen until a positive usage probe.
+                        _save_auth_store(auth_store, target_path)
 
             current_access = str(entry.get("access_token") or "").strip()
             if not current_access:
@@ -4318,9 +4467,108 @@ def _refresh_codex_pool_token_for_quota_probe(
             current_refresh = str(entry.get("refresh_token") or "").strip()
             if not current_refresh:
                 return result
-            refreshed = refresh_codex_oauth_pure(current_access, current_refresh)
-            fresh_access = str(refreshed.get("access_token") or "").strip()
+
+            refresh_cache_key = hashlib.sha256(
+                f"{current_access}\0{current_refresh}".encode("utf-8")
+            ).hexdigest()[:16]
+            persisted_failure_at = _parse_codex_reset_at(
+                entry.get(_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD)
+            )
+            persisted_failure_chain = str(
+                entry.get(_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD) or ""
+            ).strip()
+            wall_now = time.time()
+            if (
+                persisted_failure_chain == refresh_cache_key
+                and persisted_failure_at is not None
+                and wall_now - persisted_failure_at
+                < CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS
+            ):
+                return result
+            refresh_started_at = time.monotonic()
+            with _codex_quota_probe_lock:
+                last_failed_at = _codex_quota_refresh_failure_cache.get(
+                    refresh_cache_key
+                )
+                if (
+                    last_failed_at is not None
+                    and refresh_started_at - last_failed_at
+                    < CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS
+                ):
+                    return result
+                # Reserve before the POST so concurrent selectors in this
+                # process cannot spend the same single-use refresh token.
+                # A successful persisted rotation removes the reservation;
+                # any exception leaves it as the transient-failure throttle.
+                _codex_quota_refresh_failure_cache[refresh_cache_key] = (
+                    refresh_started_at
+                )
+
+            try:
+                refreshed = refresh_codex_oauth_pure(
+                    current_access, current_refresh
+                )
+            except Exception as exc:
+                if _is_terminal_codex_oauth_refresh_error(exc):
+                    if entry.get("source") == "device_code":
+                        providers = auth_store.get("providers")
+                        state = (
+                            providers.get("openai-codex")
+                            if isinstance(providers, dict)
+                            else None
+                        )
+                        tokens = (
+                            state.get("tokens") if isinstance(state, dict) else None
+                        )
+                        if isinstance(state, dict) and isinstance(tokens, dict):
+                            store_refresh = str(
+                                tokens.get("refresh_token") or ""
+                            ).strip()
+                            if not store_refresh or store_refresh == current_refresh:
+                                tokens.pop("access_token", None)
+                                tokens.pop("refresh_token", None)
+                                state["tokens"] = tokens
+                                state["last_auth_error"] = {
+                                    "provider": "openai-codex",
+                                    "code": getattr(exc, "code", "unknown"),
+                                    "message": str(exc),
+                                    "reason": "quota_probe_refresh_failure",
+                                    "relogin_required": True,
+                                    "at": datetime.now(timezone.utc).isoformat(),
+                                }
+                    entry.pop(_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD, None)
+                    entry.pop(_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD, None)
+                    entry["last_status"] = "dead"
+                    entry["last_status_at"] = time.time()
+                    entry["last_error_code"] = 401
+                    entry["last_error_reason"] = (
+                        getattr(exc, "code", None) or "invalid_grant"
+                    )
+                    entry["last_error_message"] = str(exc)
+                    entry["last_error_reset_at"] = None
+                    _save_auth_store(auth_store, target_path)
+                else:
+                    entry[_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD] = time.time()
+                    entry[_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD] = (
+                        refresh_cache_key
+                    )
+                    try:
+                        _save_auth_store(auth_store, target_path)
+                    except Exception:
+                        logger.debug(
+                            "Failed to persist Codex quota-refresh throttle",
+                            exc_info=True,
+                        )
+                raise
+            fresh_access = (
+                str(refreshed.get("access_token") or "").strip()
+                if isinstance(refreshed, dict)
+                else ""
+            )
             if not fresh_access:
+                entry[_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD] = time.time()
+                entry[_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD] = refresh_cache_key
+                _save_auth_store(auth_store, target_path)
                 return result
 
             entry["access_token"] = fresh_access
@@ -4329,17 +4577,62 @@ def _refresh_codex_pool_token_for_quota_probe(
                 entry["refresh_token"] = fresh_refresh
             if refreshed.get("last_refresh"):
                 entry["last_refresh"] = refreshed["last_refresh"]
-            _save_auth_store(auth_store)
+
+            if entry.get("source") == "device_code":
+                providers = auth_store.get("providers")
+                state = (
+                    providers.get("openai-codex")
+                    if isinstance(providers, dict)
+                    else None
+                )
+                tokens = state.get("tokens") if isinstance(state, dict) else None
+                if isinstance(state, dict) and isinstance(tokens, dict):
+                    tokens["access_token"] = fresh_access
+                    if fresh_refresh:
+                        tokens["refresh_token"] = fresh_refresh
+                    if refreshed.get("last_refresh"):
+                        state["last_refresh"] = refreshed["last_refresh"]
+
+            entry.pop(_CODEX_QUOTA_REFRESH_FAILURE_AT_FIELD, None)
+            entry.pop(_CODEX_QUOTA_REFRESH_FAILURE_CHAIN_FIELD, None)
+            _save_auth_store(auth_store, target_path)
+            with _codex_quota_probe_lock:
+                _codex_quota_refresh_failure_cache.pop(refresh_cache_key, None)
             result["access_token"] = fresh_access
             result["refresh_token"] = entry.get("refresh_token")
             result["last_refresh"] = entry.get("last_refresh")
             return result
-    except Exception:
+    except Exception as exc:
+        if _is_terminal_codex_oauth_refresh_error(exc):
+            raise
         logger.debug(
             "Failed to refresh expired Codex token for quota probe",
             exc_info=True,
         )
         return result
+
+
+def _refresh_codex_pool_token_for_quota_probe(
+    rate_limit_status: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Refresh the matching Codex quota row in its owning auth store."""
+    result = dict(rate_limit_status)
+    stale_token = str(result.get("access_token") or "").strip()
+    entry_id = str(result.get("id") or "").strip()
+    if not stale_token or not entry_id:
+        return result
+    try:
+        owner_paths = _codex_pool_owner_paths()
+    except Exception:
+        logger.debug("Failed to resolve Codex quota credential owner", exc_info=True)
+        return result
+    for target_path in owner_paths:
+        owner_result = _refresh_codex_pool_token_for_quota_probe_in_store(
+            result, target_path
+        )
+        if owner_result is not None:
+            return owner_result
+    return result
 
 
 def _pool_codex_access_token() -> str:
@@ -4353,12 +4646,7 @@ def _pool_codex_access_token() -> str:
     the original AuthError).
     """
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            return ""
-        entries = pool.get("openai-codex")
+        entries: Any = read_credential_pool("openai-codex")
         if not isinstance(entries, list):
             return ""
 
@@ -4368,9 +4656,16 @@ def _pool_codex_access_token() -> str:
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 return False
-            # Skip entries currently in an exhaustion cooldown window.
-            reset_at = entry.get("last_error_reset_at")
-            if isinstance(reset_at, (int, float)) and reset_at > time.time():
+            status = str(entry.get("last_status") or "").lower()
+            if status == "dead":
+                return False
+            reset_at = _parse_codex_reset_at(entry.get("last_error_reset_at"))
+            if reset_at is not None and reset_at > time.time():
+                return False
+            # An exhausted row without a parseable reset remains unavailable;
+            # the quota-status path below can probe it or surface a fail-closed
+            # cooldown instead of sending an auth/quota-bad token to the wire.
+            if status == "exhausted" and reset_at is None:
                 return False
             return True
 

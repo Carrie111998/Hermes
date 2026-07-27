@@ -797,28 +797,66 @@ class CredentialPool:
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
+                providers = auth_store.get("providers")
+                owns_provider_state = bool(
+                    isinstance(providers, dict)
+                    and isinstance(providers.get("openai-codex"), dict)
+                )
                 state = _load_provider_state(auth_store, "openai-codex")
+                active_pool = auth_store.get("credential_pool")
+                active_rows = (
+                    active_pool.get("openai-codex")
+                    if isinstance(active_pool, dict)
+                    else None
+                )
+                active_persisted_payload = next(
+                    (
+                        payload
+                        for payload in active_rows
+                        if isinstance(payload, dict)
+                        and str(payload.get("id") or "") == entry.id
+                    ),
+                    None,
+                ) if isinstance(active_rows, list) else None
+                persisted_payload = next(
+                    (
+                        payload
+                        for payload in read_credential_pool("openai-codex")
+                        if isinstance(payload, dict)
+                        and str(payload.get("id") or "") == entry.id
+                    ),
+                    None,
+                )
             if not isinstance(state, dict):
                 return entry
             tokens = state.get("tokens")
             if not isinstance(tokens, dict):
                 return entry
-            store_access = tokens.get("access_token", "")
-            store_refresh = tokens.get("refresh_token", "")
-            # Adopt auth.json tokens when either side differs.  Codex refresh
-            # tokens are single-use too, so a fresh refresh_token from
-            # another process means our entry's pair is consumed/stale.
+            store_access = str(tokens.get("access_token") or "").strip()
+            store_refresh = str(tokens.get("refresh_token") or "").strip()
+            store_last_refresh = str(state.get("last_refresh") or "").strip()
+            if not store_access:
+                return entry
+
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
-            if store_access and (
+            singleton_chain_changed = (
                 store_access != entry_access
                 or (store_refresh and store_refresh != entry_refresh)
-            ):
-                logger.debug(
-                    "Pool entry %s: syncing Codex tokens from auth.json "
-                    "(refreshed by another process)",
-                    entry.id,
+                or (
+                    store_last_refresh
+                    and store_last_refresh != (entry.last_refresh or "")
                 )
+            )
+            if (
+                owns_provider_state
+                and not isinstance(active_persisted_payload, dict)
+                and singleton_chain_changed
+            ):
+                # A fresh local device-code login replaces provider state and
+                # can omit the old pool row entirely. That write-side event is
+                # stronger than a singleton-only refresh, so it may clear the
+                # stale DEAD/EXHAUSTED lifecycle in this process.
                 field_updates: Dict[str, Any] = {
                     "access_token": store_access,
                     "refresh_token": store_refresh or entry.refresh_token,
@@ -829,11 +867,52 @@ class CredentialPool:
                     "last_error_message": None,
                     "last_error_reset_at": None,
                 }
-                if state.get("last_refresh"):
-                    field_updates["last_refresh"] = state["last_refresh"]
+                if store_last_refresh:
+                    field_updates["last_refresh"] = store_last_refresh
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
-                self._persist()
+                return updated
+
+            if isinstance(persisted_payload, dict):
+                persisted = PooledCredential.from_dict(
+                    self.provider, persisted_payload
+                )
+                persisted_matches_singleton = (
+                    persisted.access_token == store_access
+                    and (
+                        not store_refresh
+                        or persisted.refresh_token == store_refresh
+                    )
+                    and (
+                        not store_last_refresh
+                        or persisted.last_refresh == store_last_refresh
+                    )
+                )
+                if persisted_matches_singleton and persisted != entry:
+                    # A write-side reauthentication updates both the singleton
+                    # and pool row (including status). Adopt that full row so a
+                    # genuine login can clear DEAD/EXHAUSTED state.
+                    self._replace_entry(entry, persisted)
+                    return persisted
+
+            if singleton_chain_changed:
+                logger.debug(
+                    "Pool entry %s: adopting Codex singleton token metadata "
+                    "while preserving quota status",
+                    entry.id,
+                )
+                field_updates: Dict[str, Any] = {
+                    "access_token": store_access,
+                    "refresh_token": store_refresh or entry.refresh_token,
+                }
+                if store_last_refresh:
+                    field_updates["last_refresh"] = store_last_refresh
+                updated = replace(entry, **field_updates)
+                # Do not persist a whole active-profile snapshot here: this may
+                # be a root fallback, and token rotation alone does not prove
+                # quota recovery. The owner-locked quota helper writes the
+                # matching row while preserving its cooldown.
+                self._replace_entry(entry, updated)
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
@@ -1587,26 +1666,48 @@ class CredentialPool:
                 }
             )
             fresh_access = str(probe_status.get("access_token") or "").strip()
-            if not fresh_access or fresh_access == entry.access_token:
+            if not fresh_access:
+                return entry
+            fresh_refresh = (
+                str(probe_status.get("refresh_token") or "").strip()
+                or entry.refresh_token
+            )
+            fresh_last_refresh = (
+                str(probe_status.get("last_refresh") or "").strip()
+                or entry.last_refresh
+            )
+            if (
+                fresh_access == entry.access_token
+                and fresh_refresh == entry.refresh_token
+                and fresh_last_refresh == entry.last_refresh
+            ):
                 return entry
             updated = replace(
                 entry,
                 access_token=fresh_access,
-                refresh_token=(
-                    str(probe_status.get("refresh_token") or "").strip()
-                    or entry.refresh_token
-                ),
-                last_refresh=(
-                    str(probe_status.get("last_refresh") or "").strip()
-                    or entry.last_refresh
-                ),
+                refresh_token=fresh_refresh,
+                last_refresh=fresh_last_refresh,
             )
             # The auth helper already persisted this token pair under the
             # cross-process auth-store lock while retaining exhausted/error
             # fields. This only synchronizes the process-local mirror.
             self._replace_entry(entry, updated)
             return updated
-        except Exception:
+        except Exception as exc:
+            if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                dead = replace(
+                    entry,
+                    last_status=STATUS_DEAD,
+                    last_status_at=time.time(),
+                    last_error_code=401,
+                    last_error_reason=(
+                        getattr(exc, "code", None) or "invalid_grant"
+                    ),
+                    last_error_message=str(exc),
+                    last_error_reset_at=None,
+                )
+                self._replace_entry(entry, dead)
+                return dead
             logger.debug(
                 "Failed to refresh Codex quota-probe credential",
                 exc_info=True,
@@ -1659,6 +1760,7 @@ class CredentialPool:
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
         for entry in self._entries:
+            cooldown_cleared_in_owner = False
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load.  A stale duplicate row
             # can remain unhydrated; never lease or select it as an empty key.
@@ -1695,7 +1797,6 @@ class CredentialPool:
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
-                    cleared_any = True
             # For xai-oauth singleton-seeded entries, identical pattern:
             # an entry frozen as exhausted may simply be holding stale
             # tokens that another process (or a fresh `hermes model` ->
@@ -1754,6 +1855,27 @@ class CredentialPool:
                         and self._codex_quota_restored_upstream(entry)
                     ):
                         continue
+                    # The usage request ran without the auth-store lock. A
+                    # concurrent device-code refresh may have replaced this
+                    # chain while the probe was in flight; adopt it before any
+                    # later pool persistence can write the probe snapshot back.
+                    entry = self._sync_codex_entry_from_auth_store(entry)
+                    # Refresh persistence deliberately kept the quota markers;
+                    # a positive usage probe now owns clearing them on disk.
+                    # Do this before the pool snapshot write so the cooldown
+                    # merge cannot resurrect the just-confirmed stale marker.
+                    cleared_count = auth_mod.clear_codex_pool_quota_cooldowns(
+                        entry.access_token,
+                        include_global_fallback=True,
+                    )
+                    if cleared_count:
+                        cooldown_cleared_in_owner = True
+                    elif entry.last_status == STATUS_EXHAUSTED:
+                        # A positive usage response is not enough to mutate an
+                        # owner we could not atomically identify and update.
+                        # Keep the row frozen rather than shadowing/rolling back
+                        # a concurrent profile or global-store write.
+                        continue
                 if clear_expired:
                     cleared = replace(
                         entry,
@@ -1766,7 +1888,8 @@ class CredentialPool:
                     )
                     self._replace_entry(entry, cleared)
                     entry = cleared
-                    cleared_any = True
+                    if not cooldown_cleared_in_owner:
+                        cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
                 refreshed = self._refresh_entry(entry, force=False)
                 if refreshed is None:
@@ -2792,6 +2915,58 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
+    active_store = _load_auth_store()
+    active_pool = active_store.get("credential_pool")
+    active_entries = (
+        active_pool.get(provider) if isinstance(active_pool, dict) else None
+    )
+    active_providers = active_store.get("providers")
+    active_provider_state = (
+        active_providers.get(provider)
+        if isinstance(active_providers, dict)
+        else None
+    )
+    codex_global_fallback = bool(
+        provider == "openai-codex"
+        and raw_entries
+        and not active_entries
+        and not isinstance(active_provider_state, dict)
+    )
+    active_codex_tokens = (
+        active_provider_state.get("tokens")
+        if isinstance(active_provider_state, dict)
+        else None
+    )
+    active_codex_access = (
+        str(active_codex_tokens.get("access_token") or "").strip()
+        if isinstance(active_codex_tokens, dict)
+        else ""
+    )
+    active_codex_refresh = (
+        str(active_codex_tokens.get("refresh_token") or "").strip()
+        if isinstance(active_codex_tokens, dict)
+        else ""
+    )
+    codex_local_reauth_over_global = bool(
+        provider == "openai-codex"
+        and raw_entries
+        and not active_entries
+        and active_codex_access
+        and any(
+            isinstance(payload, dict)
+            and payload.get("source") == "device_code"
+            and (
+                str(payload.get("access_token") or "").strip()
+                != active_codex_access
+                or (
+                    active_codex_refresh
+                    and str(payload.get("refresh_token") or "").strip()
+                    != active_codex_refresh
+                )
+            )
+            for payload in raw_entries
+        )
+    )
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -2816,8 +2991,6 @@ def load_pool(provider: str) -> CredentialPool:
         # A profile may be reading this provider from the global-root fallback.
         # Keep that fallback read-only: only the store that owns these rows may
         # rewrite them. Loading the default/root profile will heal global rows.
-        active_pool = _load_auth_store().get("credential_pool")
-        active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
         raw_needs_auth_normalization = bool(active_entries)
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
@@ -2844,6 +3017,36 @@ def load_pool(provider: str) -> CredentialPool:
             prune_env_sources=False,
         )
         changed |= _normalize_pool_priorities(provider, entries)
+        if codex_local_reauth_over_global:
+            for index, item in enumerate(entries):
+                if (
+                    item.source != "device_code"
+                    or item.access_token != active_codex_access
+                    or (
+                        active_codex_refresh
+                        and item.refresh_token != active_codex_refresh
+                    )
+                ):
+                    continue
+                healthy = replace(
+                    item,
+                    last_status=None,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                if healthy != item:
+                    entries[index] = healthy
+                    changed = True
+        if codex_global_fallback and not env_changed:
+            # ``read_credential_pool`` supplied root-owned rows. Codex's
+            # singleton loader can also see the root fallback and normalize the
+            # in-memory copy, but that must not turn a read into a profile pool
+            # shadow. A genuine local singleton was excluded above; an explicit
+            # local env credential still keeps its existing write behavior.
+            changed = False
 
     if changed:
         new_ids = {entry.id for entry in entries}
