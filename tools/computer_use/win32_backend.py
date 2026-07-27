@@ -129,7 +129,7 @@ class Win32NativeBackend(ComputerUseBackend):
 
         # Physical click via ljqCtrl (with pixel-diff verification)
         cur = _ljqCtrl.win32api.GetCursorPos()
-        _ljqCtrl.SetCursorPos((tx, ty))
+        self._smooth_move(cur[0], cur[1], tx, ty)
         for _ in range(click_count):
             if button == "right":
                 _ljqCtrl.win32api.mouse_event(_ljqCtrl.win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0)
