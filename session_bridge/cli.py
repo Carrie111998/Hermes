@@ -1316,6 +1316,9 @@ class ProductionBackend:
             if (
                 registration.status == "unsettled"
                 and registration.error_code == "codex_tool_unavailable"
+            ) or (
+                registration.status == "retry"
+                and registration.error_code == "bridge_temporarily_unavailable"
             ):
                 self._recycle_sidebar_delivery_runtime()
             return {"lane": "registration", **asdict(registration)}

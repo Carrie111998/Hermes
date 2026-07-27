@@ -5423,6 +5423,55 @@ def test_production_sidebar_recovery_recycles_unavailable_codex_client(
     assert backend._sidebar_executor is None
 
 
+def test_production_sidebar_recovery_recycles_retryable_codex_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    )
+    closed: list[str] = []
+
+    class Client:
+        def close(self) -> None:
+            closed.append("client")
+
+    class Store:
+        def record_sidebar_recovery_progress(self, **value: object) -> None:
+            del value
+
+    class HydrationExecutor:
+        def run_once(self) -> SidebarHydrationExecutionResult:
+            return SidebarHydrationExecutionResult(status="idle")
+
+    class RegistrationExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            return SidebarExecutionResult(
+                status="retry",
+                job_id="sidebar-job:" + ("c" * 64),
+                error_code="bridge_temporarily_unavailable",
+            )
+
+    client = Client()
+    hydration = HydrationExecutor()
+    registration = RegistrationExecutor()
+    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
+    backend._sidebar_executor = registration
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+
+    assert backend.run_sidebar_recovery_once() == {
+        "lane": "registration",
+        "status": "retry",
+        "job_id": "sidebar-job:" + ("c" * 64),
+        "thread_id": None,
+        "error_code": "bridge_temporarily_unavailable",
+    }
+    assert closed == ["client"]
+    assert backend._sidebar_codex_client is None
+    assert backend._sidebar_hydration_executor is None
+    assert backend._sidebar_executor is None
+
+
 def test_sidebar_hydration_claim_runtime_does_not_start_a_provider_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
