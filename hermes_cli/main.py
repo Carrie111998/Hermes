@@ -15371,6 +15371,19 @@ def main():
     except Exception:
         pass
 
+    # Refuse an unsupported interpreter, and warn on a SQLite build with the
+    # WAL-reset bug, BEFORE anything opens a database.  Nothing enforced
+    # ``requires-python`` before this, so ``hermes`` ran happily on 3.14 (where
+    # every delegate_task dies inside a private-stdlib mirror) and on builds
+    # linking vulnerable SQLite against already-WAL databases.  Only the import
+    # is defensive: a guard that silently no-ops is the bug it exists to prevent.
+    try:
+        from hermes_cli.runtime_guard import enforce as _enforce_runtime
+    except Exception:
+        _enforce_runtime = None
+    if _enforce_runtime is not None:
+        _enforce_runtime()
+
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
     # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
